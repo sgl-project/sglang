@@ -644,7 +644,7 @@ class CudaGraphRunner:
         # Actual attention capture happens at runtime, not during graph capture.
         capture_attention_tokens = False
         attention_top_k = 5  # dummy value
-        attention_capture_layer_id = -1
+        attention_capture_layer_ids = None
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -679,7 +679,7 @@ class CudaGraphRunner:
             lora_ids=lora_ids,
             capture_attention_tokens=capture_attention_tokens,
             attention_top_k=attention_top_k,
-            attention_capture_layer_id=attention_capture_layer_id,
+            attention_capture_layer_ids=attention_capture_layer_ids,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 

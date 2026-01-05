@@ -135,14 +135,12 @@ def test_attention_biases(base_url: str) -> bool:
     print("\n=== Test 4: Attention Bias Steering ===")
 
     # Create biases that boost attention to the first few tokens
-    # Format: {layer_id: {batch_idx: {token_pos: bias_value}}}
+    # Format: {layer_id_str: {token_pos_str: bias_value, ...}, ...}
     attention_biases = {
         "11": {  # Apply to layer 11
-            "0": {  # Batch index 0
-                "0": 2.0,   # Boost first token
-                "1": 1.5,   # Boost second token
-                "2": 1.0,   # Boost third token
-            }
+            "0": 2.0,   # Boost first token
+            "1": 1.5,   # Boost second token
+            "2": 1.0,   # Boost third token
         }
     }
 
@@ -211,7 +209,7 @@ def test_combined_features(base_url: str) -> bool:
             "return_moe_routing": True,
             "moe_routing_top_k": 3,
             "attention_biases": {
-                "11": {"0": {"0": 1.0}}  # Small bias on layer 11
+                "11": {"0": 1.0}  # Small bias on layer 11, token 0
             },
         }
     )

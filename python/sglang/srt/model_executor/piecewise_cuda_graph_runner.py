@@ -665,7 +665,7 @@ class PiecewiseCudaGraphRunner:
             top_p=forward_batch.top_p,
             capture_attention_tokens=forward_batch.capture_attention_tokens,
             attention_top_k=forward_batch.attention_top_k,
-            attention_capture_layer_id=forward_batch.attention_capture_layer_id,
+            attention_capture_layer_ids=forward_batch.attention_capture_layer_ids,
         )
 
         return static_forward_batch

@@ -617,11 +617,17 @@ class ForwardBatch:
 
             # Per-request layer override takes highest precedence
             if batch.attention_capture_layer_id is not None:
-                layer_id = batch.attention_capture_layer_id
-                # Handle -1 as "last layer"
-                if layer_id < 0:
-                    layer_id = num_layers + layer_id
-                layer_ids = [layer_id]
+                layer_override = batch.attention_capture_layer_id
+                # Handle both int and List[int] formats
+                if isinstance(layer_override, list):
+                    # Handle -1 as "last layer" for each element
+                    layer_ids = [l if l >= 0 else num_layers + l for l in layer_override]
+                else:
+                    # Single int
+                    layer_id = layer_override
+                    if layer_id < 0:
+                        layer_id = num_layers + layer_id
+                    layer_ids = [layer_id]
             # Server arg specific layer ID takes second precedence
             elif server_layer_id is not None:
                 layer_id = server_layer_id
