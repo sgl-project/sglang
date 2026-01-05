@@ -183,7 +183,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         # Parse args
         self.server_args = server_args
-        self.enable_metrics = server_args.enable_metrics
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
         self.enable_trace = server_args.enable_trace
@@ -414,22 +413,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     def init_metric_collector_watchdog(self):
         # Metrics
-        if self.enable_metrics:
-            labels = {
-                "model_name": self.server_args.served_model_name,
-                # TODO: Add lora name/path in the future,
-            }
-            if self.server_args.tokenizer_metrics_allowed_custom_labels:
-                for label in self.server_args.tokenizer_metrics_allowed_custom_labels:
-                    labels[label] = ""
-            self.metrics_collector = TokenizerMetricsCollector(
-                server_args=self.server_args,
-                labels=labels,
-                bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
-                bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
-                bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
-                collect_tokens_histogram=self.server_args.collect_tokens_histogram,
-            )
+        labels = {
+            "model_name": self.server_args.served_model_name,
+            # TODO: Add lora name/path in the future,
+        }
+        if self.server_args.tokenizer_metrics_allowed_custom_labels:
+            for label in self.server_args.tokenizer_metrics_allowed_custom_labels:
+                labels[label] = ""
+        self.metrics_collector = TokenizerMetricsCollector(
+            server_args=self.server_args,
+            labels=labels,
+            bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
+            bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
+            bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
+            collect_tokens_histogram=self.server_args.collect_tokens_histogram,
+        )
 
         if self.server_args.gc_warning_threshold_secs > 0.0:
             configure_gc_warning(self.server_args.gc_warning_threshold_secs)
@@ -1294,11 +1292,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
-        if self.enable_metrics:
-            # TODO: also use custom_labels from the request
-            self.metrics_collector.observe_one_aborted_request(
-                self.metrics_collector.labels
-            )
+        # TODO: also use custom_labels from the request
+        self.metrics_collector.observe_one_aborted_request(
+            self.metrics_collector.labels
+        )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
@@ -1482,17 +1479,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 "total_retractions": recv_obj.retraction_counts[i],
             }
 
-            if self.enable_metrics:
-                self._add_metric_if_present(recv_obj, "queue_time", meta_info, i)
-                self._add_metric_if_present(
-                    recv_obj, "prefill_launch_delay", meta_info, i
-                )
-                self._add_metric_if_present(
-                    recv_obj, "prefill_launch_latency", meta_info, i
-                )
-                self._add_metric_if_present(
-                    recv_obj, "prefill_finished_ts", meta_info, i
-                )
+            self._add_metric_if_present(recv_obj, "queue_time", meta_info, i)
+            self._add_metric_if_present(recv_obj, "prefill_launch_delay", meta_info, i)
+            self._add_metric_if_present(
+                recv_obj, "prefill_launch_latency", meta_info, i
+            )
+            self._add_metric_if_present(recv_obj, "prefill_finished_ts", meta_info, i)
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
@@ -1571,8 +1563,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
-                if self.enable_metrics:
-                    self._calculate_timing_metrics(meta_info, state, recv_obj, i)
+                self._calculate_timing_metrics(meta_info, state, recv_obj, i)
 
                 trace_req_finish(rid, ts=int(state.finished_time * 1e9))
 
@@ -1586,7 +1577,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             state.event.set()
 
             # Log metrics and dump
-            if self.enable_metrics and state.obj.log_metrics:
+            if state.obj.log_metrics:
                 self.collect_metrics(state, recv_obj, i)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)

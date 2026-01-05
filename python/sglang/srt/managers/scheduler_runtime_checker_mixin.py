@@ -251,8 +251,7 @@ class SchedulerRuntimeCheckerMixin:
         self._check_req_pool()
 
         if (
-            self.enable_metrics
-            and self.current_scheduler_metrics_enabled
+            self.current_scheduler_metrics_enabled
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.

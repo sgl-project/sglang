@@ -383,8 +383,7 @@ class MambaRadixCache(BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
-        if params.enable_metrics:
-            self.init_metrics_collector()
+        self.init_metrics_collector()
 
         if self.page_size == 1:
             self.key_match_fn = _key_match_page_size1

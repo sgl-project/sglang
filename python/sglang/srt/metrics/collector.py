@@ -1381,79 +1381,93 @@ class RadixCacheMetricsCollector:
 
         self.labels = labels
 
-        bucket_eviction_duration = get_histogram_conf_from_env(
-            "SGLANG_BUCKET_EVICTION_DURATION"
-        )
-        if bucket_eviction_duration is None:
-            bucket_eviction_duration = [
-                0.001,
-                0.002,
-                0.003,
-                0.004,
-                0.005,
-                0.006,
-                0.007,
-                0.008,
-                0.009,
-                0.01,
-                0.02,
-                0.03,
-                0.04,
-                0.05,
-                0.1,
-                0.2,
-                0.5,
-                1.0,
-            ]
-        bucket_load_back_duration = get_histogram_conf_from_env(
-            "SGLANG_BUCKET_LOAD_BACK_DURATION"
-        )
-        if bucket_load_back_duration is None:
-            bucket_load_back_duration = [
-                0.001,
-                0.002,
-                0.003,
-                0.004,
-                0.005,
-                0.006,
-                0.007,
-                0.008,
-                0.009,
-                0.01,
-                0.02,
-                0.03,
-                0.04,
-                0.05,
-                0.1,
-                0.2,
-                0.5,
-                1.0,
-            ]
-        self.eviction_duration_seconds = Histogram(
-            name="sglang:eviction_duration_seconds",
-            documentation="Time taken to evict memory from GPU to CPU in seconds.",
-            labelnames=labels.keys(),
-            buckets=bucket_eviction_duration,
-        )
+        # Use class-level metrics to avoid duplicate registration
+        if not hasattr(RadixCacheMetricsCollector, "_metrics_initialized"):
+            bucket_eviction_duration = get_histogram_conf_from_env(
+                "SGLANG_BUCKET_EVICTION_DURATION"
+            )
+            if bucket_eviction_duration is None:
+                bucket_eviction_duration = [
+                    0.001,
+                    0.002,
+                    0.003,
+                    0.004,
+                    0.005,
+                    0.006,
+                    0.007,
+                    0.008,
+                    0.009,
+                    0.01,
+                    0.02,
+                    0.03,
+                    0.04,
+                    0.05,
+                    0.1,
+                    0.2,
+                    0.5,
+                    1.0,
+                ]
+            bucket_load_back_duration = get_histogram_conf_from_env(
+                "SGLANG_BUCKET_LOAD_BACK_DURATION"
+            )
+            if bucket_load_back_duration is None:
+                bucket_load_back_duration = [
+                    0.001,
+                    0.002,
+                    0.003,
+                    0.004,
+                    0.005,
+                    0.006,
+                    0.007,
+                    0.008,
+                    0.009,
+                    0.01,
+                    0.02,
+                    0.03,
+                    0.04,
+                    0.05,
+                    0.1,
+                    0.2,
+                    0.5,
+                    1.0,
+                ]
+            RadixCacheMetricsCollector._eviction_duration_seconds = Histogram(
+                name="sglang:eviction_duration_seconds",
+                documentation="Time taken to evict memory from GPU to CPU in seconds.",
+                labelnames=labels.keys(),
+                buckets=bucket_eviction_duration,
+            )
 
-        self.eviction_num_tokens = Counter(
-            name="sglang:evicted_tokens_total",
-            documentation="The number of tokens evicted from GPU to CPU.",
-            labelnames=labels.keys(),
-        )
+            RadixCacheMetricsCollector._eviction_num_tokens = Counter(
+                name="sglang:evicted_tokens_total",
+                documentation="The number of tokens evicted from GPU to CPU.",
+                labelnames=labels.keys(),
+            )
 
-        self.load_back_duration_seconds = Histogram(
-            name="sglang:load_back_duration_seconds",
-            documentation="Time taken to load memory from CPU to GPU in seconds.",
-            labelnames=labels.keys(),
-            buckets=bucket_load_back_duration,
-        )
+            RadixCacheMetricsCollector._load_back_duration_seconds = Histogram(
+                name="sglang:load_back_duration_seconds",
+                documentation="Time taken to load memory from CPU to GPU in seconds.",
+                labelnames=labels.keys(),
+                buckets=bucket_load_back_duration,
+            )
 
-        self.load_back_num_tokens = Counter(
-            name="sglang:load_back_tokens_total",
-            documentation="The number of tokens loaded from CPU to GPU.",
-            labelnames=labels.keys(),
+            RadixCacheMetricsCollector._load_back_num_tokens = Counter(
+                name="sglang:load_back_tokens_total",
+                documentation="The number of tokens loaded from CPU to GPU.",
+                labelnames=labels.keys(),
+            )
+
+            RadixCacheMetricsCollector._metrics_initialized = True
+
+        # Use class-level metrics
+        self.eviction_duration_seconds = (
+            RadixCacheMetricsCollector._eviction_duration_seconds
         )
+        self.eviction_num_tokens = RadixCacheMetricsCollector._eviction_num_tokens
+        self.load_back_duration_seconds = (
+            RadixCacheMetricsCollector._load_back_duration_seconds
+        )
+        self.load_back_num_tokens = RadixCacheMetricsCollector._load_back_num_tokens
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)

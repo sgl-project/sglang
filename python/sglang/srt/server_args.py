@@ -778,6 +778,13 @@ class ServerArgs:
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
+        # Warn about enable_metrics being ignored (metrics are always enabled now)
+        if self.enable_metrics:
+            logger.warning(
+                "The '--enable-metrics' flag is deprecated and will be ignored. "
+                "Metrics are now always enabled by default."
+            )
+
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path

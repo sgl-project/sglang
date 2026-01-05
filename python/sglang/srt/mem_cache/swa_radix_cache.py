@@ -354,8 +354,7 @@ class SWARadixCache(BasePrefixCache):
         else:
             self.key_convert_fn = lambda key: key
 
-        if params.enable_metrics:
-            self.init_metrics_collector()
+        self.init_metrics_collector()
 
         self.sliding_window_size = sliding_window_size
         self.reset()

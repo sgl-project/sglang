@@ -2399,7 +2399,7 @@ def configure_ipv6(dist_init_addr):
     return port, host
 
 
-def launch_dummy_health_check_server(host, port, enable_metrics):
+def launch_dummy_health_check_server(host, port):
     import asyncio
 
     import uvicorn
@@ -2423,9 +2423,8 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         return Response(status_code=200)
 
     # Add prometheus middleware
-    if enable_metrics:
-        add_prometheus_middleware(app)
-        enable_func_timer()
+    add_prometheus_middleware(app)
+    enable_func_timer()
 
     config = uvicorn.Config(
         app,

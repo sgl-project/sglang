@@ -262,8 +262,7 @@ class RadixCache(BasePrefixCache):
 
         self.kv_event_queue = []
 
-        if params.enable_metrics:
-            self.init_metrics_collector()
+        self.init_metrics_collector()
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device

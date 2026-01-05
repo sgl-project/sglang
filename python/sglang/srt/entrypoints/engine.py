@@ -772,8 +772,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     )
 
     # Set prometheus env vars
-    if server_args.enable_metrics:
-        set_prometheus_multiproc_dir()
+    set_prometheus_multiproc_dir()
 
     # Set ulimit
     set_ulimit()
@@ -961,9 +960,7 @@ def _launch_subprocesses(
             # When using `Engine` as a Python API, we don't want to block here.
             return None, None, scheduler_infos, port_args
 
-        launch_dummy_health_check_server(
-            server_args.host, server_args.port, server_args.enable_metrics
-        )
+        launch_dummy_health_check_server(server_args.host, server_args.port)
 
         for proc in scheduler_procs:
             proc.join()

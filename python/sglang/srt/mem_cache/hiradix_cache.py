@@ -71,7 +71,7 @@ class HiRadixCache(RadixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.enable_storage = server_args.hicache_storage_backend is not None
-        self.enable_storage_metrics = self.enable_storage and params.enable_metrics
+        self.enable_storage_metrics = self.enable_storage
 
         (
             extra_config,

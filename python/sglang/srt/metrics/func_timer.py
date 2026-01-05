@@ -22,15 +22,12 @@ from typing import Any, Callable, Optional
 
 from sglang.srt.metrics.utils import exponential_buckets
 
-enable_metrics = False
-
 
 def enable_func_timer():
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
     from prometheus_client import Histogram
 
-    global enable_metrics, FUNC_LATENCY
-    enable_metrics = True
+    global FUNC_LATENCY
 
     FUNC_LATENCY = Histogram(
         "sglang:func_latency_seconds",
@@ -65,9 +62,6 @@ def time_func_latency(
 
         @wraps(func)
         async def async_wrapper(*args, **kwargs):
-            if not enable_metrics:
-                return await func(*args, **kwargs)
-
             metric = FUNC_LATENCY
             start = time.monotonic()
             ret = func(*args, **kwargs)
@@ -80,9 +74,6 @@ def time_func_latency(
 
         @wraps(func)
         def sync_wrapper(*args, **kwargs):
-            if not enable_metrics:
-                return func(*args, **kwargs)
-
             metric = FUNC_LATENCY
             start = time.monotonic()
             try:

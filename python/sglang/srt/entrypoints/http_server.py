@@ -252,9 +252,8 @@ async def lifespan(fast_api_app: FastAPI):
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
     # Add prometheus middleware
-    if server_args.enable_metrics:
-        add_prometheus_middleware(app)
-        enable_func_timer()
+    add_prometheus_middleware(app)
+    enable_func_timer()
 
     # Init tracing
     if server_args.enable_trace:
@@ -1717,8 +1716,7 @@ def launch_server(
         )
     )
 
-    if server_args.enable_metrics:
-        add_prometheus_track_response_middleware(app)
+    add_prometheus_track_response_middleware(app)
 
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.

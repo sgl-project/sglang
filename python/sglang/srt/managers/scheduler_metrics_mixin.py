@@ -77,31 +77,30 @@ class SchedulerMetricsMixin:
             self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
         )
 
-        if self.enable_metrics:
-            if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL:
-                engine_type = "prefill"
-            elif self.server_args.disaggregation_mode == DisaggregationMode.DECODE:
-                engine_type = "decode"
-            else:
-                engine_type = "unified"
+        if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL:
+            engine_type = "prefill"
+        elif self.server_args.disaggregation_mode == DisaggregationMode.DECODE:
+            engine_type = "decode"
+        else:
+            engine_type = "unified"
 
-            labels = {
-                "model_name": self.server_args.served_model_name,
-                "engine_type": engine_type,
-                "tp_rank": tp_rank,
-                "pp_rank": pp_rank,
-                "moe_ep_rank": self.moe_ep_rank,
-            }
-            if dp_rank is not None:
-                labels["dp_rank"] = dp_rank
-            self.metrics_collector = SchedulerMetricsCollector(
-                labels=labels, enable_lora=self.enable_lora
+        labels = {
+            "model_name": self.server_args.served_model_name,
+            "engine_type": engine_type,
+            "tp_rank": tp_rank,
+            "pp_rank": pp_rank,
+            "moe_ep_rank": self.moe_ep_rank,
+        }
+        if dp_rank is not None:
+            labels["dp_rank"] = dp_rank
+        self.metrics_collector = SchedulerMetricsCollector(
+            labels=labels, enable_lora=self.enable_lora
+        )
+
+        if ENABLE_METRICS_DEVICE_TIMER:
+            self.forward_pass_device_timer = DeviceTimer(
+                reporter=self.metrics_collector.increment_gpu_execution_seconds,
             )
-
-            if ENABLE_METRICS_DEVICE_TIMER:
-                self.forward_pass_device_timer = DeviceTimer(
-                    reporter=self.metrics_collector.increment_gpu_execution_seconds,
-                )
 
         if self.enable_kv_cache_events:
             self.init_kv_events(self.server_args.kv_events_config)
@@ -202,58 +201,57 @@ class SchedulerMetricsMixin:
 
         logger.info(f)
 
-        if self.enable_metrics:
-            # Basics
-            total_tokens = adder.log_input_tokens + adder.log_hit_tokens
-            cache_hit_rate = (
-                adder.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
+        # Basics
+        total_tokens = adder.log_input_tokens + adder.log_hit_tokens
+        cache_hit_rate = (
+            adder.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
+        )
+
+        self.stats.num_running_reqs = running_bs
+        self.stats.num_running_reqs_offline_batch = running_bs_offline_batch
+        self.stats.num_used_tokens = num_used
+        self.stats.token_usage = token_usage
+        if self.is_hybrid_swa:
+            self.stats.swa_token_usage = swa_token_usage
+        if self.is_hybrid_ssm:
+            self.stats.mamba_usage = mamba_usage
+        self.stats.num_queue_reqs = len(self.waiting_queue)
+        self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
+        self.stats.cache_hit_rate = cache_hit_rate
+
+        self.stats.max_total_num_tokens = self.max_total_num_tokens
+
+        # Retract
+        self.stats.num_retracted_reqs = self.num_retracted_reqs
+        self.stats.num_paused_reqs = self.num_paused_reqs
+        self.num_retracted_reqs = self.num_paused_reqs = 0
+
+        # PD disaggregation
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.stats.num_prefill_prealloc_queue_reqs = len(
+                self.disagg_prefill_bootstrap_queue.queue
+            )
+            self.stats.num_prefill_inflight_queue_reqs = len(
+                self.disagg_prefill_inflight_queue
+            )
+            self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
+            self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
+            self.stats.kv_transfer_bootstrap_ms = self.kv_transfer_bootstrap_ms
+            self.stats.kv_transfer_alloc_ms = self.kv_transfer_alloc_ms
+            self.stats.kv_transfer_total_mb = self.kv_transfer_total_mb
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.stats.num_decode_prealloc_queue_reqs = len(
+                self.disagg_decode_prealloc_queue.queue
+            )
+            self.stats.num_decode_transfer_queue_reqs = len(
+                self.disagg_decode_transfer_queue.queue
             )
 
-            self.stats.num_running_reqs = running_bs
-            self.stats.num_running_reqs_offline_batch = running_bs_offline_batch
-            self.stats.num_used_tokens = num_used
-            self.stats.token_usage = token_usage
-            if self.is_hybrid_swa:
-                self.stats.swa_token_usage = swa_token_usage
-            if self.is_hybrid_ssm:
-                self.stats.mamba_usage = mamba_usage
-            self.stats.num_queue_reqs = len(self.waiting_queue)
-            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
-            self.stats.cache_hit_rate = cache_hit_rate
-
-            self.stats.max_total_num_tokens = self.max_total_num_tokens
-
-            # Retract
-            self.stats.num_retracted_reqs = self.num_retracted_reqs
-            self.stats.num_paused_reqs = self.num_paused_reqs
-            self.num_retracted_reqs = self.num_paused_reqs = 0
-
-            # PD disaggregation
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_prealloc_queue_reqs = len(
-                    self.disagg_prefill_bootstrap_queue.queue
-                )
-                self.stats.num_prefill_inflight_queue_reqs = len(
-                    self.disagg_prefill_inflight_queue
-                )
-                self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
-                self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
-                self.stats.kv_transfer_bootstrap_ms = self.kv_transfer_bootstrap_ms
-                self.stats.kv_transfer_alloc_ms = self.kv_transfer_alloc_ms
-                self.stats.kv_transfer_total_mb = self.kv_transfer_total_mb
-            elif self.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = len(
-                    self.disagg_decode_prealloc_queue.queue
-                )
-                self.stats.num_decode_transfer_queue_reqs = len(
-                    self.disagg_decode_transfer_queue.queue
-                )
-
-            # Others
-            self.calculate_utilization()
-            self.update_lora_metrics()
-            self.metrics_collector.log_stats(self.stats)
-            self._emit_kv_metrics()
+        # Others
+        self.calculate_utilization()
+        self.update_lora_metrics()
+        self.metrics_collector.log_stats(self.stats)
+        self._emit_kv_metrics()
         self._publish_kv_events()
 
     def log_prefill_stats_late(self: Scheduler, batch: Optional[ScheduleBatch]):
@@ -262,7 +260,7 @@ class SchedulerMetricsMixin:
         info = self.temp_prefill_info
         self.temp_prefill_info = None
 
-        if self.enable_metrics and batch is not None and info is not None:
+        if batch is not None and info is not None:
             self.metrics_collector.increment_realtime_tokens(
                 prefill_compute_tokens=info["adder_log_input_tokens"],
                 prefill_cache_tokens=info["adder_log_hit_tokens"],
@@ -371,54 +369,54 @@ class SchedulerMetricsMixin:
         )
 
         logger.info(msg)
-        if self.enable_metrics:
-            # Basics
-            self.stats.num_running_reqs = num_running_reqs
-            self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
-            self.stats.num_used_tokens = num_used
-            self.stats.token_usage = token_usage
-            if self.is_hybrid_swa:
-                self.stats.swa_token_usage = swa_token_usage
-            if self.is_hybrid_ssm:
-                self.stats.mamba_usage = mamba_usage
-            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
-            self.stats.gen_throughput = self.last_gen_throughput
-            self.stats.num_queue_reqs = len(self.waiting_queue)
-            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
-            self.stats.cache_hit_rate = cache_hit_rate
 
-            self.stats.max_total_num_tokens = self.max_total_num_tokens
+        # Basics
+        self.stats.num_running_reqs = num_running_reqs
+        self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
+        self.stats.num_used_tokens = num_used
+        self.stats.token_usage = token_usage
+        if self.is_hybrid_swa:
+            self.stats.swa_token_usage = swa_token_usage
+        if self.is_hybrid_ssm:
+            self.stats.mamba_usage = mamba_usage
+        self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
+        self.stats.gen_throughput = self.last_gen_throughput
+        self.stats.num_queue_reqs = len(self.waiting_queue)
+        self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
+        self.stats.cache_hit_rate = cache_hit_rate
 
-            # Speculative decoding
-            self.stats.spec_accept_rate = spec_accept_rate
-            self.stats.spec_accept_length = spec_accept_length
+        self.stats.max_total_num_tokens = self.max_total_num_tokens
 
-            # Retract
-            self.stats.num_retracted_reqs = self.num_retracted_reqs
-            self.stats.num_paused_reqs = self.num_paused_reqs
-            self.num_retracted_reqs = self.num_paused_reqs = 0
+        # Speculative decoding
+        self.stats.spec_accept_rate = spec_accept_rate
+        self.stats.spec_accept_length = spec_accept_length
 
-            # PD disaggregation
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_prealloc_queue_reqs = len(
-                    self.disagg_prefill_bootstrap_queue.queue
-                )
-                self.stats.num_prefill_inflight_queue_reqs = len(
-                    self.disagg_prefill_inflight_queue
-                )
-            elif self.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = len(
-                    self.disagg_decode_prealloc_queue.queue
-                )
-                self.stats.num_decode_transfer_queue_reqs = len(
-                    self.disagg_decode_transfer_queue.queue
-                )
+        # Retract
+        self.stats.num_retracted_reqs = self.num_retracted_reqs
+        self.stats.num_paused_reqs = self.num_paused_reqs
+        self.num_retracted_reqs = self.num_paused_reqs = 0
 
-            # Others
-            self.calculate_utilization()
-            self.update_lora_metrics()
-            self.metrics_collector.log_stats(self.stats)
-            self._emit_kv_metrics()
+        # PD disaggregation
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.stats.num_prefill_prealloc_queue_reqs = len(
+                self.disagg_prefill_bootstrap_queue.queue
+            )
+            self.stats.num_prefill_inflight_queue_reqs = len(
+                self.disagg_prefill_inflight_queue
+            )
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.stats.num_decode_prealloc_queue_reqs = len(
+                self.disagg_decode_prealloc_queue.queue
+            )
+            self.stats.num_decode_transfer_queue_reqs = len(
+                self.disagg_decode_transfer_queue.queue
+            )
+
+        # Others
+        self.calculate_utilization()
+        self.update_lora_metrics()
+        self.metrics_collector.log_stats(self.stats)
+        self._emit_kv_metrics()
         self._publish_kv_events()
 
     def log_decode_stats_every_iteration(
@@ -435,8 +433,6 @@ class SchedulerMetricsMixin:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        if not self.enable_metrics:
-            return
         if not isinstance(result, GenerationBatchResult):
             return
 
@@ -563,7 +559,7 @@ class SchedulerMetricsMixin:
 
     @contextmanager
     def record_forward_metrics(self: Scheduler, batch: ScheduleBatch):
-        if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
+        if not ENABLE_METRICS_DEVICE_TIMER:
             yield
             return
 
