@@ -91,6 +91,21 @@ test.describe('UI Rendering', () => {
     await expect(page.getByText('Latent Chat Explorer')).toBeVisible();
   });
 
+  test('connection status shows model name', async ({ page }) => {
+    await page.goto('/');
+
+    // Wait for connection check to complete
+    await page.waitForTimeout(3000);
+
+    // Check for connected dot (green)
+    const dot = page.locator('.dot');
+    await expect(dot).toHaveClass(/connected/);
+
+    // Check model name contains Qwen (not "Not connected")
+    const pillText = await page.locator('.pill').first().textContent();
+    expect(pillText).toContain('Qwen');
+  });
+
   test('view navigation works', async ({ page }) => {
     await page.goto('/');
 
