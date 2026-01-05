@@ -34,6 +34,7 @@ class EncodingStage(PipelineStage):
     """
 
     def __init__(self, vae: ParallelTiledVAE) -> None:
+        super().__init__()
         self.vae: ParallelTiledVAE = vae
 
     @torch.no_grad()

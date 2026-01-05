@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use super::{
     client::GrpcClient,
+    context::RequestContext,
     proto_wrapper::{ProtoGenerateComplete, ProtoStream},
     ProcessedMessages,
 };
@@ -41,6 +42,49 @@ use crate::{
         ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
     },
 };
+
+/// Resolve tokenizer from registry and cache it in request context.
+///
+/// This is a helper to avoid duplicating tokenizer resolution logic across
+/// preparation stages (chat, generate, embedding).
+///
+/// Returns the tokenizer Arc, which is also cached in `ctx.state.tokenizer`.
+pub fn resolve_tokenizer(
+    ctx: &mut RequestContext,
+    stage_name: &str,
+) -> Result<Arc<dyn Tokenizer>, Box<Response>> {
+    let model_id = ctx.input.model_id.as_deref().ok_or_else(|| {
+        error!(
+            function = %stage_name,
+            "model_id not set in request context"
+        );
+        Box::new(error::internal_error(
+            "model_id_not_set",
+            "model_id not set in request context - this is a bug in request routing",
+        ))
+    })?;
+
+    let tokenizer = ctx
+        .components
+        .tokenizer_registry
+        .get(model_id)
+        .ok_or_else(|| {
+            error!(
+                function = %stage_name,
+                model = %model_id,
+                "Tokenizer not found for model"
+            );
+            Box::new(error::internal_error(
+                "tokenizer_not_found",
+                format!("Tokenizer not found for model: {}", model_id),
+            ))
+        })?;
+
+    // Cache tokenizer in context for reuse in response processing stage
+    ctx.state.tokenizer = Some(tokenizer.clone());
+
+    Ok(tokenizer)
+}
 
 /// Get gRPC client from worker, returning appropriate error response on failure
 pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<GrpcClient, Response> {
@@ -235,8 +279,7 @@ pub fn generate_tool_constraints(
 /// Build JSON schema for required tool calls (array with minItems: 1)
 /// Includes $defs consolidation from all tools (matching Python's behavior)
 fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
-    // Build anyOf schemas for each tool
-    let mut any_of_schemas = Vec::new();
+    let mut any_of_schemas = Vec::with_capacity(tools.len());
     for tool in tools {
         let tool_schema = json!({
             "properties": {
@@ -252,7 +295,7 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
     }
 
     // Consolidate $defs from all tools (matching Python's _get_tool_schema_defs)
-    let mut all_defs: HashMap<String, Value> = HashMap::new();
+    let mut all_defs: Map<String, Value> = Map::new();
     for tool in tools {
         if let Value::Object(params) = &tool.function.parameters {
             if let Some(Value::Object(defs)) = params.get("$defs") {
@@ -288,8 +331,7 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
     // Add $defs if any were found (matching Python's behavior)
     if !all_defs.is_empty() {
         if let Value::Object(ref mut schema_obj) = array_schema {
-            let defs_value = Value::Object(all_defs.into_iter().collect::<Map<String, Value>>());
-            schema_obj.insert("$defs".to_string(), defs_value);
+            schema_obj.insert("$defs".to_string(), Value::Object(all_defs));
         }
     }
 
@@ -395,8 +437,8 @@ pub fn process_chat_messages(
             .transpose()
             .map_err(|e| format!("Failed to serialize tools: {}", e))?;
 
-        // Build template kwargs, merging reasoning_effort if present
-        let mut combined_template_kwargs = HashMap::new();
+        let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
+        let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
 
         // Add reasoning_effort if present (like Python does)
         if let Some(reasoning_effort) = &request.reasoning_effort {
@@ -834,7 +876,7 @@ pub fn convert_proto_to_openai_logprobs(
     proto_logprobs: &OutputLogProbs,
     tokenizer: &Arc<dyn Tokenizer>,
 ) -> Result<ChatLogProbs, String> {
-    let mut content_items = Vec::new();
+    let mut content_items = Vec::with_capacity(proto_logprobs.token_logprobs.len());
 
     // Decode token IDs to text (always with skip_special_tokens=false for logprobs)
     let token_texts: Vec<String> = proto_logprobs
@@ -857,8 +899,9 @@ pub fn convert_proto_to_openai_logprobs(
         let bytes = Some(token_text.as_bytes().to_vec());
 
         // Build top_logprobs for this position
-        let mut top_logprobs = Vec::new();
-        if let Some(top_logprobs_entry) = proto_logprobs.top_logprobs.get(i) {
+        let top_logprobs = if let Some(top_logprobs_entry) = proto_logprobs.top_logprobs.get(i) {
+            let mut top_logprobs = Vec::with_capacity(top_logprobs_entry.values.len());
+
             // Decode top token IDs (always with skip_special_tokens=false)
             let top_token_texts: Vec<String> = top_logprobs_entry
                 .token_ids
@@ -884,7 +927,10 @@ pub fn convert_proto_to_openai_logprobs(
                     });
                 }
             }
-        }
+            top_logprobs
+        } else {
+            Vec::new()
+        };
 
         content_items.push(ChatLogProbsContent {
             token: token_text,

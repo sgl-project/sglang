@@ -3,16 +3,24 @@ Benchmark online serving for diffusion models (Image/Video Generation).
 
 
 Usage:
-
+    # Video
     t2v:
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task t2v --num-prompts 20
+         --backend sglang-video --dataset vbench --task t2v --num-prompts 20
 
     i2v:
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task i2v --num-prompts 20
+         --backend sglang-video --dataset vbench --task i2v --num-prompts 20
 
 
+    # Image
+    t2i:
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+         --backend sglang-image --dataset vbench --task t2i --num-prompts 20
+
+    ti2i(edit):
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+         --backend sglang-image --dataset vbench --task ti2i --num-prompts 20
 
 
 """
@@ -55,6 +63,7 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     response_body: Dict[str, Any] = field(default_factory=dict)
+    peak_memory_mb: float = 0.0
 
 
 class BaseDataset(ABC):
@@ -91,7 +100,7 @@ class VBenchDataset(BaseDataset):
         self.items = self._load_data()
 
     def _load_data(self) -> List[Dict[str, Any]]:
-        if self.args.task == "t2v":
+        if self.args.task == "t2v" or self.args.task == "t2i":
             return self._load_t2v_prompts()
         elif self.args.task in ["i2v", "ti2v", "ti2i"]:
             return self._load_i2v_data()
@@ -363,6 +372,8 @@ async def async_request_image_sglang(
                     resp_json = await response.json()
                     output.response_body = resp_json
                     output.success = True
+                    if "peak_memory_mb" in resp_json:
+                        output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
                     output.error = f"HTTP {response.status}: {await response.text()}"
                     output.success = False
@@ -390,6 +401,8 @@ async def async_request_image_sglang(
                     resp_json = await response.json()
                     output.response_body = resp_json
                     output.success = True
+                    if "peak_memory_mb" in resp_json:
+                        output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
                     output.error = f"HTTP {response.status}: {await response.text()}"
                     output.success = False
@@ -398,6 +411,7 @@ async def async_request_image_sglang(
             output.success = False
 
     output.latency = time.perf_counter() - output.start_time
+
     if pbar:
         pbar.update(1)
     return output
@@ -413,7 +427,6 @@ async def async_request_video_sglang(
 
     # 1. Submit Job
     job_id = None
-
     # Check if we need to upload images (Multipart) or just send JSON
     if input.image_paths and len(input.image_paths) > 0:
         # Use multipart/form-data
@@ -529,6 +542,8 @@ async def async_request_video_sglang(
                     if status == "completed":
                         output.success = True
                         output.response_body = status_data
+                        if "peak_memory_mb" in status_data:
+                            output.peak_memory_mb = status_data["peak_memory_mb"]
                         break
                     elif status == "failed":
                         output.success = False
@@ -549,6 +564,7 @@ async def async_request_video_sglang(
             break
 
     output.latency = time.perf_counter() - output.start_time
+
     if pbar:
         pbar.update(1)
     return output
@@ -560,6 +576,7 @@ def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
 
     num_success = len(success_outputs)
     latencies = [o.latency for o in success_outputs]
+    peak_memories = [o.peak_memory_mb for o in success_outputs if o.peak_memory_mb > 0]
 
     metrics = {
         "duration": total_duration,
@@ -570,12 +587,15 @@ def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
         "latency_median": np.median(latencies) if latencies else 0,
         "latency_p99": np.percentile(latencies, 99) if latencies else 0,
         "latency_p50": np.percentile(latencies, 50) if latencies else 0,
+        "peak_memory_mb_max": max(peak_memories) if peak_memories else 0,
+        "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
+        "peak_memory_mb_median": np.median(peak_memories) if peak_memories else 0,
     }
 
     return metrics
 
 
-def wait_for_service(base_url: str, timeout: int = 120) -> None:
+def wait_for_service(base_url: str, timeout: int = 1200) -> None:
     print(f"Waiting for service at {base_url}...")
     start_time = time.time()
     while True:
@@ -604,14 +624,31 @@ async def benchmark(args):
     # Wait for service
     wait_for_service(args.base_url)
 
+    # Fetch model info
+    try:
+        resp = requests.get(f"{args.base_url}/v1/model_info", timeout=5)
+        if resp.status_code == 200:
+            info = resp.json()
+            if "model_path" in info and info["model_path"]:
+                args.model = info["model_path"]
+                print(f"Updated model name from server: {args.model}")
+    except Exception as e:
+        print(f"Failed to fetch model info: {e}. Using default: {args.model}")
+
     # Setup dataset
     if args.backend == "sglang-image":
-        if args.task == "i2v":
+        if args.task not in ["ti2i", "t2i"]:
+            raise Exception("sglang-image backend only support ti2i and t2i tasks.")
+        if args.task == "ti2i":
             api_url = f"{args.base_url}/v1/images/edits"
         else:
             api_url = f"{args.base_url}/v1/images/generations"
         request_func = async_request_image_sglang
     elif args.backend == "sglang-video":
+        if args.task not in ["t2v", "i2v", "ti2v"]:
+            raise Exception(
+                "sglang-video backend only support t2v, i2v and ti2v tasks."
+            )
         api_url = f"{args.base_url}/v1/videos"
         request_func = async_request_video_sglang
     else:
@@ -624,14 +661,21 @@ async def benchmark(args):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
+    print(f"Loading requests...")
     requests_list = dataset.get_requests()
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
 
     # Limit concurrency
-    semaphore = asyncio.Semaphore(args.max_concurrency)
+    if args.max_concurrency is not None:
+        semaphore = asyncio.Semaphore(args.max_concurrency)
+    else:
+        semaphore = None
 
     async def limited_request_func(req, session, pbar):
-        async with semaphore:
+        if semaphore:
+            async with semaphore:
+                return await request_func(req, session, pbar)
+        else:
             return await request_func(req, session, pbar)
 
     # Run benchmark
@@ -642,8 +686,8 @@ async def benchmark(args):
         tasks = []
         for req in requests_list:
             if args.request_rate != float("inf"):
-                # Simple rate limiting
-                interval = 1.0 / args.request_rate
+                # Poisson process: inter-arrival times follow exponential distribution
+                interval = np.random.exponential(1.0 / args.request_rate)
                 await asyncio.sleep(interval)
 
             task = asyncio.create_task(limited_request_func(req, session, pbar))
@@ -657,19 +701,61 @@ async def benchmark(args):
     # Calculate metrics
     metrics = calculate_metrics(outputs, total_duration)
 
-    print("\n" + "=" * 40)
-    print("Benchmark Results")
-    print("=" * 40)
-    print(f"Backend: {args.backend}")
-    print(f"Model: {args.model}")
-    print(f"Dataset: {args.dataset}")
-    print(f"Total Duration: {metrics['duration']:.2f} s")
-    print(f"Throughput: {metrics['throughput_qps']:.2f} req/s")
-    print(f"Success Rate: {metrics['completed_requests']}/{len(requests_list)}")
-    print(f"Latency Mean: {metrics['latency_mean']:.4f} s")
-    print(f"Latency Median: {metrics['latency_median']:.4f} s")
-    print(f"Latency P99: {metrics['latency_p99']:.4f} s")
-    print("=" * 40)
+    print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
+
+    # Section 1: Configuration
+    print("{:<40} {:<15}".format("Backend:", args.backend))
+    print("{:<40} {:<15}".format("Model:", args.model))
+    print("{:<40} {:<15}".format("Dataset:", args.dataset))
+    print("{:<40} {:<15}".format("Task:", args.task))
+
+    # Section 2: Execution & Traffic
+    print(f"{'-' * 50}")
+    print("{:<40} {:<15.2f}".format("Benchmark duration (s):", metrics["duration"]))
+    print("{:<40} {:<15}".format("Request rate:", str(args.request_rate)))
+    print(
+        "{:<40} {:<15}".format(
+            "Max request concurrency:",
+            str(args.max_concurrency) if args.max_concurrency else "not set",
+        )
+    )
+    print(
+        "{:<40} {}/{:<15}".format(
+            "Successful requests:", metrics["completed_requests"], len(requests_list)
+        )
+    )
+
+    # Section 3: Performance Metrics
+    print(f"{'-' * 50}")
+
+    print(
+        "{:<40} {:<15.2f}".format(
+            "Request throughput (req/s):", metrics["throughput_qps"]
+        )
+    )
+    print("{:<40} {:<15.4f}".format("Latency Mean (s):", metrics["latency_mean"]))
+    print("{:<40} {:<15.4f}".format("Latency Median (s):", metrics["latency_median"]))
+    print("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
+
+    if metrics["peak_memory_mb_max"] > 0:
+        print(f"{'-' * 50}")
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Max (MB):", metrics["peak_memory_mb_max"]
+            )
+        )
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]
+            )
+        )
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Median (MB):", metrics["peak_memory_mb_median"]
+            )
+        )
+
+    print("=" * 60)
 
     if args.output_file:
         with open(args.output_file, "w") as f:
@@ -708,8 +794,8 @@ if __name__ == "__main__":
         "--task",
         type=str,
         default="t2v",
-        choices=["t2v", "i2v", "ti2v", "ti2i"],
-        help="Task type.",
+        choices=["t2v", "i2v", "ti2v", "ti2i", "t2i"],
+        help="Task type. t2v, i2v, ti2v are used for video generation. ti2i, t2i are used for image generation. ti2i is image edit task and t2i is image generation task.",
     )
     parser.add_argument(
         "--dataset-path",
@@ -721,10 +807,24 @@ if __name__ == "__main__":
         "--num-prompts", type=int, default=10, help="Number of prompts to benchmark."
     )
     parser.add_argument(
-        "--max-concurrency", type=int, default=10, help="Maximum concurrent requests."
+        "--max-concurrency",
+        type=int,
+        default=1,
+        help="Maximum number of concurrent requests, default to `1`. This can be used "
+        "to help simulate an environment where a higher level component "
+        "is enforcing a maximum number of concurrent requests. While the "
+        "--request-rate argument controls the rate at which requests are "
+        "initiated, this argument will control how many are actually allowed "
+        "to execute at a time. This means that when used in combination, the "
+        "actual request rate may be lower than specified with --request-rate, "
+        "if the server is not processing requests fast enough to keep up.",
     )
     parser.add_argument(
-        "--request-rate", type=float, default=float("inf"), help="Request rate (req/s)."
+        "--request-rate",
+        type=float,
+        default=float("inf"),
+        help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
+        "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
     )
     parser.add_argument("--width", type=int, default=None, help="Image/Video width.")
     parser.add_argument("--height", type=int, default=None, help="Image/Video height.")

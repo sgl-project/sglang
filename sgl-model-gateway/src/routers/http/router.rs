@@ -3,31 +3,28 @@ use std::{sync::Arc, time::Instant};
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
-        HeaderMap, HeaderValue, Method, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use futures_util::StreamExt;
-use memchr::memmem;
 use reqwest::Client;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
 
 use crate::{
+    app_context::AppContext,
     config::types::RetryConfig,
     core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuardV2,
-        WorkerRegistry, WorkerType,
+        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
+        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::PolicyRegistry,
+    policies::{PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -39,14 +36,13 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
-        error,
+        error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils, RouterTrait,
     },
 };
 
 /// Regular router that uses injected load balancing policies
-#[derive(Debug)]
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
@@ -56,9 +52,22 @@ pub struct Router {
     retry_config: RetryConfig,
 }
 
+impl std::fmt::Debug for Router {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Router")
+            .field("worker_registry", &self.worker_registry)
+            .field("policy_registry", &self.policy_registry)
+            .field("client", &self.client)
+            .field("dp_aware", &self.dp_aware)
+            .field("enable_igw", &self.enable_igw)
+            .field("retry_config", &self.retry_config)
+            .finish()
+    }
+}
+
 impl Router {
     /// Create a new router with injected policy and client
-    pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
@@ -79,7 +88,6 @@ impl Router {
         }
     }
 
-    // Helper method to proxy GET requests to the first available worker
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
         let headers = header_utils::copy_request_headers(&req);
 
@@ -87,10 +95,7 @@ impl Router {
             Ok(worker_url) => {
                 let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
                 for (name, value) in headers {
-                    // Use eq_ignore_ascii_case to avoid string allocation
-                    if !name.eq_ignore_ascii_case("content-type")
-                        && !name.eq_ignore_ascii_case("content-length")
-                    {
+                    if header_utils::should_forward_request_header(&name) {
                         request_builder = request_builder.header(name, value);
                     }
                 }
@@ -129,6 +134,7 @@ impl Router {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
+        headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -156,7 +162,20 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let idx = policy.select_worker(&available, text)?;
+        // Get cached hash ring for consistent hashing (O(log n) lookup)
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
+        let idx = policy.select_worker(
+            &available,
+            &SelectWorkerInfo {
+                request_text: text,
+                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                headers,
+                hash_ring,
+            },
+        )?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -196,8 +215,18 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                self.route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
-                    .await
+                let res = self
+                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .await;
+
+                // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                Metrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    res.status().as_u16(),
+                    extract_error_code_from_response(&res),
+                );
+
+                res
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
@@ -247,7 +276,7 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text)) {
+        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
             Some(w) => w,
             None => {
                 return error::service_unavailable(
@@ -265,12 +294,10 @@ impl Router {
         };
 
         let load_guard =
-            (policy.name() == "cache_aware").then(|| WorkerLoadGuardV2::new(worker.clone()));
+            (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
 
-        events::RequestSentEvent {
-            url: worker.url().to_string(),
-        }
-        .emit();
+        // Note: Using borrowed reference avoids heap allocation
+        events::RequestSentEvent { url: worker.url() }.emit();
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
@@ -327,14 +354,10 @@ impl Router {
             return error::service_unavailable("no_workers", "No available workers");
         }
 
-        // Pre-filter headers once before the loop to avoid repeated lowercasing
         let filtered_headers: Vec<_> = headers
             .map(|hdrs| {
                 hdrs.iter()
-                    .filter(|(name, _)| {
-                        !name.as_str().eq_ignore_ascii_case("content-type")
-                            && !name.as_str().eq_ignore_ascii_case("content-length")
-                    })
+                    .filter(|(name, _)| header_utils::should_forward_request_header(name.as_str()))
                     .collect()
             })
             .unwrap_or_default();
@@ -443,7 +466,7 @@ impl Router {
         route: &'static str,
         worker_url: &str,
         is_stream: bool,
-        mut load_guard: Option<WorkerLoadGuardV2>,
+        load_guard: Option<WorkerLoadGuard>,
     ) -> Response {
         // Get the worker once and reuse for API key and load tracking
         let worker = self.worker_registry.get_by_url(worker_url);
@@ -508,11 +531,9 @@ impl Router {
             request_builder = request_builder.header("Authorization", auth_header);
         }
 
-        // Copy all headers from original request if provided
         if let Some(headers) = headers {
             for (name, value) in headers {
-                // Skip Content-Type and Content-Length as .json() sets them
-                if *name != CONTENT_TYPE && *name != CONTENT_LENGTH {
+                if header_utils::should_forward_request_header(name.as_str()) {
                     request_builder = request_builder.header(name, value);
                 }
             }
@@ -550,7 +571,7 @@ impl Router {
                 }
             };
 
-            drop(load_guard);
+            // load_guard dropped here automatically after response body is read
             response
         } else {
             // Preserve headers for streaming response
@@ -561,18 +582,12 @@ impl Router {
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-            // Spawn task to forward stream and detect completion
+            // Spawn task to forward stream
             tokio::spawn(async move {
                 let mut stream = stream;
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            // Check for stream end marker using memmem for efficiency
-                            if load_guard.is_some()
-                                && memmem::find(&bytes, b"data: [DONE]").is_some()
-                            {
-                                load_guard = None;
-                            }
                             if tx.send(Ok(bytes)).is_err() {
                                 break;
                             }
@@ -583,7 +598,6 @@ impl Router {
                         }
                     }
                 }
-                drop(load_guard);
             });
 
             let stream = UnboundedReceiverStream::new(rx);
@@ -592,6 +606,12 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
+
+            // Attach load guard to response body for proper RAII lifecycle
+            // Guard is dropped when response body is consumed or client disconnects
+            if let Some(guard) = load_guard {
+                response = guard.attach_to_response(response);
+            }
             response
         }
     }
@@ -652,7 +672,7 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
             "call_upstream_decode_error",
         )
     } else if e.is_timeout() {
-        (StatusCode::INTERNAL_SERVER_ERROR, "call_upstream_timeout")
+        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
     } else if e.is_connect() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -7,11 +7,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
@@ -342,9 +342,7 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req, pre_len in zip(batch.reqs, batch.prefix_lens):
-            batch.tree_cache.evict_swa(
-                req, pre_len, batch.model_config.attention_chunk_size
-            )
+            batch.tree_cache.evict_swa(req, pre_len)
 
     bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
@@ -437,9 +435,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req in batch.reqs:
-            batch.tree_cache.evict_swa(
-                req, req.seqlen - 1, batch.model_config.attention_chunk_size
-            )
+            batch.tree_cache.evict_swa(req, req.seqlen - 1)
 
     bs = batch.seq_lens.shape[0]
 

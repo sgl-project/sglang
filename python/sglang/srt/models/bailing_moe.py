@@ -19,7 +19,7 @@
 # limitations under the License.
 """SGLang BailingMoE model."""
 import logging
-from typing import Iterable, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -54,7 +54,11 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
+from sglang.srt.layers.moe import (
+    get_deepep_mode,
+    get_moe_a2a_backend,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
@@ -71,6 +75,7 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import (
+    apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
@@ -124,6 +129,7 @@ class BailingMoEMLP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
+        should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if (self.tp_size == 1) and hidden_states.shape[0] == 0:
@@ -132,7 +138,7 @@ class BailingMoEMLP(nn.Module):
         gate_up, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(gate_up)
         hidden_states, _ = self.down_proj(
-            hidden_states, skip_all_reduce=use_reduce_scatter
+            hidden_states, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )
         return hidden_states
 
@@ -301,10 +307,15 @@ class BailingMoESparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
+        should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if not get_moe_a2a_backend().is_deepep():
-            return self.forward_normal(hidden_states, use_reduce_scatter)
+            return self.forward_normal(
+                hidden_states,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+            )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
@@ -344,6 +355,7 @@ class BailingMoESparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
@@ -364,7 +376,12 @@ class BailingMoESparseMoeBlock(nn.Module):
         if self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1 and not use_reduce_scatter:
+        if (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
@@ -491,28 +508,6 @@ class BailingMoEAttention(nn.Module):
 
         self.alt_stream = alt_stream
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # overlap qk norm
-        if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.query_layernorm(q_by_head)
-            with torch.cuda.stream(self.alt_stream):
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.key_layernorm(k_by_head)
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.query_layernorm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
-            k_by_head = self.key_layernorm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
-        return q, k
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -524,7 +519,14 @@ class BailingMoEAttention(nn.Module):
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
-            q, k = self._apply_qk_norm(q, k)
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.query_layernorm,
+                k_norm=self.key_layernorm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
         q, k = self.rotary_emb(
             positions,
             q,
@@ -560,6 +562,7 @@ class BailingMoEBlock(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
+        self.config = config
         hidden_size = config.hidden_size
 
         self.input_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
@@ -625,6 +628,7 @@ class BailingMoEBlock(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
     def _is_layer_sparse(
@@ -640,18 +644,23 @@ class BailingMoEBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
 
-        hidden_states = self.attention(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.attention(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states=hidden_states,
@@ -659,18 +668,27 @@ class BailingMoEBlock(nn.Module):
             forward_batch=forward_batch,
         )
 
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
+        hidden_states = self.mlp(
+            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
+
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
 
         return hidden_states, residual
 
@@ -739,6 +757,7 @@ class BailingMoEModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
@@ -747,6 +766,11 @@ class BailingMoEModel(nn.Module):
                     hidden_states,
                     forward_batch,
                     residual,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states
+                        if getattr(layer, "_is_layer_to_capture", False)
+                        else None
+                    ),
                 )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(

@@ -24,10 +24,28 @@ on:
         required: false
         type: string
         default: ""
+      pr_head_sha:
+        description: "PR head SHA to checkout (for /rerun-stage on fork PRs)"
+        required: false
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests (for releasing or testing purpose)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
-  group: pr-test-amd-${{ github.ref }}
-  cancel-in-progress: true
+  # Include pr_head_sha in group for /rerun-stage dispatches to avoid collisions with main branch runs
+  group: pr-test-amd-${{ inputs.pr_head_sha || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
   call-gate:
@@ -37,19 +55,37 @@ jobs:
     needs: [call-gate]
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.filter.outputs.main_package }}
-      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
-      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen }}
+      main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel || steps.run-mode.outputs.run_all_tests }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          # Run all tests for workflow_call (when ref input is provided)
+          # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+            echo "Run mode: ALL TESTS (run_all_tests=${{ inputs.run_all_tests }})"
+          else
+            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
+          fi
+
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
             main_package:
-              - "python/**"
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/*.toml"
               - "scripts/ci/**"
               - "test/**"
               - ".github/workflows/pr-test-amd.yml"
@@ -59,7 +95,6 @@ jobs:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
               - "python/*.toml"
-              - ".github/workflows/pr-test-amd.yml"
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
@@ -81,6 +116,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -102,6 +139,7 @@ jobs:
           docker exec -w /sglang-checkout/sgl-kernel/tests/speculative ci_sglang python3 -m pytest test_eagle_utils.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_apply_token_bitmask_inplace.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_activation.py
+          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_topk.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_kvcacheio.py
 
   # =============================================== primary ====================================================
@@ -126,6 +164,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -144,6 +184,46 @@ jobs:
         run: |
           docker exec -w /sglang-checkout/test ci_sglang python3 run_suite.py --hw amd --suite stage-a-test-1
 
+  stage-b-test-small-1-gpu-amd:
+    needs: [check-changes, stage-a-test-1-amd]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi325-gpu-1]
+        part: [0, 1, 2, 3]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          docker exec -w /sglang-checkout/test ci_sglang python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 4
+
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
@@ -157,6 +237,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -276,6 +358,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -401,6 +485,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -439,6 +525,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -458,29 +546,29 @@ jobs:
 
   unit-test-backend-8-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
-    # Temporarily disabled - uncomment when ready to re-enable
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-8-gpu-amd') ||
         (
-          false &&
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
     env:
-      RUNNER_LABELS: linux-mi300-gpu-8
+      RUNNER_LABELS: linux-mi325-gpu-8
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi300-gpu-8]
+        runner: [linux-mi325-gpu-8]
         part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -524,6 +612,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -577,6 +667,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -624,6 +716,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -681,6 +775,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -698,13 +794,11 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
           bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
-          bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py
 
   accuracy-test-2-gpu-amd:
     needs: [check-changes, accuracy-test-1-gpu-amd]
     # Temporarily disabled - uncomment when ready to re-enable (tracked here: https://github.com/sgl-project/sglang/issues/13107)
     if: |
-      false &&
       always() &&
       (
         (inputs.target_stage == 'accuracy-test-2-gpu-amd') ||
@@ -722,6 +816,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -737,7 +833,44 @@ jobs:
       - name: Evaluate accuracy (TP=2)
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
+
+  dllm-test-1-gpu-amd:
+    needs: [check-changes, stage-a-test-1-amd]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'dllm-test-1-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi325-gpu-1]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Test DLLM (LLaDA2)
+        timeout-minutes: 30
+        run: |
+          bash scripts/ci/amd_ci_exec.sh python3 dllm/test_llada2_mini_amd.py
 
   pr-test-amd-finish:
     needs:
@@ -750,14 +883,16 @@ jobs:
         multimodal-gen-test-2-gpu-amd,
 
         stage-a-test-1-amd,
+        stage-b-test-small-1-gpu-amd,
         unit-test-backend-1-gpu-amd,
         unit-test-backend-2-gpu-amd,
-        # unit-test-backend-8-gpu-amd,  # Temporarily disabled
+        unit-test-backend-8-gpu-amd,
         performance-test-1-gpu-part-1-amd,
         performance-test-1-gpu-part-2-amd,
         performance-test-2-gpu-amd,
         accuracy-test-1-gpu-amd,
-        # accuracy-test-2-gpu-amd, # Temporarily disabled
+        accuracy-test-2-gpu-amd,
+        dllm-test-1-gpu-amd,
       ]
     if: always()
     runs-on: ubuntu-latest
