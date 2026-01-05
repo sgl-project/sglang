@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 logger = logging.getLogger(__name__)
 
 # Re-export commonly used items from submodules
-from backends import kill_process_tree  # noqa: F401
+from infra import kill_process_tree  # noqa: F401
 from infra.model_specs import (  # noqa: F401; Default model paths
     DEFAULT_EMBEDDING_MODEL_PATH,
     DEFAULT_ENABLE_THINKING_MODEL_PATH,
