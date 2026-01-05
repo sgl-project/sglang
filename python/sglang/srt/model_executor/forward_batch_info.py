@@ -642,14 +642,37 @@ class ForwardBatch:
                 else:
                     layer_ids = [num_layers - 1]
             elif layers_config == "auto":
-                # Automatically select ~4 layers spread across depth
-                # [L/4, L/2, 3L/4, L-1] for semantic manifold coverage
-                layer_ids = [
-                    num_layers // 4,
-                    num_layers // 2,
-                    (3 * num_layers) // 4,
-                    num_layers - 1,
-                ]
+                # Automatically select ~4 layers spread across depth for semantic manifold coverage
+                # For hybrid models (Qwen3-Next, Llama4, etc.), only use full attention layers
+                # since sliding window layers don't provide the same semantic information
+                full_attn_layers = getattr(model_runner.model_config, 'full_attention_layer_ids', None)
+
+                if full_attn_layers and len(full_attn_layers) > 0:
+                    # HYBRID MODEL: Select ~4 layers spread across full attention layers
+                    # This ensures we only capture from semantically meaningful layers
+                    n_full = len(full_attn_layers)
+                    if n_full <= 4:
+                        # Use all full attention layers if <= 4
+                        layer_ids = list(full_attn_layers)
+                    else:
+                        # Select 4 layers spread across the full attention layers
+                        # [0, n/3, 2n/3, n-1] indices into full_attn_layers
+                        indices = [
+                            0,
+                            n_full // 3,
+                            (2 * n_full) // 3,
+                            n_full - 1,
+                        ]
+                        layer_ids = [full_attn_layers[i] for i in sorted(set(indices))]
+                else:
+                    # STANDARD MODEL: Use generic layer selection
+                    # [L/4, L/2, 3L/4, L-1] for semantic manifold coverage
+                    layer_ids = [
+                        num_layers // 4,
+                        num_layers // 2,
+                        (3 * num_layers) // 4,
+                        num_layers - 1,
+                    ]
                 # Remove duplicates and sort
                 layer_ids = sorted(set(layer_ids))
             else:
