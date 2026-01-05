@@ -489,7 +489,7 @@ def main():
         )
 
         # Generate execution report for standalone
-        standalone_filename = standalone_file
+        standalone_filename = standalone_files[standalone_idx]
         write_execution_report(
             suite=args.suite,
             partition_id=args.partition_id,
