@@ -188,7 +188,9 @@ def _selective_scan_update_kernel(
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
         if HAS_INTERMEDIATE_STATE_INDICES:
-            intermediate_state_idx = tl.load(intermediate_state_indices_ptr + pid_b).to(tl.int64)
+            intermediate_state_idx = tl.load(intermediate_state_indices_ptr + pid_b).to(
+                tl.int64
+            )
             cache_idx = intermediate_state_idx
         elif HAS_STATE_BATCH_INDICES:
             cache_idx = state_batch_idx
