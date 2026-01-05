@@ -3,6 +3,10 @@ import os
 import unittest
 
 import torch
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=29, suite="stage-b-test-small-1-gpu")
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM

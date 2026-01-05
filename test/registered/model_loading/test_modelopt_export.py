@@ -6,6 +6,10 @@ and quantization workflow.
 """
 
 import json
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
 import os
 import tempfile
 import unittest
