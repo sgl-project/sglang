@@ -191,10 +191,10 @@ jobs:
 
       - name: Run Python unit tests
         run: |
-          cd sgl-model-gateway
+          cd sgl-model-gateway/bindings/python
           source "$HOME/.cargo/env"
           python3 -m pip install pytest pytest-cov pytest-xdist
-          pytest -q py_test/unit --cov=sglang_router --cov-config=bindings/python/.coveragerc --cov-report=term-missing --cov-fail-under=80
+          pytest -q tests --cov=sglang_router --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
 
       - name: Run Python integration tests
         run: |
