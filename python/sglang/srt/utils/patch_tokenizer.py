@@ -46,7 +46,8 @@ def unpatch_tokenizer(tokenizer):
 
 def _is_kimi_tokenizer(tokenizer):
     name = getattr(tokenizer, "name_or_path", "") or ""
-    return "kimi" in name.lower()
+    class_name = type(tokenizer).__name__
+    return ("kimi" in name.lower()) and (class_name == "TikTokenTokenizer")
 
 
 def _patch_special_tokens_cache(tokenizer):
