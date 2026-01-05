@@ -96,7 +96,8 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
     let mut all_char_counts: Vec<i32> = Vec::with_capacity(texts.len());
 
     for text in texts {
-        let encoding = match tokenizer.encode(text) {
+        // Don't add special tokens for tokenize API (matches Python behavior)
+        let encoding = match tokenizer.encode(text, false) {
             Ok(enc) => enc,
             Err(e) => {
                 error!("Tokenization failed: {}", e);

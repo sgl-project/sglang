@@ -18,7 +18,7 @@ HW_MAPPING = {
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
     HWBackend.CPU: ["default"],
-    HWBackend.AMD: ["stage-a-test-1"],
+    HWBackend.AMD: ["stage-a-test-1", "stage-b-test-small-1-gpu"],
     HWBackend.CUDA: [
         "stage-a-test-1",
         "stage-b-test-small-1-gpu",
@@ -26,6 +26,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-large-2-gpu",
         "stage-c-test-large-4-gpu",
         "stage-b-test-4-gpu-b200",
+        "stage-c-test-large-4-gpu-b200",
     ],
     HWBackend.NPU: [],
 }
