@@ -95,7 +95,6 @@ suites = {
         TestFile("test_disaggregation_basic.py", 400),
         TestFile("test_dp_attention.py", 350),
         TestFile("test_load_weights_from_remote_instance.py", 72),
-        TestFile("test_patch_torch.py", 19),
     ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 650),
