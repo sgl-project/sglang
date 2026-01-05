@@ -48,19 +48,10 @@ class _SpecialTokensCachePatcher:
         tokenizer_cls._original_add_special_tokens = tokenizer_cls.add_special_tokens
         tokenizer_cls._original_add_tokens = tokenizer_cls.add_tokens
 
-        def make_cached_property(cache_attr, original_fn):
-            @property
-            def cached_prop(self):
-                if getattr(self, cache_attr, None) is None:
-                    setattr(self, cache_attr, original_fn(self))
-                return getattr(self, cache_attr)
-
-            return cached_prop
-
-        patched_all_special_tokens = make_cached_property(
+        patched_all_special_tokens = _make_cached_property(
             cls._CACHED_TOKENS_ATTR, tokenizer_cls._original_all_special_tokens
         )
-        patched_all_special_ids = make_cached_property(
+        patched_all_special_ids = _make_cached_property(
             cls._CACHED_IDS_ATTR, tokenizer_cls._original_all_special_ids
         )
 
@@ -114,3 +105,13 @@ class _SpecialTokensCachePatcher:
 
         logger.info(f"Unpatched special tokens cache for {tokenizer_cls.__name__}")
         return tokenizer
+
+
+def _make_cached_property(cache_attr, original_fn):
+    @property
+    def cached_prop(self):
+        if getattr(self, cache_attr, None) is None:
+            setattr(self, cache_attr, original_fn(self))
+        return getattr(self, cache_attr)
+
+    return cached_prop
