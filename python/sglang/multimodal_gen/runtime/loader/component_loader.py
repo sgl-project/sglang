@@ -11,7 +11,7 @@ import traceback
 from abc import ABC
 from collections.abc import Generator, Iterable
 from copy import deepcopy
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 import torch.distributed as dist
@@ -137,7 +137,7 @@ class ComponentLoader(ABC):
         component_model_path: str,
         server_args: ServerArgs,
         module_name: str,
-        transformers_or_diffusers: str,
+        transformers_or_diffusers: Literal["transformers", "diffusers"],
     ) -> tuple[AutoModel, float]:
         """
         Template method that standardizes logging around the core load implementation.
@@ -204,7 +204,7 @@ class ComponentLoader(ABC):
         self,
         component_model_path: str,
         server_args: ServerArgs,
-        transformers_or_diffusers: str,
+        transformers_or_diffusers: Literal["transformers", "diffusers"],
     ) -> AutoModel:
         """
         Load the component using the native library (transformers/diffusers).
@@ -246,7 +246,9 @@ class ComponentLoader(ABC):
 
     @classmethod
     def for_module_type(
-        cls, module_type: str, transformers_or_diffusers: str
+        cls,
+        module_type: str,
+        transformers_or_diffusers: Literal["transformers", "diffusers"],
     ) -> "ComponentLoader":
         """
         Factory method to create a component loader for a specific module type.
@@ -792,7 +794,7 @@ class PipelineComponentLoader:
     def load_module(
         module_name: str,
         component_model_path: str,
-        transformers_or_diffusers: str,
+        transformers_or_diffusers: Literal["transformers", "diffusers"],
         server_args: ServerArgs,
     ):
         """
