@@ -33,13 +33,21 @@ class TestPatchTokenizerEndToEndTest(unittest.TestCase):
             "\n\nMultiple\n\nNewlines\n\n",
             *[f"Text with {tok} inside" for tok in special_tokens],
             " ".join(special_tokens),
-            *[cls._random_text_from_tokens(tokenizer, num_tokens=100) for _ in range(5)],
-            *[cls._random_text_from_tokens(tokenizer, num_tokens=1000) for _ in range(3)],
+            *[
+                cls._random_text_from_tokens(tokenizer, num_tokens=100)
+                for _ in range(5)
+            ],
+            *[
+                cls._random_text_from_tokens(tokenizer, num_tokens=1000)
+                for _ in range(3)
+            ],
         ]
 
     @classmethod
     def _random_text_from_tokens(cls, tokenizer, num_tokens):
-        token_ids = [random.randint(0, tokenizer.vocab_size - 1) for _ in range(num_tokens)]
+        token_ids = [
+            random.randint(0, tokenizer.vocab_size - 1) for _ in range(num_tokens)
+        ]
         return tokenizer.decode(token_ids)
 
     @classmethod
