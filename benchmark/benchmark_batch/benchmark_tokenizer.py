@@ -1,9 +1,12 @@
 import argparse
 import random
+import sys
 import time
 from statistics import mean
 
 from transformers import AutoTokenizer
+
+from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 
 def main():
@@ -19,6 +22,7 @@ def main():
     print("-" * 60)
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+    tokenizer = patch_tokenizer(tokenizer)
     max_batch_size = max(args.batch_sizes)
 
     token_ids = generate_random_token_ids(
