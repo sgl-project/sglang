@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 import torch
 
@@ -23,9 +24,6 @@ class PrefillDelayer:
         self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
 
         assert (
-            server_args.schedule_policy == "fcfs"
-        ), f"To use PrefillDelayer, schedule_policy must be 'fcfs'. '{server_args.schedule_policy}' is not supported."
-        assert (
             server_args.enable_dp_attention
         ), "To use PrefillDelayer, enable_dp_attention must be enabled."
         assert (
@@ -35,21 +33,7 @@ class PrefillDelayer:
             not server_args.disable_overlap_schedule
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
-    def _gather_info(self, local_prefillable: int):
-        local_info = torch.tensor(
-            [local_prefillable],
-            device="cpu",
-            dtype=torch.int64,
-        )
-        torch.distributed.all_gather_into_tensor(
-            self.global_info.flatten(),
-            local_info,
-            group=self.cpu_group,
-        )
-        tp0_info = self.global_info[:, 0, :]
-        return tp0_info
-
-    def should_allow_prefill(self, local_prefillable: int) -> bool:
+    def _negotiate_should_allow_prefill(self, local_prefillable: bool) -> bool:
         tp0_info = self._gather_info(local_prefillable=local_prefillable)
         global_prefillable = tp0_info[:, 0]
         global_exists_not_prefillable = global_prefillable.min().item() == 0
@@ -70,3 +54,42 @@ class PrefillDelayer:
 
         self.curr_delayed_count = 0
         return True
+
+    def _gather_info(self, local_prefillable: bool):
+        local_info = torch.tensor(
+            [int(local_prefillable)],
+            device="cpu",
+            dtype=torch.int64,
+        )
+        torch.distributed.all_gather_into_tensor(
+            self.global_info.flatten(),
+            local_info,
+            group=self.cpu_group,
+        )
+        tp0_info = self.global_info[:, 0, :]
+        return tp0_info
+
+
+class PrefillDelayerSinglePassExecutor:
+    def __init__(self, prefill_delayer: PrefillDelayer):
+        self._prefill_delayer = prefill_delayer
+        self._result: Optional[bool] = None
+
+    @property
+    def _called(self) -> bool:
+        return self._result is not None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self._called:
+            self.negotiate_should_allow_prefill(local_prefillable=False)
+        return False
+
+    def negotiate_should_allow_prefill(self, local_prefillable: bool) -> bool:
+        if not self._called:
+            self._result = self._prefill_delayer._negotiate_should_allow_prefill(
+                local_prefillable=local_prefillable
+            )
+        return self._result

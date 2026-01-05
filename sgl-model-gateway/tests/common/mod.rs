@@ -6,7 +6,11 @@ pub mod mock_openai_server;
 pub mod mock_worker;
 pub mod streaming_helpers;
 pub mod test_app;
+pub mod test_certs;
+pub mod test_config;
+pub mod tls_mock_worker;
 
+// Re-export commonly used test builders
 use std::{
     fs,
     path::PathBuf,
@@ -33,6 +37,8 @@ use smg::{
     tokenizer::registry::TokenizerRegistry,
     tool_parser::ParserFactory as ToolParserFactory,
 };
+#[allow(unused_imports)]
+pub use test_config::{TestRouterConfig, TestWorkerConfig};
 
 /// Test context for directly testing mock workers without full router setup.
 pub struct WorkerTestContext {
