@@ -305,6 +305,9 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
             except Exception as e:
                 logger.warning("Failed to pre-launch PD workers: %s", e)
 
+    # Log final GPU allocation summary
+    logger.info(_model_pool.allocator.summary())
+
     # Register cleanup
     request.addfinalizer(_model_pool.shutdown)
 

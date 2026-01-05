@@ -243,7 +243,6 @@ class ModelPool:
             for model_id, mode in valid_requirements:
                 self._launch_model(model_id, mode, gpu_slot=None)
         else:
-            logger.info(self.allocator.summary())
             # Launch on allocated slots
             for slot in slots:
                 if slot.assigned_model:
@@ -544,8 +543,6 @@ class ModelPool:
             logger.warning(
                 "No GPU slots allocated for PD workers, launching without GPU assignment"
             )
-
-        logger.info(self.allocator.summary())
 
         prefill_instances: list[ModelInstance] = []
         decode_instances: list[ModelInstance] = []
