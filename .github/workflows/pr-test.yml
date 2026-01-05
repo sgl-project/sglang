@@ -210,11 +210,17 @@ jobs:
         env:
           USE_CCACHE: 1
 
+      - name: Verify wheel artifacts
+        run: |
+          ls -alh sgl-kernel/dist
+          ls -alh sgl-kernel/dist/*.whl
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
           path: sgl-kernel/dist/*
+          if-no-files-found: error
 
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
@@ -252,11 +258,17 @@ jobs:
         env:
           USE_CCACHE: 1
 
+      - name: Verify wheel artifacts
+        run: |
+          ls -alh sgl-kernel/dist
+          ls -alh sgl-kernel/dist/*.whl
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}-aarch64
           path: sgl-kernel/dist/*
+          if-no-files-found: error
 
   sgl-kernel-unit-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]

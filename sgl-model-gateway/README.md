@@ -1001,7 +1001,7 @@ cd bindings/python && maturin develop
 
 # Run Python tests
 cd ../..  # Back to sgl-model-gateway root
-pytest py_test/
+pytest e2e_test/
 ```
 For production builds, use `maturin build --release --out dist` from the `bindings/python/` directory to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
 
