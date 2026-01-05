@@ -51,10 +51,10 @@ wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./
 ### Install sgl-kernel-npu
 SGL_KERNEL_NPU_TAG="2025.12.29"
 mkdir sgl-kernel-npu
-(cd sgl-kernel-npu && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_8.3.rc2_910b.zip \
-&& unzip sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_8.3.rc2_910b.zip \
+(cd sgl-kernel-npu && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGL_KERNEL_NPU_TAG}/sgl-kernel-npu_${SGL_KERNEL_NPU_TAG}_8.3.rc2_910b.zip \
+&& unzip sgl-kernel-npu_${SGL_KERNEL_NPU_TAG}_8.3.rc2_910b.zip \
 && ${PIP_INSTALL} output/deep_ep*.whl output/sgl_kernel_npu*.whl \
-&& (cd "$(python3 -m pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so))
+&& (cd "$(python3 -m pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -sf deep_ep/deep_ep_cpp*.so))
 
 
 ### Install CustomOps (TODO: to be removed once merged into sgl-kernel-npu)
