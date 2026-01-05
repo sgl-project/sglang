@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # Path setup for imports
 _ROOT = Path(__file__).resolve().parents[1]  # sgl-model-gateway/
-_E2E_TEST = Path(__file__).resolve().parent   # e2e_test/
+_E2E_TEST = Path(__file__).resolve().parent  # e2e_test/
 _SRC = _ROOT / "bindings" / "python"
 
 # Add e2e_test to path so "from infra import ..." works
