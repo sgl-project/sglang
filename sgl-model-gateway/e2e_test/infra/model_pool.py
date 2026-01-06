@@ -44,6 +44,9 @@ class ModelInstance:
     gpu_slot: GPUSlot | None
     worker_type: WorkerType = WorkerType.REGULAR
     bootstrap_port: int | None = None  # For prefill workers in PD mode
+    scope: str = "session"  # "session" or "class"
+    last_used: float = 0.0  # Timestamp for LRU eviction
+    _healthy: bool = False  # Track if initial health check passed
 
     @property
     def key(self) -> str:
@@ -165,10 +168,14 @@ class ModelPool:
     keeps them running and allows reuse across multiple tests. Routers can then
     be launched cheaply (~1-2s) pointing to these workers.
 
+    Model scopes:
+    - session: Pre-launched at session start, never evicted
+    - class: Launched on-demand, can be evicted when GPUs are needed
+
     Startup behavior:
-    - Workers are launched sequentially (one subprocess.Popen at a time)
-    - But they boot up concurrently (overlapping model loading)
-    - _wait_all_healthy() blocks until all workers respond to health checks
+    - Session-scoped workers are launched at startup
+    - Class-scoped workers are launched on-demand via get()
+    - When GPUs are full, class-scoped workers are evicted (LRU)
 
     Instance keys:
     - Regular workers: "model_id:mode" (e.g., "llama-8b:http")
@@ -176,16 +183,18 @@ class ModelPool:
 
     Limitations:
     - Currently one worker instance per (model_id, mode) combination
-    - @pytest.mark.workers(n) duplicates URLs to router, not distinct workers
+    - @pytest.mark.workers(count=n) duplicates URLs to router, not distinct workers
     - For true multi-worker LB testing, extend to support multiple instances
 
     Usage:
         pool = ModelPool()
         pool.startup(requirements=[("llama-8b", ConnectionMode.HTTP)])
 
+        # Session-scoped (pre-launched)
         instance = pool.get("llama-8b", "http")
-        # instance.base_url -> "http://127.0.0.1:30000"
-        # instance.worker_url -> URL for router to connect to
+
+        # Class-scoped (on-demand)
+        instance = pool.get("qwen-7b", "http", scope="class")
     """
 
     def __init__(self, allocator: GPUAllocator | None = None):
@@ -197,6 +206,22 @@ class ModelPool:
         self.allocator = allocator or GPUAllocator()
         self.instances: dict[str, ModelInstance] = {}  # key = "model_id:mode"
         self._startup_timeout = DEFAULT_STARTUP_TIMEOUT
+        self._class_scoped_models: set[str] = (
+            set()
+        )  # Models that can be launched on-demand
+        self._queued_models: set[str] = (
+            set()
+        )  # Session models that couldn't be pre-launched
+
+    def register_class_scoped_models(self, models: set[str]) -> None:
+        """Register models that may be launched on-demand.
+
+        Args:
+            models: Set of model IDs that are class-scoped.
+        """
+        self._class_scoped_models = models
+        if models:
+            logger.info("Registered class-scoped models: %s", models)
 
     def startup(
         self,
@@ -253,11 +278,15 @@ class ModelPool:
         # Allocate GPU slots
         slots = self.allocator.allocate_slots(allocation_specs)
 
+        # Track which models got slots
+        launched_keys = set()
+
         if not slots:
             logger.warning("No GPU slots allocated, launching without GPU assignment")
             # Fallback: launch without specific GPU assignment
             for model_id, mode in valid_requirements:
                 self._launch_model(model_id, mode, gpu_slot=None)
+                launched_keys.add(f"{model_id}:{mode.value}")
         else:
             # Launch on allocated slots
             for slot in slots:
@@ -266,8 +295,20 @@ class ModelPool:
                     model_id, mode_str = slot.assigned_model.rsplit(":", 1)
                     mode = ConnectionMode(mode_str)
                     self._launch_model(model_id, mode, gpu_slot=slot)
+                    launched_keys.add(slot.assigned_model)
 
-        # Wait for all to be healthy
+        # Track queued models (requested but couldn't be launched due to GPU constraints)
+        all_keys = set(allocation_specs.keys())
+        queued_keys = all_keys - launched_keys
+        if queued_keys:
+            self._queued_models.update(queued_keys)
+            logger.info(
+                "Queued %d models for on-demand launch (GPU constraints): %s",
+                len(queued_keys),
+                queued_keys,
+            )
+
+        # Wait for all launched models to be healthy
         self._wait_all_healthy()
 
     def _launch_model(
@@ -278,6 +319,7 @@ class ModelPool:
         worker_type: WorkerType = WorkerType.REGULAR,
         bootstrap_port: int | None = None,
         ib_device: str | None = None,
+        scope: str = "session",
     ) -> ModelInstance:
         """Launch a model instance.
 
@@ -288,6 +330,7 @@ class ModelPool:
             worker_type: Worker type (REGULAR, PREFILL, or DECODE).
             bootstrap_port: Bootstrap port for prefill workers in PD mode.
             ib_device: InfiniBand device for PD disaggregation.
+            scope: Model scope ("session" or "class").
 
         Returns:
             The launched ModelInstance.
@@ -367,15 +410,26 @@ class ModelPool:
             gpu_slot=gpu_slot,
             worker_type=worker_type,
             bootstrap_port=bootstrap_port,
+            scope=scope,
+            last_used=time.time(),
         )
         self.instances[key] = instance
         return instance
 
     def _wait_all_healthy(self) -> None:
-        """Wait for all model instances to become healthy."""
+        """Wait for all model instances to become healthy.
+
+        Only checks workers that haven't been marked healthy yet,
+        avoiding redundant health checks on already-verified workers.
+        """
         start_time = time.time()
-        pending = set(self.instances.keys())
+        # Only wait for workers that haven't been verified healthy yet
+        pending = {key for key, inst in self.instances.items() if not inst._healthy}
         check_count = 0
+
+        if not pending:
+            logger.info("All workers already healthy, skipping health check")
+            return
 
         logger.info(
             "Waiting for %d workers to become healthy (timeout: %ds)...",
@@ -415,6 +469,7 @@ class ModelPool:
                         instance.base_url,
                         check_count,
                     )
+                    instance._healthy = True
                     pending.discard(key)
 
             if pending:
@@ -454,19 +509,26 @@ class ModelPool:
         model_id: str,
         mode: ConnectionMode | str,
         worker_type: WorkerType | str = WorkerType.REGULAR,
+        scope: str = "session",
     ) -> ModelInstance:
         """Get a model instance by model_id, mode, and worker_type.
+
+        For session-scoped models, raises KeyError if not pre-launched.
+        For class-scoped models, launches on-demand if not running.
 
         Args:
             model_id: The model ID (e.g., "llama-8b")
             mode: The mode (ConnectionMode.HTTP or ConnectionMode.GRPC, or string)
             worker_type: The worker type (REGULAR, PREFILL, DECODE). Defaults to REGULAR.
+            scope: Model scope ("session" or "class"). Class-scoped models are
+                   launched on-demand if not running.
 
         Returns:
             ModelInstance for the requested model/mode/worker_type.
 
         Raises:
-            KeyError: If model/mode/worker_type combination is not running.
+            KeyError: If session-scoped model is not running.
+            RuntimeError: If worker process died or failed health check.
         """
         # Accept both enum and string for convenience
         if isinstance(mode, str):
@@ -479,12 +541,35 @@ class ModelPool:
         else:
             key = f"{model_id}:{mode.value}:{worker_type.value}"
 
+        # Check if instance exists
         if key not in self.instances:
-            raise KeyError(
-                f"{key} not running. Available: {list(self.instances.keys())}"
-            )
+            # Check if this model can be launched on-demand
+            is_class_scoped = scope == "class" or model_id in self._class_scoped_models
+            is_queued = key in self._queued_models
+
+            if is_class_scoped or is_queued:
+                launch_scope = "class" if is_class_scoped else "session"
+                logger.info(
+                    "Launching %s model %s on-demand (queued=%s)",
+                    launch_scope,
+                    key,
+                    is_queued,
+                )
+                self._ensure_gpu_available(model_id)
+                self._launch_model(model_id, mode, scope=launch_scope)
+                self._wait_for_instance(key)
+
+                # Remove from queued if it was there
+                self._queued_models.discard(key)
+            else:
+                raise KeyError(
+                    f"{key} not running. Available: {list(self.instances.keys())}"
+                )
 
         instance = self.instances[key]
+
+        # Update last_used timestamp
+        instance.last_used = time.time()
 
         # Verify worker is still alive and healthy
         if not instance.is_alive():
@@ -498,6 +583,104 @@ class ModelPool:
 
         logger.info("Worker %s passed deep health check", key)
         return instance
+
+    def _ensure_gpu_available(self, model_id: str) -> None:
+        """Ensure GPU is available, evicting models if needed (LRU).
+
+        All models can be evicted when GPU resources are needed.
+        Uses LRU (least recently used) eviction strategy.
+
+        Args:
+            model_id: Model ID that needs GPU resources.
+        """
+        spec = get_model_spec(model_id)
+        required_gpus = spec.get("tp", 1)
+
+        # Check if we have enough free GPUs
+        available = self.allocator.available_gpus()
+        if len(available) >= required_gpus:
+            return  # Enough GPUs available
+
+        # Need to evict models to free up GPUs
+        # Sort by last_used (LRU eviction) - evict least recently used first
+        evictable = [
+            inst
+            for inst in self.instances.values()
+            if inst.worker_type == WorkerType.REGULAR
+        ]
+        evictable.sort(key=lambda x: x.last_used)
+
+        freed_gpus = 0
+        for inst in evictable:
+            if freed_gpus >= required_gpus:
+                break
+
+            logger.info(
+                "Evicting model %s (LRU) to free GPUs for %s", inst.key, model_id
+            )
+            self._evict_instance(inst.key)
+            if inst.gpu_slot:
+                freed_gpus += len(inst.gpu_slot.gpu_ids)
+
+        # Recheck available GPUs
+        available = self.allocator.available_gpus()
+        if len(available) < required_gpus:
+            raise RuntimeError(
+                f"Cannot launch {model_id}: need {required_gpus} GPUs, "
+                f"only {len(available)} available after eviction"
+            )
+
+    def _evict_instance(self, key: str) -> None:
+        """Evict a model instance and free its resources.
+
+        Evicted models are added back to the queue for potential re-launch.
+
+        Args:
+            key: Instance key to evict.
+        """
+        if key not in self.instances:
+            return
+
+        instance = self.instances[key]
+        instance.terminate()
+
+        # Release GPU slot back to allocator
+        if instance.gpu_slot:
+            self.allocator.release_slot(instance.gpu_slot)
+
+        # Add to queued so it can be re-launched on-demand
+        self._queued_models.add(key)
+
+        del self.instances[key]
+        logger.info("Evicted instance %s (added to queue for re-launch)", key)
+
+    def _wait_for_instance(self, key: str, timeout: float | None = None) -> None:
+        """Wait for a specific instance to become healthy.
+
+        Args:
+            key: Instance key to wait for.
+            timeout: Timeout in seconds. Defaults to _startup_timeout.
+        """
+        if timeout is None:
+            timeout = self._startup_timeout
+
+        start_time = time.time()
+        instance = self.instances.get(key)
+        if not instance:
+            raise KeyError(f"Instance {key} not found")
+
+        while (time.time() - start_time) < timeout:
+            if not instance.is_alive():
+                raise RuntimeError(f"Worker {key} died during startup")
+
+            if instance.health_check():
+                logger.info("Instance %s is healthy", key)
+                instance._healthy = True
+                return
+
+            time.sleep(HEALTH_CHECK_INTERVAL)
+
+        raise TimeoutError(f"Instance {key} did not become healthy within {timeout}s")
 
     def get_workers_by_type(
         self, model_id: str, worker_type: WorkerType

@@ -1,4 +1,103 @@
-"""Pytest configuration for E2E tests."""
+"""Pytest configuration for E2E tests.
+
+Markers
+-------
+This module defines several pytest markers for configuring E2E tests:
+
+@pytest.mark.model(name, scope="session")
+    Specify which model to use for the test.
+
+    Args:
+        name: Model ID from MODEL_SPECS (e.g., "llama-8b", "qwen-7b")
+        scope: "session" (default) or "class"
+            - session: Pre-launched at test session start. Stays running.
+            - class: Launched on-demand when test class starts.
+
+    GPU Resource Management:
+        When GPUs are limited (e.g., 4 GPUs, 6 models), the model pool uses
+        LRU (Least Recently Used) eviction:
+        1. Session models are pre-launched until GPUs are full
+        2. Overflow models are queued for on-demand launch
+        3. When a queued model is needed, LRU model is evicted
+        4. Evicted models go back to queue and can be re-launched later
+
+    Examples:
+        @pytest.mark.model("llama-8b")  # session scope, pre-launched
+        @pytest.mark.model("qwen-72b", scope="class")  # on-demand only
+
+@pytest.mark.workers(count=1, prefill=None, decode=None)
+    Configure worker topology for the test.
+
+    Args:
+        count: Number of regular workers (default: 1)
+        prefill: Number of prefill workers for PD disaggregation
+        decode: Number of decode workers for PD disaggregation
+
+    Examples:
+        @pytest.mark.workers(count=3)  # 3 regular workers
+        @pytest.mark.workers(prefill=2, decode=2)  # PD mode
+
+@pytest.mark.gateway(policy="round_robin", timeout=None, extra_args=None)
+    Configure the gateway/router.
+
+    Args:
+        policy: Routing policy ("round_robin", "random", etc.)
+        timeout: Startup timeout in seconds
+        extra_args: Additional CLI arguments for the router
+
+    Examples:
+        @pytest.mark.gateway(policy="random")
+        @pytest.mark.gateway(extra_args=["--cache-routing"])
+
+@pytest.mark.e2e
+    Mark test as an end-to-end test requiring GPU workers.
+
+@pytest.mark.slow
+    Mark test as slow-running.
+
+Fixtures
+--------
+model_pool: Session-scoped fixture managing SGLang worker processes.
+setup_backend: Class-scoped fixture that launches gateway + provides client.
+
+Usage Examples
+--------------
+Basic test with default model:
+
+    @pytest.mark.e2e
+    @pytest.mark.parametrize("setup_backend", ["http"], indirect=True)
+    class TestBasic:
+        def test_chat(self, setup_backend):
+            backend, model, client, gateway = setup_backend
+            response = client.chat.completions.create(...)
+
+Test with specific model and multiple backends:
+
+    @pytest.mark.e2e
+    @pytest.mark.model("qwen-7b")
+    @pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
+    class TestQwen:
+        def test_generate(self, setup_backend):
+            ...
+
+Large model loaded on-demand (class scope):
+
+    @pytest.mark.e2e
+    @pytest.mark.model("llama-70b", scope="class")
+    @pytest.mark.parametrize("setup_backend", ["http"], indirect=True)
+    class TestLargeModel:
+        def test_inference(self, setup_backend):
+            ...
+
+PD disaggregation mode:
+
+    @pytest.mark.e2e
+    @pytest.mark.workers(prefill=1, decode=1)
+    @pytest.mark.parametrize("setup_backend", ["pd"], indirect=True)
+    class TestPD:
+        def test_pd_inference(self, setup_backend):
+            ...
+"""
 
 from __future__ import annotations
 
@@ -96,7 +195,8 @@ from infra import (
 
 # Global storage for scanned requirements
 _scanned_backends: set[str] = set()  # {"grpc", "http", "openai", ...}
-_scanned_models: set[str] = set()  # {"llama-8b", "qwen-7b", ...}
+_session_models: set[str] = set()  # Models to pre-launch at session start
+_class_models: set[str] = set()  # Models to launch on-demand per class
 
 
 def pytest_collection_modifyitems(
@@ -108,8 +208,12 @@ def pytest_collection_modifyitems(
 
     This runs after test collection but before tests execute.
     It extracts backend requirements from @pytest.mark.parametrize markers.
+
+    Models are categorized by scope:
+    - session: Pre-launched at session start (default)
+    - class: Launched on-demand when test class starts
     """
-    global _scanned_backends, _scanned_models
+    global _scanned_backends, _session_models, _class_models
 
     for item in items:
         # Scan parametrize markers for setup_backend
@@ -124,30 +228,45 @@ def pytest_collection_modifyitems(
                         _scanned_backends.update(param_values)
 
                 elif param_name == PARAM_MODEL or PARAM_MODEL in param_name:
-                    # Extract model names
+                    # Extract model names from parametrize - default to session scope
                     if isinstance(param_values, (list, tuple)):
-                        _scanned_models.update(param_values)
+                        _session_models.update(param_values)
 
-        # Also check for @pytest.mark.model("name") markers
+        # Check for @pytest.mark.model("name", scope="...") markers
         model_marker = item.get_closest_marker(PARAM_MODEL)
         if model_marker and model_marker.args:
-            _scanned_models.add(model_marker.args[0])
+            model_name = model_marker.args[0]
+            scope = model_marker.kwargs.get("scope", "session")
+
+            if scope == "class":
+                _class_models.add(model_name)
+            else:
+                _session_models.add(model_name)
+
+    # Remove class models from session models (class scope takes precedence if mixed)
+    # Actually, keep both - a model can be used by both session and class scoped tests
+    # The model_pool will handle this by keeping session models running
 
     logger.info(
-        "Scanned test requirements - backends: %s, models: %s",
+        "Scanned test requirements - backends: %s, session models: %s, class models: %s",
         _scanned_backends or {"(none)"},
-        _scanned_models or {"(none)"},
+        _session_models or {"(none)"},
+        _class_models or {"(none)"},
     )
 
 
 def get_pool_requirements() -> list[tuple[str, ConnectionMode]]:
     """Build pool requirements from scanned test markers.
 
+    Only returns session-scoped models for pre-launching.
+    Class-scoped models are launched on-demand by model_pool.get().
+
     Returns:
-        List of (model_id, ConnectionMode) tuples needed by tests.
+        List of (model_id, ConnectionMode) tuples to pre-launch.
     """
+    # Only pre-launch session-scoped models
     # Default model if none specified
-    models = _scanned_models or {DEFAULT_MODEL}
+    models = _session_models or {DEFAULT_MODEL}
 
     # Convert scanned string backends to ConnectionMode enums
     # Filter to local backends only (grpc, http) - cloud backends don't need workers
@@ -174,6 +293,15 @@ def get_pool_requirements() -> list[tuple[str, ConnectionMode]]:
     return requirements
 
 
+def get_class_scoped_models() -> set[str]:
+    """Get models that are class-scoped (launched on-demand).
+
+    Returns:
+        Set of model IDs that should be launched on-demand.
+    """
+    return _class_models.copy()
+
+
 # ---------------------------------------------------------------------------
 # Custom pytest markers
 # ---------------------------------------------------------------------------
@@ -183,7 +311,8 @@ def pytest_configure(config: pytest.Config) -> None:
     """Register custom markers."""
     config.addinivalue_line(
         "markers",
-        "model(name): mark test to use a specific model from the model pool",
+        "model(name, scope='session'): mark test to use a specific model "
+        "(scope: 'session' for pre-launched, 'class' for on-demand)",
     )
     config.addinivalue_line(
         "markers",
@@ -191,11 +320,14 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     config.addinivalue_line(
         "markers",
-        "workers(n): number of workers to launch behind the router (default: 1)",
+        "workers(count=1, prefill=None, decode=None): "
+        "worker configuration - use count for regular workers, "
+        "or prefill/decode for PD disaggregation mode",
     )
     config.addinivalue_line(
         "markers",
-        "pd(num_prefill=1, num_decode=1): PD disaggregation worker configuration",
+        "gateway(policy='round_robin', timeout=None, extra_args=None): "
+        "gateway/router configuration",
     )
     config.addinivalue_line(
         "markers",
@@ -299,6 +431,11 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
     allocator = GPUAllocator()
     _model_pool = ModelPool(allocator)
 
+    # Register class-scoped models for on-demand launching
+    class_models = get_class_scoped_models()
+    if class_models:
+        _model_pool.register_class_scoped_models(class_models)
+
     startup_timeout = int(os.environ.get(ENV_STARTUP_TIMEOUT, "300"))
     _model_pool.startup(requirements=requirements, startup_timeout=startup_timeout)
 
@@ -306,7 +443,7 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
     if "pd" in _scanned_backends:
         logger.info("PD backend detected, pre-launching PD workers")
         # Use default model for PD workers
-        pd_model = next(iter(_scanned_models), DEFAULT_MODEL)
+        pd_model = next(iter(_session_models), DEFAULT_MODEL)
         if pd_model in MODEL_SPECS:
             try:
                 _model_pool.launch_pd_workers(
@@ -371,173 +508,6 @@ def model_base_url(request: pytest.FixtureRequest, model_pool: "ModelPool") -> s
         return model_pool.get_base_url(model_id)
     except KeyError:
         pytest.skip(f"Model {model_id} not available in model pool")
-
-
-# ---------------------------------------------------------------------------
-# Router launching helpers
-# ---------------------------------------------------------------------------
-
-
-def launch_local_router(
-    worker_urls: list[str],
-    model_path: str,
-    *,
-    policy: str = "round_robin",
-    router_args: list[str] | None = None,
-    timeout: float = DEFAULT_ROUTER_TIMEOUT,
-    show_output: bool | None = None,
-) -> tuple[str, subprocess.Popen]:
-    """Launch a router pointing to pre-started workers.
-
-    Args:
-        worker_urls: List of worker URLs (e.g., ["http://127.0.0.1:30000"])
-        model_path: Model path for the router
-        policy: Routing policy
-        router_args: Additional router arguments
-        timeout: Startup timeout in seconds
-        show_output: Show subprocess output
-
-    Returns:
-        Tuple of (base_url, router_process)
-    """
-    from infra import get_open_port, wait_for_workers_ready
-
-    if show_output is None:
-        show_output = os.environ.get(ENV_SHOW_ROUTER_LOGS, "0") == "1"
-
-    router_port = get_open_port()
-    prometheus_port = get_open_port()
-    base_url = f"http://127.0.0.1:{router_port}"
-
-    cmd = [
-        "python3",
-        "-m",
-        "sglang_router.launch_router",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(router_port),
-        "--prometheus-port",
-        str(prometheus_port),
-        "--policy",
-        policy,
-        "--model-path",
-        model_path,
-        "--log-level",
-        "warn",
-        "--worker-urls",
-        *worker_urls,
-    ]
-
-    if router_args:
-        cmd.extend(router_args)
-
-    logger.info("Starting router on port %d with workers: %s", router_port, worker_urls)
-
-    router_proc = subprocess.Popen(
-        cmd,
-        stdout=None if show_output else subprocess.PIPE,
-        stderr=None if show_output else subprocess.PIPE,
-        start_new_session=True,
-    )
-
-    try:
-        wait_for_workers_ready(base_url, len(worker_urls), timeout=timeout)
-    except TimeoutError:
-        from infra import kill_process_tree
-
-        kill_process_tree(router_proc.pid)
-        raise
-
-    logger.info("Router ready at %s", base_url)
-    return base_url, router_proc
-
-
-def launch_pd_router(
-    prefills: list,
-    decodes: list,
-    *,
-    policy: str = "round_robin",
-    router_args: list[str] | None = None,
-    timeout: float = DEFAULT_ROUTER_TIMEOUT,
-    show_output: bool | None = None,
-) -> tuple[str, subprocess.Popen]:
-    """Launch a PD disaggregation router.
-
-    Args:
-        prefills: List of prefill ModelInstance objects.
-        decodes: List of decode ModelInstance objects.
-        policy: Routing policy.
-        router_args: Additional router arguments.
-        timeout: Startup timeout in seconds.
-        show_output: Show subprocess output.
-
-    Returns:
-        Tuple of (base_url, router_process)
-    """
-    from infra import get_open_port, wait_for_health
-
-    if show_output is None:
-        show_output = os.environ.get(ENV_SHOW_ROUTER_LOGS, "0") == "1"
-
-    router_port = get_open_port()
-    prometheus_port = get_open_port()
-    base_url = f"http://127.0.0.1:{router_port}"
-
-    cmd = [
-        "python3",
-        "-m",
-        "sglang_router.launch_router",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(router_port),
-        "--prometheus-port",
-        str(prometheus_port),
-        "--prometheus-host",
-        "127.0.0.1",
-        "--policy",
-        policy,
-        "--pd-disaggregation",
-        "--log-level",
-        "warn",
-    ]
-
-    # Add prefill workers with bootstrap ports
-    for pf in prefills:
-        cmd += ["--prefill", pf.base_url, str(pf.bootstrap_port)]
-
-    # Add decode workers
-    for dc in decodes:
-        cmd += ["--decode", dc.base_url]
-
-    if router_args:
-        cmd.extend(router_args)
-
-    logger.info(
-        "Starting PD router on port %d with %d prefill, %d decode workers",
-        router_port,
-        len(prefills),
-        len(decodes),
-    )
-
-    router_proc = subprocess.Popen(
-        cmd,
-        stdout=None if show_output else subprocess.PIPE,
-        stderr=None if show_output else subprocess.PIPE,
-        start_new_session=True,
-    )
-
-    try:
-        wait_for_health(base_url, timeout=timeout)
-    except TimeoutError:
-        from infra import kill_process_tree
-
-        kill_process_tree(router_proc.pid)
-        raise
-
-    logger.info("PD Router ready at %s", base_url)
-    return base_url, router_proc
 
 
 # ---------------------------------------------------------------------------
@@ -607,11 +577,12 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
 
     Configuration via markers:
     - @pytest.mark.model("model-id"): Override default model
-    - @pytest.mark.workers(n): Number of workers behind router (default: 1)
-    - @pytest.mark.pd(num_prefill=1, num_decode=1): PD worker configuration
+    - @pytest.mark.workers(count=1): Number of regular workers behind router
+    - @pytest.mark.workers(prefill=1, decode=1): PD worker configuration
+    - @pytest.mark.gateway(policy="round_robin", timeout=60): Gateway configuration
 
     Returns:
-        Tuple of (backend_name, model_path, openai_client)
+        Tuple of (backend_name, model_path, openai_client, gateway)
 
     Usage:
         # Simple - uses defaults
@@ -626,19 +597,21 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
             ...
 
         # Load balancing with multiple workers
-        @pytest.mark.workers(3)
+        @pytest.mark.workers(count=3)
+        @pytest.mark.gateway(policy="round_robin")
         @pytest.mark.parametrize("setup_backend", ["http"], indirect=True)
         class TestLoadBalancing:
             ...
 
         # PD with custom configuration
-        @pytest.mark.pd(num_prefill=2, num_decode=2)
+        @pytest.mark.workers(prefill=2, decode=2)
+        @pytest.mark.gateway(policy="round_robin")
         @pytest.mark.parametrize("setup_backend", ["pd"], indirect=True)
         class TestPDScaling:
             ...
     """
     import openai
-    from infra import kill_process_tree
+    from infra import DEFAULT_ROUTER_TIMEOUT, Gateway, WorkerType
 
     backend_name = request.param
 
@@ -650,6 +623,28 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
     model_id = _get_marker_value(request, "model")
     if model_id is None:
         model_id = os.environ.get(ENV_MODEL, DEFAULT_MODEL)
+
+    # Get model scope from marker (session or class)
+    model_marker = request.node.get_closest_marker("model")
+    model_scope = "session"
+    if model_marker:
+        model_scope = model_marker.kwargs.get("scope", "session")
+
+    # Get worker configuration from marker
+    workers_config = _get_marker_kwargs(
+        request, "workers", defaults={"count": 1, "prefill": None, "decode": None}
+    )
+
+    # Get gateway configuration from marker
+    gateway_config = _get_marker_kwargs(
+        request,
+        "gateway",
+        defaults={
+            "policy": "round_robin",
+            "timeout": DEFAULT_ROUTER_TIMEOUT,
+            "extra_args": None,
+        },
+    )
 
     # PD disaggregation backend
     if backend_name == "pd":
@@ -667,12 +662,9 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
 
-        # Get PD configuration from marker
-        pd_config = _get_marker_kwargs(
-            request, "pd", defaults={"num_prefill": 1, "num_decode": 1}
-        )
-        num_prefill = pd_config["num_prefill"]
-        num_decode = pd_config["num_decode"]
+        # Get PD configuration from workers marker
+        num_prefill = workers_config.get("prefill") or 1
+        num_decode = workers_config.get("decode") or 1
 
         # Check GPU requirements
         required_gpus = num_prefill + num_decode
@@ -684,8 +676,6 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
             )
 
         # Try to use pre-launched PD workers, or launch new ones if needed
-        from infra import WorkerType
-
         existing_prefills = model_pool.get_workers_by_type(model_id, WorkerType.PREFILL)
         existing_decodes = model_pool.get_workers_by_type(model_id, WorkerType.DECODE)
 
@@ -712,27 +702,36 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
 
         model_path = prefills[0].model_path if prefills else None
 
-        # Launch PD router
-        base_url, router_proc = launch_pd_router(prefills, decodes)
+        # Launch PD gateway with configuration
+        gateway = Gateway()
+        gateway.start(
+            prefill_workers=prefills,
+            decode_workers=decodes,
+            policy=gateway_config["policy"],
+            timeout=gateway_config["timeout"],
+            extra_args=gateway_config["extra_args"],
+        )
 
         client = openai.OpenAI(
-            base_url=f"{base_url}/v1",
+            base_url=f"{gateway.base_url}/v1",
             api_key="not-used",
         )
 
         logger.info(
-            "Setup PD backend: model=%s, %d prefill + %d decode workers, router=%s",
+            "Setup PD backend: model=%s, %d prefill + %d decode workers, "
+            "gateway=%s, policy=%s",
             model_id,
             len(prefills),
             len(decodes),
-            base_url,
+            gateway.base_url,
+            gateway_config["policy"],
         )
 
         try:
-            yield backend_name, model_path, client
+            yield backend_name, model_path, client, gateway
         finally:
-            logger.info("Tearing down PD router")
-            kill_process_tree(router_proc.pid)
+            logger.info("Tearing down PD gateway")
+            gateway.shutdown()
         return
 
     # Check if this is a local backend (grpc, http)
@@ -743,15 +742,17 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
         is_local = False
         connection_mode = None
 
-    # Local backends: use worker from pool + launch router
+    # Local backends: use worker from pool + launch gateway
     if is_local:
         # Get number of workers from marker
-        num_workers = _get_marker_value(request, "workers", default=1)
+        num_workers = workers_config.get("count") or 1
 
         try:
-            instance = model_pool.get(model_id, connection_mode)
+            instance = model_pool.get(model_id, connection_mode, scope=model_scope)
         except KeyError:
             pytest.skip(f"Model {model_id}:{backend_name} not available in pool")
+        except RuntimeError as e:
+            pytest.fail(str(e))
 
         # Build worker URLs list
         # For num_workers > 1, we need multiple workers from the pool
@@ -759,30 +760,35 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
         # TODO: Support launching multiple distinct workers for true LB testing
         worker_urls = [instance.worker_url] * num_workers
 
-        # Launch router pointing to the worker(s)
-        base_url, router_proc = launch_local_router(
+        # Launch gateway with configuration
+        gateway = Gateway()
+        gateway.start(
             worker_urls=worker_urls,
             model_path=instance.model_path,
+            policy=gateway_config["policy"],
+            timeout=gateway_config["timeout"],
+            extra_args=gateway_config["extra_args"],
         )
 
         client = openai.OpenAI(
-            base_url=f"{base_url}/v1",
+            base_url=f"{gateway.base_url}/v1",
             api_key="not-used",
         )
 
         logger.info(
-            "Setup %s backend: model=%s, workers=%d, router=%s",
+            "Setup %s backend: model=%s, workers=%d, gateway=%s, policy=%s",
             backend_name,
             model_id,
             num_workers,
-            base_url,
+            gateway.base_url,
+            gateway_config["policy"],
         )
 
         try:
-            yield backend_name, instance.model_path, client
+            yield backend_name, instance.model_path, client, gateway
         finally:
-            logger.info("Tearing down router for %s backend", backend_name)
-            kill_process_tree(router_proc.pid)
+            logger.info("Tearing down gateway for %s backend", backend_name)
+            gateway.shutdown()
         return
 
     # Cloud backends: launch cloud router
@@ -817,16 +823,16 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
 def backend_router(request: pytest.FixtureRequest, model_pool: "ModelPool"):
     """Function-scoped fixture for launching a fresh router per test.
 
-    This launches a new router for each test, pointing to workers from the pool.
+    This launches a new Gateway for each test, pointing to workers from the pool.
     Use for tests that need isolated router state.
 
     Usage:
         @pytest.mark.parametrize("backend_router", ["grpc", "http"], indirect=True)
         def test_router_state(backend_router):
-            base_url, router_proc = backend_router
-            # Test router-specific behavior
+            gateway = backend_router
+            # Test gateway-specific behavior
     """
-    from infra import kill_process_tree
+    from infra import Gateway
 
     backend_name = request.param
     model_id = os.environ.get(ENV_MODEL, DEFAULT_MODEL)
@@ -838,13 +844,16 @@ def backend_router(request: pytest.FixtureRequest, model_pool: "ModelPool"):
         instance = model_pool.get(model_id, connection_mode)
     except KeyError:
         pytest.skip(f"Model {model_id}:{backend_name} not available in pool")
+    except RuntimeError as e:
+        pytest.fail(str(e))
 
-    base_url, router_proc = launch_local_router(
+    gateway = Gateway()
+    gateway.start(
         worker_urls=[instance.worker_url],
         model_path=instance.model_path,
     )
 
     try:
-        yield base_url, router_proc
+        yield gateway
     finally:
-        kill_process_tree(router_proc.pid)
+        gateway.shutdown()
