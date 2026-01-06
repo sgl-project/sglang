@@ -24,6 +24,7 @@ use crate::{
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegistry},
     tool_parser::ParserFactory as ToolParserFactory,
+    utils::http_utils::AttachedBody,
 };
 
 /// Main request processing context
@@ -194,8 +195,7 @@ impl LoadGuards {
             LoadGuards::Single(guard) => vec![guard],
             LoadGuards::Dual { prefill, decode } => vec![prefill, decode],
         };
-
-        attach_guards_to_response(guards, response)
+        AttachedBody::wrap_response(response, guards)
     }
 }
 

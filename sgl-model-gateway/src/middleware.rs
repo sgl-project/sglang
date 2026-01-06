@@ -30,7 +30,7 @@ use crate::{
     },
     routers::error::extract_error_code_from_response,
     server::AppState,
-    utils::AttachedBody,
+    utils::http_utils::AttachedBody,
     wasm::{
         module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
         spec::{

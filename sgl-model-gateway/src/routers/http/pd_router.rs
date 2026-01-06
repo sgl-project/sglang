@@ -835,7 +835,7 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
-        use crate::core::attach_guards_to_response;
+        use crate::utils::http_utils::AttachedBody;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -882,10 +882,8 @@ impl PDRouter {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = headers;
 
-        // Attach load guards to response body for proper RAII lifecycle
-        // Guards are dropped when response body is consumed or client disconnects
         let guards = vec![WorkerLoadGuard::new(prefill), WorkerLoadGuard::new(decode)];
-        attach_guards_to_response(guards, response)
+        AttachedBody::wrap_response(response, guards)
     }
 
     // Helper to process non-streaming decode response with logprob merging
