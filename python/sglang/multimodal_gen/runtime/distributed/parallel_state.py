@@ -406,7 +406,9 @@ def initialize_model_parallel(
 
     try:
         from .yunchang import PROCESS_GROUP as _YC_PROCESS_GROUP
-        from .yunchang import set_seq_parallel_pg_by_sp_groups as _set_seq_parallel_pg_by_sp_groups
+        from .yunchang import (
+            set_seq_parallel_pg_by_sp_groups as _set_seq_parallel_pg_by_sp_groups,
+        )
     except ImportError:
         _set_seq_parallel_pg_by_sp_groups = None
 
