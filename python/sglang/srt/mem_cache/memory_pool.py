@@ -86,9 +86,10 @@ def _set_kv_buffer_impl(
     store_dtype: torch.dtype,
     device_module: Any,
     alt_stream: Optional[torch.cuda.Stream] = None,
+    same_kv_dim: bool = True,
 ) -> None:
     row_bytes = row_dim * store_dtype.itemsize
-    if _is_cuda and can_use_store_cache(row_bytes):
+    if _is_cuda and same_kv_dim and can_use_store_cache(row_bytes):
         return store_cache(
             k.view(-1, row_dim),
             v.view(-1, row_dim),
@@ -688,7 +689,10 @@ class MHATokenToKVPool(KVCache):
             self._kv_copy_config = None
 
         self._finalize_allocation_log(size)
+
+        # for store_cache JIT kernel
         self.row_dim = self.head_num * self.head_dim
+        self.same_kv_dim = self.head_dim == self.v_head_dim
 
     def _init_kv_copy_and_warmup(self):
         # Heuristics for KV copy tiling
@@ -923,6 +927,7 @@ class MHATokenToKVPool(KVCache):
             store_dtype=self.store_dtype,
             device_module=self.device_module,
             alt_stream=self.alt_stream,
+            same_kv_dim=self.same_kv_dim,
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
