@@ -3,7 +3,6 @@ Consolidated HiCache variant tests.
 Tests HiCache with different configurations: standard, MLA, EAGLE, and page size variants.
 """
 
-import time
 import unittest
 from types import SimpleNamespace
 
@@ -40,6 +39,21 @@ class HiCacheEvalMixin:
 
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], self.expected_mmlu_score)
+        print("Flushing device cache...")
+        self.assertTrue(self.flush_cache(), "Cache flush should succeed")
+
+        print("Running second MMLU evaluation using memory cache...")
+        metrics_cached = run_eval(args)
+
+        self.assertGreaterEqual(metrics_cached["score"], self.expected_mmlu_score)
+        # Verify accuracy consistency
+        accuracy_diff = abs(metrics["score"] - metrics_cached["score"])
+        print(f"Accuracy difference after cache flush: {accuracy_diff:.4f}")
+        self.assertLess(
+            accuracy_diff,
+            0.05,
+            "Accuracy should be consistent between cache states",
+        )
 
 
 class HiCacheMGSMEvalMixin:
@@ -182,63 +196,6 @@ class TestHiCachePage(HiCacheBaseServer, HiCacheEvalMixin):
         "write_back",
     ]
     expected_mmlu_score = 0.65
-
-
-class TestHiCacheMemoryAccuracy(HiCacheBaseServer, HiCacheEvalMixin):
-    """Accuracy tests for HiCache"""
-
-    hicache_args = [
-        "--enable-hierarchical-cache",
-        "--tp-size",
-        2,
-        "--hicache-ratio",
-        1.5,
-    ]
-
-    def test_eval_accuracy(self, accuracy_threshold: float = 0.05):
-        """Test eval accuracy with cache persistence across cache flushes"""
-        print("\n=== Testing Eval Accuracy with Cache Persistence ===")
-
-        # First evaluation - populate cache
-        print("Phase 1: Running initial MMLU evaluation to populate cache...")
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-        metrics_initial = run_eval(args)
-
-        # Flush cache to force remote storage access
-        print("Phase 2: Flushing device cache...")
-        self.assertTrue(self.flush_cache(), "Cache flush should succeed")
-        time.sleep(2)
-
-        # Second evaluation - should use remote cache
-        print("Phase 3: Running second MMLU evaluation using memory cache...")
-        metrics_cached = run_eval(args)
-
-        # Verify accuracy consistency
-        accuracy_diff = abs(metrics_initial["score"] - metrics_cached["score"])
-        print(f"Accuracy difference: {accuracy_diff:.4f}")
-
-        # Assertions
-        self.assertGreater(
-            metrics_initial["score"],
-            self.expected_mmlu_score,
-            "Initial accuracy should be reasonable",
-        )
-        self.assertGreater(
-            metrics_cached["score"],
-            self.expected_mmlu_score,
-            "Cached accuracy should be reasonable",
-        )
-        self.assertLess(
-            accuracy_diff,
-            accuracy_threshold,
-            "Accuracy should be consistent between cache states",
-        )
 
 
 if __name__ == "__main__":
