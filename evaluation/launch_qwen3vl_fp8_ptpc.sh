@@ -1,6 +1,6 @@
 model=/models/Qwen3-VL-235B-A22B-Instruct-FP8-dynamic/
 TP=8
-EP=8
+EP=1
 
 # for profiling
 # export SGLANG_TORCH_PROFILER_DIR=./profile_log
@@ -19,9 +19,10 @@ python3 -m sglang.launch_server \
     --ep-size ${EP} \
     --trust-remote-code \
     --chunked-prefill-size 32768 \
-    --mem-fraction-static 0.6 \
+    --mem-fraction-static 0.85 \
     --disable-radix-cache \
     --max-prefill-tokens 32768 \
     --cuda-graph-max-bs 128 \
+    --max-running-requests 128 \
     --mm-attention-backend aiter_attn \
     2>&1 | tee log.server.log &

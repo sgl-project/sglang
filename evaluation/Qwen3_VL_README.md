@@ -162,10 +162,37 @@ Please make sure that the `SGLANG_TORCH_PROFILER_DIR` should be set at both serv
 
 ## Vision Model Evaluation
 
-Vision model is evaluated on MMMU dataset. More information you can find in the [benchmark/mmmu/README.md](../benchmark/mmmu/README.md).
+Vision model is evaluated on MMMU dataset.
 
-1. Start evaluating. Example:
+1. First, install the lmms-eval package:
+    ```bash
+    git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+    cd lmms-eval
+    pip3 install -e .
+    ```
+2. Start evaluating:
+    ```bash
+    export OPENAI_API_KEY=EMPTY
+    export OPENAI_API_BASE=http://localhost:9000/v1
+    export PYTHONPATH=/the/path/to/your/sglang/python
 
+    python3 -m lmms_eval \
+        --model=openai_compatible \
+        --model_args model_version=/mnt/raid0/models/Qwen3-VL-235B-A22B-Instruct-FP8-dynamic/ \
+        --tasks mmmu_val   \
+        --batch_size 16 \
+    ```
+    The result of TP8 on MI308 should be:
+    ```bash
+    openai_compatible (model_version=/mnt/raid0/models/Qwen3-VL-235B-A22B-Instruct-FP8-dynamic/), gen_kwargs: (), limit: None, num_fewshot: None, batch_size: 16
+    | Tasks  |Version|Filter|n-shot| Metric |   |Value |   |Stderr|
+    |--------|------:|------|-----:|--------|---|-----:|---|------|
+    |mmmu_val|      0|none  |     0|mmmu_acc|↑  |0.607 |±  |   N/A|
+    ```
+
+3. Other
+
+    We can also use benchmark to evaluate VLM accuracy.  More information you can find in the [benchmark/mmmu/README.md](../benchmark/mmmu/README.md).
     ```bash
     python benchmark/mmmu/bench_sglang.py --port 9000 --concurrency 16
     ```
