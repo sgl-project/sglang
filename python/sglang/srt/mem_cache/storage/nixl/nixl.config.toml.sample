@@ -1,0 +1,38 @@
+[plugin.posix]
+# 
+# config for posix plugin, AIO > URING > POSIXAIO
+#
+use_uring = "true"
+# use_posix_aio = "true"
+# use_aio = "true"
+
+active = "true"   # needed to enable a specific plugin
+
+[plugin.gds]
+batch_pool_size = "16"
+batch_limit = "128"
+max_request_size = "16777216"  # 16 * 1024 * 1024
+
+[plugin.gds_mt]
+thread_count = "4"
+
+[plugin.3fs]
+mount_point = "/mnt/3fs"
+mem_config = "dram"  # valid values: dram, dram_zc, auto
+iopool_size = "64"  # range [64, 2^20]
+
+[plugin.obj]
+# bucket is mandatory 
+bucket = ""
+# client configurations
+num_threads = "4"
+endpoint_override = ""
+scheme = "http"       # valid values: http, https
+region = ""
+req_checksum = "required" # valid values: required, supported
+ca_bundle = ""
+# credential configurations
+access_key = ""
+secrete_key = ""
+session_token = ""
+use_virtual_addressing = "true"  # valid values: true, False

@@ -33,6 +33,7 @@ The main storage connector that provides:
 ### NixlUtils
 Consolidated utility classes:
 - **NixlBackendSelection** - Handles backend selection and creation
+- **NixlBackendConfig** - Handles backend configuration
 - **NixlRegistration** - Manages memory registration for tensors, files and objects
 - **NixlFileManager** - Handles file system operations and NIXL tuple creation
 
@@ -48,6 +49,19 @@ To customize the base directory for files, you can set the following environment
 ```bash
 export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/path/to/desired/dir
 ```
+
+To use specific configurations for the backend,
+```bash
+python3 -m sglang.launch_server --model-path <model> --host <ip> --port <port> --page-size 64 --enable-hierarchical-cache --hicache-ratio 2 --hicache-size 64 --hicache-write-policy write_through --hicache-storage-backend nixl --hicache-storage-backend-extra-config "@config.nixl.toml"
+```
+where `config.nixl.toml` is a TOML file specifying the configurations for the backend. 
+
+Note: for quick experiments and troubleshooting, `--hicache-storage-backend-extra-config` can also work if provided with a JSON string and combined with `export SGLANG_HICACHE_NIXL_BACKEND_PLUGIN_TYPE=POSIX` (here `POSIX` can be any supported NIXL storage backend) which specify the backend configuration. For instance, the following command 
+```bash
+export SGLANG_HICACHE_NIXL_BACKEND_PLUGIN_TYPE=POSIX
+python3 -m sglang.launch_server --model-path <model> --host <ip> --port <port> --page-size 64 --enable-hierarchical-cache --hicache-ratio 2 --hicache-size 64 --hicache-write-policy write_through --hicache-storage-backend nixl --hicache-storage-backend-extra-config "{'use_uring': 'true'}"
+```
+forces to use URING for POSIX storage backend. In practice, a TOML file is preferred for specifying the configuration for NIXL storage backends.
 
 Selection of any storage backend like 3FS requires availability of that library on the system, and the backend is selected based on the priority mentioned above.
 
