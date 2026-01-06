@@ -33,8 +33,6 @@
 #include "source_location.h"
 #endif
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include <dlpack/dlpack.h>
 
 #include <concepts>
