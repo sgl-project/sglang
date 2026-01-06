@@ -152,7 +152,19 @@ class RMSNorm(CustomOp):
             if residual is not None:
                 x = x + residual
                 residual = x
-            out = flashinfer_rmsnorm(x, self.weight.data, self.variance_epsilon)
+            # FlashInfer only supports 2D/3D input, handle 4D by reshaping
+            orig_shape = x.shape
+            if x.dim() == 4:
+                # [batch, seq, heads, head_dim] -> [batch*seq, heads, head_dim]
+                x = x.reshape(-1, x.shape[2], x.shape[3])
+            # Ensure weight dtype matches input dtype
+            weight = self.weight.data
+            if weight.dtype != x.dtype:
+                weight = weight.to(x.dtype)
+            out = flashinfer_rmsnorm(x, weight, self.variance_epsilon)
+            # Reshape back if needed
+            if len(orig_shape) == 4:
+                out = out.reshape(orig_shape)
             if residual is None:
                 return out
             return out, residual
