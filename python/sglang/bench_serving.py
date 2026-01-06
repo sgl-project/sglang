@@ -2252,7 +2252,6 @@ async def benchmark(
         )
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
-
     if is_multi_turn:
         warmup_outputs = [x for output in warmup_outputs for x in output]
 
@@ -2360,7 +2359,6 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
-
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
