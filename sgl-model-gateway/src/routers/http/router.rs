@@ -40,6 +40,7 @@ use crate::{
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils, RouterTrait,
     },
+    utils::http_utils::AttachedBody,
 };
 
 /// Regular router that uses injected load balancing policies
@@ -629,7 +630,7 @@ impl Router {
             // Attach load guard to response body for proper RAII lifecycle
             // Guard is dropped when response body is consumed or client disconnects
             if let Some(guard) = load_guard {
-                response = guard.attach_to_response(response);
+                response = AttachedBody::wrap_response(response, guard);
             }
             response
         }

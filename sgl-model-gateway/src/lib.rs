@@ -16,6 +16,7 @@ pub mod server;
 pub mod service_discovery;
 pub mod tokenizer;
 pub mod tool_parser;
+pub mod utils;
 pub mod version;
 pub mod wasm;
 pub mod workflow;

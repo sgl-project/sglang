@@ -11,7 +11,10 @@ use axum::{body::Body, response::Response};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
-use smg::core::{attach_guards_to_response, BasicWorkerBuilder, Worker, WorkerLoadGuard};
+use smg::{
+    core::{BasicWorkerBuilder, Worker, WorkerLoadGuard},
+    utils::http_utils::AttachedBody,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -40,7 +43,7 @@ async fn test_guard_dropped_when_response_body_consumed() {
     let guard = WorkerLoadGuard::new(worker.clone());
     assert_eq!(worker.worker_load().value(), 1);
 
-    let guarded_response = guard.attach_to_response(response);
+    let guarded_response = AttachedBody::wrap_response(response, guard);
 
     // Load should still be 1 (guard is in the body)
     assert_eq!(worker.worker_load().value(), 1);
@@ -65,7 +68,7 @@ async fn test_guard_dropped_when_response_dropped_without_consumption() {
         let guard = WorkerLoadGuard::new(worker.clone());
         assert_eq!(worker.worker_load().value(), 1);
 
-        let _guarded_response = guard.attach_to_response(response);
+        let _guarded_response = AttachedBody::wrap_response(response, guard);
 
         // Load is still 1
         assert_eq!(worker.worker_load().value(), 1);
@@ -89,7 +92,7 @@ async fn test_streaming_guard_dropped_when_stream_ends() {
     let guard = WorkerLoadGuard::new(worker.clone());
     assert_eq!(worker.worker_load().value(), 1);
 
-    let guarded_response = guard.attach_to_response(response);
+    let guarded_response = AttachedBody::wrap_response(response, guard);
 
     // Spawn a task to consume the response
     let worker_clone = worker.clone();
@@ -136,7 +139,7 @@ async fn test_streaming_guard_dropped_on_client_disconnect() {
     let guard = WorkerLoadGuard::new(worker.clone());
     assert_eq!(worker.worker_load().value(), 1);
 
-    let guarded_response = guard.attach_to_response(response);
+    let guarded_response = AttachedBody::wrap_response(response, guard);
 
     // Start consuming but drop early (simulate client disconnect)
     {
@@ -176,8 +179,7 @@ async fn test_multiple_guards_all_dropped() {
         assert_eq!(worker1.worker_load().value(), 1);
         assert_eq!(worker2.worker_load().value(), 1);
 
-        // Attach both guards using attach_guards_to_response
-        let _response = attach_guards_to_response(vec![guard1, guard2], response);
+        let _response = AttachedBody::wrap_response(response, vec![guard1, guard2]);
 
         // Both loads are 1
         assert_eq!(worker1.worker_load().value(), 1);
@@ -201,7 +203,7 @@ async fn test_guard_with_empty_body() {
         let guard = WorkerLoadGuard::new(worker.clone());
         assert_eq!(worker.worker_load().value(), 1);
 
-        let guarded_response = guard.attach_to_response(response);
+        let guarded_response = AttachedBody::wrap_response(response, guard);
 
         // Consume empty body
         let body = guarded_response.into_body();
