@@ -1023,6 +1023,11 @@ impl Drop for WorkerLoadGuard {
     }
 }
 
+/// Body wrapper that holds an attached value.
+///
+/// When this body is dropped (stream ends or client disconnects),
+/// the attached value is dropped automatically. This is useful for RAII guards
+/// like WorkerLoadGuard that need to be tied to a response body's lifetime.
 pub struct AttachedBody<T> {
     inner: Body,
     _attached: T,

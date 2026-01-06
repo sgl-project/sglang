@@ -87,6 +87,8 @@ impl http_body::Body for TokenGuardBody {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // SAFETY: We never move the inner body, and Body is Unpin
+        // (it's a type alias for UnsyncBoxBody which is Unpin)
         let this = self.get_mut();
         Pin::new(&mut this.inner).poll_frame(cx)
     }
