@@ -2124,7 +2124,7 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
             prev_messages.append({"role": "user", "content": prompts[round_index]})
 
             inner_input = replace(
-                request_func_input, prompt=copy.deepcopy(prev_messages)
+                copy.deepcopy(request_func_input), prompt=copy.deepcopy(prev_messages)
             )
             output = await request_func(
                 inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
