@@ -1,6 +1,5 @@
 from sglang.test.ci.ci_register import register_amd_ci
 
-# DLLM LLaDA2 tests for AMD (1-GPU)
 register_amd_ci(est_time=520, suite="stage-b-test-small-1-gpu")
 
 """
