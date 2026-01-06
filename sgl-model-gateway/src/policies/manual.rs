@@ -20,8 +20,9 @@ use rand::Rng;
 use tracing::info;
 
 use super::{
-    extract_routing_key, get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy,
-    SelectWorkerInfo,
+    get_healthy_worker_indices,
+    utils::{extract_routing_key, PeriodicTask},
+    LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::{core::Worker, observability::metrics::Metrics};
 

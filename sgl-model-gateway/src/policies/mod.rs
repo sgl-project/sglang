@@ -7,8 +7,6 @@ use std::{fmt::Debug, sync::Arc};
 
 use crate::core::{HashRing, Worker};
 
-pub(crate) use utils::{extract_routing_key, extract_target_worker};
-
 mod bucket;
 mod cache_aware;
 mod consistent_hashing;
