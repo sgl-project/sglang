@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 class SpeculativeAlgorithm(Enum):
     """Enumeration of speculative decoding algorithms."""
 
+    DFLASH = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
@@ -39,6 +40,9 @@ class SpeculativeAlgorithm(Enum):
     def is_eagle3(self) -> bool:
         return self == SpeculativeAlgorithm.EAGLE3
 
+    def is_dflash(self) -> bool:
+        return self == SpeculativeAlgorithm.DFLASH
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -53,6 +57,13 @@ class SpeculativeAlgorithm(Enum):
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
         if self.is_none():
             return None
+
+        if self.is_dflash():
+            if enable_overlap:
+                raise ValueError("DFLASH does not support overlap scheduling (spec v2).")
+            from sglang.srt.speculative.dflash_worker import DFlashWorker
+
+            return DFlashWorker
 
         if self.is_eagle():
             if enable_overlap:
@@ -92,6 +103,8 @@ class SpecInputType(IntEnum):
     # If all algorithms can share the same datastrucutre of draft_input and verify_input, consider simplify it
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
+    DFLASH_DRAFT = auto()
+    DFLASH_VERIFY = auto()
     NGRAM_VERIFY = auto()
 
 
@@ -102,11 +115,12 @@ class SpecInput(ABC):
     def is_draft_input(self) -> bool:
         # FIXME: remove this function which is only used for assertion
         # or use another variable name like `draft_input` to substitute `spec_info`
-        return self.spec_input_type == SpecInputType.EAGLE_DRAFT
+        return self.spec_input_type in {SpecInputType.EAGLE_DRAFT, SpecInputType.DFLASH_DRAFT}
 
     def is_verify_input(self) -> bool:
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,
+            SpecInputType.DFLASH_VERIFY,
             SpecInputType.NGRAM_VERIFY,
         }
 

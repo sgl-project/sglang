@@ -2037,6 +2037,71 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
+        if self.speculative_algorithm == "DFLASH":
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "Currently DFLASH speculative decoding does not support dp attention."
+                )
+
+            if self.tp_size != 1 or self.pp_size != 1:
+                raise ValueError(
+                    "Currently DFLASH speculative decoding only supports tp_size == 1 and pp_size == 1."
+                )
+
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "DFLASH speculative decoding requires setting --speculative-draft-model-path."
+                )
+
+            # Set default spec params expected by generic spec-v1 plumbing.
+            # For DFlash, the natural unit is `block_size` (verify window length).
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = 1
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 1
+            if self.speculative_num_draft_tokens is None:
+                inferred_block_size = None
+                try:
+                    if os.path.isdir(self.speculative_draft_model_path):
+                        draft_config_path = os.path.join(
+                            self.speculative_draft_model_path, "config.json"
+                        )
+                        if os.path.isfile(draft_config_path):
+                            with open(draft_config_path, "r") as f:
+                                draft_config_json = json.load(f)
+                            inferred_block_size = draft_config_json.get("block_size")
+                except Exception as e:
+                    logger.warning(
+                        "Failed to infer DFlash block_size from draft config.json; "
+                        "defaulting speculative_num_draft_tokens to 16. Error: %s",
+                        e,
+                    )
+
+                if inferred_block_size is None:
+                    inferred_block_size = 16
+                    logger.warning(
+                        "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
+                        inferred_block_size,
+                    )
+                self.speculative_num_draft_tokens = int(inferred_block_size)
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled when using DFLASH speculative decoding (spec v2 is not supported yet)."
+            )
+
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+                )
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -3427,7 +3492,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
