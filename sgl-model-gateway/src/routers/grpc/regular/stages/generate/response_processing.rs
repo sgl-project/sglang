@@ -18,7 +18,7 @@ use crate::routers::{
 /// Generate response processing stage
 ///
 /// Extracts generate-specific response processing logic from the old unified ResponseProcessingStage.
-pub struct GenerateResponseProcessingStage {
+pub(crate) struct GenerateResponseProcessingStage {
     processor: processor::ResponseProcessor,
     streaming_processor: Arc<streaming::StreamingProcessor>,
 }
