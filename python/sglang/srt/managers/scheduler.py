@@ -2060,8 +2060,6 @@ class Scheduler(
                 # Without this, the slot remains held by a waiting request, causing
                 # check_memory() to detect a "memory leak" and crash the server.
                 # The next schedule round will re-allocate safely via match_prefix().
-                #
-                # See: https://github.com/sgl-project/sglang/issues/15840
                 if req.mamba_pool_idx is not None:
                     self.req_to_token_pool.mamba_pool.free(
                         req.mamba_pool_idx.unsqueeze(-1)
