@@ -102,6 +102,9 @@ class SWAChunkCache(ChunkCache):
 
         self.sliding_window_size = params.sliding_window_size
         self.attention_chunk_size = params.attention_chunk_size
+        self.window_size = self.sliding_window_size or self.attention_chunk_size
+
+        self.chunked_prefill_size = params.chunked_prefill_size
 
     def evict_swa(
         self,
@@ -119,6 +122,11 @@ class SWAChunkCache(ChunkCache):
                 req.evicted_seqlen_local,
                 prelen // self.attention_chunk_size * self.attention_chunk_size,
             )
+
+        if self.page_size > 1:
+            new_evicted_seqlen_local = (
+                new_evicted_seqlen_local // self.page_size
+            ) * self.page_size
 
         if new_evicted_seqlen_local > req.evicted_seqlen_local:
             free_slots = self.req_to_token_pool.req_to_token[

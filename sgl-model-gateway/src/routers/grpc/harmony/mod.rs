@@ -29,28 +29,22 @@
 //! }
 //! ```
 
-pub mod builder;
-pub mod detector;
-pub mod parser;
-pub mod processor;
-pub mod responses;
-pub mod stages;
-pub mod streaming;
-pub mod types;
+pub(crate) mod builder;
+pub(crate) mod detector;
+pub(crate) mod parser;
+pub(crate) mod processor;
+pub(crate) mod responses;
+pub(crate) mod stages;
+pub(crate) mod streaming;
+pub(crate) mod types;
 
-// Re-export main types for convenience
-pub use builder::HarmonyBuilder;
-pub use detector::HarmonyDetector;
-pub use parser::HarmonyParserAdapter;
-pub use processor::{HarmonyResponseProcessor, ResponsesIterationResult};
-pub use responses::{
+// Re-export types that are accessed via harmony::TypeName
+pub(crate) use builder::HarmonyBuilder;
+pub(crate) use detector::HarmonyDetector;
+pub(crate) use parser::HarmonyParserAdapter;
+pub(crate) use processor::{HarmonyResponseProcessor, ResponsesIterationResult};
+pub(crate) use responses::{
     serve_harmony_responses, serve_harmony_responses_stream, HarmonyResponsesContext,
 };
-pub use stages::{
-    HarmonyPreparationStage, HarmonyRequestBuildingStage, HarmonyResponseProcessingStage,
-};
-pub use streaming::HarmonyStreamingProcessor;
-pub use types::{
-    FunctionDelta, HarmonyBuildOutput, HarmonyChannelDelta, HarmonyChannelOutput, HarmonyMessage,
-    ToolCallDelta,
-};
+pub(crate) use streaming::HarmonyStreamingProcessor;
+pub(crate) use types::HarmonyMessage;
