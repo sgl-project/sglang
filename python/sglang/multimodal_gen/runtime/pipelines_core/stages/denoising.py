@@ -37,9 +37,6 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
-    get_tp_group,
-    get_tp_rank,
-    get_tp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
@@ -71,89 +68,6 @@ from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
 
 logger = init_logger(__name__)
-
-
-def _debug_tensor_stats(name: str, x: torch.Tensor, step: int) -> None:
-    if not isinstance(x, torch.Tensor):
-        return
-    if x.numel() == 0:
-        return
-    try:
-        # Keep logging overhead low.
-        x_detached = x.detach()
-        finite = torch.isfinite(x_detached)
-        finite_ratio = float(finite.float().mean().item())
-        if finite_ratio < 1.0:
-            min_v = float(x_detached[finite].min().item()) if finite.any() else float("nan")
-            max_v = float(x_detached[finite].max().item()) if finite.any() else float("nan")
-        else:
-            min_v = float(x_detached.min().item())
-            max_v = float(x_detached.max().item())
-        mean_v = float(x_detached.float().mean().item())
-        std_v = float(x_detached.float().std().item())
-    except Exception:
-        return
-
-    try:
-        world_rank = get_world_group().rank_in_group
-        world_size = get_world_group().world_size
-        sp_rank = get_sp_parallel_rank()
-        sp_world = get_sp_world_size()
-        tp_rank = get_tp_rank()
-        tp_world = get_tp_world_size()
-    except Exception:
-        world_rank, world_size, sp_rank, sp_world, tp_rank, tp_world = (
-            -1,
-            -1,
-            -1,
-            -1,
-            -1,
-            -1,
-        )
-
-    logger.info(
-        "WAN_DEBUG_TP step=%s name=%s rank=%s/%s tp=%s/%s sp=%s/%s shape=%s dtype=%s finite=%s min=%s max=%s mean=%s std=%s",
-        step,
-        name,
-        world_rank,
-        world_size,
-        tp_rank,
-        tp_world,
-        sp_rank,
-        sp_world,
-        tuple(x.shape),
-        str(x.dtype),
-        finite_ratio,
-        min_v,
-        max_v,
-        mean_v,
-        std_v,
-    )
-
-    if os.environ.get("WAN_DEBUG_TP_CHECK", "0") != "1":
-        return
-    if tp_world <= 1:
-        return
-
-    try:
-        # Check TP-rank consistency on a small scalar summary to keep overhead low.
-        # If TP is correct and deterministic enough, (mean, std) should match across tp ranks.
-        summary = torch.tensor([mean_v, std_v], device=x.device, dtype=torch.float32)
-        gathered = [torch.empty_like(summary) for _ in range(tp_world)]
-        torch.distributed.all_gather(gathered, summary, group=get_tp_group().device_group)
-        stacked = torch.stack(gathered, dim=0)
-        max_abs_diff = float((stacked - stacked[0]).abs().max().item())
-        if tp_rank == 0:
-            logger.info(
-                "WAN_DEBUG_TP_CHECK step=%s name=%s tp_world=%s max_abs_diff=%s summaries=%s",
-                step,
-                name,
-                tp_world,
-                max_abs_diff,
-                stacked.tolist(),
-            )
-    except Exception:
-        return
 
 
 class DenoisingStage(PipelineStage):
@@ -1055,7 +969,6 @@ class DenoisingStage(PipelineStage):
                         timings=batch.timings,
                         perf_dump_path_provided=batch.perf_dump_path is not None,
                     ):
-                        wan_debug_tp = os.environ.get("WAN_DEBUG_TP", "0") == "1"
                         t_int = int(t_host.item())
                         t_device = timesteps[i]
                         current_model, current_guidance_scale = (
@@ -1110,10 +1023,6 @@ class DenoisingStage(PipelineStage):
                             latents=latents,
                         )
 
-                        if wan_debug_tp:
-                            _debug_tensor_stats("latents_pre_step", latents, i)
-                            _debug_tensor_stats("noise_pred", noise_pred, i)
-
                         # Compute the previous noisy sample
                         latents = self.scheduler.step(
                             model_output=noise_pred,
@@ -1122,9 +1031,6 @@ class DenoisingStage(PipelineStage):
                             **extra_step_kwargs,
                             return_dict=False,
                         )[0]
-
-                        if wan_debug_tp:
-                            _debug_tensor_stats("latents_post_step", latents, i)
 
                         latents = self.post_forward_for_ti2v_task(
                             batch, server_args, reserved_frames_mask, latents, z
