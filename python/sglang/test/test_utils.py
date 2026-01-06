@@ -752,6 +752,7 @@ def get_similarities(vec1, vec2):
 
 def get_benchmark_args(
     base_url="",
+    backend="sglang",
     dataset_name="",
     dataset_path="",
     tokenizer="",
@@ -769,9 +770,15 @@ def get_benchmark_args(
     lora_name=None,
     lora_request_distribution="uniform",
     lora_zipf_alpha=1.5,
+    gsp_num_groups=4,
+    gsp_prompts_per_group=4,
+    gsp_system_prompt_len=128,
+    gsp_question_len=32,
+    gsp_output_len=32,
+    gsp_num_turns=1,
 ):
     return SimpleNamespace(
-        backend="sglang",
+        backend=backend,
         base_url=base_url,
         host=None,
         port=None,
@@ -803,6 +810,12 @@ def get_benchmark_args(
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
+        gsp_num_groups=gsp_num_groups,
+        gsp_prompts_per_group=gsp_prompts_per_group,
+        gsp_system_prompt_len=gsp_system_prompt_len,
+        gsp_question_len=gsp_question_len,
+        gsp_output_len=gsp_output_len,
+        gsp_num_turns=gsp_num_turns,
     )
 
 
