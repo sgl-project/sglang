@@ -1705,11 +1705,11 @@ mod tests {
         dp_worker.set_healthy(false);
         assert!(!dp_worker.is_healthy());
 
-        assert_eq!(dp_worker.load(), 0);
-        dp_worker.increment_load();
-        assert_eq!(dp_worker.load(), 1);
-        dp_worker.decrement_load();
-        assert_eq!(dp_worker.load(), 0);
+        assert_eq!(dp_worker.worker_load().value(), 0);
+        dp_worker.worker_load().increment();
+        assert_eq!(dp_worker.worker_load().value(), 1);
+        dp_worker.worker_load().decrement();
+        assert_eq!(dp_worker.worker_load().value(), 0);
 
         assert_eq!(dp_worker.processed_requests(), 0);
         dp_worker.increment_processed();
@@ -1837,7 +1837,7 @@ mod tests {
 
         for worker in &workers {
             assert!(worker.is_healthy());
-            assert_eq!(worker.load(), 0);
+            assert_eq!(worker.worker_load().value(), 0);
             assert_eq!(worker.processed_requests(), 0);
         }
 

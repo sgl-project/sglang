@@ -1463,14 +1463,14 @@ mod tests {
         let _prefill_guard = WorkerLoadGuard::new(prefill_worker.clone());
         let _decode_guard = WorkerLoadGuard::new(decode_worker.clone());
 
-        assert_eq!(prefill_worker.load(), 1);
-        assert_eq!(decode_worker.load(), 1);
+        assert_eq!(prefill_worker.worker_load().value(), 1);
+        assert_eq!(decode_worker.worker_load().value(), 1);
 
         drop(_prefill_guard);
         drop(_decode_guard);
 
-        assert_eq!(prefill_worker.load(), 0);
-        assert_eq!(decode_worker.load(), 0);
+        assert_eq!(prefill_worker.worker_load().value(), 0);
+        assert_eq!(decode_worker.worker_load().value(), 0);
     }
 
     #[tokio::test]
@@ -1499,8 +1499,8 @@ mod tests {
         let prefill_ref = prefill_workers[0].clone();
         let decode_ref = decode_workers[0].clone();
 
-        assert_eq!(prefill_ref.load(), 0);
-        assert_eq!(decode_ref.load(), 0);
+        assert_eq!(prefill_ref.worker_load().value(), 0);
+        assert_eq!(decode_ref.worker_load().value(), 0);
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
@@ -1518,16 +1518,16 @@ mod tests {
             );
 
             // Guards are now attached to response body, so load should be 1
-            assert_eq!(prefill_ref.load(), 1);
-            assert_eq!(decode_ref.load(), 1);
+            assert_eq!(prefill_ref.worker_load().value(), 1);
+            assert_eq!(decode_ref.worker_load().value(), 1);
 
             tx.send(bytes::Bytes::from("test data")).unwrap();
 
             sleep(Duration::from_millis(10)).await;
 
             // Load still 1 while response body exists
-            assert_eq!(prefill_ref.load(), 1);
-            assert_eq!(decode_ref.load(), 1);
+            assert_eq!(prefill_ref.worker_load().value(), 1);
+            assert_eq!(decode_ref.worker_load().value(), 1);
 
             drop(tx);
 
@@ -1536,7 +1536,7 @@ mod tests {
         }
 
         // Guards dropped when response dropped
-        assert_eq!(prefill_ref.load(), 0);
-        assert_eq!(decode_ref.load(), 0);
+        assert_eq!(prefill_ref.worker_load().value(), 0);
+        assert_eq!(decode_ref.worker_load().value(), 0);
     }
 }
