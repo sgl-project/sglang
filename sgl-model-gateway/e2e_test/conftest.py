@@ -197,6 +197,7 @@ from infra import (
 _scanned_backends: set[str] = set()  # {"grpc", "http", "openai", ...}
 _session_models: set[str] = set()  # Models to pre-launch at session start
 _class_models: set[str] = set()  # Models to launch on-demand per class
+_needs_default_model: bool = False  # True if any e2e test lacks explicit model marker
 
 
 def pytest_collection_modifyitems(
@@ -213,9 +214,12 @@ def pytest_collection_modifyitems(
     - session: Pre-launched at session start (default)
     - class: Launched on-demand when test class starts
     """
-    global _scanned_backends, _session_models, _class_models
+    global _scanned_backends, _session_models, _class_models, _needs_default_model
 
     for item in items:
+        # Track if this test has an explicit model marker
+        has_model_marker = False
+
         # Scan parametrize markers for setup_backend
         for marker in item.iter_markers("parametrize"):
             if marker.args and len(marker.args) >= 2:
@@ -231,27 +235,35 @@ def pytest_collection_modifyitems(
                     # Extract model names from parametrize - default to session scope
                     if isinstance(param_values, (list, tuple)):
                         _session_models.update(param_values)
+                        has_model_marker = True
 
         # Check for @pytest.mark.model("name", scope="...") markers
         model_marker = item.get_closest_marker(PARAM_MODEL)
         if model_marker and model_marker.args:
             model_name = model_marker.args[0]
             scope = model_marker.kwargs.get("scope", "session")
+            has_model_marker = True
 
             if scope == "class":
                 _class_models.add(model_name)
             else:
                 _session_models.add(model_name)
 
+        # Check if this is an e2e test without an explicit model marker
+        # Such tests need the DEFAULT_MODEL to be pre-launched
+        if not has_model_marker and item.get_closest_marker("e2e"):
+            _needs_default_model = True
+
     # Remove class models from session models (class scope takes precedence if mixed)
     # Actually, keep both - a model can be used by both session and class scoped tests
     # The model_pool will handle this by keeping session models running
 
     logger.info(
-        "Scanned test requirements - backends: %s, session models: %s, class models: %s",
+        "Scanned test requirements - backends: %s, session models: %s, class models: %s, needs default: %s",
         _scanned_backends or {"(none)"},
         _session_models or {"(none)"},
         _class_models or {"(none)"},
+        _needs_default_model,
     )
 
 
@@ -264,9 +276,13 @@ def get_pool_requirements() -> list[tuple[str, ConnectionMode]]:
     Returns:
         List of (model_id, ConnectionMode) tuples to pre-launch.
     """
-    # Only pre-launch session-scoped models
-    # Default model if none specified
-    models = _session_models or {DEFAULT_MODEL}
+    # Start with session-scoped models from explicit markers
+    models = set(_session_models)
+
+    # Add DEFAULT_MODEL if any e2e test lacks an explicit model marker,
+    # or if no models were specified at all
+    if _needs_default_model or not models:
+        models.add(DEFAULT_MODEL)
 
     # Convert scanned string backends to ConnectionMode enums
     # Filter to local backends only (grpc, http) - cloud backends don't need workers

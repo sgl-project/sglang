@@ -338,6 +338,7 @@ class ModelPool:
         spec = get_model_spec(model_id)
         model_path = spec["model"]
         tp_size = spec.get("tp", 1)
+        features = spec.get("features", [])
 
         # Get port - use slot's port if available, otherwise find open port
         port = gpu_slot.port if gpu_slot else get_open_port()
@@ -366,6 +367,10 @@ class ModelPool:
 
         if mode == ConnectionMode.GRPC:
             cmd.append("--grpc-mode")
+
+        # Embedding model flag
+        if "embedding" in features:
+            cmd.append("--is-embedding")
 
         # PD disaggregation arguments
         if worker_type == WorkerType.PREFILL:

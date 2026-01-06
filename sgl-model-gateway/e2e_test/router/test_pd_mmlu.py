@@ -43,8 +43,11 @@ class TestPDMMLU:
         Runs MMLU with 1 prefill + 1 decode worker and validates
         accuracy meets threshold (>= 0.65).
         """
-        backend, model, client, *_ = setup_backend
-        base_url = str(client.base_url).rstrip("/v1")
+        backend, _model_path, client, *_ = setup_backend
+        base_url = str(client.base_url).removesuffix("/v1")
+
+        # Get the actual registered model name from the gateway
+        model = client.models.list().data[0].id
 
         args = SimpleNamespace(
             base_url=base_url,

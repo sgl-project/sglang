@@ -184,10 +184,8 @@ jobs:
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
           cd sgl-model-gateway/bindings/python
-          python3 -m pip install --upgrade pip maturin
-          pip uninstall -y sglang-router
-          maturin build --profile ci --features vendored-openssl --out dist
-          pip install dist/*.whl
+          pip install maturin
+          maturin develop --profile dev --features vendored-openssl
 
       - name: Run Python unit tests
         run: |
@@ -290,10 +288,8 @@ jobs:
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
           cd sgl-model-gateway/bindings/python
-          python3 -m pip install --upgrade pip maturin
-          pip uninstall -y sglang-router
-          maturin build --profile ci --features vendored-openssl --out dist
-          pip install dist/*.whl
+          pip install maturin
+          maturin develop --profile dev --features vendored-openssl
 
       - name: Run Python E2E response API tests
         run: |
@@ -361,10 +357,8 @@ jobs:
           source "$HOME/.cargo/env"
           export RUSTC_WRAPPER=sccache
           cd sgl-model-gateway/bindings/python
-          python3 -m pip install --upgrade pip maturin
-          pip uninstall -y sglang-router
-          maturin build --profile ci --features vendored-openssl --out dist
-          pip install dist/*.whl
+          pip install maturin
+          maturin develop --profile dev --features vendored-openssl
 
       - name: Install e2e test dependencies
         run: |

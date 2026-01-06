@@ -35,8 +35,13 @@ class TestMMLU:
 
         Note: setup_backend fixture already waits for workers to be ready.
         """
-        backend, model, client, *_ = setup_backend
-        base_url = str(client.base_url).rstrip("/v1")
+        backend, _model_path, client, *_ = setup_backend
+        base_url = str(client.base_url).removesuffix("/v1")
+
+        # Get the actual registered model name from the gateway
+        # This is required for gRPC mode where model name must match exactly
+        model = client.models.list().data[0].id
+        logger.info("Using model: %s (backend: %s)", model, backend)
 
         args = SimpleNamespace(
             base_url=base_url,
@@ -59,8 +64,12 @@ class TestMMLU:
         Runs MMLU with 128 examples for more statistically
         significant results.
         """
-        backend, model, client, *_ = setup_backend
-        base_url = str(client.base_url).rstrip("/v1")
+        backend, _model_path, client, *_ = setup_backend
+        base_url = str(client.base_url).removesuffix("/v1")
+
+        # Get the actual registered model name from the gateway
+        model = client.models.list().data[0].id
+        logger.info("Using model: %s (backend: %s)", model, backend)
 
         args = SimpleNamespace(
             base_url=base_url,
