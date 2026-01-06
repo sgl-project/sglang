@@ -1525,10 +1525,25 @@ def add_prometheus_track_response_middleware(app):
 
     routing_keys_active = Gauge(
         name="sglang:routing_keys_active",
-        documentation="Number of currently active requests per routing key",
-        labelnames=["routing_key"],
+        documentation="Number of unique routing keys with active requests",
         multiprocess_mode="livesum",
     )
+
+    routing_key_refcount: Dict[str, int] = {}
+
+    def routing_key_inc(key: str):
+        if key in routing_key_refcount:
+            routing_key_refcount[key] += 1
+        else:
+            routing_key_refcount[key] = 1
+            routing_keys_active.inc()
+
+    def routing_key_dec(key: str):
+        if key in routing_key_refcount:
+            routing_key_refcount[key] -= 1
+            if routing_key_refcount[key] == 0:
+                del routing_key_refcount[key]
+                routing_keys_active.dec()
 
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
@@ -1541,7 +1556,7 @@ def add_prometheus_track_response_middleware(app):
         http_request_counter.labels(endpoint=path, method=method).inc()
         http_requests_active.labels(endpoint=path, method=method).inc()
         if routing_key:
-            routing_keys_active.labels(routing_key=routing_key).inc()
+            routing_key_inc(routing_key)
 
         try:
             response = await call_next(request)
@@ -1556,7 +1571,7 @@ def add_prometheus_track_response_middleware(app):
         finally:
             http_requests_active.labels(endpoint=path, method=method).dec()
             if routing_key:
-                routing_keys_active.labels(routing_key=routing_key).dec()
+                routing_key_dec(routing_key)
 
 
 # https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
