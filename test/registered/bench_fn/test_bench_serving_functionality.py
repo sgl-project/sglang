@@ -37,6 +37,7 @@ class TestBenchServingFunctionality(CustomTestCase):
                     "--log-requests-format",
                     "json",
                     "--log-requests-target",
+                    "stdout",
                     temp_dir,
                 ],
             )
