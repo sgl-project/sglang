@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { Message, AttentionEntry, Fingerprint, MoERoutingEntry } from '../api/types';
+import { useTraceStore } from './useTraceStore';
 
 interface SessionState {
   messages: Message[];
@@ -8,6 +9,7 @@ interface SessionState {
   currentMoE: MoERoutingEntry[];
   fingerprint: Fingerprint | null;
   inputTokens: string[];
+  isStreaming: boolean;
 
   addMessage: (msg: Message) => void;
   appendToken: (token: string) => void;
@@ -15,61 +17,81 @@ interface SessionState {
   appendMoE: (entry: MoERoutingEntry) => void;
   setFingerprint: (fp: Fingerprint | null) => void;
   setInputTokens: (tokens: string[]) => void;
+  startStreaming: () => void;
+  finishStreaming: () => void;
   clear: () => void;
 }
 
-export const useSessionStore = create<SessionState>((set) => ({
+export const useSessionStore = create<SessionState>((set, get) => ({
   messages: [],
   currentTokens: [],
   currentAttention: new Map(),
   currentMoE: [],
   fingerprint: null,
   inputTokens: [],
+  isStreaming: false,
 
-  addMessage: (msg) =>
+  addMessage: (msg) => {
+    // Sync user messages to TraceStore
+    if (msg.role === 'user') {
+      const traceStore = useTraceStore.getState();
+      if (traceStore.currentTrace) {
+        traceStore.addUserMessage(msg.content);
+      }
+    }
+
     set((state) => ({
       messages: [...state.messages, msg],
       currentTokens: msg.role === 'user' ? [] : state.currentTokens,
       currentAttention: msg.role === 'user' ? new Map() : state.currentAttention,
       currentMoE: msg.role === 'user' ? [] : state.currentMoE,
-    })),
+    }));
+  },
 
-  appendToken: (token) =>
-    set((state) => {
-      const newTokens = [...state.currentTokens, token];
+  appendToken: (token) => {
+    const state = get();
+    const newTokens = [...state.currentTokens, token];
+    const tokenIndex = newTokens.length - 1;
 
-      // Convert map to array for storage in message, matching by token index
-      const attentionArray: AttentionEntry[] = [];
-      for (let i = 0; i < newTokens.length; i++) {
-        const entry = state.currentAttention.get(i);
-        if (entry) {
-          attentionArray[i] = entry;
-        }
+    // Convert map to array for storage in message, matching by token index
+    const attentionArray: AttentionEntry[] = [];
+    for (let i = 0; i < newTokens.length; i++) {
+      const entry = state.currentAttention.get(i);
+      if (entry) {
+        attentionArray[i] = entry;
       }
+    }
 
-      const messages = [...state.messages];
-      const lastMsg = messages[messages.length - 1];
+    const messages = [...state.messages];
+    const lastMsg = messages[messages.length - 1];
 
-      if (lastMsg?.role === 'assistant') {
-        messages[messages.length - 1] = {
-          ...lastMsg,
-          content: lastMsg.content + token,
-          tokens: newTokens,
-          attention: attentionArray,
-        };
-      } else {
-        messages.push({
-          id: `assistant-${Date.now()}`,
-          role: 'assistant',
-          content: token,
-          tokens: [token],
-          attention: attentionArray,
-          timestamp: Date.now(),
-        });
-      }
+    if (lastMsg?.role === 'assistant') {
+      messages[messages.length - 1] = {
+        ...lastMsg,
+        content: lastMsg.content + token,
+        tokens: newTokens,
+        attention: attentionArray,
+      };
+    } else {
+      messages.push({
+        id: `assistant-${Date.now()}`,
+        role: 'assistant',
+        content: token,
+        tokens: [token],
+        attention: attentionArray,
+        timestamp: Date.now(),
+      });
+    }
 
-      return { messages, currentTokens: newTokens };
-    }),
+    // Sync to TraceStore
+    const traceStore = useTraceStore.getState();
+    if (traceStore.currentTrace) {
+      const attention = state.currentAttention.get(tokenIndex);
+      traceStore.appendToken(token, attention);
+    }
+
+    set({ messages, currentTokens: newTokens });
+  },
 
   appendAttention: (entry) =>
     set((state) => {
@@ -110,7 +132,29 @@ export const useSessionStore = create<SessionState>((set) => ({
 
   setInputTokens: (tokens) => set({ inputTokens: tokens }),
 
-  clear: () =>
+  startStreaming: () => {
+    // Start assistant message in TraceStore
+    const traceStore = useTraceStore.getState();
+    if (traceStore.currentTrace) {
+      traceStore.startAssistantMessage();
+    }
+    set({ isStreaming: true });
+  },
+
+  finishStreaming: () => {
+    // Finish assistant message in TraceStore
+    const traceStore = useTraceStore.getState();
+    if (traceStore.currentTrace) {
+      traceStore.finishAssistantMessage();
+    }
+    set({ isStreaming: false });
+  },
+
+  clear: () => {
+    // Also clear TraceStore
+    const traceStore = useTraceStore.getState();
+    traceStore.clearTrace();
+
     set({
       messages: [],
       currentTokens: [],
@@ -118,5 +162,7 @@ export const useSessionStore = create<SessionState>((set) => ({
       currentMoE: [],
       fingerprint: null,
       inputTokens: [],
-    }),
+      isStreaming: false,
+    });
+  },
 }));
