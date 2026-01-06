@@ -29,10 +29,8 @@ def prepare_request(
     sampling_params: SamplingParams,
 ) -> Req:
     """
-    Create a Req object with sampling_params as a member.
-
+    Create a Req object with sampling_params as a parameter.
     """
-    # Create Req with sampling_params as a member
     req = Req(sampling_params=sampling_params, VSA_sparsity=server_args.VSA_sparsity)
     diffusers_kwargs = getattr(sampling_params, "diffusers_kwargs", None)
     if diffusers_kwargs:
