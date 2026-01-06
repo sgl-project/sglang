@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use common::mock_mcp_server::MockMCPServer;
 use serde_json::json;
-use smg::mcp::{McpConfig, McpError, McpManager, McpServerConfig, McpTransport};
+use smg::mcp::{error::McpError, McpConfig, McpManager, McpServerConfig, McpTransport};
 
 /// Create a new mock server for testing (each test gets its own)
 async fn create_mock_server() -> MockMCPServer {
