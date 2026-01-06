@@ -421,6 +421,7 @@ impl Router {
                 PolicyType::Manual => ConfigPolicyConfig::Manual {
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_idle_secs: self.max_idle_secs,
+                    assignment_mode: Default::default(),
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {

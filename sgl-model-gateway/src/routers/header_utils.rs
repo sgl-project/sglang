@@ -199,6 +199,17 @@ pub fn should_forward_request_header(name: &str) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
 }
 
+static HEADER_ROUTING_KEY: http::header::HeaderName =
+    http::header::HeaderName::from_static("x-smg-routing-key");
+
+#[inline]
+pub fn extract_routing_key(headers: Option<&HeaderMap>) -> Option<&str> {
+    headers
+        .and_then(|h| h.get(&HEADER_ROUTING_KEY))
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

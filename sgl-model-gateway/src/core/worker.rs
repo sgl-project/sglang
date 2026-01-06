@@ -97,7 +97,7 @@ impl fmt::Debug for WorkerLoad {
 
 pub struct WorkerRoutingKeyLoad {
     url: String,
-    active_routing_keys: dashmap::DashMap<String, AtomicUsize>,
+    active_routing_keys: dashmap::DashMap<String, usize>,
 }
 
 impl WorkerRoutingKeyLoad {
@@ -109,34 +109,37 @@ impl WorkerRoutingKeyLoad {
     }
 
     pub fn value(&self) -> usize {
-        self.active_routing_keys
-            .iter()
-            .filter(|entry| entry.value().load(Ordering::Relaxed) > 0)
-            .count()
+        self.active_routing_keys.len()
     }
 
     pub fn increment(&self, routing_key: &str) {
-        self.active_routing_keys
+        *self
+            .active_routing_keys
             .entry(routing_key.to_string())
-            .or_insert_with(|| AtomicUsize::new(0))
-            .fetch_add(1, Ordering::Relaxed);
+            .or_insert(0) += 1;
         self.update_metrics();
     }
 
     pub fn decrement(&self, routing_key: &str) {
-        if let Some(counter) = self.active_routing_keys.get(routing_key) {
-            if counter
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    current.checked_sub(1)
-                })
-                .is_err()
-            {
-                tracing::warn!(
-                    worker_url = %self.url,
-                    routing_key = %routing_key,
-                    "Attempted to decrement routing key counter that is already at 0"
-                );
-            }
+        let should_remove = self
+            .active_routing_keys
+            .get_mut(routing_key)
+            .map(|mut counter| {
+                if *counter > 0 {
+                    *counter -= 1;
+                } else {
+                    tracing::warn!(
+                        worker_url = %self.url,
+                        routing_key = %routing_key,
+                        "Attempted to decrement routing key counter that is already at 0"
+                    );
+                }
+                *counter == 0
+            })
+            .unwrap_or(false);
+
+        if should_remove {
+            self.active_routing_keys.remove(routing_key);
         }
         self.update_metrics();
     }
@@ -1083,9 +1086,6 @@ impl Worker for DPAwareWorker {
 /// an axum Response to tie the guard's lifetime to the response body,
 /// which is essential for streaming responses where the function returns
 /// immediately but the stream continues in the background.
-static HEADER_ROUTING_KEY: http::header::HeaderName =
-    http::header::HeaderName::from_static("x-smg-routing-key");
-
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
@@ -1093,13 +1093,11 @@ pub struct WorkerLoadGuard {
 
 impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
+        use crate::routers::header_utils::extract_routing_key;
+
         worker.worker_load().increment();
 
-        let routing_key = headers
-            .and_then(|h| h.get(&HEADER_ROUTING_KEY))
-            .and_then(|v| v.to_str().ok())
-            .filter(|s| !s.is_empty())
-            .map(String::from);
+        let routing_key = extract_routing_key(headers).map(String::from);
 
         if let Some(ref key) = routing_key {
             worker.worker_routing_key_load().increment(key);
