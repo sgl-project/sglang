@@ -32,7 +32,7 @@ from datetime import datetime
 from functools import lru_cache
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -86,10 +86,11 @@ class RequestFuncInput:
     output_len: int
     model: str
     lora_name: str
-    image_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
+    image_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -100,15 +101,19 @@ class RequestFuncOutput:
     ttft: float = 0.0  # Time to first token
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
     text_chunks: List[str] = field(default_factory=list)
+    prompt: str = ""
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
+        output.prompt = request_func_input.prompt
+        output.metadata = {**(request_func_input.metadata or {})}
         return output
 
 
@@ -2092,6 +2097,80 @@ def calculate_metrics(
     return metrics, output_lens
 
 
+def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable:
+    print("Enable multi-round request function")
+
+    def compute_inner_input_prompt(
+        history_user_texts: List[str],
+        history_assistant_texts: List[str],
+        gen_prompt: str,
+    ):
+        assert len(history_user_texts) == len(history_assistant_texts)
+        history_conversations = []
+        for i in range(len(history_assistant_texts)):
+            history_conversations += [
+                {"role": "user", "content": history_user_texts[i]},
+                {"role": "assistant", "content": history_assistant_texts[i]},
+            ]
+
+        full_conversations = [
+            *history_conversations,
+            {"role": "user", "content": gen_prompt},
+        ]
+
+        history_text = (
+            tokenizer.apply_chat_template(
+                history_conversations,
+                add_generation_prompt=False,
+                tokenize=False,
+            ).replace(tokenizer.bos_token, "")
+            if len(history_conversations) > 0
+            else ""
+        )
+        full_text = tokenizer.apply_chat_template(
+            full_conversations,
+            add_generation_prompt=True,
+            tokenize=False,
+        ).replace(tokenizer.bos_token, "")
+        return history_text, full_text
+
+    async def f(
+        request_func_input: RequestFuncInput,
+        pbar: Optional[tqdm] = None,
+    ) -> List[RequestFuncOutput]:
+        prompts: List[str] = request_func_input.prompt
+        outputs = []
+        for round_index in range(len(prompts)):
+            history_text, full_prompt = compute_inner_input_prompt(
+                history_user_texts=prompts[:round_index],
+                history_assistant_texts=[o.generated_text for o in outputs],
+                gen_prompt=prompts[round_index],
+            )
+            inner_input = RequestFuncInput(
+                prompt=full_prompt,
+                model=request_func_input.model,
+                api_url=request_func_input.api_url,
+                prompt_len=request_func_input.prompt_len,
+                output_len=request_func_input.output_len,
+                lora_name=request_func_input.lora_name,
+                extra_request_body=request_func_input.extra_request_body,
+                metadata={**(request_func_input.metadata or {})},
+            )
+            print(
+                f"[{datetime.now().isoformat()}] hi wrap_multi_round_request_func call request start dataset_index={request_func_input.metadata.get('dataset_index')} {round_index=}"
+            )
+            output = await request_func(
+                inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
+            )
+            output.metadata["multi_round_index"] = round_index
+            output.metadata["multi_round_len"] = len(prompts)
+            output.metadata["history_text"] = history_text
+            outputs.append(output)
+        return outputs
+
+    return f
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -2120,6 +2199,11 @@ async def benchmark(
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
+
+    is_multi_round = isinstance(input_requests[0].prompt, list)
+    if is_multi_round:
+        assert args.disable_ignore_eos, "multi-round requires disable-ignore-eos"
+        request_func = wrap_multi_round_request_func(request_func, tokenizer=tokenizer)
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
