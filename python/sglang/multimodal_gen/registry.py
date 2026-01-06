@@ -361,7 +361,7 @@ def _register_configs():
         ],
     )
     register_configs(
-        sampling_param_cls=WanI2V_14B_720P_SamplingParam,
+        sampling_param_cls=Wan2_2_I2V_A14B_SamplingParam,
         pipeline_config_cls=TurboWanI2V720Config,
         hf_model_paths=[
             "IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",

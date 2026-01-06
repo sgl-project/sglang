@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Sequence
 
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.test.test_utils import is_in_amd_ci
 
 
 @dataclass
@@ -413,18 +414,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             prompt=T2V_PROMPT,
         ),
     ),
-    DiffusionTestCase(
-        "turbo_wan2_1_t2v_1.3b",
-        DiffusionServerArgs(
-            model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
-            modality="video",
-            warmup=0,
-            custom_validator="video",
-        ),
-        DiffusionSamplingParams(
-            prompt=T2V_PROMPT,
-        ),
-    ),
     # LoRA test case for single transformer + merge/unmerge API test
     DiffusionTestCase(
         "wan2_1_t2v_1_3b_lora_1gpu",
@@ -495,6 +484,23 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     ),
 ]
 
+# Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
+if not is_in_amd_ci():
+    ONE_GPU_CASES_B.append(
+        DiffusionTestCase(
+            "turbo_wan2_1_t2v_1.3b",
+            DiffusionServerArgs(
+                model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+                modality="video",
+                warmup=0,
+                custom_validator="video",
+            ),
+            DiffusionSamplingParams(
+                prompt=T2V_PROMPT,
+            ),
+        )
+    )
+
 TWO_GPU_CASES_A = [
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
@@ -505,17 +511,6 @@ TWO_GPU_CASES_A = [
             custom_validator="video",
         ),
         TI2V_sampling_params,
-    ),
-    DiffusionTestCase(
-        "turbo_wan2_2_i2v_a14b_2gpu",
-        DiffusionServerArgs(
-            model_path="IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
-            modality="video",
-            warmup=0,
-            custom_validator="video",
-            num_gpus=2,
-        ),
-        TURBOWAN_I2V_sampling_params,
     ),
     DiffusionTestCase(
         "wan2_2_t2v_a14b_2gpu",
@@ -560,6 +555,23 @@ TWO_GPU_CASES_A = [
         ),
     ),
 ]
+
+# Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
+if not is_in_amd_ci():
+    TWO_GPU_CASES_A.append(
+        DiffusionTestCase(
+            "turbo_wan2_2_i2v_a14b_2gpu",
+            DiffusionServerArgs(
+                model_path="IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
+                modality="video",
+                warmup=0,
+                custom_validator="video",
+                num_gpus=2,
+                tp_size=2,
+            ),
+            TURBOWAN_I2V_sampling_params,
+        )
+    )
 
 TWO_GPU_CASES_B = [
     DiffusionTestCase(
