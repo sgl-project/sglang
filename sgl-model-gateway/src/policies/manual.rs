@@ -23,7 +23,7 @@ use tracing::info;
 use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::{core::Worker, observability::metrics::Metrics};
+use crate::{config::ManualAssignmentMode, core::Worker, observability::metrics::Metrics};
 
 /// Header for routing key based sticky sessions
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
@@ -64,6 +64,7 @@ const MAX_CANDIDATE_WORKERS: usize = 2;
 pub struct ManualConfig {
     pub eviction_interval_secs: u64,
     pub max_idle_secs: u64,
+    pub assignment_mode: ManualAssignmentMode,
 }
 
 impl Default for ManualConfig {
@@ -71,6 +72,7 @@ impl Default for ManualConfig {
         Self {
             eviction_interval_secs: 60,
             max_idle_secs: 4 * 3600,
+            assignment_mode: ManualAssignmentMode::Random,
         }
     }
 }
@@ -90,10 +92,10 @@ impl Node {
     }
 }
 
-// TODO may optimize performance
 #[derive(Debug)]
 pub struct ManualPolicy {
     routing_map: Arc<DashMap<RoutingId, Node>>,
+    assignment_mode: ManualAssignmentMode,
     _eviction_task: Option<PeriodicTask>,
 }
 
@@ -144,7 +146,20 @@ impl ManualPolicy {
 
         Self {
             routing_map,
+            assignment_mode: config.assignment_mode,
             _eviction_task: eviction_task,
+        }
+    }
+
+    fn select_new_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+    ) -> usize {
+        match self.assignment_mode {
+            ManualAssignmentMode::Random => random_select(healthy_indices),
+            ManualAssignmentMode::MinLoad => min_load_select(workers, healthy_indices),
+            ManualAssignmentMode::MinGroup => min_group_select(workers, healthy_indices),
         }
     }
 
@@ -165,13 +180,13 @@ impl ManualPolicy {
                 {
                     (idx, ExecutionBranch::OccupiedHit)
                 } else {
-                    let selected_idx = random_select(healthy_indices);
+                    let selected_idx = self.select_new_worker(workers, healthy_indices);
                     node.push_bounded(workers[selected_idx].url().to_string());
                     (selected_idx, ExecutionBranch::OccupiedMiss)
                 }
             }
             Entry::Vacant(entry) => {
-                let selected_idx = random_select(healthy_indices);
+                let selected_idx = self.select_new_worker(workers, healthy_indices);
                 entry.insert(Node {
                     candi_worker_urls: vec![workers[selected_idx].url().to_string()],
                     last_access: Instant::now(),
@@ -204,7 +219,7 @@ impl ManualPolicy {
         }
 
         (
-            Some(random_select(&healthy_indices)),
+            Some(self.select_new_worker(workers, &healthy_indices)),
             ExecutionBranch::NoRoutingId,
         )
     }
@@ -246,11 +261,52 @@ fn find_worker_index_by_url(workers: &[Arc<dyn Worker>], url: &str) -> Option<us
     workers.iter().position(|w| w.url() == url)
 }
 
-// TODO: use load-aware selection later
 fn random_select(healthy_indices: &[usize]) -> usize {
     let mut rng = rand::rng();
     let random_idx = rng.random_range(0..healthy_indices.len());
     healthy_indices[random_idx]
+}
+
+fn min_load_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
+    let min_load = healthy_indices
+        .iter()
+        .map(|&idx| workers[idx].worker_load().value())
+        .min()
+        .unwrap_or(0);
+
+    let candidates: Vec<usize> = healthy_indices
+        .iter()
+        .filter(|&&idx| workers[idx].worker_load().value() == min_load)
+        .copied()
+        .collect();
+
+    if candidates.len() == 1 {
+        candidates[0]
+    } else {
+        let mut rng = rand::rng();
+        candidates[rng.random_range(0..candidates.len())]
+    }
+}
+
+fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
+    let min_count = healthy_indices
+        .iter()
+        .map(|&idx| workers[idx].worker_routing_key_load().value())
+        .min()
+        .unwrap_or(0);
+
+    let candidates: Vec<usize> = healthy_indices
+        .iter()
+        .filter(|&&idx| workers[idx].worker_routing_key_load().value() == min_count)
+        .copied()
+        .collect();
+
+    if candidates.len() == 1 {
+        candidates[0]
+    } else {
+        let mut rng = rand::rng();
+        candidates[rng.random_range(0..candidates.len())]
+    }
 }
 
 #[cfg(test)]

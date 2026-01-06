@@ -95,6 +95,66 @@ impl fmt::Debug for WorkerLoad {
     }
 }
 
+pub struct WorkerRoutingKeyLoad {
+    url: String,
+    active_routing_keys: dashmap::DashMap<String, AtomicUsize>,
+}
+
+impl WorkerRoutingKeyLoad {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            active_routing_keys: dashmap::DashMap::new(),
+        }
+    }
+
+    pub fn value(&self) -> usize {
+        self.active_routing_keys
+            .iter()
+            .filter(|entry| entry.value().load(Ordering::Relaxed) > 0)
+            .count()
+    }
+
+    pub fn increment(&self, routing_key: &str) {
+        self.active_routing_keys
+            .entry(routing_key.to_string())
+            .or_insert_with(|| AtomicUsize::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+        self.update_metrics();
+    }
+
+    pub fn decrement(&self, routing_key: &str) {
+        if let Some(counter) = self.active_routing_keys.get(routing_key) {
+            if counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_sub(1)
+                })
+                .is_err()
+            {
+                tracing::warn!(
+                    worker_url = %self.url,
+                    routing_key = %routing_key,
+                    "Attempted to decrement routing key counter that is already at 0"
+                );
+            }
+        }
+        self.update_metrics();
+    }
+
+    fn update_metrics(&self) {
+        Metrics::set_worker_routing_keys_active(&self.url, self.value());
+    }
+}
+
+impl fmt::Debug for WorkerRoutingKeyLoad {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkerRoutingKeyLoad")
+            .field("url", &self.url)
+            .field("active_routing_keys", &self.value())
+            .finish()
+    }
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
@@ -157,6 +217,9 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Get the worker load tracker
     fn worker_load(&self) -> &WorkerLoad;
+
+    /// Get the worker routing key load tracker
+    fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
 
     /// Get the number of processed requests
     fn processed_requests(&self) -> usize;
@@ -592,6 +655,7 @@ impl WorkerMetadata {
 pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub worker_load: Arc<WorkerLoad>,
+    pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
     pub consecutive_failures: Arc<AtomicUsize>,
@@ -713,6 +777,10 @@ impl Worker for BasicWorker {
 
     fn worker_load(&self) -> &WorkerLoad {
         &self.worker_load
+    }
+
+    fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
+        &self.worker_routing_key_load
     }
 
     fn processed_requests(&self) -> usize {
@@ -938,6 +1006,10 @@ impl Worker for DPAwareWorker {
         self.base_worker.worker_load()
     }
 
+    fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
+        self.base_worker.worker_routing_key_load()
+    }
+
     fn processed_requests(&self) -> usize {
         self.base_worker.processed_requests()
     }
@@ -1011,20 +1083,38 @@ impl Worker for DPAwareWorker {
 /// an axum Response to tie the guard's lifetime to the response body,
 /// which is essential for streaming responses where the function returns
 /// immediately but the stream continues in the background.
+static HEADER_ROUTING_KEY: http::header::HeaderName =
+    http::header::HeaderName::from_static("x-smg-routing-key");
+
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
+    routing_key: Option<String>,
 }
 
 impl WorkerLoadGuard {
-    pub fn new(worker: Arc<dyn Worker>) -> Self {
+    pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
         worker.worker_load().increment();
-        Self { worker }
+
+        let routing_key = headers
+            .and_then(|h| h.get(&HEADER_ROUTING_KEY))
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+
+        if let Some(ref key) = routing_key {
+            worker.worker_routing_key_load().increment(key);
+        }
+
+        Self { worker, routing_key }
     }
 }
 
 impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
         self.worker.worker_load().decrement();
+        if let Some(ref key) = self.routing_key {
+            self.worker.worker_routing_key_load().decrement(key);
+        }
     }
 }
 
