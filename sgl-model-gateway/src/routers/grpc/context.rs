@@ -13,7 +13,7 @@ use super::{
     proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
 };
 use crate::{
-    core::{attach_guards_to_response, Worker, WorkerLoadGuard},
+    core::{Worker, WorkerLoadGuard},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         classify::{ClassifyRequest, ClassifyResponse},

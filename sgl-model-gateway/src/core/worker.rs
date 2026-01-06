@@ -20,7 +20,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerInfo,
     routers::grpc::client::GrpcClient,
-    utils::AttachedBody,
+    utils::http_utils::AttachedBody,
 };
 
 /// Default worker priority (mid-range on 0-100 scale)
@@ -1030,12 +1030,6 @@ impl Drop for WorkerLoadGuard {
     }
 }
 
-pub fn attach_guards_to_response(
-    guards: Vec<WorkerLoadGuard>,
-    response: axum::response::Response,
-) -> axum::response::Response {
-    AttachedBody::wrap_response(response, guards)
-}
 
 /// Health checker handle with graceful shutdown
 pub(crate) struct HealthChecker {
