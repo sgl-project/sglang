@@ -88,7 +88,7 @@ pub async fn ensure_request_mcp_client(
     let mut server_keys = Vec::new();
     let mut has_mcp_tools = false;
 
-    // Process ALL MCP tools, not just the first one
+    // Process all MCP tools
     for tool in tools {
         if matches!(tool.r#type, ResponseToolType::Mcp) && tool.server_url.is_some() {
             has_mcp_tools = true;
