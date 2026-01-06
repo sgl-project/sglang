@@ -5,7 +5,6 @@
 pub mod errors;
 pub mod factory;
 pub mod partial_json;
-pub mod state;
 pub mod traits;
 pub mod types;
 
@@ -15,13 +14,11 @@ pub mod parsers;
 #[cfg(test)]
 mod tests;
 
-// Re-export commonly used types
-pub use errors::{ParserError, ParserResult};
-pub use factory::{ParserFactory, ParserRegistry, PooledParser};
-// Re-export parsers for convenience
+// Re-export types used outside this module
+pub use factory::{ParserFactory, PooledParser};
 pub use parsers::{
     DeepSeekParser, Glm4MoeParser, JsonParser, KimiK2Parser, LlamaParser, MinimaxM2Parser,
     MistralParser, PythonicParser, QwenParser, Step3Parser,
 };
-pub use traits::{PartialJsonParser, ToolParser};
+pub use traits::ToolParser;
 pub use types::{FunctionCall, PartialToolCall, StreamingParseResult, ToolCall};

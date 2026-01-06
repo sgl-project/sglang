@@ -23,7 +23,7 @@ use super::{
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    core::{is_retryable_status, RetryExecutor, WorkerRegistry},
+    core::{is_retryable_status, RetryExecutor, WorkerRegistry, UNKNOWN_MODEL_ID},
     observability::metrics::{metrics_labels, Metrics},
     protocols::{
         chat::ChatCompletionRequest,
@@ -37,7 +37,6 @@ use crate::{
 
 /// gRPC router implementation for SGLang
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
     pipeline: RequestPipeline,
@@ -117,7 +116,6 @@ impl GrpcRouter {
             responses::ResponsesContext::new(
                 Arc::new(pipeline.clone()),
                 shared_components.clone(),
-                worker_registry.clone(),
                 ctx.response_storage.clone(),
                 ctx.conversation_storage.clone(),
                 ctx.conversation_item_storage.clone(),
@@ -154,8 +152,9 @@ impl GrpcRouter {
             HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &body.model);
 
         debug!(
-            "Processing chat completion request for model: {:?}, using_harmony={}",
-            model_id, is_harmony
+            "Processing chat completion request for model: {}, using_harmony={}",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID),
+            is_harmony
         );
 
         let pipeline = if is_harmony {
@@ -212,7 +211,10 @@ impl GrpcRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        debug!("Processing generate request for model: {:?}", model_id);
+        debug!(
+            "Processing generate request for model: {}",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID)
+        );
 
         // Clone values needed for retry closure
         let request = Arc::new(body.clone());
@@ -280,8 +282,9 @@ impl GrpcRouter {
 
         if is_harmony {
             debug!(
-                "Processing Harmony responses request for model: {:?}, streaming: {:?}",
-                model_id, body.stream
+                "Processing Harmony responses request for model: {}, streaming: {}",
+                model_id.unwrap_or(UNKNOWN_MODEL_ID),
+                body.stream.unwrap_or(false)
             );
             let harmony_ctx = HarmonyResponsesContext::new(
                 Arc::new(self.harmony_pipeline.clone()),
@@ -320,7 +323,10 @@ impl GrpcRouter {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        debug!("Processing embedding request for model: {:?}", model_id);
+        debug!(
+            "Processing embedding request for model: {}",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID)
+        );
 
         self.embedding_pipeline
             .execute_embeddings(
@@ -339,7 +345,10 @@ impl GrpcRouter {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        debug!("Processing classify request for model: {:?}", model_id);
+        debug!(
+            "Processing classify request for model: {}",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID)
+        );
 
         self.classify_pipeline
             .execute_classify(
