@@ -864,9 +864,9 @@ class ServerArgs:
             has_sp = self.sp_degree > 1
             has_tp = self.tp_size > 1
             if has_sp and has_tp:
-                raise ValueError(
-                    "cache-dit does not support hybrid parallelism (SP + TP). "
-                    "Please use either sequence parallelism or tensor parallelism, not both."
+                logger.warning(
+                    "cache-dit is enabled with hybrid parallelism (SP + TP). "
+                    "Proceeding anyway (SGLang integration may support this mode)."
                 )
 
     def _set_default_attention_backend(self) -> None:
