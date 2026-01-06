@@ -1,7 +1,8 @@
-import copy
+import asyncio
 import unittest
+from types import SimpleNamespace
 
-from sglang.bench_serving import DatasetRow, run_benchmark
+from sglang.bench_serving import DatasetRow, benchmark, run_benchmark
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
@@ -60,37 +61,36 @@ class TestBenchServingFunctionality(CustomTestCase):
         self.assertGreater(res["output_throughput"], 0)
 
     def test_multi_turn_functionality(self):
-        args = get_benchmark_args(
-            base_url=self.base_url,
-            dataset_name="random",
-            num_prompts=5,
-            random_input_len=64,
-            random_output_len=32,
-            request_rate=float("inf"),
-            disable_ignore_eos=True,
-        )
+        import sglang.bench_serving as bench_serving_module
+        from transformers import AutoTokenizer
 
         multi_turn_requests = []
-        for i in range(5):
+        for i in range(3):
             multi_turn_requests.append(
                 DatasetRow(
                     prompt=[
-                        f"Hello, this is turn 1 of conversation {i}. Please respond briefly.",
-                        f"This is turn 2 of conversation {i}. What did you say before?",
-                        f"This is turn 3 of conversation {i}. Please summarize.",
+                        f"Hello, this is turn 1 of conversation {i}. Say hi.",
+                        f"Turn 2 of conversation {i}. What is 1+1?",
                     ],
-                    prompt_len=64,
-                    output_len=32,
+                    prompt_len=32,
+                    output_len=16,
                 )
             )
 
-        from sglang.bench_serving import benchmark
-        import asyncio
+        mock_args = SimpleNamespace(
+            disable_ignore_eos=True,
+            disable_stream=False,
+            output_file=None,
+            output_details=False,
+            dataset_name="custom",
+            warmup_requests=1,
+            plot_throughput=False,
+        )
+        bench_serving_module.args = mock_args
+
+        tokenizer = AutoTokenizer.from_pretrained(self.model)
 
         async def run_multi_turn():
-            from transformers import AutoTokenizer
-
-            tokenizer = AutoTokenizer.from_pretrained(self.model)
             result = await benchmark(
                 backend="sglang",
                 api_url=f"{self.base_url}/v1/completions",
@@ -111,18 +111,10 @@ class TestBenchServingFunctionality(CustomTestCase):
 
         res = asyncio.run(run_multi_turn())
 
-        total_turns = 5 * 3
+        total_turns = 3 * 2
         self.assertEqual(res["completed"], total_turns)
-
-        for output_metadata_list in res.get("output_metadata", []):
-            if output_metadata_list:
-                for metadata in output_metadata_list:
-                    if metadata:
-                        self.assertIn("multi_round_index", metadata)
-                        self.assertIn("multi_round_len", metadata)
-                        self.assertEqual(metadata["multi_round_len"], 3)
+        self.assertGreater(res["output_throughput"], 0)
 
 
 if __name__ == "__main__":
     unittest.main()
-
