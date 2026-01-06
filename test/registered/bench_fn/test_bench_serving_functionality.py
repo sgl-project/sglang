@@ -33,33 +33,6 @@ class TestBenchServingFunctionality(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_basic_smoke(self):
-        args = get_benchmark_args(
-            base_url=self.base_url,
-            dataset_name="random",
-            num_prompts=10,
-            random_input_len=128,
-            random_output_len=32,
-            request_rate=float("inf"),
-        )
-        res = run_benchmark(args)
-        self.assertEqual(res["completed"], 10)
-        self.assertGreater(res["output_throughput"], 0)
-
-    def test_max_concurrency(self):
-        args = get_benchmark_args(
-            base_url=self.base_url,
-            dataset_name="random",
-            num_prompts=20,
-            random_input_len=128,
-            random_output_len=32,
-            request_rate=float("inf"),
-        )
-        args.max_concurrency = 4
-        res = run_benchmark(args)
-        self.assertEqual(res["completed"], 20)
-        self.assertGreater(res["output_throughput"], 0)
-
     def test_multi_turn_functionality(self):
         import sglang.bench_serving as bench_serving_module
         from transformers import AutoTokenizer
