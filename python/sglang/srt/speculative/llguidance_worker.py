@@ -98,22 +98,26 @@ class LlguidanceWorker:
             #         device=self.device,
             #     )
 
-            batch.prepare_for_decode()
+            # batch.prepare_for_decode()
 
         model_worker_batch = batch.get_model_worker_batch()
         num_accepted_tokens = 0
         accept_lens = None        
 
-        kwargs = {"pp_proxy_tensors": None}
         batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, **kwargs
+            model_worker_batch
         )        
 
-        # logits_output, next_token_ids, can_run_cuda_graph = (
-        #     batch_result.logits_output,
-        #     batch_result.next_token_ids,
-        #     batch_result.can_run_cuda_graph,
-        # )
+        logits_output, next_token_ids, can_run_cuda_graph = (
+            batch_result.logits_output,
+            batch_result.next_token_ids,
+            batch_result.can_run_cuda_graph,
+        )
+
+        next_token_ids_cpu = next_token_ids.cpu()
+        for i, req in enumerate(batch.reqs):
+            req.output_ids.append(next_token_ids_cpu[i].item())
+
         # # batch.forward_mode = ForwardMode.DECODE
 
         # return GenerationBatchResult(
