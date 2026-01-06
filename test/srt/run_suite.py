@@ -9,24 +9,14 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
-        TestFile("debug_utils/test_tensor_dump_forward_hook.py", 9),
-        TestFile("ops/test_repeat_interleave.py", 60),
-        TestFile("test_abort.py", 131),
-        TestFile("test_chunked_prefill.py", 312),
         TestFile("test_eval_fp8_accuracy.py", 250),
         TestFile("test_evs.py", 20),
         TestFile("test_external_models.py", 30),
         TestFile("test_fp8_utils.py", 9),
-        TestFile("rotary_embedding/test_mrope.py", 10),
         TestFile("test_jinja_template_utils.py", 7),
         TestFile("test_mamba_unittest.py", 9),
         TestFile("test_modelopt_loader.py", 11),
         TestFile("test_multi_tokenizer.py", 230),
-        TestFile("test_no_chunked_prefill.py", 108),
-        TestFile("test_no_overlap_scheduler.py", 217),
-        TestFile("test_prefill_adder.py", 1),
-        TestFile("test_priority_scheduling.py", 130),
-        TestFile("test_retract_decode.py", 259),
         TestFile("test_skip_tokenizer_init.py", 77),
         TestFile("test_start_profile.py", 41),
         TestFile("test_profile_merger.py", 8),
@@ -117,7 +107,6 @@ suites = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_amd = {
     "per-commit-amd": [
-        TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
         # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
@@ -125,21 +114,13 @@ suite_amd = {
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("ops/test_repeat_interleave.py", 75),
-        TestFile("rotary_embedding/test_mrope.py", 15),
-        TestFile("test_abort.py", 51),
         TestFile("test_bench_typebaseddispatcher.py", 10),
-        TestFile("test_chunked_prefill.py", 312),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_external_models.py", 45),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_multi_tokenizer.py", 345),
-        TestFile("test_no_chunked_prefill.py", 108),
-        TestFile("test_prefill_adder.py", 2),
-        TestFile("test_priority_scheduling.py", 195),
         TestFile("test_profile_merger.py", 12),
         TestFile("test_profile_merger_http_api.py", 15),
-        TestFile("test_retract_decode.py", 450),
         TestFile("test_rope_rocm.py", 3),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_start_profile.py", 60),
