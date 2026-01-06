@@ -47,7 +47,6 @@ CP_ROUND_ROBIN_ARGS = [
 ]
 
 
-@unittest.skip("Temporarily disabled for Kimi K2 testing")
 class TestDeepseekV32CPSingleNode(unittest.TestCase):
     """Test class for DeepSeek V3.2 with NSA context parallelism.
 

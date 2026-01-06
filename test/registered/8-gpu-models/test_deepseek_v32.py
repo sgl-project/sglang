@@ -27,7 +27,6 @@ GSM8K_BASELINE = 0.935
 GPQA_BASELINE = 0.835
 
 
-@unittest.skip("Temporarily disabled for Kimi K2 testing")
 class TestDeepseekV32Unified(unittest.TestCase):
     """Unified test class for DeepSeek V3.2 performance and accuracy.
 
