@@ -46,23 +46,37 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
     return summary
 
 
-# Model path can be overridden via environment variable
-# Default path for MI35x DeepSeek-R1-MXFP4 quantized model
-DEEPSEEK_R1_MXFP4_MODEL_PATH = os.environ.get(
-    "DEEPSEEK_R1_MXFP4_MODEL_PATH", "/data2/models/amd-DeepSeek-R1-MXFP4-Preview"
-)
+# Model path configuration for MI35x DeepSeek-R1-MXFP4
+# Priority: 1) env var, 2) local path, 3) HuggingFace model ID
+DEEPSEEK_R1_MXFP4_LOCAL_PATH = "/data2/models/amd-DeepSeek-R1-MXFP4-Preview"
+DEEPSEEK_R1_MXFP4_HF_MODEL_ID = "amd/DeepSeek-R1-MXFP4-Preview"
 PROFILE_DIR = "performance_profiles_deepseek_r1_mxfp4"
+
+
+def get_model_path() -> str:
+    """Get effective model path: env var > local path > HF model ID."""
+    # Check env var first
+    env_path = os.environ.get("DEEPSEEK_R1_MXFP4_MODEL_PATH")
+    if env_path:
+        return env_path
+    # Check local path
+    if os.path.exists(DEEPSEEK_R1_MXFP4_LOCAL_PATH):
+        return DEEPSEEK_R1_MXFP4_LOCAL_PATH
+    # Fall back to HF model ID
+    return DEEPSEEK_R1_MXFP4_HF_MODEL_ID
 
 
 class TestNightlyDeepseekR1MXFP4Performance(unittest.TestCase):
     """Nightly performance benchmark for DeepSeek-R1-MXFP4 model (MI35x).
 
     Tests the DeepSeek-R1-MXFP4 quantized model on TP=8 with DP=8.
+    Uses local path if available, otherwise downloads from HuggingFace.
     """
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEEPSEEK_R1_MXFP4_MODEL_PATH
+        cls.model = get_model_path()
+        print(f"Using model path: {cls.model}")
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 16, 64]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
@@ -95,14 +109,19 @@ class TestNightlyDeepseekR1MXFP4Performance(unittest.TestCase):
         """Run benchmark across all configured variants."""
         failed_variants = []
 
-        # Check if model path exists (only for local paths starting with /)
-        # HF model IDs will be downloaded automatically
+        # For local paths, check if exists. HF model IDs will download automatically.
         is_local_path = self.model.startswith("/")
         if is_local_path and not os.path.exists(self.model):
             print(f"\n⏭️ SKIPPING: Local model not found at {self.model}")
             self.runner.full_report += f"\n⏭️ Test skipped: Local model not found at {self.model}\n"
             self.runner.write_final_report()
             return
+
+        # Log model source
+        if is_local_path:
+            print(f"📁 Using local model: {self.model}")
+        else:
+            print(f"📥 Using HuggingFace model: {self.model} (will download if not cached)")
 
         try:
             for variant_config in self.variants:

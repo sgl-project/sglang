@@ -62,19 +62,26 @@ INVALID = -9999999
 class BaseModelConfig:
     """Configuration for a base model to test."""
 
-    model_path: str
+    model_path: str  # HuggingFace model ID (e.g., "amd/DeepSeek-R1-MXFP4-Preview")
     tp_size: int = 8
     accuracy_threshold: float = 0.50
     other_args: Optional[List[str]] = None
     env_vars: Optional[dict] = None
     tokenizer_path: Optional[str] = None
     timeout: Optional[int] = None
+    local_path: Optional[str] = None  # Preferred local path (checked first before HF)
 
     def __post_init__(self):
         if self.other_args is None:
             self.other_args = []
         if self.env_vars is None:
             self.env_vars = {}
+
+    def get_effective_model_path(self) -> str:
+        """Return local_path if it exists, otherwise model_path (HF ID)."""
+        if self.local_path and os.path.exists(self.local_path):
+            return self.local_path
+        return self.model_path
 
 
 # =============================================================================
@@ -124,10 +131,12 @@ MI35X_GPT_OSS_MODELS = [
 
 # Group 2: DeepSeek-R1-MXFP4 basic + MTP (MI35x specific quantized model)
 # Runner: nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4
+# Uses local path if available, otherwise downloads from HuggingFace
 MI35X_DEEPSEEK_R1_MXFP4_MODELS = [
     # DeepSeek-R1-MXFP4 basic
     BaseModelConfig(
-        model_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",
+        model_path="amd/DeepSeek-R1-MXFP4-Preview",  # HF fallback
+        local_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",  # Preferred local
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=3600,
@@ -145,7 +154,8 @@ MI35X_DEEPSEEK_R1_MXFP4_MODELS = [
     ),
     # DeepSeek-R1-MXFP4 with MTP (EAGLE speculative decoding)
     BaseModelConfig(
-        model_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",
+        model_path="amd/DeepSeek-R1-MXFP4-Preview",  # HF fallback
+        local_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",  # Preferred local
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=3600,
@@ -170,10 +180,12 @@ MI35X_DEEPSEEK_R1_MXFP4_MODELS = [
 
 # Group 3: DeepSeek-R1-MXFP4 with DP + TC (requires ROCm 7.0+)
 # Runner: nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4-dp-tc
+# Uses local path if available, otherwise downloads from HuggingFace
 MI35X_DEEPSEEK_R1_MXFP4_DP_TC_MODELS = [
     # DeepSeek-R1-MXFP4 with DP attention
     BaseModelConfig(
-        model_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",
+        model_path="amd/DeepSeek-R1-MXFP4-Preview",  # HF fallback
+        local_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",  # Preferred local
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=3600,
@@ -191,7 +203,8 @@ MI35X_DEEPSEEK_R1_MXFP4_DP_TC_MODELS = [
     ),
     # DeepSeek-R1-MXFP4 with torch compile
     BaseModelConfig(
-        model_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",
+        model_path="amd/DeepSeek-R1-MXFP4-Preview",  # HF fallback
+        local_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",  # Preferred local
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=7200,  # 2 hours for compilation
@@ -307,14 +320,31 @@ def log_model_status(config: "BaseModelConfig") -> Tuple[bool, str]:
     """
     Log detailed model availability status.
 
+    Checks in order:
+    1. local_path (if specified) - preferred local path
+    2. model_path as local path (if starts with /)
+    3. model_path as HF model ID - check cache then HF access
+
     Returns:
         Tuple of (is_available, status_message)
     """
     model_path = config.model_path
+    local_path = config.local_path
+
     print(f"\n📦 Checking model: {model_path}")
+    if local_path:
+        print(f"   (preferred local: {local_path})")
     print("-" * 50)
 
-    # For local paths (starting with /), check if exists
+    # Step 1: Check preferred local_path first (if specified)
+    if local_path:
+        if os.path.exists(local_path):
+            print(f"  ✅ LOCAL PATH: Found at {local_path}")
+            return True, f"Local path exists at {local_path}"
+        else:
+            print(f"  ⚠️  LOCAL PATH: Not found at {local_path}, trying HF fallback...")
+
+    # Step 2: For absolute paths (starting with /), check if exists
     if model_path.startswith("/"):
         if os.path.exists(model_path):
             print(f"  ✅ LOCAL PATH: Found at {model_path}")
@@ -323,7 +353,7 @@ def log_model_status(config: "BaseModelConfig") -> Tuple[bool, str]:
             print(f"  ❌ LOCAL PATH: Not found at {model_path}")
             return False, f"Local path not found at {model_path}"
 
-    # For HF model IDs, check local cache first
+    # Step 3: For HF model IDs, check local cache first
     is_cached, cache_msg = check_local_cache(model_path)
     if is_cached:
         print(f"  ✅ LOCAL CACHE: Found at {cache_msg}")
@@ -331,7 +361,7 @@ def log_model_status(config: "BaseModelConfig") -> Tuple[bool, str]:
     else:
         print(f"  ⚠️  LOCAL CACHE: {cache_msg}")
 
-    # Check HF repo access
+    # Step 4: Check HF repo access (will download if accessible)
     is_accessible, access_msg = check_hf_repo_access(model_path)
     if is_accessible:
         print(f"  ✅ HF ACCESS: {access_msg}")
@@ -447,8 +477,12 @@ def popen_launch_server_for_base_model(
 
     timeout = config.timeout if config.timeout else DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
+    # Use effective model path (local if exists, else HF model ID)
+    effective_model_path = config.get_effective_model_path()
+    print(f"Using model path: {effective_model_path}")
+
     process = popen_launch_server(
-        model=config.model_path,
+        model=effective_model_path,
         base_url=base_url,
         timeout=timeout,
         other_args=other_args,
