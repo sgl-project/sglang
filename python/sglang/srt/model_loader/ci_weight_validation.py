@@ -35,6 +35,57 @@ logger = logging.getLogger(__name__)
 VALIDATION_MARKER_VERSION = "2"
 
 
+def _remote_file_exists(
+    repo_id: str, filename: str, revision: Optional[str], allow_remote_check: bool
+) -> Optional[bool]:
+    """
+    Check if a file exists on Hugging Face Hub for a specific revision.
+
+    Args:
+        repo_id: Repository ID (e.g., "meta-llama/Llama-2-7b-hf")
+        filename: File name to check (e.g., "hf_quant_config.json")
+        revision: Git revision (commit hash, branch, or tag). None means default branch.
+        allow_remote_check: Whether remote checks are allowed (e.g., CI validation phase)
+
+    Returns:
+        True if file exists on hub, False if it doesn't exist, None if we cannot determine
+        (network error or remote check not allowed - be conservative and assume incomplete)
+    """
+    if not allow_remote_check:
+        logger.debug(
+            "Remote check disabled for %s/%s, returning None (unknown)",
+            repo_id,
+            filename,
+        )
+        return None
+
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        exists = api.file_exists(repo_id=repo_id, filename=filename, revision=revision)
+        logger.debug(
+            "Remote file check: %s/%s (revision=%s) exists=%s",
+            repo_id,
+            filename,
+            revision or "default",
+            exists,
+        )
+        return exists
+    except Exception as e:
+        # Network errors, auth issues, repo not found, etc.
+        # Return None (unknown) - caller will treat as optional
+        logger.debug(
+            "Failed to check remote file existence for %s/%s (revision=%s): %s. "
+            "Will treat as optional.",
+            repo_id,
+            filename,
+            revision or "default",
+            e,
+        )
+        return None
+
+
 def _get_validation_marker_path(snapshot_dir: str) -> Optional[str]:
     """
     Get the path to validation marker file for a snapshot.
@@ -229,7 +280,12 @@ def _validate_json_file(file_path: str, file_name: str) -> bool:
         return False
 
 
-def _validate_config_and_tokenizer_files(snapshot_dir: str) -> Tuple[bool, List[str]]:
+def _validate_config_and_tokenizer_files(
+    snapshot_dir: str,
+    model_id: Optional[str] = None,
+    revision: Optional[str] = None,
+    allow_remote_check: bool = False,
+) -> Tuple[bool, List[str]]:
     """
     Validate that critical config and tokenizer files exist and are valid.
 
@@ -237,7 +293,7 @@ def _validate_config_and_tokenizer_files(snapshot_dir: str) -> Tuple[bool, List[
     - config.json (required)
     - tokenizer_config.json (required)
     - generation_config.json (optional but validated if present)
-    - hf_quant_config.json (optional but validated if present) - for FP4/FP8/ModelOpt
+    - hf_quant_config.json (conditionally required based on Hub) - for FP4/FP8/ModelOpt
     - quantize_config.json / quant_config.json (optional but validated if present) - for AWQ/GPTQ
     - params.json (optional but validated if present) - for Mistral native format
     - preprocessor_config.json (optional but validated if present) - for vision models
@@ -246,6 +302,9 @@ def _validate_config_and_tokenizer_files(snapshot_dir: str) -> Tuple[bool, List[
 
     Args:
         snapshot_dir: Path to the model snapshot directory
+        model_id: Model repository ID (e.g., "meta-llama/Llama-2-7b-hf"), used for remote checks
+        revision: Git revision (commit hash), used for remote checks
+        allow_remote_check: Whether to check Hub for file existence to determine requirements
 
     Returns:
         Tuple of (is_valid, missing_files)
@@ -271,13 +330,64 @@ def _validate_config_and_tokenizer_files(snapshot_dir: str) -> Tuple[bool, List[
         if not _validate_json_file(generation_config_path, "generation_config.json"):
             missing_files.append("generation_config.json (exists but invalid)")
 
-    # Check optional hf_quant_config.json (validate if exists)
+    # Check hf_quant_config.json with remote existence check
     # This file is needed for quantized models (FP4/FP8/ModelOpt)
-    # Example: nvidia/Llama-3.1-8B-Instruct-FP8, Barrrrry/DeepSeek-R1-W4AFP8
+    # Example: nvidia/Llama-3.1-8B-Instruct-FP8, nvidia/DeepSeek-V3-0324-FP4
     hf_quant_config_path = os.path.join(snapshot_dir, "hf_quant_config.json")
-    if os.path.exists(hf_quant_config_path):
-        if not _validate_json_file(hf_quant_config_path, "hf_quant_config.json"):
+    local_hf_quant_exists = os.path.exists(hf_quant_config_path)
+
+    # Check if file exists on Hub for this revision
+    # Only do remote check if model_id looks like a HF repo_id (org/model format)
+    # Skip if it's a local path (absolute path or doesn't contain '/')
+    remote_hf_quant_exists = None
+    is_hf_repo = (
+        model_id is not None
+        and "/" in model_id
+        and not os.path.isabs(model_id)
+        and not model_id.startswith("/")
+    )
+    if is_hf_repo and allow_remote_check:
+        remote_hf_quant_exists = _remote_file_exists(
+            repo_id=model_id,
+            filename="hf_quant_config.json",
+            revision=revision,
+            allow_remote_check=allow_remote_check,
+        )
+
+    # Apply conditional requirement logic
+    if remote_hf_quant_exists is True:
+        # Hub has this file for this revision - it's REQUIRED
+        if not local_hf_quant_exists:
+            missing_files.append(
+                f"hf_quant_config.json (required: exists on Hub for revision {revision or 'default'} but missing locally)"
+            )
+            log_info_on_rank0(
+                logger,
+                f"Hub has hf_quant_config.json for {model_id} revision {revision or 'default'} "
+                f"but local snapshot missing it. Cache incomplete, will not write marker.",
+            )
+        elif not _validate_json_file(hf_quant_config_path, "hf_quant_config.json"):
             missing_files.append("hf_quant_config.json (exists but invalid)")
+    elif remote_hf_quant_exists is False:
+        # Hub doesn't have this file - it's OPTIONAL
+        # Only validate if it happens to exist locally
+        if local_hf_quant_exists:
+            if not _validate_json_file(hf_quant_config_path, "hf_quant_config.json"):
+                missing_files.append("hf_quant_config.json (exists but invalid)")
+    else:
+        # remote_hf_quant_exists is None - unknown (network error or remote check disabled)
+        # Treat as OPTIONAL - only enforce when we can positively confirm Hub has it
+        if local_hf_quant_exists:
+            # Local file exists - validate it
+            if not _validate_json_file(hf_quant_config_path, "hf_quant_config.json"):
+                missing_files.append("hf_quant_config.json (exists but invalid)")
+        # If local file missing and remote unknown, just log it - don't block marker
+        logger.debug(
+            "Cannot verify hf_quant_config.json on Hub for %s (revision=%s), "
+            "treating as optional since remote status unknown",
+            model_id or "unknown",
+            revision or "default",
+        )
 
     # Check optional quantize_config.json / quant_config.json (validate if exists)
     # These files are needed for AWQ/GPTQ/AutoRound quantized models
@@ -436,14 +546,29 @@ def ci_validate_cache_and_enable_offline_if_complete(
 
     # No marker - perform full validation
     # (Failures are not cached, so we'll retry validation each time until success)
+
+    # Extract revision (snapshot hash) from snapshot_dir path
+    # snapshot_dir format: /path/to/cache/models--org--model/snapshots/<commit_hash>
+    revision = os.path.basename(snapshot_dir)
+
+    # Only allow remote checks if we're not in offline mode
+    # This avoids unnecessary API calls and warnings in offline CI environments
+    import huggingface_hub.constants
+
+    allow_remote_check = not huggingface_hub.constants.HF_HUB_OFFLINE
+
     log_info_on_rank0(
         logger,
-        f"CI_OFFLINE: No marker found, performing full validation - {model_name_or_path}",
+        f"CI_OFFLINE: No marker found, performing full validation "
+        f"(snapshot={revision}, allow_remote_check={allow_remote_check}) - {model_name_or_path}",
     )
 
-    # Validate config and tokenizer files
+    # Validate config and tokenizer files with remote existence checks
     config_valid, missing_config_files = _validate_config_and_tokenizer_files(
-        snapshot_dir
+        snapshot_dir=snapshot_dir,
+        model_id=model_name_or_path,
+        revision=revision,
+        allow_remote_check=allow_remote_check,
     )
 
     if not config_valid:
