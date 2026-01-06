@@ -27,6 +27,7 @@ from cache_dit import (
 )
 from cache_dit.caching.block_adapters import BlockAdapterRegister
 from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
 
 _original_similarity = None
 
@@ -322,10 +323,6 @@ def enable_cache_on_transformer(
             # as a conservative superset group; fallback to None.
             tp_sp_group = None
             if sp_group is not None and tp_group is not None:
-                from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-                    get_dit_group,
-                )
-
                 tp_sp_group = get_dit_group()
 
             context_manager._sglang_tp_sp_group = tp_sp_group
@@ -504,10 +501,6 @@ def enable_cache_on_dual_transformer(
                 tp_sp_group = None
                 if sp_group is not None and tp_group is not None:
                     try:
-                        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-                            get_dit_group,
-                        )
-
                         tp_sp_group = get_dit_group()
                     except Exception:
                         tp_sp_group = None
