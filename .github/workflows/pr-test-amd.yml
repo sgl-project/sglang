@@ -182,7 +182,7 @@ jobs:
       - name: Run test
         timeout-minutes: 10
         run: |
-          docker exec -w /sglang-checkout/test ci_sglang python3 run_suite.py --hw amd --suite stage-a-test-1
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1
 
   stage-b-test-small-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -222,7 +222,7 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          docker exec -w /sglang-checkout/test ci_sglang python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 4
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 4
 
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
