@@ -826,12 +826,12 @@ class BaseMultimodalProcessor(ABC):
                     item.format = MultimodalInputFormat.PROCESSOR_OUTPUT
                 all_collected_items.extend(items)
             elif input_format == "precomputed_embedding":
-                feature = dict_item["feature"]
+                precomputed_embeddings = dict_item["feature"]
                 del dict_item["feature"]
                 all_collected_items.append(
                     MultimodalDataItem(
                         modality=modality,
-                        feature=feature,
+                        precomputed_embeddings=precomputed_embeddings,
                         format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
                         model_specific_data=dict_item,
                     )
