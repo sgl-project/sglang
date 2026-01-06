@@ -1,33 +1,45 @@
-//! Context for /v1/responses endpoint handlers
+//! Context and types for /v1/responses endpoint handlers
 //!
 //! Bundles all dependencies needed by responses handlers to avoid passing
 //! 10+ parameters to every function.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock as StdRwLock},
+};
 
-use tokio::sync::RwLock;
+use tokio::{sync::RwLock, task::JoinHandle};
 
-use super::types::BackgroundTaskInfo;
 use crate::{
-    core::WorkerRegistry,
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
+    grpc_client::SglangSchedulerClient,
     mcp::McpManager,
     routers::grpc::{context::SharedComponents, pipeline::RequestPipeline},
 };
+
+/// Information stored for background tasks to enable end-to-end cancellation
+///
+/// This struct enables cancelling both the Rust task AND the Python scheduler processing.
+/// The client field is lazily initialized during pipeline execution.
+pub(crate) struct BackgroundTaskInfo {
+    /// Tokio task handle for aborting the Rust task
+    pub handle: JoinHandle<()>,
+    /// gRPC request_id sent to Python scheduler (chatcmpl-* prefix)
+    pub grpc_request_id: String,
+    /// gRPC client for sending abort requests to Python (set after client acquisition)
+    pub client: Arc<RwLock<Option<SglangSchedulerClient>>>,
+}
 
 /// Context for /v1/responses endpoint
 ///
 /// All fields are Arc/shared references, so cloning this context is cheap.
 #[derive(Clone)]
-pub struct ResponsesContext {
+pub(crate) struct ResponsesContext {
     /// Chat pipeline for executing requests
     pub pipeline: Arc<RequestPipeline>,
 
-    /// Shared components (tokenizer, parsers, worker_registry)
+    /// Shared components (tokenizer, parsers)
     pub components: Arc<SharedComponents>,
-
-    /// Worker registry for validation
-    pub worker_registry: Arc<WorkerRegistry>,
 
     /// Response storage backend
     pub response_storage: Arc<dyn ResponseStorage>,
@@ -41,6 +53,9 @@ pub struct ResponsesContext {
     /// MCP manager for tool support
     pub mcp_manager: Arc<McpManager>,
 
+    /// Server keys for MCP tools requested in this context
+    pub requested_servers: Arc<StdRwLock<Vec<String>>>,
+
     /// Background task handles for cancellation support
     pub background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 }
@@ -50,7 +65,6 @@ impl ResponsesContext {
     pub fn new(
         pipeline: Arc<RequestPipeline>,
         components: Arc<SharedComponents>,
-        worker_registry: Arc<WorkerRegistry>,
         response_storage: Arc<dyn ResponseStorage>,
         conversation_storage: Arc<dyn ConversationStorage>,
         conversation_item_storage: Arc<dyn ConversationItemStorage>,
@@ -59,11 +73,11 @@ impl ResponsesContext {
         Self {
             pipeline,
             components,
-            worker_registry,
             response_storage,
             conversation_storage,
             conversation_item_storage,
             mcp_manager,
+            requested_servers: Arc::new(StdRwLock::new(Vec::new())),
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
