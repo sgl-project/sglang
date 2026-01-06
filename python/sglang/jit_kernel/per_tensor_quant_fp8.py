@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 import os
 from typing import TYPE_CHECKING
 
@@ -8,13 +7,14 @@ import flashinfer
 import torch
 from torch.utils.cpp_extension import CUDA_HOME
 
-from sglang.jit_kernel.utils import load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@functools.cache
+@cache_once
 def _jit_per_tensor_quant_fp8_module(is_static: bool) -> Module:
     args = make_cpp_args(is_static)
 
@@ -32,6 +32,10 @@ def _jit_per_tensor_quant_fp8_module(is_static: bool) -> Module:
     )
 
 
+@register_custom_op(
+    op_name="per_tensor_quant_fp8",
+    mutates_args=["output_q", "output_s"],
+)
 def per_tensor_quant_fp8(
     input: torch.Tensor,
     output_q: torch.Tensor,
@@ -44,8 +48,13 @@ def per_tensor_quant_fp8(
     Args:
         input: Input tensor to quantize (float, half, or bfloat16)
         output_q: Output quantized tensor (fp8_e4m3)
-        output_s: Output scale tensor (float scalar)
+        output_s: Output scale tensor (float scalar or 1D tensor with 1 element)
         is_static: If True, assumes scale is pre-computed and skips absmax computation
     """
+    # Ensure output_s has shape [1] instead of being a 0D scalar
+    # The JIT kernel expects a 1D tensor
+    if output_s.ndim == 0:
+        output_s = output_s.reshape(1)
+
     module = _jit_per_tensor_quant_fp8_module(is_static)
     module.per_tensor_quant_fp8(input, output_q, output_s)
