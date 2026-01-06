@@ -2,7 +2,7 @@ import { useSessionStore } from '../../stores/useSessionStore';
 import { useUIStore } from '../../stores/useUIStore';
 import { KPICard } from './KPICard';
 import { TopKList } from './TopKList';
-import { getTopKForLayer, isRawMode, isFingerprintMode, isSketchMode, extractFingerprint, AttentionEntry } from '../../api/types';
+import { getTopKForLayer, isRawMode, isFingerprintMode, isSketchMode, AttentionEntry } from '../../api/types';
 
 // Extract fingerprint metrics from any attention entry
 function getMetricsFromAttention(entry: AttentionEntry | null): {
@@ -57,20 +57,17 @@ export function InsightPanel() {
   const selectedTokenIndex = useUIStore((state) => state.selectedTokenIndex);
   const selectedLayerId = useUIStore((state) => state.selectedLayerId);
 
-  // Get attention data for selected token
+  // Get attention data for selected token from stored messages
   const lastAssistant = messages.filter((m) => m.role === 'assistant').pop();
   const selectedAttention =
-    selectedTokenIndex !== null ? lastAssistant?.attention?.[selectedTokenIndex] : null;
+    selectedTokenIndex !== null ? (lastAssistant?.attention?.[selectedTokenIndex] ?? null) : null;
 
-  // Extract metrics from selected attention
+  // Extract metrics from the stored attention data
   const tokenMetrics = getMetricsFromAttention(selectedAttention);
 
-  // Get top-k for selected layer (only works for raw/sketch modes)
+  // Get top-k from attention entry (only available in raw mode)
   const layerId = selectedLayerId === -1 ? 31 : selectedLayerId;
   const topK = selectedAttention ? getTopKForLayer(selectedAttention, layerId, 5) : [];
-
-  const topkMass =
-    selectedAttention && isRawMode(selectedAttention) ? selectedAttention.topk_mass ?? 0 : 0;
 
   // Use token-level metrics if available, fallback to session fingerprint
   const displayMetrics = tokenMetrics || (fingerprint ? {
@@ -120,24 +117,46 @@ export function InsightPanel() {
         <div className="section">
           <div className="section-header">
             <span>Token Lens</span>
-            <span className="badge">{selectedTokenIndex !== null ? 'active' : 'idle'}</span>
-          </div>
-          <div className="hint-text">
-            When you select an assistant token, we highlight its <strong>top-k attended context tokens</strong>.
-            Low <strong>topk_mass</strong> indicates diffuse attention (top-k may miss signal).
+            <span className="badge">
+              {selectedTokenIndex !== null ? 'active' : 'idle'}
+            </span>
           </div>
 
           {selectedTokenIndex !== null && topK.length > 0 ? (
             <>
-              <div className="metric-row">
-                <span className="badge">layer {layerId}</span>
-                <span className="badge">topk_mass {topkMass.toFixed(2)}</span>
-                <span className="badge">{topkMass < 0.55 ? 'diffuse' : 'captured'}</span>
+              <div className="metric-row" style={{ marginBottom: '8px' }}>
+                <span className="badge" style={{ background: 'rgba(85, 214, 166, 0.15)' }}>
+                  {tokenMetrics?.mode || 'raw'}
+                </span>
+                <span className="badge">{topK.length} anchors</span>
+              </div>
+              <div className="hint-text" style={{ marginBottom: '8px' }}>
+                <strong>Top attended tokens</strong>:
               </div>
               <TopKList items={topK} />
             </>
+          ) : selectedTokenIndex !== null && tokenMetrics ? (
+            <div className="hint-text" style={{ padding: '12px', textAlign: 'center' }}>
+              <div style={{ fontSize: '20px', marginBottom: '8px', opacity: 0.7 }}>📊</div>
+              <div>Server is in <strong>fingerprint mode</strong>.</div>
+              <div style={{ fontSize: '11px', marginTop: '8px', opacity: 0.7 }}>
+                Attention metrics are shown below. For detailed token-level anchors,
+                restart the server without --attention-fingerprint-mode.
+              </div>
+            </div>
+          ) : selectedTokenIndex !== null ? (
+            <div className="hint-text" style={{ padding: '12px', textAlign: 'center' }}>
+              <div style={{ fontSize: '20px', marginBottom: '8px', opacity: 0.5 }}>🔍</div>
+              <div>No attention data for this token.</div>
+              <div style={{ fontSize: '11px', marginTop: '4px', opacity: 0.7 }}>
+                Make sure attention capture is enabled on the server.
+              </div>
+            </div>
           ) : (
-            <div className="hint-text">Select any assistant token to populate the lens.</div>
+            <div className="hint-text" style={{ padding: '12px', textAlign: 'center' }}>
+              <div style={{ fontSize: '20px', marginBottom: '8px', opacity: 0.5 }}>👆</div>
+              <div>Click any <strong>assistant token</strong> to see its attention.</div>
+            </div>
           )}
         </div>
 
@@ -191,7 +210,7 @@ export function InsightPanel() {
         )}
 
         {/* Session-level Fingerprint (from sidecar) */}
-        {fingerprint && fingerprint !== displayMetrics && (
+        {fingerprint && displayMetrics?.mode !== 'session' && (
           <div className="section">
             <div className="section-header">
               <span>Session Fingerprint</span>

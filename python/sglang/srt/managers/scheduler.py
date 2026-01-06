@@ -1445,6 +1445,7 @@ class Scheduler(
                 attention_capture_layer_id=getattr(recv_req, 'attention_capture_layer_id', None),
                 attention_capture_layer_ids=getattr(recv_req, 'attention_capture_layer_ids', None),
                 attention_sketch_mode=getattr(recv_req, 'attention_sketch_mode', False),
+                attention_fingerprint_mode=getattr(recv_req, 'attention_fingerprint_mode', None),
                 return_moe_routing=getattr(recv_req, 'return_moe_routing', False),
                 moe_routing_top_k=getattr(recv_req, 'moe_routing_top_k', 2),
                 moe_capture_layer_ids=getattr(recv_req, 'moe_capture_layer_ids', None),

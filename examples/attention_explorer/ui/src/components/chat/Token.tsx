@@ -18,16 +18,17 @@ export function Token({ text, index, type, attention }: TokenProps) {
   const isSelected = type === 'output' && selectedTokenIndex === index;
   const isHovered = type === 'output' && hoveredTokenIndex === index;
 
-  // Check if this input token is attended by the selected output token
-  const isAttended = false; // TODO: implement cross-reference
-  const isAnchor = false;
-
   // Check topk_mass for low-mass indicator
   const isLowMass = attention && isRawMode(attention) && (attention.topk_mass ?? 1) < 0.55;
 
   const handleClick = useCallback(() => {
     if (type === 'output') {
-      selectToken(isSelected ? null : index);
+      if (isSelected) {
+        selectToken(null);
+        return;
+      }
+      // Simply select the token - the InsightPanel will read attention from stored messages
+      selectToken(index);
     }
   }, [type, index, isSelected, selectToken]);
 
@@ -45,8 +46,6 @@ export function Token({ text, index, type, attention }: TokenProps) {
     'tok',
     isSelected && 'selected',
     isHovered && 'hovered',
-    isAttended && 'attended',
-    isAnchor && 'anchor',
     isLowMass && 'lowmass',
   ]
     .filter(Boolean)

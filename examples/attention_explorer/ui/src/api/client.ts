@@ -7,7 +7,6 @@ import {
   AttentionEntry,
   MoERoutingEntry,
   Program,
-  extractFingerprint,
 } from './types';
 
 // ============================================================================
@@ -334,4 +333,140 @@ export async function fetchWithAttention(
   }
 
   return response.json();
+}
+
+// ============================================================================
+// TOKEN ATTENTION DETAIL FETCHER
+// ============================================================================
+
+export interface TokenAttentionDetail {
+  tokenIndex: number;
+  tokenText: string;
+  topK: Array<{
+    position: number;
+    score: number;
+    tokenText?: string;
+  }>;
+  entropy: number;
+  localMass: number;
+  midMass: number;
+  longMass: number;
+  layerId: number;
+  mode: string;
+}
+
+/**
+ * Fetches detailed attention data for a specific token by making a focused request
+ * This is used when the user clicks on a token to see what it attended to
+ */
+export async function fetchTokenAttentionDetail(
+  baseUrl: string,
+  model: string,
+  contextMessages: Array<{ role: string; content: string }>,
+  targetTokenIndex: number,
+  inputTokens: string[]
+): Promise<TokenAttentionDetail | null> {
+  try {
+    // Make a request with raw attention mode to get detailed top-k
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: contextMessages,
+        max_tokens: 1, // Just need attention data, not generation
+        stream: false,
+        return_attention_tokens: true,
+        top_k_attention: 10,
+        // Force raw mode to get actual token positions, even if server is in fingerprint mode
+        attention_fingerprint_mode: false,
+        // Request specific layers for detail view
+        attention_capture_layer_ids: [7, 15, 23, 31],
+      }),
+    });
+
+    if (!response.ok) {
+      console.warn('Failed to fetch token attention detail:', response.status);
+      return null;
+    }
+
+    const data = await response.json();
+
+    // Extract attention from response
+    const attentionTokens = data.choices?.[0]?.attention_tokens || data.attention_tokens || [];
+
+    if (attentionTokens.length === 0) {
+      return null;
+    }
+
+    // Get the attention entry (use first available)
+    const entry = attentionTokens[0];
+
+    // Build result based on mode
+    if (entry.mode === 'raw') {
+      const layerId = entry.layer_id || 31;
+      const layer = entry.layers?.[layerId] || entry;
+
+      const topK = (layer.token_positions || []).map((pos: number, i: number) => ({
+        position: pos,
+        score: layer.attention_scores?.[i] || 0,
+        tokenText: inputTokens[pos] || `[${pos}]`,
+      })).slice(0, 10);
+
+      return {
+        tokenIndex: targetTokenIndex,
+        tokenText: `Token #${targetTokenIndex}`,
+        topK,
+        entropy: 0,
+        localMass: 0,
+        midMass: 0,
+        longMass: 0,
+        layerId,
+        mode: 'raw',
+      };
+    }
+
+    if (entry.mode === 'fingerprint') {
+      const fp = entry.fingerprint || [];
+      return {
+        tokenIndex: targetTokenIndex,
+        tokenText: `Token #${targetTokenIndex}`,
+        topK: [],
+        entropy: fp[19] ?? fp[3] ?? 0,
+        localMass: fp[16] ?? fp[0] ?? 0,
+        midMass: fp[17] ?? fp[1] ?? 0,
+        longMass: fp[18] ?? fp[2] ?? 0,
+        layerId: -1,
+        mode: 'fingerprint',
+      };
+    }
+
+    if (entry.mode === 'sketch') {
+      const sketch = entry.sketch || Object.values(entry.layer_sketches || {})[0];
+      if (sketch) {
+        const topK = (sketch.top_hubs || []).map((pos: number, i: number) => ({
+          position: pos,
+          score: sketch.hub_scores?.[i] || 0,
+          tokenText: inputTokens[pos] || `[${pos}]`,
+        })).slice(0, 10);
+
+        return {
+          tokenIndex: targetTokenIndex,
+          tokenText: `Token #${targetTokenIndex}`,
+          topK,
+          entropy: sketch.entropy || 0,
+          localMass: sketch.local_mass || 0,
+          midMass: sketch.mid_mass || 0,
+          longMass: sketch.long_mass || 0,
+          layerId: entry.layer_id || -1,
+          mode: 'sketch',
+        };
+      }
+    }
+
+    return null;
+  } catch (error) {
+    console.error('Error fetching token attention detail:', error);
+    return null;
+  }
 }
