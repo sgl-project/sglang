@@ -7,29 +7,7 @@ use std::{
     time::Duration,
 };
 
-use http::header::HeaderName;
 use tracing::debug;
-
-static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
-static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
-
-fn extract_header_value<'a>(
-    headers: Option<&'a http::HeaderMap>,
-    name: &HeaderName,
-) -> Option<&'a str> {
-    headers
-        .and_then(|h| h.get(name))
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-}
-
-pub(crate) fn extract_target_worker(headers: Option<&http::HeaderMap>) -> Option<&str> {
-    extract_header_value(headers, &HEADER_TARGET_WORKER)
-}
-
-pub(crate) fn extract_routing_key(headers: Option<&http::HeaderMap>) -> Option<&str> {
-    extract_header_value(headers, &HEADER_ROUTING_KEY)
-}
 
 #[derive(Debug)]
 pub struct PeriodicTask {
@@ -99,44 +77,6 @@ mod tests {
     use std::{sync::atomic::AtomicUsize, time::Instant};
 
     use super::*;
-
-    #[test]
-    fn test_extract_header_value_returns_value() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-smg-routing-key", "test-key".parse().unwrap());
-        assert_eq!(extract_routing_key(Some(&headers)), Some("test-key"));
-    }
-
-    #[test]
-    fn test_extract_header_value_returns_none_for_missing() {
-        let headers = http::HeaderMap::new();
-        assert_eq!(extract_routing_key(Some(&headers)), None);
-    }
-
-    #[test]
-    fn test_extract_header_value_returns_none_for_empty() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-smg-routing-key", "".parse().unwrap());
-        assert_eq!(extract_routing_key(Some(&headers)), None);
-    }
-
-    #[test]
-    fn test_extract_header_value_returns_none_for_none_headers() {
-        assert_eq!(extract_routing_key(None), None);
-    }
-
-    #[test]
-    fn test_extract_target_worker() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-smg-target-worker", "2".parse().unwrap());
-        assert_eq!(extract_target_worker(Some(&headers)), Some("2"));
-    }
-
-    #[test]
-    fn test_extract_target_worker_missing() {
-        let headers = http::HeaderMap::new();
-        assert_eq!(extract_target_worker(Some(&headers)), None);
-    }
 
     #[test]
     fn test_periodic_task_executes() {

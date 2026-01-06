@@ -20,11 +20,12 @@ use std::sync::Arc;
 
 use rand::Rng as _;
 
-use super::{
-    utils::{extract_routing_key, extract_target_worker},
-    LoadBalancingPolicy, SelectWorkerInfo,
+use super::{LoadBalancingPolicy, SelectWorkerInfo};
+use crate::{
+    core::Worker,
+    observability::metrics::Metrics,
+    routers::header_utils::{extract_routing_key, extract_target_worker},
 };
-use crate::{core::Worker, observability::metrics::Metrics};
 
 /// Execution branch for metrics
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
