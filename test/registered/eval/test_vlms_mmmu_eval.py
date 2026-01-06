@@ -51,7 +51,7 @@ MODEL_THRESHOLDS = {
     ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 30.4),
     ModelLaunchSettings(
         "zai-org/GLM-4.5V-FP8", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.26, 34.5),
+    ): ModelEvalMetrics(0.26, 34.0),
 }
 
 
