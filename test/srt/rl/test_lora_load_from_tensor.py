@@ -49,19 +49,10 @@ class TestLoRALoadFromTensor(CustomTestCase):
     def test_e2e_lora_load_from_tensor_params(self):
         print("[Test]Testing LoRA load from tensor params...")
 
-        serialized_tensors = MultiprocessingSerializer.serialize(
-                self.lora_tensors, output_str=True
-            )
-
-        lora_req = LoadLoRAAdapterFromTensorsReqInput(
-                lora_name="self_cognition_Alice",
-                config_dict=self.lora_config_dict,
-                serialized_tensors=serialized_tensors,
-        )
-
-        # Load LoRA adapter from tensors
-        result = self.engine.loop.run_until_complete(
-                self.engine.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
+        result = self.engine.load_lora_adapter_from_tensors(
+            lora_name="self_cognition_Alice",
+            tensors=self.lora_tensors,
+            config_dict=self.lora_config_dict,
         )
         self.assertTrue(
             result.success,
@@ -102,19 +93,11 @@ class TestLoRALoadFromTensor(CustomTestCase):
     def test_lora_load_unload_load_from_tensor_params(self):
         print("[Test]Testing LoRA load, unload, load from tensor params...")
 
-        serialized_tensors = MultiprocessingSerializer.serialize(
-                self.lora_tensors, output_str=True
-            )
-
-        lora_req = LoadLoRAAdapterFromTensorsReqInput(
-            lora_name="self_cognition_Alice_multiple",
-            config_dict=self.lora_config_dict,
-            serialized_tensors=serialized_tensors,
-        )
-
         # Load LoRA adapter from tensors
-        result = self.engine.loop.run_until_complete(
-                self.engine.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
+        result = self.engine.load_lora_adapter_from_tensors(
+            lora_name="self_cognition_Alice_multiple",
+            tensors=self.lora_tensors,
+            config_dict=self.lora_config_dict,
         )
         self.assertTrue(
             result.success,
@@ -134,17 +117,11 @@ class TestLoRALoadFromTensor(CustomTestCase):
                 lora_path=["self_cognition_Alice_multiple"],
             )
         # Load LoRA adapter again
-        serialized_tensors_again = MultiprocessingSerializer.serialize(
-            self.lora_tensors, output_str=True
-        )
-        lora_req_again = LoadLoRAAdapterFromTensorsReqInput(
+        result_again = self.engine.load_lora_adapter_from_tensors(
             lora_name="self_cognition_Alice_multiple",
+            tensors=self.lora_tensors,
             config_dict=self.lora_config_dict,
-            serialized_tensors=serialized_tensors_again,
         )
-        result_again = self.engine.loop.run_until_complete(
-                    self.engine.tokenizer_manager.load_lora_adapter_from_tensors(lora_req_again, None)
-            )
         self.assertTrue(
             result_again.success,
             f"Failed to load LoRA from tensors: {result_again.error_message}",
@@ -205,27 +182,15 @@ class TestLoRALoadFromTensor(CustomTestCase):
                 "down_proj",
             ],
         ) as srt_runner:
-            # Serialize tensors and create request
-            serialized_tensors = MultiprocessingSerializer.serialize(
-                self.lora_tensors, output_str=True
-            )
-            
-            lora_req = LoadLoRAAdapterFromTensorsReqInput(
+            result = srt_runner.engine.load_lora_adapter_from_tensors(
                 lora_name=lora_name,
+                tensors=self.lora_tensors,
                 config_dict=self.lora_config_dict,
-                serialized_tensors=serialized_tensors,
             )
-            
-            # Load LoRA adapter from tensors
-            result = srt_runner.engine.loop.run_until_complete(
-                srt_runner.engine.tokenizer_manager.load_lora_adapter_from_tensors(
-                    lora_req, None
-                )
+            self.assertTrue(
+                result.success,
+                f"Failed to load LoRA from tensors: {result.error_message}",
             )
-            if not result.success:
-                raise RuntimeError(
-                    f"Failed to load LoRA from tensors: {result.error_message}"
-                )
             
             # Run inference with loaded LoRA
             srt_outputs = srt_runner.forward(
