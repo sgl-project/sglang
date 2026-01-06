@@ -3,6 +3,7 @@ import { Message } from '../../api/types';
 import { TokenLine } from './TokenLine';
 import { SegmentTimeline } from './SegmentTimeline';
 import { SegmentedTokenLine } from './SegmentedTokenLine';
+import { VirtualTokenList, VIRTUALIZATION_THRESHOLD } from './VirtualTokenList';
 
 interface MessageBubbleProps {
   message: Message;
@@ -70,7 +71,14 @@ export function MessageBubble({ message }: MessageBubbleProps) {
 
       {/* Token visualization */}
       {message.tokens && message.tokens.length > 0 && (
-        hasThink ? (
+        // Use virtualization for large token counts (without think sections)
+        message.tokens.length > VIRTUALIZATION_THRESHOLD && !hasThink ? (
+          <VirtualTokenList
+            tokens={message.tokens}
+            attention={message.attention}
+            type={isAssistant ? 'output' : 'input'}
+          />
+        ) : hasThink ? (
           <SegmentedTokenLine
             content={message.content}
             tokens={message.tokens}
