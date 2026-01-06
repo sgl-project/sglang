@@ -697,7 +697,6 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
@@ -709,7 +708,6 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
@@ -721,7 +719,6 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
