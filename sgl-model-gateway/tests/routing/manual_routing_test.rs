@@ -175,8 +175,6 @@ mod manual_routing_tests {
 
 #[cfg(test)]
 mod manual_min_group_tests {
-    use std::sync::Arc;
-
     use super::*;
 
     async fn send_request(app: axum::Router, routing_key: &str) -> (String, String) {
@@ -215,16 +213,13 @@ mod manual_min_group_tests {
             AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(29910, 3, 500))
                 .await;
 
-        let app = Arc::new(ctx.create_app().await);
+        let app = ctx.create_app().await;
 
         let mut handles = Vec::new();
         for i in 0..9 {
             let routing_key = format!("key-{}", i);
-            let app_clone = Arc::clone(&app);
-            let handle = tokio::spawn(async move {
-                let app = (*app_clone).clone();
-                send_request(app, &routing_key).await
-            });
+            let app_clone = app.clone();
+            let handle = tokio::spawn(async move { send_request(app_clone, &routing_key).await });
             handles.push(handle);
         }
 
@@ -267,18 +262,15 @@ mod manual_min_group_tests {
             AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(29920, 3, 200))
                 .await;
 
-        let app = Arc::new(ctx.create_app().await);
+        let app = ctx.create_app().await;
 
         let routing_key = "sticky-key-123";
 
         let mut handles = Vec::new();
         for _ in 0..5 {
-            let app_clone = Arc::clone(&app);
+            let app_clone = app.clone();
             let key = routing_key.to_string();
-            let handle = tokio::spawn(async move {
-                let app = (*app_clone).clone();
-                send_request(app, &key).await
-            });
+            let handle = tokio::spawn(async move { send_request(app_clone, &key).await });
             handles.push(handle);
         }
 
@@ -289,14 +281,13 @@ mod manual_min_group_tests {
             .collect();
 
         let workers: Vec<String> = results.into_iter().map(|(_, w)| w).collect();
-        let first_worker = &workers[0];
-        for (i, worker) in workers.iter().enumerate() {
-            assert_eq!(
-                worker, first_worker,
-                "Request {} should go to same worker as first request (expected {}, got {})",
-                i, first_worker, worker
-            );
-        }
+        let unique_workers: HashSet<&String> = workers.iter().collect();
+        assert_eq!(
+            unique_workers.len(),
+            1,
+            "All requests with same routing key should route to same worker, got {:?}",
+            unique_workers
+        );
 
         ctx.shutdown().await;
     }
@@ -309,18 +300,15 @@ mod manual_min_group_tests {
             AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(29930, 2, 300))
                 .await;
 
-        let app = Arc::new(ctx.create_app().await);
+        let app = ctx.create_app().await;
 
         let mut handles = Vec::new();
         for i in 0..4 {
             let routing_key = format!("key-{}", i);
             for _ in 0..3 {
-                let app_clone = Arc::clone(&app);
+                let app_clone = app.clone();
                 let key = routing_key.clone();
-                let handle = tokio::spawn(async move {
-                    let app = (*app_clone).clone();
-                    send_request(app, &key).await
-                });
+                let handle = tokio::spawn(async move { send_request(app_clone, &key).await });
                 handles.push(handle);
             }
         }
