@@ -52,10 +52,10 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.environ import envs
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -1625,17 +1625,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
-                kv_a, k_pe = self._get_mla_kv_buffer(
-                    forward_batch.fetch_mha_one_shot_kv_indices(),
-                    q.dtype,
-                    forward_batch,
-                )
-        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-            kv = self.kv_b_proj(
-                kv_a_quanted,
-            )[0]
-        else:
-            kv = self.kv_b_proj(kv_a)[0]
                 if get_dcp_world_size() > 1:
                     prefix_kv_a, prefix_k_pe = (
                         forward_batch.token_to_kv_pool.get_mla_kv_buffer(
@@ -1671,13 +1660,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                     kv_a = torch.cat(kv_a_tuple, dim=0)
                     k_pe = torch.cat(k_pe_tuple, dim=0)
                 else:
-                    # BF16/FP16 path: directly fetch from cache
                     kv_a, k_pe = self._get_mla_kv_buffer(
                         forward_batch.fetch_mha_one_shot_kv_indices(),
                         q.dtype,
                         forward_batch,
                     )
-        kv = self.kv_b_proj(kv_a)[0]
+        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+            kv = self.kv_b_proj(
+                kv_a_quanted,
+            )[0]
+        else:
+            kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
@@ -2047,14 +2040,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             attn_output = attn_output.view(
                 -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
             )
-            if get_global_server_args().enable_symm_mem:
-                # Note(wh): make sure input tensors use nccl allocator
-                with use_symmetric_memory(get_dcp_group()):
-                    attn_output = attn_output.clone(
-                        memory_format=torch.contiguous_format
-                    )
-                    lse = lse.clone(memory_format=torch.contiguous_format)
-            attn_output = attn_output.contiguous()
+            # Note(wh): make sure input tensors use nccl allocator
+            with use_symmetric_memory(get_dcp_group()):
+                attn_output = attn_output.clone(memory_format=torch.contiguous_format)
+                lse = lse.clone(memory_format=torch.contiguous_format)
             attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
