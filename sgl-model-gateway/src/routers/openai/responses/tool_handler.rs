@@ -7,8 +7,8 @@ use tracing::warn;
 
 use super::{
     accumulator::StreamingResponseAccumulator,
+    common::{extract_output_index, get_event_type},
     mcp::FunctionCallInProgress,
-    streaming::{extract_output_index, get_event_type},
 };
 use crate::protocols::event_types::{
     is_function_call_type, FunctionCallEvent, OutputItemEvent, ResponseEvent,
@@ -20,7 +20,7 @@ use crate::protocols::event_types::{
 
 /// Action to take based on streaming event processing
 #[derive(Debug)]
-pub(crate) enum StreamAction {
+pub(super) enum StreamAction {
     Forward,      // Pass event to client
     Buffer,       // Accumulate for tool execution
     ExecuteTools, // Function call complete, execute now
@@ -32,7 +32,7 @@ pub(crate) enum StreamAction {
 
 /// Maps upstream output indices to sequential downstream indices
 #[derive(Debug, Default)]
-pub(crate) struct OutputIndexMapper {
+pub(super) struct OutputIndexMapper {
     next_index: usize,
     // Map upstream output_index -> remapped output_index
     assigned: HashMap<usize, usize>,

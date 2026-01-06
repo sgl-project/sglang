@@ -33,7 +33,7 @@ use crate::{
 // ============================================================================
 
 /// State for tracking multi-turn tool calling loop
-pub(crate) struct ToolLoopState {
+pub(super) struct ToolLoopState {
     /// Current iteration number (starts at 0, increments with each tool call)
     pub iteration: usize,
     /// Total number of tool calls executed
@@ -83,7 +83,7 @@ impl ToolLoopState {
 
 /// Represents a function call being accumulated across delta events
 #[derive(Debug, Clone)]
-pub(crate) struct FunctionCallInProgress {
+pub(super) struct FunctionCallInProgress {
     pub call_id: String,
     pub name: String,
     pub arguments_buffer: String,
