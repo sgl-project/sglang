@@ -4,6 +4,7 @@ import openai
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -11,6 +12,9 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=7, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=20, suite="stage-b-test-small-1-gpu")
 
 
 # -------------------------------------------------------------------------
@@ -96,3 +100,9 @@ class TestOpenAIServerEBNF(CustomTestCase):
         self.assertRegex(
             text, pattern, f"Text '{text}' not matching the EBNF strict JSON shape"
         )
+
+
+if __name__ == "__main__":
+    import unittest
+
+    unittest.main()

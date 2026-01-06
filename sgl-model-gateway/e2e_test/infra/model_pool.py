@@ -466,7 +466,7 @@ class ModelPool:
                         "[%.1fs] %s is healthy at %s (check #%d)",
                         elapsed,
                         key,
-                        instance.base_url,
+                        instance.worker_url,
                         check_count,
                     )
                     instance._healthy = True
