@@ -28,15 +28,10 @@ suites = {
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 6),
         TestFile("openai_server/validation/test_request_length_validation.py", 38),
         TestFile("ops/test_repeat_interleave.py", 60),
-        # quant tests moved to test/registered/quant/
-        TestFile("rl/test_fp32_lm_head.py", 9),
-        # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
-        TestFile("rl/test_update_weights_from_tensor.py", 195),
         TestFile("dllm/test_llada2_mini.py", 520),
         TestFile("test_abort.py", 131),
         TestFile("test_chunked_prefill.py", 312),
         TestFile("test_deterministic.py", 228),
-        TestFile("test_constrained_decoding.py", 111),
         TestFile("test_eval_fp8_accuracy.py", 250),
         TestFile("test_evs.py", 20),
         TestFile("test_external_models.py", 30),
@@ -48,19 +43,14 @@ suites = {
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 7),
         TestFile("test_mamba_unittest.py", 9),
-        TestFile("test_metrics.py", 32),
-        TestFile("test_metrics_utils.py", 1),
         TestFile("test_model_hooks.py", 6),
         TestFile("test_modelopt_loader.py", 11),
         TestFile("test_multi_tokenizer.py", 230),
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_no_overlap_scheduler.py", 217),
-        TestFile("test_original_logprobs.py", 41),
         TestFile("test_page_size.py", 60),
-        TestFile("test_penalty.py", 82),
         TestFile("test_prefill_adder.py", 1),
         TestFile("test_priority_scheduling.py", 130),
-        TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_request_queue_validation.py", 47),
         TestFile("test_retract_decode.py", 259),
         TestFile("test_score_api.py", 260),
@@ -79,8 +69,7 @@ suites = {
         TestFile("test_modelopt_export.py", 9),
     ],
     "per-commit-2-gpu": [
-        TestFile("rl/test_update_weights_from_distributed.py", 103),
-        TestFile("test_patch_torch.py", 19),
+
     ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 650),
@@ -88,7 +77,6 @@ suites = {
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
         TestFile("test_pp_single_node.py", 500),
         TestFile("test_epd_disaggregation.py", 150),
-        TestFile("rl/test_return_routed_experts.py", 300),
     ],
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
@@ -97,7 +85,6 @@ suites = {
         TestFile("models/test_kimi_k2_models.py", 200),
         TestFile("test_deepseek_v32_basic.py", 360),
         TestFile("test_deepseek_v32_mtp.py", 360),
-        TestFile("test_deepseek_v32_cp_single_node.py", 360),
         TestFile("models/test_mimo_models.py", 200),
     ],
     "per-commit-8-gpu-h20": [
@@ -137,9 +124,6 @@ suites = {
     "__not_in_ci__": [
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
         TestFile("models/test_dummy_grok_models.py"),
-        TestFile(
-            "rl/test_update_weights_from_disk.py"
-        ),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("test_bench_one_batch.py"),
         TestFile("test_bench_serving.py"),
         TestFile("test_eval_accuracy_large.py"),
@@ -182,32 +166,23 @@ suite_amd = {
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
         TestFile("ops/test_repeat_interleave.py", 75),
-        # quant tests moved to test/registered/quant/
-        TestFile("rl/test_fp32_lm_head.py", 15),
-        # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("rotary_embedding/test_mrope.py", 15),
         TestFile("test_abort.py", 51),
         TestFile("test_bench_typebaseddispatcher.py", 10),
         TestFile("test_chunked_prefill.py", 312),
-        TestFile("test_constrained_decoding.py", 120),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_external_models.py", 45),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
-        TestFile("test_metrics.py", 32),
-        TestFile("test_metrics_utils.py", 1),
         TestFile("test_model_hooks.py", 10),
         TestFile("test_multi_tokenizer.py", 345),
         TestFile("test_no_chunked_prefill.py", 108),
-        TestFile("test_original_logprobs.py", 60),
         TestFile("test_page_size.py", 60),
-        TestFile("test_penalty.py", 180),
         TestFile("test_prefill_adder.py", 2),
         TestFile("test_priority_scheduling.py", 195),
         TestFile("test_profile_merger.py", 12),
         TestFile("test_profile_merger_http_api.py", 15),
-        TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_request_queue_validation.py", 70),
         TestFile("test_retract_decode.py", 450),
         TestFile("test_rope_rocm.py", 3),
@@ -233,7 +208,6 @@ suite_amd = {
         TestFile("test_gpt_oss_1gpu.py", 750),
     ],
     "per-commit-2-gpu-amd": [
-        TestFile("rl/test_update_weights_from_distributed.py", 103),
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),

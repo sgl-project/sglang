@@ -888,14 +888,17 @@ class ServerArgs:
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
 
         if self.ring_degree > 1:
-            if self.attention_backend is not None and self.attention_backend != "fa":
+            if self.attention_backend is not None and self.attention_backend not in (
+                "fa",
+                "sage_attn",
+            ):
                 raise ValueError(
-                    "Ring Attention is only supported for flash attention backend for now"
+                    "Ring Attention is only supported for flash attention or sage attention backend for now"
                 )
-            else:
+            if self.attention_backend is None:
                 self.attention_backend = "fa"
                 logger.info(
-                    "Ring Attention is currently only supported for flash attention, attention_backend has been automatically set to flash attention"
+                    "Ring Attention is currently only supported for flash attention or sage attention; attention_backend has been automatically set to flash attention"
                 )
 
         if self.sp_degree == -1:
