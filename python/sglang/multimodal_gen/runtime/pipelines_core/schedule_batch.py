@@ -153,7 +153,7 @@ class Req:
     timings: Optional["RequestTimings"] = None
 
     # results
-    output: torch.Tensor | None = None
+    output: torch.Tensor | list[str] | None = None
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields

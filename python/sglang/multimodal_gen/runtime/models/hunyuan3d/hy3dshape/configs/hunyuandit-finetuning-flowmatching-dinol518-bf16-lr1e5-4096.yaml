@@ -1,0 +1,130 @@
+name: "HunyuanDiT flowmatching; VAE: 4096 token length; ImageEncoder: DINO-v2 Large; ImageSize: 518"
+# training successfully on 8 x H20 with 98G Memory
+
+training:
+  steps: 10_0000_0000
+  use_amp: true
+  amp_type: "bf16"
+  base_lr: 1e-5
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
+  every_n_train_steps: 2000 # 5000
+  val_check_interval: 200 # 4096 
+  # val_check_interval must be smaller than every_n_train_steps!!!
+  limit_val_batches: 16
+
+dataset:
+  target: hy3dshape.data.dit_asl.AlignedShapeLatentModule
+  params:
+    #! Base setting
+    batch_size: 4
+    num_workers: 8
+    val_num_workers: 4
+
+    # Data 
+    train_data_list: tools/mini_trainset/preprocessed
+    val_data_list: tools/mini_trainset/preprocessed
+
+    #! Image loading
+    cond_stage_key: "image"
+    image_size: 518
+    mean: &mean [0.5, 0.5, 0.5]
+    std: &std [0.5, 0.5, 0.5]
+
+    #! Point cloud sampling
+    pc_size: &pc_size 81920
+    pc_sharpedge_size: &pc_sharpedge_size 0
+    sharpedge_label: &sharpedge_label true
+    return_normal: true
+
+    #! Augmentation
+    padding: true
+
+model:
+  target: hy3dshape.models.diffusion.flow_matching_sit.Diffuser
+  params:
+    first_stage_key: "surface"
+    cond_stage_key: "image"
+    scale_by_std: false
+    z_scale_factor: &z_scale_factor 1.0039506158752403
+    torch_compile: false
+
+    # ema_config:
+    #   ema_model: LitEma
+    #   ema_decay: 0.999
+    #   ema_inference: false
+
+    first_stage_config:
+      target: hy3dshape.models.autoencoders.ShapeVAE
+      from_pretrained: tencent/Hunyuan3D-2.1
+
+    cond_stage_config:
+      target: hy3dshape.models.conditioner.SingleImageEncoder
+      params:
+        drop_ratio: 0.1
+        main_image_encoder:
+            type: DinoImageEncoder 
+            kwargs:
+                version: 'facebook/dinov2-large'
+                image_size: 518
+                use_cls_token: true
+
+    denoiser_cfg:
+      target: hy3dshape.models.denoisers.hunyuandit.HunYuanDiTPlain
+      from_pretrained: tencent/Hunyuan3D-2.1
+        
+    scheduler_cfg:
+      transport:
+        target: hy3dshape.models.diffusion.transport.create_transport
+        params:
+          path_type: Linear
+          prediction: velocity
+      sampler:
+        target: hy3dshape.models.diffusion.transport.Sampler
+        params: {}
+        ode_params:
+          sampling_method: euler # dopri5 ...
+          num_steps: &num_steps 50
+
+    optimizer_cfg:
+      optimizer:
+        target: torch.optim.AdamW
+        params:
+          betas: [0.9, 0.99]
+          eps: 1.e-6
+          weight_decay: 1.e-2
+
+      scheduler:
+        target: hy3dshape.utils.trainings.lr_scheduler.LambdaWarmUpCosineFactorScheduler
+        params:
+          warm_up_steps: 50 # 5000
+          f_start: 1.e-6
+          f_min: 1.e-3
+          f_max: 1.0
+
+    pipeline_cfg:
+      target: hy3dshape.pipelines.Hunyuan3DDiTFlowMatchingPipeline
+
+    image_processor_cfg:
+      target: hy3dshape.preprocessors.ImageProcessorV2
+      params: {}
+
+callbacks:
+    logger:
+      target: hy3dshape.utils.trainings.mesh_log_callback.ImageConditionalASLDiffuserLogger
+      params:
+        step_frequency: 1000 # 10000
+        num_samples: 1
+        sample_times: 1
+        mean: *mean
+        std: *std
+        bounds: [-1.01, -1.01, -1.01, 1.01, 1.01, 1.01]
+        octree_depth: 8
+        num_chunks: 50000
+        mc_level: 0.0
+    
+    file_loggers:
+        target: hy3dshape.utils.trainings.mesh_log_callback.ImageConditionalFixASLDiffuserLogger
+        params:
+          step_frequency: 500 # 5000
+          test_data_path: "tools/mini_testset/images.json"

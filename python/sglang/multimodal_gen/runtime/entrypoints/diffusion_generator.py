@@ -256,36 +256,50 @@ class DiffGenerator:
                                 isinstance(sample, (tuple, list)) and len(sample) == 2
                             ):
                                 sample = (sample, audio)
-                        frames = post_process_sample(
-                            sample,
-                            fps=req.fps,
-                            save_output=req.save_output,
-                            # TODO: output file path for req should be determined
-                            save_file_path=req.output_file_path(
-                                num_outputs, output_idx
-                            ),
-                            data_type=req.data_type,
-                            audio_sample_rate=audio_sample_rate,
-                        )
+                        if req.data_type == DataType.MESH:
+                            result_item = {
+                                "mesh_path": sample,
+                                "prompts": req.prompt,
+                                "generation_time": timer.duration,
+                                "peak_memory_mb": output_batch.peak_memory_mb,
+                                "timings": (
+                                    output_batch.timings.to_dict()
+                                    if output_batch.timings
+                                    else {}
+                                ),
+                                "prompt_index": output_idx,
+                            }
+                        else:
+                            frames = post_process_sample(
+                                sample,
+                                fps=req.fps,
+                                save_output=req.save_output,
+                                # TODO: output file path for req should be determined
+                                save_file_path=req.output_file_path(
+                                    num_outputs, output_idx
+                                ),
+                                data_type=req.data_type,
+                                audio_sample_rate=audio_sample_rate,
+                            )
 
-                        result_item: dict[str, Any] = {
-                            "samples": sample,
-                            "frames": frames,
-                            "audio": audio,
-                            "prompts": req.prompt,
-                            "size": (req.height, req.width, req.num_frames),
-                            "generation_time": timer.duration,
-                            "peak_memory_mb": output_batch.peak_memory_mb,
-                            "timings": (
-                                output_batch.timings.to_dict()
-                                if output_batch.timings
-                                else {}
-                            ),
-                            "trajectory": output_batch.trajectory_latents,
-                            "trajectory_timesteps": output_batch.trajectory_timesteps,
-                            "trajectory_decoded": output_batch.trajectory_decoded,
-                            "prompt_index": output_idx,
-                        }
+                            result_item = {
+                                "samples": sample,
+                                "frames": frames,
+                                "audio": audio,
+                                "prompts": req.prompt,
+                                "size": (req.height, req.width, req.num_frames),
+                                "generation_time": timer.duration,
+                                "peak_memory_mb": output_batch.peak_memory_mb,
+                                "timings": (
+                                    output_batch.timings.to_dict()
+                                    if output_batch.timings
+                                    else {}
+                                ),
+                                "trajectory": output_batch.trajectory_latents,
+                                "trajectory_timesteps": output_batch.trajectory_timesteps,
+                                "trajectory_decoded": output_batch.trajectory_decoded,
+                                "prompt_index": output_idx,
+                            }
                         results.append(result_item)
             except Exception:
                 continue
@@ -314,7 +328,10 @@ class DiffGenerator:
             return None
         else:
             if requests[0].return_frames:
-                results = [r["frames"] for r in results]
+                if requests[0].data_type == DataType.MESH:
+                    results = [r["mesh_path"] for r in results]
+                else:
+                    results = [r["frames"] for r in results]
             if len(results) == 1:
                 return results[0]
             return results

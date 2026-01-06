@@ -1,0 +1,40 @@
+ninja
+pybind11
+
+diffusers
+einops
+opencv-python
+numpy
+torch
+transformers
+torchvision
+#taming-transformers-rom1504
+#ConfigArgParse
+#ipdb
+omegaconf
+
+#sentencepiece
+tqdm
+
+# Mesh Processing
+trimesh
+pymeshlab
+pygltflib
+xatlas
+#kornia
+#facexlib
+
+# Training
+accelerate
+#pytorch_lightning
+#scikit-learn
+#scikit-image
+
+# Demo only
+gradio
+fastapi
+uvicorn
+rembg
+onnxruntime
+#gevent
+#geventhttpclient

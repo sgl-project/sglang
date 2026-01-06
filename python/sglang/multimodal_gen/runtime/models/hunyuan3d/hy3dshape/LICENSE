@@ -1,0 +1,81 @@
+TENCENT HUNYUAN 3D 2.1 COMMUNITY LICENSE AGREEMENT
+Tencent Hunyuan 3D 2.1 Release Date: June 13, 2025
+THIS LICENSE AGREEMENT DOES NOT APPLY IN THE EUROPEAN UNION, UNITED KINGDOM AND SOUTH KOREA AND IS EXPRESSLY LIMITED TO THE TERRITORY, AS DEFINED BELOW.
+By clicking to agree or by using, reproducing, modifying, distributing, performing or displaying any portion or element of the Tencent Hunyuan 3D 2.1 Works, including via any Hosted Service, You will be deemed to have recognized and accepted the content of this Agreement, which is effective immediately.
+1.	DEFINITIONS.
+a.	“Acceptable Use Policy” shall mean the policy made available by Tencent as set forth in the Exhibit A.
+b.	“Agreement” shall mean the terms and conditions for use, reproduction, distribution, modification, performance and displaying of Tencent Hunyuan 3D 2.1 Works or any portion or element thereof set forth herein.
+c.	“Documentation” shall mean the specifications, manuals and documentation for Tencent Hunyuan 3D 2.1 made publicly available by Tencent.
+d.	“Hosted Service” shall mean a hosted service offered via an application programming interface (API), web access, or any other electronic or remote means.
+e.	“Licensee,” “You” or “Your” shall mean a natural person or legal entity exercising the rights granted by this Agreement and/or using the Tencent Hunyuan 3D 2.1 Works for any purpose and in any field of use.
+f.	“Materials” shall mean, collectively, Tencent’s proprietary Tencent Hunyuan 3D 2.1 and Documentation (and any portion thereof) as made available by Tencent under this Agreement.
+g.	“Model Derivatives” shall mean all: (i) modifications to Tencent Hunyuan 3D 2.1 or any Model Derivative of Tencent Hunyuan 3D 2.1; (ii) works based on Tencent Hunyuan 3D 2.1 or any Model Derivative of Tencent Hunyuan 3D 2.1; or (iii) any other machine learning model which is created by transfer of patterns of the weights, parameters, operations, or Output of Tencent Hunyuan 3D 2.1 or any Model Derivative of Tencent Hunyuan 3D 2.1, to that model in order to cause that model to perform similarly to Tencent Hunyuan 3D 2.1 or a Model Derivative of Tencent Hunyuan 3D 2.1, including distillation methods, methods that use intermediate data representations, or methods based on the generation of synthetic data Outputs by Tencent Hunyuan 3D 2.1 or a Model Derivative of Tencent Hunyuan 3D 2.1 for training that model. For clarity, Outputs by themselves are not deemed Model Derivatives.
+h.	“Output” shall mean the information and/or content output of Tencent Hunyuan 3D 2.1 or a Model Derivative that results from operating or otherwise using Tencent Hunyuan 3D 2.1 or a Model Derivative, including via a Hosted Service.
+i.	“Tencent,” “We” or “Us” shall mean THL Q Limited.
+j.	“Tencent Hunyuan 3D 2.1” shall mean the 3D generation models and their software and algorithms, including trained model weights, parameters (including optimizer states), machine-learning model code, inference-enabling code, training-enabling code, fine-tuning enabling code and other elements of the foregoing made publicly available by Us at [ https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1].
+k.	“Tencent Hunyuan 3D 2.1 Works” shall mean: (i) the Materials; (ii) Model Derivatives; and (iii) all derivative works thereof.
+l.	“Territory” shall mean the worldwide territory, excluding the territory of the European Union, United Kingdom and South Korea. 
+m.	“Third Party” or “Third Parties” shall mean individuals or legal entities that are not under common control with Us or You.
+n.	“including” shall mean including but not limited to.
+2.	GRANT OF RIGHTS.
+We grant You, for the Territory only, a non-exclusive, non-transferable and royalty-free limited license under Tencent’s intellectual property or other rights owned by Us embodied in or utilized by the Materials to use, reproduce, distribute, create derivative works of (including Model Derivatives), and make modifications to the Materials, only in accordance with the terms of this Agreement and the Acceptable Use Policy, and You must not violate (or encourage or permit anyone else to violate) any term of this Agreement or the Acceptable Use Policy.
+3.	DISTRIBUTION.
+You may, subject to Your compliance with this Agreement, distribute or make available to Third Parties the Tencent Hunyuan 3D 2.1 Works, exclusively in the Territory, provided that You meet all of the following conditions:
+a.	You must provide all such Third Party recipients of the Tencent Hunyuan 3D 2.1 Works or products or services using them a copy of this Agreement;
+b.	You must cause any modified files to carry prominent notices stating that You changed the files;
+c.	You are encouraged to: (i) publish at least one technology introduction blogpost or one public statement expressing Your experience of using the Tencent Hunyuan 3D 2.1 Works; and (ii) mark the products or services developed by using the Tencent Hunyuan 3D 2.1 Works to indicate that the product/service is “Powered by Tencent Hunyuan”; and
+d.	All distributions to Third Parties (other than through a Hosted Service) must be accompanied by a “Notice” text file that contains the following notice: “Tencent Hunyuan 3D 2.1 is licensed under the Tencent Hunyuan 3D 2.1 Community License Agreement, Copyright © 2025 Tencent. All Rights Reserved. The trademark rights of “Tencent Hunyuan” are owned by Tencent or its affiliate.”
+You may add Your own copyright statement to Your modifications and, except as set forth in this Section and in Section 5, may provide additional or different license terms and conditions for use, reproduction, or distribution of Your modifications, or for any such Model Derivatives as a whole, provided Your use, reproduction, modification, distribution, performance and display of the work otherwise complies with the terms and conditions of this Agreement (including as regards the Territory). If You receive Tencent Hunyuan 3D 2.1 Works from a Licensee as part of an integrated end user product, then this Section 3 of this Agreement will not apply to You.
+4.	ADDITIONAL COMMERCIAL TERMS.
+If, on the Tencent Hunyuan 3D 2.1 version release date, the monthly active users of all products or services made available by or for Licensee is greater than 1 million monthly active users in the preceding calendar month, You must request a license from Tencent, which Tencent may grant to You in its sole discretion, and You are not authorized to exercise any of the rights under this Agreement unless or until Tencent otherwise expressly grants You such rights. 
+Subject to Tencent's written approval, you may request a license for the use of Tencent Hunyuan 3D 2.1 by submitting the following information to hunyuan3d@tencent.com:
+a.	Your company’s name and associated business sector that plans to use Tencent Hunyuan 3D 2.1.
+b.	Your intended use case and the purpose of using Tencent Hunyuan 3D 2.1.
+c.	Your plans to modify Tencent Hunyuan 3D 2.1 or create Model Derivatives.
+5.	RULES OF USE.
+a.	Your use of the Tencent Hunyuan 3D 2.1 Works must comply with applicable laws and regulations (including trade compliance laws and regulations) and adhere to the Acceptable Use Policy for the Tencent Hunyuan 3D 2.1 Works, which is hereby incorporated by reference into this Agreement. You must include the use restrictions referenced in these Sections 5(a) and 5(b) as an enforceable provision in any agreement (e.g., license agreement, terms of use, etc.) governing the use and/or distribution of Tencent Hunyuan 3D 2.1 Works and You must provide notice to subsequent users to whom You distribute that Tencent Hunyuan 3D 2.1 Works are subject to the use restrictions in these Sections 5(a) and 5(b).
+b.	You must not use the Tencent Hunyuan 3D 2.1 Works or any Output or results of the Tencent Hunyuan 3D 2.1 Works to improve any other AI model (other than Tencent Hunyuan 3D 2.1 or Model Derivatives thereof).
+c.	You must not use, reproduce, modify, distribute, or display the Tencent Hunyuan 3D 2.1 Works, Output or results of the Tencent Hunyuan 3D 2.1 Works outside the Territory. Any such use outside the Territory is unlicensed and unauthorized under this Agreement.
+6.	INTELLECTUAL PROPERTY.
+a.	Subject to Tencent’s ownership of Tencent Hunyuan 3D 2.1 Works made by or for Tencent and intellectual property rights therein, conditioned upon Your compliance with the terms and conditions of this Agreement, as between You and Tencent, You will be the owner of any derivative works and modifications of the Materials and any Model Derivatives that are made by or for You.
+b.	No trademark licenses are granted under this Agreement, and in connection with the Tencent Hunyuan 3D 2.1 Works, Licensee may not use any name or mark owned by or associated with Tencent or any of its affiliates, except as required for reasonable and customary use in describing and distributing the Tencent Hunyuan 3D 2.1 Works. Tencent hereby grants You a license to use “Tencent Hunyuan” (the “Mark”) in the Territory solely as required to comply with the provisions of Section 3(c), provided that You comply with any applicable laws related to trademark protection. All goodwill arising out of Your use of the Mark will inure to the benefit of Tencent.
+c.	If You commence a lawsuit or other proceedings (including a cross-claim or counterclaim in a lawsuit) against Us or any person or entity alleging that the Materials or any Output, or any portion of any of the foregoing, infringe any intellectual property or other right owned or licensable by You, then all licenses granted to You under this Agreement shall terminate as of the date such lawsuit or other proceeding is filed. You will defend, indemnify and hold harmless Us from and against any claim by any Third Party arising out of or related to Your or the Third Party’s use or distribution of the Tencent Hunyuan 3D 2.1 Works.
+d.	Tencent claims no rights in Outputs You generate. You and Your users are solely responsible for Outputs and their subsequent uses.
+7.	DISCLAIMERS OF WARRANTY AND LIMITATIONS OF LIABILITY.
+a.	We are not obligated to support, update, provide training for, or develop any further version of the Tencent Hunyuan 3D 2.1 Works or to grant any license thereto.
+b.	UNLESS AND ONLY TO THE EXTENT REQUIRED BY APPLICABLE LAW, THE TENCENT HUNYUAN 3D 2.1 WORKS AND ANY OUTPUT AND RESULTS THEREFROM ARE PROVIDED “AS IS” WITHOUT ANY EXPRESS OR IMPLIED WARRANTIES OF ANY KIND INCLUDING ANY WARRANTIES OF TITLE, MERCHANTABILITY, NONINFRINGEMENT, COURSE OF DEALING, USAGE OF TRADE, OR FITNESS FOR A PARTICULAR PURPOSE. YOU ARE SOLELY RESPONSIBLE FOR DETERMINING THE APPROPRIATENESS OF USING, REPRODUCING, MODIFYING, PERFORMING, DISPLAYING OR DISTRIBUTING ANY OF THE TENCENT HUNYUAN 3D 2.1 WORKS OR OUTPUTS AND ASSUME ANY AND ALL RISKS ASSOCIATED WITH YOUR OR A THIRD PARTY’S USE OR DISTRIBUTION OF ANY OF THE TENCENT HUNYUAN 3D 2.1 WORKS OR OUTPUTS AND YOUR EXERCISE OF RIGHTS AND PERMISSIONS UNDER THIS AGREEMENT.
+c.	TO THE FULLEST EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL TENCENT OR ITS AFFILIATES BE LIABLE UNDER ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, TORT, NEGLIGENCE, PRODUCTS LIABILITY, OR OTHERWISE, FOR ANY DAMAGES, INCLUDING ANY DIRECT, INDIRECT, SPECIAL, INCIDENTAL, EXEMPLARY, CONSEQUENTIAL OR PUNITIVE DAMAGES, OR LOST PROFITS OF ANY KIND ARISING FROM THIS AGREEMENT OR RELATED TO ANY OF THE TENCENT HUNYUAN 3D 2.1 WORKS OR OUTPUTS, EVEN IF TENCENT OR ITS AFFILIATES HAVE BEEN ADVISED OF THE POSSIBILITY OF ANY OF THE FOREGOING.
+8.	SURVIVAL AND TERMINATION.
+a.	The term of this Agreement shall commence upon Your acceptance of this Agreement or access to the Materials and will continue in full force and effect until terminated in accordance with the terms and conditions herein.
+b.	We may terminate this Agreement if You breach any of the terms or conditions of this Agreement. Upon termination of this Agreement, You must promptly delete and cease use of the Tencent Hunyuan 3D 2.1 Works. Sections 6(a), 6(c), 7 and 9 shall survive the termination of this Agreement.
+9.	GOVERNING LAW AND JURISDICTION.
+a.	This Agreement and any dispute arising out of or relating to it will be governed by the laws of the Hong Kong Special Administrative Region of the People’s Republic of China, without regard to conflict of law principles, and the UN Convention on Contracts for the International Sale of Goods does not apply to this Agreement.
+b.	Exclusive jurisdiction and venue for any dispute arising out of or relating to this Agreement will be a court of competent jurisdiction in the Hong Kong Special Administrative Region of the People’s Republic of China, and Tencent and Licensee consent to the exclusive jurisdiction of such court with respect to any such dispute.
+ 
+EXHIBIT A
+ACCEPTABLE USE POLICY
+
+Tencent reserves the right to update this Acceptable Use Policy from time to time.
+Last modified: November 5, 2024
+
+Tencent endeavors to promote safe and fair use of its tools and features, including Tencent Hunyuan 3D 2.1. You agree not to use Tencent Hunyuan 3D 2.1 or Model Derivatives:
+1.	Outside the Territory;
+2.	In any way that violates any applicable national, federal, state, local, international or any other law or regulation;
+3.	To harm Yourself or others;
+4.	To repurpose or distribute output from Tencent Hunyuan 3D 2.1 or any Model Derivatives to harm Yourself or others; 
+5.	To override or circumvent the safety guardrails and safeguards We have put in place;
+6.	For the purpose of exploiting, harming or attempting to exploit or harm minors in any way;
+7.	To generate or disseminate verifiably false information and/or content with the purpose of harming others or influencing elections;
+8.	To generate or facilitate false online engagement, including fake reviews and other means of fake online engagement;
+9.	To intentionally defame, disparage or otherwise harass others;
+10.	To generate and/or disseminate malware (including ransomware) or any other content to be used for the purpose of harming electronic systems;
+11.	To generate or disseminate personal identifiable information with the purpose of harming others;
+12.	To generate or disseminate information (including images, code, posts, articles), and place the information in any public context (including –through the use of bot generated tweets), without expressly and conspicuously identifying that the information and/or content is machine generated;
+13.	To impersonate another individual without consent, authorization, or legal right;
+14.	To make high-stakes automated decisions in domains that affect an individual’s safety, rights or wellbeing (e.g., law enforcement, migration, medicine/health, management of critical infrastructure, safety components of products, essential services, credit, employment, housing, education, social scoring, or insurance);
+15.	In a manner that violates or disrespects the social ethics and moral standards of other countries or regions;
+16.	To perform, facilitate, threaten, incite, plan, promote or encourage violent extremism or terrorism;
+17.	For any use intended to discriminate against or harm individuals or groups based on protected characteristics or categories, online or offline social behavior or known or predicted personal or personality characteristics;
+18.	To intentionally exploit any of the vulnerabilities of a specific group of persons based on their age, social, physical or mental characteristics, in order to materially distort the behavior of a person pertaining to that group in a manner that causes or is likely to cause that person or another person physical or psychological harm;
+19.	For military purposes;
+20.	To engage in the unauthorized or unlicensed practice of any profession including, but not limited to, financial, legal, medical/health, or other professional practices.

@@ -280,3 +280,8 @@ sgl-kernel/third_party/
 
 # MUSA core dump files
 core_*
+
+# Others
+*.glb
+*.ply
+*.npz

@@ -7,11 +7,12 @@ import glob
 import importlib.util
 import json
 import os
+import sys
 import traceback
 from abc import ABC
 from collections.abc import Generator, Iterable
 from copy import deepcopy
-from typing import Any, cast
+from typing import Any, Dict, cast
 
 import torch
 import torch.distributed as dist
@@ -50,6 +51,20 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+
+_HY3D_SHAPE_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _ensure_hunyuan3d_shape_path(repo_path: str) -> str:
+    repo_root = os.path.abspath(repo_path)
+    shape_root = os.path.join(repo_root, "hy3dshape")
+    if not os.path.isdir(shape_root):
+        raise FileNotFoundError(
+            "Hunyuan3D repo path must contain 'hy3dshape': " f"{repo_root}"
+        )
+    if shape_root not in sys.path:
+        sys.path.insert(0, shape_root)
+    return shape_root
 
 
 class skip_init_modules:
@@ -266,6 +281,11 @@ class ComponentLoader(ABC):
             "image_processor": (ImageProcessorLoader, "transformers"),
             "image_encoder": (ImageEncoderLoader, "transformers"),
             "processor": (AutoProcessorLoader, "transformers"),
+            "hy3dshape_model": (Hunyuan3DShapeLoader, "diffusers"),
+            "hy3dshape_vae": (Hunyuan3DShapeLoader, "diffusers"),
+            "hy3dshape_scheduler": (Hunyuan3DShapeLoader, "diffusers"),
+            "hy3dshape_conditioner": (Hunyuan3DShapeLoader, "diffusers"),
+            "hy3dshape_image_processor": (Hunyuan3DShapeLoader, "diffusers"),
             "vision_language_encoder": (VisionLanguageEncoderLoader, "transformers"),
         }
 
@@ -955,6 +975,87 @@ class VisionLanguageEncoderLoader(ComponentLoader):
             raise ValueError(
                 f"Unsupported library for VisionLanguageEncoder: {transformers_or_diffusers}"
             )
+
+
+class Hunyuan3DShapeLoader(ComponentLoader):
+    """Loader for Hunyuan3D shape components."""
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
+    ):
+        from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
+            Hunyuan3DPipelineConfig,
+        )
+
+        config = server_args.pipeline_config
+        if not isinstance(config, Hunyuan3DPipelineConfig):
+            raise ValueError(
+                f"Hunyuan3DShapeLoader expects Hunyuan3DPipelineConfig, got {type(config)}"
+            )
+
+        model_path = config.shape_model_path or server_args.model_path
+        cache_key = (
+            f"{model_path}:{config.shape_subfolder}:"
+            f"{config.shape_use_safetensors}:{config.shape_variant}"
+        )
+        if cache_key not in _HY3D_SHAPE_CACHE:
+            _ensure_hunyuan3d_shape_path(config.hunyuan3d_repo_path)
+            from hy3dshape.pipelines import instantiate_from_config
+            from hy3dshape.utils import smart_load_model
+            import yaml
+
+            config_path, ckpt_path = smart_load_model(
+                model_path,
+                subfolder=config.shape_subfolder,
+                use_safetensors=config.shape_use_safetensors,
+                variant=config.shape_variant,
+            )
+
+            with open(config_path, "r") as f:
+                model_config = yaml.safe_load(f)
+
+            if config.shape_use_safetensors:
+                import safetensors.torch
+
+                safetensors_ckpt = safetensors.torch.load_file(ckpt_path, device="cpu")
+                ckpt = {}
+                for key, value in safetensors_ckpt.items():
+                    model_name = key.split(".")[0]
+                    new_key = key[len(model_name) + 1 :]
+                    if model_name not in ckpt:
+                        ckpt[model_name] = {}
+                    ckpt[model_name][new_key] = value
+            else:
+                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+
+            model = instantiate_from_config(model_config["model"])
+            model.load_state_dict(ckpt["model"])
+            vae = instantiate_from_config(model_config["vae"])
+            vae.load_state_dict(ckpt["vae"], strict=False)
+            conditioner = instantiate_from_config(model_config["conditioner"])
+            if "conditioner" in ckpt:
+                conditioner.load_state_dict(ckpt["conditioner"])
+            image_processor = instantiate_from_config(model_config["image_processor"])
+            scheduler = instantiate_from_config(model_config["scheduler"])
+
+            dtype = torch.float16
+            if config.shape_variant and "bf16" in config.shape_variant:
+                dtype = torch.bfloat16
+            device = get_local_torch_device()
+
+            for module in (model, vae, conditioner):
+                module.to(device=device, dtype=dtype)
+                module.eval()
+
+            _HY3D_SHAPE_CACHE[cache_key] = {
+                "hy3dshape_model": model,
+                "hy3dshape_vae": vae,
+                "hy3dshape_conditioner": conditioner,
+                "hy3dshape_image_processor": image_processor,
+                "hy3dshape_scheduler": scheduler,
+            }
+
+        return _HY3D_SHAPE_CACHE[cache_key][module_name]
 
 
 class PipelineComponentLoader:

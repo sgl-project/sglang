@@ -66,12 +66,14 @@ def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150)
 class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
+    MESH = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
             return "png"
-        else:
+        if self == DataType.VIDEO:
             return "mp4"
+        return "obj"
 
 
 @dataclass
@@ -156,7 +158,7 @@ class SamplingParams:
         # add extension if needed
         if not any(
             self.output_file_name.endswith(ext)
-            for ext in [".mp4", ".jpg", ".png", ".webp"]
+            for ext in [".mp4", ".jpg", ".png", ".webp", ".obj", ".glb"]
         ):
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"

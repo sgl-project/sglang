@@ -1,0 +1,52 @@
+model:
+  base_learning_rate: 5.0e-05
+  target: hunyuanpaintpbr.model.HunyuanPaint
+  params:
+    num_view: 6
+    view_size: 512
+    drop_cond_prob: 0.1
+    
+    noise_in_channels: 12
+
+    stable_diffusion_config:
+      pretrained_model_name_or_path: stabilityai/stable-diffusion-2-1
+      custom_pipeline: ./hunyuanpaintpbr
+      
+
+data:
+  target: src.data.objaverse_hunyuan.DataModuleFromConfig
+  params:
+    batch_size: 1
+    num_workers: 4
+    train:
+      - 
+        target: src.data.dataloader.objaverse_loader_forTexturePBR.TextureDataset
+        params:
+          num_view: 6
+          json_path: train_examples/examples.json
+    validation:
+      -
+        target: src.data.dataloader.objaverse_loader_forTexturePBR.TextureDataset
+        params:
+          num_view: 6
+          json_path: train_examples/examples.json
+
+lightning:
+  modelcheckpoint:
+    params:
+      every_n_train_steps: 10000
+      save_top_k: -1
+      save_last: true
+  callbacks: {}
+
+  trainer:
+    benchmark: true
+    max_epochs: -1
+    gradient_clip_val: 1.0
+    val_check_interval: 1000
+    num_sanity_val_steps: 0
+    accumulate_grad_batches: 1
+    check_val_every_n_epoch: null   # if not set this, validation does not run
+
+init_control_from:
+resume_from: 

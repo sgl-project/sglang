@@ -10,7 +10,10 @@ import torch
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import ORJSONResponse
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
@@ -118,36 +121,39 @@ async def forward_to_scheduler(req_obj, sp):
             raise RuntimeError("Model generation returned no output.")
 
         output_file_path = sp.output_file_path()
-        sample = response.output[0]
-        try:
-            audio = response.audio
-        except AttributeError:
-            audio = None
-        if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-            audio = audio[0]
-        if audio is not None and not (
-            isinstance(sample, (tuple, list)) and len(sample) == 2
-        ):
-            sample = (sample, audio)
-        post_process_sample(
-            sample=sample,
-            data_type=sp.data_type,
-            fps=sp.fps or 24,
-            save_output=True,
-            save_file_path=output_file_path,
-            audio_sample_rate=(
-                response.audio_sample_rate
-                if hasattr(response, "audio_sample_rate")
-                else None
-            ),
-        )
+        if sp.data_type != DataType.MESH:
+            sample = response.output[0]
+            try:
+                audio = response.audio
+            except AttributeError:
+                audio = None
+            if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+                audio = audio[0]
+            if audio is not None and not (
+                isinstance(sample, (tuple, list)) and len(sample) == 2
+            ):
+                sample = (sample, audio)
+            post_process_sample(
+                    sample=sample,
+                    data_type=sp.data_type,
+                    fps=sp.fps or 24,
+                    save_output=True,
+                    save_file_path=output_file_path,
+                    audio_sample_rate=(
+                    response.audio_sample_rate
+                    if hasattr(response, "audio_sample_rate")
+                    else None
+                ),
+            )
 
         if hasattr(response, "model_dump"):
             data = response.model_dump()
         else:
             data = response if isinstance(response, dict) else vars(response)
 
-        if output_file_path:
+        if sp.data_type == DataType.MESH:
+            data["output"] = response.output
+        elif output_file_path:
             print(f"Processing output file: {output_file_path}")
             b64_video = encode_video_to_base64(output_file_path)
 

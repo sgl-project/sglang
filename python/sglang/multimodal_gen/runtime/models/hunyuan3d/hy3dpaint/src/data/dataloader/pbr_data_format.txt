@@ -1,0 +1,10 @@
++-----------------+----------------------------------+
+|       Key       |              Value               |
++-----------------+----------------------------------+
+|   images_cond   | torch.Size([2, 2, 3, 512, 512])  |
+|  images_albedo  | torch.Size([2, 6, 3, 512, 512])  |
+|    images_mr    | torch.Size([2, 6, 3, 512, 512])  |
+|  images_normal  | torch.Size([2, 6, 3, 512, 512])  |
+| images_position | torch.Size([2, 6, 3, 512, 512])  |
+|     caption     | ['high quality', 'high quality'] |
++-----------------+----------------------------------+

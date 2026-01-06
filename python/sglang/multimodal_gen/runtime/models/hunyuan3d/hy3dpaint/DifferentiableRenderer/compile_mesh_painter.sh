@@ -1,0 +1,1 @@
+c++ -O3 -Wall -shared -std=c++11 -fPIC `python -m pybind11 --includes` mesh_inpaint_processor.cpp -o mesh_inpaint_processor`python3-config --extension-suffix`
