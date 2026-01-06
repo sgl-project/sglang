@@ -342,12 +342,21 @@ async def async_request_openai_chat_completions(
     if isinstance(request_func_input.prompt, list):
         messages = request_func_input.prompt
     elif request_func_input.image_data:
+        # Build multi-image content: a list of image_url entries followed by the text
         content_items = [
-            {"type": "image_url", "image_url": {"url": img_url}}
+            {
+                "type": "image_url",
+                "image_url": {"url": img_url},
+            }
             for img_url in request_func_input.image_data
         ]
         content_items.append({"type": "text", "text": request_func_input.prompt})
-        messages = [{"role": "user", "content": content_items}]
+        messages = [
+            {
+                "role": "user",
+                "content": content_items,
+            },
+        ]
     else:
         messages = [{"role": "user", "content": request_func_input.prompt}]
 
@@ -1766,6 +1775,7 @@ def sample_generated_shared_prefix_requests(
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
     should_cache = (range_ratio == 1) and not send_routing_key and num_turns == 1
 
+    # Try to load from cache first
     if cache_path.exists() and should_cache:
         print(f"\nLoading cached generated input data from {cache_path}")
         with open(cache_path, "rb") as f:
@@ -1797,16 +1807,19 @@ def sample_generated_shared_prefix_requests(
     )
     del system_prompt_len, question_len, output_len
 
+    # Generate system prompts for each group
     system_prompts = []
     for i in range(num_groups):
         system_prompt = gen_prompt(tokenizer, system_prompt_lens[i].item())
         system_prompts.append(system_prompt)
 
+    # Generate questions
     questions = []
     for i in range(total_questions):
         question = gen_prompt(tokenizer, question_lens[i].item())
         questions.append(question)
 
+    # Combine system prompts with questions
     input_requests = []
     total_input_tokens = 0
     total_output_tokens = 0
@@ -1844,8 +1857,10 @@ def sample_generated_shared_prefix_requests(
             total_input_tokens += prompt_len
             total_output_tokens += output_lens[flat_index].item()
 
+    # Shuffle questions
     random.shuffle(input_requests)
 
+    # Print statistics
     print(f"\nGenerated shared prefix dataset statistics:")
     print(f"Number of groups: {num_groups}")
     print(f"Prompts per group: {prompts_per_group}")
@@ -1861,6 +1876,7 @@ def sample_generated_shared_prefix_requests(
             f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
         )
 
+    # Save to cache
     if should_cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Caching generated input data to {cache_path}")
