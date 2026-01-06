@@ -870,6 +870,12 @@ def run_bench_serving(
         seed=seed,
         device=device,
         lora_name=lora_name,
+        gsp_num_groups=gsp_num_groups,
+        gsp_prompts_per_group=gsp_prompts_per_group,
+        gsp_system_prompt_len=gsp_system_prompt_len,
+        gsp_question_len=gsp_question_len,
+        gsp_output_len=gsp_output_len,
+        gsp_num_turns=gsp_num_turns,
     )
 
     async def _run():
@@ -901,7 +907,8 @@ def run_bench_serving(
     finally:
         kill_process_tree(process.pid)
 
-    assert res["completed"] == num_prompts
+    expected_completed = num_prompts * gsp_num_turns if gsp_num_turns > 1 else num_prompts
+    assert res["completed"] == expected_completed
     return res
 
 
