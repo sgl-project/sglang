@@ -1920,4 +1920,153 @@ mod tests {
         // Not found
         assert!(metadata.find_model("unknown-model").is_none());
     }
+
+    #[test]
+    fn test_worker_routing_key_load_increment_decrement() {
+        let load = WorkerRoutingKeyLoad::new("http://test:8000");
+        assert_eq!(load.value(), 0);
+
+        load.increment("key1");
+        assert_eq!(load.value(), 1);
+
+        load.increment("key2");
+        assert_eq!(load.value(), 2);
+
+        load.increment("key1");
+        assert_eq!(load.value(), 2);
+
+        load.decrement("key1");
+        assert_eq!(load.value(), 2);
+
+        load.decrement("key1");
+        assert_eq!(load.value(), 1);
+
+        load.decrement("key2");
+        assert_eq!(load.value(), 0);
+    }
+
+    #[test]
+    fn test_worker_routing_key_load_cleanup_on_zero() {
+        let load = WorkerRoutingKeyLoad::new("http://test:8000");
+
+        load.increment("key1");
+        load.increment("key2");
+        load.increment("key3");
+        assert_eq!(load.active_routing_keys.len(), 3);
+
+        load.decrement("key1");
+        assert_eq!(load.active_routing_keys.len(), 2);
+
+        load.decrement("key2");
+        assert_eq!(load.active_routing_keys.len(), 1);
+
+        load.decrement("key3");
+        assert_eq!(load.active_routing_keys.len(), 0);
+    }
+
+    #[test]
+    fn test_worker_routing_key_load_multiple_requests_same_key() {
+        let load = WorkerRoutingKeyLoad::new("http://test:8000");
+
+        load.increment("paper-1");
+        load.increment("paper-1");
+        load.increment("paper-1");
+        assert_eq!(load.value(), 1);
+
+        load.decrement("paper-1");
+        assert_eq!(load.value(), 1);
+
+        load.decrement("paper-1");
+        assert_eq!(load.value(), 1);
+
+        load.decrement("paper-1");
+        assert_eq!(load.value(), 0);
+        assert_eq!(load.active_routing_keys.len(), 0);
+    }
+
+    #[test]
+    fn test_worker_routing_key_load_decrement_nonexistent() {
+        let load = WorkerRoutingKeyLoad::new("http://test:8000");
+        load.decrement("nonexistent");
+        assert_eq!(load.value(), 0);
+    }
+
+    #[test]
+    fn test_worker_load_guard_with_routing_key() {
+        use super::BasicWorkerBuilder;
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://test:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+
+        assert_eq!(worker.worker_load().value(), 0);
+        assert_eq!(worker.worker_routing_key_load().value(), 0);
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-routing-key", "paper-123".parse().unwrap());
+
+        {
+            let _guard = WorkerLoadGuard::new(worker.clone(), Some(&headers));
+            assert_eq!(worker.worker_load().value(), 1);
+            assert_eq!(worker.worker_routing_key_load().value(), 1);
+        }
+
+        assert_eq!(worker.worker_load().value(), 0);
+        assert_eq!(worker.worker_routing_key_load().value(), 0);
+    }
+
+    #[test]
+    fn test_worker_load_guard_without_routing_key() {
+        use super::BasicWorkerBuilder;
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://test:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+
+        assert_eq!(worker.worker_load().value(), 0);
+        assert_eq!(worker.worker_routing_key_load().value(), 0);
+
+        {
+            let _guard = WorkerLoadGuard::new(worker.clone(), None);
+            assert_eq!(worker.worker_load().value(), 1);
+            assert_eq!(worker.worker_routing_key_load().value(), 0);
+        }
+
+        assert_eq!(worker.worker_load().value(), 0);
+        assert_eq!(worker.worker_routing_key_load().value(), 0);
+    }
+
+    #[test]
+    fn test_worker_load_guard_multiple_same_routing_key() {
+        use super::BasicWorkerBuilder;
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://test:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-routing-key", "paper-123".parse().unwrap());
+
+        let guard1 = WorkerLoadGuard::new(worker.clone(), Some(&headers));
+        assert_eq!(worker.worker_load().value(), 1);
+        assert_eq!(worker.worker_routing_key_load().value(), 1);
+
+        let guard2 = WorkerLoadGuard::new(worker.clone(), Some(&headers));
+        assert_eq!(worker.worker_load().value(), 2);
+        assert_eq!(worker.worker_routing_key_load().value(), 1);
+
+        drop(guard1);
+        assert_eq!(worker.worker_load().value(), 1);
+        assert_eq!(worker.worker_routing_key_load().value(), 1);
+
+        drop(guard2);
+        assert_eq!(worker.worker_load().value(), 0);
+        assert_eq!(worker.worker_routing_key_load().value(), 0);
+    }
 }

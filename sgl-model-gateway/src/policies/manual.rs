@@ -16,17 +16,18 @@
 use std::{sync::Arc, time::Instant};
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use http::header::HeaderName;
 use rand::Rng;
 use tracing::info;
 
 use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::{config::ManualAssignmentMode, core::Worker, observability::metrics::Metrics};
-
-/// Header for routing key based sticky sessions
-static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
+use crate::{
+    config::ManualAssignmentMode,
+    core::Worker,
+    observability::metrics::Metrics,
+    routers::header_utils::extract_routing_key,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionBranch {
@@ -206,14 +207,7 @@ impl ManualPolicy {
             return (None, ExecutionBranch::NoHealthyWorkers);
         }
 
-        // Extract routing key from header
-        let routing_id = info
-            .headers
-            .and_then(|h| h.get(&HEADER_ROUTING_KEY))
-            .and_then(|v| v.to_str().ok())
-            .filter(|s| !s.is_empty());
-
-        if let Some(routing_id) = routing_id {
+        if let Some(routing_id) = extract_routing_key(info.headers) {
             let (idx, branch) = self.select_by_routing_id(workers, routing_id, &healthy_indices);
             return (Some(idx), branch);
         }
@@ -267,16 +261,15 @@ fn random_select(healthy_indices: &[usize]) -> usize {
     healthy_indices[random_idx]
 }
 
-fn min_load_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
-    let min_load = healthy_indices
-        .iter()
-        .map(|&idx| workers[idx].worker_load().value())
-        .min()
-        .unwrap_or(0);
+fn select_min_by<F>(healthy_indices: &[usize], get_value: F) -> usize
+where
+    F: Fn(usize) -> usize,
+{
+    let min_val = healthy_indices.iter().map(|&idx| get_value(idx)).min().unwrap_or(0);
 
     let candidates: Vec<usize> = healthy_indices
         .iter()
-        .filter(|&&idx| workers[idx].worker_load().value() == min_load)
+        .filter(|&&idx| get_value(idx) == min_val)
         .copied()
         .collect();
 
@@ -288,25 +281,14 @@ fn min_load_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> us
     }
 }
 
+fn min_load_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
+    select_min_by(healthy_indices, |idx| workers[idx].worker_load().value())
+}
+
 fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
-    let min_count = healthy_indices
-        .iter()
-        .map(|&idx| workers[idx].worker_routing_key_load().value())
-        .min()
-        .unwrap_or(0);
-
-    let candidates: Vec<usize> = healthy_indices
-        .iter()
-        .filter(|&&idx| workers[idx].worker_routing_key_load().value() == min_count)
-        .copied()
-        .collect();
-
-    if candidates.len() == 1 {
-        candidates[0]
-    } else {
-        let mut rng = rand::rng();
-        candidates[rng.random_range(0..candidates.len())]
-    }
+    select_min_by(healthy_indices, |idx| {
+        workers[idx].worker_routing_key_load().value()
+    })
 }
 
 #[cfg(test)]
@@ -771,5 +753,161 @@ mod tests {
         std::thread::sleep(Duration::from_secs(4));
 
         assert_eq!(policy.routing_map.len(), 0);
+    }
+
+    #[test]
+    fn test_min_group_select_distributes_evenly() {
+        let config = ManualConfig {
+            assignment_mode: ManualAssignmentMode::MinGroup,
+            ..Default::default()
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        for i in 0..9 {
+            let headers = headers_with_routing_key(&format!("paper-{}", i));
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            workers[0].worker_routing_key_load().increment(&format!("paper-{}", i));
+            workers[1].worker_routing_key_load().increment(&format!("paper-{}", i));
+            workers[2].worker_routing_key_load().increment(&format!("paper-{}", i));
+
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert!(result.is_some());
+            assert_eq!(branch, ExecutionBranch::Vacant);
+
+            workers[0].worker_routing_key_load().decrement(&format!("paper-{}", i));
+            workers[1].worker_routing_key_load().decrement(&format!("paper-{}", i));
+            workers[2].worker_routing_key_load().decrement(&format!("paper-{}", i));
+        }
+
+        let mut distribution = HashMap::new();
+        for entry in policy.routing_map.iter() {
+            let url = entry.candi_worker_urls.first().unwrap();
+            *distribution.entry(url.clone()).or_insert(0) += 1;
+        }
+
+        assert_eq!(distribution.len(), 3, "Should use all 3 workers");
+        for (_, count) in &distribution {
+            assert_eq!(*count, 3, "Each worker should have exactly 3 papers");
+        }
+    }
+
+    #[test]
+    fn test_min_group_select_prefers_worker_with_fewer_routing_keys() {
+        let config = ManualConfig {
+            assignment_mode: ManualAssignmentMode::MinGroup,
+            ..Default::default()
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        workers[0].worker_routing_key_load().increment("existing-1");
+        workers[0].worker_routing_key_load().increment("existing-2");
+        workers[1].worker_routing_key_load().increment("existing-3");
+
+        assert_eq!(workers[0].worker_routing_key_load().value(), 2);
+        assert_eq!(workers[1].worker_routing_key_load().value(), 1);
+        assert_eq!(workers[2].worker_routing_key_load().value(), 0);
+
+        let headers = headers_with_routing_key("new-paper");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let (result, _) = policy.select_worker_impl(&workers, &info);
+        let selected_idx = result.unwrap();
+
+        assert_eq!(selected_idx, 2, "Should select worker with 0 routing keys");
+    }
+
+    #[test]
+    fn test_min_load_select_prefers_worker_with_fewer_requests() {
+        let config = ManualConfig {
+            assignment_mode: ManualAssignmentMode::MinLoad,
+            ..Default::default()
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        workers[0].worker_load().increment();
+        workers[0].worker_load().increment();
+        workers[1].worker_load().increment();
+
+        assert_eq!(workers[0].worker_load().value(), 2);
+        assert_eq!(workers[1].worker_load().value(), 1);
+        assert_eq!(workers[2].worker_load().value(), 0);
+
+        let headers = headers_with_routing_key("new-paper");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let (result, _) = policy.select_worker_impl(&workers, &info);
+        let selected_idx = result.unwrap();
+
+        assert_eq!(selected_idx, 2, "Should select worker with 0 load");
+    }
+
+    #[test]
+    fn test_min_group_sticky_after_assignment() {
+        let config = ManualConfig {
+            assignment_mode: ManualAssignmentMode::MinGroup,
+            ..Default::default()
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        workers[0].worker_routing_key_load().increment("paper-0");
+        workers[1].worker_routing_key_load().increment("paper-1");
+        workers[1].worker_routing_key_load().increment("paper-2");
+
+        let headers = headers_with_routing_key("new-paper");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let first_idx = first_result.unwrap();
+        assert_eq!(branch, ExecutionBranch::Vacant);
+        assert_eq!(first_idx, 0, "Should select worker 0 (has 1 routing key vs 2)");
+
+        for _ in 0..10 {
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(result, Some(first_idx), "Same routing key should route to same worker");
+            assert_eq!(branch, ExecutionBranch::OccupiedHit);
+        }
+    }
+
+    #[test]
+    fn test_random_mode_does_not_consider_load() {
+        let config = ManualConfig {
+            assignment_mode: ManualAssignmentMode::Random,
+            ..Default::default()
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        workers[0].worker_routing_key_load().increment("paper-1");
+        workers[0].worker_routing_key_load().increment("paper-2");
+        workers[0].worker_routing_key_load().increment("paper-3");
+
+        let mut selected_worker_0 = false;
+        for i in 0..50 {
+            let headers = headers_with_routing_key(&format!("test-{}", i));
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            let (result, _) = policy.select_worker_impl(&workers, &info);
+            if result == Some(0) {
+                selected_worker_0 = true;
+                break;
+            }
+        }
+        assert!(selected_worker_0, "Random mode should sometimes select worker 0 despite higher load");
     }
 }
