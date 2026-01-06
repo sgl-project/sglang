@@ -86,8 +86,8 @@ class RequestFuncInput:
     output_len: int
     model: str
     lora_name: str
+    image_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
-    image_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
@@ -2155,9 +2155,6 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
                 lora_name=request_func_input.lora_name,
                 extra_request_body=request_func_input.extra_request_body,
                 metadata={**(request_func_input.metadata or {})},
-            )
-            print(
-                f"[{datetime.now().isoformat()}] hi wrap_multi_round_request_func call request start dataset_index={request_func_input.metadata.get('dataset_index')} {round_index=}"
             )
             output = await request_func(
                 inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
