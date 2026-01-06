@@ -3192,6 +3192,11 @@ if __name__ == "__main__":
         default=1,
         help="Number of turns for multi-turn conversations. If > 1, each prompt becomes a list of questions sharing the same system prefix.",
     )
+    group.add_argument(
+        "--gsp-ordered",
+        action="store_true",
+        help="Keep requests in order without shuffling. By default, requests are shuffled randomly.",
+    )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(
         "--mooncake-slowdown-factor",
