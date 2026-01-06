@@ -487,6 +487,9 @@ class DenoisingStage(PipelineStage):
         """
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
+        # NOTE: In warmup requests we may override req.num_inference_steps (e.g. set to 1)
+        # for latency amortization, but cache-dit needs the *original* total steps to
+        # initialize/refresh its context correctly.
         cache_dit_num_inference_steps = batch.extra.get(
             "cache_dit_num_inference_steps", batch.num_inference_steps
         )
