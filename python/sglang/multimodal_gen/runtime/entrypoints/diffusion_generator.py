@@ -31,6 +31,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    GREEN,
+    RESET,
     init_logger,
     log_batch_completion,
     log_generation_timer,
@@ -198,15 +200,20 @@ class DiffGenerator:
             **sampling_params_kwargs,
         )
 
+        # Extract diffusers_kwargs if passed
+        diffusers_kwargs = sampling_params_kwargs.pop("diffusers_kwargs", None)
+
         requests: list[Req] = []
         for output_idx, p in enumerate(prompts):
             sampling_params.prompt = p
-            requests.append(
-                prepare_request(
-                    server_args=self.server_args,
-                    sampling_params=sampling_params,
-                )
+            req = prepare_request(
+                server_args=self.server_args,
+                sampling_params=sampling_params,
             )
+            # Add diffusers_kwargs to request's extra dict
+            if diffusers_kwargs:
+                req.extra["diffusers_kwargs"] = diffusers_kwargs
+            requests.append(req)
 
         results = []
         total_start_time = time.perf_counter()
@@ -266,6 +273,13 @@ class DiffGenerator:
         log_batch_completion(logger, len(results), total_gen_time)
 
         if results:
+            if self.server_args.warmup:
+                total_duration_ms = results[0]["timings"]["total_duration_ms"]
+                logger.info(
+                    f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
+                    total_duration_ms / 1000.0,
+                )
+
             peak_memories = [r.get("peak_memory_mb", 0) for r in results]
             if peak_memories:
                 max_peak_memory = max(peak_memories)
@@ -293,14 +307,10 @@ class DiffGenerator:
     # LoRA
     def _send_lora_request(self, req: Any, success_msg: str, failure_msg: str):
         response = sync_scheduler_client.forward(req)
-        if isinstance(response, dict) and response.get("status") == "ok":
+        if response.error is None:
             logger.info(success_msg)
         else:
-            error_msg = (
-                response.get("message", "Unknown error")
-                if isinstance(response, dict)
-                else "Unknown response format"
-            )
+            error_msg = response.error
             raise RuntimeError(f"{failure_msg}: {error_msg}")
 
     def set_lora(
