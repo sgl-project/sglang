@@ -9,8 +9,7 @@ use http::header::HeaderName;
 
 use crate::core::{HashRing, Worker};
 
-pub(crate) static HEADER_TARGET_WORKER: HeaderName =
-    HeaderName::from_static("x-smg-target-worker");
+pub(crate) static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
 pub(crate) static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
 
 pub(crate) fn extract_header_value<'a>(
