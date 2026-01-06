@@ -1,3 +1,7 @@
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=430, suite="stage-b-test-small-1-gpu")
+
 import json
 import unittest
 from io import BytesIO
