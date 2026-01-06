@@ -18,34 +18,10 @@
 
 use std::sync::Arc;
 
-use http::header::HeaderName;
 use rand::Rng as _;
 
-use super::{LoadBalancingPolicy, SelectWorkerInfo};
+use super::{extract_routing_key, extract_target_worker, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{core::Worker, observability::metrics::Metrics};
-
-/// Header for direct worker targeting by index (0-based)
-static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
-/// Header for consistent hash routing
-static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
-
-fn extract_header_value<'a>(
-    headers: Option<&'a http::HeaderMap>,
-    name: &HeaderName,
-) -> Option<&'a str> {
-    headers
-        .and_then(|h| h.get(name))
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-}
-
-fn extract_target_worker(headers: Option<&http::HeaderMap>) -> Option<&str> {
-    extract_header_value(headers, &HEADER_TARGET_WORKER)
-}
-
-fn extract_routing_key(headers: Option<&http::HeaderMap>) -> Option<&str> {
-    extract_header_value(headers, &HEADER_ROUTING_KEY)
-}
 
 /// Execution branch for metrics
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

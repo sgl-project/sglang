@@ -5,7 +5,31 @@
 
 use std::{fmt::Debug, sync::Arc};
 
+use http::header::HeaderName;
+
 use crate::core::{HashRing, Worker};
+
+pub(crate) static HEADER_TARGET_WORKER: HeaderName =
+    HeaderName::from_static("x-smg-target-worker");
+pub(crate) static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
+
+pub(crate) fn extract_header_value<'a>(
+    headers: Option<&'a http::HeaderMap>,
+    name: &HeaderName,
+) -> Option<&'a str> {
+    headers
+        .and_then(|h| h.get(name))
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+}
+
+pub(crate) fn extract_target_worker(headers: Option<&http::HeaderMap>) -> Option<&str> {
+    extract_header_value(headers, &HEADER_TARGET_WORKER)
+}
+
+pub(crate) fn extract_routing_key(headers: Option<&http::HeaderMap>) -> Option<&str> {
+    extract_header_value(headers, &HEADER_ROUTING_KEY)
+}
 
 mod bucket;
 mod cache_aware;
