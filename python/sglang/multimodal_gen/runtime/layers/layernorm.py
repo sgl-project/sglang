@@ -276,7 +276,49 @@ class FP32LayerNorm(nn.LayerNorm):
 ################################################################################
 # Fused norm kernel
 ################################################################################
-class _ScaleResidualNormScaleShift(nn.Module):
+def get_gate_arg(gate: torch.Tensor, shape: Tuple, dtype: torch.dtype):
+    if isinstance(gate, int):
+        # used by cross-attention, should be 1
+        assert gate == 1
+        return None
+    elif isinstance(gate, torch.Tensor):
+        if (
+            (gate.dim() == 2 and gate.shape[0] == 1)
+            or (gate.dim() == 3)
+            or (gate.dim() == 4)
+        ):
+            # gate.shape: [batch_size, num_frames, 1, inner_dim]
+            # gate.shape: [batch_size, 1, inner_dim]
+            return gate.contiguous().to(dtype=dtype)
+        elif gate.dim() == 2:
+            return (
+                gate.expand(-1, shape[-1])
+                .contiguous()
+                .view(-1, shape[-1])
+                .to(dtype=dtype)
+            )
+    else:
+        raise ValueError(f"Gate type {type(gate)} not supported")
+
+
+def get_norm_scale_shift_arg(t: torch.Tensor, shape: Tuple, dtype: torch.dtype):
+    if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
+        t = t.reshape(1)
+    elif (
+        (t.dim() == 2 and t.shape[0] == 1)
+        or (t.dim() == 3 and t.shape[0] == 1 and t.shape[1] == 1)
+        or (t.dim() == 4)
+    ):
+        # Do nothing
+        pass
+    elif t.dim() == 2 or t.dim() == 3:
+        t = t.expand(shape).view(-1, shape[-1])
+    else:
+        raise ValueError(f"Scale/shift tensor dimension {t.dim()} not supported")
+    return t.contiguous().to(dtype=dtype)
+
+
+class _ScaleResidualNormScaleShift(CustomOp):
     """
     Fused operation that combines:
     1. Gated residual connection
@@ -310,7 +352,7 @@ class _ScaleResidualNormScaleShift(nn.Module):
         else:
             raise NotImplementedError(f"Norm type {norm_type} not implemented")
 
-    def forward(
+    def forward_cuda(
         self,
         residual: torch.Tensor,
         x: torch.Tensor,
@@ -328,111 +370,69 @@ class _ScaleResidualNormScaleShift(nn.Module):
             - residual value (value after residual connection
               but before normalization)
         """
-        can_use_cuda = _is_cuda and (x.shape[-1] % 4 == 0)
-        if can_use_cuda:
-            B, L, C = x.shape
-            M = B * L
-            x_2d = x.contiguous().view(-1, C)
-            residual_2d = residual.contiguous().view(-1, C)
+        if x.shape[-1] % 4 != 0:
+            # Only support 4-aligned hidden sizes for the fused path
+            return self.forward_native(residual, x, gate, shift, scale)
 
-            # gamma/beta
-            gamma_opt = None
-            if getattr(self.norm, "weight", None) is not None:
-                gamma_opt = self.norm.weight.contiguous().to(
-                    dtype=x.dtype, device=x.device
-                )
-            beta_opt = None
-            if getattr(self.norm, "bias", None) is not None:
-                beta_opt = self.norm.bias.contiguous().to(
-                    dtype=x.dtype, device=x.device
-                )
+        origin_shape = x.shape
+        x_2d = x.contiguous().view(-1, origin_shape[-1])
+        residual_2d = residual.contiguous().view(-1, origin_shape[-1])
 
-            def get_arg(t):
-                if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
-                    return t.reshape(1).to(dtype=x.dtype, device=x.device)
-                elif (t.dim() == 2 and t.shape[0] == 1) or (
-                    t.dim() == 3 and t.shape[0] == 1 and t.shape[1] == 1
-                ):
-                    return t.contiguous().to(dtype=x.dtype, device=x.device)
-                elif t.dim() == 2 or t.dim() == 3:
-                    return (
-                        t.expand(B, L, C)
-                        .contiguous()
-                        .view(M, C)
-                        .to(dtype=x.dtype, device=x.device)
-                    )
-                elif t.dim() == 4:
-                    return t.contiguous().to(dtype=x.dtype, device=x.device)
-                else:
-                    raise ValueError(
-                        f"Scale/shift tensor dimension {t.dim()} not supported"
-                    )
+        # gamma/beta
+        gamma_opt = getattr(self.norm, "weight", None)
+        if gamma_opt is not None:
+            gamma_opt = gamma_opt.contiguous().to(dtype=x.dtype)
+        beta_opt = getattr(self.norm, "bias", None)
+        if beta_opt is not None:
+            beta_opt = beta_opt.contiguous().to(dtype=x.dtype)
+        gate_opt = get_gate_arg(gate, origin_shape, x.dtype)
+        scale_arg = get_norm_scale_shift_arg(scale, origin_shape, x.dtype)
+        shift_arg = get_norm_scale_shift_arg(shift, origin_shape, x.dtype)
 
-            scale_arg = get_arg(scale)
-            shift_arg = get_arg(shift)
+        y_2d, residual_output = fused_scale_residual_norm_scale_shift(
+            residual_2d,
+            x_2d,
+            gate_opt,
+            gamma_opt,
+            beta_opt,
+            scale_arg,
+            shift_arg,
+            self.norm_type,
+            self.eps,
+        )
+        return y_2d.view(origin_shape), residual_output.view(origin_shape)
 
-            gate_opt = None
-            if isinstance(gate, int):
-                # used by cross-attention, should be 1
-                assert gate == 1
-            elif isinstance(gate, torch.Tensor):
-                if (gate.dim() == 2 and gate.shape[0] == 1) or (
-                    gate.dim() == 3 and gate.shape[0] == 1 and gate.shape[1] == 1
-                ):
-                    gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
-                elif gate.dim() == 4:
-                    # gate.shape: [batch_size, num_frames, 1, inner_dim]
-                    gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
-                elif gate.dim() == 3:
-                    # gate.shape: [batch_size, 1, inner_dim]
-                    gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
-                elif gate.dim() == 2:
-                    gate_opt = (
-                        gate.expand(M, C)
-                        .contiguous()
-                        .view(M, C)
-                        .to(dtype=x.dtype, device=x.device)
-                    )
+    def forward_native(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Fallback path for triton kernel (not fused)
+        # x.shape: [batch_size, seq_len, inner_dim]
+        # Compute residual_output to return (kernel also computes this internally)
+        if isinstance(gate, int):
+            # used by cross-attention, should be 1
+            assert gate == 1
+            residual_output = residual + x
+        elif isinstance(gate, torch.Tensor):
+            if gate.dim() == 4:
+                # gate.shape: [batch_size, num_frames, 1, inner_dim]
+                num_frames = gate.shape[1]
+                frame_seqlen = x.shape[1] // num_frames
+                residual_output = residual + (
+                    x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
+                ).flatten(1, 2)
             else:
-                raise ValueError(f"Gate type {type(gate)} not supported")
-
-            y_2d, residual_output = fused_scale_residual_norm_scale_shift(
-                residual_2d,
-                x_2d,
-                gate_opt,
-                gamma_opt,
-                beta_opt,
-                scale_arg,
-                shift_arg,
-                self.norm_type,
-                self.eps,
-            )
-            return y_2d.view(B, L, C), residual_output.view(B, L, C)
-
+                # gate.shape: [batch_size, 1, inner_dim]
+                residual_output = residual + x * gate
         else:
-            # Fallback path for triton kernel (not fused)
-            # x.shape: [batch_size, seq_len, inner_dim]
-            # Compute residual_output to return (kernel also computes this internally)
-            if isinstance(gate, int):
-                # used by cross-attention, should be 1
-                assert gate == 1
-                residual_output = residual + x
-            elif isinstance(gate, torch.Tensor):
-                if gate.dim() == 4:
-                    # gate.shape: [batch_size, num_frames, 1, inner_dim]
-                    num_frames = gate.shape[1]
-                    frame_seqlen = x.shape[1] // num_frames
-                    residual_output = residual + (
-                        x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
-                    ).flatten(1, 2)
-                else:
-                    # gate.shape: [batch_size, 1, inner_dim]
-                    residual_output = residual + x * gate
-            else:
-                raise ValueError(f"Gate type {type(gate)} not supported")
-            normalized = self.norm(residual_output)
-            modulated = fuse_scale_shift_kernel(normalized, scale, shift)
-            return modulated, residual_output
+            raise ValueError(f"Gate type {type(gate)} not supported")
+        normalized = self.norm(residual_output)
+        modulated = fuse_scale_shift_kernel(normalized, scale, shift)
+        return modulated, residual_output
 
 
 class ScaleResidualLayerNormScaleShift(_ScaleResidualNormScaleShift):
@@ -459,7 +459,7 @@ class ScaleResidualRMSNormScaleShift(_ScaleResidualNormScaleShift):
         super().__init__(hidden_size, "rms", eps, elementwise_affine, dtype, prefix)
 
 
-class _NormScaleShift(nn.Module):
+class _NormScaleShift(CustomOp):
     """
     Fused operation that combines LayerNorm with scale and shift operations.
     This reduces memory bandwidth by combining memory-bound operations.
@@ -478,105 +478,64 @@ class _NormScaleShift(nn.Module):
         self.norm_type = norm_type
         self.eps = eps
         if norm_type == "rms":
-            self.norm = RMSNorm(hidden_size, has_weight=elementwise_affine, eps=eps)
+            self.norm = RMSNorm(
+                hidden_size, has_weight=elementwise_affine, eps=eps, dtype=dtype
+            )
         elif norm_type == "layer":
             # compute_dtype is hardcoded to fp32 in fused kernel
             self.norm = FP32LayerNorm(
-                hidden_size, elementwise_affine=elementwise_affine, eps=eps
+                hidden_size, elementwise_affine=elementwise_affine, eps=eps, dtype=dtype
             )
         else:
             raise NotImplementedError(f"Norm type {norm_type} not implemented")
 
-    def _get_scale_shift_args(
-        self,
-        t: torch.Tensor,
-        x: torch.Tensor,
-        B: int,
-        L: int,
-        C: int,
-        M: int,
-    ) -> torch.Tensor:
-        if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
-            return t.reshape(1).to(dtype=x.dtype, device=x.device)
-        elif (t.dim() == 2 and t.shape[0] == 1) or (
-            t.dim() == 3 and t.shape[0] == 1 and t.shape[1] == 1
-        ):
-            return t.contiguous().to(dtype=x.dtype, device=x.device)
-        elif t.dim() == 2 or t.dim() == 3:
-            return (
-                t.expand(B, L, C)
-                .contiguous()
-                .view(M, C)
-                .to(dtype=x.dtype, device=x.device)
-            )
-        elif t.dim() == 4:
-            return t.contiguous().to(dtype=x.dtype, device=x.device)
-        else:
-            raise ValueError(f"Scale/shift tensor dimension {t.dim()} not supported")
-
-    def forward(
+    def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         """Apply ln followed by scale and shift in a single fused operation."""
-        can_use_cuda = _is_cuda and (x.shape[-1] % 4 == 0)  # x.shape[-1]: hidden_size
-        if can_use_cuda:
-            B, L, C = x.shape
-            M = B * L
-            x_2d = x.contiguous().view(-1, C)
+        if x.shape[-1] % 4 != 0:
+            # Only support 4-aligned hidden sizes for the fused path
+            return self.forward_native(x, shift, scale)
 
-            if (
-                getattr(self.norm, "weight", None) is None
-                and getattr(self.norm, "bias", None) is None
-            ):
+        gamma_opt = getattr(self.norm, "weight", None)
+        beta_opt = getattr(self.norm, "bias", None)
+        if (
+            gamma_opt is None
+            and beta_opt is None
+            and (scale.dim() == 4 or shift.dim() == 4)
+        ):
+            # Only 2D scale/shift are supported by the no_affine kernel.
+            return self.forward_native(x, shift, scale)
 
-                if scale.dim() == 4 or shift.dim() == 4:
-                    raise ValueError(
-                        "Only 2D scale/shift are supported by the no_affine kernel. "
-                    )
+        if gamma_opt is not None:
+            gamma_opt = gamma_opt.contiguous().to(x.dtype)
+        if beta_opt is not None:
+            beta_opt = beta_opt.contiguous().to(x.dtype)
+        origin_shape = x.shape
+        x_2d = x.contiguous().view(-1, origin_shape[-1])
+        scale_arg = get_norm_scale_shift_arg(scale, origin_shape, x.dtype)
+        shift_arg = get_norm_scale_shift_arg(shift, origin_shape, x.dtype)
+        y_2d = fused_norm_scale_shift(
+            x_2d, gamma_opt, beta_opt, scale_arg, shift_arg, self.norm_type, self.eps
+        )
+        return y_2d.view(origin_shape)
 
-                scale_arg = self._get_scale_shift_args(scale, x, B, L, C, M)
-                shift_arg = self._get_scale_shift_args(shift, x, B, L, C, M)
-
-                y_2d = fused_norm_scale_shift(
-                    x_2d, None, None, scale_arg, shift_arg, self.norm_type, self.eps
-                )
-                return y_2d.view(B, L, C)
-
-            # Standard path: use affine LayerNorm + fused scale/shift kernel.
-            gamma_opt = self.norm.weight.contiguous().to(dtype=x.dtype, device=x.device)
-            beta_opt = None
-            if self.norm.bias is not None:
-                beta_opt = self.norm.bias.contiguous().to(
-                    dtype=x.dtype, device=x.device
-                )
-
-            scale_arg = self._get_scale_shift_args(scale, x, B, L, C, M)
-            shift_arg = self._get_scale_shift_args(shift, x, B, L, C, M)
-
-            y_2d = fused_norm_scale_shift(
-                x_2d,
-                gamma_opt,
-                beta_opt,
-                scale_arg,
-                shift_arg,
-                self.norm_type,
-                self.eps,
-            )
-            return y_2d.view(B, L, C)
+    def forward_native(
+        self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        # Fallback path for triton kernel (not fused)
+        normalized = self.norm(x).float()
+        if scale.dim() == 4:
+            num_frames = scale.shape[1]
+            frame_seqlen = normalized.shape[1] // num_frames
+            output = (
+                normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
+                * (1.0 + scale)
+                + shift
+            ).flatten(1, 2)
         else:
-            # Fallback path for triton kernel (not fused)
-            normalized = self.norm(x).float()
-            if scale.dim() == 4:
-                num_frames = scale.shape[1]
-                frame_seqlen = normalized.shape[1] // num_frames
-                output = (
-                    normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
-                    * (1.0 + scale)
-                    + shift
-                ).flatten(1, 2)
-            else:
-                output = normalized * (1.0 + scale) + shift
-            return output.to(x.dtype)
+            output = normalized * (1.0 + scale) + shift
+        return output.to(x.dtype)
 
 
 class LayerNormScaleShift(_NormScaleShift):
