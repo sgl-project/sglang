@@ -58,12 +58,8 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.mem_cache.allocator import (
-    BaseTokenToKVPoolAllocator,
-    SWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
@@ -73,7 +69,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.metrics.collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
@@ -91,6 +87,8 @@ from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 if TYPE_CHECKING:
+    from typing import Any, Dict
+
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -542,8 +540,12 @@ class Req:
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
-        # The length of KV that have been removed in local attention chunked prefill
+        # The length of KV that have been removed in swa chunk cache
         self.evicted_seqlen_local = 0
+
+        # The index of the extend / decode batch
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
@@ -699,6 +701,8 @@ class Req:
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
+        # Customized info
+        self.customized_info: Optional[Dict[str, List[Any]]] = None
 
         # Embedding (return values)
         self.embedding = None
@@ -1068,6 +1072,7 @@ class Req:
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
+        self.customized_info = None
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
@@ -1294,11 +1299,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         is_hybrid_swa = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert (
-                tree_cache is None
-                or isinstance(tree_cache, SWARadixCache)
-                or isinstance(tree_cache, SWAChunkCache)
-            ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid_swa = True
 
         return cls(
@@ -1473,6 +1473,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
+
+            req.extend_batch_idx += 1
 
             # update req-level memory management fields
             req.kv_committed_len = seq_len
@@ -1902,6 +1904,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Update req-level memory management fields
         for req in self.reqs:
+            req.decode_batch_idx += 1
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
