@@ -2234,8 +2234,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         enable_rope_fusion = (
             os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
         )
-        q_len = hidden_states.shape[0]
-        q_input = hidden_states.new_empty(
+        # NOTE: hidden_states can be a tuple for some quantization paths.
+        # For shape/device/dtype, use the first tensor; still pass the original
+        # hidden_states through linear ops which may accept tuple inputs.
+        hidden_states_tensor = (
+            hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        )
+
+        q_len = hidden_states_tensor.shape[0]
+        q_input = hidden_states_tensor.new_empty(
             q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
         )
         if self.q_lora_rank is not None:
