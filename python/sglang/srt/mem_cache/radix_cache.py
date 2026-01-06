@@ -325,6 +325,7 @@ class RadixCache(BasePrefixCache):
         self.root_node.hash_value = []
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        self.entry_count_ = 0
         self._record_all_cleared_event()
 
     def maybe_bigram_convert(
@@ -539,7 +540,7 @@ class RadixCache(BasePrefixCache):
         print(f"#tokens: {self.total_size()}")
 
     def total_size(self):
-        return self._total_size_helper()
+        return self.evictable_size_ + self.protected_size_
 
     def evict(self, num_tokens: int):
         if self.disable:
@@ -608,24 +609,10 @@ class RadixCache(BasePrefixCache):
         return self.protected_size_
 
     def get_cache_stats(self) -> dict:
-        """Return cache statistics for monitoring.
-
-        Computes entry_count and total_tokens in a single pass for efficiency.
-        """
-        entry_count = 0
-        total_tokens = 0
-        stack = [self.root_node]
-        while stack:
-            node = stack.pop()
-            if node.value is not None and len(node.value) > 0:
-                entry_count += 1
-                total_tokens += len(node.value)
-            for child in node.children.values():
-                if not child.evicted:
-                    stack.append(child)
+        """Return cache statistics for monitoring."""
         return {
-            "entry_count": entry_count,
-            "total_tokens": total_tokens,
+            "entry_count": self.entry_count_,
+            "total_tokens": self.total_size(),
             "evictable_tokens": self.evictable_size(),
         }
 
@@ -687,6 +674,9 @@ class RadixCache(BasePrefixCache):
             child.hash_value, split_len, self.page_size
         )
 
+        # Splitting one node into two increases entry count by 1
+        self.entry_count_ += 1
+
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: RadixKey, value, priority: int = 0):
@@ -728,6 +718,7 @@ class RadixCache(BasePrefixCache):
             new_node.value = value
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
+            self.entry_count_ += 1
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
         return total_prefix_length
@@ -756,6 +747,7 @@ class RadixCache(BasePrefixCache):
         assert v == node, f"parent does not have child key, {key}"
 
         self.evictable_size_ -= len(node.key)
+        self.entry_count_ -= 1
 
     def _total_size_helper(self):
         total_size = 0
