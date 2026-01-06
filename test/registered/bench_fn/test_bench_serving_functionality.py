@@ -44,6 +44,7 @@ class TestBenchServingFunctionality(CustomTestCase):
                 args = get_benchmark_args(
                     base_url=DEFAULT_URL_FOR_TEST,
                     backend="sglang-oai-chat",
+                    tokenizer=MODEL,
                     dataset_name="generated-shared-prefix",
                     num_prompts=NUM_CONVERSATIONS,
                     request_rate=float("inf"),
