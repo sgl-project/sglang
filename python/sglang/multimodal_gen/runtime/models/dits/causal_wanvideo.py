@@ -477,7 +477,6 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
             eps=config.eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
         self.proj_out = nn.Linear(
             inner_dim, config.out_channels * math.prod(config.patch_size)

@@ -276,7 +276,6 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
         self.to_q = ReplicatedLinear(dim, dim, bias=True)
         self.to_k = ReplicatedLinear(dim, dim, bias=True)
@@ -317,7 +316,6 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 2. Cross-attention
@@ -460,7 +458,6 @@ class WanTransformerBlock_VSA(nn.Module):
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
         self.to_q = ReplicatedLinear(dim, dim, bias=True)
         self.to_k = ReplicatedLinear(dim, dim, bias=True)
@@ -674,7 +671,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             eps=config.eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
         self.proj_out = nn.Linear(
             inner_dim, config.out_channels * math.prod(config.patch_size)
