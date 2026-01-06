@@ -143,6 +143,7 @@ from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
+    create_server_socket,
     delete_directory,
     get_bool_env_var,
     kill_process_tree,
@@ -1687,76 +1688,93 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    # Launch subprocesses
-    tokenizer_manager, template_manager, scheduler_infos, port_args = (
-        _launch_subprocesses(
-            server_args=server_args,
-            init_tokenizer_manager_func=init_tokenizer_manager_func,
-            run_scheduler_process_func=run_scheduler_process_func,
-            run_detokenizer_process_func=run_detokenizer_process_func,
-        )
+    # Step 1: Bind the HTTP port early to fail fast if port is already in use.
+    # This avoids wasting time on model loading when the port is unavailable.
+    # Reference: vLLM solved similar issue in https://github.com/vllm-project/vllm/issues/8204
+    logger.info(f"Reserving HTTP port {server_args.port}...")
+    try:
+        server_socket = create_server_socket(server_args.host, server_args.port)
+    except RuntimeError as e:
+        logger.error(str(e))
+        raise
+    logger.info(
+        f"Port {server_args.port} reserved successfully. Starting model loading..."
     )
-
-    # Parse info got from the schedulers
-    remote_instance_transfer_engine_info = (
-        parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos)
-    )
-
-    # Set global states
-    set_global_state(
-        _GlobalState(
-            tokenizer_manager=tokenizer_manager,
-            template_manager=template_manager,
-            scheduler_info=scheduler_infos[0],
-            remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
-        )
-    )
-
-    if server_args.enable_metrics:
-        add_prometheus_track_response_middleware(app)
-
-    # Pass additional arguments to the lifespan function.
-    # They will be used for additional initialization setups.
-    if server_args.tokenizer_worker_num == 1:
-        # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
-        app.is_single_tokenizer_mode = True
-        app.server_args = server_args
-        app.warmup_thread_kwargs = dict(
-            server_args=server_args,
-            launch_callback=launch_callback,
-            execute_warmup_func=execute_warmup_func,
-        )
-
-        # Add api key authorization
-        # This is only supported in single tokenizer mode.
-        if server_args.api_key:
-            add_api_key_middleware(app, server_args.api_key)
-    else:
-        # If it is multi-tokenizer mode, we need to write the arguments to shared memory
-        # for other worker processes to read.
-        app.is_single_tokenizer_mode = False
-        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args, server_args, scheduler_infos[0]
-        )
 
     try:
+        # Step 2: Launch subprocesses and load model (time-consuming operation)
+        # Port is protected during this phase
+        tokenizer_manager, template_manager, scheduler_infos, port_args = (
+            _launch_subprocesses(
+                server_args=server_args,
+                init_tokenizer_manager_func=init_tokenizer_manager_func,
+                run_scheduler_process_func=run_scheduler_process_func,
+                run_detokenizer_process_func=run_detokenizer_process_func,
+            )
+        )
+
+        # Parse info got from the schedulers
+        remote_instance_transfer_engine_info = (
+            parse_remote_instance_transfer_engine_info_from_scheduler_infos(
+                scheduler_infos
+            )
+        )
+
+        # Set global states
+        set_global_state(
+            _GlobalState(
+                tokenizer_manager=tokenizer_manager,
+                template_manager=template_manager,
+                scheduler_info=scheduler_infos[0],
+                remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
+            )
+        )
+
+        if server_args.enable_metrics:
+            add_prometheus_track_response_middleware(app)
+
+        # Pass additional arguments to the lifespan function.
+        # They will be used for additional initialization setups.
+        if server_args.tokenizer_worker_num == 1:
+            # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
+            app.is_single_tokenizer_mode = True
+            app.server_args = server_args
+            app.warmup_thread_kwargs = dict(
+                server_args=server_args,
+                launch_callback=launch_callback,
+                execute_warmup_func=execute_warmup_func,
+            )
+
+            # Add api key authorization
+            # This is only supported in single tokenizer mode.
+            if server_args.api_key:
+                add_api_key_middleware(app, server_args.api_key)
+        else:
+            # If it is multi-tokenizer mode, we need to write the arguments to shared memory
+            # for other worker processes to read.
+            app.is_single_tokenizer_mode = False
+            multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+                port_args, server_args, scheduler_infos[0]
+            )
+
         # Update logging configs
         set_uvicorn_logging_configs()
 
-        # Listen for HTTP requests
+        # Step 3: Start HTTP server with pre-bound socket
         if server_args.tokenizer_worker_num == 1:
-            # Default case, one tokenizer process
-            uvicorn.run(
-                app,
-                host=server_args.host,
-                port=server_args.port,
-                root_path=server_args.fastapi_root_path,
-                log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=5,
-                loop="uvloop",
+            # Single worker mode: use uvicorn.Server with pre-bound socket
+            _run_server_with_socket(
+                app=app,
+                sock=server_socket,
+                server_args=server_args,
             )
         else:
             # Multiple tokenizer and http processes
+            # Close the socket and let uvicorn rebind with SO_REUSEADDR
+            # The port check already passed, so this should succeed
+            server_socket.close()
+            server_socket = None
+
             from uvicorn.config import LOGGING_CONFIG
 
             LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
@@ -1777,6 +1795,48 @@ def launch_server(
                 workers=server_args.tokenizer_worker_num,
             )
     finally:
+        # Clean up socket if still open
+        if server_socket is not None:
+            try:
+                server_socket.close()
+            except Exception:
+                pass
+
         if server_args.tokenizer_worker_num > 1:
             multi_tokenizer_args_shm.unlink()
             _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+
+
+def _run_server_with_socket(
+    app: FastAPI,
+    sock: "socket.socket",
+    server_args: ServerArgs,
+) -> None:
+    """Run uvicorn server with a pre-bound socket.
+
+    This function uses uvicorn.Server.serve() with a pre-bound socket,
+    which allows the port to be reserved before model loading.
+
+    Args:
+        app: FastAPI application instance
+        sock: Pre-bound socket in LISTEN state
+        server_args: Server configuration arguments
+    """
+    import socket
+
+    config = uvicorn.Config(
+        app,
+        host=server_args.host,
+        port=server_args.port,
+        root_path=server_args.fastapi_root_path,
+        log_level=server_args.log_level_http or server_args.log_level,
+        timeout_keep_alive=5,
+        loop="uvloop",
+    )
+    server = uvicorn.Server(config)
+
+    # Run the server using asyncio with the pre-bound socket
+    async def serve_with_socket():
+        await server.serve(sockets=[sock])
+
+    asyncio.run(serve_with_socket())

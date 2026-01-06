@@ -1568,6 +1568,65 @@ def bind_port(port):
     return sock
 
 
+def create_server_socket(host: str, port: int) -> socket.socket:
+    """Create and bind a server socket for HTTP serving.
+
+    This function binds the port early to:
+    1. Fail fast if port is already in use (before model loading)
+    2. Reserve the port during model loading to prevent race conditions
+
+    The socket is set to LISTEN state to fully reserve the port and prevent
+    other processes from binding to it, even if they use SO_REUSEADDR.
+
+    Reference: vLLM solved similar issue in https://github.com/vllm-project/vllm/issues/8204
+
+    Args:
+        host: Host address to bind to. Use "" or "0.0.0.0" for all interfaces.
+        port: Port number to bind to.
+
+    Returns:
+        A bound socket in LISTEN state, ready to be passed to uvicorn.
+
+    Raises:
+        RuntimeError: If the port is already in use or cannot be bound.
+    """
+    # Determine socket family based on host address
+    family = socket.AF_INET
+    if host and ":" in host:
+        # IPv6 address
+        family = socket.AF_INET6
+
+    sock = socket.socket(family=family, type=socket.SOCK_STREAM)
+
+    # Allow address reuse for quick server restarts
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    # Allow port reuse for multi-worker mode (not available on all platforms)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        # SO_REUSEPORT is not available on some platforms (e.g., Windows)
+        pass
+
+    try:
+        sock.bind((host or "", port))
+    except OSError as e:
+        sock.close()
+        raise RuntimeError(
+            f"Cannot bind to {host or '0.0.0.0'}:{port}. "
+            f"Port may already be in use. Please check if another process is using this port. "
+            f"Error: {e}"
+        ) from e
+
+    # Enter LISTEN state to fully reserve the port
+    # This prevents other processes from binding to it
+    sock.listen(128)
+
+    # Set socket inheritable for multi-process scenarios
+    sock.set_inheritable(True)
+
+    return sock
+
 def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
