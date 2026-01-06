@@ -11,7 +11,8 @@ use axum::{body::Body, response::Response};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
-use smg::core::{attach_guards_to_response, BasicWorkerBuilder, Worker, WorkerLoadGuard};
+use smg::core::{BasicWorkerBuilder, Worker, WorkerLoadGuard};
+use smg::utils::http_utils::AttachedBody;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -176,8 +177,7 @@ async fn test_multiple_guards_all_dropped() {
         assert_eq!(worker1.load(), 1);
         assert_eq!(worker2.load(), 1);
 
-        // Attach both guards using attach_guards_to_response
-        let _response = attach_guards_to_response(vec![guard1, guard2], response);
+        let _response = AttachedBody::wrap_response(response, vec![guard1, guard2]);
 
         // Both loads are 1
         assert_eq!(worker1.load(), 1);
