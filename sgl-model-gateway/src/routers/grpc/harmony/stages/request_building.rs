@@ -18,7 +18,7 @@ use crate::routers::{
 ///
 /// Takes the Harmony-encoded input_ids from preparation and builds a proto::GenerateRequest.
 /// Unlike regular request building, this uses token_ids directly (Harmony encoding handles messages).
-pub struct HarmonyRequestBuildingStage {
+pub(crate) struct HarmonyRequestBuildingStage {
     inject_pd_metadata: bool,
 }
 

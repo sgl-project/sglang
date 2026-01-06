@@ -1,0 +1,30 @@
+[project]
+name = "sgl-model-gateway-e2e-tests"
+version = "0.1.0"
+description = "E2E tests for sgl-model-gateway"
+requires-python = ">=3.9"
+
+dependencies = [
+  "grpcio",
+  "grpcio-health-checking",
+  "httpx",
+  "openai",
+  "pytest",
+  "pytest-rerunfailures",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+markers = [
+  "e2e: mark test as end-to-end test requiring GPU workers",
+  "slow: mark test as slow-running",
+]
+addopts = "-v -s"
+# Explicitly disable live log to avoid "---- live log ----" dividers
+# We configure logging manually in conftest.py
+log_cli = false
