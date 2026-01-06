@@ -2,7 +2,9 @@ import { useSessionStore } from '../../stores/useSessionStore';
 import { useUIStore } from '../../stores/useUIStore';
 import { KPICard } from './KPICard';
 import { TopKList } from './TopKList';
-import { getTopKForLayer, isRawMode, isFingerprintMode, isSketchMode, AttentionEntry } from '../../api/types';
+import { DistanceHistogram } from './DistanceHistogram';
+import { FFTSpectrum } from './FFTSpectrum';
+import { getTopKForLayer, isRawMode, isFingerprintMode, isSketchMode, AttentionEntry, extractFingerprint } from '../../api/types';
 
 // Extract fingerprint metrics from any attention entry
 function getMetricsFromAttention(entry: AttentionEntry | null): {
@@ -218,6 +220,30 @@ export function InsightPanel() {
             </div>
           </div>
         )}
+
+        {/* Distance & Rhythm Section */}
+        {selectedAttention && (() => {
+          const fp = extractFingerprint(selectedAttention);
+          if (!fp?.histogram || fp.histogram.length === 0) return null;
+          return (
+            <div className="section">
+              <div className="section-header">
+                <span>Distance & Rhythm</span>
+                <span className="badge">spectral</span>
+              </div>
+              <div className="distance-rhythm-container">
+                <div className="distance-section">
+                  <div className="subsection-label">Distance Distribution</div>
+                  <DistanceHistogram histogram={fp.histogram} compact />
+                </div>
+                <div className="rhythm-section">
+                  <div className="subsection-label">Frequency Spectrum</div>
+                  <FFTSpectrum histogram={fp.histogram} compact />
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Session-level Fingerprint (from sidecar) */}
         {fingerprint && displayMetrics?.mode !== 'session' && (

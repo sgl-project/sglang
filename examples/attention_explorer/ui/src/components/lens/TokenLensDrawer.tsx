@@ -9,6 +9,8 @@ import {
   extractFingerprint,
   MoERoutingEntry,
 } from '../../api/types';
+import { DistanceHistogram } from './DistanceHistogram';
+import { FFTSpectrum } from './FFTSpectrum';
 
 interface TopKItem {
   position: number;
@@ -264,23 +266,14 @@ function SignalTab({ attention }: { attention: AttentionEntry | null }) {
       </div>
 
       {fingerprint?.histogram && fingerprint.histogram.length > 0 && (
-        <div className="signal-histogram">
-          <div className="signal-hist-header">Distance Histogram</div>
-          <div className="signal-hist-bars">
-            {fingerprint.histogram.slice(0, 16).map((val, i) => (
-              <div
-                key={i}
-                className="signal-hist-bar"
-                style={{ height: `${Math.min(val * 100, 100)}%` }}
-                title={`Bin ${i}: ${(val * 100).toFixed(1)}%`}
-              />
-            ))}
+        <div className="signal-spectral">
+          <div className="signal-spectral-section">
+            <div className="signal-spectral-header">Distance Histogram</div>
+            <DistanceHistogram histogram={fingerprint.histogram} />
           </div>
-          <div className="signal-hist-labels">
-            <span>0</span>
-            <span>Local</span>
-            <span>Mid</span>
-            <span>Long</span>
+          <div className="signal-spectral-section">
+            <div className="signal-spectral-header">Frequency Spectrum</div>
+            <FFTSpectrum histogram={fingerprint.histogram} />
           </div>
         </div>
       )}
