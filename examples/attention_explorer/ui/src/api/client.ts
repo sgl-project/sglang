@@ -120,6 +120,7 @@ export class AttentionStreamClient {
           try {
             const chunk: ChatCompletionChunkWithAttention = JSON.parse(event);
             const delta = chunk.choices[0]?.delta;
+            const choice = chunk.choices[0] as any; // For nested attention_tokens
 
             if (delta?.content) {
               const tokens = tokenizeIncremental(delta.content, buffer.pendingText);
@@ -132,9 +133,18 @@ export class AttentionStreamClient {
               }
             }
 
+            // Handle attention_token at chunk level (streaming format)
             if (chunk.attention_token) {
               buffer.attention.push(chunk.attention_token);
               this.config.onAttention?.(chunk.attention_token, buffer.attention.length - 1);
+            }
+
+            // Handle attention_tokens inside choices (some server versions)
+            if (choice?.attention_tokens) {
+              for (const attn of choice.attention_tokens) {
+                buffer.attention.push(attn);
+                this.config.onAttention?.(attn, buffer.attention.length - 1);
+              }
             }
 
             if (chunk.moe_routing_step) {
