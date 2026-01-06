@@ -61,12 +61,14 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        if is_extend_in_batch:
+        sum_len = sum(global_num_tokens)
+        avg_len = sum_len / len(global_num_tokens)
+        # Avoid SUM_LEN mode in prefill when token counts are balanced across ranks.
+        if is_extend_in_batch and any(gt < avg_len * 0.8 for gt in global_num_tokens):
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
         max_len = max(global_num_tokens)
-        sum_len = sum(global_num_tokens)
         if sum_len * 2 > max_len * get_attention_dp_size():
             return cls.MAX_LEN
         else:
