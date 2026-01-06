@@ -155,8 +155,7 @@ pub(crate) struct DispatchMetadata {
     pub weight_version: Option<String>,
 }
 
-/// Load guards for worker load tracking
-/// Automatically decrements load when dropped
+#[allow(dead_code)]
 pub(crate) enum LoadGuards {
     Single(WorkerLoadGuard),
     Dual {

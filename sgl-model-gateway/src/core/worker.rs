@@ -20,7 +20,6 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerInfo,
     routers::grpc::client::GrpcClient,
-    utils::http_utils::AttachedBody,
 };
 
 /// Default worker priority (mid-range on 0-100 scale)
