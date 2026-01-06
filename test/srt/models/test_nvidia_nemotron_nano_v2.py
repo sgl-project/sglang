@@ -11,6 +11,12 @@ class TestNvidiaNemotronNanoV2BF16(GSM8KMixin, DefaultServerBase):
     other_args = ["--max-mamba-cache-size", "256"]
 
 
+class TestNvidiaNemotronNanoV2BF16PP(GSM8KMixin, DefaultServerBase):
+    model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+    gsm8k_accuracy_thres = 0.87
+    other_args = ["--max-mamba-cache-size", "256", "--pp-size", "2"]
+
+
 class TestNvidiaNemotronNanoV2FP8(GSM8KMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.87
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8"

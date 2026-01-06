@@ -21,16 +21,16 @@
 
 #define consteval constexpr
 
-#include <source_location>
+#include "source_location.h"
 
 #undef consteval
 #pragma pop_macro("__cpp_consteval")
 #pragma pop_macro("_NODISCARD")
 #else  // __CUDACC__ && CUDA_VERSION > 12010
-#include <source_location>
+#include "source_location.h"
 #endif
 #else  // no __CUDACC__
-#include <source_location>
+#include "source_location.h"
 #endif
 
 #include <dlpack/dlpack.h>
@@ -44,8 +44,8 @@
 
 namespace host {
 
-struct DebugInfo : public std::source_location {
-  DebugInfo(std::source_location loc = std::source_location::current()) : std::source_location(loc) {}
+struct DebugInfo : public source_location_t {
+  DebugInfo(source_location_t loc = source_location_t::current()) : source_location_t(loc) {}
 };
 
 struct PanicError : public std::runtime_error {

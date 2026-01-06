@@ -14,7 +14,7 @@ use std::ptr;
 use std::sync::Arc;
 use serde_json::Value;
 
-use sgl_model_gateway::grpc_client::sglang_proto as proto;
+use smg::grpc_client::sglang_proto as proto;
 
 use super::error::{SglErrorCode, set_error_message};
 use super::grpc_converter::GrpcResponseConverterHandle;

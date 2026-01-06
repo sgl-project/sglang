@@ -120,7 +120,7 @@ python-clean: ## Clean Python build artifacts
 
 python-test: ## Run Python tests
 	@echo "Running Python tests..."
-	@pytest py_test/ -v
+	@pytest e2e_test/ -v
 
 python-check: ## Check Python package with twine
 	@echo "Checking Python package..."
