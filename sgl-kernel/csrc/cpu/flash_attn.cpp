@@ -33,8 +33,6 @@
 
 #include "common.h"
 #include "gemm.h"
-#include "vec.h"
-#include "vec_pack.h"
 
 // [NOTE]: flash attention interface for CPU
 

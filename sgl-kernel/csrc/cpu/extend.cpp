@@ -1,8 +1,6 @@
 #include "common.h"
 #include "flash_attn.h"
 #include "gemm.h"
-#include "vec.h"
-#include "vec_pack.h"
 
 namespace {
 
