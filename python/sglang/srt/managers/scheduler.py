@@ -664,7 +664,6 @@ class Scheduler(
 
                 self.tree_cache = SWAChunkCache(params)
         else:
-
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
@@ -1957,7 +1956,6 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-
             if self.enable_lora:
                 new_lora_set = (
                     lora_set
@@ -1983,10 +1981,12 @@ class Scheduler(
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     self.running_batch.batch_is_full = True
 
+            has_preemption_occurred = False
             if self.running_batch.batch_is_full:
-                if not self.try_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
-                ):
+                if not self.try_preemption:
+                    break
+                has_preemption_occurred = True
+                if not adder.preempt_to_schedule(req, self.server_args):
                     break
 
             if self.enable_hicache_storage:
@@ -2011,6 +2011,22 @@ class Scheduler(
                         ) > 0 or (not self.running_batch.is_empty())
                     else:
                         self.running_batch.batch_is_full = True
+
+                    if (
+                        not has_preemption_occurred
+                        and self.running_batch.batch_is_full
+                        and self.try_preemption
+                    ):
+                        # Preempt and retry adding this request
+                        if adder.preempt_to_schedule(req, self.server_args):
+                            retry_res = adder.add_one_req(
+                                req,
+                                has_chunked_req=(self.chunked_req is not None),
+                                truncation_align_size=self.truncation_align_size,
+                            )
+                            if retry_res == AddReqResult.CONTINUE:
+                                # Successfully added after preemption, continue to next request
+                                continue
                 break
 
         # Update waiting queue

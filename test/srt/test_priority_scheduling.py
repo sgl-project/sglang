@@ -1,9 +1,16 @@
 import asyncio
 import os
 import re
+import types
 import unittest
 from typing import Any, List, Optional, Tuple
+from unittest import mock
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.grpc.sglang_scheduler_pb2 import SamplingParams
+from sglang.srt.managers import scheduler as scheduler_mod
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -369,6 +376,125 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
 
         # FIXME(harrison lim)
         # assert e2e_latencies[2] < e2e_latencies[3] < e2e_latencies[1] < e2e_latencies[0]
+
+
+class TestPrioritySchedulingPreemption(unittest.TestCase):
+    def test_no_token_triggers_preempt_and_retry(self):
+        """
+        Simulate add_one_req returning NO_TOKEN first, then CONTINUE after
+        preempt_to_schedule frees resources. The test verifies:
+          - preempt_to_schedule is called
+          - add_one_req is retried for the same request
+          - the returned ScheduleBatch contains the request
+        """
+
+        # Minimal fake self used as 'self' when calling the unbound method
+        fake_self = types.SimpleNamespace()
+
+        # Set up scheduler-like attributes used by get_new_batch_prefill
+        fake_self.schedule_enhancer = None
+        fake_self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+
+        dummy_req = Req(
+            "r1",
+            origin_input_text="test",
+            origin_input_ids=[],
+            sampling_params=SamplingParams(),
+        )
+
+        fake_self.waiting_queue = [dummy_req]
+        fake_self.chunked_req = None
+        fake_self.chunked_prefill_size = None
+        fake_self.new_token_ratio = 1.0
+        fake_self.max_prefill_tokens = 100
+        fake_self.is_mixed_chunk = False
+        fake_self.priority_scheduling_preemption_threshold = 0
+        fake_self.server_args = types.SimpleNamespace(prefill_max_requests=1)
+        fake_self.enable_lora = False
+        fake_self.tp_worker = types.SimpleNamespace(can_run_lora_batch=lambda s: True)
+        fake_self.enable_hierarchical_cache = False
+        fake_self.enable_hicache_storage = False
+        fake_self.tree_cache = None
+        fake_self.req_to_token_pool = types.SimpleNamespace(available_size=lambda: 100)
+        fake_self.page_size = 1
+        fake_self.token_to_kv_pool_allocator = None
+
+        fake_self.model_config = types.SimpleNamespace(is_matryoshka=lambda: False)
+        fake_self.spec_algorithm = types.SimpleNamespace(is_none=lambda: True)
+        fake_self.dllm_config = None
+        fake_self.enable_metrics = False
+        fake_self.policy = types.SimpleNamespace(calc_priority=lambda q: None)
+        fake_self.grammar_queue = None
+        fake_self.truncation_align_size = None
+        fake_self.current_scheduler_metrics_enabled = lambda: False
+        fake_self.enable_overlap = False
+
+        # control how many allocatable reqs scheduler thinks it can accept
+        fake_self.get_num_allocatable_reqs = lambda running_bs: 10
+
+        # Use NULL disaggregation so PREFILL-specific branches are skipped
+        fake_self.disaggregation_mode = DisaggregationMode.NULL
+
+        fake_self.try_preemption = True
+
+        created_adder = {}
+
+        class FakeAdder:
+            def __init__(self, *args, **kwargs):
+                created_adder["instance"] = self
+                self.can_run_list = []
+                self.preempt_list = []
+                self._calls = {}
+                self.preempt_called = False
+                self.new_chunked_req = None
+
+            def add_one_req(self, req, **kwargs):
+                # First call for this req -> NO_TOKEN; second call -> success (CONTINUE)
+                key = id(req)
+                self._calls[key] = self._calls.get(key, 0) + 1
+                if self._calls[key] == 1:
+                    return AddReqResult.NO_TOKEN
+                self.can_run_list.append(req)
+                return AddReqResult.CONTINUE
+
+            def preempt_to_schedule(self, req, server_args):
+                self.preempt_called = True
+                # Simulate successful preemption freeing resources
+                return True
+
+        # Patch PrefillAdder used by get_new_batch_prefill to use our FakeAdder
+        with mock.patch.object(scheduler_mod, "PrefillAdder", new=FakeAdder):
+            # Patch ScheduleBatch.init_new to return a simple ScheduleBatch from can_run_list
+            def fake_init_new(cls, can_run_list, *args, **kwargs):
+                return ScheduleBatch(reqs=list(can_run_list))
+
+            with mock.patch.object(
+                scheduler_mod.ScheduleBatch, "init_new", new=classmethod(fake_init_new)
+            ):
+                with mock.patch.object(
+                    scheduler_mod.ScheduleBatch,
+                    "prepare_for_extend",
+                    new=lambda self: None,
+                ):  # suppress debug logging
+                    # Execute the unbound method with our fake_self
+                    result_batch = scheduler_mod.Scheduler.get_new_batch_prefill(
+                        fake_self
+                    )
+
+        # Assertions
+        self.assertIn("instance", created_adder, "FakeAdder was not created")
+        adder = created_adder["instance"]
+        self.assertTrue(
+            getattr(adder, "preempt_called", False),
+            "preempt_to_schedule was not called",
+        )
+        count = adder._calls.get(id(dummy_req), 0)
+        self.assertEqual(
+            count, 2, f"expected add_one_req to be called twice; got {count}"
+        )
+        self.assertIsInstance(result_batch, ScheduleBatch)
+        self.assertEqual(len(result_batch.reqs), 1)
+        self.assertIs(result_batch.reqs[0], dummy_req)
 
 
 def _verify_genereate_responses(
