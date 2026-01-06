@@ -36,7 +36,7 @@ class TestMMLU:
         Note: setup_backend fixture already waits for workers to be ready.
         """
         backend, model, client, *_ = setup_backend
-        base_url = str(client.base_url).rstrip("/v1")
+        base_url = str(client.base_url).removesuffix("/v1")
 
         args = SimpleNamespace(
             base_url=base_url,
@@ -60,7 +60,7 @@ class TestMMLU:
         significant results.
         """
         backend, model, client, *_ = setup_backend
-        base_url = str(client.base_url).rstrip("/v1")
+        base_url = str(client.base_url).removesuffix("/v1")
 
         args = SimpleNamespace(
             base_url=base_url,
