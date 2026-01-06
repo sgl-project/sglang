@@ -145,10 +145,7 @@ impl PrefixHashPolicy {
         }
 
         // Calculate total load for load balancing
-        let total_load: usize = healthy_workers
-            .iter()
-            .map(|(_, w)| w.load())
-            .sum();
+        let total_load: usize = healthy_workers.iter().map(|(_, w)| w.load()).sum();
         let num_workers = healthy_workers.len();
 
         // Use pre-computed ring if available
@@ -179,9 +176,7 @@ impl PrefixHashPolicy {
                     // This is a simpler approach than walking the ring
                     let least_loaded = healthy_workers
                         .iter()
-                        .filter(|(_, w)| {
-                            self.load_ok(w.load(), total_load, num_workers)
-                        })
+                        .filter(|(_, w)| self.load_ok(w.load(), total_load, num_workers))
                         .min_by_key(|(_, w)| w.load());
 
                     if let Some(&(idx, _)) = least_loaded {

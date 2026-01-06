@@ -175,13 +175,11 @@ mod manual_routing_tests {
 
 #[cfg(test)]
 mod manual_min_group_tests {
-    use super::*;
     use std::sync::Arc;
 
-    async fn send_request(
-        app: axum::Router,
-        routing_key: &str,
-    ) -> (String, String) {
+    use super::*;
+
+    async fn send_request(app: axum::Router, routing_key: &str) -> (String, String) {
         let payload = json!({
             "text": format!("Request for {}", routing_key),
             "stream": false
@@ -213,11 +211,9 @@ mod manual_min_group_tests {
     async fn test_min_group_concurrent_distribution() {
         let config = TestRouterConfig::manual_min_group(3910);
 
-        let ctx = AppTestContext::new_with_config(
-            config,
-            TestWorkerConfig::slow_workers(29910, 3, 500),
-        )
-        .await;
+        let ctx =
+            AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(29910, 3, 500))
+                .await;
 
         let app = Arc::new(ctx.create_app().await);
 
@@ -267,11 +263,9 @@ mod manual_min_group_tests {
     async fn test_min_group_sticky_routing() {
         let config = TestRouterConfig::manual_min_group(3911);
 
-        let ctx = AppTestContext::new_with_config(
-            config,
-            TestWorkerConfig::slow_workers(29920, 3, 200),
-        )
-        .await;
+        let ctx =
+            AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(29920, 3, 200))
+                .await;
 
         let app = Arc::new(ctx.create_app().await);
 
@@ -311,11 +305,9 @@ mod manual_min_group_tests {
     async fn test_min_group_mixed_concurrent_routing() {
         let config = TestRouterConfig::manual_min_group(3912);
 
-        let ctx = AppTestContext::new_with_config(
-            config,
-            TestWorkerConfig::slow_workers(29930, 2, 300),
-        )
-        .await;
+        let ctx =
+            AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(29930, 2, 300))
+                .await;
 
         let app = Arc::new(ctx.create_app().await);
 
@@ -341,10 +333,7 @@ mod manual_min_group_tests {
 
         let mut key_to_workers: HashMap<String, HashSet<String>> = HashMap::new();
         for (key, worker) in results {
-            key_to_workers
-                .entry(key)
-                .or_default()
-                .insert(worker);
+            key_to_workers.entry(key).or_default().insert(worker);
         }
 
         for (key, workers) in &key_to_workers {
@@ -357,8 +346,7 @@ mod manual_min_group_tests {
             );
         }
 
-        let all_workers: HashSet<String> =
-            key_to_workers.values().flatten().cloned().collect();
+        let all_workers: HashSet<String> = key_to_workers.values().flatten().cloned().collect();
         assert_eq!(
             all_workers.len(),
             2,

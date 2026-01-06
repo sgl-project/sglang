@@ -78,10 +78,7 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             _ => {
                 // If One or both are missing token data.
                 // Fallback to local request counts for BOTH.
-                (
-                    worker1.load() as isize,
-                    worker2.load() as isize,
-                )
+                (worker1.load() as isize, worker2.load() as isize)
             }
         };
 

@@ -207,10 +207,8 @@ impl CacheAwarePolicy {
     ) -> Option<usize> {
         // Log load balancing trigger (only compute worker loads if debug enabled)
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let worker_loads: Vec<(&str, usize)> = workers
-                .iter()
-                .map(|w| (w.url(), w.load()))
-                .collect();
+            let worker_loads: Vec<(&str, usize)> =
+                workers.iter().map(|w| (w.url(), w.load())).collect();
             debug!(
                 "Load balancing triggered | max: {} | min: {} | workers: {:?}",
                 max_load, min_load, worker_loads
