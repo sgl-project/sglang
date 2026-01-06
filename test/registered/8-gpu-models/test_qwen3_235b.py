@@ -12,6 +12,7 @@ register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
 QWEN3_235B_MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
 
+@unittest.skip("Temporarily disabled for Kimi K2 testing")
 @unittest.skipIf(not is_blackwell_system(), "Requires B200")
 class TestQwen3235BUnified(unittest.TestCase):
     """Unified test class for Qwen3-235B performance and accuracy.
