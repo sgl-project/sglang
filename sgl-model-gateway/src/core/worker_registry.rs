@@ -535,7 +535,7 @@ impl WorkerRegistry {
             if worker.is_healthy() {
                 healthy_count += 1;
             }
-            total_load += worker.worker_load().value();
+            total_load += worker.load();
 
             match worker.worker_type() {
                 WorkerType::Regular => regular_count += 1,

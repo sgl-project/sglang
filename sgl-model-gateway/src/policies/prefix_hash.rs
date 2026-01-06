@@ -147,7 +147,7 @@ impl PrefixHashPolicy {
         // Calculate total load for load balancing
         let total_load: usize = healthy_workers
             .iter()
-            .map(|(_, w)| w.worker_load().value())
+            .map(|(_, w)| w.load())
             .sum();
         let num_workers = healthy_workers.len();
 
@@ -168,7 +168,7 @@ impl PrefixHashPolicy {
                 ring.find_healthy_url(&key, |url| healthy_url_map.contains_key(url))
             {
                 if let Some(&(idx, worker)) = healthy_url_map.get(initial_url) {
-                    let worker_load = worker.worker_load().value();
+                    let worker_load = worker.load();
 
                     // Check if initial worker has acceptable load
                     if self.load_ok(worker_load, total_load, num_workers) {
@@ -180,9 +180,9 @@ impl PrefixHashPolicy {
                     let least_loaded = healthy_workers
                         .iter()
                         .filter(|(_, w)| {
-                            self.load_ok(w.worker_load().value(), total_load, num_workers)
+                            self.load_ok(w.load(), total_load, num_workers)
                         })
-                        .min_by_key(|(_, w)| w.worker_load().value());
+                        .min_by_key(|(_, w)| w.load());
 
                     if let Some(&(idx, _)) = least_loaded {
                         return (Some(idx), Branch::LoadBalanceWalk);
@@ -197,7 +197,7 @@ impl PrefixHashPolicy {
         // Fallback: no ring or ring lookup failed, use least loaded worker
         let least_loaded = healthy_workers
             .iter()
-            .min_by_key(|(_, w)| w.worker_load().value())
+            .min_by_key(|(_, w)| w.load())
             .map(|(idx, _)| *idx);
 
         (least_loaded, Branch::FallbackLeastLoad)

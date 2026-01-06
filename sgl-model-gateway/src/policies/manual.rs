@@ -287,7 +287,7 @@ where
 }
 
 fn min_load_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
-    select_min_by(healthy_indices, |idx| workers[idx].worker_load().value())
+    select_min_by(healthy_indices, |idx| workers[idx].load())
 }
 
 fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
@@ -835,13 +835,13 @@ mod tests {
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
-        workers[0].worker_load().increment();
-        workers[0].worker_load().increment();
-        workers[1].worker_load().increment();
+        workers[0].increment_load();
+        workers[0].increment_load();
+        workers[1].increment_load();
 
-        assert_eq!(workers[0].worker_load().value(), 2);
-        assert_eq!(workers[1].worker_load().value(), 1);
-        assert_eq!(workers[2].worker_load().value(), 0);
+        assert_eq!(workers[0].load(), 2);
+        assert_eq!(workers[1].load(), 1);
+        assert_eq!(workers[2].load(), 0);
 
         let headers = headers_with_routing_key("new-paper");
         let info = SelectWorkerInfo {

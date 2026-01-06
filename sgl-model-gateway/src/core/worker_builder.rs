@@ -5,8 +5,8 @@ use super::{
     model_card::ModelCard,
     model_type::ModelType,
     worker::{
-        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerLoad,
-        WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
+        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
+        WorkerRoutingKeyLoad, WorkerType,
     },
 };
 use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
@@ -192,7 +192,7 @@ impl BasicWorkerBuilder {
 
         BasicWorker {
             metadata,
-            worker_load: Arc::new(WorkerLoad::new(&self.url)),
+            load_counter: Arc::new(AtomicUsize::new(0)),
             worker_routing_key_load: Arc::new(WorkerRoutingKeyLoad::new(&self.url)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(healthy)),

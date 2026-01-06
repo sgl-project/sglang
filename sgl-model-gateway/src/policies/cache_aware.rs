@@ -209,7 +209,7 @@ impl CacheAwarePolicy {
         if tracing::enabled!(tracing::Level::DEBUG) {
             let worker_loads: Vec<(&str, usize)> = workers
                 .iter()
-                .map(|w| (w.url(), w.worker_load().value()))
+                .map(|w| (w.url(), w.load()))
                 .collect();
             debug!(
                 "Load balancing triggered | max: {} | min: {} | workers: {:?}",
@@ -220,7 +220,7 @@ impl CacheAwarePolicy {
         // Use shortest queue when imbalanced
         let min_load_idx = healthy_indices
             .iter()
-            .min_by_key(|&&idx| workers[idx].worker_load().value())
+            .min_by_key(|&&idx| workers[idx].load())
             .copied()?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
@@ -262,7 +262,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
         // Get current load statistics - compute min/max in single pass without allocation
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
-            let load = w.worker_load().value();
+            let load = w.load();
             (min.min(load), max.max(load))
         });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
@@ -311,7 +311,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Low cache match: use worker with minimum load
                 healthy_indices
                     .iter()
-                    .min_by_key(|&&idx| workers[idx].worker_load().value())
+                    .min_by_key(|&&idx| workers[idx].load())
                     .copied()
             };
 
@@ -464,7 +464,7 @@ mod tests {
 
         // Create significant load imbalance
         for _ in 0..20 {
-            worker1.worker_load().increment();
+            worker1.increment_load();
         }
         // worker2 has load 0
 

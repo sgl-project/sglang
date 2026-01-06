@@ -39,63 +39,6 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to create worker HTTP client")
 });
 
-pub struct WorkerLoad {
-    url: String,
-    load_counter: AtomicUsize,
-}
-
-impl WorkerLoad {
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            load_counter: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn value(&self) -> usize {
-        self.load_counter.load(Ordering::Relaxed)
-    }
-
-    pub fn increment(&self) {
-        self.load_counter.fetch_add(1, Ordering::Relaxed);
-        self.update_metrics();
-    }
-
-    pub fn decrement(&self) {
-        if self
-            .load_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_sub(1)
-            })
-            .is_err()
-        {
-            tracing::warn!(
-                worker_url = %self.url,
-                "Attempted to decrement load counter that is already at 0"
-            );
-        }
-        self.update_metrics();
-    }
-
-    pub fn reset(&self) {
-        self.load_counter.store(0, Ordering::Relaxed);
-        self.update_metrics();
-    }
-
-    fn update_metrics(&self) {
-        Metrics::set_worker_requests_active(&self.url, self.value());
-    }
-}
-
-impl fmt::Debug for WorkerLoad {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WorkerLoad")
-            .field("url", &self.url)
-            .field("load", &self.value())
-            .finish()
-    }
-}
-
 pub struct WorkerRoutingKeyLoad {
     url: String,
     active_routing_keys: dashmap::DashMap<String, usize>,
@@ -225,8 +168,17 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .block_on(self.check_health_async())
     }
 
-    /// Get the worker load tracker
-    fn worker_load(&self) -> &WorkerLoad;
+    /// Get the current load (number of active requests)
+    fn load(&self) -> usize;
+
+    /// Increment the load counter
+    fn increment_load(&self);
+
+    /// Decrement the load counter
+    fn decrement_load(&self);
+
+    /// Reset the load counter to 0 (for sync/recovery)
+    fn reset_load(&self) {}
 
     /// Get the worker routing key load tracker
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
@@ -664,7 +616,7 @@ impl WorkerMetadata {
 #[derive(Clone)]
 pub struct BasicWorker {
     pub metadata: WorkerMetadata,
-    pub worker_load: Arc<WorkerLoad>,
+    pub load_counter: Arc<AtomicUsize>,
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
@@ -684,7 +636,7 @@ impl fmt::Debug for BasicWorker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BasicWorker")
             .field("metadata", &self.metadata)
-            .field("worker_load", &self.worker_load)
+            .field("load", &self.load())
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
             .field("circuit_breaker", &self.circuit_breaker)
             .field("grpc_client", &"<RwLock>")
@@ -785,8 +737,34 @@ impl Worker for BasicWorker {
         }
     }
 
-    fn worker_load(&self) -> &WorkerLoad {
-        &self.worker_load
+    fn load(&self) -> usize {
+        self.load_counter.load(Ordering::Relaxed)
+    }
+
+    fn increment_load(&self) {
+        self.load_counter.fetch_add(1, Ordering::Relaxed);
+        Metrics::set_worker_requests_active(&self.metadata.url, self.load());
+    }
+
+    fn decrement_load(&self) {
+        if self
+            .load_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(1)
+            })
+            .is_err()
+        {
+            tracing::warn!(
+                worker_url = %self.metadata.url,
+                "Attempted to decrement load counter that is already at 0"
+            );
+        }
+        Metrics::set_worker_requests_active(&self.metadata.url, self.load());
+    }
+
+    fn reset_load(&self) {
+        self.load_counter.store(0, Ordering::Relaxed);
+        Metrics::set_worker_requests_active(&self.metadata.url, self.load());
     }
 
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
@@ -1012,8 +990,20 @@ impl Worker for DPAwareWorker {
         self.base_worker.check_health_async().await
     }
 
-    fn worker_load(&self) -> &WorkerLoad {
-        self.base_worker.worker_load()
+    fn load(&self) -> usize {
+        self.base_worker.load()
+    }
+
+    fn increment_load(&self) {
+        self.base_worker.increment_load();
+    }
+
+    fn decrement_load(&self) {
+        self.base_worker.decrement_load();
+    }
+
+    fn reset_load(&self) {
+        self.base_worker.reset_load();
     }
 
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
@@ -1102,7 +1092,7 @@ impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
         use crate::policies::utils::extract_routing_key;
 
-        worker.worker_load().increment();
+        worker.increment_load();
 
         let routing_key = extract_routing_key(headers).map(String::from);
 
@@ -1119,7 +1109,7 @@ impl WorkerLoadGuard {
 
 impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
-        self.worker.worker_load().decrement();
+        self.worker.decrement_load();
         if let Some(ref key) = self.routing_key {
             self.worker.worker_routing_key_load().decrement(key);
         }
@@ -1237,7 +1227,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         cost: worker.cost(),
         worker_type: worker_type_str.to_string(),
         is_healthy: worker.is_healthy(),
-        load: worker.worker_load().value(),
+        load: worker.load(),
         connection_mode: connection_mode.to_string(),
         runtime_type,
         tokenizer_path: worker.tokenizer_path(model_id).map(String::from),
@@ -1346,7 +1336,7 @@ mod tests {
         assert_eq!(worker.url(), "http://test:8080");
         assert_eq!(worker.worker_type(), &WorkerType::Regular);
         assert!(worker.is_healthy());
-        assert_eq!(worker.worker_load().value(), 0);
+        assert_eq!(worker.load(), 0);
         assert_eq!(worker.processed_requests(), 0);
     }
 
@@ -1444,24 +1434,24 @@ mod tests {
             .worker_type(WorkerType::Regular)
             .build();
 
-        assert_eq!(worker.worker_load().value(), 0);
+        assert_eq!(worker.load(), 0);
 
-        worker.worker_load().increment();
-        assert_eq!(worker.worker_load().value(), 1);
+        worker.increment_load();
+        assert_eq!(worker.load(), 1);
 
-        worker.worker_load().increment();
-        worker.worker_load().increment();
-        assert_eq!(worker.worker_load().value(), 3);
+        worker.increment_load();
+        worker.increment_load();
+        assert_eq!(worker.load(), 3);
 
-        worker.worker_load().decrement();
-        assert_eq!(worker.worker_load().value(), 2);
+        worker.decrement_load();
+        assert_eq!(worker.load(), 2);
 
-        worker.worker_load().decrement();
-        worker.worker_load().decrement();
-        assert_eq!(worker.worker_load().value(), 0);
+        worker.decrement_load();
+        worker.decrement_load();
+        assert_eq!(worker.load(), 0);
 
-        worker.worker_load().decrement();
-        assert_eq!(worker.worker_load().value(), 0);
+        worker.decrement_load();
+        assert_eq!(worker.load(), 0);
     }
 
     #[test]
@@ -1493,7 +1483,7 @@ mod tests {
         for _ in 0..100 {
             let worker_clone = Arc::clone(&worker);
             let handle = tokio::spawn(async move {
-                worker_clone.worker_load().increment();
+                worker_clone.increment_load();
             });
             handles.push(handle);
         }
@@ -1502,7 +1492,7 @@ mod tests {
             handle.await.unwrap();
         }
 
-        assert_eq!(worker.worker_load().value(), 100);
+        assert_eq!(worker.load(), 100);
     }
 
     #[tokio::test]
@@ -1515,16 +1505,16 @@ mod tests {
         );
 
         for _ in 0..100 {
-            worker.worker_load().increment();
+            worker.increment_load();
         }
-        assert_eq!(worker.worker_load().value(), 100);
+        assert_eq!(worker.load(), 100);
 
         let mut handles = vec![];
 
         for _ in 0..100 {
             let worker_clone = Arc::clone(&worker);
             let handle = tokio::spawn(async move {
-                worker_clone.worker_load().decrement();
+                worker_clone.decrement_load();
             });
             handles.push(handle);
         }
@@ -1533,7 +1523,7 @@ mod tests {
             handle.await.unwrap();
         }
 
-        assert_eq!(worker.worker_load().value(), 0);
+        assert_eq!(worker.load(), 0);
     }
 
     #[tokio::test]
@@ -1643,7 +1633,7 @@ mod tests {
 
         let start = Instant::now();
         for _ in 0..iterations {
-            worker.worker_load().increment();
+            worker.increment_load();
         }
         let duration = start.elapsed();
 
@@ -1759,11 +1749,11 @@ mod tests {
         dp_worker.set_healthy(false);
         assert!(!dp_worker.is_healthy());
 
-        assert_eq!(dp_worker.worker_load().value(), 0);
-        dp_worker.worker_load().increment();
-        assert_eq!(dp_worker.worker_load().value(), 1);
-        dp_worker.worker_load().decrement();
-        assert_eq!(dp_worker.worker_load().value(), 0);
+        assert_eq!(dp_worker.load(), 0);
+        dp_worker.increment_load();
+        assert_eq!(dp_worker.load(), 1);
+        dp_worker.decrement_load();
+        assert_eq!(dp_worker.load(), 0);
 
         assert_eq!(dp_worker.processed_requests(), 0);
         dp_worker.increment_processed();
@@ -1891,7 +1881,7 @@ mod tests {
 
         for worker in &workers {
             assert!(worker.is_healthy());
-            assert_eq!(worker.worker_load().value(), 0);
+            assert_eq!(worker.load(), 0);
             assert_eq!(worker.processed_requests(), 0);
         }
 
@@ -2061,7 +2051,7 @@ mod tests {
                 .build(),
         );
 
-        assert_eq!(worker.worker_load().value(), 0);
+        assert_eq!(worker.load(), 0);
         assert_eq!(worker.worker_routing_key_load().value(), 0);
 
         let mut headers = http::HeaderMap::new();
@@ -2069,11 +2059,11 @@ mod tests {
 
         {
             let _guard = WorkerLoadGuard::new(worker.clone(), Some(&headers));
-            assert_eq!(worker.worker_load().value(), 1);
+            assert_eq!(worker.load(), 1);
             assert_eq!(worker.worker_routing_key_load().value(), 1);
         }
 
-        assert_eq!(worker.worker_load().value(), 0);
+        assert_eq!(worker.load(), 0);
         assert_eq!(worker.worker_routing_key_load().value(), 0);
     }
 
@@ -2087,16 +2077,16 @@ mod tests {
                 .build(),
         );
 
-        assert_eq!(worker.worker_load().value(), 0);
+        assert_eq!(worker.load(), 0);
         assert_eq!(worker.worker_routing_key_load().value(), 0);
 
         {
             let _guard = WorkerLoadGuard::new(worker.clone(), None);
-            assert_eq!(worker.worker_load().value(), 1);
+            assert_eq!(worker.load(), 1);
             assert_eq!(worker.worker_routing_key_load().value(), 0);
         }
 
-        assert_eq!(worker.worker_load().value(), 0);
+        assert_eq!(worker.load(), 0);
         assert_eq!(worker.worker_routing_key_load().value(), 0);
     }
 
@@ -2114,19 +2104,19 @@ mod tests {
         headers.insert("x-smg-routing-key", "paper-123".parse().unwrap());
 
         let guard1 = WorkerLoadGuard::new(worker.clone(), Some(&headers));
-        assert_eq!(worker.worker_load().value(), 1);
+        assert_eq!(worker.load(), 1);
         assert_eq!(worker.worker_routing_key_load().value(), 1);
 
         let guard2 = WorkerLoadGuard::new(worker.clone(), Some(&headers));
-        assert_eq!(worker.worker_load().value(), 2);
+        assert_eq!(worker.load(), 2);
         assert_eq!(worker.worker_routing_key_load().value(), 1);
 
         drop(guard1);
-        assert_eq!(worker.worker_load().value(), 1);
+        assert_eq!(worker.load(), 1);
         assert_eq!(worker.worker_routing_key_load().value(), 1);
 
         drop(guard2);
-        assert_eq!(worker.worker_load().value(), 0);
+        assert_eq!(worker.load(), 0);
         assert_eq!(worker.worker_routing_key_load().value(), 0);
     }
 }
