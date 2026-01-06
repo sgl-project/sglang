@@ -308,7 +308,6 @@ class ServerArgs:
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
-    hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
@@ -2849,15 +2848,8 @@ class ServerArgs:
         )
         parser.add_argument(
             "--hybrid-kvcache-ratio",
-            nargs="?",
-            const=0.5,
-            type=float,
-            default=ServerArgs.hybrid_kvcache_ratio,
-            help=(
-                "Mix ratio in [0,1] between uniform and hybrid kv buffers "
-                "(0.0 = pure uniform: swa_size / full_size = 1)"
-                "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
-            ),
+            action=DeprecatedAction,
+            help="Note: --hybrid-kvcache-ratio is deprecated now. Please use --swa-full-tokens-ratio instead.",
         )
         parser.add_argument(
             "--swa-full-tokens-ratio",
