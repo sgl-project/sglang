@@ -17,7 +17,6 @@ use super::{
         extract_all_tool_calls_from_chat, load_conversation_history, prepare_chat_tools_and_choice,
         ToolLoopState,
     },
-    context::ResponsesContext,
     conversions,
 };
 use crate::{
@@ -25,7 +24,9 @@ use crate::{
     protocols::responses::{ResponseStatus, ResponsesRequest, ResponsesResponse},
     routers::{
         error,
-        grpc::common::responses::{ensure_mcp_connection, persist_response_if_needed},
+        grpc::common::responses::{
+            ensure_mcp_connection, persist_response_if_needed, ResponsesContext,
+        },
         mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
     },
 };
