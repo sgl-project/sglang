@@ -393,12 +393,19 @@ class Gateway:
             return None
 
     def add_worker(
-        self, worker_url: str, timeout: float = 10.0
+        self,
+        worker_url: str,
+        timeout: float = 10.0,
+        wait_ready: bool = True,
+        ready_timeout: float = 60.0,
     ) -> tuple[bool, str | None]:
         """Add a worker to the gateway.
 
         Args:
             worker_url: URL of the worker to add.
+            timeout: HTTP request timeout.
+            wait_ready: If True, wait for worker to become ready.
+            ready_timeout: Timeout for waiting for worker to be ready.
 
         Returns:
             Tuple of (success, worker_id or error message).
@@ -409,9 +416,28 @@ class Gateway:
                 json={"url": worker_url},
                 timeout=timeout,
             )
-            if resp.status_code == 200:
+            # API returns 200 OK or 202 Accepted for async processing
+            if resp.status_code in (200, 202):
                 data = resp.json()
-                return True, data.get("worker_id")
+                worker_id = data.get("worker_id")
+
+                if wait_ready and worker_id:
+                    # Wait for worker to appear in list
+                    import time
+
+                    start = time.time()
+                    while time.time() - start < ready_timeout:
+                        workers = self.list_workers()
+                        for w in workers:
+                            if w.id == worker_id:
+                                return True, worker_id
+                        time.sleep(1.0)
+                    return (
+                        False,
+                        f"Worker {worker_id} not ready within {ready_timeout}s",
+                    )
+
+                return True, worker_id
             return False, resp.text
         except (httpx.RequestError, httpx.TimeoutException) as e:
             return False, str(e)

@@ -46,6 +46,7 @@ class ModelInstance:
     bootstrap_port: int | None = None  # For prefill workers in PD mode
     scope: str = "session"  # "session" or "class"
     last_used: float = 0.0  # Timestamp for LRU eviction
+    _healthy: bool = False  # Track if initial health check passed
 
     @property
     def key(self) -> str:
@@ -416,10 +417,19 @@ class ModelPool:
         return instance
 
     def _wait_all_healthy(self) -> None:
-        """Wait for all model instances to become healthy."""
+        """Wait for all model instances to become healthy.
+
+        Only checks workers that haven't been marked healthy yet,
+        avoiding redundant health checks on already-verified workers.
+        """
         start_time = time.time()
-        pending = set(self.instances.keys())
+        # Only wait for workers that haven't been verified healthy yet
+        pending = {key for key, inst in self.instances.items() if not inst._healthy}
         check_count = 0
+
+        if not pending:
+            logger.info("All workers already healthy, skipping health check")
+            return
 
         logger.info(
             "Waiting for %d workers to become healthy (timeout: %ds)...",
@@ -459,6 +469,7 @@ class ModelPool:
                         instance.base_url,
                         check_count,
                     )
+                    instance._healthy = True
                     pending.discard(key)
 
             if pending:
@@ -664,6 +675,7 @@ class ModelPool:
 
             if instance.health_check():
                 logger.info("Instance %s is healthy", key)
+                instance._healthy = True
                 return
 
             time.sleep(HEALTH_CHECK_INTERVAL)
