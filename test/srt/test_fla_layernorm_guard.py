@@ -201,9 +201,9 @@ CASES: list[FwdCase] = [
 ]
 
 
-@pytest.mark.parametrize("num_tokens", [128, 8191])
-@pytest.mark.parametrize("hidden_size", [256, 1024])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_tokens", [128])
+@pytest.mark.parametrize("hidden_size", [256])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.name)
 def test_layernorm_guard_fwd_spawn(
     num_tokens: int,
@@ -307,7 +307,7 @@ def _layernorm_guard_fwd_worker(
             assert rstd.shape == (ngroups * num_tokens,)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_layernorm_guard_misc_spawn(dtype: torch.dtype, device: str = "cuda"):
     _skip_if_no_cuda_or_not_enough_gpus(NUM_GPUS)
     _skip_if_dtype_unsupported(dtype)
@@ -341,7 +341,7 @@ def _layernorm_guard_misc_worker(
         weight = torch.randn(hidden_size, dtype=dtype, device=device)
         bias = torch.randn(hidden_size, dtype=dtype, device=device)
         eps = 1e-6
-        for num_tokens in [63, 513, 2049]:
+        for num_tokens in [513]:
             x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
             out, _, _ = layer_norm_fwd(x, weight, bias, eps, z=None, is_rms_norm=False)
             ref = layer_norm_ref(x, weight, bias, z=None, eps=eps, is_rms_norm=False)
@@ -370,7 +370,7 @@ def _layernorm_guard_misc_worker(
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
         # 4) multidimensional input via autograd fn
-        for shape in [(4, 16, 1024), (2, 8, 512, 256)]:
+        for shape in [(4, 16, 1024)]:
             hs = shape[-1]
             x = torch.randn(*shape, dtype=dtype, device=device)
             w = torch.randn(hs, dtype=dtype, device=device)

@@ -212,7 +212,6 @@ def _layer_norm_fwd(
     rows_per_block = calc_rows_per_block(M, x.device)
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
-    grid = (M, ngroups)
     with device_context(x.device):
         _layer_norm_fwd_1pass_kernel[grid](
             x,

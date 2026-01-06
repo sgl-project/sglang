@@ -69,6 +69,7 @@ suites = {
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
         TestFile("test_prefill_delayer.py"),
+        TestFile("test_fla_layernorm_guard.py"),
     ],
 }
 
