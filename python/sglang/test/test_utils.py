@@ -907,7 +907,9 @@ def run_bench_serving(
     finally:
         kill_process_tree(process.pid)
 
-    expected_completed = num_prompts * gsp_num_turns if gsp_num_turns > 1 else num_prompts
+    expected_completed = (
+        num_prompts * gsp_num_turns if gsp_num_turns > 1 else num_prompts
+    )
     assert res["completed"] == expected_completed
     return res
 

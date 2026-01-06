@@ -25,17 +25,34 @@ class TestBenchServingFunctionality(CustomTestCase):
     def test_gsp_multi_turn(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             process = popen_launch_server(
-                MODEL, DEFAULT_URL_FOR_TEST, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=["--mem-fraction-static", "0.7", "--log-requests",
-                            "--log-requests-level", "3", "--log-requests-format", "json",
-                            "--log-requests-target", temp_dir],
+                MODEL,
+                DEFAULT_URL_FOR_TEST,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--mem-fraction-static",
+                    "0.7",
+                    "--log-requests",
+                    "--log-requests-level",
+                    "3",
+                    "--log-requests-format",
+                    "json",
+                    "--log-requests-target",
+                    temp_dir,
+                ],
             )
             try:
                 args = get_benchmark_args(
-                    base_url=DEFAULT_URL_FOR_TEST, dataset_name="generated-shared-prefix",
-                    num_prompts=NUM_CONVERSATIONS, request_rate=float("inf"), disable_ignore_eos=True,
-                    gsp_num_groups=2, gsp_prompts_per_group=2, gsp_system_prompt_len=64,
-                    gsp_question_len=16, gsp_output_len=16, gsp_num_turns=NUM_TURNS,
+                    base_url=DEFAULT_URL_FOR_TEST,
+                    dataset_name="generated-shared-prefix",
+                    num_prompts=NUM_CONVERSATIONS,
+                    request_rate=float("inf"),
+                    disable_ignore_eos=True,
+                    gsp_num_groups=2,
+                    gsp_prompts_per_group=2,
+                    gsp_system_prompt_len=64,
+                    gsp_question_len=16,
+                    gsp_output_len=16,
+                    gsp_num_turns=NUM_TURNS,
                 )
                 res = run_benchmark(args)
                 self.assertEqual(res["completed"], NUM_CONVERSATIONS * NUM_TURNS)
@@ -47,17 +64,24 @@ class TestBenchServingFunctionality(CustomTestCase):
                 kill_process_tree(process.pid)
 
     def _verify_multi_turn_logs(self, content: str):
-        reqs = [json.loads(line) for line in content.splitlines()
-                if line.startswith("{") and "request.finished" in line
-                and not json.loads(line).get("rid", "").startswith("HEALTH_CHECK")]
+        reqs = [
+            json.loads(line)
+            for line in content.splitlines()
+            if line.startswith("{")
+            and "request.finished" in line
+            and not json.loads(line).get("rid", "").startswith("HEALTH_CHECK")
+        ]
 
         self.assertEqual(len(reqs), NUM_CONVERSATIONS * NUM_TURNS)
 
         lengths = sorted(len(r.get("obj", {}).get("text", "")) for r in reqs)
         avg_short = sum(lengths[:NUM_CONVERSATIONS]) / NUM_CONVERSATIONS
         avg_long = sum(lengths[-NUM_CONVERSATIONS:]) / NUM_CONVERSATIONS
-        self.assertGreater(avg_long, avg_short * 1.5,
-                           f"Later turns should have longer prompts. Short: {avg_short}, Long: {avg_long}")
+        self.assertGreater(
+            avg_long,
+            avg_short * 1.5,
+            f"Later turns should have longer prompts. Short: {avg_short}, Long: {avg_long}",
+        )
 
 
 if __name__ == "__main__":
