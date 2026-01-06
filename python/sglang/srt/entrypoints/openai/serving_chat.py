@@ -119,14 +119,14 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> tuple[List[Dict[str, Any]], Optional[str]]:
         """
         Handle continue_final_message feature: separate final assistant message.
-        
+
         If continue_final_message is enabled and the last message is from assistant,
         extract its content and remove it from the message list.
-        
+
         Args:
             messages: List of message dictionaries
             request: ChatCompletionRequest with continue_final_message flag
-            
+
         Returns:
             Tuple of (processed_messages, assistant_prefix)
             - processed_messages: Messages with last assistant message removed if continue_final_message is True
@@ -147,19 +147,16 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> List[int]:
         """
         Append assistant prefix to prompt_ids.
-        
+
         Args:
             prompt_ids: Current prompt token IDs
             assistant_prefix: Assistant message content to append
-            
+
         Returns:
             Updated prompt_ids with assistant prefix appended
         """
         encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
-        if (
-            encoded
-            and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id
-        ):
+        if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
             encoded = encoded[1:]
         return prompt_ids + encoded
 
@@ -433,9 +430,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle continue_final_message: separate final assistant message
             openai_compatible_messages, assistant_prefix = (
-                self._handle_continue_final_message(
-                    openai_compatible_messages, request
-                )
+                self._handle_continue_final_message(openai_compatible_messages, request)
             )
 
             try:
