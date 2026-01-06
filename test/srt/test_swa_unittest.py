@@ -7,6 +7,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.utils import get_device
 
 
 class TestSWA(unittest.TestCase):
@@ -27,7 +28,7 @@ class TestSWA(unittest.TestCase):
         num_layers = 48
         global_interval = 4
         dtype = torch.bfloat16
-        device = "cuda"
+        device = get_device()
         full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
         full_attention_layer_ids_set = set(full_attention_layer_ids)
         swa_attention_layer_ids = [
@@ -79,7 +80,7 @@ class TestSWA(unittest.TestCase):
         num_layers = 48
         global_interval = 4
         dtype = torch.bfloat16
-        device = "cuda"
+        device = get_device()
         full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
         full_attention_layer_ids_set = set(full_attention_layer_ids)
         swa_attention_layer_ids = [
@@ -215,7 +216,7 @@ class TestSWA(unittest.TestCase):
         num_layers = 48
         global_interval = 4
         dtype = torch.bfloat16
-        device = "cuda"
+        device = get_device()
         full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
         full_attention_layer_ids_set = set(full_attention_layer_ids)
         swa_attention_layer_ids = [
