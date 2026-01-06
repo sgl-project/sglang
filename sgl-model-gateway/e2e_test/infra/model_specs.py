@@ -107,3 +107,17 @@ CHAT_MODELS = get_models_with_feature("chat")
 EMBEDDING_MODELS = get_models_with_feature("embedding")
 REASONING_MODELS = get_models_with_feature("reasoning")
 FUNCTION_CALLING_MODELS = get_models_with_feature("function_calling")
+
+
+# =============================================================================
+# Default model path constants (for backward compatibility with existing tests)
+# =============================================================================
+
+DEFAULT_MODEL_PATH = MODEL_SPECS["llama-8b"]["model"]
+DEFAULT_SMALL_MODEL_PATH = MODEL_SPECS["llama-1b"]["model"]
+DEFAULT_REASONING_MODEL_PATH = MODEL_SPECS["deepseek-7b"]["model"]
+DEFAULT_ENABLE_THINKING_MODEL_PATH = MODEL_SPECS["qwen-30b"]["model"]
+DEFAULT_QWEN_FUNCTION_CALLING_MODEL_PATH = MODEL_SPECS["qwen-7b"]["model"]
+DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH = MODEL_SPECS["mistral-7b"]["model"]
+DEFAULT_GPT_OSS_MODEL_PATH = MODEL_SPECS["gpt-oss"]["model"]
+DEFAULT_EMBEDDING_MODEL_PATH = MODEL_SPECS["embedding"]["model"]
