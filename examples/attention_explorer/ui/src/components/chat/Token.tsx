@@ -12,40 +12,45 @@ interface TokenProps {
 export function Token({ text, index, type, attention }: TokenProps) {
   const selectedTokenIndex = useUIStore((state) => state.selectedTokenIndex);
   const hoveredTokenIndex = useUIStore((state) => state.hoveredTokenIndex);
-  const selectToken = useUIStore((state) => state.selectToken);
-  const hoverToken = useUIStore((state) => state.hoverToken);
+  const drawerState = useUIStore((state) => state.drawerState);
+  const drawerTokenIndex = useUIStore((state) => state.drawerTokenIndex);
+  const openDrawerHover = useUIStore((state) => state.openDrawerHover);
+  const closeDrawerHover = useUIStore((state) => state.closeDrawerHover);
+  const pinDrawer = useUIStore((state) => state.pinDrawer);
 
   const isSelected = type === 'output' && selectedTokenIndex === index;
   const isHovered = type === 'output' && hoveredTokenIndex === index;
+  const isPinned = type === 'output' && drawerState === 'pinned' && drawerTokenIndex === index;
 
   // Check topk_mass for low-mass indicator
   const isLowMass = attention && isRawMode(attention) && (attention.topk_mass ?? 1) < 0.55;
 
   const handleClick = useCallback(() => {
     if (type === 'output') {
-      if (isSelected) {
-        selectToken(null);
-        return;
-      }
-      // Simply select the token - the InsightPanel will read attention from stored messages
-      selectToken(index);
+      // Pin/unpin drawer on click
+      pinDrawer(index);
     }
-  }, [type, index, isSelected, selectToken]);
+  }, [type, index, pinDrawer]);
 
   const handleMouseEnter = useCallback(() => {
     if (type === 'output') {
-      hoverToken(index);
+      // Open drawer on hover (unless pinned to another token)
+      openDrawerHover(index);
     }
-  }, [type, index, hoverToken]);
+  }, [type, index, openDrawerHover]);
 
   const handleMouseLeave = useCallback(() => {
-    hoverToken(null);
-  }, [hoverToken]);
+    if (type === 'output') {
+      // Start close delay (drawer will close after delay unless re-hovered)
+      closeDrawerHover();
+    }
+  }, [type, closeDrawerHover]);
 
   const classNames = [
     'tok',
     isSelected && 'selected',
     isHovered && 'hovered',
+    isPinned && 'pinned',
     isLowMass && 'lowmass',
   ]
     .filter(Boolean)

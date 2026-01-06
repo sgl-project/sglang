@@ -5,6 +5,7 @@ import { InspectView } from './components/views/InspectView';
 import { ManifoldView } from './components/views/ManifoldView';
 import { RouterView } from './components/views/RouterView';
 import { InsightPanel } from './components/lens/InsightPanel';
+import { TokenLensDrawer } from './components/lens/TokenLensDrawer';
 import { useUIStore } from './stores/useUIStore';
 
 export default function App() {
@@ -36,6 +37,8 @@ export default function App() {
           <InsightPanel />
         </div>
       </div>
+      {/* Token Lens Drawer - slides in from right on token hover/click */}
+      <TokenLensDrawer />
     </AppShell>
   );
 }
