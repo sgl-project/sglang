@@ -1773,11 +1773,11 @@ def sample_generated_shared_prefix_requests(
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
     send_routing_key = getattr(args, "gsp_send_routing_key", False)
+    num_turns = getattr(args, "gsp_num_turns", 1)
 
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
-    should_cache = (range_ratio == 1) and not send_routing_key
+    should_cache = (range_ratio == 1) and not send_routing_key and num_turns == 1
 
-    # Try to load from cache first
     if cache_path.exists() and should_cache:
         print(f"\nLoading cached generated input data from {cache_path}")
         with open(cache_path, "rb") as f:
@@ -1785,7 +1785,7 @@ def sample_generated_shared_prefix_requests(
 
     print(
         f"\nGenerating new input data... "
-        f"({num_groups=}, {prompts_per_group}, {system_prompt_len=}, {question_len=}, {output_len=}, {range_ratio=})"
+        f"({num_groups=}, {prompts_per_group}, {system_prompt_len=}, {question_len=}, {output_len=}, {range_ratio=}, {num_turns=})"
     )
 
     run_random_str = uuid.uuid4().hex[:8]
@@ -1796,10 +1796,11 @@ def sample_generated_shared_prefix_requests(
         range_ratio=range_ratio,
         num=num_groups,
     )
+    total_questions = num_groups * prompts_per_group * num_turns
     question_lens = compute_random_lens(
         full_len=question_len,
         range_ratio=range_ratio,
-        num=num_groups * prompts_per_group,
+        num=total_questions,
     )
     output_lens = compute_random_lens(
         full_len=output_len,
@@ -1808,19 +1809,16 @@ def sample_generated_shared_prefix_requests(
     )
     del system_prompt_len, question_len, output_len
 
-    # Generate system prompts for each group
     system_prompts = []
     for i in range(num_groups):
         system_prompt = gen_prompt(tokenizer, system_prompt_lens[i].item())
         system_prompts.append(system_prompt)
 
-    # Generate questions
     questions = []
-    for i in range(num_groups * prompts_per_group):
+    for i in range(total_questions):
         question = gen_prompt(tokenizer, question_lens[i].item())
         questions.append(question)
 
-    # Combine system prompts with questions
     input_requests = []
     total_input_tokens = 0
     total_output_tokens = 0
@@ -1836,13 +1834,25 @@ def sample_generated_shared_prefix_requests(
             range(prompts_per_group), desc="Generating questions", leave=False
         ):
             flat_index = group_idx * prompts_per_group + prompt_idx
-            question = questions[flat_index]
-            full_prompt = f"{system_prompt}\n\n{question}"
-            prompt_len = (
-                1
-                if getattr(args, "gsp_fast_prepare", False)
-                else len(tokenizer.encode(full_prompt))
-            )
+            if num_turns == 1:
+                question = questions[flat_index]
+                full_prompt = f"{system_prompt}\n\n{question}"
+                prompt_len = (
+                    1
+                    if getattr(args, "gsp_fast_prepare", False)
+                    else len(tokenizer.encode(full_prompt))
+                )
+            else:
+                turn_questions = []
+                for turn_idx in range(num_turns):
+                    q_idx = flat_index * num_turns + turn_idx
+                    turn_questions.append(questions[q_idx])
+                full_prompt = [f"{system_prompt}\n\n{q}" for q in turn_questions]
+                prompt_len = (
+                    1
+                    if getattr(args, "gsp_fast_prepare", False)
+                    else len(tokenizer.encode(full_prompt[0]))
+                )
 
             input_requests.append(
                 DatasetRow(
@@ -1855,13 +1865,12 @@ def sample_generated_shared_prefix_requests(
             total_input_tokens += prompt_len
             total_output_tokens += output_lens[flat_index].item()
 
-    # Shuffle questions
     random.shuffle(input_requests)
 
-    # Print statistics
     print(f"\nGenerated shared prefix dataset statistics:")
     print(f"Number of groups: {num_groups}")
     print(f"Prompts per group: {prompts_per_group}")
+    print(f"Number of turns: {num_turns}")
     print(f"Total prompts: {len(input_requests)}")
     if not getattr(args, "gsp_fast_prepare", False):
         print(f"Total input tokens: {total_input_tokens}")
@@ -1873,7 +1882,6 @@ def sample_generated_shared_prefix_requests(
             f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
         )
 
-    # Save to cache
     if should_cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Caching generated input data to {cache_path}")
