@@ -11,6 +11,10 @@ DEFAULT_CUDA_VERSION = "129"
 
 
 def check_wheel_cuda_version(path_name, target_cuda_version):
+    # Pass ROCm wheel
+    if re.search(f"rocm", path_name):
+        return False
+
     # For other CUDA versions, the wheel path name will contain the cuda version suffix, e.g. sgl_kernel-0.3.16.post5+cu130-cp310-abi3-manylinux2014_x86_64.whl
     if target_cuda_version != DEFAULT_CUDA_VERSION:
         return target_cuda_version in path_name
@@ -24,30 +28,38 @@ def check_wheel_cuda_version(path_name, target_cuda_version):
 
 
 def update_wheel_index(cuda_version=DEFAULT_CUDA_VERSION, rocm_version=None):
-    if rocm_version is None:
-        index_dir = pathlib.Path(f"sgl-whl/cu{cuda_version}/sgl-kernel")
-    else:
-        index_dir = pathlib.Path(f"sgl-whl/rocm{rocm_version}/sgl-kernel")
+    index_dir = pathlib.Path(f"sgl-whl/cu{cuda_version}/sgl-kernel")
     index_dir.mkdir(exist_ok=True, parents=True)
     base_url = "https://github.com/sgl-project/whl/releases/download"
 
     for path in sorted(pathlib.Path("sgl-kernel/dist").glob("*.whl")):
         # Skip the wheel if mismatches the passed in cuda_version
-        if (
-            not check_wheel_cuda_version(path.name, cuda_version)
-            and rocm_version is None
-        ):
+        if not check_wheel_cuda_version(path.name, cuda_version):
             continue
         with open(path, "rb") as f:
             sha256 = hashlib.sha256(f.read()).hexdigest()
-        if rocm_version is None:
-            ver = re.findall(
-                r"sgl_kernel-([0-9.]+(?:\.post[0-9]+)?)(?:\+cu[0-9]+)?-", path.name
-            )[0]
-        else:
-            ver = re.findall(
-                r"sgl_kernel-([0-9.]+(?:\.post[0-9]+)?)(?:\+rocm[0-9]+)?-", path.name
-            )[0]
+        ver = re.findall(
+            r"sgl_kernel-([0-9.]+(?:\.post[0-9]+)?)(?:\+cu[0-9]+)?-", path.name
+        )[0]
+        full_url = f"{base_url}/v{ver}/{path.name}#sha256={sha256}"
+        with (index_dir / "index.html").open("a") as f:
+            f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
+
+
+def update_wheel_index_rocm(rocm_version):
+    index_dir = pathlib.Path(f"sgl-whl/rocm{rocm_version}/sgl-kernel")
+    index_dir.mkdir(exist_ok=True, parents=True)
+    base_url = "https://github.com/sgl-project/whl/releases/download"
+
+    for path in sorted(pathlib.Path("sgl-kernel/dist").glob("*.whl")):
+        # Skip the wheel if not rocm
+        if re.search(f"rocm", path.name) is None:
+            continue
+        with open(path, "rb") as f:
+            sha256 = hashlib.sha256(f.read()).hexdigest()
+        ver = re.findall(
+            r"sgl_kernel-([0-9.]+(?:\.post[0-9]+)?)(?:\+rocm[0-9]+)?-", path.name
+        )[0]
         full_url = f"{base_url}/v{ver}/{path.name}#sha256={sha256}"
         with (index_dir / "index.html").open("a") as f:
             f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
@@ -58,7 +70,10 @@ def main():
     parser.add_argument("--cuda", type=str, default=DEFAULT_CUDA_VERSION)
     parser.add_argument("--rocm", type=str, default=None)
     args = parser.parse_args()
-    update_wheel_index(args.cuda, args.rocm)
+    if args.rocm is None:
+        update_wheel_index(args.cuda)
+    else:
+        update_wheel_index_rocm(args.rocm)
 
 
 if __name__ == "__main__":
