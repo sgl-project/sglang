@@ -1103,7 +1103,10 @@ impl WorkerLoadGuard {
             worker.worker_routing_key_load().increment(key);
         }
 
-        Self { worker, routing_key }
+        Self {
+            worker,
+            routing_key,
+        }
     }
 }
 
@@ -1993,7 +1996,7 @@ mod tests {
 
     #[test]
     fn test_worker_load_guard_with_routing_key() {
-        use super::BasicWorkerBuilder;
+        use crate::core::BasicWorkerBuilder;
 
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://test:8000")
@@ -2019,7 +2022,7 @@ mod tests {
 
     #[test]
     fn test_worker_load_guard_without_routing_key() {
-        use super::BasicWorkerBuilder;
+        use crate::core::BasicWorkerBuilder;
 
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://test:8000")
@@ -2042,7 +2045,7 @@ mod tests {
 
     #[test]
     fn test_worker_load_guard_multiple_same_routing_key() {
-        use super::BasicWorkerBuilder;
+        use crate::core::BasicWorkerBuilder;
 
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://test:8000")

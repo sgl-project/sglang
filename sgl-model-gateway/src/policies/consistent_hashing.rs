@@ -23,9 +23,7 @@ use rand::Rng as _;
 
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{
-    core::Worker,
-    observability::metrics::Metrics,
-    routers::header_utils::extract_routing_key,
+    core::Worker, observability::metrics::Metrics, routers::header_utils::extract_routing_key,
 };
 
 /// Header for direct worker targeting by index (0-based)

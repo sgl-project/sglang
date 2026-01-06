@@ -23,9 +23,7 @@ use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::{
-    config::ManualAssignmentMode,
-    core::Worker,
-    observability::metrics::Metrics,
+    config::ManualAssignmentMode, core::Worker, observability::metrics::Metrics,
     routers::header_utils::extract_routing_key,
 };
 
@@ -152,11 +150,7 @@ impl ManualPolicy {
         }
     }
 
-    fn select_new_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        healthy_indices: &[usize],
-    ) -> usize {
+    fn select_new_worker(&self, workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
         match self.assignment_mode {
             ManualAssignmentMode::Random => random_select(healthy_indices),
             ManualAssignmentMode::MinLoad => min_load_select(workers, healthy_indices),
@@ -265,7 +259,11 @@ fn select_min_by<F>(healthy_indices: &[usize], get_value: F) -> usize
 where
     F: Fn(usize) -> usize,
 {
-    let min_val = healthy_indices.iter().map(|&idx| get_value(idx)).min().unwrap_or(0);
+    let min_val = healthy_indices
+        .iter()
+        .map(|&idx| get_value(idx))
+        .min()
+        .unwrap_or(0);
 
     let candidates: Vec<usize> = healthy_indices
         .iter()
@@ -770,17 +768,29 @@ mod tests {
                 headers: Some(&headers),
                 ..Default::default()
             };
-            workers[0].worker_routing_key_load().increment(&format!("paper-{}", i));
-            workers[1].worker_routing_key_load().increment(&format!("paper-{}", i));
-            workers[2].worker_routing_key_load().increment(&format!("paper-{}", i));
+            workers[0]
+                .worker_routing_key_load()
+                .increment(&format!("paper-{}", i));
+            workers[1]
+                .worker_routing_key_load()
+                .increment(&format!("paper-{}", i));
+            workers[2]
+                .worker_routing_key_load()
+                .increment(&format!("paper-{}", i));
 
             let (result, branch) = policy.select_worker_impl(&workers, &info);
             assert!(result.is_some());
             assert_eq!(branch, ExecutionBranch::Vacant);
 
-            workers[0].worker_routing_key_load().decrement(&format!("paper-{}", i));
-            workers[1].worker_routing_key_load().decrement(&format!("paper-{}", i));
-            workers[2].worker_routing_key_load().decrement(&format!("paper-{}", i));
+            workers[0]
+                .worker_routing_key_load()
+                .decrement(&format!("paper-{}", i));
+            workers[1]
+                .worker_routing_key_load()
+                .decrement(&format!("paper-{}", i));
+            workers[2]
+                .worker_routing_key_load()
+                .decrement(&format!("paper-{}", i));
         }
 
         let mut distribution = HashMap::new();
@@ -873,11 +883,18 @@ mod tests {
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
         assert_eq!(branch, ExecutionBranch::Vacant);
-        assert_eq!(first_idx, 0, "Should select worker 0 (has 1 routing key vs 2)");
+        assert_eq!(
+            first_idx, 0,
+            "Should select worker 0 (has 1 routing key vs 2)"
+        );
 
         for _ in 0..10 {
             let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(result, Some(first_idx), "Same routing key should route to same worker");
+            assert_eq!(
+                result,
+                Some(first_idx),
+                "Same routing key should route to same worker"
+            );
             assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
     }
@@ -908,6 +925,9 @@ mod tests {
                 break;
             }
         }
-        assert!(selected_worker_0, "Random mode should sometimes select worker 0 despite higher load");
+        assert!(
+            selected_worker_0,
+            "Random mode should sometimes select worker 0 despite higher load"
+        );
     }
 }
