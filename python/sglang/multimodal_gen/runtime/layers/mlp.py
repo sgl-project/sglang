@@ -28,6 +28,7 @@ class MLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.act_type = act_type.lower()
         self.fc_in = ColumnParallelLinear(
             input_dim,
             mlp_hidden_dim,
@@ -36,6 +37,13 @@ class MLP(nn.Module):
         )
 
         self.act = get_act_fn(act_type)
+        self.act_fp32 = self.act_type in {
+            "gelu",
+            "gelu_new",
+            "gelu_pytorch_tanh",
+            "quick_gelu",
+            "silu",
+        }
         if output_dim is None:
             output_dim = input_dim
         self.fc_out = RowParallelLinear(
@@ -47,6 +55,9 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x, _ = self.fc_in(x)
-        x = self.act(x)
+        if self.act_fp32 and x.dtype in (torch.float16, torch.bfloat16):
+            x = self.act(x.float()).to(dtype=x.dtype)
+        else:
+            x = self.act(x)
         x, _ = self.fc_out(x)
         return x
