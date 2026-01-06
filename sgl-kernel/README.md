@@ -32,6 +32,18 @@ Requires
 make build
 ```
 
+### Limit build resource usage (CPU / parallelism)
+
+By default, `make build` uses all available CPU cores. You can override build parallelism and NVCC compile threads:
+
+```bash
+# Limit parallel jobs (controls both make and cmake parallelism)
+make build MAX_JOBS=2
+
+# Additionally limit NVCC internal threads (reduces CPU and peak memory)
+make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
+```
+
 ## Contribution
 
 ### Steps to add a new kernel:
@@ -104,7 +116,9 @@ m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 
 ## Kernel Size Analysis
 
-Analyze CUDA kernel sizes in compiled wheel files to identify optimization opportunities:
+Analyze CUDA kernel sizes in compiled wheel files to identify oversized kernels and template-instantiation bloat:
+
+This tool requires `cubloaty` (install with `pip install cubloaty`) to work.
 
 ```bash
 # Install cubloaty
@@ -118,9 +132,9 @@ python analyze_whl_kernel_sizes.py path/to/sgl_kernel-*.whl --output my_analysis
 ```
 
 The tool generates:
-- Text report with kernel groups (by name prefix) and individual kernel sizes
-- JSON file with detailed structured data
-- Timing information for each analysis step
+- A text report with:
+  - Kernel groups (by name prefix)
+  - Individual kernel sizes (sorted by size)
 
 Use this to identify large kernels and potential template instantiation bloat.
 

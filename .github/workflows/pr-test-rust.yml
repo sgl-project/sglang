@@ -55,7 +55,16 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.10.0"
+          version: "v0.12.0"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          shared-key: "rust-cache"
+          cache-all-crates: true
+          cache-on-failure: true
+          save-if: true
 
       - name: Test maturin build
         uses: PyO3/maturin-action@v1
@@ -91,14 +100,16 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.10.0"
+          version: "v0.12.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: sgl-model-gateway
+          shared-key: "rust-cache"
           cache-all-crates: true
           cache-on-failure: true
+          save-if: true
 
       - name: Run lint
         run: |
@@ -131,20 +142,6 @@ jobs:
           cd sgl-model-gateway/
           cargo test
 
-      - name: Check benchmark compilation
-        run: |
-          source "$HOME/.cargo/env"
-          cd sgl-model-gateway/
-          cargo check --benches
-
-      - name: Quick benchmark sanity check
-        timeout-minutes: 15
-        run: |
-          source "$HOME/.cargo/env"
-          cd sgl-model-gateway/
-          # Run quick benchmarks to ensure they work using Python script
-          python3 scripts/run_benchmarks.py --quick
-
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
@@ -167,14 +164,16 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.10.0"
+          version: "v0.12.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: sgl-model-gateway
+          shared-key: "rust-cache"
           cache-all-crates: true
           cache-on-failure: true
+          save-if: true
 
       - name: Install SGLang dependencies
         run: |
@@ -192,18 +191,10 @@ jobs:
 
       - name: Run Python unit tests
         run: |
-          cd sgl-model-gateway
+          cd sgl-model-gateway/bindings/python
           source "$HOME/.cargo/env"
           python3 -m pip install pytest pytest-cov pytest-xdist
-          pytest -q py_test/unit --cov=sglang_router --cov-config=bindings/python/.coveragerc --cov-report=term-missing --cov-fail-under=80
-
-      - name: Run Python integration tests
-        run: |
-          cd sgl-model-gateway
-          source "$HOME/.cargo/env"
-          # Integration tests use FastAPI/uvicorn for mock workers
-          python3 -m pip install fastapi uvicorn orjson
-          pytest -q py_test/integration_mock
+          pytest -q tests --cov=sglang_router --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
 
       - name: Run Python E2E tests
         run: |
@@ -212,7 +203,7 @@ jobs:
           source "$HOME/.cargo/env"
           python3 -m pip --no-cache-dir install --upgrade --ignore-installed blinker
           python3 -m pip --no-cache-dir install --upgrade genai-bench==0.0.2
-          pytest py_test/e2e_http -s  -vv -o log_cli=true --log-cli-level=INFO
+          pytest e2e_test/e2e_http -s  -vv -o log_cli=true --log-cli-level=INFO
 
       - name: Upload benchmark results
         if: success()
@@ -239,14 +230,16 @@ jobs:
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.10.0"
+          version: "v0.12.0"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: sgl-model-gateway
+          shared-key: "rust-cache"
           cache-all-crates: true
           cache-on-failure: true
+          save-if: true
 
       - name: Install SGLang dependencies
         run: |
@@ -308,14 +301,14 @@ jobs:
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-model-gateway
           source "$HOME/.cargo/env"
-          SHOW_ROUTER_LOGS=1 pytest --reruns 3 --reruns-delay 2 py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=INFO
+          SHOW_ROUTER_LOGS=1 pytest --reruns 3 --reruns-delay 2 e2e_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=INFO
 
       - name: Run Python E2E gRPC tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-model-gateway
           source "$HOME/.cargo/env"
-          SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
+          SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest e2e_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
 
       - name: Cleanup Brave MCP Server
         if: always()
@@ -329,6 +322,60 @@ jobs:
           docker stop oracle-db || true
           docker rm oracle-db || true
 
+
+  router-e2e-tests:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: 4-gpu-a10
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install rust dependencies
+        run: |
+          bash scripts/ci/ci_install_rust.sh
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.12.0"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sgl-model-gateway
+          shared-key: "rust-cache"
+          cache-all-crates: true
+          cache-on-failure: true
+          save-if: true
+
+      - name: Install SGLang dependencies
+        run: |
+          sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
+
+      - name: Build python binding
+        run: |
+          source "$HOME/.cargo/env"
+          export RUSTC_WRAPPER=sccache
+          cd sgl-model-gateway/bindings/python
+          python3 -m pip install --upgrade pip maturin
+          pip uninstall -y sglang-router
+          maturin build --profile ci --features vendored-openssl --out dist
+          pip install dist/*.whl
+
+      - name: Install e2e test dependencies
+        run: |
+          python3 -m pip install pytest pytest-rerunfailures httpx openai grpcio grpcio-health-checking
+
+      - name: Run router e2e tests
+        run: |
+          bash scripts/killall_sglang.sh "nuk_gpus"
+          cd sgl-model-gateway
+          source "$HOME/.cargo/env"
+          ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 pytest --reruns 2 --reruns-delay 5 e2e_test/router -s -vv -o log_cli=true --log-cli-level=INFO
 
   docker-build-test:
     if: |
@@ -349,12 +396,12 @@ jobs:
           context: .
           file: docker/gateway.Dockerfile
           push: false
-          tags: sglang-router:test
+          tags: sgl-model-gateway:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
   finish:
-    needs: [maturin-build-test, router-unit-tests, router-http-tests, router-grpc-response-api-tests, docker-build-test]
+    needs: [maturin-build-test, router-unit-tests, router-http-tests, router-grpc-response-api-tests, router-e2e-tests, docker-build-test]
     runs-on: ubuntu-latest
     steps:
       - name: Finish

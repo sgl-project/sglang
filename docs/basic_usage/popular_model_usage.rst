@@ -1,4 +1,4 @@
-Popular Model Usage (DeepSeek, GPT-OSS, GLM, Llama, Qwen, and more)
+Popular Model Usage (DeepSeek, GPT-OSS, GLM, Llama, MiniMax, Qwen, and more)
 ===============================================================
 
 .. toctree::
@@ -9,6 +9,7 @@ Popular Model Usage (DeepSeek, GPT-OSS, GLM, Llama, Qwen, and more)
    glm45.md
    glmv.md
    gpt_oss.md
+   minimax_m2.md
    qwen3.md
    qwen3_vl.md
    llama4.md
