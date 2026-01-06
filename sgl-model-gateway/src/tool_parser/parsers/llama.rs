@@ -242,4 +242,11 @@ impl ToolParser for LlamaParser {
             &mut self.streamed_args_for_tool,
         );
     }
+
+    fn get_format_info(&self, tool_name: &str) -> (String, String, String) {
+        let begin = format!(r#"{{"name":"{}", "arguments":"#, tool_name);
+        let end = "}".to_string();
+        let trigger = "<|python_tag|>".to_string();
+        (begin, end, trigger)
+    }
 }

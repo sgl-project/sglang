@@ -255,4 +255,11 @@ impl ToolParser for QwenParser {
             &mut self.streamed_args_for_tool,
         );
     }
+
+    fn get_format_info(&self, _tool_name: &str) -> (String, String, String) {
+        let begin = "{\"name\": \"".to_string();
+        let end = "\"}".to_string();
+        let trigger = "<tool_call>".to_string();
+        (begin, end, trigger)
+    }
 }

@@ -85,6 +85,7 @@ fn get_tool_parser(
     }
 
     factory
+        .registry()
         .create_for_model(model)
         .unwrap_or_else(|| factory.registry().create_parser("json").unwrap())
 }

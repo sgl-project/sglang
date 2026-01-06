@@ -16,6 +16,7 @@ use crate::{
             utils,
         },
     },
+    tool_parser::constraints,
 };
 
 /// Chat preparation stage
@@ -75,7 +76,14 @@ impl ChatPreparationStage {
 
         // Step 4: Build tool constraints if needed
         let tool_call_constraint = if let Some(tools) = body_ref.tools.as_ref() {
-            utils::generate_tool_constraints(tools, &request.tool_choice, &request.model)
+            constraints::build_tool_call_constraint(
+                tools,
+                &request.tool_choice,
+                request.parallel_tool_calls.unwrap_or(true),
+                &ctx.components.tool_parser_factory,
+                None,
+                &request.model,
+            )
                 .map_err(|e| {
                     error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
                     error::bad_request("invalid_tool_configuration", format!("Invalid tool configuration: {}", e))
