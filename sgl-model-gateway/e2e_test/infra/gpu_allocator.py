@@ -199,6 +199,7 @@ class GPUAllocator:
         """
         self.gpus = gpus if gpus is not None else self._detect_gpus()
         self.slots: list[GPUSlot] = []
+        self._used_gpus: set[int] = set()  # Track GPUs used across all allocations
 
     def _detect_gpus(self) -> list[GPUInfo]:
         """Auto-detect available GPUs via nvidia-ml-py (NVML)."""
@@ -251,11 +252,14 @@ class GPUAllocator:
         2. For each model, find the first GPU(s) that can fit it
         3. For multi-GPU models, find consecutive GPUs
 
+        Note: This method tracks used GPUs across multiple calls, so subsequent
+        allocations will use different GPUs than previous ones.
+
         Args:
             model_specs: Dict of model_id -> spec dict with 'memory_gb' and 'tp' keys
 
         Returns:
-            List of GPUSlots with assigned models
+            List of GPUSlots with assigned models (only the newly allocated slots)
         """
         if not self.gpus:
             logger.warning("No GPUs available for allocation")
@@ -268,16 +272,15 @@ class GPUAllocator:
             reverse=True,
         )
 
-        # Track which GPUs are used
-        used_gpus: set[int] = set()
-        slots: list[GPUSlot] = []
+        # Track new slots allocated in this call
+        new_slots: list[GPUSlot] = []
 
         for model_id, spec in sorted_models:
             memory_gb = spec.get("memory_gb", 16)
             tp_size = spec.get("tp", 1)
 
-            # Find available GPUs
-            available = [g for g in self.gpus if g.id not in used_gpus]
+            # Find available GPUs (not used by any previous allocation)
+            available = [g for g in self.gpus if g.id not in self._used_gpus]
 
             if tp_size == 1:
                 # Single GPU - find one with enough memory
@@ -289,8 +292,8 @@ class GPUAllocator:
                             assigned_model=model_id,
                             port=get_open_port(),
                         )
-                        slots.append(slot)
-                        used_gpus.add(gpu.id)
+                        new_slots.append(slot)
+                        self._used_gpus.add(gpu.id)
                         logger.info(
                             "Allocated GPU %d (%s, %.1fGB) for %s",
                             gpu.id,
@@ -301,7 +304,10 @@ class GPUAllocator:
                         break
                 else:
                     logger.warning(
-                        "No GPU with %.1fGB available for %s", memory_gb, model_id
+                        "No GPU with %.1fGB available for %s (used: %s)",
+                        memory_gb,
+                        model_id,
+                        self._used_gpus,
                     )
             else:
                 # Multi-GPU - find consecutive GPUs with enough total memory
@@ -320,8 +326,8 @@ class GPUAllocator:
                             assigned_model=model_id,
                             port=get_open_port(),
                         )
-                        slots.append(slot)
-                        used_gpus.update(gpu_ids)
+                        new_slots.append(slot)
+                        self._used_gpus.update(gpu_ids)
                         logger.info(
                             "Allocated GPUs %s (%.1fGB total) for %s (tp=%d)",
                             gpu_ids,
@@ -332,14 +338,16 @@ class GPUAllocator:
                         break
                 else:
                     logger.warning(
-                        "No %d consecutive GPUs with %.1fGB available for %s",
+                        "No %d consecutive GPUs with %.1fGB available for %s (used: %s)",
                         tp_size,
                         memory_gb,
                         model_id,
+                        self._used_gpus,
                     )
 
-        self.slots = slots
-        return slots
+        # Add new slots to existing slots list
+        self.slots.extend(new_slots)
+        return new_slots
 
     def get_slot_for_model(self, model_id: str) -> GPUSlot | None:
         """Get the slot assigned to a specific model."""
@@ -348,10 +356,23 @@ class GPUAllocator:
                 return slot
         return None
 
+    def release_gpus(self, gpu_ids: list[int]) -> None:
+        """Release GPUs back to the available pool.
+
+        Args:
+            gpu_ids: List of GPU IDs to release.
+        """
+        for gpu_id in gpu_ids:
+            self._used_gpus.discard(gpu_id)
+        # Remove slots that used these GPUs
+        self.slots = [s for s in self.slots if not any(g in gpu_ids for g in s.gpu_ids)]
+        logger.info("Released GPUs %s, now used: %s", gpu_ids, self._used_gpus)
+
     def summary(self) -> str:
         """Return a summary of GPU allocations."""
         lines = ["GPU Allocation Summary:"]
         lines.append(f"  Total GPUs: {len(self.gpus)}")
+        lines.append(f"  Used GPUs: {sorted(self._used_gpus)}")
         lines.append(f"  Allocated Slots: {len(self.slots)}")
         for slot in self.slots:
             lines.append(

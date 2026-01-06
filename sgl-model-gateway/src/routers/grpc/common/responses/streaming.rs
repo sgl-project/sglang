@@ -25,7 +25,7 @@ use crate::{
     routers::grpc::harmony::responses::ToolResult,
 };
 
-pub enum OutputItemType {
+pub(crate) enum OutputItemType {
     Message,
     McpListTools,
     McpCall,
@@ -67,7 +67,7 @@ struct OutputItemState {
 /// - response.mcp_call_arguments.done
 /// - response.mcp_call.completed
 /// - response.mcp_call.failed
-pub struct ResponseStreamEventEmitter {
+pub(crate) struct ResponseStreamEventEmitter {
     sequence_number: u64,
     pub response_id: String,
     model: String,
@@ -828,7 +828,9 @@ impl ResponseStreamEventEmitter {
 /// Build a Server-Sent Events (SSE) response
 ///
 /// Creates a Response with proper SSE headers and streaming body.
-pub fn build_sse_response(rx: mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>) -> Response {
+pub(crate) fn build_sse_response(
+    rx: mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>,
+) -> Response {
     let stream = UnboundedReceiverStream::new(rx);
     Response::builder()
         .status(StatusCode::OK)
