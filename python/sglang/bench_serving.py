@@ -344,22 +344,15 @@ async def async_request_openai_chat_completions(
             f'rid={rid} time={request_start_time} message="request start" request_func_input="{str(input_partial)}"'
         )
 
-    if request_func_input.image_data:
-        # Build multi-image content: a list of image_url entries followed by the text
+    if isinstance(request_func_input.prompt, list):
+        messages = request_func_input.prompt
+    elif request_func_input.image_data:
         content_items = [
-            {
-                "type": "image_url",
-                "image_url": {"url": img_url},
-            }
+            {"type": "image_url", "image_url": {"url": img_url}}
             for img_url in request_func_input.image_data
         ]
         content_items.append({"type": "text", "text": request_func_input.prompt})
-        messages = [
-            {
-                "role": "user",
-                "content": content_items,
-            },
-        ]
+        messages = [{"role": "user", "content": content_items}]
     else:
         messages = [{"role": "user", "content": request_func_input.prompt}]
 
