@@ -13,7 +13,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# OpenAI server EBNF tests
 register_cuda_ci(est_time=7, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=20, suite="stage-b-test-small-1-gpu")
 

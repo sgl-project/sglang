@@ -23,7 +23,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# OpenAI reasoning content tests
 register_cuda_ci(est_time=89, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=89, suite="stage-b-test-small-1-gpu")
 
