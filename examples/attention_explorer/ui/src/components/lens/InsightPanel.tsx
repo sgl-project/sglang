@@ -1,10 +1,12 @@
+import { useMemo } from 'react';
 import { useSessionStore } from '../../stores/useSessionStore';
-import { useUIStore } from '../../stores/useUIStore';
+import { useUIStore, MetricScope } from '../../stores/useUIStore';
 import { KPICard } from './KPICard';
 import { TopKList } from './TopKList';
 import { DistanceHistogram } from './DistanceHistogram';
 import { FFTSpectrum } from './FFTSpectrum';
 import { getTopKForLayer, isRawMode, isFingerprintMode, isSketchMode, AttentionEntry, extractFingerprint } from '../../api/types';
+import { parseSegments } from '../chat/SegmentTimeline';
 
 // Extract fingerprint metrics from any attention entry
 function getMetricsFromAttention(entry: AttentionEntry | null): {
@@ -53,16 +55,45 @@ function getMetricsFromAttention(entry: AttentionEntry | null): {
   return null;
 }
 
+// Scope selector labels
+const SCOPE_LABELS: Record<MetricScope, { label: string; icon: string; hint: string }> = {
+  all: { label: 'All', icon: '📊', hint: 'All tokens' },
+  think: { label: 'Think', icon: '💭', hint: 'Reasoning tokens only' },
+  output: { label: 'Output', icon: '💬', hint: 'Final output tokens only' },
+  boundary: { label: 'Boundary', icon: '🔀', hint: 'Tokens crossing think/output boundary' },
+};
+
 export function InsightPanel() {
   const fingerprint = useSessionStore((state) => state.fingerprint);
   const messages = useSessionStore((state) => state.messages);
   const selectedTokenIndex = useUIStore((state) => state.selectedTokenIndex);
   const selectedLayerId = useUIStore((state) => state.selectedLayerId);
+  const metricScope = useUIStore((state) => state.metricScope);
+  const setMetricScope = useUIStore((state) => state.setMetricScope);
 
   // Get attention data for selected token from stored messages
   const lastAssistant = messages.filter((m) => m.role === 'assistant').pop();
   const selectedAttention =
     selectedTokenIndex !== null ? (lastAssistant?.attention?.[selectedTokenIndex] ?? null) : null;
+
+  // Parse segments for the last assistant message
+  const segments = useMemo(() => {
+    if (!lastAssistant?.tokens || !lastAssistant.content) return null;
+    const parsed = parseSegments(lastAssistant.content, lastAssistant.tokens);
+    // Only return if we have think sections
+    return parsed.some((s) => s.type === 'assistant_think') ? parsed : null;
+  }, [lastAssistant?.content, lastAssistant?.tokens]);
+
+  // Check if selected token is in think or output segment
+  const selectedSegmentType = useMemo(() => {
+    if (selectedTokenIndex === null || !segments) return null;
+    for (const seg of segments) {
+      if (selectedTokenIndex >= seg.startIndex && selectedTokenIndex < seg.endIndex) {
+        return seg.type;
+      }
+    }
+    return null;
+  }, [selectedTokenIndex, segments]);
 
   // Extract metrics from the stored attention data
   const tokenMetrics = getMetricsFromAttention(selectedAttention);
@@ -124,6 +155,33 @@ export function InsightPanel() {
             progress={fingerprint?.consensus}
           />
         </div>
+
+        {/* Segment Scope Selector - only show when segments exist */}
+        {segments && (
+          <div className="section">
+            <div className="section-header">
+              <span>Metric Scope</span>
+              {selectedSegmentType && (
+                <span className={`badge segment-badge ${selectedSegmentType}`}>
+                  {selectedSegmentType === 'assistant_think' ? '💭 In Think' : '💬 In Output'}
+                </span>
+              )}
+            </div>
+            <div className="scope-selector">
+              {(Object.keys(SCOPE_LABELS) as MetricScope[]).map((scope) => (
+                <button
+                  key={scope}
+                  className={`scope-btn ${metricScope === scope ? 'active' : ''}`}
+                  onClick={() => setMetricScope(scope)}
+                  title={SCOPE_LABELS[scope].hint}
+                >
+                  <span className="scope-icon">{SCOPE_LABELS[scope].icon}</span>
+                  <span className="scope-label">{SCOPE_LABELS[scope].label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Token Lens */}
         <div className="section">

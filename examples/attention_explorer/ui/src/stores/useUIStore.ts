@@ -4,6 +4,7 @@ import { TokenAttentionDetail } from '../api/client';
 
 export type DrawerState = 'closed' | 'hovering' | 'pinned';
 export type DrawerTab = 'links' | 'signal' | 'moe';
+export type MetricScope = 'all' | 'think' | 'output' | 'boundary';
 
 interface UIState {
   view: View;
@@ -27,6 +28,9 @@ interface UIState {
   drawerTab: DrawerTab;
   hoverTimeoutId: ReturnType<typeof setTimeout> | null;
 
+  // Metric scope for InsightPanel
+  metricScope: MetricScope;
+
   setView: (v: View) => void;
   setProgram: (p: Program) => void;
   selectToken: (idx: number | null) => void;
@@ -49,6 +53,9 @@ interface UIState {
   unpinDrawer: () => void;
   setDrawerTab: (tab: DrawerTab) => void;
   clearHoverTimeout: () => void;
+
+  // Metric scope actions
+  setMetricScope: (scope: MetricScope) => void;
 }
 
 const HOVER_CLOSE_DELAY = 300; // ms before drawer closes after mouse leaves
@@ -74,6 +81,9 @@ export const useUIStore = create<UIState>((set, get) => ({
   drawerTokenIndex: null,
   drawerTab: 'links',
   hoverTimeoutId: null,
+
+  // Metric scope
+  metricScope: 'all',
 
   setView: (view) => set({ view }),
   setProgram: (program) => set({ program }),
@@ -186,4 +196,6 @@ export const useUIStore = create<UIState>((set, get) => ({
       set({ hoverTimeoutId: null });
     }
   },
+
+  setMetricScope: (metricScope) => set({ metricScope }),
 }));

@@ -1575,3 +1575,284 @@
     gap: var(--space-sm);
   }
 }
+
+/* ==========================================================================
+   Think Segmentation - Phase 4
+   ========================================================================== */
+
+/* Segment Timeline */
+.segment-timeline {
+  margin: var(--space-sm) 0;
+}
+
+.segment-timeline.compact {
+  margin: var(--space-xs) 0;
+}
+
+.segment-bar {
+  display: flex;
+  height: 8px;
+  gap: 2px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.segment-block {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  min-width: 4px;
+}
+
+.segment-block:hover {
+  opacity: 0.9;
+  transform: scaleY(1.2);
+}
+
+.segment-block.selected {
+  box-shadow: 0 0 4px currentColor;
+}
+
+.segment-block.assistant_think {
+  background: linear-gradient(135deg, rgba(168, 139, 250, 0.7), rgba(139, 92, 246, 0.7));
+}
+
+.segment-block.assistant_final {
+  background: linear-gradient(135deg, rgba(85, 214, 166, 0.7), rgba(34, 197, 94, 0.7));
+}
+
+.segment-block.user {
+  background: linear-gradient(135deg, rgba(122, 162, 255, 0.7), rgba(59, 130, 246, 0.7));
+}
+
+.segment-block.system {
+  background: linear-gradient(135deg, rgba(148, 163, 184, 0.5), rgba(100, 116, 139, 0.5));
+}
+
+.segment-label {
+  font-size: 9px;
+  font-weight: 600;
+  color: white;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0 4px;
+}
+
+.segment-icon {
+  margin-right: 2px;
+}
+
+.segment-legend {
+  display: flex;
+  gap: var(--space-sm);
+  margin-top: var(--space-xs);
+  flex-wrap: wrap;
+}
+
+.segment-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 11px;
+  transition: background 0.15s ease;
+}
+
+.segment-legend-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.segment-legend-item.selected {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.segment-legend-item.assistant_think {
+  color: rgb(168, 139, 250);
+}
+
+.segment-legend-item.assistant_final {
+  color: var(--secondary);
+}
+
+.segment-legend-icon {
+  font-size: 12px;
+}
+
+.segment-legend-label {
+  font-weight: 500;
+}
+
+.segment-legend-count {
+  opacity: 0.7;
+  font-size: 10px;
+}
+
+/* Segmented Token Line */
+.segmented-token-line {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.token-segment {
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.token-segment.assistant_think {
+  border: 1px solid rgba(168, 139, 250, 0.3);
+  background: rgba(168, 139, 250, 0.05);
+}
+
+.token-segment.assistant_final {
+  border: 1px solid rgba(85, 214, 166, 0.2);
+  background: transparent;
+}
+
+.segment-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-xs) var(--space-sm);
+  font-size: 11px;
+}
+
+.token-segment.assistant_think .segment-header {
+  background: rgba(168, 139, 250, 0.1);
+  cursor: pointer;
+}
+
+.token-segment.assistant_think .segment-header:hover {
+  background: rgba(168, 139, 250, 0.15);
+}
+
+.segment-indicator {
+  font-size: 10px;
+  width: 12px;
+  color: rgba(168, 139, 250, 0.8);
+}
+
+.segment-type-badge {
+  font-weight: 600;
+}
+
+.token-segment.assistant_think .segment-type-badge {
+  color: rgb(168, 139, 250);
+}
+
+.token-segment.assistant_final .segment-type-badge {
+  color: var(--secondary);
+}
+
+.segment-token-count {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.segment-preview {
+  flex: 1;
+  color: var(--muted);
+  font-size: 10px;
+  font-style: italic;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.segment-tokens {
+  padding: var(--space-xs) var(--space-sm);
+}
+
+.segment-tokens.think-tokens {
+  opacity: 0.85;
+}
+
+/* Collapsed state */
+.token-segment.collapsed .segment-tokens {
+  display: none;
+}
+
+/* Think badge in bubble meta */
+.think-badge {
+  background: rgba(168, 139, 250, 0.15) !important;
+  color: rgb(168, 139, 250) !important;
+}
+
+/* Bubble with think sections */
+.bubble.has-think {
+  border-color: rgba(168, 139, 250, 0.2);
+}
+
+/* Scope Selector */
+.scope-selector {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.scope-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.scope-btn:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+
+.scope-btn.active {
+  border-color: var(--accent);
+  background: rgba(122, 162, 255, 0.1);
+  color: var(--accent);
+}
+
+.scope-icon {
+  font-size: 12px;
+}
+
+.scope-label {
+  font-weight: 500;
+}
+
+/* Segment badge in InsightPanel */
+.segment-badge.assistant_think {
+  background: rgba(168, 139, 250, 0.15) !important;
+  color: rgb(168, 139, 250) !important;
+}
+
+.segment-badge.assistant_final {
+  background: rgba(85, 214, 166, 0.15) !important;
+  color: var(--secondary) !important;
+}
+
+/* Responsive */
+@media (max-width: 600px) {
+  .scope-selector {
+    gap: 2px;
+  }
+
+  .scope-btn {
+    padding: 3px 6px;
+    font-size: 10px;
+  }
+
+  .scope-label {
+    display: none;
+  }
+}
