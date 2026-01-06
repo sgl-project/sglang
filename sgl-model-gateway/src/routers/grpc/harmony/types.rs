@@ -10,11 +10,12 @@ use crate::protocols::common::ToolCall;
 ///
 /// Represents messages in the Harmony encoding format with role and content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HarmonyMessage {
+pub(crate) struct HarmonyMessage {
     pub role: String,
     pub content: String,
 }
 
+#[allow(dead_code)]
 impl HarmonyMessage {
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
@@ -67,7 +68,7 @@ impl HarmonyMessage {
 /// Contains the encoded input_ids, stop tokens, selection text for worker routing,
 /// and the Harmony message history.
 #[derive(Debug, Clone)]
-pub struct HarmonyBuildOutput {
+pub(crate) struct HarmonyBuildOutput {
     /// Encoded token IDs to send to the model
     pub input_ids: Vec<u32>,
 
@@ -85,7 +86,7 @@ pub struct HarmonyBuildOutput {
 ///
 /// Represents the complete response after parsing analysis, commentary, and final channels.
 #[derive(Debug, Clone)]
-pub struct HarmonyChannelOutput {
+pub(crate) struct HarmonyChannelOutput {
     /// Analysis/reasoning content (from analysis channel)
     pub analysis: Option<String>,
 
@@ -109,7 +110,8 @@ pub struct HarmonyChannelOutput {
 ///
 /// Represents incremental updates as tokens are parsed from the stream.
 #[derive(Debug, Clone)]
-pub struct HarmonyChannelDelta {
+#[allow(dead_code)]
+pub(crate) struct HarmonyChannelDelta {
     /// Delta for analysis/reasoning content
     pub analysis_delta: Option<String>,
 
@@ -125,7 +127,7 @@ pub struct HarmonyChannelDelta {
 
 /// Tool call delta for streaming
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCallDelta {
+pub(crate) struct ToolCallDelta {
     pub index: usize,
     pub id: Option<String>,
     pub function: Option<FunctionDelta>,
@@ -133,7 +135,7 @@ pub struct ToolCallDelta {
 
 /// Function call delta for streaming
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionDelta {
+pub(crate) struct FunctionDelta {
     pub name: Option<String>,
     pub arguments: Option<String>,
 }
