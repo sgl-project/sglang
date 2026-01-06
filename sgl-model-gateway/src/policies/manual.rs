@@ -770,7 +770,8 @@ mod tests {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         for i in 0..9 {
-            let headers = headers_with_routing_key(&format!("paper-{}", i));
+            let routing_key = format!("key-{}", i);
+            let headers = headers_with_routing_key(&routing_key);
             let info = SelectWorkerInfo {
                 headers: Some(&headers),
                 ..Default::default()
@@ -783,18 +784,21 @@ mod tests {
             let selected_idx = result.unwrap();
             workers[selected_idx]
                 .worker_routing_key_load()
-                .increment(&format!("paper-{}", i));
+                .increment(&routing_key);
         }
 
-        let mut distribution = HashMap::new();
-        for entry in policy.routing_map.iter() {
-            let url = entry.candi_worker_urls.first().unwrap();
-            *distribution.entry(url.clone()).or_insert(0) += 1;
-        }
+        let distribution: HashMap<_, usize> = policy
+            .routing_map
+            .iter()
+            .map(|e| e.candi_worker_urls.first().unwrap().clone())
+            .fold(HashMap::new(), |mut acc, url| {
+                *acc.entry(url).or_default() += 1;
+                acc
+            });
 
         assert_eq!(distribution.len(), 3, "Should use all 3 workers");
         for count in distribution.values() {
-            assert_eq!(*count, 3, "Each worker should have exactly 3 papers");
+            assert_eq!(*count, 3, "Each worker should have exactly 3 routing keys");
         }
     }
 
@@ -815,7 +819,7 @@ mod tests {
         assert_eq!(workers[1].worker_routing_key_load().value(), 1);
         assert_eq!(workers[2].worker_routing_key_load().value(), 0);
 
-        let headers = headers_with_routing_key("new-paper");
+        let headers = headers_with_routing_key("new-key");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -843,7 +847,7 @@ mod tests {
         assert_eq!(workers[1].load(), 1);
         assert_eq!(workers[2].load(), 0);
 
-        let headers = headers_with_routing_key("new-paper");
+        let headers = headers_with_routing_key("new-key");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -863,11 +867,11 @@ mod tests {
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
-        workers[0].worker_routing_key_load().increment("paper-0");
-        workers[1].worker_routing_key_load().increment("paper-1");
-        workers[1].worker_routing_key_load().increment("paper-2");
+        workers[0].worker_routing_key_load().increment("key-0");
+        workers[1].worker_routing_key_load().increment("key-1");
+        workers[1].worker_routing_key_load().increment("key-2");
 
-        let headers = headers_with_routing_key("new-paper");
+        let headers = headers_with_routing_key("new-key");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -901,9 +905,9 @@ mod tests {
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
-        workers[0].worker_routing_key_load().increment("paper-1");
-        workers[0].worker_routing_key_load().increment("paper-2");
-        workers[0].worker_routing_key_load().increment("paper-3");
+        workers[0].worker_routing_key_load().increment("key-1");
+        workers[0].worker_routing_key_load().increment("key-2");
+        workers[0].worker_routing_key_load().increment("key-3");
 
         let mut selected_worker_0 = false;
         for i in 0..50 {

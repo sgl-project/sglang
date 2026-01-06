@@ -2018,18 +2018,18 @@ mod tests {
     fn test_worker_routing_key_load_multiple_requests_same_key() {
         let load = WorkerRoutingKeyLoad::new("http://test:8000");
 
-        load.increment("paper-1");
-        load.increment("paper-1");
-        load.increment("paper-1");
+        load.increment("key-1");
+        load.increment("key-1");
+        load.increment("key-1");
         assert_eq!(load.value(), 1);
 
-        load.decrement("paper-1");
+        load.decrement("key-1");
         assert_eq!(load.value(), 1);
 
-        load.decrement("paper-1");
+        load.decrement("key-1");
         assert_eq!(load.value(), 1);
 
-        load.decrement("paper-1");
+        load.decrement("key-1");
         assert_eq!(load.value(), 0);
         assert_eq!(load.active_routing_keys.len(), 0);
     }
@@ -2055,7 +2055,7 @@ mod tests {
         assert_eq!(worker.worker_routing_key_load().value(), 0);
 
         let mut headers = http::HeaderMap::new();
-        headers.insert("x-smg-routing-key", "paper-123".parse().unwrap());
+        headers.insert("x-smg-routing-key", "key-123".parse().unwrap());
 
         {
             let _guard = WorkerLoadGuard::new(worker.clone(), Some(&headers));
@@ -2101,7 +2101,7 @@ mod tests {
         );
 
         let mut headers = http::HeaderMap::new();
-        headers.insert("x-smg-routing-key", "paper-123".parse().unwrap());
+        headers.insert("x-smg-routing-key", "key-123".parse().unwrap());
 
         let guard1 = WorkerLoadGuard::new(worker.clone(), Some(&headers));
         assert_eq!(worker.load(), 1);

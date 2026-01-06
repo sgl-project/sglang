@@ -190,7 +190,7 @@ mod manual_min_group_tests {
         let mut success_count = 0;
 
         for i in 0..9 {
-            let routing_key = format!("paper-{}", i);
+            let routing_key = format!("key-{}", i);
 
             let payload = json!({
                 "text": format!("Request for {}", routing_key),
@@ -231,11 +231,11 @@ mod manual_min_group_tests {
         let app = ctx.create_app().await;
         let mut success_count = 0;
 
-        let routing_key = "sticky-paper-123";
+        let routing_key = "sticky-key-123";
 
         for i in 0..5 {
             let payload = json!({
-                "text": format!("Request {} for sticky paper", i),
+                "text": format!("Request {} for sticky key", i),
                 "stream": false
             });
 
@@ -274,7 +274,7 @@ mod manual_min_group_tests {
         let mut success_count = 0;
 
         for i in 0..3 {
-            let routing_key = format!("preload-paper-{}", i);
+            let routing_key = format!("preload-key-{}", i);
             let payload = json!({
                 "text": "Preload request",
                 "stream": false
@@ -294,9 +294,9 @@ mod manual_min_group_tests {
             }
         }
 
-        let new_routing_key = "new-paper-after-preload";
+        let new_routing_key = "new-key-after-preload";
         let payload = json!({
-            "text": "New paper request",
+            "text": "New request request",
             "stream": false
         });
 

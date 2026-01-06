@@ -700,9 +700,10 @@ impl CliArgs {
                 eviction_interval_secs: self.eviction_interval,
                 max_idle_secs: self.max_idle_secs,
                 assignment_mode: match self.assignment_mode.as_str() {
+                    "random" => ManualAssignmentMode::Random,
                     "min_load" => ManualAssignmentMode::MinLoad,
                     "min_group" => ManualAssignmentMode::MinGroup,
-                    _ => ManualAssignmentMode::Random,
+                    other => panic!("Unknown assignment mode: {}", other),
                 },
             },
             _ => PolicyConfig::RoundRobin,
