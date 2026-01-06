@@ -1627,6 +1627,7 @@ def create_server_socket(host: str, port: int) -> socket.socket:
 
     return sock
 
+
 def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output

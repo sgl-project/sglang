@@ -83,7 +83,7 @@ class TestCreateServerSocket(unittest.TestCase):
         # Test the error message format by trying to bind to a privileged port
         # (requires root on Unix) or by mocking
         # For simplicity, we just verify the function handles errors gracefully
-        
+
         # Create a socket that holds a port
         blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         blocker.bind(("127.0.0.1", 0))
@@ -111,9 +111,10 @@ class TestCreateServerSocket(unittest.TestCase):
         """Test that error message contains useful information."""
         # Try to bind to a port that should fail (privileged port without root)
         import os
+
         if os.geteuid() == 0:
             self.skipTest("Running as root, cannot test privileged port failure")
-        
+
         try:
             # Port 1 requires root privileges
             create_server_socket("127.0.0.1", 1)
@@ -123,6 +124,7 @@ class TestCreateServerSocket(unittest.TestCase):
             self.assertIn("Cannot bind", error_msg)
             self.assertIn("127.0.0.1", error_msg)
             self.assertIn("1", error_msg)
+
     def test_socket_reuse_after_close(self):
         """Test that port can be reused after socket is closed."""
         # Create and close a socket

@@ -24,6 +24,7 @@ import os
 import tempfile
 import threading
 import time
+import socket
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -1814,7 +1815,6 @@ def launch_server(
             _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
-
 def _run_server_with_socket(
     app: FastAPI,
     sock: "socket.socket",
@@ -1830,7 +1830,6 @@ def _run_server_with_socket(
         sock: Pre-bound socket in LISTEN state
         server_args: Server configuration arguments
     """
-    import socket
 
     config = uvicorn.Config(
         app,
