@@ -156,6 +156,7 @@ class LlamaAttention(nn.Module):
         )
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
         self.rotary_dim = int(partial_rotary_factor * self.head_dim)
+        self.architectures = getattr(config, "architectures", [''])[0]
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -228,7 +229,7 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if not _is_npu or not hasattr(self.rotary_emb, 'get_cos_sin_with_position'):
+        if not _is_npu or not hasattr(self.rotary_emb, 'get_cos_sin_with_position') or self.architectures == 'Ernie4_5_MoeForCausalLM':
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
