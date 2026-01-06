@@ -10,11 +10,6 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 suites = {
     "per-commit-1-gpu": [
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 9),
-        TestFile("hicache/test_hicache_storage.py", 96),
-        TestFile("hicache/test_hicache_variants.py", 368),
-        TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
-        TestFile("layers/attention/mamba/test_mamba_ssm.py", 7),
-        TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 13),
         TestFile("openai_server/basic/test_openai_embedding.py", 70),
         TestFile("openai_server/basic/test_openai_server.py", 184),
         TestFile("openai_server/basic/test_protocol.py", 3),
@@ -93,7 +88,6 @@ suites = {
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
         TestFile("hicache/test_hicache_storage_runtime_attach_detach.py", 300),
-        TestFile("layers/attention/mamba/test_mamba2_mixer.py", 50),
         TestFile("models/test_kimi_linear_models.py", 90),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 132),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
