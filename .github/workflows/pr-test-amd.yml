@@ -758,13 +758,11 @@ jobs:
       - name: Benchmark offline PP decode throughput (PP=2)
         timeout-minutes: 10
         run: |
-          cd test/srt
           bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_pp_offline_throughput_default_decode
 
       - name: Benchmark offline PP prefill throughput (PP=2)
         timeout-minutes: 10
         run: |
-          cd test/srt
           bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
 
   accuracy-test-1-gpu-amd:
