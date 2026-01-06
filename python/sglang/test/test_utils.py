@@ -837,12 +837,6 @@ def run_bench_serving(
     device="auto",
     background_task: Optional[Callable[[str, asyncio.Event], Awaitable[None]]] = None,
     lora_name: Optional[str] = None,
-    gsp_num_groups=4,
-    gsp_prompts_per_group=4,
-    gsp_system_prompt_len=128,
-    gsp_question_len=32,
-    gsp_output_len=32,
-    gsp_num_turns=1,
 ):
     if device == "auto":
         device = auto_config_device()
@@ -871,12 +865,6 @@ def run_bench_serving(
         seed=seed,
         device=device,
         lora_name=lora_name,
-        gsp_num_groups=gsp_num_groups,
-        gsp_prompts_per_group=gsp_prompts_per_group,
-        gsp_system_prompt_len=gsp_system_prompt_len,
-        gsp_question_len=gsp_question_len,
-        gsp_output_len=gsp_output_len,
-        gsp_num_turns=gsp_num_turns,
     )
 
     async def _run():
@@ -908,10 +896,7 @@ def run_bench_serving(
     finally:
         kill_process_tree(process.pid)
 
-    expected_completed = (
-        num_prompts * gsp_num_turns if gsp_num_turns > 1 else num_prompts
-    )
-    assert res["completed"] == expected_completed
+    assert res["completed"] == num_prompts
     return res
 
 
