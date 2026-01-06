@@ -65,6 +65,7 @@ if _is_cuda or _is_xpu:
         rmsnorm,
     )
 if _use_aiter:
+    from aiter import layer_norm, layernorm2d_fwd_with_add
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 elif _is_hip:
@@ -308,17 +309,20 @@ class LayerNorm(MultiPlatformOp):
         eps: float = 1e-6,
         elementwise_affine: bool = True,
         bias: bool = True,
-        dtype: torch.dtype = torch.float32,
+        weight_dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
         self.elementwise_affine = elementwise_affine
         self.use_bias = bias
-        self.dtype = dtype
+        self.dtype = weight_dtype
 
         self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=self.dtype))
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=self.dtype))
+
+        if _use_aiter:
+            self._forward_method = self.forward_aiter
 
     def forward_cuda(
         self,
@@ -376,6 +380,26 @@ class LayerNorm(MultiPlatformOp):
             )
         else:
             return self.forward_native(x, **kwargs)
+
+    def forward_aiter(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            residual_out = torch.empty_like(x)
+            output = torch.empty_like(x)
+            layernorm2d_fwd_with_add(
+                output,
+                x,
+                residual,
+                residual_out,
+                self.weight.data,
+                self.bias.data,
+                self.variance_epsilon,
+            )
+            return output, residual_out
+        return layer_norm(x, self.weight.data, self.bias.data, self.variance_epsilon)
 
 
 class GemmaRMSNorm(MultiPlatformOp):
