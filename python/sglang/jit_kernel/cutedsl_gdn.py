@@ -22,8 +22,8 @@ TILE_V_SMALL = 16
 NUM_STAGES = 2
 NUM_THREADS = 128
 NUM_BLOCKS_PER_STATE_SMALL = 8
-NUM_THREADS_BIG = 256
-NUM_WARPS_BIG = 8
+NUM_THREADS_LARGE = 256
+NUM_WARPS_LARGE = 8
 V_PER_WARP = 4
 ROWS_PER_ITER = 8
 NUM_K_ITERS = TILE_K // ROWS_PER_ITER
@@ -70,7 +70,7 @@ def _define_kernels():
     cpasync = _cpasync
 
     @cute.kernel
-    def cpasync_swizzle_kernel_small_batch(
+    def gdn_kernel_small_batch(
         tiled_copy_load: cute.TiledCopy,
         h0_source: cute.Tensor,
         smem_layout_staged: cute.ComposedLayout,
@@ -289,7 +289,7 @@ def _define_kernels():
                 cute.arch.barrier()
 
     @cute.kernel
-    def cpasync_swizzle_kernel_small_batch_varlen(
+    def gdn_kernel_small_batch_varlen(
         tiled_copy_load: cute.TiledCopy,
         h0_source: cute.Tensor,
         smem_layout_staged: cute.ComposedLayout,
@@ -509,7 +509,7 @@ def _define_kernels():
                 cute.arch.barrier()
 
     @cute.kernel
-    def cpasync_swizzle_kernel_big_batch(
+    def gdn_kernel_large_batch(
         tiled_copy_load: cute.TiledCopy,
         h0_source: cute.Tensor,
         smem_layout_staged: cute.Layout,
@@ -537,7 +537,7 @@ def _define_kernels():
         use_qk_l2norm: cutlass.Constexpr[bool],
         is_varlen: cutlass.Constexpr[bool],
     ):
-        """Big batch kernel for (N, 1, ...) format."""
+        """Large batch kernel for (N, 1, ...) format."""
         tidx, _, _ = cute.arch.thread_idx()
         in_warp_tid = tidx % 32
         warp_idx = cute.arch.warp_idx()
@@ -639,7 +639,7 @@ def _define_kernels():
                 if warp_idx == 0:
                     local_sum_q = 0.0
                     local_sum_k = 0.0
-                    if in_warp_tid < NUM_WARPS_BIG:
+                    if in_warp_tid < NUM_WARPS_LARGE:
                         local_sum_q = smem_o[in_warp_tid]
                         local_sum_k = smem_o[in_warp_tid + 8]
                     for offset in [4, 2, 1]:
@@ -729,9 +729,7 @@ def _define_kernels():
 
                 cute.arch.barrier()
 
-                # Coalesced write h back to GMEM from CURRENT stage
-                # 256 threads write 128×32 = 4096 elements
-                # Each thread writes 4096/256 = 16 elements
+                # Write h back to GMEM (each thread writes 16 elements)
                 for elem in range(16):
                     flat_idx = tidx + elem * 256
                     k_write = flat_idx // TILE_V
@@ -744,7 +742,7 @@ def _define_kernels():
                 cute.arch.barrier()
 
     @cute.kernel
-    def cpasync_swizzle_kernel_big_batch_varlen(
+    def gdn_kernel_large_batch_varlen(
         tiled_copy_load: cute.TiledCopy,
         h0_source: cute.Tensor,
         smem_layout_staged: cute.Layout,
@@ -772,7 +770,7 @@ def _define_kernels():
         use_qk_l2norm: cutlass.Constexpr[bool],
         is_varlen: cutlass.Constexpr[bool],
     ):
-        """Big batch kernel for varlen decode (1, N, ...) format."""
+        """Large batch kernel for varlen decode (1, N, ...) format."""
         tidx, _, _ = cute.arch.thread_idx()
         in_warp_tid = tidx % 32
         warp_idx = cute.arch.warp_idx()
@@ -875,7 +873,7 @@ def _define_kernels():
                 if warp_idx == 0:
                     local_sum_q = 0.0
                     local_sum_k = 0.0
-                    if in_warp_tid < NUM_WARPS_BIG:
+                    if in_warp_tid < NUM_WARPS_LARGE:
                         local_sum_q = smem_o[in_warp_tid]
                         local_sum_k = smem_o[in_warp_tid + 8]
                     for offset in [4, 2, 1]:
@@ -965,9 +963,7 @@ def _define_kernels():
 
                 cute.arch.barrier()
 
-                # Coalesced write h back to GMEM from CURRENT stage
-                # 256 threads write 128×32 = 4096 elements
-                # Each thread writes 4096/256 = 16 elements
+                # Write h back to GMEM (each thread writes 16 elements)
                 for elem in range(16):
                     flat_idx = tidx + elem * 256
                     k_write = flat_idx // TILE_V
@@ -980,10 +976,10 @@ def _define_kernels():
                 cute.arch.barrier()
 
     return (
-        cpasync_swizzle_kernel_small_batch,
-        cpasync_swizzle_kernel_small_batch_varlen,
-        cpasync_swizzle_kernel_big_batch,
-        cpasync_swizzle_kernel_big_batch_varlen,
+        gdn_kernel_small_batch,
+        gdn_kernel_small_batch_varlen,
+        gdn_kernel_large_batch,
+        gdn_kernel_large_batch_varlen,
     )
 
 
@@ -994,7 +990,7 @@ def _create_jit_functions():
     cpasync = _cpasync
     cuda = _cuda
 
-    small_kernel, small_kernel_varlen, big_kernel, big_kernel_varlen = _define_kernels()
+    gdn_small, gdn_small_varlen, gdn_large, gdn_large_varlen = _define_kernels()
 
     @cute.jit
     def run_small_batch(
@@ -1050,7 +1046,7 @@ def _create_jit_functions():
             4 * TILE_K * TILE_V_SMALL * NUM_STAGES + 4 * TILE_V_SMALL + 32
         )
 
-        small_kernel(
+        gdn_small(
             tiled_copy_load_small,
             h0_source,
             smem_layout_small,
@@ -1139,7 +1135,7 @@ def _create_jit_functions():
             4 * TILE_K * TILE_V_SMALL * NUM_STAGES + 4 * TILE_V_SMALL + 32
         )
 
-        small_kernel_varlen(
+        gdn_small_varlen(
             tiled_copy_load_small,
             h0_source,
             smem_layout_small,
@@ -1175,7 +1171,7 @@ def _create_jit_functions():
         )
 
     @cute.jit
-    def run_big_batch(
+    def run_large_batch(
         cu_seqlens: cute.Tensor,
         q: cute.Tensor,
         k: cute.Tensor,
@@ -1210,8 +1206,7 @@ def _create_jit_functions():
             num_bits_per_copy=128,
         )
         num_v_tiles = cute.ceil_div(v_dim, TILE_V)
-        # Use TILE_V_PADDED (36) instead of TILE_V (32) for bank conflict free
-        # PADDING: stride=(36, 1) with 128-bit alignment - reduces bank conflict
+        # Padded layout (stride=36) to avoid shared memory bank conflicts
         base_smem_layout = cute.make_layout(
             (TILE_K, TILE_V, NUM_STAGES),
             stride=(TILE_V_PADDED, 1, TILE_K * TILE_V_PADDED),
@@ -1219,12 +1214,11 @@ def _create_jit_functions():
         thread_layout = cute.make_layout((32, 8), stride=(8, 1))
         val_layout = cute.make_layout((1, 4))
         tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
-        # smem_bytes uses TILE_V_PADDED for padded layout
         smem_bytes = (
             4 * TILE_K * TILE_V_PADDED * NUM_STAGES + 4 * TILE_V + 4 * TILE_K * 2 + 64
         )
 
-        big_kernel(
+        gdn_large(
             tiled_copy_load,
             h0_source,
             base_smem_layout,
@@ -1253,13 +1247,13 @@ def _create_jit_functions():
             False,
         ).launch(
             grid=(batch_size, 1, 1),
-            block=[NUM_THREADS_BIG, 1, 1],
+            block=[NUM_THREADS_LARGE, 1, 1],
             smem=smem_bytes,
             stream=stream,
         )
 
     @cute.jit
-    def run_big_batch_varlen(
+    def run_large_batch_varlen(
         cu_seqlens: cute.Tensor,
         q: cute.Tensor,
         k: cute.Tensor,
@@ -1294,8 +1288,7 @@ def _create_jit_functions():
             num_bits_per_copy=128,
         )
         num_v_tiles = cute.ceil_div(v_dim, TILE_V)
-        # Use TILE_V_PADDED (36) instead of TILE_V (32) for bank conflict free
-        # PADDING: stride=(36, 1) with 128-bit alignment - reduces bank conflict
+        # Padded layout (stride=36) to avoid shared memory bank conflicts
         base_smem_layout = cute.make_layout(
             (TILE_K, TILE_V, NUM_STAGES),
             stride=(TILE_V_PADDED, 1, TILE_K * TILE_V_PADDED),
@@ -1303,12 +1296,11 @@ def _create_jit_functions():
         thread_layout = cute.make_layout((32, 8), stride=(8, 1))
         val_layout = cute.make_layout((1, 4))
         tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
-        # smem_bytes uses TILE_V_PADDED for padded layout
         smem_bytes = (
             4 * TILE_K * TILE_V_PADDED * NUM_STAGES + 4 * TILE_V + 4 * TILE_K * 2 + 64
         )
 
-        big_kernel_varlen(
+        gdn_large_varlen(
             tiled_copy_load,
             h0_source,
             base_smem_layout,
@@ -1337,12 +1329,12 @@ def _create_jit_functions():
             True,
         ).launch(
             grid=(batch_size, 1, 1),
-            block=[NUM_THREADS_BIG, 1, 1],
+            block=[NUM_THREADS_LARGE, 1, 1],
             smem=smem_bytes,
             stream=stream,
         )
 
-    return run_small_batch, run_small_batch_varlen, run_big_batch, run_big_batch_varlen
+    return run_small_batch, run_small_batch_varlen, run_large_batch, run_large_batch_varlen
 
 
 _jit_functions = None
@@ -1408,12 +1400,12 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    run_small, run_small_varlen, run_big, run_big_varlen = _get_jit_functions()
+    run_small, run_small_varlen, run_large, run_large_varlen = _get_jit_functions()
 
     if use_small_batch:
         kernel_func = run_small_varlen if is_varlen_decode else run_small
     else:
-        kernel_func = run_big_varlen if is_varlen_decode else run_big
+        kernel_func = run_large_varlen if is_varlen_decode else run_large
 
     scale = K**-0.5
     softplus_beta = 1.0
@@ -1517,7 +1509,7 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
             b = b.unsqueeze(1)
         o = q.new_empty(N, 1, HV, V, dtype=torch.bfloat16)
 
-    # Todo
+    # Ensure contiguous tensors for CuTe kernel
     q, k, v = [t.contiguous() for t in (q, k, v)]
 
     global _cu_seqlens_cache

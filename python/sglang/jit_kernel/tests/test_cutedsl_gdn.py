@@ -239,7 +239,7 @@ def test_cutedsl_gdn_precision(B: int):
     )
 
     metrics = comprehensive_precision_check(out_triton, out_cutedsl)
-    kernel_type = "SmallBatch" if B < 32 else "BigBatch"
+    kernel_type = "SmallBatch" if B < 32 else "LargeBatch"
     print_precision_table(metrics, B, kernel_type)
 
     assert metrics["passed"], (
@@ -309,17 +309,12 @@ def test_cutedsl_gdn_performance(B: int):
             v_i = torch.randn(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
             a_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
             b_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
-            # 2D (N, HV): strides = (HV, 1), leading_dim = 1
-            a_leading_dim = 1
         else:
-            # Normal decode format: (N, 1, H, K), a/b are 3D (N, 1, HV)
             q_i = torch.randn(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
             k_i = torch.randn(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
             v_i = torch.randn(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
             a_i = torch.randn(N, 1, HV, dtype=torch.bfloat16, device="cuda")
             b_i = torch.randn(N, 1, HV, dtype=torch.bfloat16, device="cuda")
-            # 3D (N, 1, HV): strides = (HV, HV, 1), leading_dim = 2 (last dim has stride=1)
-            a_leading_dim = 2
         q_list.append(q_i)
         k_list.append(k_i)
         v_list.append(v_i)
@@ -502,7 +497,7 @@ def test_cutedsl_gdn_performance(B: int):
     cutedsl_mean = cutedsl_times.mean()
     cutedsl_std = cutedsl_times.std()
 
-    kernel_type = "SmallBatch" if B < 32 else "BigBatch"
+    kernel_type = "SmallBatch" if B < 32 else "LargeBatch"
     print_performance_table(
         B, kernel_type, triton_mean, triton_std, cutedsl_mean, cutedsl_std
     )
@@ -575,17 +570,12 @@ def run_benchmark(
             v_i = torch.randn(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
             a_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
             b_i = torch.randn(N, HV, dtype=torch.bfloat16, device="cuda")
-            # 2D (N, HV): strides = (HV, 1), leading_dim = 1
-            a_leading_dim = 1
         else:
-            # Normal decode format: (N, 1, H, K), a/b are 3D (N, 1, HV)
             q_i = torch.randn(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
             k_i = torch.randn(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
             v_i = torch.randn(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
             a_i = torch.randn(N, 1, HV, dtype=torch.bfloat16, device="cuda")
             b_i = torch.randn(N, 1, HV, dtype=torch.bfloat16, device="cuda")
-            # 3D (N, 1, HV): strides = (HV, HV, 1), leading_dim = 2 (last dim has stride=1)
-            a_leading_dim = 2
         q_list.append(q_i)
         k_list.append(k_i)
         v_list.append(v_i)
@@ -612,7 +602,7 @@ def run_benchmark(
         else None
     )
 
-    kernel_type = "SmallBatch" if use_small_batch else "BigBatch"
+    kernel_type = "SmallBatch" if use_small_batch else "LargeBatch"
     print(
         f"\nBENCHMARK: B={B} ({kernel_type}), warmup={warmup_iters}, samples={bench_iters}, runs={run_iters}"
     )
