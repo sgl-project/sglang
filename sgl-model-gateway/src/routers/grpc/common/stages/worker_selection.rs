@@ -8,9 +8,9 @@ use tracing::{error, warn};
 
 use super::PipelineStage;
 use crate::{
-    core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
+    core::{ConnectionMode, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
     observability::metrics::{metrics_labels, Metrics},
-    policies::PolicyRegistry,
+    policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
         error,
         grpc::context::{RequestContext, WorkerSelection},
@@ -18,13 +18,13 @@ use crate::{
 };
 
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
-pub struct WorkerSelectionStage {
+pub(crate) struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     mode: WorkerSelectionMode,
 }
 
-pub enum WorkerSelectionMode {
+pub(crate) enum WorkerSelectionMode {
     /// Regular mode: select single worker
     Regular,
     /// PD mode: select prefill + decode workers
@@ -67,40 +67,53 @@ impl PipelineStage for WorkerSelectionStage {
             prep.original_text.as_deref()
         };
 
+        // Get tokens for PrefixHash policy support
+        let tokens = if prep.token_ids.is_empty() {
+            None
+        } else {
+            Some(prep.token_ids.as_slice())
+        };
+
+        let headers = ctx.input.headers.as_ref();
+
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(ctx.input.model_id.as_deref(), text) {
+                match self.select_single_worker(
+                    ctx.input.model_id.as_deref(),
+                    text,
+                    tokens,
+                    headers,
+                ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
+                        let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
                         error!(
                             function = "WorkerSelectionStage::execute",
                             mode = "Regular",
-                            model_id = ?ctx.input.model_id,
+                            model_id = %model,
                             "No available workers for model"
                         );
                         return Err(error::service_unavailable(
                             "no_available_workers",
-                            format!("No available workers for model: {:?}", ctx.input.model_id),
+                            format!("No available workers for model: {}", model),
                         ));
                     }
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
-                match self.select_pd_pair(ctx.input.model_id.as_deref(), text) {
+                match self.select_pd_pair(ctx.input.model_id.as_deref(), text, tokens, headers) {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
                     None => {
+                        let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
                         error!(
                             function = "WorkerSelectionStage::execute",
                             mode = "PrefillDecode",
-                            model_id = ?ctx.input.model_id,
+                            model_id = %model,
                             "No available PD worker pairs for model"
                         );
                         return Err(error::service_unavailable(
                             "no_available_pd_worker_pairs",
-                            format!(
-                                "No available PD worker pairs for model: {:?}",
-                                ctx.input.model_id
-                            ),
+                            format!("No available PD worker pairs for model: {}", model),
                         ));
                     }
                 }
@@ -121,6 +134,8 @@ impl WorkerSelectionStage {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
+        tokens: Option<&[u32]>,
+        headers: Option<&http::HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model, filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
@@ -145,8 +160,21 @@ impl WorkerSelectionStage {
             None => self.policy_registry.get_default_policy(),
         };
 
+        // Get cached hash ring for consistent hashing (O(log n) lookup)
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
         // Select worker using the policy
-        let idx = policy.select_worker(&available, text)?;
+        let idx = policy.select_worker(
+            &available,
+            &SelectWorkerInfo {
+                request_text: text,
+                tokens,
+                headers,
+                hash_ring,
+            },
+        )?;
         let selected = available[idx].clone();
 
         // Record worker selection metric
@@ -164,6 +192,8 @@ impl WorkerSelectionStage {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
+        tokens: Option<&[u32]>,
+        headers: Option<&http::HeaderMap>,
     ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
         let all_workers = self.worker_registry.get_workers_filtered(
             model_id,
@@ -203,8 +233,19 @@ impl WorkerSelectionStage {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let prefill_idx = policy.select_worker(&available_prefill, text)?;
-        let decode_idx = policy.select_worker(&available_decode, text)?;
+        // Get cached hash ring for consistent hashing (O(log n) lookup)
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
+        let info = SelectWorkerInfo {
+            request_text: text,
+            tokens,
+            headers,
+            hash_ring,
+        };
+        let prefill_idx = policy.select_worker(&available_prefill, &info)?;
+        let decode_idx = policy.select_worker(&available_decode, &info)?;
 
         let model = model_id.unwrap_or("default");
         let policy_name = policy.name();
