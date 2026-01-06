@@ -13,7 +13,8 @@ from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import (
-    LocalAttention,
+    MinimalA2AAttnOp,
+    SparseLinearAttention,
     UlyssesAttention_VSA,
     USPAttention,
 )
@@ -42,6 +43,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -138,7 +140,7 @@ class WanSelfAttention(nn.Module):
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
         # Scaled dot product attention
-        self.attn = LocalAttention(
+        self.attn = USPAttention(
             num_heads=num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
@@ -263,6 +265,8 @@ class WanTransformerBlock(nn.Module):
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        attention_type: str = "original",
+        sla_topk: float = 0.1,
     ):
         super().__init__()
 
@@ -273,13 +277,20 @@ class WanTransformerBlock(nn.Module):
         self.to_v = ReplicatedLinear(dim, dim, bias=True)
 
         self.to_out = ReplicatedLinear(dim, dim, bias=True)
-        self.attn1 = USPAttention(
-            num_heads=num_heads,
-            head_size=dim // num_heads,
-            causal=False,
-            supported_attention_backends=supported_attention_backends,
-            prefix=f"{prefix}.attn1",
-        )
+        if attention_type == "sla":
+            self.attn1 = MinimalA2AAttnOp(
+                SparseLinearAttention(
+                    dim // num_heads, topk=sla_topk, BLKQ=128, BLKK=64
+                )
+            )
+        else:
+            self.attn1 = USPAttention(
+                num_heads=num_heads,
+                head_size=dim // num_heads,
+                causal=False,
+                supported_attention_backends=supported_attention_backends,
+                prefix=f"{prefix}.attn1",
+            )
 
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
@@ -391,7 +402,7 @@ class WanTransformerBlock(nn.Module):
         query, key = _apply_rotary_emb(
             query, cos, sin, is_neox_style=False
         ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        attn_output, _ = self.attn1(query, key, value)
+        attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -560,7 +571,7 @@ class WanTransformerBlock_VSA(nn.Module):
             query, cos, sin, is_neox_style=False
         ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
 
-        attn_output, _ = self.attn1(query, key, value, gate_compress=gate_compress)
+        attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -592,7 +603,7 @@ class WanTransformerBlock_VSA(nn.Module):
         return hidden_states
 
 
-class WanTransformer3DModel(CachableDiT):
+class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
     _supported_attention_backends = WanVideoConfig()._supported_attention_backends
@@ -648,6 +659,8 @@ class WanTransformer3DModel(CachableDiT):
                     self._supported_attention_backends
                     | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
                     prefix=f"{config.prefix}.blocks.{i}",
+                    attention_type=config.attention_type,
+                    sla_topk=config.sla_topk,
                 )
                 for i in range(config.num_layers)
             ]
@@ -694,6 +707,8 @@ class WanTransformer3DModel(CachableDiT):
             rope_theta=10000,
             dtype=torch.float32 if current_platform.is_mps() else torch.float64,
         )
+
+        self.layer_names = ["blocks"]
 
     def forward(
         self,

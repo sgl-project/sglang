@@ -12,14 +12,17 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
-    Timer,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 class ParallelExecutor(PipelineExecutor):
@@ -48,45 +51,48 @@ class ParallelExecutor(PipelineExecutor):
                 src=self.worker.cfg_group.ranks[0],
             )
 
+    def _execute(
+        self,
+        stages: List[PipelineStage],
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> OutputBatch:
+        """
+        Execute all pipeline stages respecting their declared parallelism type.
+        """
+        rank = get_classifier_free_guidance_rank()
+        cfg_group = get_cfg_group()
+
+        # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
+        for stage in stages:
+            paradigm = stage.parallelism_type
+
+            if paradigm == StageParallelismType.MAIN_RANK_ONLY:
+                if rank == 0:
+                    # Only main rank executes, others just wait
+                    batch = stage(batch, server_args)
+                torch.distributed.barrier()
+
+            elif paradigm == StageParallelismType.CFG_PARALLEL:
+                obj_list = [batch] if rank == 0 else []
+                broadcasted_list = broadcast_pyobj(
+                    obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
+                )
+                if rank != 0:
+                    batch = broadcasted_list[0]
+                batch = stage(batch, server_args)
+
+                torch.distributed.barrier()
+
+            elif paradigm == StageParallelismType.REPLICATED:
+                batch = stage(batch, server_args)
+        return batch
+
     def execute(
         self,
         stages: List[PipelineStage],
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
-        rank = get_classifier_free_guidance_rank()
-        cfg_rank = get_classifier_free_guidance_rank()
-        cfg_group = get_cfg_group()
-
-        # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
-        for stage in stages:
-            with Timer(stage.__class__.__name__):
-                paradigm = stage.parallelism_type
-
-                if paradigm == StageParallelismType.MAIN_RANK_ONLY:
-                    if rank == 0:
-                        batch = stage(batch, server_args)
-                    # obj_list = [batch] if rank == 0 else []
-                    #
-                    # broadcasted_list = broadcast_pyobj(
-                    #     obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
-                    # )
-                    # if rank != 0:
-                    #     batch = broadcasted_list[0]
-                    torch.distributed.barrier()
-
-                elif paradigm == StageParallelismType.CFG_PARALLEL:
-                    obj_list = [batch] if rank == 0 else []
-                    broadcasted_list = broadcast_pyobj(
-                        obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
-                    )
-                    if rank != 0:
-                        batch = broadcasted_list[0]
-                    batch = stage(batch, server_args)
-
-                    torch.distributed.barrier()
-
-                elif paradigm == StageParallelismType.REPLICATED:
-                    batch = stage(batch, server_args)
-
+    ) -> OutputBatch:
+        batch = self._execute(stages, batch, server_args)
         return batch

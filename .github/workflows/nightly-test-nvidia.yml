@@ -8,20 +8,59 @@ on:
       - main
     paths:
       - "python/sglang/version.py"
+      - "test/run_suite.py"
   workflow_dispatch:
+    inputs:
+      job_filter:
+        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - 'nightly-test-general-1-gpu-runner'
+          - 'nightly-test-general-4-gpu-h100'
+          - 'nightly-test-general-8-gpu-h200'
+          - 'nightly-test-general-8-gpu-h20'
+          - 'nightly-test-general-8-gpu-b200'
+          - 'nightly-test-text-accuracy-2-gpu-runner'
+          - 'nightly-test-text-perf-2-gpu-runner'
+          - 'nightly-test-vlm-accuracy-2-gpu-runner'
+          - 'nightly-test-vlm-perf-2-gpu-runner'
+          - 'nightly-test-multimodal-server-1-gpu'
+          - 'nightly-test-multimodal-server-2-gpu'
+          - 'nightly-test-perf-4-gpu-b200'
+          - 'nightly-test-perf-8-gpu-b200'
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      job_filter:
+        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+        required: false
+        type: string
+        default: 'all'
 
 concurrency:
-  group: nightly-test-nvidia-${{ github.ref }}
-  cancel-in-progress: true
+  group: nightly-test-nvidia-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+env:
+  SGLANG_IS_IN_CI: true
 
 jobs:
   # General tests - 1 GPU
   nightly-test-general-1-gpu-runner:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-1-gpu-runner')
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -31,15 +70,17 @@ jobs:
         timeout-minutes: 60
         run: |
           cd test
-          python3 run_suite_nightly.py --suite nightly-1-gpu --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-1-gpu --nightly --continue-on-error
 
   # General tests - 4 GPU H100
   nightly-test-general-4-gpu-h100:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-4-gpu-h100')
     runs-on: 4-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -49,21 +90,35 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test
-          python3 run_suite_nightly.py --suite nightly-4-gpu --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-4-gpu --nightly --continue-on-error
 
   # General tests - 8 GPU H200
   nightly-test-general-8-gpu-h200:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-h200')
     runs-on: 8-gpu-h200
     env:
       RUNNER_LABELS: 8-gpu-h200
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
           bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run common 8-GPU model tests
+        if: always()
+        timeout-minutes: 300
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          GPU_CONFIG: "8-gpu-h200"
+          IS_H200: "1"
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=18000 --continue-on-error
 
       - name: Run test
         timeout-minutes: 30
@@ -71,17 +126,19 @@ jobs:
           GPU_CONFIG: "8-gpu-h200"
         run: |
           cd test
-          python3 run_suite_nightly.py --suite nightly-8-gpu-h200 --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --nightly --continue-on-error
 
   # General tests - 8 GPU H20
   nightly-test-general-8-gpu-h20:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-h20')
     runs-on: 8-gpu-h20
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -93,15 +150,39 @@ jobs:
           GPU_CONFIG: "8-gpu-h20"
         run: |
           cd test
-          python3 run_suite_nightly.py --suite nightly-8-gpu-h20 --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-h20 --nightly --continue-on-error
+
+  # General tests - 8 GPU B200
+  nightly-test-general-8-gpu-b200:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-h20')
+    runs-on: 8-gpu-b200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 120
+        env:
+          GPU_CONFIG: "8-gpu-b200"
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-b200 --nightly --continue-on-error --timeout-per-file 2400
 
   # Text model accuracy tests
   nightly-test-text-accuracy-2-gpu-runner:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-text-accuracy-2-gpu-runner')
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -111,15 +192,17 @@ jobs:
         timeout-minutes: 120
         run: |
           cd test
-          python3 nightly/test_text_models_gsm8k_eval.py
+          python3 run_suite.py --hw cuda --suite nightly-eval-text-2-gpu --nightly --continue-on-error --timeout-per-file 4500
 
   # Text model performance tests
   nightly-test-text-perf-2-gpu-runner:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-text-perf-2-gpu-runner')
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -134,7 +217,7 @@ jobs:
         run: |
           cd test
           rm -rf performance_profiles_text_models/
-          python3 nightly/test_text_models_perf.py
+          python3 run_suite.py --hw cuda --suite nightly-perf-text-2-gpu --nightly --continue-on-error
 
       - name: Publish traces to storage repo
         env:
@@ -142,15 +225,17 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_text_models
+          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_text_models
 
   # VLM accuracy tests
   nightly-test-vlm-accuracy-2-gpu-runner:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-vlm-accuracy-2-gpu-runner')
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -160,15 +245,17 @@ jobs:
         timeout-minutes: 240
         run: |
           cd test
-          python3 nightly/test_vlms_mmmu_eval.py
+          python3 run_suite.py --hw cuda --suite nightly-eval-vlm-2-gpu --nightly --continue-on-error --timeout-per-file 9000
 
   # VLM performance tests
   nightly-test-vlm-perf-2-gpu-runner:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-vlm-perf-2-gpu-runner')
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -183,7 +270,7 @@ jobs:
         run: |
           cd test
           rm -rf performance_profiles_vlms/
-          python3 nightly/test_vlms_perf.py
+          python3 run_suite.py --hw cuda --suite nightly-perf-vlm-2-gpu --nightly --continue-on-error
 
       - name: Publish traces to storage repo
         env:
@@ -191,15 +278,83 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_vlms
+          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_vlms
+
+  # diffusion performance tests
+  nightly-test-multimodal-server-1-gpu:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-multimodal-server-1-gpu')
+    runs-on: 1-gpu-runner
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        part: [0, 1]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh diffusion
+          pip install slack_sdk
+
+      - name: Run diffusion server tests
+        env:
+          SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+
+        timeout-minutes: 60
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite 1-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2
+
+
+  nightly-test-multimodal-server-2-gpu:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-multimodal-server-2-gpu')
+    runs-on: 2-gpu-runner
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        part: [0, 1]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh diffusion
+          pip install slack_sdk
+
+      - name: Run diffusion server tests
+        env:
+          SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+
+        timeout-minutes: 60
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite 2-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2
 
   # B200 Performance tests - 4 GPU
   nightly-test-perf-4-gpu-b200:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-4-gpu-b200')
     runs-on: 4-gpu-b200
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
@@ -209,59 +364,34 @@ jobs:
         timeout-minutes: 60
         run: |
           cd test
-          python3 run_suite_nightly.py --suite nightly-4-gpu-b200 --continue-on-error
+          python3 run_suite.py --hw cuda --suite nightly-4-gpu-b200 --nightly --continue-on-error
 
   # B200 Performance tests - 8 GPU
   nightly-test-perf-8-gpu-b200:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-8-gpu-b200')
     runs-on: 8-gpu-b200
     env:
       RUNNER_LABELS: 8-gpu-b200
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         run: |
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run DeepSeek v3.1 nightly performance test
-        timeout-minutes: 180
+      - name: Run common 8-GPU model tests
+        if: always()
+        timeout-minutes: 200
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-b200"
         run: |
-          rm -rf test/srt/performance_profiles_deepseek_v31/
           cd test
-          IS_BLACKWELL=1 python3 nightly/test_deepseek_v31_perf.py
-
-      - name: Publish DeepSeek v3.1 traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_deepseek_v31
-
-      - name: Run DeepSeek v3.2 nightly performance test
-        timeout-minutes: 180
-        env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "8-gpu-b200"
-        run: |
-          rm -rf test/srt/performance_profiles_deepseek_v32/
-          cd test
-          IS_BLACKWELL=1 python3 nightly/test_deepseek_v32_perf.py
-
-      - name: Publish DeepSeek v3.2 traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_deepseek_v32
+          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error
 
   # Final check job
   check-all-jobs:
@@ -271,10 +401,13 @@ jobs:
       - nightly-test-general-4-gpu-h100
       - nightly-test-general-8-gpu-h200
       - nightly-test-general-8-gpu-h20
+      - nightly-test-general-8-gpu-b200
       - nightly-test-text-accuracy-2-gpu-runner
       - nightly-test-text-perf-2-gpu-runner
       - nightly-test-vlm-accuracy-2-gpu-runner
       - nightly-test-vlm-perf-2-gpu-runner
+      - nightly-test-multimodal-server-1-gpu
+      - nightly-test-multimodal-server-2-gpu
       - nightly-test-perf-4-gpu-b200
       - nightly-test-perf-8-gpu-b200
     runs-on: ubuntu-latest

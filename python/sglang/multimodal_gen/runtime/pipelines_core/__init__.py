@@ -42,7 +42,7 @@ def build_pipeline(
     3. based on the config, determine the pipeline class
     """
     model_path = server_args.model_path
-    model_info = get_model_info(model_path)
+    model_info = get_model_info(model_path, backend=server_args.backend)
     if model_info is None:
         raise ValueError(f"Unsupported model: {model_path}")
 
@@ -51,7 +51,7 @@ def build_pipeline(
     # instantiate the pipelines
     pipeline = pipeline_cls(model_path, server_args)
 
-    logger.info("Pipelines instantiated")
+    logger.info("Pipeline instantiated")
 
     return cast(PipelineWithLoRA, pipeline)
 
