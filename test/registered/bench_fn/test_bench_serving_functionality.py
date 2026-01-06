@@ -76,22 +76,19 @@ class TestBenchServingFunctionality(CustomTestCase):
         self.assertEqual(len(reqs), NUM_CONVERSATIONS * NUM_TURNS)
 
         messages_list = [r.get("obj", {}).get("messages", []) for r in reqs]
-        turn1_reqs = [m for m in messages_list if len(m) == 1]
-        turn2_reqs = [m for m in messages_list if len(m) == 3]
-        turn3_reqs = [m for m in messages_list if len(m) == 5]
 
-        self.assertEqual(len(turn1_reqs), NUM_CONVERSATIONS)
-        self.assertEqual(len(turn2_reqs), NUM_CONVERSATIONS)
-        self.assertEqual(len(turn3_reqs), NUM_CONVERSATIONS)
+        # Group by turn: turn i has (2*i - 1) messages
+        turns = [[m for m in messages_list if len(m) == 2 * i - 1] for i in range(1, NUM_TURNS + 1)]
+        for i, turn in enumerate(turns):
+            self.assertEqual(len(turn), NUM_CONVERSATIONS, f"Turn {i+1} count mismatch")
 
-        prefix_count = 0
-        for t2 in turn2_reqs:
-            if any(t2[:1] == t1 for t1 in turn1_reqs):
-                prefix_count += 1
-        for t3 in turn3_reqs:
-            if any(t3[:3] == t2 for t2 in turn2_reqs):
-                prefix_count += 1
-        expected = NUM_CONVERSATIONS * 2
+        # Verify prefix relationships between consecutive turns
+        prefix_count = sum(
+            any(curr[: len(prev)] == prev for prev in turns[i])
+            for i in range(NUM_TURNS - 1)
+            for curr in turns[i + 1]
+        )
+        expected = NUM_CONVERSATIONS * (NUM_TURNS - 1)
         self.assertEqual(prefix_count, expected, f"Expected {expected} prefix pairs")
 
 
