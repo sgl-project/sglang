@@ -423,9 +423,10 @@ impl Router {
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_idle_secs: self.max_idle_secs,
                     assignment_mode: match self.assignment_mode.as_str() {
+                        "random" => config::ManualAssignmentMode::Random,
                         "min_load" => config::ManualAssignmentMode::MinLoad,
                         "min_group" => config::ManualAssignmentMode::MinGroup,
-                        _ => config::ManualAssignmentMode::Random,
+                        other => panic!("Unknown assignment mode: {}", other),
                     },
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
