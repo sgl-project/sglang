@@ -3,7 +3,7 @@
 //! Tests `constraints::build_tool_call_constraint()` with various tool_choice modes
 //! and parallel_tool_calls configurations
 
-use smg::protocols::common::{Tool, ToolChoice, ToolChoiceValue};
+use smg::protocols::common::{FunctionChoice, Tool, ToolChoice, ToolChoiceValue, ToolReference};
 use smg::tool_parser::{constraints, factory::ParserFactory};
 
 /// Helper to create test tools
@@ -47,7 +47,7 @@ fn create_test_tools() -> Vec<Tool> {
 fn create_tool_with_defs() -> Tool {
     Tool {
         tool_type: "function".to_string(),
-        function: sgl_model_gateway::protocols::common::Function {
+        function: smg::protocols::common::Function {
             name: "complex_tool".to_string(),
             description: Some("Tool with $defs".to_string()),
             parameters: serde_json::json!({
@@ -173,7 +173,7 @@ fn test_required_mode_generates_json_schema() {
     let schema: serde_json::Value = serde_json::from_str(&constraint.1).unwrap();
     assert_eq!(schema["type"], "array");
     assert_eq!(schema["minItems"], 1);
-    assert!(schema["maxItems"], serde_json::json!(null));
+    assert!(schema.get("maxItems").is_none());
 
     let items = &schema["items"];
     assert_eq!(items["type"], "object");
@@ -214,7 +214,10 @@ fn test_specific_function_generates_json_schema() {
     let factory = ParserFactory::new();
     let tools = create_test_tools();
     let tool_choice = Some(ToolChoice::Function {
-        name: "search".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionChoice {
+            name: "search".to_string(),
+        },
     });
 
     let result = constraints::build_tool_call_constraint(
@@ -405,8 +408,16 @@ fn test_allowed_tools_auto_mode() {
     let factory = ParserFactory::new();
     let tools = create_test_tools();
     let tool_choice = Some(ToolChoice::AllowedTools {
+        tool_type: "allowed_tools".to_string(),
         mode: "auto".to_string(),
-        allowed_tools: vec!["get_weather".to_string(), "search".to_string()],
+        tools: vec![
+            ToolReference::Function {
+                name: "get_weather".to_string(),
+            },
+            ToolReference::Function {
+                name: "search".to_string(),
+            },
+        ],
     });
 
     let result = constraints::build_tool_call_constraint(
@@ -428,8 +439,16 @@ fn test_allowed_tools_required_mode() {
     let factory = ParserFactory::new();
     let tools = create_test_tools();
     let tool_choice = Some(ToolChoice::AllowedTools {
+        tool_type: "allowed_tools".to_string(),
         mode: "required".to_string(),
-        allowed_tools: vec!["get_weather".to_string(), "search".to_string()],
+        tools: vec![
+            ToolReference::Function {
+                name: "get_weather".to_string(),
+            },
+            ToolReference::Function {
+                name: "search".to_string(),
+            },
+        ],
     });
 
     let result = constraints::build_tool_call_constraint(

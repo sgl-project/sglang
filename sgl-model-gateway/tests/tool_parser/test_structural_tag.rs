@@ -47,8 +47,8 @@ fn test_mistral_get_format_info() {
     let parser = MistralParser::new();
     let (begin, end, trigger) = parser.get_format_info("my_tool");
 
-    assert_eq!(begin, "[TOOL_CALLS] [{");
-    assert_eq!(end, "}]");
+    assert_eq!(begin, "{\"name\": \"");
+    assert_eq!(end, "\"}");
     assert_eq!(trigger, "[TOOL_CALLS]");
 }
 
@@ -67,7 +67,7 @@ fn test_json_get_format_info() {
     let parser = JsonParser::new();
     let (begin, end, trigger) = parser.get_format_info("json_func");
 
-    assert_eq!(begin, "{\"name\": \"");
+    assert_eq!(begin, "{\"name\":\"json_func\", \"arguments\":");
     assert_eq!(end, "\"}");
     assert_eq!(trigger, "[TOOL_CALLS]");
 }
@@ -116,7 +116,7 @@ fn test_mistral_build_structural_tag_default() {
     let tags = tag_json["tags"].as_array().unwrap();
     assert_eq!(tags.len(), 1);
     assert_eq!(tags[0]["format"], "tag");
-    assert!(tags[0]["begin"].as_str().unwrap().contains("[TOOL_CALLS]"));
+    assert!(tags[0]["begin"].as_str().unwrap().contains("name"));
 }
 
 #[test]
