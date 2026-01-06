@@ -266,24 +266,6 @@ class CudaPlatformBase(Platform):
             raise ValueError(f"Invalid attention backend for {cls.device_name}")
         else:
             if cls.is_sm120():
-                # On SM12.x, the sgl-kernel FlashAttention wheels may not include
-                # support yet. Default to Torch SDPA for correctness.
-                logger.info("Defaulting to Torch SDPA backend on SM12.x")
-                target_backend = AttentionBackendEnum.TORCH_SDPA
-            elif cls.is_blackwell():
-                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-                    set_fa_ver,
-                )
-
-                set_fa_ver(4)
-                target_backend = AttentionBackendEnum.FA
-            else:
-                target_backend = AttentionBackendEnum.FA
-
-        # Ensure we have a target backend selected before validation/fallback.
-        if target_backend is None:
-            target_backend = AttentionBackendEnum.FA
-            if is_sm120():
                 try:
                     from sageattention import sageattn  # noqa: F401
 
@@ -300,12 +282,16 @@ class CudaPlatformBase(Platform):
                         "Sage Attention backend is not installed (To install it, run `pip install sageattention==2.2.0 --no-build-isolation`). Falling back to Flash Attention."
                     )
                     target_backend = AttentionBackendEnum.TORCH_SDPA
-        if target_backend == AttentionBackendEnum.FA and cls.is_blackwell():
-            from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-                set_fa_ver,
-            )
+            elif cls.is_blackwell():
+                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+                    set_fa_ver,
+                )
 
-            set_fa_ver(4)
+                set_fa_ver(4)
+                target_backend = AttentionBackendEnum.FA
+            else:
+                target_backend = AttentionBackendEnum.FA
+
         if not cls.has_device_capability(80):
             logger.info("Cannot use FlashAttention backend for Volta and Turing GPUs.")
             target_backend = AttentionBackendEnum.TORCH_SDPA
