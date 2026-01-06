@@ -179,7 +179,9 @@ impl PrefixHashPolicy {
                     // This is a simpler approach than walking the ring
                     let least_loaded = healthy_workers
                         .iter()
-                        .filter(|(_, w)| self.load_ok(w.worker_load().value(), total_load, num_workers))
+                        .filter(|(_, w)| {
+                            self.load_ok(w.worker_load().value(), total_load, num_workers)
+                        })
                         .min_by_key(|(_, w)| w.worker_load().value());
 
                     if let Some(&(idx, _)) = least_loaded {

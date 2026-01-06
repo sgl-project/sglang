@@ -96,7 +96,6 @@ impl fmt::Debug for WorkerLoad {
     }
 }
 
-
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
