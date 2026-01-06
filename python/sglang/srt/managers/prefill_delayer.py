@@ -24,9 +24,6 @@ class PrefillDelayer:
         self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
 
         assert (
-            server_args.schedule_policy == "fcfs"
-        ), f"To use PrefillDelayer, schedule_policy must be 'fcfs'. '{server_args.schedule_policy}' is not supported."
-        assert (
             server_args.enable_dp_attention
         ), "To use PrefillDelayer, enable_dp_attention must be enabled."
         assert (
