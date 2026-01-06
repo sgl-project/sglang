@@ -664,6 +664,11 @@ impl BasicWorker {
             Ok(self.url())
         }
     }
+
+    fn update_running_requests_metrics(&self) {
+        let load = self.load();
+        Metrics::set_worker_requests_active(self.url(), load);
+    }
 }
 
 #[async_trait]
@@ -743,7 +748,7 @@ impl Worker for BasicWorker {
 
     fn increment_load(&self) {
         self.load_counter.fetch_add(1, Ordering::Relaxed);
-        Metrics::set_worker_requests_active(&self.metadata.url, self.load());
+        self.update_running_requests_metrics();
     }
 
     fn decrement_load(&self) {
@@ -759,12 +764,12 @@ impl Worker for BasicWorker {
                 "Attempted to decrement load counter that is already at 0"
             );
         }
-        Metrics::set_worker_requests_active(&self.metadata.url, self.load());
+        self.update_running_requests_metrics();
     }
 
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
-        Metrics::set_worker_requests_active(&self.metadata.url, self.load());
+        self.update_running_requests_metrics();
     }
 
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
