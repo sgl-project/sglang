@@ -15,6 +15,7 @@ Example:
 This will search for /tmp/test_metrics.*.jsonl files and merge them.
 """
 
+import argparse
 import glob
 import json
 import sys
@@ -43,7 +44,16 @@ def merge_metrics(base_path: str, output_file: str) -> int:
             file=sys.stderr,
         )
         print(f"Creating empty output file: {output_file}", file=sys.stderr)
-        Path(output_file).touch()
+        try:
+            output_path = Path(output_file)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.touch()
+        except IOError as e:
+            print(
+                f"Error: Failed to create empty output file {output_file}: {e}",
+                file=sys.stderr,
+            )
+            return 1
         return 0
 
     print(
@@ -109,21 +119,17 @@ def merge_metrics(base_path: str, output_file: str) -> int:
 
 
 def main():
-    if len(sys.argv) != 3:
-        print(
-            "Usage: python3 merge_metrics.py <base_path> <output_file>",
-            file=sys.stderr,
-        )
-        print(
-            "\nExample: python3 merge_metrics.py /tmp/test_metrics /tmp/merged.jsonl",
-            file=sys.stderr,
-        )
-        return 1
+    parser = argparse.ArgumentParser(
+        description="Merge multiple test metrics JSONL files into a single output file.",
+        epilog="Example: python3 merge_metrics.py /tmp/test_metrics /tmp/merged.jsonl",
+    )
+    parser.add_argument(
+        "base_path", help="Base path pattern for input files (without .*.jsonl suffix)"
+    )
+    parser.add_argument("output_file", help="Path to the output merged JSONL file")
+    args = parser.parse_args()
 
-    base_path = sys.argv[1]
-    output_file = sys.argv[2]
-
-    return merge_metrics(base_path, output_file)
+    return merge_metrics(args.base_path, args.output_file)
 
 
 if __name__ == "__main__":
