@@ -1,10 +1,8 @@
 use std::{
-    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -15,8 +13,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use bytes::Bytes;
-use http_body::Frame;
 use rand::Rng;
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
@@ -32,6 +28,7 @@ use crate::{
     },
     routers::error::extract_error_code_from_response,
     server::AppState,
+    utils::AttachedBody,
     wasm::{
         module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
         spec::{
@@ -44,63 +41,33 @@ use crate::{
     },
 };
 
-/// A body wrapper that holds a token and returns it when the body is fully consumed or dropped.
-/// This ensures that for streaming responses, the token is only returned after the entire
-/// stream has been sent to the client.
-pub struct TokenGuardBody {
-    inner: Body,
-    /// The token bucket to return tokens to. Uses Option so we can take() on drop.
+pub struct TokenGuard {
     token_bucket: Option<Arc<TokenBucket>>,
-    /// Number of tokens to return.
     tokens: f64,
 }
 
-impl TokenGuardBody {
-    /// Create a new TokenGuardBody that will return tokens when dropped.
-    pub fn new(inner: Body, token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
+impl TokenGuard {
+    pub fn new(token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
         Self {
-            inner,
             token_bucket: Some(token_bucket),
             tokens,
         }
     }
 }
 
-impl Drop for TokenGuardBody {
+impl Drop for TokenGuard {
     fn drop(&mut self) {
         if let Some(bucket) = self.token_bucket.take() {
             debug!(
-                "TokenGuardBody: stream ended, returning {} tokens to bucket",
+                "TokenGuard: stream ended, returning {} tokens to bucket",
                 self.tokens
             );
-            // Use lock-free sync return - no runtime needed, guaranteed token return
             bucket.return_tokens_sync(self.tokens);
         }
     }
 }
 
-impl http_body::Body for TokenGuardBody {
-    type Data = Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        // SAFETY: We never move the inner body, and Body is Unpin
-        // (it's a type alias for UnsyncBoxBody which is Unpin)
-        let this = self.get_mut();
-        Pin::new(&mut this.inner).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
-    }
-}
+pub type TokenGuardBody = AttachedBody<TokenGuard>;
 
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -517,7 +484,7 @@ pub async fn concurrency_limit_middleware(
         // This ensures that for streaming responses, the token is only returned
         // after the entire stream has been sent to the client.
         let (parts, body) = response.into_parts();
-        let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+        let guarded_body = TokenGuardBody::new(body, TokenGuard::new(token_bucket, 1.0));
         Response::from_parts(parts, Body::new(guarded_body))
     } else {
         // No tokens available, try to queue if enabled
@@ -554,7 +521,7 @@ pub async fn concurrency_limit_middleware(
 
                             // Wrap the response body with TokenGuardBody to return token when stream ends
                             let (parts, body) = response.into_parts();
-                            let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+                            let guarded_body = TokenGuardBody::new(body, TokenGuard::new(token_bucket, 1.0));
                             Response::from_parts(parts, Body::new(guarded_body))
                         }
                         Ok(Err(status)) => {

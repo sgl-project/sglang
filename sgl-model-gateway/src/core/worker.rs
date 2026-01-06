@@ -21,6 +21,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerInfo,
     routers::grpc::client::GrpcClient,
+    utils::AttachedBody,
 };
 
 /// Default worker priority (mid-range on 0-100 scale)
@@ -1016,26 +1017,12 @@ impl WorkerLoadGuard {
         Self { worker }
     }
 
-    /// Attach this guard to a Response, tying the guard's lifetime to the response body.
-    ///
-    /// When the response body is fully consumed or dropped (e.g., client disconnects),
-    /// the guard is dropped and worker load is decremented automatically.
-    ///
-    /// This is the proper RAII pattern for SSE/streaming responses where the handler
-    /// returns immediately but the stream continues in a background task.
     pub fn attach_to_response(
         self,
         response: axum::response::Response,
     ) -> axum::response::Response {
         let (parts, body) = response.into_parts();
-
-        // Wrap body with guard - guard drops when body drops
-        let guarded_body = GuardedBody {
-            inner: body,
-            _guard: self,
-        };
-
-        axum::response::Response::from_parts(parts, Body::new(guarded_body))
+        axum::response::Response::from_parts(parts, Body::new(AttachedBody::new(body, self)))
     }
 }
 
@@ -1045,74 +1032,12 @@ impl Drop for WorkerLoadGuard {
     }
 }
 
-/// Attach multiple guards to a Response (for dual prefill/decode workers)
 pub fn attach_guards_to_response(
     guards: Vec<WorkerLoadGuard>,
     response: axum::response::Response,
 ) -> axum::response::Response {
     let (parts, body) = response.into_parts();
-
-    let guarded_body = MultiGuardedBody {
-        inner: body,
-        _guards: guards,
-    };
-
-    axum::response::Response::from_parts(parts, Body::new(guarded_body))
-}
-
-/// Body wrapper that holds a WorkerLoadGuard
-///
-/// When this body is dropped (stream ends or client disconnects),
-/// the guard is dropped, decrementing worker load.
-struct GuardedBody {
-    inner: Body,
-    _guard: WorkerLoadGuard,
-}
-
-/// Body wrapper that holds multiple WorkerLoadGuards (for dual prefill/decode)
-struct MultiGuardedBody {
-    inner: Body,
-    _guards: Vec<WorkerLoadGuard>,
-}
-
-impl http_body::Body for GuardedBody {
-    type Data = bytes::Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-impl http_body::Body for MultiGuardedBody {
-    type Data = bytes::Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
-    }
+    axum::response::Response::from_parts(parts, Body::new(AttachedBody::new(body, guards)))
 }
 
 /// Health checker handle with graceful shutdown
