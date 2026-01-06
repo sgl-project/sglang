@@ -258,6 +258,12 @@ class MultimodalDataItem:
 
         from sglang.srt.managers.mm_utils import hash_feature
 
+        if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+            import uuid
+
+            self.hash = uuid.uuid4().int
+            self.pad_value = self.hash % (1 << 30)
+            return
         if self.hash is None:
             if self.feature is not None:
                 hashed_feature = self.feature
