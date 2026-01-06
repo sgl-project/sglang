@@ -1690,8 +1690,6 @@ def launch_server(
     """
     # Step 1: Bind the HTTP port early to fail fast if port is already in use.
     # This avoids wasting time on model loading when the port is unavailable.
-    # Reference: vLLM solved similar issue in https://github.com/vllm-project/vllm/issues/8204
-    logger.info(f"Reserving HTTP port {server_args.port}...")
     try:
         server_socket = create_server_socket(server_args.host, server_args.port)
     except RuntimeError as e:
@@ -1700,6 +1698,10 @@ def launch_server(
     logger.info(
         f"Port {server_args.port} reserved successfully. Starting model loading..."
     )
+
+    # Initialize to None to avoid UnboundLocalError in finally block
+    # if an exception occurs before assignment
+    multi_tokenizer_args_shm = None
 
     try:
         # Step 2: Launch subprocesses and load model (time-consuming operation)
@@ -1802,9 +1804,15 @@ def launch_server(
             except Exception:
                 pass
 
-        if server_args.tokenizer_worker_num > 1:
+        # Clean up shared memory if it was created
+        if multi_tokenizer_args_shm is not None:
             multi_tokenizer_args_shm.unlink()
+
+        # Always clean up socket mapping in multi-tokenizer mode
+        # This should run even if multi_tokenizer_args_shm wasn't created
+        if server_args.tokenizer_worker_num > 1 and _global_state is not None:
             _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+
 
 
 def _run_server_with_socket(
