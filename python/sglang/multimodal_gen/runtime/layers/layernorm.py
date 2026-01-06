@@ -23,15 +23,22 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 # Try to import FlashInfer RMSNorm (works on CUDA, experimental on HIP)
-_flashinfer_rmsnorm_available = False
-try:
-    from flashinfer.norm import rmsnorm as flashinfer_rmsnorm
+# Set SGLANG_DISABLE_FLASHINFER=1 to force Triton fallback for comparison
+import os
 
-    _flashinfer_rmsnorm_available = True
-    logger.debug("FlashInfer RMSNorm available")
-except ImportError:
+_flashinfer_rmsnorm_available = False
+if os.environ.get("SGLANG_DISABLE_FLASHINFER", "0") != "1":
+    try:
+        from flashinfer.norm import rmsnorm as flashinfer_rmsnorm
+
+        _flashinfer_rmsnorm_available = True
+        logger.debug("FlashInfer RMSNorm available")
+    except ImportError:
+        flashinfer_rmsnorm = None
+        logger.debug("FlashInfer RMSNorm not available")
+else:
     flashinfer_rmsnorm = None
-    logger.debug("FlashInfer RMSNorm not available")
+    logger.info("FlashInfer disabled via SGLANG_DISABLE_FLASHINFER=1")
 
 # Import sgl_kernel RMSNorm (CUDA only)
 try:
@@ -149,6 +156,11 @@ class RMSNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # Try FlashInfer first (if built with HIP patches), fall back to Triton
         if _flashinfer_rmsnorm_available:
+            if not getattr(self.__class__, "_logged_flashinfer", False):
+                import os
+                if os.environ.get("SGLANG_LOG_KERNEL", "0") == "1":
+                    logger.info("[FlashInfer] Using FlashInfer RMSNorm kernel on HIP")
+                self.__class__._logged_flashinfer = True
             if residual is not None:
                 x = x + residual
                 residual = x
@@ -169,6 +181,11 @@ class RMSNorm(CustomOp):
                 return out
             return out, residual
         # Triton fallback - works well on AMD GPUs
+        if not getattr(self.__class__, "_logged_triton", False):
+            import os
+            if os.environ.get("SGLANG_LOG_KERNEL", "0") == "1":
+                logger.info("[Triton] Using Triton RMSNorm fallback on HIP")
+            self.__class__._logged_triton = True
         return self.forward_triton(x, residual)
 
     def extra_repr(self) -> str:

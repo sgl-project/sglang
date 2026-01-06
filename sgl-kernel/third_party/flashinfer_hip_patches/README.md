@@ -20,6 +20,56 @@ pip install -e . -v
 
 The fork includes all HIP/ROCm patches directly in the codebase.
 
+## Performance (FLUX.1-dev on MI300X)
+
+| Kernel | Denoising (50 steps) | Per Step | Speedup |
+|--------|---------------------|----------|---------|
+| **FlashInfer** | 8.75s | 0.174s | **1.29x** |
+| Triton fallback | 11.26s | 0.224s | baseline |
+
+## Reproduce
+
+```bash
+# 1. Install FlashInfer AMD fork
+pip install git+https://github.com/sunxxuns/flashinfer.git
+
+# 2. Run with FlashInfer (default)
+SGLANG_LOG_KERNEL=1 sglang generate \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --prompt "A beautiful sunset over mountains" \
+  --save-output
+
+# 3. Run WITHOUT FlashInfer (Triton fallback) for comparison
+SGLANG_DISABLE_FLASHINFER=1 SGLANG_LOG_KERNEL=1 sglang generate \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --prompt "A beautiful sunset over mountains" \
+  --save-output
+```
+
+### Expected Output
+
+With FlashInfer:
+```
+[FlashInfer] Using FlashInfer RMSNorm kernel on HIP
+[FlashInfer] Using FlashInfer RoPE kernel
+[DenoisingStage] average time per step: 0.174 seconds
+```
+
+Without FlashInfer:
+```
+FlashInfer disabled via SGLANG_DISABLE_FLASHINFER=1
+[Triton] Using Triton RMSNorm fallback on HIP
+FlashInfer not available, using Triton fallback for RoPE
+[DenoisingStage] average time per step: 0.224 seconds
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SGLANG_DISABLE_FLASHINFER` | `0` | Set to `1` to force Triton fallback |
+| `SGLANG_LOG_KERNEL` | `0` | Set to `1` to log which kernels are used |
+
 ## What's Included
 
 ✅ Working on AMD MI300X (gfx942):

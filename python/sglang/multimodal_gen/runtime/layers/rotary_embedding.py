@@ -68,10 +68,28 @@ def apply_flashinfer_rope_qk_inplace(
         raise ValueError(f"head_size mismatch: inferred {d}, but head_size={head_size}")
 
     # Try FlashInfer first (works on CUDA, experimental on HIP with patches)
-    try:
-        from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
-    except ImportError:
+    # Set SGLANG_DISABLE_FLASHINFER=1 to force Triton fallback for comparison
+    import os
+
+    _use_flashinfer_rope = False
+    if os.environ.get("SGLANG_DISABLE_FLASHINFER", "0") != "1":
+        try:
+            from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+
+            _use_flashinfer_rope = True
+        except ImportError:
+            pass
+
+    if not _use_flashinfer_rope:
         # Triton fallback for AMD/ROCm where FlashInfer is not available
+        import os
+
+        if os.environ.get("SGLANG_LOG_KERNEL", "0") == "1":
+            if not getattr(apply_flashinfer_rope_qk_inplace, "_logged_triton", False):
+                import warnings
+
+                warnings.warn("FlashInfer not available, using Triton fallback for RoPE")
+                apply_flashinfer_rope_qk_inplace._logged_triton = True
         half_size = cos_sin_cache.shape[-1] // 2
         if positions is None:
             cos = cos_sin_cache[:seqlen, :half_size].to(q.dtype)
@@ -87,6 +105,16 @@ def apply_flashinfer_rope_qk_inplace(
         q_rot = apply_rotary_embedding(q_flat, cos, sin, interleaved=not is_neox)
         k_rot = apply_rotary_embedding(k_flat, cos, sin, interleaved=not is_neox)
         return q_rot.view(bsz, seqlen, nheads, d), k_rot.view(bsz, seqlen, nheads, d)
+
+    # Log FlashInfer usage once
+    import os
+
+    if os.environ.get("SGLANG_LOG_KERNEL", "0") == "1":
+        if not getattr(apply_flashinfer_rope_qk_inplace, "_logged_flashinfer", False):
+            import logging
+
+            logging.getLogger(__name__).info("[FlashInfer] Using FlashInfer RoPE kernel")
+            apply_flashinfer_rope_qk_inplace._logged_flashinfer = True
 
     if positions is None:
         pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)
