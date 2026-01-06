@@ -37,7 +37,7 @@ class WeightChecker:
         ), f"should not have duplicated tensor name"
 
     def _reset_tensors(self):
-        for name, param in self._model_state():
+        for name, param in self._model_state(skip_buffers=True):
             param.copy_(_random_like(param))
 
     def _compare(self):
@@ -48,10 +48,11 @@ class WeightChecker:
             actual_tensors=_postprocess_tensors(dict(self._model_state())),
         )
 
-    def _model_state(self):
+    def _model_state(self, skip_buffers: bool = False):
         # TODO: support EAGLE etc (e.g. yield from both main model and draft model)
         yield from self._model_runner.model.named_parameters()
-        yield from self._model_runner.model.named_buffers()
+        if not skip_buffers:
+            yield from self._model_runner.model.named_buffers()
 
 
 def _check_tensors(
