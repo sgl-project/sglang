@@ -767,29 +767,15 @@ mod tests {
                 headers: Some(&headers),
                 ..Default::default()
             };
-            workers[0]
-                .worker_routing_key_load()
-                .increment(&format!("paper-{}", i));
-            workers[1]
-                .worker_routing_key_load()
-                .increment(&format!("paper-{}", i));
-            workers[2]
-                .worker_routing_key_load()
-                .increment(&format!("paper-{}", i));
 
             let (result, branch) = policy.select_worker_impl(&workers, &info);
             assert!(result.is_some());
             assert_eq!(branch, ExecutionBranch::Vacant);
 
-            workers[0]
+            let selected_idx = result.unwrap();
+            workers[selected_idx]
                 .worker_routing_key_load()
-                .decrement(&format!("paper-{}", i));
-            workers[1]
-                .worker_routing_key_load()
-                .decrement(&format!("paper-{}", i));
-            workers[2]
-                .worker_routing_key_load()
-                .decrement(&format!("paper-{}", i));
+                .increment(&format!("paper-{}", i));
         }
 
         let mut distribution = HashMap::new();
