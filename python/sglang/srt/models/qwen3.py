@@ -30,7 +30,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_cpu
+from sglang.srt.utils import add_prefix, is_cpu, is_cuda, is_npu
 
 Qwen3Config = None
 
@@ -43,65 +43,6 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
-
-# from torch.library import Library, impl
-
-# lib = Library("python_kernel", "FRAGMENT")
-# lib.define(
-#     "qkv_rmsnorm_cpu(Tensor qkv, Tensor q_weight, Tensor k_weight, float q_variance_epsilon, float k_variance_epsilon, int q_size, int kv_size, int head_dim, Tensor? residual) -> (Tensor, Tensor, Tensor)"
-# )
-
-# lib.define(
-#     "print_kernel_cpu(Tensor(a!) input) -> ()"
-# )
-
-# @impl(lib, "print_kernel_cpu", "CPU")
-# def print_kernel(input):
-#     print("print_kenerl: ", input, flush=True)
-    
-
-
-# @impl(lib, "qkv_rmsnorm_cpu", "CPU")
-# def qkv_rmsnorm_cpu(qkv, q_weight, k_weight, q_variance_epsilon, k_variance_epsilon, q_size, kv_size, head_dim, residual:Optional[torch.Tensor] = None):
-#     print("python kernel qkv shape: ", qkv.shape, flush=True)
-#     print("python kernel qkv stride: ", qkv.stride(), flush=True)
-#     print("python kernel qkv: ", qkv, flush=True)
-#     q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-#     q_by_head = q.reshape(-1, head_dim)
-
-#     if residual is None:
-#         q_by_head = torch.ops.sgl_kernel.rmsnorm_cpu(
-#             q_by_head, q_weight, q_variance_epsilon
-#         )
-#     else:
-#         q_by_head = torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(
-#             q_by_head, residual, q_weight, q_variance_epsilon
-#         )
-
-#     k_by_head = k.reshape(-1, head_dim)
-
-#     if residual is None:
-#         k_by_head = torch.ops.sgl_kernel.rmsnorm_cpu(
-#             k_by_head, k_weight, k_variance_epsilon
-#         )
-#     else:
-#         k_by_head = torch.ops.sgl_kernel.rmsnorm_cpu(
-#             k_by_head, residual, k_weight, k_variance_epsilon
-#         )
-
-#     q = q_by_head.view(q.shape)
-#     k = k_by_head.view(k.shape)
-#     print("python kernel q shape: ", q.shape, flush=True)
-#     print("python kernel q stride: ", q.stride(), flush=True)
-#     print("python kernel q: ", q, flush=True)
-#     print("python kernel k shape: ", k.shape, flush=True)
-#     print("python kernel k stride: ", k.stride(), flush=True)
-#     print("python kernel k: ", k, flush=True)
-#     print("python kernel v shape: ", v.shape, flush=True)
-#     print("python kernel v stride: ", v.stride(), flush=True)
-#     print("python kernel v: ", v, flush=True)
-
-#     return q, k, v
 
 
 class Qwen3Attention(nn.Module):
@@ -228,9 +169,11 @@ class Qwen3Attention(nn.Module):
             # generate vectorized kernels as much as possible.
             batch_dims = qkv.shape[:-1]
             qkv_view = qkv.view(*batch_dims, -1, self.head_dim)
-            q_view = qkv_view[..., :self.num_heads, :]
-            k_view = qkv_view[..., self.num_heads:self.num_heads + self.num_kv_heads, :]
-            v_view = qkv_view[..., self.num_heads + self.num_kv_heads:, :]
+            q_view = qkv_view[..., : self.num_heads, :]
+            k_view = qkv_view[
+                ..., self.num_heads : self.num_heads + self.num_kv_heads, :
+            ]
+            v_view = qkv_view[..., self.num_heads + self.num_kv_heads :, :]
             q_reshape = q_view.reshape(-1, self.head_dim)
             k_reshape = k_view.reshape(-1, self.head_dim)
 
@@ -239,13 +182,6 @@ class Qwen3Attention(nn.Module):
             q = q_by_head.view(*batch_dims, self.q_size)
             k = k_by_head.view(*batch_dims, self.kv_size)
             v = v_view.view(*batch_dims, self.kv_size)
-
-            # q, k, v = torch.ops.python_kernel.qkv_rmsnorm_cpu(
-            #     qkv, self.q_norm.weight.data, self.k_norm.weight.data,
-            #     self.q_norm.variance_epsilon,
-            #     self.k_norm.variance_epsilon,
-            #     self.q_size, self.kv_size, self.head_dim, None
-            # )
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = self._apply_qk_norm(q, k)

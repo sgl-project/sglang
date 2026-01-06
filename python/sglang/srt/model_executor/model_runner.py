@@ -185,7 +185,6 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
 )
-from dataclasses import is_dataclass, asdict
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -2421,7 +2420,6 @@ class ModelRunner:
         self.graph_runner = None
         self.graph_mem_usage = 0
 
-        # return
         if not self.is_generation and self.device != "cpu":
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
@@ -2599,21 +2597,12 @@ class ModelRunner:
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
 
-        # with torch.profiler.profile(
-        #                 activities=[
-        #                     torch.profiler.ProfilerActivity.CPU,
-        #                 ]
-        #             ) as perf:
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
-        # print("--------------eager---------------", flush=True)
-        # print("forward_batch.input_ids shape: ", forward_batch.input_ids.shape, flush=True)
-        # print(perf.key_averages().table(sort_by="self_cpu_time_total", row_limit=-1), flush=True)
-        # return ret
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
@@ -2695,7 +2684,6 @@ class ModelRunner:
             and self.graph_runner.can_run(forward_batch)
         )
 
-        # print("self.spec_algorithm.is_eagle3(): ", self.spec_algorithm.is_eagle3())
         if can_run_graph:
             ret = self.graph_runner.replay(
                 forward_batch,
