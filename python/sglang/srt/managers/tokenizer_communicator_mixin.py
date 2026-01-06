@@ -653,7 +653,10 @@ class TokenizerCommunicatorMixin:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
                 if self.server_args.max_loaded_loras is not None:
-                    while self.lora_registry.num_registered_loras > self.server_args.max_loaded_loras:
+                    while (
+                        self.lora_registry.num_registered_loras
+                        > self.server_args.max_loaded_loras
+                    ):
                         lru_lora_name = await self.lora_registry.lru_lora_name(
                             exclude_pinned=True
                         )
