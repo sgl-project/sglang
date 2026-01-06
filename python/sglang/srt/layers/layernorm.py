@@ -197,7 +197,7 @@ class RMSNorm(MultiPlatformOp):
         if residual is not None:
             x = x + residual.to(torch.float32)
             if post_residual_addition is not None:
-                residual = residual + post_residual_addition
+                x = x + post_residual_addition
             if self.fp32_residual:
                 residual = x.clone()
             else:
