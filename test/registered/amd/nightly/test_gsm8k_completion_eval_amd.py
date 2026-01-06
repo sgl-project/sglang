@@ -1,5 +1,5 @@
 """
-AMD GSM8K Completion Evaluation Test
+AMD GSM8K Completion Evaluation Test (Migrated from test/srt/nightly/)
 
 This test uses the completion-based gsm8k benchmark (few-shot prompting)
 which works with base models that don't have chat templates.
@@ -20,6 +20,8 @@ Model groups are selected via AMD_TEST_MODEL_GROUP environment variable:
 - "deepseek-v3-mtp": DeepSeek-V3 with MTP/EAGLE (nightly-amd-8-gpu-deepseek-v3-mtp)
 - "deepseek-r1": DeepSeek-R1 reasoning model (nightly-amd-8-gpu-deepseek-r1)
 - "all": All models
+
+Registry: nightly-amd-8-gpu suite (8-GPU tests)
 """
 
 import ast
@@ -44,6 +46,7 @@ except ImportError:
     print("[WARNING] huggingface_hub not available - model cache checking disabled")
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -52,6 +55,9 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 from sglang.utils import download_and_cache_file, read_jsonl
+
+# Register for AMD CI - GSM8K completion tests (~120 min)
+register_amd_ci(est_time=7200, suite="nightly-amd-8-gpu", nightly=True)
 
 INVALID = -9999999
 
@@ -924,3 +930,4 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

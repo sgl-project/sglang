@@ -1,6 +1,10 @@
 name: Nightly Test (AMD)
 
 on:
+  # TODO: Remove pull_request trigger before merging
+  pull_request:
+    branches:
+      - main
   schedule:
     - cron: '0 0 * * *'
   push:
@@ -28,6 +32,9 @@ on:
           - 'nightly-perf-8-gpu-grok'
           - 'nightly-perf-8-gpu-deepseek-v3'
           - 'nightly-perf-8-gpu-deepseek-v31'
+          # MI35x jobs
+          - 'nightly-test-2-gpu-mi35x'
+          - 'nightly-test-2-gpu-vlm-mi35x'
   workflow_call:
     inputs:
       ref:
@@ -68,7 +75,9 @@ jobs:
 
       - name: Nightly Test (2-GPU)
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -95,7 +104,9 @@ jobs:
       - name: Nightly Test (2-GPU VLM MMMU)
         timeout-minutes: 180
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-vlm --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-vlm --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -121,7 +132,10 @@ jobs:
 
       - name: Nightly Test (8-GPU GPT-OSS)
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=gpt-oss -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e AMD_TEST_MODEL_GROUP=gpt-oss \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -147,7 +161,10 @@ jobs:
 
       - name: Nightly Test (8-GPU GROK)
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=grok -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e AMD_TEST_MODEL_GROUP=grok \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -173,7 +190,10 @@ jobs:
 
       - name: Nightly Test (8-GPU DeepSeek-R1)
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=deepseek-r1 -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e AMD_TEST_MODEL_GROUP=deepseek-r1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -199,7 +219,10 @@ jobs:
 
       - name: Nightly Test (8-GPU DeepSeek-V3 + DP Attention)
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=deepseek-v3-dp -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e AMD_TEST_MODEL_GROUP=deepseek-v3-dp \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -225,7 +248,10 @@ jobs:
 
       - name: Nightly Test (8-GPU DeepSeek-V3 + Torch Compile)
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=deepseek-v3-tc -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e AMD_TEST_MODEL_GROUP=deepseek-v3-tc \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -251,7 +277,10 @@ jobs:
 
       - name: Nightly Test (8-GPU DeepSeek-V3 + MTP)
         run: |
-          bash scripts/ci/amd_ci_exec.sh -e AMD_TEST_MODEL_GROUP=deepseek-v3-mtp -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd-8-gpu --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e AMD_TEST_MODEL_GROUP=deepseek-v3-mtp \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -336,9 +365,68 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+  # ============================================== MI35x Tests ==============================================
+  # MI35x 2-GPU tests (TP=2) - Reuses nightly-amd suite
+  nightly-test-2-gpu-mi35x:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-2-gpu-mi35x')
+    runs-on: linux-mi35x-gpu-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Test (2-GPU)
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # MI35x 2-GPU VLM tests - Reuses nightly-amd-vlm suite
+  nightly-test-2-gpu-vlm-mi35x:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-2-gpu-vlm-mi35x')
+    runs-on: linux-mi35x-gpu-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Test (2-GPU VLM MMMU)
+        timeout-minutes: 180
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-vlm --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
     needs:
+      # MI325 jobs
       - nightly-test-2-gpu
       - nightly-test-2-gpu-vlm
       - nightly-test-8-gpu-gpt-oss
@@ -350,6 +438,9 @@ jobs:
       - nightly-perf-8-gpu-grok
       - nightly-perf-8-gpu-deepseek-v3
       - nightly-perf-8-gpu-deepseek-v31
+      # MI35x jobs
+      - nightly-test-2-gpu-mi35x
+      - nightly-test-2-gpu-vlm-mi35x
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed

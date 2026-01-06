@@ -1,3 +1,12 @@
+"""
+AMD GSM8K Evaluation Test (Migrated from test/srt/nightly/)
+
+This test evaluates instruction-tuned models on the mgsm_en benchmark using chat completions.
+Models are tested with various TP configurations on AMD GPUs.
+
+Registry: nightly-amd suite (2-GPU tests)
+"""
+
 import json
 import os
 import time
@@ -6,6 +15,7 @@ import warnings
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
@@ -20,6 +30,9 @@ from sglang.test.test_utils import (
     write_github_step_summary,
     write_results_to_json,
 )
+
+# Register for AMD CI - GSM8K evaluation tests (~60 min)
+register_amd_ci(est_time=3600, suite="nightly-amd", nightly=True)
 
 MODEL_SCORE_THRESHOLDS = {
     # Llama 3.1 series
@@ -323,3 +336,4 @@ class TestNightlyGsm8KEval(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
