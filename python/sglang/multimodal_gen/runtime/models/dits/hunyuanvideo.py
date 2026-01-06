@@ -299,7 +299,6 @@ class MMSingleStreamBlock(nn.Module):
         # Fused operations with better naming
         self.input_norm_scale_shift = LayerNormScaleShift(
             hidden_size,
-            norm_type="layer",
             eps=1e-6,
             elementwise_affine=False,
             dtype=dtype,
