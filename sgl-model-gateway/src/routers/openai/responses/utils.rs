@@ -1,3 +1,5 @@
+//! Response patching and transformation utilities for OpenAI responses
+
 use serde_json::{json, Map, Value};
 use tracing::warn;
 
