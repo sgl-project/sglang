@@ -6,6 +6,7 @@ import logging
 import time
 import uuid
 from collections import deque
+from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -22,6 +23,8 @@ import fastapi
 import zmq
 
 from sglang.srt.managers.io_struct import (
+    CheckWeightsReqInput,
+    CheckWeightsReqOutput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
@@ -183,6 +186,9 @@ class TokenizerCommunicatorMixin:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.check_weights_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.slow_down_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -257,6 +263,10 @@ class TokenizerCommunicatorMixin:
                     self.resume_memory_occupation_communicator.handle_recv,
                 ),
                 (
+                    CheckWeightsReqOutput,
+                    self.check_weights_communicator.handle_recv,
+                ),
+                (
                     SlowDownReqOutput,
                     self.slow_down_communicator.handle_recv,
                 ),
@@ -316,6 +326,7 @@ class TokenizerCommunicatorMixin:
         profile_by_stage: bool = False,
         merge_profiles: bool = False,
         profile_prefix: Optional[str] = None,
+        profile_stages: Optional[List[str]] = None,
     ):
         self.auto_create_handle_loop()
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
@@ -336,6 +347,7 @@ class TokenizerCommunicatorMixin:
             profile_id=str(time.time()),
             merge_profiles=merge_profiles,
             profile_prefix=profile_prefix,
+            profile_stages=profile_stages,
         )
         return await self._execute_profile(req)
 
@@ -404,12 +416,17 @@ class TokenizerCommunicatorMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # This means that weight sync
-        # cannot run while requests are in progress.
-        async with self.model_update_lock.writer_lock:
-            results = await self.update_weights_from_distributed_communicator(obj)
-            success, message = _Communicator.merge_results(results)
+        # Immediately update the weights if the engine is in paused state
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
 
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
+        async with lock_context:
+            results = await self.update_weights_from_distributed_communicator(obj)
+
+        success, message = _Communicator.merge_results(results)
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -457,12 +474,17 @@ class TokenizerCommunicatorMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # This means that weight sync
-        # cannot run while requests are in progress.
-        async with self.model_update_lock.writer_lock:
-            result = (await self.update_weights_from_tensor_communicator(obj))[0]
-            success, message = result.success, result.message
+        # Immediately update the weights if the engine is in paused state
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
 
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
+        async with lock_context:
+            results = await self.update_weights_from_tensor_communicator(obj)
+
+        success, message = _Communicator.merge_results(results)
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -656,6 +678,15 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
 
+    async def check_weights(
+        self: TokenizerManager,
+        obj: CheckWeightsReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> CheckWeightsReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.check_weights_communicator(obj)
+        return _Communicator.merge_results(results)
+
     async def slow_down(
         self: TokenizerManager,
         obj: SlowDownReqInput,
@@ -705,44 +736,6 @@ class TokenizerCommunicatorMixin:
         self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
     ):
         await self.send_to_scheduler.send_pyobj(obj)
-
-    def get_log_request_metadata(self):
-        max_length = None
-        skip_names = None
-        out_skip_names = None
-        if self.log_requests:
-            if self.log_requests_level == 0:
-                max_length = 1 << 30
-                skip_names = {
-                    "text",
-                    "input_ids",
-                    "input_embeds",
-                    "image_data",
-                    "audio_data",
-                    "lora_path",
-                    "sampling_params",
-                }
-                out_skip_names = {"text", "output_ids", "embedding"}
-            elif self.log_requests_level == 1:
-                max_length = 1 << 30
-                skip_names = {
-                    "text",
-                    "input_ids",
-                    "input_embeds",
-                    "image_data",
-                    "audio_data",
-                    "lora_path",
-                }
-                out_skip_names = {"text", "output_ids", "embedding"}
-            elif self.log_requests_level == 2:
-                max_length = 2048
-            elif self.log_requests_level == 3:
-                max_length = 1 << 30
-            else:
-                raise ValueError(
-                    f"Invalid --log-requests-level: {self.log_requests_level=}"
-                )
-        return max_length, skip_names, out_skip_names
 
     def _update_weight_version_if_provided(self, weight_version: Optional[str]) -> None:
         """Update weight version if provided."""

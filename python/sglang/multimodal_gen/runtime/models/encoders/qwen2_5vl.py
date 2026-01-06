@@ -1,7 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-from types import SimpleNamespace
-
 from transformers import (
     Cache,
     DynamicCache,
@@ -389,13 +387,6 @@ class Qwen2_5_VLTextModel(nn.Module):
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
 
-        if self.gradient_checkpointing and self.training:
-            if use_cache:
-                logger.warn(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
-
         # torch.jit.trace() doesn't support cache objects in the output
         if use_cache and past_key_values is None and not torch.jit.is_tracing():
             past_key_values = DynamicCache(config=self.config)
@@ -515,13 +506,15 @@ class Qwen2_5_VLModel(nn.Module):
     accepts_loss_kwargs = False
     _no_split_modules = ["Qwen2_5_VLDecoderLayer", "Qwen2_5_VLVisionBlock"]
 
-    def __init__(self, config):
+    def __init__(self, config, enable_image_understanding: bool = False):
         super().__init__()
-        self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(
-            config.vision_config
-        )
         self.language_model = Qwen2_5_VLTextModel(config.text_config)
-        self.visual.to(torch.get_default_dtype())
+
+        if enable_image_understanding:
+            self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(
+                config.vision_config
+            )
+            self.visual.to(torch.get_default_dtype())
         self.rope_deltas = None  # cache rope_deltas here
         self.config = config
         # Initialize weights and apply final processing
@@ -1004,41 +997,6 @@ class Qwen2_5_VLModel(nn.Module):
         return output if return_dict else output.to_tuple()
 
 
-class DotDict(dict):
-    def __init__(self, mapping):
-        super().__init__()
-        for key, value in mapping.items():
-            if isinstance(value, dict):
-                value = DotDict(value)  # 递归转换
-            elif isinstance(value, list):
-                # 如果是 list，且元素是 dict 也递归转换
-                value = [
-                    DotDict(item) if isinstance(item, dict) else item for item in value
-                ]
-            self[key] = value
-
-    def __getattr__(self, item):
-        try:
-            return self[item]
-        except KeyError:
-            raise AttributeError(f"No attribute '{item}'")
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __delattr__(self, key):
-        del self[key]
-
-
-def dict_to_namespace(d):
-    for k, v in d.items():
-        if isinstance(v, dict):
-            d[k] = dict_to_namespace(v)
-        elif isinstance(v, list):
-            d[k] = [dict_to_namespace(i) if isinstance(i, dict) else i for i in v]
-    return SimpleNamespace(**d)
-
-
 class Qwen2_5_VLForConditionalGeneration(TextEncoder):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
@@ -1065,11 +1023,16 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         prefix: str = "",
     ) -> None:
         super().__init__(config)
+        enable_image_understanding = config.enable_image_understanding
         config = config.arch_config
-        self.model = Qwen2_5_VLModel(config)
+        self.model = Qwen2_5_VLModel(
+            config, enable_image_understanding=enable_image_understanding
+        )
         self.lm_head = nn.Linear(
             config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
+
+        self.enable_image_understanding = enable_image_understanding
 
         self.config = config
 
@@ -1164,6 +1127,8 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
 
             name = name.replace("model.", "model.language_model.")
             if "visual." in name:
+                if not self.enable_image_understanding:
+                    continue
                 name = name.replace("visual.", "model.visual.")
             try:
                 # Skip loading extra bias for GPTQ models.
@@ -1171,7 +1136,6 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
                     continue
                 param = params_dict[name]
             except KeyError:
-                print(params_dict.keys())
                 raise
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)

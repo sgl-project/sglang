@@ -11,28 +11,45 @@ import dataclasses
 import importlib
 import os
 import pkgutil
-import re
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.server_args import Backend
 
 from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
     HunyuanConfig,
-    StepVideoT2VConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
     WanT2V720PConfig,
+    ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
+    QwenImageEditPlus_2511_PipelineConfig,
+    QwenImageEditPlusPipelineConfig,
+    QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
+    TurboWanT2V480PConfig,
     Wan2_2_I2V_A14B_Config,
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
@@ -42,8 +59,12 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
-from sglang.multimodal_gen.configs.sample.stepvideo import StepVideoT2VSamplingParams
+from sglang.multimodal_gen.configs.sample.qwenimage import (
+    QwenImage2512SamplingParams,
+    QwenImageEditPlusSamplingParams,
+    QwenImageLayeredSamplingParams,
+    QwenImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
@@ -55,6 +76,7 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -121,42 +143,45 @@ class ConfigInfo:
 _CONFIG_REGISTRY: Dict[str, ConfigInfo] = {}
 
 # Mappings from Hugging Face model paths to our internal model names
-_MODEL_PATH_TO_NAME: Dict[str, str] = {}
+_MODEL_HF_PATH_TO_NAME: Dict[str, str] = {}
 
 # Detectors to identify model families from paths or class names
 _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 
 
 def register_configs(
-    model_name: str,
     sampling_param_cls: Any,
     pipeline_config_cls: Type[PipelineConfig],
-    model_paths: Optional[List[str]] = None,
+    hf_model_paths: Optional[List[str]] = None,
     model_detectors: Optional[List[Callable[[str], bool]]] = None,
 ):
     """
     Registers configuration classes for a new model family.
     """
-    if model_name in _CONFIG_REGISTRY:
-        logger.warning(
-            f"Config for model '{model_name}' is already registered and will be overwritten."
-        )
+    model_id = str(len(_CONFIG_REGISTRY))
 
-    _CONFIG_REGISTRY[model_name] = ConfigInfo(
+    _CONFIG_REGISTRY[model_id] = ConfigInfo(
         sampling_param_cls=sampling_param_cls,
         pipeline_config_cls=pipeline_config_cls,
     )
-    if model_paths:
-        for path in model_paths:
-            if path in _MODEL_PATH_TO_NAME:
+    if hf_model_paths:
+        for path in hf_model_paths:
+            if path in _MODEL_HF_PATH_TO_NAME:
                 logger.warning(
-                    f"Model path '{path}' is already mapped to '{_MODEL_PATH_TO_NAME[path]}' and will be overwritten by '{model_name}'."
+                    f"Model path '{path}' is already mapped to '{_MODEL_HF_PATH_TO_NAME[path]}' and will be overwritten by '{model_id}'."
                 )
-            _MODEL_PATH_TO_NAME[path] = model_name
+            _MODEL_HF_PATH_TO_NAME[path] = model_id
 
     if model_detectors:
         for detector in model_detectors:
-            _MODEL_NAME_DETECTORS.append((model_name, detector))
+            _MODEL_NAME_DETECTORS.append((model_id, detector))
+
+
+def get_model_short_name(model_id: str) -> str:
+    if "/" in model_id:
+        return model_id.split("/")[-1]
+    else:
+        return model_id
 
 
 def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
@@ -164,18 +189,23 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
     Gets the ConfigInfo for a given model path using mappings and detectors.
     """
     # 1. Exact match
-    if model_path in _MODEL_PATH_TO_NAME:
-        model_name = _MODEL_PATH_TO_NAME[model_path]
-        logger.debug(f"Resolved model name '{model_name}' from exact path match.")
-        return _CONFIG_REGISTRY.get(model_name)
+    if model_path in _MODEL_HF_PATH_TO_NAME:
+        model_id = _MODEL_HF_PATH_TO_NAME[model_path]
+        logger.debug(f"Resolved model path '{model_path}' from exact path match.")
+        return _CONFIG_REGISTRY.get(model_id)
 
-    # 2. Partial match: find the best (longest) match against all registered model names.
-    cleaned_model_path = re.sub(r"--", "/", model_path.lower())
-    all_model_names = sorted(_CONFIG_REGISTRY.keys(), key=len, reverse=True)
-    for model_name in all_model_names:
-        if model_name in cleaned_model_path:
-            logger.debug(f"Resolved model name '{model_name}' from partial path match.")
-            return _CONFIG_REGISTRY.get(model_name)
+    # 2. Partial match: find the best (longest) match against all registered model hf paths.
+    model_name = get_model_short_name(model_path.lower())
+    all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
+    for registered_model_hf_id in all_model_hf_paths:
+        registered_model_name = get_model_short_name(registered_model_hf_id.lower())
+
+        if registered_model_name == model_name:
+            logger.debug(
+                f"Resolved model name '{registered_model_hf_id}' from partial path match."
+            )
+            model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
+            return _CONFIG_REGISTRY.get(model_id)
 
     # 3. Use detectors
     if os.path.exists(model_path):
@@ -185,14 +215,23 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
 
     pipeline_name = config.get("_class_name", "").lower()
 
-    for model_name, detector in _MODEL_NAME_DETECTORS:
+    matched_model_names = []
+    for model_id, detector in _MODEL_NAME_DETECTORS:
         if detector(model_path.lower()) or detector(pipeline_name):
             logger.debug(
-                f"Resolved model name '{model_name}' using a registered detector."
+                f"Matched model name '{model_id}' using a registered detector."
             )
-            return _CONFIG_REGISTRY.get(model_name)
+            matched_model_names += [model_id]
 
-    return None
+    if len(matched_model_names) >= 1:
+        if len(matched_model_names) > 1:
+            logger.warning(
+                f"More than one model name is matched, using the first matched"
+            )
+        model_id = matched_model_names[0]
+        return _CONFIG_REGISTRY.get(model_id)
+    else:
+        raise RuntimeError(f"No model info found for model path: {model_path}")
 
 
 # --- Part 3: Main Resolver ---
@@ -210,8 +249,34 @@ class ModelInfo:
     pipeline_config_cls: Type[PipelineConfig]
 
 
+def _get_diffusers_model_info(model_path: str) -> ModelInfo:
+    """
+    Get model info for diffusers backend.
+
+    Returns a ModelInfo with DiffusersPipeline and generic configs.
+    """
+    from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
+        DiffusersGenericPipelineConfig,
+    )
+    from sglang.multimodal_gen.configs.sample.diffusers_generic import (
+        DiffusersGenericSamplingParams,
+    )
+    from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
+        DiffusersPipeline,
+    )
+
+    return ModelInfo(
+        pipeline_cls=DiffusersPipeline,
+        sampling_param_cls=DiffusersGenericSamplingParams,
+        pipeline_config_cls=DiffusersGenericPipelineConfig,
+    )
+
+
 @lru_cache(maxsize=1)
-def get_model_info(model_path: str) -> Optional[ModelInfo]:
+def get_model_info(
+    model_path: str,
+    backend: Optional[Union[str, "Backend"]] = None,
+) -> Optional[ModelInfo]:
     """
     Resolves all necessary classes (pipeline, sampling, config) for a given model path.
 
@@ -220,7 +285,31 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
        '_class_name' against an auto-discovered registry of pipeline implementations.
     2. Resolves the associated configuration classes (for sampling and pipeline) using a
        manually registered mapping based on the model path.
+
+    Args:
+        model_path: Path to the model or HuggingFace model ID
+        backend: Backend to use ('auto', 'sglang', 'diffusers'). If None, uses 'auto'.
+
+    Returns:
+        ModelInfo with the resolved pipeline class and config classes, or None if not found.
     """
+    # import Backend enum here to avoid circular imports
+    from sglang.multimodal_gen.runtime.server_args import Backend
+
+    # Normalize backend
+    if backend is None:
+        backend = Backend.AUTO
+    elif isinstance(backend, str):
+        backend = Backend.from_string(backend)
+
+    # Handle explicit diffusers backend
+    if backend == Backend.DIFFUSERS:
+        logger.info(
+            "Using diffusers backend for model '%s' (explicitly requested)", model_path
+        )
+        return _get_diffusers_model_info(model_path)
+
+    # For AUTO or SGLANG backend, try native implementation first
     # 1. Discover all available pipeline classes and cache them
     _discover_and_register_pipelines()
 
@@ -232,179 +321,225 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
             config = maybe_download_model_index(model_path)
     except Exception as e:
         logger.error(f"Could not read model config for '{model_path}': {e}")
+        if backend == Backend.AUTO:
+            logger.info("Falling back to diffusers backend")
+            return _get_diffusers_model_info(model_path)
         return None
 
     pipeline_class_name = config.get("_class_name")
     if not pipeline_class_name:
         logger.error(f"'_class_name' not found in model_index.json for '{model_path}'")
+        if backend == Backend.AUTO:
+            logger.info("Falling back to diffusers backend")
+            return _get_diffusers_model_info(model_path)
         return None
 
     pipeline_cls = _PIPELINE_REGISTRY.get(pipeline_class_name)
     if not pipeline_cls:
-        logger.error(
-            f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' is not a registered EntryClass in the framework. "
-            f"Available pipelines: {list(_PIPELINE_REGISTRY.keys())}"
-        )
-        return None
+        if backend == Backend.AUTO:
+            logger.warning(
+                f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' has no native sglang support. "
+                f"Falling back to diffusers backend."
+            )
+            return _get_diffusers_model_info(model_path)
+        else:
+            logger.error(
+                f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' is not a registered EntryClass in the framework. "
+                f"Available pipelines: {list(_PIPELINE_REGISTRY.keys())}. "
+                f"Consider using --backend diffusers to use vanilla diffusers pipeline."
+            )
+            return None
 
     # 3. Get configuration classes (sampling, pipeline config)
     config_info = _get_config_info(model_path)
     if not config_info:
-        logger.error(
-            f"Could not resolve configuration for model '{model_path}'. "
-            "It is not a registered model path or detected by any registered model family detectors. "
-            f"Known model paths: {list(_MODEL_PATH_TO_NAME.keys())}"
-        )
-        return None
+        if backend == Backend.AUTO:
+            logger.warning(
+                f"Could not resolve native configuration for model '{model_path}'. "
+                f"Falling back to diffusers backend."
+            )
+            return _get_diffusers_model_info(model_path)
+        else:
+            logger.error(
+                f"Could not resolve configuration for model '{model_path}'. "
+                "It is not a registered model path or detected by any registered model family detectors. "
+                f"Known model paths: {list(_MODEL_HF_PATH_TO_NAME.keys())}. "
+                f"Consider using --backend diffusers to use vanilla diffusers pipeline."
+            )
+            return None
 
     # 4. Combine and return the complete model info
-    return ModelInfo(
+    logger.info("Using native sglang backend for model '%s'", model_path)
+    model_info = ModelInfo(
         pipeline_cls=pipeline_cls,
         sampling_param_cls=config_info.sampling_param_cls,
         pipeline_config_cls=config_info.pipeline_config_cls,
     )
+    logger.info(f"Found model info: {model_info}")
+
+    return model_info
 
 
 # Registration of model configs
 def _register_configs():
     # Hunyuan
     register_configs(
-        model_name="hunyuan",
         sampling_param_cls=HunyuanSamplingParams,
         pipeline_config_cls=HunyuanConfig,
-        model_paths=[
+        hf_model_paths=[
             "hunyuanvideo-community/HunyuanVideo",
         ],
-        model_detectors=[lambda id: "hunyuan" in id.lower()],
+        model_detectors=[lambda hf_id: "hunyuan" in hf_id.lower()],
     )
     register_configs(
-        model_name="fasthunyuan",
         sampling_param_cls=FastHunyuanSamplingParam,
         pipeline_config_cls=FastHunyuanConfig,
-        model_paths=[
+        hf_model_paths=[
             "FastVideo/FastHunyuan-diffusers",
         ],
     )
-
-    # StepVideo
-    register_configs(
-        model_name="stepvideo",
-        sampling_param_cls=StepVideoT2VSamplingParams,
-        pipeline_config_cls=StepVideoT2VConfig,
-        model_paths=[
-            "FastVideo/stepvideo-t2v-diffusers",
-        ],
-        model_detectors=[lambda id: "stepvideo" in id.lower()],
-    )
-
     # Wan
     register_configs(
-        model_name="wan-t2v-1.3b",
         sampling_param_cls=WanT2V_1_3B_SamplingParams,
         pipeline_config_cls=WanT2V480PConfig,
-        model_paths=[
+        hf_model_paths=[
             "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         ],
-        model_detectors=[lambda id: "wanpipeline" in id.lower()],
+        model_detectors=[lambda hf_id: "wanpipeline" in hf_id.lower()],
     )
     register_configs(
-        model_name="wan-t2v-14b",
+        sampling_param_cls=WanT2V_1_3B_SamplingParams,
+        pipeline_config_cls=TurboWanT2V480PConfig,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+        ],
+    )
+    register_configs(
         sampling_param_cls=WanT2V_14B_SamplingParams,
         pipeline_config_cls=WanT2V720PConfig,
-        model_paths=[
+        hf_model_paths=[
             "Wan-AI/Wan2.1-T2V-14B-Diffusers",
         ],
     )
     register_configs(
-        model_name="wan-i2v-14b-480p",
-        sampling_param_cls=WanI2V_14B_480P_SamplingParam,
-        pipeline_config_cls=WanI2V480PConfig,
-        model_paths=[
-            "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        sampling_param_cls=WanT2V_14B_SamplingParams,
+        pipeline_config_cls=TurboWanT2V480PConfig,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.1-T2V-14B-Diffusers",
         ],
-        model_detectors=[lambda id: "wanimagetovideo" in id.lower()],
     )
     register_configs(
-        model_name="wan-i2v-14b-720p",
+        sampling_param_cls=WanI2V_14B_480P_SamplingParam,
+        pipeline_config_cls=WanI2V480PConfig,
+        hf_model_paths=[
+            "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        ],
+        model_detectors=[lambda hf_id: "wanimagetovideo" in hf_id.lower()],
+    )
+    register_configs(
         sampling_param_cls=WanI2V_14B_720P_SamplingParam,
         pipeline_config_cls=WanI2V720PConfig,
-        model_paths=[
+        hf_model_paths=[
             "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
         ],
     )
     register_configs(
-        model_name="wan-fun-1.3b-inp",
         sampling_param_cls=Wan2_1_Fun_1_3B_InP_SamplingParams,
         pipeline_config_cls=WanI2V480PConfig,
-        model_paths=[
+        hf_model_paths=[
             "weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers",
         ],
     )
     register_configs(
-        model_name="wan-ti2v-5b",
         sampling_param_cls=Wan2_2_TI2V_5B_SamplingParam,
         pipeline_config_cls=Wan2_2_TI2V_5B_Config,
-        model_paths=[
+        hf_model_paths=[
             "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
         ],
     )
-
     register_configs(
-        model_name="fastwan-ti2v-5b",
         sampling_param_cls=Wan2_2_TI2V_5B_SamplingParam,
         pipeline_config_cls=FastWan2_2_TI2V_5B_Config,
-        model_paths=[
+        hf_model_paths=[
             "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
             "FastVideo/FastWan2.2-TI2V-5B-Diffusers",
         ],
     )
-
     register_configs(
-        model_name="wan-t2v-a14b",
         sampling_param_cls=Wan2_2_T2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_T2V_A14B_Config,
-        model_paths=[
-            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-        ],
+        hf_model_paths=["Wan-AI/Wan2.2-T2V-A14B-Diffusers"],
     )
     register_configs(
-        model_name="wan-i2v-a14b",
         sampling_param_cls=Wan2_2_I2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_I2V_A14B_Config,
-        model_paths=[
-            "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        ],
+        hf_model_paths=["Wan-AI/Wan2.2-I2V-A14B-Diffusers"],
     )
     register_configs(
-        model_name="fast-wan-t2v-1.3b",
         sampling_param_cls=FastWanT2V480PConfig,
         pipeline_config_cls=FastWan2_1_T2V_480P_Config,
-        model_paths=[
+        hf_model_paths=[
             "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
         ],
     )
-
     # FLUX
     register_configs(
-        model_name="flux",
         sampling_param_cls=FluxSamplingParams,
         pipeline_config_cls=FluxPipelineConfig,
-        model_paths=[
+        hf_model_paths=[
             "black-forest-labs/FLUX.1-dev",
         ],
-        model_detectors=[lambda id: "flux" in id.lower()],
+        model_detectors=[lambda hf_id: "flux.1" in hf_id.lower()],
     )
-
+    register_configs(
+        sampling_param_cls=FluxSamplingParams,
+        pipeline_config_cls=Flux2PipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-dev",
+        ],
+        model_detectors=[lambda hf_id: "flux.2" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=ZImageSamplingParams,
+        pipeline_config_cls=ZImagePipelineConfig,
+        hf_model_paths=[
+            "Tongyi-MAI/Z-Image-Turbo",
+        ],
+        model_detectors=[lambda hf_id: "z-image" in hf_id.lower()],
+    )
     # Qwen-Image
     register_configs(
-        model_name="qwen-image",
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image"],
     )
     register_configs(
-        model_name="qwen-image-edit",
+        sampling_param_cls=QwenImage2512SamplingParams,
+        pipeline_config_cls=QwenImagePipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-2512"],
+    )
+    register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Edit"],
+    )
+
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
+    )
+
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlus_2511_PipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
+    )
+
+    register_configs(
+        sampling_param_cls=QwenImageLayeredSamplingParams,
+        pipeline_config_cls=QwenImageLayeredPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Layered"],
     )
 
 

@@ -379,6 +379,7 @@ class Olmo2ForCausalLM(nn.Module):
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

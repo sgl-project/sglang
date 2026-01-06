@@ -5,11 +5,12 @@
 
 import argparse
 import dataclasses
+import json
 import os
 from typing import cast
 
 from sglang.multimodal_gen import DiffGenerator
-from sglang.multimodal_gen.configs.sample.base import (
+from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
@@ -19,6 +20,10 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    PerformanceLogger,
+    RequestTimings,
+)
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
@@ -33,6 +38,13 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
         required=False,
         help="Read CLI options from a config JSON or YAML file. If provided, --model-path and --prompt are optional.",
     )
+    parser.add_argument(
+        "--perf-dump-path",
+        type=str,
+        default=None,
+        required=False,
+        help="Path to dump the performance metrics (JSON) for the run.",
+    )
 
     parser = ServerArgs.add_cli_args(parser)
     parser = SamplingParams.add_cli_args(parser)
@@ -46,19 +58,69 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
     return parser
 
 
-def generate_cmd(args: argparse.Namespace):
-    """The entry point for the generate command."""
-    # FIXME(mick): do not hard code
-    args.request_id = generate_request_id()
+def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, results):
+    """dump performance if necessary"""
+    if not (args.perf_dump_path and results):
+        return
 
-    server_args = ServerArgs.from_cli_args(args)
-    sampling_params = SamplingParams.from_cli_args(args)
-    sampling_params.request_id = generate_request_id()
-    generator = DiffGenerator.from_pretrained(
-        model_path=server_args.model_path, server_args=server_args
+    if isinstance(results, list):
+        result = results[0] if results else {}
+    else:
+        result = results
+
+    timings_dict = result.get("timings")
+    if not (args.perf_dump_path and timings_dict):
+        return
+
+    timings = RequestTimings(request_id=timings_dict.get("request_id"))
+    timings.stages = timings_dict.get("stages", {})
+    timings.steps = timings_dict.get("steps", [])
+    timings.total_duration_ms = timings_dict.get("total_duration_ms", 0)
+
+    PerformanceLogger.dump_benchmark_report(
+        file_path=args.perf_dump_path,
+        timings=timings,
+        meta={
+            "prompt": prompt,
+            "model": server_args.model_path,
+        },
+        tag="cli_generate",
     )
 
-    generator.generate(prompt=sampling_params.prompt, sampling_params=sampling_params)
+
+def generate_cmd(args: argparse.Namespace):
+    """The entry point for the generate command."""
+    args.request_id = "mocked_fake_id_for_offline_generate"
+
+    server_args = ServerArgs.from_cli_args(args)
+
+    sampling_params_kwargs = SamplingParams.get_cli_args(args)
+    sampling_params_kwargs["request_id"] = generate_request_id()
+
+    # Handle diffusers-specific kwargs passed via CLI
+    if hasattr(args, "diffusers_kwargs") and args.diffusers_kwargs:
+        try:
+            sampling_params_kwargs["diffusers_kwargs"] = json.loads(
+                args.diffusers_kwargs
+            )
+            logger.info(
+                "Parsed diffusers_kwargs: %s",
+                sampling_params_kwargs["diffusers_kwargs"],
+            )
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse --diffusers-kwargs as JSON: %s", e)
+            raise ValueError(
+                f"--diffusers-kwargs must be valid JSON. Got: {args.diffusers_kwargs}"
+            ) from e
+
+    generator = DiffGenerator.from_pretrained(
+        model_path=server_args.model_path, server_args=server_args, local_mode=True
+    )
+
+    results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
+
+    prompt = sampling_params_kwargs.get("prompt")
+    maybe_dump_performance(args, server_args, prompt, results)
 
 
 class GenerateSubcommand(CLISubcommand):

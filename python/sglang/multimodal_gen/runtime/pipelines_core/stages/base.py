@@ -8,20 +8,19 @@ This module defines the abstract base classes for pipeline stages that can be
 composed to create complete diffusion pipelines.
 """
 
-import time
-import traceback
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 
 import torch
 
-import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 logger = init_logger(__name__)
 
@@ -94,6 +93,21 @@ class PipelineStage(ABC):
         # Default implementation - no verification
         return VerificationResult()
 
+    def maybe_free_model_hooks(self):
+        pass
+
+    def load_model(self):
+        """
+        Load the model for the stage.
+        """
+        pass
+
+    def offload_model(self):
+        """
+        Offload the model for the stage.
+        """
+        pass
+
     # execute on all ranks by default
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -146,7 +160,9 @@ class PipelineStage(ABC):
     @property
     def device(self) -> torch.device:
         """Get the device for this stage."""
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(
+            current_platform.device_type,
+        )
 
     def set_logging(self, enable: bool):
         """
@@ -175,77 +191,32 @@ class PipelineStage(ABC):
         """
         stage_name = self.__class__.__name__
         # Check if verification is enabled (simple approach for prototype)
-        enable_verification = getattr(server_args, "enable_stage_verification", False)
 
-        if enable_verification:
-            # Pre-execution input verification
-            try:
-                input_result = self.verify_input(batch, server_args)
-                self._run_verification(input_result, stage_name, "input")
-            except Exception as e:
-                logger.error("Input verification failed for %s: %s", stage_name, str(e))
-                raise
+        # Pre-execution input verification
+        try:
+            input_result = self.verify_input(batch, server_args)
+            self._run_verification(input_result, stage_name, "input")
+        except Exception as e:
+            logger.error("Input verification failed for %s: %s", stage_name, str(e))
+            raise
 
-        # Execute the actual stage logic
-        logging_info = getattr(batch, "logging_info", None)
-
-        if envs.SGLANG_DIFFUSION_STAGE_LOGGING:
-            logger.info("[%s] Starting execution", stage_name)
-            start_time = time.perf_counter()
-
-            try:
-                result = self.forward(batch, server_args)
-                execution_time = time.perf_counter() - start_time
-                logger.info(
-                    "[%s] Execution completed in %s ms",
-                    stage_name,
-                    execution_time * 1000,
-                )
-                if logging_info is not None:
-                    try:
-                        logging_info.add_stage_execution_time(
-                            stage_name, execution_time
-                        )
-                    except Exception:
-                        logger.warning(
-                            "[%s] Failed to record stage timing on batch.logging_info",
-                            stage_name,
-                            exc_info=True,
-                        )
-                perf_logger = getattr(batch, "perf_logger", None)
-                if perf_logger is not None:
-                    try:
-                        perf_logger.log_stage_metric(stage_name, execution_time * 1000)
-                    except Exception:
-                        logger.warning(
-                            "[%s] Failed to log stage metric to performance logger",
-                            stage_name,
-                            exc_info=True,
-                        )
-            except Exception as e:
-                execution_time = time.perf_counter() - start_time
-                logger.error(
-                    "[%s] Error during execution after %s ms: %s",
-                    stage_name,
-                    execution_time * 1000,
-                    e,
-                )
-                logger.error("[%s] Traceback: %s", stage_name, traceback.format_exc())
-                raise
-        else:
-            # Direct execution (current behavior)
+        # Execute the actual stage logic with unified profiling
+        with StageProfiler(
+            stage_name,
+            logger=logger,
+            timings=batch.timings,
+            perf_dump_path_provided=batch.perf_dump_path is not None,
+            log_stage_start_end=not batch.is_warmup,
+        ):
             result = self.forward(batch, server_args)
 
-        if enable_verification:
-            # Post-execution output verification
-            try:
-                output_result = self.verify_output(result, server_args)
-                self._run_verification(output_result, stage_name, "output")
-            except Exception as e:
-                logger.error(
-                    "Output verification failed for %s: %s", stage_name, str(e)
-                )
-                raise
+        # Post-execution output verification
+        try:
+            output_result = self.verify_output(result, server_args)
+            self._run_verification(output_result, stage_name, "output")
+        except Exception as e:
+            logger.error("Output verification failed for %s: %s", stage_name, str(e))
+            raise
 
         return result
 
