@@ -487,7 +487,7 @@ class _NormScaleShift(nn.Module):
         else:
             raise NotImplementedError(f"Norm type {norm_type} not implemented")
 
-    def _get_arg(
+    def _get_scale_shift_args(
         self,
         t: torch.Tensor,
         x: torch.Tensor,
@@ -534,8 +534,8 @@ class _NormScaleShift(nn.Module):
                         "Only 2D scale/shift are supported by the no_affine kernel. "
                     )
 
-                scale_arg = self._get_arg(scale, x, B, L, C, M)
-                shift_arg = self._get_arg(shift, x, B, L, C, M)
+                scale_arg = self._get_scale_shift_args(scale, x, B, L, C, M)
+                shift_arg = self._get_scale_shift_args(shift, x, B, L, C, M)
 
                 y_2d = fused_norm_scale_shift(
                     x_2d, None, None, scale_arg, shift_arg, self.norm_type, self.eps
@@ -550,8 +550,8 @@ class _NormScaleShift(nn.Module):
                     dtype=x.dtype, device=x.device
                 )
 
-            scale_arg = self._get_arg(scale, x, B, L, C, M)
-            shift_arg = self._get_arg(shift, x, B, L, C, M)
+            scale_arg = self._get_scale_shift_args(scale, x, B, L, C, M)
+            shift_arg = self._get_scale_shift_args(shift, x, B, L, C, M)
 
             y_2d = fused_norm_scale_shift(
                 x_2d,
