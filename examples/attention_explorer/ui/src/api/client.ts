@@ -101,6 +101,7 @@ export class AttentionStreamClient {
 
     const buffer = new StreamBuffer();
     let tokenIndex = 0;
+    let sseBuffer = '';  // Buffer for incomplete SSE data
 
     try {
       while (true) {
@@ -108,7 +109,11 @@ export class AttentionStreamClient {
         if (done) break;
 
         const text = decoder.decode(value, { stream: true });
-        const events = parseSSEEvents(text);
+        sseBuffer += text;
+
+        // Parse complete SSE events from buffer
+        const { events, remaining } = parseSSEEventsWithBuffer(sseBuffer);
+        sseBuffer = remaining;
 
         for (const event of events) {
           if (event === '[DONE]') {
@@ -146,6 +151,15 @@ export class AttentionStreamClient {
               }
             }
 
+            // Handle attention_tokens in delta (newer server versions)
+            const deltaAny = delta as any;
+            if (deltaAny?.attention_tokens) {
+              for (const attn of deltaAny.attention_tokens) {
+                buffer.attention.push(attn);
+                this.config.onAttention?.(attn, buffer.attention.length - 1);
+              }
+            }
+
             if (chunk.moe_routing_step) {
               buffer.moe.push(chunk.moe_routing_step);
               this.config.onMoE?.(chunk.moe_routing_step, buffer.moe.length - 1);
@@ -155,7 +169,10 @@ export class AttentionStreamClient {
               buffer.finishReason = chunk.choices[0].finish_reason;
             }
           } catch (e) {
-            console.warn('Failed to parse SSE event:', event, e);
+            // Only warn if it looks like a real parse error (not empty/partial data)
+            if (event.length > 10) {
+              console.warn('Failed to parse SSE event:', event.slice(0, 100) + '...', e);
+            }
           }
         }
       }
@@ -202,20 +219,37 @@ class StreamBuffer {
 // SSE PARSING
 // ============================================================================
 
-function parseSSEEvents(text: string): string[] {
-  const events: string[] = [];
-  const lines = text.split('\n');
+interface SSEParseResult {
+  events: string[];
+  remaining: string;
+}
 
-  for (const line of lines) {
-    if (line.startsWith('data: ')) {
-      const data = line.slice(6).trim();
-      if (data) {
-        events.push(data);
+/**
+ * Parse SSE events from a buffer, handling incomplete data that spans chunks.
+ * SSE format: "data: {...}\n\n" - events are separated by double newlines.
+ */
+function parseSSEEventsWithBuffer(buffer: string): SSEParseResult {
+  const events: string[] = [];
+
+  // Split by double newline (SSE event separator)
+  const parts = buffer.split('\n\n');
+
+  // Last part might be incomplete - keep it in buffer
+  const remaining = parts.pop() || '';
+
+  for (const part of parts) {
+    const lines = part.split('\n');
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        const data = line.slice(6).trim();
+        if (data) {
+          events.push(data);
+        }
       }
     }
   }
 
-  return events;
+  return { events, remaining };
 }
 
 // ============================================================================
