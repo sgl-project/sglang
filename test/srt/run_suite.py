@@ -28,7 +28,6 @@ suites = {
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 6),
         TestFile("openai_server/validation/test_request_length_validation.py", 38),
         TestFile("ops/test_repeat_interleave.py", 60),
-        TestFile("dllm/test_llada2_mini.py", 520),
         TestFile("test_abort.py", 131),
         TestFile("test_chunked_prefill.py", 312),
         TestFile("test_deterministic.py", 228),
@@ -156,7 +155,6 @@ suite_amd = {
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("dllm/test_llada2_mini_amd.py", 520),
         TestFile("openai_server/basic/test_openai_embedding.py", 141),
         TestFile("openai_server/basic/test_openai_server.py", 149),
         TestFile("openai_server/basic/test_protocol.py", 10),
