@@ -1834,25 +1834,16 @@ def sample_generated_shared_prefix_requests(
             range(prompts_per_group), desc="Generating questions", leave=False
         ):
             flat_index = group_idx * prompts_per_group + prompt_idx
-            if num_turns == 1:
-                question = questions[flat_index]
-                full_prompt = f"{system_prompt}\n\n{question}"
-                prompt_len = (
-                    1
-                    if getattr(args, "gsp_fast_prepare", False)
-                    else len(tokenizer.encode(full_prompt))
-                )
-            else:
-                turn_questions = []
-                for turn_idx in range(num_turns):
-                    q_idx = flat_index * num_turns + turn_idx
-                    turn_questions.append(questions[q_idx])
-                full_prompt = [f"{system_prompt}\n\n{q}" for q in turn_questions]
-                prompt_len = (
-                    1
-                    if getattr(args, "gsp_fast_prepare", False)
-                    else len(tokenizer.encode(full_prompt[0]))
-                )
+            turn_questions = [
+                questions[flat_index * num_turns + t] for t in range(num_turns)
+            ]
+            turn_prompts = [f"{system_prompt}\n\n{q}" for q in turn_questions]
+            full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
+            prompt_len = (
+                1
+                if getattr(args, "gsp_fast_prepare", False)
+                else len(tokenizer.encode(turn_prompts[0]))
+            )
 
             input_requests.append(
                 DatasetRow(
