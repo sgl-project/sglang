@@ -1074,6 +1074,10 @@ class Scheduler(
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
+                (
+                    LoadLoRAAdapterFromTensorsReqInput,
+                    self.load_lora_adapter_from_tensors,
+                ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
                 (PauseGenerationReqInput, self.pause_generation),
