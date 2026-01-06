@@ -172,3 +172,149 @@ mod manual_routing_tests {
         ctx.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod manual_min_group_tests {
+    use super::*;
+
+    /// Test that min_group mode handles multiple routing keys successfully
+    #[tokio::test]
+    async fn test_min_group_handles_multiple_routing_keys() {
+        let config = TestRouterConfig::manual_min_group(3710);
+
+        let ctx =
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19710, 3))
+                .await;
+
+        let app = ctx.create_app().await;
+        let mut success_count = 0;
+
+        for i in 0..9 {
+            let routing_key = format!("paper-{}", i);
+
+            let payload = json!({
+                "text": format!("Request for {}", routing_key),
+                "stream": false
+            });
+
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .header(ROUTING_KEY_HEADER, &routing_key)
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            if resp.status() == StatusCode::OK {
+                success_count += 1;
+            }
+        }
+
+        assert_eq!(
+            success_count, 9,
+            "All requests should succeed with min_group mode"
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// Test that min_group still maintains sticky sessions after assignment
+    #[tokio::test]
+    async fn test_min_group_sticky_routing() {
+        let config = TestRouterConfig::manual_min_group(3711);
+
+        let ctx =
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19713, 2))
+                .await;
+
+        let app = ctx.create_app().await;
+        let mut success_count = 0;
+
+        let routing_key = "sticky-paper-123";
+
+        for i in 0..5 {
+            let payload = json!({
+                "text": format!("Request {} for sticky paper", i),
+                "stream": false
+            });
+
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .header(ROUTING_KEY_HEADER, routing_key)
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            if resp.status() == StatusCode::OK {
+                success_count += 1;
+            }
+        }
+
+        assert_eq!(
+            success_count, 5,
+            "All requests with same routing key should succeed"
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// Test min_group with mixed routing keys
+    #[tokio::test]
+    async fn test_min_group_mixed_routing_keys() {
+        let config = TestRouterConfig::manual_min_group(3712);
+
+        let ctx =
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19716, 2))
+                .await;
+
+        let app = ctx.create_app().await;
+        let mut success_count = 0;
+
+        for i in 0..3 {
+            let routing_key = format!("preload-paper-{}", i);
+            let payload = json!({
+                "text": "Preload request",
+                "stream": false
+            });
+
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .header(ROUTING_KEY_HEADER, &routing_key)
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            if resp.status() == StatusCode::OK {
+                success_count += 1;
+            }
+        }
+
+        let new_routing_key = "new-paper-after-preload";
+        let payload = json!({
+            "text": "New paper request",
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .header(ROUTING_KEY_HEADER, new_routing_key)
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        if resp.status() == StatusCode::OK {
+            success_count += 1;
+        }
+
+        assert_eq!(success_count, 4, "All requests should succeed");
+
+        ctx.shutdown().await;
+    }
+}
