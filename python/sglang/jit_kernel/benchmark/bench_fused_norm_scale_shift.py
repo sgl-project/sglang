@@ -10,9 +10,9 @@ from typing import List, Tuple
 
 import torch
 
-from sglang.jit_kernel.diffusion.fused_norm_scale_shift import fused_norm_scale_shift
-from sglang.jit_kernel.diffusion.fused_scale_residual_norm_scale_shift import (
-    fused_scale_residual_norm_scale_shift,
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    _NormScaleShift,
+    _ScaleResidualNormScaleShift,
 )
 
 # CI environment detection
@@ -22,143 +22,10 @@ IS_CI = (
 )
 
 
-# ========== fused_norm_scale_shift ==========
-def fused_norm_scale_shift_naive(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    scale: torch.Tensor,
-    shift: torch.Tensor,
-    norm_type: str,
-    eps: float = 1e-5,
-):
-    dtype = x.dtype
-    x32 = x.float()
-    w32 = weight.float()
-    b32 = bias.float()
-    s32 = scale.float()
-    sh32 = shift.float()
-
-    if norm_type == "layer":
-        mean = x32.mean(dim=1, keepdim=True)
-        var = (x32 - mean).pow(2).mean(dim=1, keepdim=True)
-        inv_std = (var + eps).sqrt().reciprocal()
-        y_ln32 = (x32 - mean) * inv_std
-        y_ln32 = y_ln32 * w32 + b32
-    elif norm_type == "rms":
-        mean_sq = (x32 * x32).mean(dim=1, keepdim=True)
-        inv_std = (mean_sq + eps).sqrt().reciprocal()
-        y_ln32 = x32 * inv_std
-        y_ln32 = y_ln32 * w32
-    y_out = (y_ln32 * (1.0 + s32) + sh32).to(dtype)
-    return y_out
-
-
-def fused_norm_scale_shift_sglang(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    scale: torch.Tensor,
-    shift: torch.Tensor,
-    norm_type: str,
-    eps: float = 1e-5,
-):
-    return fused_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps)
-
-
-# ========== fused_norm_scale_shift_no_affine ==========
-def fused_norm_scale_shift_no_affine_naive(
-    x: torch.Tensor,
-    scale: torch.Tensor,
-    shift: torch.Tensor,
-    norm_type: str,
-    eps: float = 1e-5,
-):
-    dtype = x.dtype
-    x32 = x.float()
-    s32 = scale.float()
-    sh32 = shift.float()
-
-    if norm_type == "layer":
-        mean = x32.mean(dim=1, keepdim=True)
-        var = (x32 - mean).pow(2).mean(dim=1, keepdim=True)
-        inv_std = (var + eps).sqrt().reciprocal()
-        y_ln32 = (x32 - mean) * inv_std
-    else:
-        mean_sq = (x32 * x32).mean(dim=1, keepdim=True)
-        inv_std = (mean_sq + eps).sqrt().reciprocal()
-        y_ln32 = x32 * inv_std
-    y_out = (y_ln32 * (1.0 + s32) + sh32).to(dtype)
-    return y_out
-
-
-def fused_norm_scale_shift_no_affine_sglang(
-    x: torch.Tensor,
-    scale: torch.Tensor,
-    shift: torch.Tensor,
-    norm_type: str,
-    eps: float = 1e-5,
-):
-    return fused_norm_scale_shift(x, None, None, scale, shift, norm_type, eps)
-
-
-# ========== fused_scale_residual_norm_scale_shift ==========
-def fused_scale_residual_norm_scale_shift_naive(
-    residual: torch.Tensor,
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    scale: torch.Tensor,
-    shift: torch.Tensor,
-    norm_type: str,
-    eps: float = 1e-5,
-):
-    dtype = x.dtype
-    # Residual connection with gate
-    res32 = residual.float() + x.float() * gate.float()
-    residual_out = res32.to(dtype)
-
-    # LayerNorm / RMSNorm
-    w32 = weight.float()
-    b32 = bias.float()
-    s32 = scale.float()
-    sh32 = shift.float()
-
-    if norm_type == "layer":
-        mean = res32.mean(dim=1, keepdim=True)
-        var = (res32 - mean).pow(2).mean(dim=1, keepdim=True)
-        inv_std = (var + eps).sqrt().reciprocal()
-        y_ln32 = (res32 - mean) * inv_std
-        y_ln32 = y_ln32 * w32 + b32
-    else:
-        mean_sq = (res32 * res32).mean(dim=1, keepdim=True)
-        inv_std = (mean_sq + eps).sqrt().reciprocal()
-        y_ln32 = res32 * inv_std
-        y_ln32 = y_ln32 * w32
-    y_out = (y_ln32 * (1.0 + s32) + sh32).to(dtype)
-    return y_out, residual_out
-
-
-def fused_scale_residual_norm_scale_shift_sglang(
-    residual: torch.Tensor,
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    scale: torch.Tensor,
-    shift: torch.Tensor,
-    norm_type: str,
-    eps: float = 1e-5,
-):
-    return fused_scale_residual_norm_scale_shift(
-        residual, x, gate, weight, bias, scale, shift, norm_type, eps
-    )
-
-
 def bench_fused_norm_scale_shift(
-    M: int,
-    N: int,
+    B: int,
+    L: int,
+    C: int,
     norm_type: str,
     num_warmup: int,
     num_run: int,
@@ -167,21 +34,20 @@ def bench_fused_norm_scale_shift(
     dtype = torch.bfloat16
     eps = 1e-5
 
-    x = torch.randn(M, N, dtype=dtype, device=device)
-    weight = torch.randn(N, dtype=dtype, device=device)
-    bias = torch.randn(N, dtype=dtype, device=device)
-    scale = torch.randn(M, N, dtype=dtype, device=device)
-    shift = torch.randn(M, N, dtype=dtype, device=device)
-
-    def run_naive():
-        fused_norm_scale_shift_naive(x, weight, bias, scale, shift, norm_type, eps)
-
-    def run_sglang():
-        fused_norm_scale_shift_sglang(x, weight, bias, scale, shift, norm_type, eps)
+    x = torch.randn(B, L, C, dtype=dtype, device=device)
+    weight = torch.randn(C, dtype=dtype, device=device)
+    bias = torch.randn(C, dtype=dtype, device=device)
+    scale = torch.randn(B, L, C, dtype=dtype, device=device)
+    shift = torch.randn(B, L, C, dtype=dtype, device=device)
+    layer = _NormScaleShift(C, norm_type, eps=eps, elementwise_affine=True, dtype=dtype)
+    with torch.no_grad():
+        layer.norm.weight.copy_(weight)
+        if norm_type == "layer":
+            layer.norm.bias.copy_(bias)
 
     # warmup
     for _ in range(num_warmup):
-        run_naive()
+        layer.forward_native(x, shift, scale)
     torch.cuda.synchronize()
 
     # run naive
@@ -189,7 +55,7 @@ def bench_fused_norm_scale_shift(
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
     for _ in range(num_run):
-        run_naive()
+        layer.forward_native(x, shift, scale)
     end_event.record()
     end_event.synchronize()
     torch.cuda.synchronize()
@@ -197,7 +63,7 @@ def bench_fused_norm_scale_shift(
 
     # warmup
     for _ in range(num_warmup):
-        run_sglang()
+        layer.forward_cuda(x, shift, scale)
     torch.cuda.synchronize()
 
     # run sglang
@@ -205,7 +71,7 @@ def bench_fused_norm_scale_shift(
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
     for _ in range(num_run):
-        run_sglang()
+        layer.forward_cuda(x, shift, scale)
     end_event.record()
     end_event.synchronize()
     torch.cuda.synchronize()
@@ -215,8 +81,9 @@ def bench_fused_norm_scale_shift(
 
 
 def bench_fused_norm_scale_shift_no_affine(
-    M: int,
-    N: int,
+    B: int,
+    L: int,
+    C: int,
     norm_type: str,
     num_warmup: int,
     num_run: int,
@@ -225,19 +92,17 @@ def bench_fused_norm_scale_shift_no_affine(
     dtype = torch.bfloat16
     eps = 1e-5
 
-    x = torch.randn(M, N, dtype=dtype, device=device)
-    scale = torch.randn(M, N, dtype=dtype, device=device)
-    shift = torch.randn(M, N, dtype=dtype, device=device)
+    x = torch.randn(B, L, C, dtype=dtype, device=device)
+    scale = torch.randn(B, L, C, dtype=dtype, device=device)
+    shift = torch.randn(B, L, C, dtype=dtype, device=device)
 
-    def run_naive():
-        fused_norm_scale_shift_no_affine_naive(x, scale, shift, norm_type, eps)
-
-    def run_sglang():
-        fused_norm_scale_shift_no_affine_sglang(x, scale, shift, norm_type, eps)
+    layer = _NormScaleShift(
+        C, norm_type, eps=eps, elementwise_affine=False, dtype=dtype
+    )
 
     # warmup
     for _ in range(num_warmup):
-        run_naive()
+        layer.forward_native(x, shift, scale)
     torch.cuda.synchronize()
 
     # run naive
@@ -245,7 +110,7 @@ def bench_fused_norm_scale_shift_no_affine(
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
     for _ in range(num_run):
-        run_naive()
+        layer.forward_native(x, shift, scale)
     end_event.record()
     end_event.synchronize()
     torch.cuda.synchronize()
@@ -253,7 +118,7 @@ def bench_fused_norm_scale_shift_no_affine(
 
     # warmup
     for _ in range(num_warmup):
-        run_sglang()
+        layer.forward_cuda(x, shift, scale)
     torch.cuda.synchronize()
 
     # run sglang
@@ -261,7 +126,7 @@ def bench_fused_norm_scale_shift_no_affine(
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
     for _ in range(num_run):
-        run_sglang()
+        layer.forward_cuda(x, shift, scale)
     end_event.record()
     end_event.synchronize()
     torch.cuda.synchronize()
@@ -271,8 +136,9 @@ def bench_fused_norm_scale_shift_no_affine(
 
 
 def bench_fused_scale_residual_norm_scale_shift(
-    M: int,
-    N: int,
+    B: int,
+    L: int,
+    C: int,
     norm_type: str,
     num_warmup: int,
     num_run: int,
@@ -281,27 +147,23 @@ def bench_fused_scale_residual_norm_scale_shift(
     dtype = torch.bfloat16
     eps = 1e-5
 
-    residual = torch.randn(M, N, dtype=dtype, device=device)
-    x = torch.randn(M, N, dtype=dtype, device=device)
-    weight = torch.randn(N, dtype=dtype, device=device)
-    bias = torch.randn(N, dtype=dtype, device=device)
-    scale = torch.randn(M, N, dtype=dtype, device=device)
-    shift = torch.randn(M, N, dtype=dtype, device=device)
-    gate = torch.randn(M, N, dtype=dtype, device=device)
-
-    def run_naive():
-        fused_scale_residual_norm_scale_shift_naive(
-            residual, x, gate, weight, bias, scale, shift, norm_type, eps
-        )
-
-    def run_sglang():
-        fused_scale_residual_norm_scale_shift_sglang(
-            residual, x, gate, weight, bias, scale, shift, norm_type, eps
-        )
-
+    residual = torch.randn(B, L, C, dtype=dtype, device=device)
+    x = torch.randn(B, L, C, dtype=dtype, device=device)
+    weight = torch.randn(C, dtype=dtype, device=device)
+    bias = torch.randn(C, dtype=dtype, device=device)
+    scale = torch.randn(B, L, C, dtype=dtype, device=device)
+    shift = torch.randn(B, L, C, dtype=dtype, device=device)
+    gate = torch.randn(B, 1, C, dtype=dtype, device=device)
+    layer = _ScaleResidualNormScaleShift(
+        C, norm_type, eps=eps, elementwise_affine=True, dtype=dtype
+    )
+    with torch.no_grad():
+        layer.norm.weight.copy_(weight)
+        if norm_type == "layer":
+            layer.norm.bias.copy_(bias)
     # warmup
     for _ in range(num_warmup):
-        run_naive()
+        layer.forward_native(residual, x, gate, shift, scale)
     torch.cuda.synchronize()
 
     # run naive
@@ -309,7 +171,7 @@ def bench_fused_scale_residual_norm_scale_shift(
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
     for _ in range(num_run):
-        run_naive()
+        layer.forward_native(residual, x, gate, shift, scale)
     end_event.record()
     end_event.synchronize()
     torch.cuda.synchronize()
@@ -317,7 +179,7 @@ def bench_fused_scale_residual_norm_scale_shift(
 
     # warmup
     for _ in range(num_warmup):
-        run_sglang()
+        layer.forward_cuda(residual, x, gate, shift, scale)
     torch.cuda.synchronize()
 
     # run sglang
@@ -325,7 +187,7 @@ def bench_fused_scale_residual_norm_scale_shift(
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
     for _ in range(num_run):
-        run_sglang()
+        layer.forward_cuda(residual, x, gate, shift, scale)
     end_event.record()
     end_event.synchronize()
     torch.cuda.synchronize()
@@ -343,8 +205,9 @@ benchmark_kernels = {
 
 @dataclass
 class ShapeArg:
-    M: int
-    N: int
+    B: int
+    L: int
+    C: int
 
 
 def benchmark_one_shape(
@@ -363,15 +226,16 @@ def benchmark_one_shape(
     for norm_type in norm_type_args:
         for shape in shape_args:
             naive_time, sglang_time = kernel_func(
-                shape.M,
-                shape.N,
+                shape.B,
+                shape.L,
+                shape.C,
                 norm_type,
                 num_warmup,
                 num_run,
             )
             speedup = naive_time / sglang_time if sglang_time > 0 else 0.0
             print(
-                f"M={shape.M:5d}, N={shape.N:5d} norm={norm_type} | "
+                f"B={shape.B:1d}, L={shape.L:4d}, C={shape.C:4d} norm={norm_type} | "
                 f"Naive: {naive_time:8.2f} us | "
                 f"SGLang: {sglang_time:8.2f} us | "
                 f"Speedup: {speedup:5.2f}x"
@@ -387,22 +251,22 @@ def main():
     if IS_CI:
         shape_args = [
             # Only test one simple shape in CI
-            ShapeArg(M=128, N=1024),
+            ShapeArg(B=1, L=128, C=1024),
         ]
     else:
         shape_args = [
             # Small shapes
-            ShapeArg(M=128, N=1024),
-            ShapeArg(M=128, N=3072),
-            ShapeArg(M=128, N=4096),
+            ShapeArg(B=1, L=128, C=1024),
+            ShapeArg(B=1, L=128, C=3072),
+            ShapeArg(B=1, L=128, C=4096),
             # Medium shapes
-            ShapeArg(M=1024, N=1024),
-            ShapeArg(M=1024, N=3072),
-            ShapeArg(M=1024, N=4096),
+            ShapeArg(B=1, L=1024, C=1024),
+            ShapeArg(B=1, L=1024, C=3072),
+            ShapeArg(B=1, L=1024, C=4096),
             # Large shapes
-            ShapeArg(M=4096, N=1024),
-            ShapeArg(M=4096, N=3072),
-            ShapeArg(M=4096, N=4096),
+            ShapeArg(B=1, L=4096, C=1024),
+            ShapeArg(B=1, L=4096, C=3072),
+            ShapeArg(B=1, L=4096, C=4096),
         ]
 
     norm_type_args = ["layer", "rms"]

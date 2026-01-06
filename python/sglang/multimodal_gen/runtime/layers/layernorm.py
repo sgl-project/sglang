@@ -66,6 +66,7 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         shape = x.shape
+        device = x.device
         x = x.reshape(-1, shape[-1])
         if residual is not None:
             residual_shape = residual.shape
@@ -80,7 +81,7 @@ class RMSNorm(CustomOp):
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x.view(shape), residual.view(residual_shape)
         else:
-            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            out = rmsnorm(x, self.weight.data.to(device), self.variance_epsilon)
         out = out.view(shape)
         return out
 
@@ -264,11 +265,12 @@ class ScaleResidual(nn.Module):
 class FP32LayerNorm(nn.LayerNorm):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         origin_dtype = inputs.dtype
+        device = inputs.device
         return F.layer_norm(
             inputs.float(),
             self.normalized_shape,
-            self.weight.float() if self.weight is not None else None,
-            self.bias.float() if self.bias is not None else None,
+            self.weight.float().to(device=device) if self.weight is not None else None,
+            self.bias.float().to(device=device) if self.bias is not None else None,
             self.eps,
         ).to(origin_dtype)
 
@@ -276,7 +278,7 @@ class FP32LayerNorm(nn.LayerNorm):
 ################################################################################
 # Fused norm kernel
 ################################################################################
-def get_gate_arg(gate: torch.Tensor, shape: Tuple, dtype: torch.dtype):
+def get_gate_arg(gate: torch.Tensor, shape: Tuple, dtype: torch.dtype, device):
     if isinstance(gate, int):
         # used by cross-attention, should be 1
         assert gate == 1
@@ -289,19 +291,19 @@ def get_gate_arg(gate: torch.Tensor, shape: Tuple, dtype: torch.dtype):
         ):
             # gate.shape: [batch_size, num_frames, 1, inner_dim]
             # gate.shape: [batch_size, 1, inner_dim]
-            return gate.contiguous().to(dtype=dtype)
+            return gate.contiguous().to(dtype=dtype, device=device)
         elif gate.dim() == 2:
             return (
                 gate.expand(-1, shape[-1])
                 .contiguous()
                 .view(-1, shape[-1])
-                .to(dtype=dtype)
+                .to(dtype=dtype, device=device)
             )
     else:
         raise ValueError(f"Gate type {type(gate)} not supported")
 
 
-def get_norm_scale_shift_arg(t: torch.Tensor, shape: Tuple, dtype: torch.dtype):
+def get_norm_scale_shift_arg(t: torch.Tensor, shape: Tuple, dtype: torch.dtype, device):
     if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
         t = t.reshape(1)
     elif (
@@ -315,7 +317,7 @@ def get_norm_scale_shift_arg(t: torch.Tensor, shape: Tuple, dtype: torch.dtype):
         t = t.expand(shape).view(-1, shape[-1])
     else:
         raise ValueError(f"Scale/shift tensor dimension {t.dim()} not supported")
-    return t.contiguous().to(dtype=dtype)
+    return t.contiguous().to(dtype=dtype, device=device)
 
 
 class _ScaleResidualNormScaleShift(CustomOp):
@@ -341,9 +343,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         self.norm_type = norm_type
         self.eps = eps
         if norm_type == "rms":
-            self.norm = RMSNorm(
-                hidden_size, has_weight=elementwise_affine, eps=eps, dtype=dtype
-            )
+            self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif norm_type == "layer":
             # compute_dtype is hardcoded to fp32 in fused kernel
             self.norm = FP32LayerNorm(
@@ -375,19 +375,20 @@ class _ScaleResidualNormScaleShift(CustomOp):
             return self.forward_native(residual, x, gate, shift, scale)
 
         origin_shape = x.shape
+        device = x.device
         x_2d = x.contiguous().view(-1, origin_shape[-1])
         residual_2d = residual.contiguous().view(-1, origin_shape[-1])
 
         # gamma/beta
         gamma_opt = getattr(self.norm, "weight", None)
         if gamma_opt is not None:
-            gamma_opt = gamma_opt.contiguous().to(dtype=x.dtype)
+            gamma_opt = gamma_opt.contiguous().to(dtype=x.dtype, device=device)
         beta_opt = getattr(self.norm, "bias", None)
         if beta_opt is not None:
-            beta_opt = beta_opt.contiguous().to(dtype=x.dtype)
-        gate_opt = get_gate_arg(gate, origin_shape, x.dtype)
-        scale_arg = get_norm_scale_shift_arg(scale, origin_shape, x.dtype)
-        shift_arg = get_norm_scale_shift_arg(shift, origin_shape, x.dtype)
+            beta_opt = beta_opt.contiguous().to(dtype=x.dtype, device=device)
+        gate_opt = get_gate_arg(gate, origin_shape, x.dtype, device)
+        scale_arg = get_norm_scale_shift_arg(scale, origin_shape, x.dtype, device)
+        shift_arg = get_norm_scale_shift_arg(shift, origin_shape, x.dtype, device)
 
         y_2d, residual_output = fused_scale_residual_norm_scale_shift(
             residual_2d,
@@ -478,9 +479,7 @@ class _NormScaleShift(CustomOp):
         self.norm_type = norm_type
         self.eps = eps
         if norm_type == "rms":
-            self.norm = RMSNorm(
-                hidden_size, has_weight=elementwise_affine, eps=eps, dtype=dtype
-            )
+            self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif norm_type == "layer":
             # compute_dtype is hardcoded to fp32 in fused kernel
             self.norm = FP32LayerNorm(
@@ -507,14 +506,15 @@ class _NormScaleShift(CustomOp):
             # Only 2D scale/shift are supported by the no_affine kernel.
             return self.forward_native(x, shift, scale)
 
-        if gamma_opt is not None:
-            gamma_opt = gamma_opt.contiguous().to(x.dtype)
-        if beta_opt is not None:
-            beta_opt = beta_opt.contiguous().to(x.dtype)
         origin_shape = x.shape
+        device = x.device
+        if gamma_opt is not None:
+            gamma_opt = gamma_opt.contiguous().to(dtype=x.dtype, device=device)
+        if beta_opt is not None:
+            beta_opt = beta_opt.contiguous().to(dtype=x.dtype, device=device)
         x_2d = x.contiguous().view(-1, origin_shape[-1])
-        scale_arg = get_norm_scale_shift_arg(scale, origin_shape, x.dtype)
-        shift_arg = get_norm_scale_shift_arg(shift, origin_shape, x.dtype)
+        scale_arg = get_norm_scale_shift_arg(scale, origin_shape, x.dtype, device)
+        shift_arg = get_norm_scale_shift_arg(shift, origin_shape, x.dtype, device)
         y_2d = fused_norm_scale_shift(
             x_2d, gamma_opt, beta_opt, scale_arg, shift_arg, self.norm_type, self.eps
         )
@@ -524,18 +524,9 @@ class _NormScaleShift(CustomOp):
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         # Fallback path for triton kernel (not fused)
-        normalized = self.norm(x).float()
-        if scale.dim() == 4:
-            num_frames = scale.shape[1]
-            frame_seqlen = normalized.shape[1] // num_frames
-            output = (
-                normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
-                * (1.0 + scale)
-                + shift
-            ).flatten(1, 2)
-        else:
-            output = normalized * (1.0 + scale) + shift
-        return output.to(x.dtype)
+        normalized = self.norm(x)
+        modulated = fuse_scale_shift_kernel(normalized, scale, shift)
+        return modulated.to(x.dtype)
 
 
 class LayerNormScaleShift(_NormScaleShift):
