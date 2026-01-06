@@ -9,6 +9,9 @@
     "preview": "vite preview",
     "lint": "eslint src --ext ts,tsx",
     "test": "playwright test",
+    "test:unit": "playwright test --project=unit",
+    "test:integration": "RUN_INTEGRATION_E2E=1 playwright test --project=integration",
+    "test:all": "RUN_INTEGRATION_E2E=1 playwright test",
     "test:ui": "playwright test --ui",
     "test:headed": "playwright test --headed"
   },

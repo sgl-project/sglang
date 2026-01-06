@@ -3,10 +3,30 @@ import { test, expect } from '@playwright/test';
 const SGLANG_URL = 'http://localhost:30000';
 const SIDECAR_URL = 'http://localhost:9000';
 
+/**
+ * Full Integration E2E Tests
+ *
+ * These tests require:
+ * - SGLang server running at localhost:30000 with attention capture enabled
+ * - RAPIDS sidecar running at localhost:9000
+ * - Real LLM inference (not mocked)
+ *
+ * To run these tests:
+ *   RUN_INTEGRATION_E2E=1 npm test
+ *
+ * In CI, these tests are skipped by default to avoid flakiness.
+ * Enable with: RUN_INTEGRATION_E2E=1 in your CI environment.
+ */
+
+// Skip in CI unless explicitly enabled
+const skipIntegration = process.env.CI && !process.env.RUN_INTEGRATION_E2E;
+
 // Extended timeout for LLM responses
 test.setTimeout(180000);
 
 test.describe('Full Integration E2E - Real LLM Responses', () => {
+  // Skip entire suite in CI unless RUN_INTEGRATION_E2E is set
+  test.skip(!!skipIntegration, 'Skipping integration tests in CI. Set RUN_INTEGRATION_E2E=1 to enable.');
 
   test.beforeEach(async ({ page }) => {
     await page.goto('/');
