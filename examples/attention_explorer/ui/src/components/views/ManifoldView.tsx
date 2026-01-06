@@ -1,10 +1,8 @@
 import { ManifoldMap } from '../manifold/ManifoldMap';
 import { useSessionStore } from '../../stores/useSessionStore';
-import { useUIStore } from '../../stores/useUIStore';
 
 export function ManifoldView() {
   const fingerprint = useSessionStore((state) => state.fingerprint);
-  const segment = useUIStore((state) => state.segment);
 
   return (
     <div className="card manifold-view">

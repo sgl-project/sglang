@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useUIStore } from '../../stores/useUIStore';
 import { View, Program } from '../../api/types';
 
