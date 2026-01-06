@@ -1,7 +1,5 @@
 //! Shared helpers and state tracking for Harmony Responses
 
-use std::sync::Arc;
-
 use axum::response::Response;
 use serde_json::{from_value, json, to_string, Value};
 use tracing::{debug, error, warn};
@@ -10,7 +8,7 @@ use uuid::Uuid;
 use super::{context::HarmonyResponsesContext, execution::ToolResult};
 use crate::{
     data_connector::ResponseId,
-    mcp::McpManager,
+    mcp,
     protocols::{
         common::{ToolCall, ToolChoice, ToolChoiceValue},
         responses::{
@@ -217,10 +215,10 @@ pub(super) fn build_next_request_with_tools(
 pub(super) fn inject_mcp_metadata(
     response: &mut ResponsesResponse,
     tracking: &McpCallTracking,
-    mcp_manager: &Arc<McpManager>,
+    mcp_tools: &[mcp::Tool],
 ) {
     // Build mcp_list_tools item
-    let tools = mcp_manager.list_tools();
+    let tools = mcp_tools;
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
         .map(|t| McpToolInfo {
