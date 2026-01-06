@@ -13,6 +13,11 @@ weights from the seed instance at any time.
 
 """
 
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(est_time=72, suite="stage-b-test-large-2-gpu")
+register_amd_ci(est_time=72, suite="stage-b-test-large-2-gpu-amd")
+
 import gc
 import os
 import random

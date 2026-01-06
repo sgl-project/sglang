@@ -1,3 +1,7 @@
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=132, suite="stage-b-test-large-2-gpu")
+
 import unittest
 
 from sglang.srt.utils import is_blackwell

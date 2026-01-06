@@ -1,8 +1,12 @@
 """
 E2E tests for HiCache Storage functionality.
 Usage:
-    python3 -m pytest test/srt/hicache/test_hicache_storage_e2e.py -v
+    python3 -m pytest test/registered/hicache/test_hicache_storage_file_backend.py -v
 """
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
 
 import json
 import os

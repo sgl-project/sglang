@@ -89,17 +89,8 @@ suites = {
         TestFile("test_modelopt_export.py", 9),
     ],
     "per-commit-2-gpu": [
-        TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
-        TestFile("hicache/test_hicache_storage_file_backend.py", 200),
-        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", 50),
-        TestFile("models/test_kimi_linear_models.py", 90),
-        TestFile("models/test_nvidia_nemotron_nano_v2.py", 132),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
-        TestFile("test_data_parallelism.py", 73),
-        TestFile("test_disaggregation_basic.py", 400),
-        TestFile("test_dp_attention.py", 350),
-        TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
     ],
     "per-commit-4-gpu": [
@@ -256,11 +247,7 @@ suite_amd = {
         TestFile("test_gpt_oss_1gpu.py", 750),
     ],
     "per-commit-2-gpu-amd": [
-        # TestFile("lora/test_lora_tp.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107. Moved to test/registered/lora/
         TestFile("rl/test_update_weights_from_distributed.py", 103),
-        TestFile("test_data_parallelism.py", 73),
-        TestFile("test_load_weights_from_remote_instance.py", 72),
-        # TestFile("test_patch_torch.py", 19), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
