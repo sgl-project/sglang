@@ -87,7 +87,7 @@ impl McpManager {
         }
 
         if static_clients.is_empty() {
-            warn!("No static MCP servers connected");
+            info!("No static MCP servers connected");
         }
 
         Ok(Self {
