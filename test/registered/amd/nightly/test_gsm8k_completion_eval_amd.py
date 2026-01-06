@@ -286,10 +286,10 @@ AMD_DEEPSEEK_V3_MTP_MODELS = [
     ),
 ]
 
-# Group 4: DeepSeek-R1 (reasoning model)
+# Group 4: DeepSeek-R1 (reasoning model) - Basic + MTP combined
 # Runner: nightly-amd-8-gpu-deepseek-r1
 AMD_DEEPSEEK_R1_MODELS = [
-    # DeepSeek-R1-0528 - reasoning model, ~80GB per GPU
+    # DeepSeek-R1-0528 basic - reasoning model, ~80GB per GPU
     BaseModelConfig(
         model_path="deepseek-ai/DeepSeek-R1-0528",
         tp_size=8,
@@ -306,6 +306,80 @@ AMD_DEEPSEEK_R1_MODELS = [
             "--trust-remote-code",
         ],
         env_vars={
+            "SGLANG_USE_AITER": "1",
+        },
+    ),
+    # DeepSeek-R1-0528 with MTP (EAGLE speculative decoding)
+    BaseModelConfig(
+        model_path="deepseek-ai/DeepSeek-R1-0528",
+        tp_size=8,
+        accuracy_threshold=0.93,
+        timeout=3600,
+        other_args=[
+            "--chunked-prefill-size",
+            "131072",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--mem-fraction-static",
+            "0.7",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "SGLANG_USE_AITER": "1",
+        },
+    ),
+]
+
+# Group 5: DeepSeek-R1 with DP + TC combined
+# Runner: nightly-amd-8-gpu-deepseek-r1-dp-tc
+# Combines DP attention and Torch Compile tests for DeepSeek-R1
+AMD_DEEPSEEK_R1_DP_TC_MODELS = [
+    # DeepSeek-R1-0528 with DP attention
+    BaseModelConfig(
+        model_path="deepseek-ai/DeepSeek-R1-0528",
+        tp_size=8,
+        accuracy_threshold=0.93,
+        timeout=3600,
+        other_args=[
+            "--chunked-prefill-size",
+            "131072",
+            "--dp-size",
+            "8",
+            "--enable-dp-attention",
+            "--mem-fraction-static",
+            "0.85",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "SGLANG_USE_ROCM700A": "1",
+            "SGLANG_USE_AITER": "1",
+        },
+    ),
+    # DeepSeek-R1-0528 with torch compile
+    BaseModelConfig(
+        model_path="deepseek-ai/DeepSeek-R1-0528",
+        tp_size=8,
+        accuracy_threshold=0.93,
+        timeout=7200,  # 2 hours for compilation
+        other_args=[
+            "--chunked-prefill-size",
+            "131072",
+            "--mem-fraction-static",
+            "0.70",
+            "--cuda-graph-max-bs",
+            "8",
+            "--enable-torch-compile",
+            "--disable-cuda-graph",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "SGLANG_USE_ROCM700A": "1",
             "SGLANG_USE_AITER": "1",
         },
     ),
@@ -331,6 +405,8 @@ def get_models_for_group(group: str) -> List[BaseModelConfig]:
         return AMD_DEEPSEEK_V3_MTP_MODELS
     elif group == "deepseek-r1":
         return AMD_DEEPSEEK_R1_MODELS
+    elif group == "deepseek-r1-dp-tc":
+        return AMD_DEEPSEEK_R1_DP_TC_MODELS
     elif group == "all":
         return (
             AMD_GPT_OSS_MODELS
@@ -339,6 +415,7 @@ def get_models_for_group(group: str) -> List[BaseModelConfig]:
             + AMD_DEEPSEEK_V3_TC_MODELS
             + AMD_DEEPSEEK_V3_MTP_MODELS
             + AMD_DEEPSEEK_R1_MODELS
+            + AMD_DEEPSEEK_R1_DP_TC_MODELS
         )
     else:
         print(f"[WARNING] Unknown model group '{group}', using 'gpt-oss'")

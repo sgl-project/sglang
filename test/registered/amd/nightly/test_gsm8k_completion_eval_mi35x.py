@@ -10,13 +10,18 @@ MI35x-specific models:
 
 Model groups are selected via AMD_TEST_MODEL_GROUP environment variable:
 - "gpt-oss" (default): GPT-OSS models with MI35x paths
-- "deepseek-r1-mxfp4": DeepSeek-R1-MXFP4 quantized model
+- "deepseek-r1-mxfp4": DeepSeek-R1-MXFP4 basic + MTP (nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4)
+- "deepseek-r1-mxfp4-dp-tc": DeepSeek-R1-MXFP4 DP + TC (nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4-dp-tc)
 
 Registry: nightly-amd-8-gpu-mi35x suite (8-GPU tests on MI35x)
 """
 
 import ast
 import os
+
+# Set HF cache to /data2/models/ for MI35x so HF models download there
+os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
+os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
 import re
 import subprocess
 import time
@@ -25,6 +30,16 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
+
+# HuggingFace Hub for model cache checking and download progress
+try:
+    from huggingface_hub import HfFileSystem, snapshot_download
+    from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
+
+    HF_HUB_AVAILABLE = True
+except ImportError:
+    HF_HUB_AVAILABLE = False
+    print("[WARNING] huggingface_hub not available - model cache checking disabled")
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -107,9 +122,10 @@ MI35X_GPT_OSS_MODELS = [
     ),
 ]
 
-# Group 2: DeepSeek-R1-MXFP4 (MI35x specific quantized model)
-# Note: This model uses a different path and configuration than MI300X DeepSeek-R1
+# Group 2: DeepSeek-R1-MXFP4 basic + MTP (MI35x specific quantized model)
+# Runner: nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4
 MI35X_DEEPSEEK_R1_MXFP4_MODELS = [
+    # DeepSeek-R1-MXFP4 basic
     BaseModelConfig(
         model_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",
         tp_size=8,
@@ -127,6 +143,71 @@ MI35X_DEEPSEEK_R1_MXFP4_MODELS = [
         ],
         env_vars={},
     ),
+    # DeepSeek-R1-MXFP4 with MTP (EAGLE speculative decoding)
+    BaseModelConfig(
+        model_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",
+        tp_size=8,
+        accuracy_threshold=0.93,
+        timeout=3600,
+        other_args=[
+            "--trust-remote-code",
+            "--chunked-prefill-size",
+            "131072",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--mem-fraction-static",
+            "0.7",
+        ],
+        env_vars={"SGLANG_USE_ROCM700A": "1", "SGLANG_USE_AITER": "1"},
+    ),
+]
+
+# Group 3: DeepSeek-R1-MXFP4 with DP + TC (requires ROCm 7.0+)
+# Runner: nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4-dp-tc
+MI35X_DEEPSEEK_R1_MXFP4_DP_TC_MODELS = [
+    # DeepSeek-R1-MXFP4 with DP attention
+    BaseModelConfig(
+        model_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",
+        tp_size=8,
+        accuracy_threshold=0.93,
+        timeout=3600,
+        other_args=[
+            "--trust-remote-code",
+            "--chunked-prefill-size",
+            "131072",
+            "--dp-size",
+            "8",
+            "--enable-dp-attention",
+            "--mem-fraction-static",
+            "0.85",
+        ],
+        env_vars={"SGLANG_USE_ROCM700A": "1", "SGLANG_USE_AITER": "1"},
+    ),
+    # DeepSeek-R1-MXFP4 with torch compile
+    BaseModelConfig(
+        model_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",
+        tp_size=8,
+        accuracy_threshold=0.93,
+        timeout=7200,  # 2 hours for compilation
+        other_args=[
+            "--trust-remote-code",
+            "--chunked-prefill-size",
+            "131072",
+            "--mem-fraction-static",
+            "0.70",
+            "--cuda-graph-max-bs",
+            "8",
+            "--enable-torch-compile",
+            "--disable-cuda-graph",
+        ],
+        env_vars={"SGLANG_USE_ROCM700A": "1", "SGLANG_USE_AITER": "1"},
+    ),
 ]
 
 
@@ -141,11 +222,124 @@ def get_models_for_group(group: str) -> List[BaseModelConfig]:
         return MI35X_GPT_OSS_MODELS
     elif group == "deepseek-r1-mxfp4":
         return MI35X_DEEPSEEK_R1_MXFP4_MODELS
+    elif group == "deepseek-r1-mxfp4-dp-tc":
+        return MI35X_DEEPSEEK_R1_MXFP4_DP_TC_MODELS
     elif group == "all":
-        return MI35X_GPT_OSS_MODELS + MI35X_DEEPSEEK_R1_MXFP4_MODELS
+        return (
+            MI35X_GPT_OSS_MODELS
+            + MI35X_DEEPSEEK_R1_MXFP4_MODELS
+            + MI35X_DEEPSEEK_R1_MXFP4_DP_TC_MODELS
+        )
     else:
         print(f"[WARNING] Unknown model group '{group}', using 'gpt-oss'")
         return MI35X_GPT_OSS_MODELS
+
+
+# =============================================================================
+# MODEL CACHE AND DOWNLOAD UTILITIES
+# =============================================================================
+
+
+def check_local_cache(model_path: str) -> Tuple[bool, str]:
+    """
+    Check if model is cached locally.
+
+    Returns:
+        Tuple of (is_cached, cache_path_or_message)
+    """
+    # Check common HF cache locations for MI35x
+    cache_dirs = [
+        os.path.expanduser("~/.cache/huggingface/hub"),
+        "/data2/models/huggingface/hub",
+        os.environ.get("HF_HUB_CACHE", ""),
+    ]
+    cache_dirs = [d for d in cache_dirs if d]  # Remove empty
+
+    # Convert model_path to cache directory format (org--model)
+    cache_name = f"models--{model_path.replace('/', '--')}"
+
+    for cache_dir in cache_dirs:
+        cache_path = os.path.join(cache_dir, cache_name)
+        if os.path.exists(cache_path):
+            # Check if there are snapshots
+            snapshots_dir = os.path.join(cache_path, "snapshots")
+            if os.path.exists(snapshots_dir) and os.listdir(snapshots_dir):
+                return True, cache_path
+
+    return False, f"Not found in: {', '.join(cache_dirs)}"
+
+
+def check_hf_repo_access(model_path: str) -> Tuple[bool, str]:
+    """
+    Check if HuggingFace repository is accessible.
+
+    Returns:
+        Tuple of (is_accessible, message)
+    """
+    if not HF_HUB_AVAILABLE:
+        return True, "huggingface_hub not available, skipping access check"
+
+    try:
+        fs = HfFileSystem()
+        # Try to list files in the repo
+        files = fs.ls(model_path, detail=False)
+        if files:
+            return True, f"Repository accessible ({len(files)} files)"
+        else:
+            return False, "Repository exists but is empty"
+    except GatedRepoError:
+        return False, "GATED REPO - requires authentication/approval"
+    except RepositoryNotFoundError:
+        return False, "REPO NOT FOUND on HuggingFace"
+    except Exception as e:
+        error_msg = str(e)
+        if "401" in error_msg or "unauthorized" in error_msg.lower():
+            return False, f"AUTH ERROR - may need HF_TOKEN: {error_msg[:100]}"
+        elif "404" in error_msg:
+            return False, f"NOT FOUND: {error_msg[:100]}"
+        elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
+            return False, f"NETWORK ERROR: {error_msg[:100]}"
+        else:
+            return False, f"ERROR: {error_msg[:100]}"
+
+
+def log_model_status(config: "BaseModelConfig") -> Tuple[bool, str]:
+    """
+    Log detailed model availability status.
+
+    Returns:
+        Tuple of (is_available, status_message)
+    """
+    model_path = config.model_path
+    print(f"\n📦 Checking model: {model_path}")
+    print("-" * 50)
+
+    # For local paths (starting with /), check if exists
+    if model_path.startswith("/"):
+        if os.path.exists(model_path):
+            print(f"  ✅ LOCAL PATH: Found at {model_path}")
+            return True, f"Local path exists at {model_path}"
+        else:
+            print(f"  ❌ LOCAL PATH: Not found at {model_path}")
+            return False, f"Local path not found at {model_path}"
+
+    # For HF model IDs, check local cache first
+    is_cached, cache_msg = check_local_cache(model_path)
+    if is_cached:
+        print(f"  ✅ LOCAL CACHE: Found at {cache_msg}")
+        return True, f"Cached locally at {cache_msg}"
+    else:
+        print(f"  ⚠️  LOCAL CACHE: {cache_msg}")
+
+    # Check HF repo access
+    is_accessible, access_msg = check_hf_repo_access(model_path)
+    if is_accessible:
+        print(f"  ✅ HF ACCESS: {access_msg}")
+        print(f"  📥 Model will be downloaded from HuggingFace to {os.environ.get('HF_HOME', '~/.cache/huggingface')}")
+        return True, f"Will download from HF: {access_msg}"
+    else:
+        print(f"  ❌ HF ACCESS: {access_msg}")
+        return False, access_msg
 
 
 # =============================================================================
@@ -310,9 +504,12 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
                 startup_time, bench_time, total_time = None, None, None
                 model_start = time.time()
 
-                # Check if model path exists
-                if not os.path.exists(config.model_path) and not config.model_path.startswith(("http", "hf://")):
-                    print(f"\n⏭️ SKIPPING: Model not found at {config.model_path}")
+                # Check model availability with detailed logging
+                is_available, status_msg = log_model_status(config)
+
+                if not is_available:
+                    print(f"\n❌ MODEL NOT AVAILABLE: {status_msg}")
+                    print(f"⏭️ SKIPPING: {config.model_path}")
                     status = "⏭️ SKIP"
                     all_results.append({
                         "model": config.model_path,
@@ -321,7 +518,7 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
                         "threshold": config.accuracy_threshold,
                         "passed": True,
                         "skipped": True,
-                        "error": f"Model not found at {config.model_path}",
+                        "error": status_msg,
                     })
                 else:
                     try:
