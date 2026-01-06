@@ -201,7 +201,13 @@ class PipelineStage(ABC):
             raise
 
         # Execute the actual stage logic with unified profiling
-        with StageProfiler(stage_name, logger=logger, timings=batch.timings):
+        with StageProfiler(
+            stage_name,
+            logger=logger,
+            timings=batch.timings,
+            perf_dump_path_provided=batch.perf_dump_path is not None,
+            log_stage_start_end=not batch.is_warmup,
+        ):
             result = self.forward(batch, server_args)
 
         # Post-execution output verification

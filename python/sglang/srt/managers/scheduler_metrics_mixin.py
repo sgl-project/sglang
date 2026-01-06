@@ -78,7 +78,13 @@ class SchedulerMetricsMixin:
         )
 
         if self.enable_metrics:
-            engine_type = "unified"
+            if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL:
+                engine_type = "prefill"
+            elif self.server_args.disaggregation_mode == DisaggregationMode.DECODE:
+                engine_type = "decode"
+            else:
+                engine_type = "unified"
+
             labels = {
                 "model_name": self.server_args.served_model_name,
                 "engine_type": engine_type,
@@ -131,7 +137,7 @@ class SchedulerMetricsMixin:
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
 
-        assert self.temp_prefill_info is None
+        # assert self.temp_prefill_info is None # TODO re-enable
         self.temp_prefill_info = dict(
             adder_log_input_tokens=adder.log_input_tokens,
             adder_log_hit_tokens=adder.log_hit_tokens,

@@ -6,6 +6,29 @@ from enum import IntEnum
 from typing import Any
 
 
+@contextmanager
+def temp_set_env(**env_vars: dict[str, Any]):
+    """Temporarily set non-sglang environment variables, e.g. OPENAI_API_KEY"""
+    for key in env_vars:
+        if key.startswith("SGLANG_") or key.startswith("SGL_"):
+            raise ValueError("temp_set_env should not be used for sglang env vars")
+
+    backup = {key: os.environ.get(key) for key in env_vars}
+    try:
+        for key, value in env_vars.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -200,6 +223,7 @@ class Envs:
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
+    SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(30)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
 
     # Test: pd-disaggregation
@@ -228,6 +252,7 @@ class Envs:
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     MOONCAKE_MASTER = EnvStr(None)
+    MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
     MOONCAKE_TE_META_DATA_SERVER = EnvStr("P2PHANDSHAKE")
     MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")
@@ -235,6 +260,7 @@ class Envs:
     MOONCAKE_DEVICE = EnvStr("")
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
+    MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
@@ -389,6 +415,12 @@ class Envs:
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+
+    # Tokenizer
+    SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
+
+    # TokenizerManager
+    SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
     # fmt: on
 
