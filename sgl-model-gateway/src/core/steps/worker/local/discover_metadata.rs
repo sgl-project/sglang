@@ -32,7 +32,10 @@ pub struct ServerInfo {
     pub model_id: Option<String>,
     pub model_path: Option<String>,
     pub served_model_name: Option<String>,
+    pub tp_size: Option<usize>,
     pub dp_size: Option<usize>,
+    pub load_balance_method: Option<String>,
+    pub disaggregation_mode: Option<String>,
     pub version: Option<String>,
     pub max_batch_size: Option<usize>,
     pub max_total_tokens: Option<usize>,
@@ -241,6 +244,18 @@ impl StepExecutor for DiscoverMetadataStep {
                         server_info.served_model_name.filter(|s| !s.is_empty())
                     {
                         labels.insert("served_model_name".to_string(), served_model_name);
+                    }
+                    if let Some(tp_size) = server_info.tp_size {
+                        labels.insert("tp_size".to_string(), tp_size.to_string());
+                    }
+                    if let Some(dp_size) = server_info.dp_size {
+                        labels.insert("dp_size".to_string(), dp_size.to_string());
+                    }
+                    if let Some(load_balance_method) = server_info.load_balance_method {
+                        labels.insert("load_balance_method".to_string(), load_balance_method);
+                    }
+                    if let Some(disaggregation_mode) = server_info.disaggregation_mode {
+                        labels.insert("disaggregation_mode".to_string(), disaggregation_mode);
                     }
                 }
 

@@ -339,6 +339,7 @@ class ServerArgs:
     log_requests: bool = False
     log_requests_level: int = 2
     log_requests_format: str = "text"
+    log_requests_target: Optional[List[str]] = None
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -482,6 +483,10 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
+
+    # Hierarchical sparse attention
+    hierarchical_sparse_attention_extra_config: Optional[str] = None
+
     # LMCache
     enable_lmcache: bool = False
 
@@ -3014,6 +3019,14 @@ class ServerArgs:
             help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
         )
         parser.add_argument(
+            "--log-requests-target",
+            type=str,
+            nargs="+",
+            default=ServerArgs.log_requests_target,
+            help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
+            "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
+        )
+        parser.add_argument(
             "--crash-dump-folder",
             type=str,
             default=ServerArgs.crash_dump_folder,
@@ -3807,6 +3820,18 @@ class ServerArgs:
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
         )
+
+        # Hierarchical sparse attention
+        parser.add_argument(
+            "--hierarchical-sparse-attention-extra-config",
+            type=str,
+            default=ServerArgs.hierarchical_sparse_attention_extra_config,
+            help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
+            "Required fields: algorithm (str), backend (str). "
+            "All other fields are algorithm-specific and passed to the algorithm constructor. "
+            'Example: \'{"algorithm": "quest", "backend": "flashattention", "sparsity_ratio": 0.7, "min_sparse_prompt_len": 2048}\'',
+        )
+
         # LMCache
         parser.add_argument(
             "--enable-lmcache",
