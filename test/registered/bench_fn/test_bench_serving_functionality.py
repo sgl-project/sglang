@@ -13,6 +13,9 @@ from sglang.test.test_utils import (
     get_benchmark_args,
     popen_launch_server,
 )
+import sglang.bench_serving as bench_serving_module
+from transformers import AutoTokenizer
+
 
 register_cuda_ci(est_time=300, suite="nightly-1-gpu", nightly=True)
 
@@ -34,9 +37,6 @@ class TestBenchServingFunctionality(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_multi_turn_functionality(self):
-        import sglang.bench_serving as bench_serving_module
-        from transformers import AutoTokenizer
-
         multi_turn_requests = []
         for i in range(3):
             multi_turn_requests.append(
