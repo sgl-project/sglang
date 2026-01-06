@@ -121,12 +121,16 @@ impl WorkerRoutingKeyLoad {
     }
 
     pub fn decrement(&self, routing_key: &str) {
-        let should_remove = self
-            .active_routing_keys
-            .get_mut(routing_key)
-            .map(|mut counter| {
+        use dashmap::mapref::entry::Entry;
+
+        match self.active_routing_keys.entry(routing_key.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let counter = entry.get_mut();
                 if *counter > 0 {
                     *counter -= 1;
+                    if *counter == 0 {
+                        entry.remove();
+                    }
                 } else {
                     tracing::warn!(
                         worker_url = %self.url,
@@ -134,12 +138,14 @@ impl WorkerRoutingKeyLoad {
                         "Attempted to decrement routing key counter that is already at 0"
                     );
                 }
-                *counter == 0
-            })
-            .unwrap_or(false);
-
-        if should_remove {
-            self.active_routing_keys.remove(routing_key);
+            }
+            Entry::Vacant(_) => {
+                tracing::warn!(
+                    worker_url = %self.url,
+                    routing_key = %routing_key,
+                    "Attempted to decrement non-existent routing key"
+                );
+            }
         }
         self.update_metrics();
     }
