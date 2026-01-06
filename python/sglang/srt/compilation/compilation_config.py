@@ -7,7 +7,7 @@ from typing import List
 class CompilationConfig:
     def __init__(
         self,
-        capture_sizes: List[int],
+        capture_sizes: List[int] = [],
         compiler: str = "eager",
         enable_debug_mode: bool = False,
     ):
