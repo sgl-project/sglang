@@ -1023,7 +1023,6 @@ impl Drop for WorkerLoadGuard {
     }
 }
 
-
 /// Health checker handle with graceful shutdown
 pub(crate) struct HealthChecker {
     #[allow(dead_code)]

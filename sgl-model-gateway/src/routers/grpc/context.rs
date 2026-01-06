@@ -179,7 +179,6 @@ impl From<&WorkerSelection> for LoadGuards {
     }
 }
 
-
 /// Response processing state (Step 6)
 #[derive(Default)]
 pub(crate) struct ResponseState {

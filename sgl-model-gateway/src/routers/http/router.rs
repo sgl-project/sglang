@@ -19,7 +19,6 @@ use crate::{
         is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
         WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
-    utils::http_utils::AttachedBody,
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -41,6 +40,7 @@ use crate::{
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils, RouterTrait,
     },
+    utils::http_utils::AttachedBody,
 };
 
 /// Regular router that uses injected load balancing policies
