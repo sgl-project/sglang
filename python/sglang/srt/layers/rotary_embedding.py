@@ -832,14 +832,11 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             / yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
             * attn_factor
         )
-        if device is not None:
-            self.device = device
-        else:
-            self.device = get_device()
         self.cos_cached_total = None
         self.sin_cached_total = None
         self.cos_cached = None
         self.sin_cached = None
+        self.device = device if device is not None else get_device()
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
