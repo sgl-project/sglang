@@ -65,6 +65,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
 )
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -473,10 +474,9 @@ class Scheduler(
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
 
-        # Initialize GEMM-related configuration (currently FP8 Blockwise GEMM backend).
-        # Other GEMM backends (e.g. FP4, BF16, etc.) can be added here in the future.
-        # This is needed for FP8 quantization.
+        # Initialize GEMM-related configuration for FP8 and FP4 backends.
         initialize_fp8_gemm_config(self.server_args)
+        initialize_fp4_gemm_config(self.server_args)
 
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync(self.server_args)
