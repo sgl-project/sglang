@@ -183,49 +183,6 @@ def get_tokenizer_from_processor(processor):
 
 
 # =============================================================================
-# Pytest Utilities
-# =============================================================================
-
-
-def pytest_retry(max_retries: int = 3):
-    """Decorator for pytest test functions with retry support.
-
-    Args:
-        max_retries: Maximum number of retry attempts
-
-    Example:
-        @pytest_retry(max_retries=3)
-        def test_flaky_operation():
-            # Test that might occasionally fail
-            pass
-    """
-    import functools
-
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            last_exception = None
-            for attempt in range(max_retries + 1):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    last_exception = e
-                    if attempt < max_retries:
-                        logger.info(
-                            "Test %s failed on attempt %d/%d, retrying...",
-                            func.__name__,
-                            attempt + 1,
-                            max_retries + 1,
-                        )
-                    continue
-            raise last_exception
-
-        return wrapper
-
-    return decorator
-
-
-# =============================================================================
 # Environment Utilities
 # =============================================================================
 
