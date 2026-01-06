@@ -2,27 +2,14 @@ import argparse
 import glob
 from pathlib import Path
 
+import tabulate
+
 from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 9),
-        TestFile("hicache/test_hicache_storage.py", 96),
-        TestFile("hicache/test_hicache_variants.py", 368),
-        TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
-        TestFile("layers/attention/mamba/test_mamba_ssm.py", 7),
-        TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 13),
-        TestFile("models/test_compressed_tensors_models.py", 42),
-        TestFile("models/test_cross_encoder_models.py", 100),
-        TestFile("models/test_embedding_models.py", 73),
-        TestFile("models/test_encoder_embedding_models.py", 221),
-        TestFile("models/test_generation_models.py", 103),
-        TestFile("models/test_nvidia_nemotron_nano_v2_vl.py", 214),  # GSM8k + MMMU
-        TestFile("models/test_qwen_models.py", 90),
-        TestFile("models/test_reward_models.py", 103),
-        TestFile("models/test_transformers_models.py", 245),
-        TestFile("models/test_vlm_models.py", 270),
         TestFile("openai_server/basic/test_openai_embedding.py", 70),
         TestFile("openai_server/basic/test_openai_server.py", 184),
         TestFile("openai_server/basic/test_protocol.py", 3),
@@ -41,12 +28,7 @@ suites = {
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 6),
         TestFile("openai_server/validation/test_request_length_validation.py", 38),
         TestFile("ops/test_repeat_interleave.py", 60),
-        TestFile("quant/test_block_int8.py", 44),
-        TestFile("quant/test_fp8_kernel.py", 10),
-        TestFile("quant/test_int8_kernel.py", 8),
-        TestFile("quant/test_triton_scaled_mm.py", 8),
-        TestFile("quant/test_w8a8_quantization.py", 160),
-        TestFile("quant/test_autoround.py", 77),
+        # quant tests moved to test/registered/quant/
         TestFile("rl/test_fp32_lm_head.py", 9),
         # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("rl/test_update_weights_from_tensor.py", 195),
@@ -56,10 +38,10 @@ suites = {
         TestFile("test_deterministic.py", 228),
         TestFile("test_constrained_decoding.py", 111),
         TestFile("test_eval_fp8_accuracy.py", 250),
+        TestFile("test_evs.py", 20),
         TestFile("test_external_models.py", 30),
         TestFile("test_fp8_utils.py", 9),
         TestFile("rotary_embedding/test_mrope.py", 10),
-        TestFile("test_fused_moe.py", 80),
         TestFile("test_gpt_oss_1gpu.py", 402),
         TestFile("test_harmony_parser.py", 6),
         TestFile("test_hidden_states.py", 55),
@@ -93,10 +75,7 @@ suites = {
         TestFile("test_profile_merger_http_api.py", 9),
         TestFile("test_swa_unittest.py", 8),
         TestFile("test_torch_compile.py", 190),
-        TestFile("test_torch_compile_moe.py", 210),
-        TestFile("test_triton_fused_moe.py", 12),
         TestFile("test_torchao.py", 103),
-        TestFile("test_triton_moe_channel_fp8_kernel.py", 16),
         TestFile("test_utils_update_weights.py", 29),
         TestFile("test_video_utils.py", 5),
         TestFile("test_vision_chunked_prefill.py", 150),
@@ -105,12 +84,9 @@ suites = {
         TestFile("test_modelopt_export.py", 9),
     ],
     "per-commit-2-gpu": [
-        TestFile("ep/test_moe_ep.py", 140),
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
-        TestFile("layers/attention/mamba/test_mamba2_mixer.py", 50),
-        TestFile("models/test_glm4_moe_models.py", 100),
         TestFile("models/test_kimi_linear_models.py", 90),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 132),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
@@ -154,7 +130,6 @@ suites = {
     #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
     # ],
     "per-commit-4-gpu-gb200": [
-        TestFile("test_cutedsl_moe.py", 300),
         TestFile("test_deepseek_v3_cutedsl_4gpu.py", 1800),
     ],
     "per-commit-4-gpu-deepep": [
@@ -205,12 +180,6 @@ suite_amd = {
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("dllm/test_llada2_mini_amd.py", 520),
-        TestFile("models/test_compressed_tensors_models.py", 42),
-        TestFile("models/test_cross_encoder_models.py", 150),
-        TestFile("models/test_qwen_models.py", 82),
-        TestFile("models/test_reward_models.py", 132),
-        TestFile("models/test_transformers_models.py", 320),
-        TestFile("models/test_vlm_models.py", 387),
         TestFile("openai_server/basic/test_openai_embedding.py", 141),
         TestFile("openai_server/basic/test_openai_server.py", 149),
         TestFile("openai_server/basic/test_protocol.py", 10),
@@ -228,10 +197,7 @@ suite_amd = {
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
         TestFile("ops/test_repeat_interleave.py", 75),
-        TestFile("quant/test_awq_dequant.py", 2),
-        TestFile("quant/test_block_int8.py", 22),
-        TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
-        TestFile("quant/test_triton_scaled_mm.py", 12),
+        # quant tests moved to test/registered/quant/
         TestFile("rl/test_fp32_lm_head.py", 15),
         # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("rotary_embedding/test_mrope.py", 15),
@@ -241,7 +207,6 @@ suite_amd = {
         TestFile("test_constrained_decoding.py", 120),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_external_models.py", 45),
-        TestFile("test_fused_moe.py", 30),
         TestFile("test_harmony_parser.py", 20),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
@@ -275,7 +240,6 @@ suite_amd = {
         TestFile("test_video_utils.py", 8),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
-        # TestFile("models/test_embedding_models.py", 73), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
         # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
         # TestFile("rl/test_update_weights_from_tensor.py", 48),
         # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
@@ -539,7 +503,25 @@ def main():
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
 
-    print("The running tests are ", [f.name for f in files])
+    # Print test info at beginning (similar to test/run_suite.py pretty_print_tests)
+    if args.auto_partition_size:
+        partition_info = (
+            f"{args.auto_partition_id + 1}/{args.auto_partition_size} "
+            f"(0-based id={args.auto_partition_id})"
+        )
+    else:
+        partition_info = "full"
+
+    headers = ["Suite", "Partition"]
+    rows = [[args.suite, partition_info]]
+    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
+
+    total_est_time = sum(f.estimated_time for f in files)
+    msg += f"✅ Enabled {len(files)} test(s) (est total {total_est_time:.1f}s):\n"
+    for f in files:
+        msg += f"  - {f.name} (est_time={f.estimated_time})\n"
+
+    print(msg, flush=True)
 
     # Add extra timeout when retry is enabled
     timeout = args.timeout_per_file
@@ -554,6 +536,14 @@ def main():
         args.max_attempts,
         args.retry_wait_seconds,
     )
+
+    # Print tests again at the end for visibility
+    msg = "\n" + tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
+    msg += f"✅ Executed {len(files)} test(s) (est total {total_est_time:.1f}s):\n"
+    for f in files:
+        msg += f"  - {f.name} (est_time={f.estimated_time})\n"
+    print(msg, flush=True)
+
     exit(exit_code)
 
 
