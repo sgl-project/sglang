@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useSessionStore } from '../stores/useSessionStore';
 import { useUIStore } from '../stores/useUIStore';
-import { AttentionStreamClient, TokenAttentionAligner } from '../api/client';
+import { AttentionStreamClient } from '../api/client';
 import { extractFingerprint, isFingerprintMode } from '../api/types';
 
 export interface UseAttentionStreamOptions {
@@ -20,10 +20,10 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
   const setModelName = useUIStore((state) => state.setModelName);
   const addMessage = useSessionStore((state) => state.addMessage);
   const appendToken = useSessionStore((state) => state.appendToken);
+  const appendAttention = useSessionStore((state) => state.appendAttention);
   const setFingerprint = useSessionStore((state) => state.setFingerprint);
 
   const clientRef = useRef<AttentionStreamClient | null>(null);
-  const alignerRef = useRef<TokenAttentionAligner>(new TokenAttentionAligner());
 
   // Check server health and fetch model info
   useEffect(() => {
@@ -71,12 +71,12 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
       baseUrl,
       model,
       program,
-      onToken: (token, index) => {
-        alignerRef.current.addToken(token);
-        appendToken(token, alignerRef.current.getAttention(index));
+      onToken: (token) => {
+        appendToken(token);
       },
       onAttention: (entry) => {
-        alignerRef.current.addAttention(entry);
+        // Store attention in the session (will be matched to tokens by step)
+        appendAttention(entry);
 
         if (isFingerprintMode(entry)) {
           const fp = extractFingerprint(entry);
@@ -85,8 +85,6 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
       },
       onFinish: () => {
         setIsStreaming(false);
-        const stats = alignerRef.current.getAlignmentStats();
-        console.log('Alignment stats:', stats);
       },
       onError: (err) => {
         setError(err);
@@ -99,7 +97,7 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
     return () => {
       client.abort();
     };
-  }, [baseUrl, model, program, appendToken, setFingerprint]);
+  }, [baseUrl, model, program, appendToken, appendAttention, setFingerprint]);
 
   useEffect(() => {
     clientRef.current?.setProgram(program);
@@ -112,8 +110,6 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
       setIsStreaming(true);
       setError(null);
 
-      alignerRef.current = new TokenAttentionAligner();
-
       addMessage({
         id: `user-${Date.now()}`,
         role: 'user',
@@ -125,9 +121,6 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
         role: m.role,
         content: m.content,
       }));
-
-      const prefillChars = messages.reduce((sum, m) => sum + m.content.length, 0);
-      alignerRef.current.setPrefillLength(Math.ceil(prefillChars / 4));
 
       try {
         await clientRef.current.stream(messages);
