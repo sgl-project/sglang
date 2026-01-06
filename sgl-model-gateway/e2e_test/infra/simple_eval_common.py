@@ -141,7 +141,7 @@ class ChatCompletionSampler(SamplerBase):
                 self._pack_message("system", self.system_message)
             ] + message_list
         trial = 0
-        while trial < 6:  # 126 seconds in total
+        while trial < 6:  # Max 63 seconds backoff (1+2+4+8+16+32)
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
@@ -157,15 +157,20 @@ class ChatCompletionSampler(SamplerBase):
                 return ""
             except Exception as e:
                 exception_backoff = 2**trial  # exponential back off
-                logger.debug(
-                    "Rate limit, retry %d after %ds: %s",
-                    trial,
+                # Log first few retries at debug, later ones at warning
+                log_fn = logger.warning if trial >= 3 else logger.debug
+                log_fn(
+                    "Request failed (retry %d/%d, backoff %ds): %s",
+                    trial + 1,
+                    6,
                     exception_backoff,
                     e,
                 )
                 time.sleep(exception_backoff)
                 trial += 1
-        logger.warning("All retry attempts exhausted, returning empty response")
+        logger.warning(
+            "All retry attempts exhausted after 6 retries, returning empty response"
+        )
         return ""
 
 
