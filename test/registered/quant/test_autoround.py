@@ -17,7 +17,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# AutoRound quantization tests
 register_cuda_ci(est_time=77, suite="stage-b-test-small-1-gpu")
 
 

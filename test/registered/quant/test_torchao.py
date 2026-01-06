@@ -6,7 +6,6 @@ import requests
 from sglang import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# TorchAO quantization integration tests
 register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree

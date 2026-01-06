@@ -4,7 +4,6 @@ from types import SimpleNamespace
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-# FP8 quantization accuracy evaluation tests
 register_cuda_ci(est_time=250, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=303, suite="stage-b-test-small-1-gpu")
 from sglang.test.run_eval import run_eval
