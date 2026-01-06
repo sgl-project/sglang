@@ -117,7 +117,7 @@ def get_nccl_mem_pool(group_coordinator: GroupCoordinator):
     global _allocator, _mem_pool_map
     if group_coordinator.unique_name not in _mem_pool_map:
         init_pynccl_allocator()
-        _mem_pool = torch.cuda.MemoryPool(_allocator)
+        _mem_pool = torch.cuda.MemPool(_allocator)
         _mem_pool_map[group_coordinator.unique_name] = _mem_pool
     return _mem_pool_map[group_coordinator.unique_name]
 
