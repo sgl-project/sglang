@@ -96,8 +96,8 @@ test.describe('Full Integration E2E - Real LLM Responses', () => {
       await outputTokens.nth(3).click();
       await page.waitForTimeout(500);
 
-      // Check that token is selected
-      await expect(outputTokens.nth(3)).toHaveClass(/selected/);
+      // Check that token is selected or pinned (new drawer behavior)
+      await expect(outputTokens.nth(3)).toHaveClass(/selected|pinned/);
 
       // Check Insight Lens updates
       const insightPanel = page.locator('.insight-panel');
@@ -293,8 +293,10 @@ test.describe('Full Integration E2E - Real LLM Responses', () => {
       await tokens.nth(i).click();
       await page.waitForTimeout(500);
 
-      // Check that token gets selected class
-      const isSelected = await tokens.nth(i).evaluate(el => el.classList.contains('selected'));
+      // Check that token gets selected or pinned class (new drawer behavior)
+      const isSelected = await tokens.nth(i).evaluate(el =>
+        el.classList.contains('selected') || el.classList.contains('pinned')
+      );
       if (isSelected) tokenSelections++;
 
       // Check insight panel shows token number
