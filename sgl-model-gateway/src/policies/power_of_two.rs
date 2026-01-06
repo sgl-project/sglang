@@ -78,7 +78,10 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             _ => {
                 // If One or both are missing token data.
                 // Fallback to local request counts for BOTH.
-                (worker1.load() as isize, worker2.load() as isize)
+                (
+                    worker1.worker_load().value() as isize,
+                    worker2.worker_load().value() as isize,
+                )
             }
         };
 
@@ -145,10 +148,10 @@ mod tests {
 
         // Set different loads
         for _ in 0..10 {
-            worker1.increment_load();
+            worker1.worker_load().increment();
         }
         for _ in 0..5 {
-            worker2.increment_load();
+            worker2.worker_load().increment();
         }
         // worker3 has load 0
 
@@ -243,7 +246,7 @@ mod tests {
 
         // Manually increment load on Worker B to simulate active requests
         for _ in 0..5 {
-            worker_b.increment_load();
+            worker_b.worker_load().increment();
         }
 
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker_a), Arc::new(worker_b)];
@@ -294,7 +297,7 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .build();
             for _ in 0..reqs {
-                w.increment_load();
+                w.worker_load().increment();
             }
             Arc::new(w)
         };

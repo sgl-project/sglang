@@ -282,7 +282,7 @@ impl OpenAIRouter {
             .get_workers_filtered(None, None, None, Some(RuntimeType::External), true)
             .into_iter()
             .filter(|w| w.supports_model(model_id) && w.circuit_breaker().can_execute())
-            .min_by_key(|w| w.load())
+            .min_by_key(|w| w.worker_load().value())
     }
 
     /// Check if any worker supports the model (regardless of circuit breaker state)
