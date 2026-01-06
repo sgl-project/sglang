@@ -368,6 +368,22 @@ class GPUAllocator:
         self.slots = [s for s in self.slots if not any(g in gpu_ids for g in s.gpu_ids)]
         logger.info("Released GPUs %s, now used: %s", gpu_ids, self._used_gpus)
 
+    def release_slot(self, slot: GPUSlot) -> None:
+        """Release a GPU slot back to the available pool.
+
+        Args:
+            slot: The GPUSlot to release.
+        """
+        self.release_gpus(slot.gpu_ids)
+
+    def available_gpus(self) -> list[int]:
+        """Get list of available (unused) GPU IDs.
+
+        Returns:
+            List of GPU IDs that are not currently allocated.
+        """
+        return [g.id for g in self.gpus if g.id not in self._used_gpus]
+
     def summary(self) -> str:
         """Return a summary of GPU allocations."""
         lines = ["GPU Allocation Summary:"]
