@@ -177,17 +177,16 @@ mod manual_routing_tests {
 mod manual_min_group_tests {
     use super::*;
 
-    /// Test that min_group mode handles multiple routing keys successfully
     #[tokio::test]
     async fn test_min_group_handles_multiple_routing_keys() {
-        let config = TestRouterConfig::manual_min_group(3710);
+        let config = TestRouterConfig::manual_min_group(3810);
 
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19710, 3))
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19810, 3))
                 .await;
 
         let app = ctx.create_app().await;
-        let mut success_count = 0;
+        let mut key_to_worker: HashMap<String, String> = HashMap::new();
 
         for i in 0..9 {
             let routing_key = format!("key-{}", i);
@@ -206,17 +205,158 @@ mod manual_min_group_tests {
                 .unwrap();
 
             let resp = app.clone().oneshot(req).await.unwrap();
-            if resp.status() == StatusCode::OK {
-                success_count += 1;
-            }
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let worker_id = resp
+                .headers()
+                .get("x-worker-id")
+                .expect("Response should have x-worker-id header")
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            key_to_worker.insert(routing_key, worker_id);
         }
 
+        let worker_counts: HashMap<String, usize> =
+            key_to_worker.values().fold(HashMap::new(), |mut acc, w| {
+                *acc.entry(w.clone()).or_default() += 1;
+                acc
+            });
+
         assert_eq!(
-            success_count, 9,
-            "All requests should succeed with min_group mode"
+            worker_counts.len(),
+            3,
+            "min_group should distribute keys across all 3 workers"
         );
+        for (worker, count) in &worker_counts {
+            assert_eq!(
+                *count, 3,
+                "Worker {} should have exactly 3 keys, got {}",
+                worker, count
+            );
+        }
 
         ctx.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn test_min_group_sticky_routing() {
+        let config = TestRouterConfig::manual_min_group(3811);
+
+        let ctx =
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19811, 3))
+                .await;
+
+        let app = ctx.create_app().await;
+
+        let routing_key = "sticky-key-123";
+        let mut seen_workers: Vec<String> = Vec::new();
+
+        for i in 0..5 {
+            let payload = json!({
+                "text": format!("Request {}", i),
+                "stream": false
+            });
+
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .header(ROUTING_KEY_HEADER, routing_key)
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let worker_id = resp
+                .headers()
+                .get("x-worker-id")
+                .expect("Response should have x-worker-id header")
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            seen_workers.push(worker_id);
+        }
+
+        let first_worker = &seen_workers[0];
+        for (i, worker) in seen_workers.iter().enumerate() {
+            assert_eq!(
+                worker, first_worker,
+                "Request {} should go to same worker as first request (expected {}, got {})",
+                i, first_worker, worker
+            );
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_min_group_mixed_routing_keys() {
+        let config = TestRouterConfig::manual_min_group(3812);
+
+        let ctx =
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19812, 2))
+                .await;
+
+        let app = ctx.create_app().await;
+        let mut key_to_workers: HashMap<String, HashSet<String>> = HashMap::new();
+
+        for i in 0..4 {
+            let routing_key = format!("key-{}", i);
+
+            for j in 0..3 {
+                let payload = json!({
+                    "text": format!("Request {} for {}", j, routing_key),
+                    "stream": false
+                });
+
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/generate")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(ROUTING_KEY_HEADER, &routing_key)
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap();
+
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+
+                let worker_id = resp
+                    .headers()
+                    .get("x-worker-id")
+                    .expect("Response should have x-worker-id header")
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+
+                key_to_workers
+                    .entry(routing_key.clone())
+                    .or_default()
+                    .insert(worker_id);
+            }
+        }
+
+        for (key, workers) in &key_to_workers {
+            assert_eq!(
+                workers.len(),
+                1,
+                "Key {} should route to exactly one worker (sticky), but got {:?}",
+                key,
+                workers
+            );
+        }
+
+        let all_workers: HashSet<String> =
+            key_to_workers.values().flatten().cloned().collect();
+        assert_eq!(
+            all_workers.len(),
+            2,
+            "Keys should be distributed across both workers"
+        );
+
+        ctx.shutdown().await;
+    }
 }
