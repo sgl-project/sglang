@@ -217,16 +217,12 @@ impl ToolParser for PythonicParser {
         false
     }
 
-    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
-        None
-    }
-
     fn reset(&mut self) {
         self.buffer.clear();
     }
 
     fn get_format_info(&self, _tool_name: &str) -> (String, String, String) {
-        // Passthrough doesn't support structural tags - return empty markers
+        // PythonicParser doesn't support structural tags - return empty markers
         (String::new(), String::new(), String::new())
     }
 }

@@ -107,18 +107,38 @@ fn get_tool_parser(
 }
 
 /// Build JSON schema for required tool choice mode.
+/// Includes $defs consolidation from all tools (matching Python's behavior).
 fn build_required_json_schema(tools: &[Tool], parallel_tool_calls: bool) -> Result<String, String> {
     let mut any_of_schemas = Vec::new();
-    let mut defs = serde_json::Map::new();
+    let mut all_defs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
     for tool in tools {
-        // Extract any $defs from tool parameters
-        if let Some(params_def) = tool.function.parameters.get("$defs") {
-            if let Some(params_def_obj) = params_def.as_object() {
-                for (key, value) in params_def_obj {
-                    defs.insert(key.clone(), value.clone());
+        // Consolidate $defs from all tools (matching Python's _get_tool_schema_defs)
+        if let serde_json::Value::Object(params) = &tool.function.parameters {
+            if let Some(serde_json::Value::Object(defs)) = params.get("$defs") {
+                for (def_name, def_schema) in defs {
+                    if let Some(existing) = all_defs.get(def_name) {
+                        // Check for conflicts
+                        if existing != def_schema {
+                            let error_msg = format!(
+                                "Tool definition '{}' has multiple conflicting schemas, which is not supported",
+                                def_name
+                            );
+                            tracing::error!("{}", error_msg);
+                            return Err(error_msg);
+                        }
+                    } else {
+                        all_defs.insert(def_name.clone(), def_schema.clone());
+                    }
                 }
             }
+        }
+
+        // Clone parameters and remove $defs to avoid duplication in schema
+        // since they are moved to the root level
+        let mut parameters = tool.function.parameters.clone();
+        if let serde_json::Value::Object(ref mut map) = parameters {
+            map.remove("$defs");
         }
 
         let tool_schema = serde_json::json!({
@@ -127,7 +147,7 @@ fn build_required_json_schema(tools: &[Tool], parallel_tool_calls: bool) -> Resu
                     "type": "string",
                     "enum": [tool.function.name]
                 },
-                "parameters": tool.function.parameters
+                "parameters": parameters
             },
             "required": ["name", "parameters"]
         });
@@ -147,9 +167,9 @@ fn build_required_json_schema(tools: &[Tool], parallel_tool_calls: bool) -> Resu
         array_schema["maxItems"] = serde_json::json!(1);
     }
 
-    // Add $defs to root level if any were found
-    if !defs.is_empty() {
-        array_schema["$defs"] = serde_json::Value::Object(defs);
+    // Add $defs to root level if any were found (matching Python's behavior)
+    if !all_defs.is_empty() {
+        array_schema["$defs"] = serde_json::Value::Object(all_defs);
     }
 
     serde_json::to_string(&array_schema)
@@ -157,25 +177,41 @@ fn build_required_json_schema(tools: &[Tool], parallel_tool_calls: bool) -> Resu
 }
 
 /// Build JSON schema for specific function choice.
+/// Includes $defs extraction from the tool's parameters (matching Python's behavior).
 fn build_specific_function_json_schema(
     tool: &Tool,
     _parallel_tool_calls: bool,
 ) -> Result<String, String> {
-    let schema = serde_json::json!({
+    let mut array_schema = serde_json::json!({
         "type": "array",
         "minItems": 1,
-        "maxItems": 1,
-        "items": {
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "enum": [tool.function.name]
-                },
-                "parameters": tool.function.parameters
-            },
-            "required": ["name", "parameters"]
-        }
+        "maxItems": 1
     });
 
-    serde_json::to_string(&schema).map_err(|e| format!("Failed to serialize json schema: {}", e))
+    // Extract $defs from tool parameters and add to root level (matching Python's behavior)
+    let mut parameters = tool.function.parameters.clone();
+    
+    if let serde_json::Value::Object(ref mut params) = parameters {
+        if let Some(serde_json::Value::Object(defs)) = params.remove("$defs") {
+             if !defs.is_empty() {
+                array_schema["$defs"] = serde_json::Value::Object(defs);
+            }
+        }
+    }
+
+    let item_schema = serde_json::json!({
+        "properties": {
+            "name": {
+                "type": "string",
+                "enum": [tool.function.name]
+            },
+            "parameters": parameters
+        },
+        "required": ["name", "parameters"]
+    });
+
+    array_schema["items"] = item_schema;
+
+    serde_json::to_string(&array_schema)
+        .map_err(|e| format!("Failed to serialize json schema: {}", e))
 }
