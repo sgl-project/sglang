@@ -38,6 +38,9 @@ pub fn build_tool_call_constraint(
 
     match choice {
         ToolChoice::Value(ToolChoiceValue::Auto) => {
+            if tools.is_empty() {
+                return Ok(None);
+            }
             let parser = get_tool_parser(tool_parser_factory, configured_parser, model);
 
             let tag = parser.build_structural_tag(tools, false, !parallel_tool_calls)?;
@@ -45,19 +48,32 @@ pub fn build_tool_call_constraint(
         }
 
         ToolChoice::Value(ToolChoiceValue::Required) => {
+            if tools.is_empty() {
+                return Ok(None);
+            }
             let schema = build_required_json_schema(tools, parallel_tool_calls)?;
             Ok(Some(("json_schema".to_string(), schema)))
         }
 
-        ToolChoice::Function { .. } => {
+        ToolChoice::Function {
+            tool_type: _,
+            function,
+        } => {
+            let target_tool = tools.iter().find(|t| t.function.name == function.name);
+            if let Some(tool) = target_tool {
+                let schema = build_specific_function_json_schema(tool, parallel_tool_calls)?;
+                Ok(Some(("json_schema".to_string(), schema)))
+            } else {
+                Ok(None)
+            }
+        }
+
+        ToolChoice::AllowedTools {
+            tool_type: _, mode, ..
+        } => {
             if tools.is_empty() {
                 return Ok(None);
             }
-            let schema = build_specific_function_json_schema(&tools[0], parallel_tool_calls)?;
-            Ok(Some(("json_schema".to_string(), schema)))
-        }
-
-        ToolChoice::AllowedTools { mode, .. } => {
             if mode == "required" {
                 let schema = build_required_json_schema(tools, parallel_tool_calls)?;
                 Ok(Some(("json_schema".to_string(), schema)))
@@ -93,7 +109,18 @@ fn get_tool_parser(
 /// Build JSON schema for required tool choice mode.
 fn build_required_json_schema(tools: &[Tool], parallel_tool_calls: bool) -> Result<String, String> {
     let mut any_of_schemas = Vec::new();
+    let mut defs = serde_json::Map::new();
+
     for tool in tools {
+        // Extract any $defs from tool parameters
+        if let Some(params_def) = tool.function.parameters.get("$defs") {
+            if let Some(params_def_obj) = params_def.as_object() {
+                for (key, value) in params_def_obj {
+                    defs.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
         let tool_schema = serde_json::json!({
             "properties": {
                 "name": {
@@ -118,6 +145,11 @@ fn build_required_json_schema(tools: &[Tool], parallel_tool_calls: bool) -> Resu
 
     if !parallel_tool_calls {
         array_schema["maxItems"] = serde_json::json!(1);
+    }
+
+    // Add $defs to root level if any were found
+    if !defs.is_empty() {
+        array_schema["$defs"] = serde_json::Value::Object(defs);
     }
 
     serde_json::to_string(&array_schema)

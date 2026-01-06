@@ -306,7 +306,7 @@ impl ToolParser for JsonParser {
     fn get_format_info(&self, tool_name: &str) -> (String, String, String) {
         let begin = format!(r#"{{"name":"{}", "arguments":"#, tool_name);
         let end = "\"}".to_string();
-        let trigger = "[".to_string();
+        let trigger = "[TOOL_CALLS]".to_string();
         (begin, end, trigger)
     }
 }
