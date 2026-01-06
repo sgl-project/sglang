@@ -24,6 +24,7 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     Runtime,
     WorkerType,
 )
+from .gateway import Gateway, WorkerInfo
 from .gpu_allocator import (
     GPUAllocator,
     GPUInfo,
@@ -107,6 +108,9 @@ __all__ = [
     "ModelInstance",
     "ModelPool",
     "MODEL_SPECS",
+    # Gateway
+    "Gateway",
+    "WorkerInfo",
     # Default model paths
     "DEFAULT_MODEL_PATH",
     "DEFAULT_SMALL_MODEL_PATH",
