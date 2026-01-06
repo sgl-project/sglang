@@ -254,25 +254,27 @@ fn random_select(healthy_indices: &[usize]) -> usize {
     healthy_indices[random_idx]
 }
 
-fn select_min_by<F>(healthy_indices: &[usize], get_value: F) -> usize
+fn select_min_by<K, V, F>(indices: &[K], get_value: F) -> K
 where
-    F: Fn(usize) -> usize,
+    K: Copy,
+    V: Ord,
+    F: Fn(K) -> V,
 {
-    let mut min_val = usize::MAX;
+    let mut min_val: Option<V> = None;
     let mut candidates = Vec::new();
 
-    for &idx in healthy_indices {
+    for &idx in indices {
         let val = get_value(idx);
-        match val.cmp(&min_val) {
-            std::cmp::Ordering::Less => {
-                min_val = val;
+        match min_val.as_ref().map(|m| val.cmp(m)) {
+            None | Some(std::cmp::Ordering::Less) => {
+                min_val = Some(val);
                 candidates.clear();
                 candidates.push(idx);
             }
-            std::cmp::Ordering::Equal => {
+            Some(std::cmp::Ordering::Equal) => {
                 candidates.push(idx);
             }
-            std::cmp::Ordering::Greater => {}
+            Some(std::cmp::Ordering::Greater) => {}
         }
     }
 
