@@ -2661,10 +2661,17 @@ class ModelRunner:
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
             return
 
+        graph_name = defaultdict(
+            lambda: "cuda graph",
+            {
+                "cpu": "cpu graph",
+                "npu": "npu graph",
+            },
+        )
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            f"Capture {graph_name[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
         graph_runners = defaultdict(
             lambda: CudaGraphRunner,
@@ -2678,7 +2685,7 @@ class ModelRunner:
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
         logger.info(
-            f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"Capture {graph_name[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 

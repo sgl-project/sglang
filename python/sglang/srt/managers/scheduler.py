@@ -1094,9 +1094,9 @@ class Scheduler(
         enable_profiling: bool = (
             os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
         )
-        prof_bs: int = os.getenv("PROFILING_BS", 8)
+        prof_bs: int = int(os.getenv("PROFILING_BS", 8))
         profiling_stage: str = os.getenv("PROFILING_STAGE", "decode")
-        prof_step: int = os.getenv("PROFILING_step", 10)
+        prof_step: int = int(os.getenv("PROFILING_step", 10))
         if enable_profiling:
             prof_cnt = 0
             import torch_npu
