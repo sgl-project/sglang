@@ -468,10 +468,11 @@ class ModelPool:
                 # Check health
                 if instance.health_check():
                     logger.info(
-                        "[%.1fs] %s is healthy at %s (check #%d)",
+                        "[%.1fs] %s is healthy at %s (router url: %s) (check #%d)",
                         elapsed,
                         key,
                         instance.base_url,
+                        instance.worker_url,
                         check_count,
                     )
                     instance._healthy = True

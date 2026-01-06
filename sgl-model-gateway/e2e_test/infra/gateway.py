@@ -245,6 +245,7 @@ class Gateway:
             cmd.extend(extra_args)
 
         logger.info("Starting %s on port %d", log_msg or "gateway", self.port)
+        logger.debug("Gateway command: %s", " ".join(cmd))
 
         self.process = subprocess.Popen(
             cmd,
