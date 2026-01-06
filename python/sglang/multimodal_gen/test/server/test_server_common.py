@@ -114,34 +114,34 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             output_size=output_size,
             output_format=sampling_params.output_format,
         )
-        warmup.run_text_warmups(server_args.warmup_text)
+        if server_args.warmup > 0:
+            if sampling_params.image_path and case.sampling_params.prompt:
+                # Handle URL or local path
+                image_path_list = sampling_params.image_path
+                if not isinstance(image_path_list, list):
+                    image_path_list = [image_path_list]
 
-        if (
-            case.server_args.warmup_edit > 0
-            and case.sampling_params.prompt
-            and sampling_params.image_path
-        ):
-            # Handle URL or local path
-            image_path_list = sampling_params.image_path
-            if not isinstance(image_path_list, list):
-                image_path_list = [image_path_list]
+                new_image_path_list = []
+                for image_path in image_path_list:
+                    if is_image_url(image_path):
+                        new_image_path_list.append(
+                            download_image_from_url(str(image_path))
+                        )
+                    else:
+                        path_obj = Path(image_path)
+                        if not path_obj.exists():
+                            pytest.skip(f"{case.id}: file missing: {image_path}")
+                        new_image_path_list.append(path_obj)
 
-            new_image_path_list = []
-            for image_path in image_path_list:
-                if is_image_url(image_path):
-                    new_image_path_list.append(download_image_from_url(str(image_path)))
-                else:
-                    new_image_path_list.append(Path(image_path))
-                    if not image_path.exists():
-                        pytest.skip(f"{case.id}: file missing: {image_path}")
+                image_path_list = new_image_path_list
 
-            image_path_list = new_image_path_list
-
-            warmup.run_edit_warmups(
-                count=server_args.warmup_edit,
-                edit_prompt=sampling_params.prompt,
-                image_path=image_path_list,
-            )
+                warmup.run_edit_warmups(
+                    count=server_args.warmup,
+                    edit_prompt=sampling_params.prompt,
+                    image_path=image_path_list,
+                )
+            else:
+                warmup.run_text_warmups(server_args.warmup)
     except Exception as exc:
         logger.error("Warm-up failed for %s: %s", case.id, exc)
         ctx.cleanup()

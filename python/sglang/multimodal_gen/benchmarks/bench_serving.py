@@ -30,6 +30,7 @@ import asyncio
 import glob
 import json
 import os
+import re
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -40,6 +41,10 @@ import aiohttp
 import numpy as np
 import requests
 from tqdm.asyncio import tqdm
+
+
+def is_dir_not_empty(path):
+    return os.path.isdir(path) and bool(os.listdir(path))
 
 
 @dataclass
@@ -141,8 +146,14 @@ class VBenchDataset(BaseDataset):
         """Auto-download VBench I2V dataset and return the dataset directory."""
         vbench_i2v_dir = os.path.join(self.cache_dir, "vbench_i2v", "vbench2_beta_i2v")
         info_json_path = os.path.join(vbench_i2v_dir, "data", "i2v-bench-info.json")
+        crop_dir = os.path.join(vbench_i2v_dir, "data", "crop")
+        origin_dir = os.path.join(vbench_i2v_dir, "data", "origin")
 
-        if os.path.exists(info_json_path):
+        if (
+            os.path.exists(info_json_path)
+            and is_dir_not_empty(crop_dir)
+            and is_dir_not_empty(origin_dir)
+        ):
             return vbench_i2v_dir
 
         print(f"Downloading VBench I2V dataset to {vbench_i2v_dir}...")
@@ -162,10 +173,16 @@ class VBenchDataset(BaseDataset):
                 capture_output=True,
                 text=True,
             )
-
             if result.returncode != 0:
                 raise RuntimeError(f"Download script failed: {result.stderr}")
-
+            missing_packages = re.findall(r"(\S+): command not found", result.stderr)
+            if missing_packages:
+                missing_packages = list(set(missing_packages))
+                package_list = ", ".join(f"'{cmd}'" for cmd in missing_packages)
+                raise RuntimeError(
+                    f"Download script failed because the following commands are not installed: {package_list}.\n"
+                    "Please install them (e.g., on Ubuntu: `sudo apt install ...`) and try again."
+                )
             print(f"Successfully downloaded VBench I2V dataset to {vbench_i2v_dir}")
         except Exception as e:
             print(f"Failed to download VBench I2V dataset: {e}")
@@ -240,7 +257,6 @@ class VBenchDataset(BaseDataset):
     def _load_i2v_data(self) -> List[Dict[str, Any]]:
         """Load I2V data from VBench I2V dataset or user-provided path."""
         path = self.args.dataset_path
-
         # Auto-download if no path provided
         if not path:
             path = self._auto_download_i2v_dataset()
