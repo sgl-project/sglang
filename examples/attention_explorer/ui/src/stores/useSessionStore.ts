@@ -74,12 +74,13 @@ export const useSessionStore = create<SessionState>((set) => ({
   appendAttention: (entry) =>
     set((state) => {
       // Get step from entry (attention entries have step property)
+      // Server sends step starting at 1, so token index = step - 1
       const step = 'step' in entry ? (entry as any).step :
                    'decode_step' in entry ? (entry as any).decode_step :
-                   state.currentAttention.size;
+                   state.currentAttention.size + 1;  // Fallback: next index + 1
 
-      // Use step as token index (step 1 = token index 0, etc.)
-      const tokenIndex = step - 1;
+      // Guard against invalid step values (step should be >= 1)
+      const tokenIndex = Math.max(0, step - 1);
 
       const newAttention = new Map(state.currentAttention);
       newAttention.set(tokenIndex, entry);
