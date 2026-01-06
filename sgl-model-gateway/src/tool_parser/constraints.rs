@@ -190,10 +190,9 @@ fn build_specific_function_json_schema(
 
     // Extract $defs from tool parameters and add to root level (matching Python's behavior)
     let mut parameters = tool.function.parameters.clone();
-    
     if let serde_json::Value::Object(ref mut params) = parameters {
         if let Some(serde_json::Value::Object(defs)) = params.remove("$defs") {
-             if !defs.is_empty() {
+            if !defs.is_empty() {
                 array_schema["$defs"] = serde_json::Value::Object(defs);
             }
         }
