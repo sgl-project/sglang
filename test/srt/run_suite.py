@@ -76,9 +76,6 @@ suites = {
         TestFile("test_torchao.py", 103),
         TestFile("test_utils_update_weights.py", 29),
         TestFile("test_video_utils.py", 5),
-        TestFile("test_vision_chunked_prefill.py", 150),
-        TestFile("test_vision_openai_server_a.py", 778),
-        TestFile("test_vlm_input_format.py", 166),
         TestFile("test_modelopt_export.py", 9),
     ],
     "per-commit-2-gpu": [
@@ -157,7 +154,6 @@ suites = {
         TestFile("test_eval_accuracy_large.py"),
         TestFile("test_gpt_oss_common.py"),
         TestFile("test_moe_eval_accuracy_large.py"),
-        TestFile("test_vision_openai_server_common.py"),
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
