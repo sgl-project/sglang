@@ -560,7 +560,8 @@
             },
             "expected_e2e_ms": 1029.96,
             "expected_avg_denoise_ms": 98.46,
-            "expected_median_denoise_ms": 109.65
+            "expected_median_denoise_ms": 109.65,
+            "estimated_full_test_time_s": 49.8
         },
         "qwen_image_edit_ti2i": {
             "stages_ms": {
@@ -694,7 +695,8 @@
             },
             "expected_e2e_ms": 5982.78,
             "expected_avg_denoise_ms": 104.84,
-            "expected_median_denoise_ms": 102.01
+            "expected_median_denoise_ms": 102.01,
+            "estimated_full_test_time_s": 904.0
         },
         "wan2_1_t2v_1.3b": {
             "stages_ms": {
@@ -951,7 +953,8 @@
             },
             "expected_e2e_ms": 45109.63,
             "expected_avg_denoise_ms": 830.86,
-            "expected_median_denoise_ms": 831.34
+            "expected_median_denoise_ms": 831.34,
+            "estimated_full_test_time_s": 149.1
         },
         "fastwan2_2_ti2v_5b": {
             "stages_ms": {
@@ -1641,7 +1644,8 @@
             },
             "expected_e2e_ms": 24895.28,
             "expected_avg_denoise_ms": 596.59,
-            "expected_median_denoise_ms": 599.66
+            "expected_median_denoise_ms": 599.66,
+            "estimated_full_test_time_s": 139.8
         }
     }
 }
