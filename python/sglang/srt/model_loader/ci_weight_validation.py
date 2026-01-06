@@ -64,6 +64,40 @@ def _validate_safetensors_file(file_path: str) -> bool:
         return False
 
 
+def _validate_safetensors_only(
+    hf_folder: str, allow_patterns: List[str]
+) -> Tuple[bool, List[str]]:
+    """
+    Simple validation that only checks safetensors files for corruption.
+
+    This is used for post-download validation where we just want to catch
+    corrupted/truncated downloads, not do full cache validation.
+
+    Args:
+        hf_folder: Path to the downloaded model folder
+        allow_patterns: Patterns used to match weight files
+
+    Returns:
+        Tuple of (is_valid, corrupted_files)
+    """
+    # Find all weight files that were downloaded
+    weight_files: List[str] = []
+    for pattern in allow_patterns:
+        weight_files.extend(glob_module.glob(os.path.join(hf_folder, pattern)))
+
+    if not weight_files:
+        return True, []  # No weight files to validate
+
+    # Validate safetensors files only
+    corrupted_files = []
+    for f in weight_files:
+        if f.endswith(".safetensors") and os.path.exists(f):
+            if not _validate_safetensors_file(f):
+                corrupted_files.append(f)
+
+    return len(corrupted_files) == 0, corrupted_files
+
+
 def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
     """
     Check if all files listed in safetensors index files actually exist on disk.
@@ -506,27 +540,20 @@ def ci_download_with_retry(
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
 
-        # Validate downloaded files to catch corruption early
-        is_valid, error_msg, corrupted_files = validate_hf_weights(
+        # Simple validation: just check for corrupted safetensors files
+        is_valid, corrupted_files = _validate_safetensors_only(
             hf_folder, allow_patterns
         )
 
         if is_valid:
             return hf_folder
 
-        # Validation failed - clean up and retry
         log_info_on_rank0(
             logger,
-            f"Validation failed for {model_name_or_path}: {error_msg}",
+            f"Corrupted files for {model_name_or_path}: "
+            f"{[os.path.basename(f) for f in corrupted_files]}",
         )
-
-        if corrupted_files:
-            # Selective cleanup for corrupted files
-            remove_hf_weights(hf_folder, corrupted_files)
-        elif "Incomplete download" in (error_msg or ""):
-            # Full cleanup for incomplete downloads
-            remove_hf_weights(hf_folder)
-        # For missing shards, let snapshot_download handle it on retry
+        remove_hf_weights(hf_folder, corrupted_files)
 
         if attempt < max_retries - 1:
             log_info_on_rank0(
