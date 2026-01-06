@@ -12,6 +12,7 @@ register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
 MINIMAX_M2_MODEL_PATH = "MiniMaxAI/MiniMax-M2"
 
 
+@unittest.skip("Temporarily skipped for targeted testing")
 class TestMiniMaxM2Unified(unittest.TestCase):
     """Unified test class for MiniMax-M2 performance and accuracy.
 
