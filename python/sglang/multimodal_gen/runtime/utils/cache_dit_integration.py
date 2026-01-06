@@ -53,7 +53,8 @@ def _patch_cache_dit_similarity():
 
         sp_group = getattr(self, "_sglang_sp_group", None)
         tp_group = getattr(self, "_sglang_tp_group", None)
-        target_group = sp_group or tp_group
+        tp_sp_group = getattr(self, "_sglang_tp_sp_group", None)
+        target_group = tp_sp_group or sp_group or tp_group
 
         if target_group is None:
             return _original_similarity(
@@ -316,6 +317,18 @@ def enable_cache_on_transformer(
         if context_manager is not None:
             context_manager._sglang_sp_group = sp_group
             context_manager._sglang_tp_group = tp_group
+            # In mixed TP + SP (Ulysses/Ring) mode, cache-dit decisions must be consistent
+            # across the full TP×SP model-parallel slice. Prefer using SGLang's DIT group
+            # as a conservative superset group; fallback to None.
+            tp_sp_group = None
+            if sp_group is not None and tp_group is not None:
+                from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                    get_dit_group,
+                )
+
+                tp_sp_group = get_dit_group()
+
+            context_manager._sglang_tp_sp_group = tp_sp_group
 
     return transformer
 
@@ -488,5 +501,16 @@ def enable_cache_on_dual_transformer(
             if context_manager is not None:
                 context_manager._sglang_sp_group = sp_group
                 context_manager._sglang_tp_group = tp_group
+                tp_sp_group = None
+                if sp_group is not None and tp_group is not None:
+                    try:
+                        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                            get_dit_group,
+                        )
+
+                        tp_sp_group = get_dit_group()
+                    except Exception:
+                        tp_sp_group = None
+                context_manager._sglang_tp_sp_group = tp_sp_group
 
     return transformer, transformer_2
