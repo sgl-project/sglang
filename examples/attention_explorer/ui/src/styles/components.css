@@ -1148,6 +1148,29 @@
   margin-top: var(--space-xs);
 }
 
+/* Spectral Section (uses DistanceHistogram and FFTSpectrum) */
+.signal-spectral {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  margin-top: var(--space-sm);
+  padding-top: var(--space-sm);
+  border-top: 1px solid var(--border);
+}
+
+.signal-spectral-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.signal-spectral-header {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg);
+  margin-bottom: var(--space-xs);
+}
+
 /* MoE Tab */
 .drawer-moe {
   display: flex;
@@ -1276,5 +1299,279 @@
   .token-lens-drawer.hovering,
   .token-lens-drawer.pinned {
     transform: translateY(0);
+  }
+}
+
+/* ==========================================================================
+   Distance & Rhythm Components
+   ========================================================================== */
+
+/* Container for side-by-side layout */
+.distance-rhythm-container {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-md);
+  margin-top: var(--space-sm);
+}
+
+.distance-section,
+.rhythm-section {
+  min-width: 0;
+}
+
+.subsection-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+  margin-bottom: var(--space-xs);
+}
+
+/* Distance Histogram */
+.distance-histogram {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.distance-histogram.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 60px;
+  color: var(--muted);
+}
+
+.histogram-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 48px;
+  padding: 2px 0;
+}
+
+.histogram-bar-container {
+  flex: 1;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.histogram-bar-container:hover {
+  opacity: 1 !important;
+}
+
+.histogram-bar-container.selected .histogram-bar {
+  box-shadow: 0 0 4px currentColor;
+}
+
+.histogram-bar {
+  width: 100%;
+  min-height: 2px;
+  border-radius: 1px 1px 0 0;
+  transition: height 0.2s ease, opacity 0.15s ease;
+}
+
+.histogram-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  color: var(--muted);
+  padding-top: 2px;
+}
+
+.zone-marker {
+  font-weight: 500;
+}
+
+.zone-marker.local {
+  color: var(--accent);
+}
+
+.zone-marker.mid {
+  color: var(--secondary);
+}
+
+.zone-marker.long {
+  color: var(--warn);
+}
+
+.histogram-summary {
+  display: flex;
+  justify-content: center;
+  margin-top: var(--space-xs);
+}
+
+.zone-badge {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-weight: 500;
+}
+
+.zone-badge.local {
+  background: rgba(122, 162, 255, 0.15);
+  color: var(--accent);
+}
+
+.zone-badge.mid {
+  background: rgba(85, 214, 166, 0.15);
+  color: var(--secondary);
+}
+
+.zone-badge.long {
+  background: rgba(255, 204, 102, 0.15);
+  color: var(--warn);
+}
+
+.zone-badge.diffuse {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--muted);
+}
+
+/* Compact mode */
+.distance-histogram.compact .histogram-bars {
+  height: 36px;
+}
+
+.distance-histogram.compact .histogram-axis,
+.distance-histogram.compact .histogram-summary {
+  display: none;
+}
+
+/* FFT Spectrum */
+.fft-spectrum {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.fft-spectrum.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 60px;
+  color: var(--muted);
+}
+
+.spectrum-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 48px;
+  padding: 2px 0;
+}
+
+.spectrum-bar-container {
+  flex: 1;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  position: relative;
+}
+
+.spectrum-bar {
+  width: 100%;
+  min-height: 2px;
+  border-radius: 1px 1px 0 0;
+  background: linear-gradient(180deg, var(--accent) 0%, var(--secondary) 100%);
+  transition: height 0.2s ease;
+}
+
+.spectrum-bar-container.peak .spectrum-bar {
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+}
+
+.peak-marker {
+  position: absolute;
+  top: -10px;
+  font-size: 8px;
+  color: var(--accent);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.spectrum-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  color: var(--muted);
+  padding-top: 2px;
+}
+
+.spectrum-summary {
+  text-align: center;
+  margin-top: var(--space-xs);
+}
+
+.zone-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.zone-desc {
+  font-size: 10px;
+  margin-top: 2px;
+}
+
+.energy-split {
+  display: flex;
+  height: 6px;
+  gap: 2px;
+  margin-top: var(--space-xs);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.energy-bar {
+  min-width: 4px;
+  transition: flex 0.3s ease;
+}
+
+.energy-bar.low {
+  background: var(--secondary);
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+}
+
+.energy-bar.high {
+  background: var(--warn);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+.energy-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+/* Compact mode */
+.fft-spectrum.compact .spectrum-bars {
+  height: 36px;
+}
+
+.fft-spectrum.compact .spectrum-axis,
+.fft-spectrum.compact .spectrum-summary,
+.fft-spectrum.compact .energy-split,
+.fft-spectrum.compact .energy-labels {
+  display: none;
+}
+
+/* Responsive: Stack on narrow screens */
+@media (max-width: 500px) {
+  .distance-rhythm-container {
+    grid-template-columns: 1fr;
+    gap: var(--space-sm);
   }
 }
