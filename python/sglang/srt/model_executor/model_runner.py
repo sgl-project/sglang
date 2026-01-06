@@ -159,6 +159,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
@@ -312,6 +313,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
+        self.tokenizer = None
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -2373,6 +2375,40 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else forward_batch.seq_lens - 1
             ),
         )
+
+        # Print sampled token IDs
+        print(f"DEBUG: Sampled next_token_ids: {next_token_ids}", flush=True)
+
+        if self.tokenizer is None:
+            try:
+                self.tokenizer = get_tokenizer(
+                    self.server_args.tokenizer_path,
+                    tokenizer_mode=self.server_args.tokenizer_mode,
+                    trust_remote_code=self.server_args.trust_remote_code,
+                    revision=self.server_args.revision,
+                )
+            except Exception as e:
+                print(f"DEBUG: Failed to load tokenizer: {e}", flush=True)
+
+        if self.tokenizer is not None:
+            try:
+                # Convert tensor to list for decoding
+                if isinstance(next_token_ids, torch.Tensor):
+                    ids_list = next_token_ids.cpu().tolist()
+                else:
+                    # Fallback for other types if any (e.g. numpy, or list)
+                    ids_list = list(next_token_ids)
+                
+                # If it's a single integer (0-d tensor converted to list might behave differently depending on conversion),
+                # but sample usually returns 1D tensor [batch_size].
+                if isinstance(ids_list, int):
+                    ids_list = [ids_list]
+                
+                decoded_text = self.tokenizer.batch_decode(ids_list)
+                print(f"DEBUG: Decoded text: {decoded_text}", flush=True)
+            except Exception as e:
+                print(f"DEBUG: Failed to decode tokens: {e}", flush=True)
+
         return next_token_ids
 
     def compute_logprobs_only(
