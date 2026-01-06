@@ -48,7 +48,6 @@ class TestBenchServingFunctionality(CustomTestCase):
                     dataset_name="generated-shared-prefix",
                     num_prompts=NUM_CONVERSATIONS,
                     request_rate=float("inf"),
-                    disable_ignore_eos=True,
                     gsp_num_groups=2,
                     gsp_prompts_per_group=2,
                     gsp_system_prompt_len=64,
