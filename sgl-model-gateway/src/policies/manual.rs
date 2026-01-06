@@ -705,6 +705,7 @@ mod tests {
         let config = ManualConfig {
             eviction_interval_secs: 0,
             max_idle_secs: 3600,
+            assignment_mode: ManualAssignmentMode::Random,
         };
         let policy = ManualPolicy::with_config(config);
         assert!(policy._eviction_task.is_none());
@@ -753,6 +754,7 @@ mod tests {
         let config = ManualConfig {
             eviction_interval_secs: 2,
             max_idle_secs: 2,
+            assignment_mode: ManualAssignmentMode::Random,
         };
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);

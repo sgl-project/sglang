@@ -40,7 +40,7 @@ async fn test_guard_dropped_when_response_body_consumed() {
     let response = Response::new(body);
 
     // Attach guard
-    let guard = WorkerLoadGuard::new(worker.clone());
+    let guard = WorkerLoadGuard::new(worker.clone(), None);
     assert_eq!(worker.worker_load().value(), 1);
 
     let guarded_response = AttachedBody::wrap_response(response, guard);
@@ -65,7 +65,7 @@ async fn test_guard_dropped_when_response_dropped_without_consumption() {
         let body = Body::from("Hello, World!");
         let response = Response::new(body);
 
-        let guard = WorkerLoadGuard::new(worker.clone());
+        let guard = WorkerLoadGuard::new(worker.clone(), None);
         assert_eq!(worker.worker_load().value(), 1);
 
         let _guarded_response = AttachedBody::wrap_response(response, guard);
@@ -89,7 +89,7 @@ async fn test_streaming_guard_dropped_when_stream_ends() {
     let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
 
     let response = create_sse_response(rx);
-    let guard = WorkerLoadGuard::new(worker.clone());
+    let guard = WorkerLoadGuard::new(worker.clone(), None);
     assert_eq!(worker.worker_load().value(), 1);
 
     let guarded_response = AttachedBody::wrap_response(response, guard);
@@ -136,7 +136,7 @@ async fn test_streaming_guard_dropped_on_client_disconnect() {
     let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
 
     let response = create_sse_response(rx);
-    let guard = WorkerLoadGuard::new(worker.clone());
+    let guard = WorkerLoadGuard::new(worker.clone(), None);
     assert_eq!(worker.worker_load().value(), 1);
 
     let guarded_response = AttachedBody::wrap_response(response, guard);
@@ -174,8 +174,8 @@ async fn test_multiple_guards_all_dropped() {
         let response = Response::new(body);
 
         // Create guards for both workers (simulates dual prefill/decode)
-        let guard1 = WorkerLoadGuard::new(worker1.clone());
-        let guard2 = WorkerLoadGuard::new(worker2.clone());
+        let guard1 = WorkerLoadGuard::new(worker1.clone(), None);
+        let guard2 = WorkerLoadGuard::new(worker2.clone(), None);
         assert_eq!(worker1.worker_load().value(), 1);
         assert_eq!(worker2.worker_load().value(), 1);
 
@@ -200,7 +200,7 @@ async fn test_guard_with_empty_body() {
         let body = Body::empty();
         let response = Response::new(body);
 
-        let guard = WorkerLoadGuard::new(worker.clone());
+        let guard = WorkerLoadGuard::new(worker.clone(), None);
         assert_eq!(worker.worker_load().value(), 1);
 
         let guarded_response = AttachedBody::wrap_response(response, guard);
