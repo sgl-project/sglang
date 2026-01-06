@@ -80,7 +80,7 @@ def _create_bench_client_session():
 
 @dataclass
 class RequestFuncInput:
-    prompt: str
+    prompt: Union[str, List[str], List[Dict[str, str]]]
     api_url: str
     prompt_len: int
     output_len: int
@@ -1835,9 +1835,8 @@ def sample_generated_shared_prefix_requests(
             range(prompts_per_group), desc="Generating questions", leave=False
         ):
             flat_index = group_idx * prompts_per_group + prompt_idx
-            turn_questions = [
-                questions[flat_index * num_turns + t] for t in range(num_turns)
-            ]
+            q_start = flat_index * num_turns
+            turn_questions = questions[q_start : q_start + num_turns]
             turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[
                 1:
             ]
@@ -2177,7 +2176,6 @@ async def benchmark(
 
     is_multi_turn = isinstance(input_requests[0].prompt, list)
     if is_multi_turn:
-        assert args.disable_ignore_eos, "multi-turn requires disable-ignore-eos"
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
 
     # Limit concurrency
