@@ -16,6 +16,8 @@ class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "true"
+        os.environ["MC_FORCE_MNNVL"] = "true"
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
 
         # Non blocking start servers
@@ -27,6 +29,12 @@ class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
         cls.wait_server_ready(cls.decode_url + "/health")
 
         cls.launch_lb()
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("SGLANG_MOONCAKE_CUSTOM_MEM_POOL")
+        os.environ.pop("MC_FORCE_MNNVL")
+        super().tearDownClass()
 
     @classmethod
     def start_prefill(cls):
