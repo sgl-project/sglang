@@ -5,6 +5,8 @@ import json
 import os
 import shlex
 import socket
+import subprocess
+import sys
 import time
 import unittest
 from pathlib import Path
@@ -20,7 +22,6 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     RequestPerfRecord,
     get_diffusion_perf_log_dir,
 )
-from sglang.multimodal_gen.test.cli.test_generate_common import run_command
 
 logger = init_logger(__name__)
 
@@ -114,6 +115,26 @@ def wait_for_port(host="127.0.0.1", port=30010, deadline=300.0, interval=0.5):
             return True
         time.sleep(interval)
     raise TimeoutError(f"Port {host}:{port} not ready. Last error: {last_err}")
+
+
+def run_command(command) -> Optional[bool]:
+    """Runs a command and returns the execution time and status."""
+    print(f"Running command: {shlex.join(command)}")
+
+    with subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+    ) as process:
+        for line in process.stdout:
+            sys.stdout.write(line)
+        process.wait()
+        if process.returncode == 0:
+            return True
+        print(f"Command failed with exit code {process.returncode}")
+    return False
 
 
 def check_image_size(ut, image, width, height):
