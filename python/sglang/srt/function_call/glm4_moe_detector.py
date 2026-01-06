@@ -189,8 +189,10 @@ class Glm4MoeDetector(BaseFormatDetector):
             for match_result in match_result_list:
                 # Get function name
                 func_detail = self.func_detail_regex.search(match_result)
-                func_name = func_detail.group(1)
-                func_args = func_detail.group(2)
+                if func_detail is None:
+                    continue
+                func_name = func_detail.group(1) if func_detail.group(1) else ""
+                func_args = func_detail.group(2) if func_detail.group(2) else ""
                 pairs = self.func_arg_regex.findall(func_args)
 
                 # Parse arguments using shared method
@@ -426,9 +428,18 @@ class Glm4MoeDetector(BaseFormatDetector):
                 flags=re.DOTALL,
             )
             if partial_match:
-                func_name = partial_match.group(1).strip()
-                func_args_raw = partial_match.group(2).strip()
+                func_name_raw = partial_match.group(1)
+                func_args_raw = partial_match.group(2)
                 is_tool_end = partial_match.group(3)
+
+                # Only proceed if we have a non-empty function name
+                if func_name_raw is None or not func_name_raw.strip():
+                    # If we only have the start token without a function name,
+                    # continue buffering until we get more content
+                    return StreamingParseResult(normal_text="", calls=[])
+
+                func_name = func_name_raw.strip()
+                func_args_raw = func_args_raw.strip() if func_args_raw else ""
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -447,7 +458,6 @@ class Glm4MoeDetector(BaseFormatDetector):
 
                 # Send tool name first if not sent yet
                 if not self.current_tool_name_sent:
-                    assert func_name, "func_name should not be empty"
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
@@ -476,6 +486,10 @@ class Glm4MoeDetector(BaseFormatDetector):
                             raw_increment, func_name, tools
                         )
 
+                        # CRITICAL: Update streamed length BEFORE checking json_increment
+                        # Even if json_increment is empty, the input has been consumed by the state machine
+                        self._streamed_raw_length = current_raw_length
+
                         if json_increment:
                             calls.append(
                                 ToolCallItem(
@@ -488,9 +502,6 @@ class Glm4MoeDetector(BaseFormatDetector):
                             self.streamed_args_for_tool[
                                 self.current_tool_id
                             ] += json_increment
-
-                        # Update the streamed length
-                        self._streamed_raw_length = current_raw_length
 
                     if is_tool_end == self.eot_token:
                         if self._is_first_param:

@@ -30,7 +30,7 @@ def _jit_norm_module(head_dims: int) -> Module:
 @cache_once
 def can_use_fused_inplace_qknorm(head_dim: int) -> bool:
     logger = logging.getLogger(__name__)
-    if head_dim not in [64, 128, 256]:
+    if head_dim not in [64, 128, 256, 512, 1024]:
         logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")
         return False
     try:

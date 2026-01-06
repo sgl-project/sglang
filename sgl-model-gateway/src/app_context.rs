@@ -14,14 +14,15 @@ use crate::{
     },
     mcp::McpManager,
     middleware::TokenBucket,
+    observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::router_manager::RouterManager,
     tokenizer::{
         cache::{CacheConfig, CachedTokenizer},
         factory as tokenizer_factory,
+        registry::TokenizerRegistry,
         traits::Tokenizer,
-        TokenizerRegistry,
     },
     tool_parser::ParserFactory as ToolParserFactory,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
@@ -62,6 +63,7 @@ pub struct AppContext {
     pub mcp_manager: Arc<OnceLock<Arc<McpManager>>>,
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
+    pub inflight_tracker: Arc<InFlightRequestTracker>,
 }
 
 pub struct AppContextBuilder {
@@ -275,6 +277,7 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError("mcp_manager"))?,
             wasm_manager: self.wasm_manager,
             worker_service,
+            inflight_tracker: InFlightRequestTracker::new(),
         })
     }
 

@@ -21,7 +21,7 @@ use crate::routers::{
 };
 
 /// Response processing stage (delegates to endpoint-specific implementations)
-pub struct ResponseProcessingStage {
+pub(crate) struct ResponseProcessingStage {
     chat_stage: ChatResponseProcessingStage,
     generate_stage: GenerateResponseProcessingStage,
     embedding_stage: EmbeddingResponseProcessingStage,

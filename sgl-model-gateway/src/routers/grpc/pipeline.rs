@@ -11,7 +11,7 @@ use tracing::{debug, error};
 // Import embedding-specific and classify-specific stages
 use super::regular::stages::classify::ClassifyResponseProcessingStage;
 use super::{
-    common::stages::*,
+    common::{responses::ResponsesContext, stages::*},
     context::*,
     harmony,
     regular::{
@@ -29,7 +29,7 @@ use super::{
     utils::error_type_from_status,
 };
 use crate::{
-    core::WorkerRegistry,
+    core::{WorkerRegistry, UNKNOWN_MODEL_ID},
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     policies::PolicyRegistry,
     protocols::{
@@ -48,7 +48,7 @@ use crate::{
 /// Orchestrates all stages from request preparation to response delivery.
 /// Configured differently for regular vs PD mode.
 #[derive(Clone)]
-pub struct RequestPipeline {
+pub(crate) struct RequestPipeline {
     stages: Arc<Vec<Box<dyn PipelineStage>>>,
     /// Backend type for metrics labeling
     backend_type: &'static str,
@@ -129,6 +129,7 @@ impl RequestPipeline {
     }
 
     /// Create a Harmony PD (prefill-decode) pipeline
+    #[allow(dead_code)]
     pub fn new_harmony_pd(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
@@ -369,9 +370,6 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
     ) -> Response {
         let start = Instant::now();
-        // Clone model_id for metrics before moving into context
-        // GenerateRequest doesn't have a model field, so we use model_id
-        let model_for_metrics = model_id.clone();
         let streaming = request.stream;
 
         // Record request start
@@ -379,12 +377,12 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model_for_metrics.as_deref().unwrap_or("unknown"),
+            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
             metrics_labels::ENDPOINT_GENERATE,
             bool_to_static_str(streaming),
         );
 
-        let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
+        let mut ctx = RequestContext::for_generate(request, headers, model_id.clone(), components);
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
@@ -393,7 +391,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_for_metrics.as_deref().unwrap_or("unknown"),
+                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                         metrics_labels::ENDPOINT_GENERATE,
                         start.elapsed(),
                     );
@@ -405,7 +403,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_for_metrics.as_deref().unwrap_or("unknown"),
+                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                         metrics_labels::ENDPOINT_GENERATE,
                         error_type_from_status(response.status()),
                     );
@@ -425,7 +423,7 @@ impl RequestPipeline {
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_for_metrics.as_deref().unwrap_or("unknown"),
+                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                     metrics_labels::ENDPOINT_GENERATE,
                     start.elapsed(),
                 );
@@ -442,7 +440,7 @@ impl RequestPipeline {
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_for_metrics.as_deref().unwrap_or("unknown"),
+                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                     metrics_labels::ENDPOINT_GENERATE,
                     metrics_labels::ERROR_INTERNAL,
                 );
@@ -457,7 +455,7 @@ impl RequestPipeline {
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_for_metrics.as_deref().unwrap_or("unknown"),
+                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                     metrics_labels::ENDPOINT_GENERATE,
                     metrics_labels::ERROR_INTERNAL,
                 );
@@ -475,8 +473,8 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
     ) -> Response {
         debug!(
-            "execute_embeddings: Starting execution for model: {:?}",
-            model_id
+            "execute_embeddings: Starting execution for model: {}",
+            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID)
         );
         let start = Instant::now();
 
@@ -485,7 +483,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model_id.as_deref().unwrap_or("unknown"),
+            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
             metrics_labels::ENDPOINT_EMBEDDINGS,
             bool_to_static_str(false),
         );
@@ -504,7 +502,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or("unknown"),
+                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                         metrics_labels::ENDPOINT_EMBEDDINGS,
                         start.elapsed(),
                     );
@@ -527,7 +525,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or("unknown"),
+                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                         metrics_labels::ENDPOINT_EMBEDDINGS,
                         error_type_from_status(response.status()),
                     );
@@ -541,22 +539,16 @@ impl RequestPipeline {
             ctx.state.response.final_response
         );
         match ctx.state.response.final_response {
-            Some(FinalResponse::Embedding(_)) => {
-                error!("execute_embeddings: Embedding FinalResponse found, but pipeline finished without returning response directly. This should be handled by the last stage.");
-                // Already handled in ResponseProcessingStage, but just in case
+            Some(FinalResponse::Embedding(response)) => {
                 Metrics::record_router_duration(
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_id.as_deref().unwrap_or("unknown"),
+                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                     metrics_labels::ENDPOINT_EMBEDDINGS,
                     start.elapsed(),
                 );
-                // The response should have been returned by the last stage
-                error::internal_error(
-                    "pipeline_fallthrough",
-                    "Pipeline finished without returning response",
-                )
+                axum::Json(response).into_response()
             }
             Some(_) => {
                 error!(function = "execute_embeddings", "Wrong response type");
@@ -581,8 +573,8 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
     ) -> Response {
         debug!(
-            "execute_classify: Starting execution for model: {:?}",
-            model_id
+            "execute_classify: Starting execution for model: {}",
+            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID)
         );
         let start = Instant::now();
 
@@ -591,7 +583,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model_id.as_deref().unwrap_or("unknown"),
+            model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
             metrics_labels::ENDPOINT_CLASSIFY,
             bool_to_static_str(false), // Classify is never streaming
         );
@@ -610,7 +602,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or("unknown"),
+                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                         metrics_labels::ENDPOINT_CLASSIFY,
                         start.elapsed(),
                     );
@@ -633,7 +625,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        model_id.as_deref().unwrap_or("unknown"),
+                        model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                         metrics_labels::ENDPOINT_CLASSIFY,
                         error_type_from_status(response.status()),
                     );
@@ -647,20 +639,16 @@ impl RequestPipeline {
             ctx.state.response.final_response
         );
         match ctx.state.response.final_response {
-            Some(FinalResponse::Classify(_)) => {
-                error!("execute_classify: Classify FinalResponse found, but pipeline finished without returning response directly. This should be handled by the last stage.");
+            Some(FinalResponse::Classify(response)) => {
                 Metrics::record_router_duration(
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    model_id.as_deref().unwrap_or("unknown"),
+                    model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
                     metrics_labels::ENDPOINT_CLASSIFY,
                     start.elapsed(),
                 );
-                error::internal_error(
-                    "pipeline_fallthrough",
-                    "Pipeline finished without returning response",
-                )
+                axum::Json(response).into_response()
             }
             Some(_) => {
                 error!(function = "execute_classify", "Wrong response type");
@@ -765,7 +753,7 @@ impl RequestPipeline {
     pub async fn execute_harmony_responses(
         &self,
         request: &crate::protocols::responses::ResponsesRequest,
-        harmony_ctx: &harmony::responses::HarmonyResponsesContext,
+        harmony_ctx: &ResponsesContext,
     ) -> Result<harmony::ResponsesIterationResult, Response> {
         // Create RequestContext for this Responses request
         let mut ctx = RequestContext::for_responses(
@@ -828,7 +816,7 @@ impl RequestPipeline {
     pub async fn execute_harmony_responses_streaming(
         &self,
         request: &crate::protocols::responses::ResponsesRequest,
-        harmony_ctx: &harmony::responses::HarmonyResponsesContext,
+        harmony_ctx: &ResponsesContext,
     ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
         // Create RequestContext for this Responses request
         let mut ctx = RequestContext::for_responses(

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use super::strip_protocol;
 use crate::{
     core::ConnectionMode,
     protocols::worker_spec::WorkerConfigRequest,
@@ -31,7 +32,10 @@ pub struct ServerInfo {
     pub model_id: Option<String>,
     pub model_path: Option<String>,
     pub served_model_name: Option<String>,
+    pub tp_size: Option<usize>,
     pub dp_size: Option<usize>,
+    pub load_balance_method: Option<String>,
+    pub disaggregation_mode: Option<String>,
     pub version: Option<String>,
     pub max_batch_size: Option<usize>,
     pub max_total_tokens: Option<usize>,
@@ -48,14 +52,6 @@ pub struct ModelInfo {
     pub is_generation: Option<bool>,
     pub model_type: Option<String>,
     pub architectures: Option<Vec<String>>,
-}
-
-/// Strip protocol prefix from URL.
-fn strip_protocol(url: &str) -> String {
-    url.trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .trim_start_matches("grpc://")
-        .to_string()
 }
 
 /// Fallback function to GET JSON from old endpoint (with "get_" prefix) for backward compatibility.
@@ -248,6 +244,18 @@ impl StepExecutor for DiscoverMetadataStep {
                         server_info.served_model_name.filter(|s| !s.is_empty())
                     {
                         labels.insert("served_model_name".to_string(), served_model_name);
+                    }
+                    if let Some(tp_size) = server_info.tp_size {
+                        labels.insert("tp_size".to_string(), tp_size.to_string());
+                    }
+                    if let Some(dp_size) = server_info.dp_size {
+                        labels.insert("dp_size".to_string(), dp_size.to_string());
+                    }
+                    if let Some(load_balance_method) = server_info.load_balance_method {
+                        labels.insert("load_balance_method".to_string(), load_balance_method);
+                    }
+                    if let Some(disaggregation_mode) = server_info.disaggregation_mode {
+                        labels.insert("disaggregation_mode".to_string(), disaggregation_mode);
                     }
                 }
 

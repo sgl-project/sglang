@@ -16,11 +16,11 @@ Usage:
     # Image
     t2i:
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task t2v --num-prompts 20
+         --backend sglang-image --dataset vbench --task t2i --num-prompts 20
 
-    i2v:
+    ti2i(edit):
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task i2v --num-prompts 20
+         --backend sglang-image --dataset vbench --task ti2i --num-prompts 20
 
 
 """
@@ -30,6 +30,7 @@ import asyncio
 import glob
 import json
 import os
+import re
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -40,6 +41,10 @@ import aiohttp
 import numpy as np
 import requests
 from tqdm.asyncio import tqdm
+
+
+def is_dir_not_empty(path):
+    return os.path.isdir(path) and bool(os.listdir(path))
 
 
 @dataclass
@@ -100,7 +105,7 @@ class VBenchDataset(BaseDataset):
         self.items = self._load_data()
 
     def _load_data(self) -> List[Dict[str, Any]]:
-        if self.args.task == "t2v":
+        if self.args.task == "t2v" or self.args.task == "t2i":
             return self._load_t2v_prompts()
         elif self.args.task in ["i2v", "ti2v", "ti2i"]:
             return self._load_i2v_data()
@@ -141,8 +146,14 @@ class VBenchDataset(BaseDataset):
         """Auto-download VBench I2V dataset and return the dataset directory."""
         vbench_i2v_dir = os.path.join(self.cache_dir, "vbench_i2v", "vbench2_beta_i2v")
         info_json_path = os.path.join(vbench_i2v_dir, "data", "i2v-bench-info.json")
+        crop_dir = os.path.join(vbench_i2v_dir, "data", "crop")
+        origin_dir = os.path.join(vbench_i2v_dir, "data", "origin")
 
-        if os.path.exists(info_json_path):
+        if (
+            os.path.exists(info_json_path)
+            and is_dir_not_empty(crop_dir)
+            and is_dir_not_empty(origin_dir)
+        ):
             return vbench_i2v_dir
 
         print(f"Downloading VBench I2V dataset to {vbench_i2v_dir}...")
@@ -162,10 +173,16 @@ class VBenchDataset(BaseDataset):
                 capture_output=True,
                 text=True,
             )
-
             if result.returncode != 0:
                 raise RuntimeError(f"Download script failed: {result.stderr}")
-
+            missing_packages = re.findall(r"(\S+): command not found", result.stderr)
+            if missing_packages:
+                missing_packages = list(set(missing_packages))
+                package_list = ", ".join(f"'{cmd}'" for cmd in missing_packages)
+                raise RuntimeError(
+                    f"Download script failed because the following commands are not installed: {package_list}.\n"
+                    "Please install them (e.g., on Ubuntu: `sudo apt install ...`) and try again."
+                )
             print(f"Successfully downloaded VBench I2V dataset to {vbench_i2v_dir}")
         except Exception as e:
             print(f"Failed to download VBench I2V dataset: {e}")
@@ -240,7 +257,6 @@ class VBenchDataset(BaseDataset):
     def _load_i2v_data(self) -> List[Dict[str, Any]]:
         """Load I2V data from VBench I2V dataset or user-provided path."""
         path = self.args.dataset_path
-
         # Auto-download if no path provided
         if not path:
             path = self._auto_download_i2v_dataset()
@@ -427,7 +443,6 @@ async def async_request_video_sglang(
 
     # 1. Submit Job
     job_id = None
-
     # Check if we need to upload images (Multipart) or just send JSON
     if input.image_paths and len(input.image_paths) > 0:
         # Use multipart/form-data
@@ -596,7 +611,7 @@ def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
     return metrics
 
 
-def wait_for_service(base_url: str, timeout: int = 120) -> None:
+def wait_for_service(base_url: str, timeout: int = 1200) -> None:
     print(f"Waiting for service at {base_url}...")
     start_time = time.time()
     while True:
@@ -638,12 +653,18 @@ async def benchmark(args):
 
     # Setup dataset
     if args.backend == "sglang-image":
-        if args.task == "i2v":
+        if args.task not in ["ti2i", "t2i"]:
+            raise Exception("sglang-image backend only support ti2i and t2i tasks.")
+        if args.task == "ti2i":
             api_url = f"{args.base_url}/v1/images/edits"
         else:
             api_url = f"{args.base_url}/v1/images/generations"
         request_func = async_request_image_sglang
     elif args.backend == "sglang-video":
+        if args.task not in ["t2v", "i2v", "ti2v"]:
+            raise Exception(
+                "sglang-video backend only support t2v, i2v and ti2v tasks."
+            )
         api_url = f"{args.base_url}/v1/videos"
         request_func = async_request_video_sglang
     else:
@@ -789,8 +810,8 @@ if __name__ == "__main__":
         "--task",
         type=str,
         default="t2v",
-        choices=["t2v", "i2v", "ti2v", "ti2i"],
-        help="Task type.",
+        choices=["t2v", "i2v", "ti2v", "ti2i", "t2i"],
+        help="Task type. t2v, i2v, ti2v are used for video generation. ti2i, t2i are used for image generation. ti2i is image edit task and t2i is image generation task.",
     )
     parser.add_argument(
         "--dataset-path",

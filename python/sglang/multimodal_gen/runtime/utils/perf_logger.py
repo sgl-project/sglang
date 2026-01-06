@@ -10,6 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import torch
 from dateutil.tz import UTC
 
 import sglang
@@ -32,6 +33,10 @@ class RequestTimings:
         self.stages: Dict[str, float] = {}
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
+
+    @property
+    def total_duration_s(self) -> float:
+        return self.total_duration_ms / 1000.0
 
     def record_stage(self, stage_name: str, duration_s: float):
         """Records the duration of a pipeline stage"""
@@ -130,29 +135,41 @@ class StageProfiler:
         stage_name: str,
         logger: _SGLDiffusionLogger,
         timings: Optional["RequestTimings"],
-        simple_log: bool = False,
+        log_stage_start_end: bool = False,
         perf_dump_path_provided: bool = False,
     ):
         self.stage_name = stage_name
         self.timings = timings
         self.logger = logger
-        self.simple_log = simple_log
         self.start_time = 0.0
-        self.enabled = perf_dump_path_provided or envs.SGLANG_DIFFUSION_STAGE_LOGGING
+        self.log_timing = perf_dump_path_provided or envs.SGLANG_DIFFUSION_STAGE_LOGGING
+        self.log_stage_start_end = log_stage_start_end
 
     def __enter__(self):
-        if self.simple_log:
+        if self.log_stage_start_end:
             self.logger.info(f"[{self.stage_name}] started...")
 
-        if (self.enabled and self.timings) or self.simple_log:
+        if (self.log_timing and self.timings) or self.log_stage_start_end:
+            if (
+                os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+                and self.stage_name.startswith("denoising_step_")
+                and torch.cuda.is_available()
+            ):
+                torch.cuda.synchronize()
             self.start_time = time.perf_counter()
 
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not ((self.enabled and self.timings) or self.simple_log):
+        if not ((self.log_timing and self.timings) or self.log_stage_start_end):
             return False
 
+        if (
+            os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+            and self.stage_name.startswith("denoising_step_")
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.synchronize()
         execution_time_s = time.perf_counter() - self.start_time
 
         if exc_type:
@@ -165,12 +182,12 @@ class StageProfiler:
             )
             return False
 
-        if self.simple_log:
+        if self.log_stage_start_end:
             self.logger.info(
                 f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds",
             )
 
-        if self.enabled and self.timings:
+        if self.log_timing and self.timings:
             if "denoising_step_" in self.stage_name:
                 index = int(self.stage_name[len("denoising_step_") :])
                 self.timings.record_steps(index, execution_time_s)
@@ -227,9 +244,9 @@ class PerformanceLogger:
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             with open(abs_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
-            logger.info(f"[Performance] Metrics dumped to: {abs_path}")
+            logger.info(f"Metrics dumped to: {abs_path}")
         except IOError as e:
-            logger.error(f"[Performance] Failed to dump metrics to {abs_path}: {e}")
+            logger.error(f"Failed to dump metrics to {abs_path}: {e}")
 
     @classmethod
     def log_request_summary(

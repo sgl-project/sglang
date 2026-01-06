@@ -14,6 +14,8 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 
 - `--model-path {MODEL_PATH}`: Path to the model or model ID
 - `--vae-path {VAE_PATH}`: Path to a custom VAE model or HuggingFace model ID (e.g., `fal/FLUX.2-Tiny-AutoEncoder`). If not specified, the VAE will be loaded from the main model path.
+- `--lora-path {LORA_PATH}`: Path to a LoRA adapter (local path or HuggingFace model ID). If not specified, LoRA will not be applied.
+- `--lora-nickname {NAME}`: Nickname for the LoRA adapter. (default: `default`).
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use
 - `--tp-size {TP_SIZE}`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
 - `--sp-degree {SP_SIZE}`: Sequence parallelism size (typically should match the number of GPUs)

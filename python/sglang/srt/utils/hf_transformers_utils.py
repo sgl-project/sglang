@@ -68,6 +68,7 @@ from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
+from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     ChatGLMConfig,
@@ -501,6 +502,7 @@ def get_tokenizer(
         )
 
     attach_additional_stop_token_ids(tokenizer)
+    tokenizer = patch_tokenizer(tokenizer)
     return tokenizer
 
 
