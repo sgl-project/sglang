@@ -63,6 +63,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -375,6 +376,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
+            routing_method_type=RoutingMethodType.DeepSeekV3,
             prefix=add_prefix("experts", prefix),
         )
 
