@@ -943,8 +943,13 @@ class ResponseReasoningParam(BaseModel):
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
+    type: Literal["web_search_preview", "code_interpreter", "function", "mcp"] = Field(
         description="Type of tool to enable"
+    )
+
+    # Function tool field (used when type == "function")
+    function: Optional[Function] = Field(
+        default=None, description="Function definition when type is 'function'"
     )
 
 
