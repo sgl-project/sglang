@@ -15,7 +15,7 @@
 import multiprocessing as mp
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
     LoRAAdaptor,
     LoRAModelCase,
@@ -23,6 +23,7 @@ from sglang.test.lora_utils import (
 )
 
 register_cuda_ci(est_time=97, suite="nightly-1-gpu", nightly=True)
+register_amd_ci(est_time=97, suite="stage-b-test-small-1-gpu")
 
 from sglang.test.test_utils import CustomTestCase
 
