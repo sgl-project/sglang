@@ -3212,6 +3212,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Send routing key in requests via X-SMG-Routing-Key header. Requests with the same prefix share the same routing key.",
     )
+    group.add_argument(
+        "--gsp-num-turns",
+        type=int,
+        default=1,
+        help="Number of turns for multi-turn conversations. If > 1, each prompt becomes a list of questions sharing the same system prefix.",
+    )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(
         "--mooncake-slowdown-factor",
