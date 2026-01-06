@@ -292,6 +292,17 @@ class CudaPlatformBase(Platform):
             else:
                 target_backend = AttentionBackendEnum.FA
 
+        # Ensure we have a target backend selected before validation/fallback.
+        if target_backend is None:
+            target_backend = AttentionBackendEnum.FA
+
+        if target_backend == AttentionBackendEnum.FA and cls.is_blackwell():
+            from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+                set_fa_ver,
+            )
+
+            set_fa_ver(4)
+
         if not cls.has_device_capability(80):
             logger.info("Cannot use FlashAttention backend for Volta and Turing GPUs.")
             target_backend = AttentionBackendEnum.TORCH_SDPA
