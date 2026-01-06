@@ -338,3 +338,236 @@ export function getTopKForLayer(
 
   return [];
 }
+
+// ============================================================================
+// TRACE SESSION - CANONICAL DATA MODEL
+// ============================================================================
+
+/**
+ * Segment types for trace analysis
+ * - system: System prompt tokens
+ * - user: User message tokens
+ * - assistant_think: Assistant's reasoning tokens (inside <think> tags)
+ * - assistant_final: Assistant's final output tokens
+ */
+export type SegmentType = 'system' | 'user' | 'assistant_think' | 'assistant_final';
+
+/**
+ * A contiguous segment of tokens with the same role/phase
+ */
+export interface Segment {
+  id: string;
+  type: SegmentType;
+  startTokenIndex: number;
+  endTokenIndex: number;  // Exclusive
+  messageId: string;
+}
+
+/**
+ * A single token in the trace with full context
+ */
+export interface TokenEntry {
+  index: number;          // Global index in the trace
+  tokenId?: number;       // Model's token ID (if available)
+  text: string;           // Decoded text
+  segmentId: string;      // Which segment this belongs to
+  role: 'prompt' | 'generated';
+}
+
+/**
+ * A decode step captures attention/routing for one generated token
+ */
+export interface DecodeStep {
+  tokenIndex: number;     // Which token this step generated
+  attention?: AttentionEntry;
+  moe?: MoERoutingEntry;
+  fingerprint?: Fingerprint;
+  manifoldZone?: ManifoldZone;
+}
+
+/**
+ * Aggregated session metrics
+ */
+export interface SessionMetrics {
+  avgEntropy: number;
+  avgLocalMass: number;
+  avgMidMass: number;
+  avgLongMass: number;
+  avgHubness?: number;
+  avgConsensus?: number;
+  dominantZone: ManifoldZone;
+}
+
+/**
+ * TraceSession is the canonical in-memory representation of a chat trace
+ * All UI views should read from this structure
+ */
+export interface TraceSession {
+  id: string;
+  model: string;
+  createdAt: number;
+  updatedAt: number;
+
+  // Raw messages (for display)
+  messages: Message[];
+
+  // Tokenized view
+  tokens: TokenEntry[];
+  segments: Segment[];
+
+  // Per-token decode data
+  steps: DecodeStep[];
+
+  // Session-level metrics
+  metrics?: SessionMetrics;
+
+  // Streaming state
+  isStreaming: boolean;
+  streamingTokenIndex: number;
+}
+
+/**
+ * Create an empty trace session
+ */
+export function createTraceSession(model: string): TraceSession {
+  return {
+    id: `trace-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    model,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    messages: [],
+    tokens: [],
+    segments: [],
+    steps: [],
+    isStreaming: false,
+    streamingTokenIndex: -1,
+  };
+}
+
+/**
+ * Detect segment boundaries from content
+ * Parses <think> tags to separate reasoning from final output
+ */
+export function detectSegments(
+  content: string,
+  messageId: string,
+  startIndex: number,
+  tokens: string[]
+): Segment[] {
+  const segments: Segment[] = [];
+
+  // Simple <think> tag detection
+  const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/);
+
+  if (thinkMatch) {
+    const thinkStart = content.indexOf('<think>');
+    const thinkEnd = content.indexOf('</think>') + '</think>'.length;
+
+    // Count tokens before think section
+    let charCount = 0;
+    const preThinkTokens: number[] = [];
+    const thinkTokens: number[] = [];
+    const postThinkTokens: number[] = [];
+
+    for (let i = 0; i < tokens.length; i++) {
+      const tokenLen = tokens[i].length;
+      const tokenStart = charCount;
+      const tokenEnd = charCount + tokenLen;
+
+      if (tokenEnd <= thinkStart) {
+        preThinkTokens.push(i);
+      } else if (tokenStart >= thinkEnd) {
+        postThinkTokens.push(i);
+      } else {
+        thinkTokens.push(i);
+      }
+
+      charCount += tokenLen;
+    }
+
+    // Create segments
+    if (preThinkTokens.length > 0) {
+      segments.push({
+        id: `${messageId}-pre`,
+        type: 'assistant_final',
+        startTokenIndex: startIndex + preThinkTokens[0],
+        endTokenIndex: startIndex + preThinkTokens[preThinkTokens.length - 1] + 1,
+        messageId,
+      });
+    }
+
+    if (thinkTokens.length > 0) {
+      segments.push({
+        id: `${messageId}-think`,
+        type: 'assistant_think',
+        startTokenIndex: startIndex + thinkTokens[0],
+        endTokenIndex: startIndex + thinkTokens[thinkTokens.length - 1] + 1,
+        messageId,
+      });
+    }
+
+    if (postThinkTokens.length > 0) {
+      segments.push({
+        id: `${messageId}-final`,
+        type: 'assistant_final',
+        startTokenIndex: startIndex + postThinkTokens[0],
+        endTokenIndex: startIndex + postThinkTokens[postThinkTokens.length - 1] + 1,
+        messageId,
+      });
+    }
+  } else {
+    // No think tags - single segment
+    segments.push({
+      id: `${messageId}-main`,
+      type: 'assistant_final',
+      startTokenIndex: startIndex,
+      endTokenIndex: startIndex + tokens.length,
+      messageId,
+    });
+  }
+
+  return segments;
+}
+
+/**
+ * Compute session metrics from decode steps
+ */
+export function computeSessionMetrics(steps: DecodeStep[]): SessionMetrics | undefined {
+  if (steps.length === 0) return undefined;
+
+  let totalEntropy = 0;
+  let totalLocal = 0;
+  let totalMid = 0;
+  let totalLong = 0;
+  let count = 0;
+
+  for (const step of steps) {
+    if (step.fingerprint) {
+      totalEntropy += step.fingerprint.entropy;
+      totalLocal += step.fingerprint.local_mass;
+      totalMid += step.fingerprint.mid_mass;
+      totalLong += step.fingerprint.long_mass;
+      count++;
+    }
+  }
+
+  if (count === 0) return undefined;
+
+  const avgLocal = totalLocal / count;
+  const avgMid = totalMid / count;
+  const avgLong = totalLong / count;
+
+  // Determine dominant zone
+  let dominantZone: ManifoldZone = 'diffuse';
+  if (avgLocal > 0.5) dominantZone = 'syntax_floor';
+  else if (avgMid > 0.5) dominantZone = 'semantic_bridge';
+  else if (avgLong > 0.3) dominantZone = 'long_range';
+
+  return {
+    avgEntropy: totalEntropy / count,
+    avgLocalMass: avgLocal,
+    avgMidMass: avgMid,
+    avgLongMass: avgLong,
+    dominantZone,
+  };
+}

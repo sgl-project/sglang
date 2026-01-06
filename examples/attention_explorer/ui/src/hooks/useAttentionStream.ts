@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useSessionStore } from '../stores/useSessionStore';
 import { useUIStore } from '../stores/useUIStore';
+import { useTraceStore } from '../stores/useTraceStore';
 import { AttentionStreamClient } from '../api/client';
 import { extractFingerprint, isFingerprintMode } from '../api/types';
 
@@ -22,6 +23,9 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
   const appendToken = useSessionStore((state) => state.appendToken);
   const appendAttention = useSessionStore((state) => state.appendAttention);
   const setFingerprint = useSessionStore((state) => state.setFingerprint);
+  const startStreaming = useSessionStore((state) => state.startStreaming);
+  const finishStreaming = useSessionStore((state) => state.finishStreaming);
+  const initTrace = useTraceStore((state) => state.initTrace);
 
   const clientRef = useRef<AttentionStreamClient | null>(null);
 
@@ -84,10 +88,12 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
         }
       },
       onFinish: () => {
+        finishStreaming();
         setIsStreaming(false);
       },
       onError: (err) => {
         setError(err);
+        finishStreaming();
         setIsStreaming(false);
       },
     });
@@ -97,7 +103,7 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
     return () => {
       client.abort();
     };
-  }, [baseUrl, model, program, appendToken, appendAttention, setFingerprint]);
+  }, [baseUrl, model, program, appendToken, appendAttention, setFingerprint, finishStreaming]);
 
   useEffect(() => {
     clientRef.current?.setProgram(program);
@@ -107,15 +113,26 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
     async (content: string) => {
       if (!clientRef.current) return;
 
+      // Initialize trace if not exists
+      const traceStore = useTraceStore.getState();
+      if (!traceStore.currentTrace) {
+        const modelName = useUIStore.getState().modelName;
+        initTrace(modelName);
+      }
+
       setIsStreaming(true);
       setError(null);
 
+      // Add user message (will sync to TraceStore)
       addMessage({
         id: `user-${Date.now()}`,
         role: 'user',
         content,
         timestamp: Date.now(),
       });
+
+      // Start streaming (notifies TraceStore)
+      startStreaming();
 
       const messages = useSessionStore.getState().messages.map((m) => ({
         role: m.role,
@@ -126,16 +143,18 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
         await clientRef.current.stream(messages);
       } catch (err) {
         setError(err as Error);
+        finishStreaming();
         setIsStreaming(false);
       }
     },
-    [addMessage]
+    [addMessage, initTrace, startStreaming, finishStreaming]
   );
 
   const abort = useCallback(() => {
     clientRef.current?.abort();
+    finishStreaming();
     setIsStreaming(false);
-  }, []);
+  }, [finishStreaming]);
 
   return {
     sendMessage,
