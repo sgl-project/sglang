@@ -7,12 +7,12 @@ use axum::body::Body;
 use bytes::Bytes;
 use http_body::Frame;
 
-pub struct AttachedBody<T: Send + 'static> {
+pub struct AttachedBody<T> {
     inner: Body,
     _attached: T,
 }
 
-impl<T: Send + 'static> AttachedBody<T> {
+impl<T> AttachedBody<T> {
     pub fn new(inner: Body, attached: T) -> Self {
         Self {
             inner,
@@ -21,7 +21,7 @@ impl<T: Send + 'static> AttachedBody<T> {
     }
 }
 
-impl<T: Send + 'static> http_body::Body for AttachedBody<T> {
+impl<T: Send + Unpin + 'static> http_body::Body for AttachedBody<T> {
     type Data = Bytes;
     type Error = axum::Error;
 
