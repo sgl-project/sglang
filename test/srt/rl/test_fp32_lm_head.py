@@ -33,7 +33,9 @@ class DummyMeta:
 class TestLMHeadFP32(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available() and not(hasattr(torch, "xpu") and torch.xpu.is_available()):
+        if not torch.cuda.is_available() and not (
+            hasattr(torch, "xpu") and torch.xpu.is_available()
+        ):
             raise unittest.SkipTest("needs CUDA GPU or XPU")
 
     def _make_logprocessor(self, vocab_size, enable_fp32):

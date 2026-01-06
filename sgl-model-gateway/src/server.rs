@@ -23,13 +23,16 @@ use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::{
+        job_queue::{JobQueue, JobQueueConfig},
         steps::{
             create_external_worker_registration_workflow, create_mcp_registration_workflow,
             create_tokenizer_registration_workflow, create_wasm_module_registration_workflow,
             create_wasm_module_removal_workflow, create_worker_registration_workflow,
             create_worker_removal_workflow, create_worker_update_workflow,
         },
-        Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
+        worker::WorkerType,
+        worker_manager::WorkerManager,
+        Job,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -654,7 +657,9 @@ pub fn build_app(
             max_payload_size,
         ))
         .layer(middleware::create_logging_layer())
-        .layer(middleware::HttpMetricsLayer::new())
+        .layer(middleware::HttpMetricsLayer::new(
+            app_state.context.inflight_tracker.clone(),
+        ))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
@@ -713,6 +718,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let app_context = Arc::new(
         AppContext::from_config(config.router_config.clone(), config.request_timeout_secs).await?,
     );
+
+    if config.prometheus_config.is_some() {
+        app_context.inflight_tracker.start_sampler(20);
+    }
 
     let weak_context = Arc::downgrade(&app_context);
     let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
