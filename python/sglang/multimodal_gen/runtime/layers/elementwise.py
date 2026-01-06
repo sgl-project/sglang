@@ -7,15 +7,15 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import fuse_scale_shift_ker
 class MulAdd(CustomOp):
     """
     Fuse elementwise mul and add
-    Input: a, b, c
-    Output: a * b + c
+    Input: a, b, c, OptionalInt[k]
+    Output: a * (k + b) + c
     """
 
     def __init__(self, prefix: str = ""):
         super().__init__()
 
     def forward_native(
-        self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+        self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
     ) -> torch.Tensor:
         # a.shape: [batch_size, seq_len, inner_dim]
         if b.dim() == 4:
@@ -27,7 +27,9 @@ class MulAdd(CustomOp):
             ).flatten(1, 2)
         else:
             # b.shape: [batch_size, 1, inner_dim]
-            return c + a * b
+            return c + a * (k + b)
 
-    def forward_cuda(self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
-        return fuse_scale_shift_kernel(a, b, c, scale_constant=0.0)
+    def forward_cuda(
+        self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
+    ):
+        return fuse_scale_shift_kernel(a, b, c, scale_constant=k)

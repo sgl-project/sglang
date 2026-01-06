@@ -29,7 +29,6 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
 )
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
-    fuse_scale_shift_kernel,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -713,14 +712,14 @@ class QwenImageTransformerBlock(nn.Module):
                 )
                 gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
                 return (
-                    x * (1 + scale_result) + shift_result,
+                    self.fuse_mul_add(x, scale_result, shift_result, k=1.0),
                     gate_result,
                 )
         else:
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
-            return fuse_scale_shift_kernel(x, scale_result, shift_result), gate_result
+            return self.fuse_mul_add(x, scale_result, shift_result, k=1.0), gate_result
 
     def forward(
         self,
