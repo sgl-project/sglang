@@ -128,6 +128,8 @@ def fp4_gemm(
     out_features: int,
 ) -> torch.Tensor:
     fp4_backend = get_fp4_gemm_runner_backend()
+    # TODO(shuw@nvidia.com): Remove the "cutlass" default override after flashinfer 0.6.0
+    # and let flashinfer's auto backend selection handle it.
     backend = fp4_backend.value if not fp4_backend.is_auto() else "cutlass"
     if enable_flashinfer_fp4_gemm:
         return flashinfer_fp4_gemm(
