@@ -13,7 +13,6 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::context::ResponsesContext;
 use crate::{
     data_connector::{self, ConversationId, ResponseId},
     mcp::{self, McpManager},
@@ -25,7 +24,7 @@ use crate::{
             ResponseOutputItem, ResponsesRequest,
         },
     },
-    routers::error,
+    routers::{error, grpc::common::responses::ResponsesContext},
 };
 
 // ============================================================================
