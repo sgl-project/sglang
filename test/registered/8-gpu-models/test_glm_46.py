@@ -12,7 +12,6 @@ register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
 GLM_4_6_MODEL_PATH = "zai-org/GLM-4.6"
 
 
-@unittest.skip("Temporarily skipped for targeted testing")
 class TestGLM46Unified(unittest.TestCase):
     """Unified test class for GLM-4.6 performance and accuracy.
 
