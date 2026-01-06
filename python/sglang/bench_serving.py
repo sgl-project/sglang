@@ -2097,57 +2097,27 @@ def calculate_metrics(
     return metrics, output_lens
 
 
-def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable:
-    print("Enable multi-round request function")
+MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
 
-    def compute_inner_input_prompt(
-        history_user_texts: List[str],
-        history_assistant_texts: List[str],
-        gen_prompt: str,
-    ):
-        assert len(history_user_texts) == len(history_assistant_texts)
-        history_conversations = []
-        for i in range(len(history_assistant_texts)):
-            history_conversations += [
-                {"role": "user", "content": history_user_texts[i]},
-                {"role": "assistant", "content": history_assistant_texts[i]},
-            ]
 
-        full_conversations = [
-            *history_conversations,
-            {"role": "user", "content": gen_prompt},
-        ]
-
-        history_text = (
-            tokenizer.apply_chat_template(
-                history_conversations,
-                add_generation_prompt=False,
-                tokenize=False,
-            ).replace(tokenizer.bos_token, "")
-            if len(history_conversations) > 0
-            else ""
-        )
-        full_text = tokenizer.apply_chat_template(
-            full_conversations,
-            add_generation_prompt=True,
-            tokenize=False,
-        ).replace(tokenizer.bos_token, "")
-        return history_text, full_text
+def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
+    assert backend in MULTI_TURN_BACKENDS, (
+        f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
+    )
 
     async def f(
         request_func_input: RequestFuncInput,
         pbar: Optional[tqdm] = None,
     ) -> List[RequestFuncOutput]:
         prompts: List[str] = request_func_input.prompt
+        prev_messages: List[Dict[str, str]] = []
         outputs = []
+
         for round_index in range(len(prompts)):
-            history_text, full_prompt = compute_inner_input_prompt(
-                history_user_texts=prompts[:round_index],
-                history_assistant_texts=[o.generated_text for o in outputs],
-                gen_prompt=prompts[round_index],
-            )
+            prev_messages.append({"role": "user", "content": prompts[round_index]})
+
             inner_input = RequestFuncInput(
-                prompt=full_prompt,
+                prompt=prev_messages,
                 model=request_func_input.model,
                 api_url=request_func_input.api_url,
                 prompt_len=request_func_input.prompt_len,
@@ -2159,10 +2129,12 @@ def wrap_multi_round_request_func(request_func: Callable, tokenizer) -> Callable
             output = await request_func(
                 inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
             )
-            output.metadata["multi_round_index"] = round_index
-            output.metadata["multi_round_len"] = len(prompts)
-            output.metadata["history_text"] = history_text
+            output.metadata["multi_turn_index"] = round_index
+            output.metadata["multi_turn_len"] = len(prompts)
             outputs.append(output)
+
+            prev_messages.append({"role": "assistant", "content": output.generated_text})
+
         return outputs
 
     return f
@@ -2197,10 +2169,10 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    is_multi_round = isinstance(input_requests[0].prompt, list)
-    if is_multi_round:
-        assert args.disable_ignore_eos, "multi-round requires disable-ignore-eos"
-        request_func = wrap_multi_round_request_func(request_func, tokenizer=tokenizer)
+    is_multi_turn = isinstance(input_requests[0].prompt, list)
+    if is_multi_turn:
+        assert args.disable_ignore_eos, "multi-turn requires disable-ignore-eos"
+        request_func = wrap_multi_turn_request_func(request_func, backend=backend)
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
@@ -2268,7 +2240,7 @@ async def benchmark(
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
 
-    if is_multi_round:
+    if is_multi_turn:
         warmup_outputs = [x for output in warmup_outputs for x in output]
 
     # Check if at least one warmup request succeeded
@@ -2376,7 +2348,7 @@ async def benchmark(
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
-    if is_multi_round:
+    if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
     # Stop profiler
@@ -2421,7 +2393,7 @@ async def benchmark(
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
-        input_requests=None if is_multi_round else input_requests,
+        input_requests=None if is_multi_turn else input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
