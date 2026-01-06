@@ -223,6 +223,7 @@ class Envs:
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
+    SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(30)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
 
     # Test: pd-disaggregation
@@ -418,6 +419,12 @@ class Envs:
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+
+    # Tokenizer
+    SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
+
+    # TokenizerManager
+    SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
     # fmt: on
 
