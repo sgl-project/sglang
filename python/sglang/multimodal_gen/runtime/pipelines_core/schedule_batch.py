@@ -11,7 +11,6 @@ in a functional manner, reducing the need for explicit parameter passing.
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import pprint
 from dataclasses import asdict, dataclass, field
@@ -20,6 +19,7 @@ from typing import Any, Optional
 import PIL.Image
 import torch
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
@@ -45,7 +45,7 @@ class Req:
     sampling_params member via __getattr__ and __setattr__.
     """
 
-    sampling_params: Any = None
+    sampling_params: SamplingParams | None = None
 
     generator: torch.Generator | list[torch.Generator] | None = None
 
@@ -166,9 +166,7 @@ class Req:
             object.__setattr__(self, name, value)
             return
 
-        req_fields = {f.name for f in dataclasses.fields(self)}
-
-        if name in req_fields:
+        if name in self.__class__.__dataclass_fields__:
             object.__setattr__(self, name, value)
             return
 
@@ -178,6 +176,8 @@ class Req:
                 setattr(sampling_params, name, value)
                 return
         except AttributeError:
+            # This can happen if `sampling_params` is not set yet. We'll fall through
+            # to setting the attribute on `self`.
             pass
 
         object.__setattr__(self, name, value)
