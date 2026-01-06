@@ -752,6 +752,7 @@ def get_similarities(vec1, vec2):
 
 def get_benchmark_args(
     base_url="",
+    backend="sglang",
     dataset_name="",
     dataset_path="",
     tokenizer="",
@@ -777,7 +778,7 @@ def get_benchmark_args(
     gsp_num_turns=1,
 ):
     return SimpleNamespace(
-        backend="sglang",
+        backend=backend,
         base_url=base_url,
         host=None,
         port=None,

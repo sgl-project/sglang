@@ -90,7 +90,6 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -101,19 +100,15 @@ class RequestFuncOutput:
     ttft: float = 0.0  # Time to first token
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
     text_chunks: List[str] = field(default_factory=list)
-    prompt: str = ""
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
-    metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
-        output.prompt = request_func_input.prompt
-        output.metadata = {**(request_func_input.metadata or {})}
         return output
 
 
@@ -2117,13 +2112,11 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
                 output_len=request_func_input.output_len,
                 lora_name=request_func_input.lora_name,
                 extra_request_body=request_func_input.extra_request_body,
-                metadata={**(request_func_input.metadata or {})},
+                image_data=None,
             )
             output = await request_func(
                 inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
             )
-            output.metadata["multi_turn_index"] = round_index
-            output.metadata["multi_turn_len"] = len(prompts)
             outputs.append(output)
 
             prev_messages.append({"role": "assistant", "content": output.generated_text})

@@ -43,6 +43,7 @@ class TestBenchServingFunctionality(CustomTestCase):
             try:
                 args = get_benchmark_args(
                     base_url=DEFAULT_URL_FOR_TEST,
+                    backend="sglang-oai-chat",
                     dataset_name="generated-shared-prefix",
                     num_prompts=NUM_CONVERSATIONS,
                     request_rate=float("inf"),
@@ -73,16 +74,14 @@ class TestBenchServingFunctionality(CustomTestCase):
         ]
         self.assertEqual(len(reqs), NUM_CONVERSATIONS * NUM_TURNS)
 
-        prompts = [r.get("obj", {}).get("text", "") for r in reqs]
-        prefix_pairs = sum(
-            1 for p1 in prompts for p2 in prompts if p1 != p2 and p2.startswith(p1)
-        )
-        expected_pairs = NUM_CONVERSATIONS * (NUM_TURNS - 1)
-        self.assertEqual(
-            prefix_pairs,
-            expected_pairs,
-            f"Expected {expected_pairs} prefix pairs, got {prefix_pairs}",
-        )
+        message_counts = [len(r.get("obj", {}).get("messages", [])) for r in reqs]
+        turn1_count = sum(1 for c in message_counts if c == 1)
+        turn2_count = sum(1 for c in message_counts if c == 3)
+        turn3_count = sum(1 for c in message_counts if c == 5)
+
+        self.assertEqual(turn1_count, NUM_CONVERSATIONS, "Turn 1 should have 1 message")
+        self.assertEqual(turn2_count, NUM_CONVERSATIONS, "Turn 2 should have 3 messages")
+        self.assertEqual(turn3_count, NUM_CONVERSATIONS, "Turn 3 should have 5 messages")
 
 
 if __name__ == "__main__":
