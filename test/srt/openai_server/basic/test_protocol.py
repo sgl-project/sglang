@@ -13,53 +13,19 @@
 # ==============================================================================
 """Tests for OpenAI API protocol models"""
 
-import json
-import time
 import unittest
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
-    BatchRequest,
-    BatchResponse,
-    ChatCompletionMessageContentImagePart,
-    ChatCompletionMessageContentTextPart,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
-    ChatCompletionResponseStreamChoice,
-    ChatCompletionStreamResponse,
-    ChatCompletionTokenLogprob,
     ChatMessage,
-    ChoiceLogprobs,
     CompletionRequest,
-    CompletionResponse,
-    CompletionResponseChoice,
-    DeltaMessage,
-    EmbeddingObject,
-    EmbeddingRequest,
-    EmbeddingResponse,
-    ErrorResponse,
-    FileDeleteResponse,
-    FileRequest,
-    FileResponse,
-    Function,
-    FunctionResponse,
-    JsonSchemaResponseFormat,
-    LogProbs,
     ModelCard,
     ModelList,
-    MultimodalEmbeddingInput,
-    ResponseFormat,
-    ScoringRequest,
-    ScoringResponse,
-    StreamOptions,
-    StructuralTagResponseFormat,
-    Tool,
-    ToolCall,
-    ToolChoice,
-    TopLogprob,
     UsageInfo,
 )
 

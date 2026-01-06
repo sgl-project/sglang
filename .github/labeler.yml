@@ -1,0 +1,110 @@
+# Configuration for the GitHub Labeler action
+# Automatically adds labels to PRs based on the files changed
+
+# Router specific (Rust code in sgl-model-gateway)
+model-gateway:
+  - changed-files:
+    - any-glob-to-any-file: 'sgl-model-gateway/**/*'
+
+# Kernel specific
+sgl-kernel:
+  - changed-files:
+    - any-glob-to-any-file: 'sgl-kernel/**/*'
+
+# Documentation
+documentation:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*.md'
+      - 'docs/**/*'
+      - 'README*'
+
+# Dependencies
+dependencies:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/requirements*.txt'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/pyproject*.toml'
+      - '**/setup.py'
+      - '**/poetry.lock'
+      - '**/package.json'
+      - '**/package-lock.json'
+
+# Multi-modal
+Multi-modal:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*multimodal*'
+      - '**/*vision*'
+      - '**/*vlm*'
+
+# Diffusion
+diffusion:
+  - changed-files:
+    - any-glob-to-any-file: 'python/sglang/multimodal_gen/**/*'
+
+# LoRA
+lora:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*lora*'
+
+# Quantization
+quant:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*quant*'
+      - '**/*quantization*'
+
+# Speculative decoding
+speculative-decoding:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*speculative*'
+
+# AMD specific
+amd:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*amd*'
+      - '**/*rocm*'
+
+# NPU specific
+npu:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*npu*'
+      - '**/*ascend*'
+
+# Blackwell
+blackwell:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*nvfp4*'
+      - 'sgl-kernel/csrc/attention/cutlass_sm100_mla/**/*'
+      - 'python/sglang/srt/layers/attention/trtllm_mla_backend.py'
+      - 'python/sglang/srt/layers/attention/trtllm_mha_backend.py'
+
+# DeepSeek specific
+deepseek:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*deepseek*'
+
+# HiCache
+hicache:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*hicache*'
+
+# Deterministic
+deterministic:
+  - changed-files:
+    - any-glob-to-any-file: 'python/sglang/srt/batch_invariant_ops/**/*'
+
+# Piecewise CUDA Graph
+piecewise-cuda-graph:
+  - changed-files:
+    - any-glob-to-any-file: 'python/sglang/srt/compilation/**/*'

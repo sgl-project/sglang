@@ -17,6 +17,10 @@ For the design details, please refer to [link](https://docs.google.com/document/
 
 Currently, we support Mooncake and NIXL as the transfer engine.
 
+## Profiling in PD Disaggregation Mode
+
+When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](https://docs.sglang.io/developer_guide/benchmark_and_profiling.html#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.
+
 ## Router Integration
 
 For deploying PD disaggregation at scale with load balancing and fault tolerance, SGLang provides a router. The router can distribute requests between prefill and decode instances using various routing policies. For detailed information on setting up routing with PD disaggregation, including configuration options and deployment patterns, see the [SGLang Router documentation](router.md#mode-3-prefill-decode-disaggregation).
@@ -37,6 +41,7 @@ uv pip install mooncake-transfer-engine
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
   --disaggregation-mode prefill \
+  --port 30000 \
   --disaggregation-ib-device mlx5_roce0
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -175,6 +180,7 @@ pip install . --config-settings=setup-args="-Ducx_path=/path/to/ucx"
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
   --disaggregation-mode prefill \
+  --port 30000 \
   --disaggregation-transfer-backend nixl
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -270,6 +276,10 @@ Use mooncake backend, more details can be found in mooncake section.
 ```bash
 export ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE=true
 ```
+ASCEND_NPU_PHY_ID need to be set in container env
+```bash
+export ASCEND_NPU_PHY_ID=xxx
+```
 
 
 ### Llama Single Node
@@ -278,6 +288,7 @@ export ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE=true
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
   --disaggregation-mode prefill \
+  --port 30000 \
   --disaggregation-transfer-backend ascend
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \

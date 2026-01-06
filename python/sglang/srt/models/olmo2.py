@@ -48,6 +48,12 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
 
 
+# Aligned with HF's implementation, using sliding window inclusive with the last token
+# SGLang assumes exclusive
+def get_attention_sliding_window_size(config):
+    return config.sliding_window - 1 if hasattr(config, "sliding_window") else None
+
+
 class Olmo2Attention(nn.Module):
     """
     This is the attention block where the output is computed as
@@ -85,6 +91,8 @@ class Olmo2Attention(nn.Module):
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
 
         self.head_dim = self.hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
 
@@ -93,6 +101,7 @@ class Olmo2Attention(nn.Module):
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
             bias=config.attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
@@ -104,12 +113,26 @@ class Olmo2Attention(nn.Module):
             eps=self.config.rms_norm_eps,
         )
         self.q_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
-        # Rotary embeddings.
+
+        sliding_window = None
+        if (
+            layer_types := getattr(self.config, "layer_types", None)
+        ) is not None and layer_types[layer_id] == "sliding_attention":
+            sliding_window = get_attention_sliding_window_size(self.config)
+
+        # Rotary embeddings. Rope scaling is only applied on full attention
+        # layers.
+        self.rope_scaling = (
+            self.config.rope_scaling
+            if sliding_window is None
+            else {"rope_type": "default"}
+        )
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
+            rope_scaling=self.rope_scaling,
         )
         self.scaling = self.head_dim**-0.5
         self.attn = RadixAttention(
@@ -118,6 +141,7 @@ class Olmo2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=sliding_window,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -152,7 +176,7 @@ class Olmo2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.chunk(chunks=3, dim=-1)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
@@ -224,6 +248,7 @@ class Olmo2DecoderLayer(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.layer_id = layer_id
         # Attention block.
         self.self_attn = Olmo2Attention(
             config, layer_id, quant_config, prefix=add_prefix("self_attn", prefix)
@@ -280,8 +305,8 @@ class Olmo2Model(nn.Module):
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Olmo2DecoderLayer(
-                layer_id=idx,
                 config=config,
+                layer_id=idx,
                 quant_config=quant_config,
                 prefix=prefix,
             ),
@@ -294,7 +319,7 @@ class Olmo2Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
+        input_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -351,6 +376,10 @@ class Olmo2ForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(config)
 
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
+
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

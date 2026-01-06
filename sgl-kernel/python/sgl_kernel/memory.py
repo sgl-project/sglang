@@ -16,3 +16,11 @@ def set_kv_buffer_kernel(
     except RuntimeError:  # ok, fallback to torch implementation
         k_cache[loc] = k
         v_cache[loc] = v
+
+
+def weak_ref_tensor(tensor):
+    return (
+        torch.ops.sgl_kernel.weak_ref_tensor(tensor)
+        if isinstance(tensor, torch.Tensor)
+        else tensor
+    )

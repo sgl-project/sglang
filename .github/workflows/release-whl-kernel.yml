@@ -17,13 +17,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-cu129:
+  build-cu129-matrix:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: x64-kernel-build-node
     strategy:
       matrix:
         python-version: ["3.10"]
         cuda-version: ["12.9"]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: x64-kernel-build-node
+          - arch: aarch64
+            runner: arm-kernel-build-node
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,7 +44,9 @@ jobs:
         run: |
           cd sgl-kernel
           chmod +x ./build.sh
-          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
+        env:
+          USE_CCACHE: 0
 
       - name: Upload to PyPI
         working-directory: sgl-kernel
@@ -49,11 +57,11 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
+          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}${{ matrix.arch == 'aarch64' && '-aarch64' || '' }}
           path: sgl-kernel/dist/*
 
   release-cu129:
-    needs: build-cu129
+    needs: build-cu129-matrix
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,14 +88,14 @@ jobs:
         with:
           tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
           repository: sgl-project/whl
-          token: ${{ secrets.WHL_TOKEN }}
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           files: |
             sgl-kernel/dist/*
 
       - name: Clone wheel index
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
         env:
-          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
 
       - name: Update wheel index
         run: python3 scripts/update_kernel_whl_index.py --cuda 129
@@ -101,13 +109,20 @@ jobs:
           git commit -m "update whl index"
           git push
 
-  build-cu129-aarch64:
+  # for now we do not release CUDA 13.0 wheels to pypi
+  build-cu130-matrix:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: arm-kernel-build-node
     strategy:
       matrix:
         python-version: ["3.10"]
-        cuda-version: ["12.9"]
+        cuda-version: ["13.0"]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: x64-kernel-build-node
+          - arch: aarch64
+            runner: arm-kernel-build-node
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -122,22 +137,18 @@ jobs:
         run: |
           cd sgl-kernel
           chmod +x ./build.sh
-          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" aarch64
-
-      - name: Upload to PyPI
-        working-directory: sgl-kernel
-        run: |
-          pip install twine
-          python3 -m twine upload --skip-existing dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
+          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
+        env:
+          USE_CCACHE: 0
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}-aarch64
+          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}${{ matrix.arch == 'aarch64' && '-aarch64' || '' }}
           path: sgl-kernel/dist/*
 
-  release-cu129-aarch64:
-    needs: build-cu129-aarch64
+  release-cu130:
+    needs: build-cu130-matrix
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -164,17 +175,17 @@ jobs:
         with:
           tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
           repository: sgl-project/whl
-          token: ${{ secrets.WHL_TOKEN }}
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           files: |
             sgl-kernel/dist/*
 
       - name: Clone wheel index
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
         env:
-          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
 
       - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --cuda 129
+        run: python3 scripts/update_kernel_whl_index.py --cuda 130
 
       - name: Push wheel index
         run: |

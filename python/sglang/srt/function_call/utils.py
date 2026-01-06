@@ -1,8 +1,8 @@
-import json
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, List, Literal, Optional, Tuple, Union
 
+import orjson
 import partial_json_parser
 from partial_json_parser.core.options import Allow
 
@@ -51,7 +51,7 @@ def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
 
 def _is_complete_json(input_str: str) -> bool:
     try:
-        json.loads(input_str)
+        orjson.loads(input_str)
         return True
     except JSONDecodeError:
         return False

@@ -7,19 +7,23 @@ from typing import Optional, Tuple
 import torch
 import triton
 
+from sglang.srt.server_args import get_global_server_args
+
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
 
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.schedule_batch import (
-    ScheduleBatch,
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
     get_last_loc,
-    global_server_args_dict,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -74,7 +78,10 @@ class NgramVerifyInput(SpecInput):
         batch.input_ids = self.draft_token
 
         if page_size == 1:
-            batch.out_cache_loc = batch.alloc_token_slots(len(batch.input_ids))
+            batch.out_cache_loc = alloc_token_slots(
+                batch.tree_cache,
+                len(batch.input_ids),
+            )
             end_offset = batch.seq_lens + self.draft_token_num
         else:
             # TODO(lsyin): add prefix lens cpu here to support page size > 1
@@ -87,7 +94,8 @@ class NgramVerifyInput(SpecInput):
                 batch.req_pool_indices,
                 prefix_lens,
             )
-            batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
+            batch.out_cache_loc = alloc_paged_token_slots_extend(
+                batch.tree_cache,
                 prefix_lens,
                 prefix_lens_cpu,
                 end_offset,
@@ -147,7 +155,7 @@ class NgramVerifyInput(SpecInput):
         batch: ScheduleBatch,
         logits_output: torch.Tensor,
     ):
-        accept_index_cpu = self.accept_index.tolist()
+        accept_index_cpu = self.accepted_indices.tolist()
         predict_cpu = self.predict.tolist()
         has_finished = False
 
@@ -163,7 +171,7 @@ class NgramVerifyInput(SpecInput):
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break
-                    self.accept_index[i, j + 1 :] = -1
+                    self.accepted_indices[i, j + 1 :] = -1
                     break
                 else:
                     if req.grammar is not None:
@@ -172,38 +180,46 @@ class NgramVerifyInput(SpecInput):
                         except ValueError as e:
                             logger.info(
                                 f"{i=}, {req=}\n"
-                                f"{self.accept_index=}\n"
+                                f"{self.accepted_indices=}\n"
                                 f"{self.predict=}\n"
                             )
                             raise e
             req.spec_verify_ct += 1
+            req.spec_accepted_tokens += (
+                sum(1 for idx in accept_index_row if idx != -1) - 1
+            )
+
         if has_finished:
-            self.accept_length = (self.accept_index != -1).sum(dim=1) - 1
-        self.accept_index = self.accept_index[self.accept_index != -1]
+            self.accept_length = (self.accepted_indices != -1).sum(dim=1) - 1
+        self.accepted_indices = self.accepted_indices[self.accepted_indices != -1]
 
         logits_output.next_token_logits = logits_output.next_token_logits[
-            self.accept_index
+            self.accepted_indices
         ]
         if logits_output.hidden_states:
-            logits_output.hidden_states = logits_output.hidden_states[self.accept_index]
-        self.verified_id = self.predict[self.accept_index]
+            logits_output.hidden_states = logits_output.hidden_states[
+                self.accepted_indices
+            ]
+        self.verified_id = self.predict[self.accepted_indices]
 
-    def _free_cache(self, batch: ScheduleBatch, page_size: int):
+    def _free_cache(
+        self, batch: ScheduleBatch, page_size: int, accept_length_cpu: torch.Tensor
+    ):
         bs = batch.batch_size()
         # Free the KV cache for unaccepted tokens
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
             evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
-            evict_mask[self.accept_index] = False
+            evict_mask[self.accepted_indices] = False
             batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
-            batch.out_cache_loc = batch.out_cache_loc[self.accept_index]
+            batch.out_cache_loc = batch.out_cache_loc[self.accepted_indices]
         else:
             # Shift the accepted tokens to the beginning.
             # Only evict the last part
             src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
                 batch.seq_lens,
                 batch.out_cache_loc,
-                self.accept_index,
+                self.accepted_indices,
                 self.accept_length,
                 self.draft_token_num,
                 page_size,
@@ -243,6 +259,11 @@ class NgramVerifyInput(SpecInput):
             )
             batch.out_cache_loc = tgt_cache_loc
 
+        accept_length_list = accept_length_cpu.tolist()
+        for i, req in enumerate(batch.reqs):
+            req.kv_committed_len += accept_length_list[i] + 1
+            req.kv_allocated_len = req.kv_committed_len
+
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
@@ -266,14 +287,14 @@ class NgramVerifyInput(SpecInput):
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         self.predict = torch.empty(predict_shape, dtype=torch.int32, device=self.device)
-        self.accept_index = torch.full(
+        self.accepted_indices = torch.full(
             (bs, self.draft_token_num), -1, dtype=torch.int32, device=self.device
         )
         self.accept_length = torch.empty((bs,), dtype=torch.int32, device=self.device)
 
         verify_tree_greedy(
             predicts=self.predict,  # mutable
-            accept_index=self.accept_index,  # mutable
+            accept_index=self.accepted_indices,  # mutable
             accept_token_num=self.accept_length,  # mutable
             candidates=candidates,
             retrive_index=self.retrive_index,
@@ -293,7 +314,7 @@ class NgramVerifyInput(SpecInput):
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         self.predict = torch.empty(predict_shape, dtype=torch.int32, device=self.device)
-        self.accept_index = torch.full(
+        self.accepted_indices = torch.full(
             (bs, self.draft_token_num), -1, dtype=torch.int32, device=self.device
         )
         self.accept_length = torch.empty((bs,), dtype=torch.int32, device=self.device)
@@ -335,7 +356,7 @@ class NgramVerifyInput(SpecInput):
         )
         tree_speculative_sampling_target_only(
             predicts=self.predict,  # mutable
-            accept_index=self.accept_index,  # mutable
+            accept_index=self.accepted_indices,  # mutable
             accept_token_num=self.accept_length,  # mutable
             candidates=candidates.to(torch.int64),
             retrive_index=self.retrive_index.to(torch.int64),
@@ -345,10 +366,8 @@ class NgramVerifyInput(SpecInput):
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
             draft_probs=draft_probs,
-            threshold_single=global_server_args_dict[
-                "speculative_accept_threshold_single"
-            ],
-            threshold_acc=global_server_args_dict["speculative_accept_threshold_acc"],
+            threshold_single=get_global_server_args().speculative_accept_threshold_single,
+            threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
             deterministic=True,
         )
 
@@ -396,7 +415,9 @@ class NgramVerifyInput(SpecInput):
             )
 
         # Sample tokens. Force greedy sampling on AMD
-        is_all_greedy = sampling_info.is_all_greedy
+        is_all_greedy = (
+            sampling_info.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
+        )
         if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
             logger.warning(
                 "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
@@ -407,14 +428,14 @@ class NgramVerifyInput(SpecInput):
             self._greedy_verify(batch, logits_output)
         else:
             # NOTE: Compared with greedy_verify, the performance of _sampling_verify is relatively poor.
-            self._greedy_verify(batch, logits_output)
-            # self._sampling_verify(batch, logits_output, sampling_info)
+            self._sampling_verify(batch, logits_output, sampling_info)
 
         self._fill_requests(batch, logits_output)
-        self._free_cache(batch, page_size)
 
         accept_length_cpu = self.accept_length.cpu()
         num_accepted_tokens = accept_length_cpu.sum().item()
+
+        self._free_cache(batch, page_size, accept_length_cpu)
 
         batch.seq_lens.add_(self.accept_length + 1)
         batch.seq_lens_cpu.add_(accept_length_cpu + 1)

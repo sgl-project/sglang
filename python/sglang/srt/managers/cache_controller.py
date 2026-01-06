@@ -14,15 +14,17 @@ limitations under the License.
 """
 
 import logging
-import math
 import threading
 import time
-from queue import Empty, Full, PriorityQueue, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Set, Tuple
+from queue import Empty, Full, Queue
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -38,23 +40,26 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
+
+device_module = get_device_module()
 
 
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
-        self.load_events = [torch.cuda.Event() for _ in range(num_layers)]
-        self.start_event = torch.cuda.Event()  # start event on controller stream
+        self.load_events = [device_module.Event() for _ in range(num_layers)]
+        self.start_event = device_module.Event()  # start event on controller stream
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         self.load_events[layer_index].record()
 
     def wait(self, layer_index: int):
-        torch.cuda.current_stream().wait_event(self.load_events[layer_index])
+        device_module.current_stream().wait_event(self.load_events[layer_index])
 
     @property
     def finish_event(self):
@@ -134,8 +139,8 @@ class CacheOperation:
 
 
 class HiCacheAck(NamedTuple):
-    start_event: torch.cuda.Event
-    finish_event: torch.cuda.Event
+    start_event: device_module.Event
+    finish_event: device_module.Event
     node_ids: List[int]
 
 
@@ -191,12 +196,14 @@ class StorageOperation:
         token_ids: List[int],
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
+        prefix_keys: Optional[List[str]] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
+        self.prefix_keys = prefix_keys
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -212,6 +219,7 @@ class PrefetchOperation(StorageOperation):
         host_indices: torch.Tensor,
         token_ids: List[int],
         last_hash: Optional[str] = None,
+        prefix_keys: Optional[List[str]] = None,
     ):
         self.request_id = request_id
 
@@ -219,7 +227,7 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.start_time = time.monotonic()
 
-        super().__init__(host_indices, token_ids, last_hash)
+        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -251,6 +259,8 @@ class HiCacheController:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
+        pp_rank: int = 0,
+        pp_size: int = 1,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -259,6 +269,8 @@ class HiCacheController:
         self.page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
 
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
@@ -301,16 +313,23 @@ class HiCacheController:
             # create a new communication group for synchronizing storage operations across TP workers
             self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
             if self.tp_world_size > 1:
+                from sglang.srt.distributed.parallel_state import (
+                    create_custom_parallel_group,
+                )
+
                 group_ranks = torch.distributed.get_process_group_ranks(tp_group)
-                self.prefetch_tp_group = torch.distributed.new_group(
-                    group_ranks, backend="gloo"
+                self.prefetch_tp_group = create_custom_parallel_group(
+                    group_ranks=group_ranks, backend="gloo"
                 )
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if self.storage_backend_type in ["hf3fs", "mooncake", "eic"]:
+            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic"]) or (
+                self.storage_backend_type == "dynamic"
+                and bool(self.storage_config.extra_config.get("interface_v1", 0))
+            ):
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
@@ -338,8 +357,8 @@ class HiCacheController:
             self.stop_event, buffer_count=10, max_buffer_size=100
         )
 
-        self.write_stream = torch.cuda.Stream()
-        self.load_stream = torch.cuda.Stream()
+        self.write_stream = device_module.Stream()
+        self.load_stream = device_module.Stream()
 
         if self.enable_storage:
             self.prefetch_thread = threading.Thread(
@@ -373,12 +392,14 @@ class HiCacheController:
             self.tp_size = get_tensor_model_parallel_world_size()
             self.dp_rank = 0
 
-        # Currently, AscendMLAPagedTokenToKVPool is the subclass of MLATokenToKVPool.
+        # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
             is_mla_model=is_mla_backend,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
@@ -440,11 +461,11 @@ class HiCacheController:
         host_indices, device_indices = self.move_indices(op)
         self.write_queue.clear()
 
-        start_event = torch.cuda.Event()
-        finish_event = torch.cuda.Event()
+        start_event = device_module.Event()
+        finish_event = device_module.Event()
 
         start_event.record()
-        with torch.cuda.stream(self.write_stream):
+        with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
@@ -491,6 +512,8 @@ class HiCacheController:
                 return host_indices, device_indices.index_select(0, idx)
             elif self.mem_pool_host.layout == "page_first_direct":
                 return host_indices, device_indices.cpu()
+        elif self.io_backend == "kernel_ascend":
+            return host_indices, device_indices.cpu()
         else:
             raise ValueError(f"Unsupported io backend")
 
@@ -505,7 +528,7 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
-        with torch.cuda.stream(self.load_stream):
+        with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
@@ -550,12 +573,13 @@ class HiCacheController:
         host_indices: torch.Tensor,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
+        prefix_keys: Optional[List[str]] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash
+            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -571,8 +595,12 @@ class HiCacheController:
         for page in pages:
             self.host_mem_release_queue.put(page)
 
-    def _page_get_zero_copy(self, operation, hash_values, host_indices):
-        results = self.storage_backend.batch_get_v1(hash_values, host_indices)
+    def _page_get_zero_copy(
+        self, operation, hash_values, host_indices, extra_info=None
+    ):
+        results = self.storage_backend.batch_get_v1(
+            hash_values, host_indices, extra_info
+        )
         inc = 0
         for i in range(len(hash_values)):
             if not results[i]:
@@ -584,7 +612,7 @@ class HiCacheController:
         operation.increment(inc)
 
     # todo: deprecate
-    def _generic_page_get(self, operation, hash_values, host_indices):
+    def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
         dummy_page_dst = [
             self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
         ]
@@ -608,6 +636,7 @@ class HiCacheController:
 
     def _page_transfer(self, operation):
         # Transfer batch by batch
+        prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
             batch_host_indices = operation.host_indices[
@@ -615,7 +644,8 @@ class HiCacheController:
             ]
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
-            self.page_get_func(operation, batch_hashes, batch_host_indices)
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
             # Check termination
             if (
                 operation.completed_tokens
@@ -623,10 +653,9 @@ class HiCacheController:
             ):
                 operation.mark_terminate()
                 break  # Some operations fail or operation terminated by controller
-        # release pre-allocated memory
-        self.append_host_mem_release(
-            operation.host_indices[operation.completed_tokens :]
-        )
+
+            if prefix_keys and len(prefix_keys) > 0:
+                prefix_keys += batch_hashes
 
     def prefetch_io_aux_func(self):
         """
@@ -656,6 +685,7 @@ class HiCacheController:
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
+        prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
 
         storage_query_count = 0
         hash_value = []
@@ -673,11 +703,15 @@ class HiCacheController:
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes)
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
                 break
+            if prefix_keys and len(prefix_keys) > 0:
+                prefix_keys += batch_hashes
+
         return hash_value, storage_query_count
 
     def prefetch_thread_func(self):
@@ -734,28 +768,34 @@ class HiCacheController:
         host_indices: torch.Tensor,
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
+        prefix_keys: Optional[List[str]] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
-        operation = StorageOperation(host_indices, token_ids, hash_value=hash_value)
+        operation = StorageOperation(
+            host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+        )
         self.backup_queue.put(operation)
         return operation.id
 
     # todo: deprecate
-    def _generic_page_set(self, hash_values, host_indices) -> bool:
+    def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
         data = [
             self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
             for i in range(len(hash_values))
         ]
         return self.storage_backend.batch_set(hash_values, data)
 
-    def _page_set_zero_copy(self, hash_values, host_indices) -> bool:
-        return all(self.storage_backend.batch_set_v1(hash_values, host_indices))
+    def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
+        return all(
+            self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
+        )
 
     # Backup batch by batch
     def _page_backup(self, operation):
         # Backup batch by batch
+        prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
             batch_host_indices = operation.host_indices[
@@ -763,12 +803,16 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            success = self.page_set_func(batch_hashes, batch_host_indices)
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
                 break
+
+            if prefix_keys and len(prefix_keys) > 0:
+                prefix_keys += batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
     def backup_thread_func(self):

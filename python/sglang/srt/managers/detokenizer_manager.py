@@ -21,17 +21,17 @@ from collections import OrderedDict
 from typing import Dict, List, Union
 
 import psutil
+import pybase64
 import setproctitle
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchMultimodalDecodeReq,
-    BatchMultimodalOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
     FreezeGCReq,
-    MultiTokenizerRegisterReq,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,
@@ -78,6 +79,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         port_args: PortArgs,
     ):
         # Init inter-process communication
+        self.init_ipc_channels(port_args)
+
+        # Init tokenizer
+        self.init_tokenizer(server_args)
+
+        # Init running status
+        self.init_running_status(server_args)
+
+        # Init dispatcher
+        self.init_request_dispatcher()
+
+    def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
@@ -86,6 +99,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
 
+    def init_tokenizer(self, server_args: ServerArgs):
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
         else:
@@ -96,28 +110,38 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 revision=server_args.revision,
             )
 
+    def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
-        self.is_dummy = server_args.load_format == "dummy"
+        self.is_dummy = False
+        self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
+        self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
 
+        self.soft_watchdog = Watchdog.create(
+            debug_name="DetokenizerManager",
+            watchdog_timeout=server_args.soft_watchdog_timeout,
+            soft=True,
+            test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
+        )
+
+    def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (BatchEmbeddingOutput, self.handle_batch_embedding_out),
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
-                (MultiTokenizerRegisterReq, lambda x: x),
                 (FreezeGCReq, self.handle_freeze_gc_req),
             ]
         )
 
-        self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
-
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            with self.soft_watchdog.disable():
+                recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
+            self.soft_watchdog.feed()
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -142,6 +166,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
                 return output
             assert len(output) > 0
+            # NOTE: We can always assume the last token is the matched stop token
             return output[:-1]
         return output
 
@@ -149,7 +174,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # If it is embedding model, no detokenization is needed.
         return recv_obj
 
-    def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+    def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
 
         # Initialize decode status
@@ -177,17 +202,55 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             )
             surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
 
+        # Decode token ids to strings
         # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
-        surr_texts = self.tokenizer.batch_decode(
-            surr_ids,
-            skip_special_tokens=recv_obj.skip_special_tokens[0],
-            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-        )
-        read_texts = self.tokenizer.batch_decode(
-            read_ids,
-            skip_special_tokens=recv_obj.skip_special_tokens[0],
-            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-        )
+        skip_uniform = len(set(recv_obj.skip_special_tokens)) == 1
+        space_uniform = len(set(recv_obj.spaces_between_special_tokens)) == 1
+        if not self.disable_tokenizer_batch_decode or not (
+            skip_uniform and space_uniform
+        ):
+            if not self.is_dummy:
+                # Run normal batch decode
+                surr_texts = self.tokenizer.batch_decode(
+                    surr_ids,
+                    skip_special_tokens=recv_obj.skip_special_tokens[0],
+                    spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
+                        0
+                    ],
+                )
+                read_texts = self.tokenizer.batch_decode(
+                    read_ids,
+                    skip_special_tokens=recv_obj.skip_special_tokens[0],
+                    spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
+                        0
+                    ],
+                )
+            else:
+                # If it is dummy weights, just return dummy strings to prevent potential detokenization edge cases
+                surr_texts = ["dog" for _ in surr_ids]
+                read_texts = ["cat" for _ in read_ids]
+        else:
+            # Do not use batch decode to prevent some detokenization edge cases (e.g., gpt-oss).
+            surr_texts = [
+                self.tokenizer.decode(
+                    surr, skip_special_tokens=skip, spaces_between_special_tokens=space
+                )
+                for surr, skip, space in zip(
+                    surr_ids,
+                    recv_obj.skip_special_tokens,
+                    recv_obj.spaces_between_special_tokens,
+                )
+            ]
+            read_texts = [
+                self.tokenizer.decode(
+                    read, skip_special_tokens=skip, spaces_between_special_tokens=space
+                )
+                for read, skip, space in zip(
+                    read_ids,
+                    recv_obj.skip_special_tokens,
+                    recv_obj.spaces_between_special_tokens,
+                )
+            ]
 
         # Incremental decoding
         output_strs = []
@@ -213,6 +276,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     new_text = ""
                 else:
                     new_text = find_printable_text(new_text)
+            else:
+                del self.decode_status[recv_obj.rids[i]]
 
             output_str = self.trim_matched_stop(
                 s.decoded_text + new_text,
@@ -224,15 +289,43 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
 
+        return output_strs
+
+    def _extract_routed_experts(self, recv_obj: BatchTokenIDOutput) -> List[List[int]]:
+        output_routed_experts = None
+        if recv_obj.output_routed_experts is not None:
+            output_routed_experts = [
+                (
+                    pybase64.b64encode(output_routed_experts.numpy().tobytes()).decode(
+                        "utf-8"
+                    )
+                    if output_routed_experts is not None
+                    else []
+                )
+                for output_routed_experts in recv_obj.output_routed_experts
+            ]
+        return output_routed_experts
+
+    def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        # If handling idle batch, set output_strs to [].
+        output_strs = (
+            self._decode_batch_token_id_output(recv_obj)
+            if len(recv_obj.rids) > 0
+            else []
+        )
+        output_routed_experts = self._extract_routed_experts(recv_obj)
+
         return BatchStrOutput(
             rids=recv_obj.rids,
+            http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
-            output_ids=recv_obj.decode_ids,
+            output_ids=recv_obj.output_ids,
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
             spec_verify_ct=recv_obj.spec_verify_ct,
+            spec_accepted_tokens=recv_obj.spec_accepted_tokens,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
             output_token_logprobs_val=recv_obj.output_token_logprobs_val,
@@ -245,23 +338,24 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             input_token_ids_logprobs_idx=recv_obj.input_token_ids_logprobs_idx,
             output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
+            output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
+            output_routed_experts=output_routed_experts,
+            customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            retraction_counts=recv_obj.retraction_counts,
+            token_steps=recv_obj.token_steps,
+            load=recv_obj.load,
+            queue_time=recv_obj.queue_time,
+            forward_entry_time=recv_obj.forward_entry_time,
+            prefill_launch_delay=recv_obj.prefill_launch_delay,
+            prefill_launch_latency=recv_obj.prefill_launch_latency,
+            prefill_finished_ts=recv_obj.prefill_finished_ts,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
-        outputs = self.tokenizer.detokenize(recv_obj)
-        return BatchMultimodalOutput(
-            rids=recv_obj.rids,
-            finished_reasons=recv_obj.finished_reasons,
-            outputs=outputs,
-            prompt_tokens=recv_obj.prompt_tokens,
-            completion_tokens=recv_obj.completion_tokens,
-            cached_tokens=recv_obj.cached_tokens,
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
-        )
+        raise NotImplementedError()
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")
@@ -284,6 +378,7 @@ class LimitedCapacityDict(OrderedDict):
 def run_detokenizer_process(
     server_args: ServerArgs,
     port_args: PortArgs,
+    detokenizer_manager_class=DetokenizerManager,
 ):
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
@@ -291,13 +386,13 @@ def run_detokenizer_process(
     parent_process = psutil.Process().parent()
 
     try:
-        manager = DetokenizerManager(server_args, port_args)
-        if server_args.tokenizer_worker_num > 1:
-            manager.multi_http_worker_event_loop()
-        else:
+        manager = detokenizer_manager_class(server_args, port_args)
+        if server_args.tokenizer_worker_num == 1:
             manager.event_loop()
+        else:
+            manager.multi_http_worker_event_loop()
     except Exception:
-        manager.maybe_clear_socket_mapping()
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
+        manager.maybe_clear_socket_mapping()
         parent_process.send_signal(signal.SIGQUIT)

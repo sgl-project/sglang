@@ -1,27 +1,28 @@
-import os
-import time
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.environ import envs
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_disaggregation_utils import TestDisaggregationBase
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    PDDisaggregationServerBase,
+)
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
+    try_cached_model,
 )
 
 
-class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
+class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -85,15 +86,14 @@ class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
+class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -157,15 +157,14 @@ class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
+class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -229,15 +228,14 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-class TestDisaggregationMooncakeMHADecodeLargerTP(TestDisaggregationBase):
+class TestDisaggregationMooncakeMHADecodeLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
         # Non blocking start servers
         cls.start_prefill()

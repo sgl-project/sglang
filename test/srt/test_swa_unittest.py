@@ -2,9 +2,10 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.allocator import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
 
@@ -20,6 +21,7 @@ class TestSWA(unittest.TestCase):
     def test_swa_memory_pool(self):
         size = 16
         size_swa = 16
+        page_size = 1
         head_num = 8
         head_dim = 128
         num_layers = 48
@@ -34,6 +36,7 @@ class TestSWA(unittest.TestCase):
         pool = SWAKVPool(
             size=size,
             size_swa=size_swa,
+            page_size=page_size,
             dtype=dtype,
             head_num=head_num,
             head_dim=head_dim,
@@ -45,6 +48,7 @@ class TestSWA(unittest.TestCase):
         alloc = SWATokenToKVPoolAllocator(
             size=size,
             size_swa=size_swa,
+            page_size=page_size,
             dtype=dtype,
             device=device,
             kvcache=pool,
@@ -68,6 +72,7 @@ class TestSWA(unittest.TestCase):
         max_context_len = 128
         kv_size = 128
         kv_size_swa = 64
+        page_size = 1
         sliding_window_size = 4
         head_num = 8
         head_dim = 128
@@ -91,6 +96,7 @@ class TestSWA(unittest.TestCase):
         kv_pool = SWAKVPool(
             size=kv_size,
             size_swa=kv_size_swa,
+            page_size=page_size,
             dtype=dtype,
             head_num=head_num,
             head_dim=head_dim,
@@ -103,6 +109,7 @@ class TestSWA(unittest.TestCase):
         allocator = SWATokenToKVPoolAllocator(
             size=kv_size,
             size_swa=kv_size_swa,
+            page_size=page_size,
             dtype=dtype,
             device=device,
             kvcache=kv_pool,
@@ -110,11 +117,13 @@ class TestSWA(unittest.TestCase):
         )
         # setup radix cache
         tree = SWARadixCache(
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=allocator,
+            params=CacheInitParams(
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                disable=False,
+                page_size=page_size,
+            ),
             sliding_window_size=sliding_window_size,
-            page_size=1,
-            disable=False,
         )
 
         # test
@@ -199,6 +208,7 @@ class TestSWA(unittest.TestCase):
         max_context_len = 128
         kv_size = 128
         kv_size_swa = 64
+        page_size = 1
         sliding_window_size = 4
         head_num = 8
         head_dim = 128
@@ -222,6 +232,7 @@ class TestSWA(unittest.TestCase):
         kv_pool = SWAKVPool(
             size=kv_size,
             size_swa=kv_size_swa,
+            page_size=page_size,
             dtype=dtype,
             head_num=head_num,
             head_dim=head_dim,
@@ -234,6 +245,7 @@ class TestSWA(unittest.TestCase):
         allocator = SWATokenToKVPoolAllocator(
             size=kv_size,
             size_swa=kv_size_swa,
+            page_size=page_size,
             dtype=dtype,
             device=device,
             kvcache=kv_pool,
@@ -241,12 +253,14 @@ class TestSWA(unittest.TestCase):
         )
         # setup radix cache
         tree = SWARadixCache(
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=allocator,
+            params=CacheInitParams(
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=page_size,
+                disable=False,
+                is_eagle=True,
+            ),
             sliding_window_size=sliding_window_size,
-            page_size=1,
-            disable=False,
-            is_eagle=True,
         )
 
         # test

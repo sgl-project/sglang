@@ -14,49 +14,21 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
-from functools import lru_cache, partial
-from typing import Callable, Iterable, List, Literal, Optional, Tuple, TypedDict, Union
+import re
+from functools import lru_cache
+from typing import Iterable, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange
-from transformers import BatchFeature
-from transformers.activations import ACT2FN
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VisionRotaryEmbedding,
-)
 
-from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeVisionConfig
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_pp_group,
-    get_tensor_model_parallel_rank,
-)
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    general_mm_embed_routine,
-)
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputs,
-    global_server_args_dict,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
-from sglang.srt.models.qwen3_vl import (
-    Qwen3_VisionTransformer,
-    Qwen3VLForConditionalGeneration,
-)
-from sglang.srt.utils import add_prefix
+from sglang.srt.models.qwen3_moe import Qwen3MoeModel
+from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -68,27 +40,31 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
     def __init__(
         self,
         *,
-        config: Qwen3VLMoeConfig,
+        config: Qwen3VLMoeTextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-
         self.hidden_size = config.hidden_size
+        # Currently, we use 3 as len(config.vision_config.deepstack_visual_indexes) is not directly accessible here.
+        # This approach follows the original implementation.
+        # TODO: make config of type Qwen3VLMoeConfig, so that we can directly obtain deepstack_visual_indexes.
+        self.deepstack_embed_to_decoder_layer = range(3)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
-        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        return image_embeds
+    def get_deepstack_embeds(
+        self, layer_idx: int, input_deepstack_embeds: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Get deepstack embeddings for a given layer index, or None if not applicable."""
+        if (
+            input_deepstack_embeds is None
+            or layer_idx not in self.deepstack_embed_to_decoder_layer
+        ):
+            return None
+        sep = self.hidden_size * layer_idx
+        return input_deepstack_embeds[:, sep : sep + self.hidden_size]
 
     def forward(
         self,
@@ -114,26 +90,32 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
-            layer_idx = layer_idx + self.start_layer
+            layer_idx += self.start_layer
             if layer_idx in self.layers_to_capture:
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )
 
+            # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
+            # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
+            # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
+            # The order matters because addition with different tensors is not associative in practice.
+            # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
+            deepstack_embeds = self.get_deepstack_embeds(
+                layer_idx - 1, input_deepstack_embeds
+            )
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
+                post_residual_addition=deepstack_embeds,
             )
 
-            # process deepstack
-            if input_deepstack_embeds is not None and layer_idx in range(3):
-                sep = self.hidden_size * layer_idx
-                hidden_states = (
-                    hidden_states
-                    + input_deepstack_embeds[:, sep : sep + self.hidden_size]
-                )
+        # Handle deepstack for the last processed layer if it exists.
+        last_deepstack = self.get_deepstack_embeds(
+            self.end_layer - 1, input_deepstack_embeds
+        )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -147,7 +129,9 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
                 else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                    hidden_states, _ = self.norm(
+                        hidden_states, residual, post_residual_addition=last_deepstack
+                    )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -155,144 +139,46 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         return hidden_states, aux_hidden_states
 
 
+def load_fused_expert_weights(
+    name: str,
+    params_dict: dict,
+    loaded_weight: torch.Tensor,
+    shard_id: str,
+    num_experts: int,
+):
+    param = params_dict[name]
+    # weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+    weight_loader = param.weight_loader
+    # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
+    for expert_id in range(num_experts):
+        curr_expert_weight = loaded_weight[expert_id]
+        weight_loader(
+            param,
+            curr_expert_weight,
+            name,
+            shard_id,
+            expert_id,
+        )
+    return True
+
+
 class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def __init__(
         self,
-        *,
         config: Qwen3VLMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        language_model_cls=Qwen3MoeLLMModel,
     ):
-        super(Qwen3VLForConditionalGeneration, self).__init__()
-        self.config = config
+        super().__init__(config, quant_config, prefix, language_model_cls)
 
-        self.visual = Qwen3_VisionTransformer(
-            config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
-        )
+    # Only allow LoRA on attention projections within text layers for MoE.
+    _lora_pattern_moe = re.compile(
+        r"^model\.layers\.(\d+)\.self_attn\.(?:qkv_proj|o_proj)$"
+    )
 
-        self.model = Qwen3MoeLLMModel(
-            config=config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
-
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
-
-        self.logits_processor = LogitsProcessor(config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-
-        # deepstack
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
-        self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-
-    @property
-    def use_deepstack(self) -> bool:
-        return hasattr(self, "deepstack_visual_indexes")
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        get_embedding: bool = False,
-    ):
-        """Run forward pass for Qwen3-VL.
-
-        Args:
-            input_ids: Flattened (concatenated) input_ids corresponding to a
-                batch.
-            positions: Flattened (concatenated) position ids corresponding to a
-                batch.
-                **NOTE**: If mrope is enabled (default setting for Qwen2-VL
-                opensource models), the shape will be `(3, seq_len)`,
-                otherwise it will be `(seq_len,).
-                (Use input_metadata.mrope_positions to replace it)
-        """
-        if self.is_mrope_enabled:
-            positions = forward_batch.mrope_positions
-
-        if not (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
-        ):
-            if self.is_mrope_enabled:
-                assert positions.ndim == 2 and positions.size(0) == 3, (
-                    "multimodal section rotary embedding requires "
-                    f"(3, seq_len) positions, but got {positions.size()}"
-                )
-
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
-            positions=positions,
-            use_deepstack=self.use_deepstack,
-        )
-
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            return self.pooler(hidden_states, forward_batch)
-
-    def load_fused_expert_weights(
-        self,
-        name: str,
-        params_dict: dict,
-        loaded_weight: torch.Tensor,
-        shard_id: str,
-        num_experts: int,
-    ):
-        param = params_dict[name]
-        # weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
-        weight_loader = param.weight_loader
-        ep_rank = get_tensor_model_parallel_rank()
-        ep_size = get_moe_expert_parallel_world_size()
-        if ep_size == 1:
-            for expert_id in range(num_experts):
-                curr_expert_weight = loaded_weight[expert_id]
-                weight_loader(
-                    param,
-                    curr_expert_weight,
-                    name,
-                    shard_id,
-                    expert_id,
-                )
-        else:
-            experts_per_ep = num_experts // ep_size
-            start_expert = ep_rank * experts_per_ep
-            end_expert = (
-                (ep_rank + 1) * experts_per_ep
-                if ep_rank != ep_size - 1
-                else num_experts
-            )
-
-            for idx, expert_id in enumerate(range(start_expert, end_expert)):
-                curr_expert_weight = loaded_weight[expert_id]
-                weight_loader(
-                    param,
-                    curr_expert_weight,
-                    name,
-                    shard_id,
-                    idx,
-                )
-        return True
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern_moe.match(module_name))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -338,8 +224,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self._cached_params_dict = dict(self.named_parameters())
         params_dict = self._cached_params_dict
         for name, loaded_weight in weights:
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
+            name = name.replace(r"model.language_model.", r"model.")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
@@ -383,7 +268,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    if "visual" in name:
+                    if "visual" in name or self.config.encoder_only:
                         continue
                     # Anyway, this is an expert weight and should not be
                     # attempted to load as other weights later
@@ -393,14 +278,14 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         loaded_weight = loaded_weight.transpose(-1, -2)  # no bias
                         if "experts.gate_up_proj" in name:
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
-                            self.load_fused_expert_weights(
+                            load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
                                 loaded_weight[0],
                                 "w1",
                                 num_experts,
                             )
-                            self.load_fused_expert_weights(
+                            load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
                                 loaded_weight[1],
@@ -408,7 +293,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 num_experts,
                             )
                         else:
-                            self.load_fused_expert_weights(
+                            load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
                                 loaded_weight,
@@ -449,6 +334,12 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
 
+                    # Skip loading mm/language parameters
+                    if (
+                        self.config.encoder_only or self.config.language_only
+                    ) and name not in params_dict:
+                        continue
+
                     if name in params_dict.keys():
                         param = params_dict[name]
                         weight_loader = getattr(
@@ -466,6 +357,14 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         #         for layer_id in range(self.start_layer, self.end_layer)
         #         if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
         #     }
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.text_config.num_hidden_layers,
+            num_logical_experts=config.text_config.num_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = Qwen3VLMoeForConditionalGeneration
