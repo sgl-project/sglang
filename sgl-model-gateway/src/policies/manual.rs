@@ -20,12 +20,11 @@ use rand::Rng;
 use tracing::info;
 
 use super::{
-    get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
+    get_healthy_worker_indices,
+    utils::{extract_routing_key, PeriodicTask},
+    LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::{
-    config::ManualAssignmentMode, core::Worker, observability::metrics::Metrics,
-    routers::header_utils::extract_routing_key,
-};
+use crate::{config::ManualAssignmentMode, core::Worker, observability::metrics::Metrics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionBranch {

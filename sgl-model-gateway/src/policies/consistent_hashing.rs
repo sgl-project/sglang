@@ -18,17 +18,13 @@
 
 use std::sync::Arc;
 
-use http::header::HeaderName;
 use rand::Rng as _;
 
-use super::{LoadBalancingPolicy, SelectWorkerInfo};
-use crate::{
-    core::Worker, observability::metrics::Metrics, routers::header_utils::extract_routing_key,
+use super::{
+    utils::{extract_routing_key, extract_target_worker},
+    LoadBalancingPolicy, SelectWorkerInfo,
 };
-
-/// Header for direct worker targeting by index (0-based)
-static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
-
+use crate::{core::Worker, observability::metrics::Metrics};
 /// Execution branch for metrics
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Branch {
@@ -112,12 +108,7 @@ impl ConsistentHashingPolicy {
             return (None, Branch::NoHealthyWorkers);
         }
 
-        let target_worker = info
-            .headers
-            .and_then(|h| h.get(&HEADER_TARGET_WORKER))
-            .and_then(|v| v.to_str().ok())
-            .filter(|s| !s.is_empty());
-
+        let target_worker = extract_target_worker(info.headers);
         let routing_key = extract_routing_key(info.headers);
 
         // Priority 1: X-SMG-Target-Worker - direct routing by worker index
