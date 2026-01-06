@@ -19,7 +19,7 @@ use crate::routers::{
 ///
 /// Takes output tokens from execution and parses them using HarmonyParserAdapter
 /// to extract analysis, tool calls, and final response text from Harmony channels.
-pub struct HarmonyResponseProcessingStage {
+pub(crate) struct HarmonyResponseProcessingStage {
     processor: HarmonyResponseProcessor,
     streaming_processor: Arc<HarmonyStreamingProcessor>,
 }

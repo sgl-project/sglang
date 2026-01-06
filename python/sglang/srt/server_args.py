@@ -483,6 +483,10 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
+
+    # Hierarchical sparse attention
+    hierarchical_sparse_attention_extra_config: Optional[str] = None
+
     # LMCache
     enable_lmcache: bool = False
 
@@ -3816,6 +3820,18 @@ class ServerArgs:
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
         )
+
+        # Hierarchical sparse attention
+        parser.add_argument(
+            "--hierarchical-sparse-attention-extra-config",
+            type=str,
+            default=ServerArgs.hierarchical_sparse_attention_extra_config,
+            help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
+            "Required fields: algorithm (str), backend (str). "
+            "All other fields are algorithm-specific and passed to the algorithm constructor. "
+            'Example: \'{"algorithm": "quest", "backend": "flashattention", "sparsity_ratio": 0.7, "min_sparse_prompt_len": 2048}\'',
+        )
+
         # LMCache
         parser.add_argument(
             "--enable-lmcache",
