@@ -1838,7 +1838,7 @@ def sample_generated_shared_prefix_requests(
             turn_questions = [
                 questions[flat_index * num_turns + t] for t in range(num_turns)
             ]
-            turn_prompts = [f"{system_prompt}\n\n{q}" for q in turn_questions]
+            turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[1:]
             full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
             prompt_len = (
                 1
