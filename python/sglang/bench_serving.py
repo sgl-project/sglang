@@ -1838,7 +1838,9 @@ def sample_generated_shared_prefix_requests(
             turn_questions = [
                 questions[flat_index * num_turns + t] for t in range(num_turns)
             ]
-            turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[1:]
+            turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[
+                1:
+            ]
             full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
             prompt_len = (
                 1
@@ -2105,9 +2107,9 @@ MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
 
 
 def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
-    assert backend in MULTI_TURN_BACKENDS, (
-        f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
-    )
+    assert (
+        backend in MULTI_TURN_BACKENDS
+    ), f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
 
     async def f(
         request_func_input: RequestFuncInput,
@@ -2135,7 +2137,9 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
             )
             outputs.append(output)
 
-            prev_messages.append({"role": "assistant", "content": output.generated_text})
+            prev_messages.append(
+                {"role": "assistant", "content": output.generated_text}
+            )
 
         return outputs
 

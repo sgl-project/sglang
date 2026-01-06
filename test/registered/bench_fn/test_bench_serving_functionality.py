@@ -80,8 +80,12 @@ class TestBenchServingFunctionality(CustomTestCase):
         turn3_count = sum(1 for c in message_counts if c == 5)
 
         self.assertEqual(turn1_count, NUM_CONVERSATIONS, "Turn 1 should have 1 message")
-        self.assertEqual(turn2_count, NUM_CONVERSATIONS, "Turn 2 should have 3 messages")
-        self.assertEqual(turn3_count, NUM_CONVERSATIONS, "Turn 3 should have 5 messages")
+        self.assertEqual(
+            turn2_count, NUM_CONVERSATIONS, "Turn 2 should have 3 messages"
+        )
+        self.assertEqual(
+            turn3_count, NUM_CONVERSATIONS, "Turn 3 should have 5 messages"
+        )
 
 
 if __name__ == "__main__":
