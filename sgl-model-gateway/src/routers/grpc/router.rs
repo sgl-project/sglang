@@ -116,7 +116,6 @@ impl GrpcRouter {
             responses::ResponsesContext::new(
                 Arc::new(pipeline.clone()),
                 shared_components.clone(),
-                worker_registry.clone(),
                 ctx.response_storage.clone(),
                 ctx.conversation_storage.clone(),
                 ctx.conversation_item_storage.clone(),

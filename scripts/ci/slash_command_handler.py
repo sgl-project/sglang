@@ -145,6 +145,7 @@ def handle_rerun_stage(
     # Valid NVIDIA stage names that support target_stage
     nvidia_stages = [
         "stage-a-test-1",
+        "stage-a-cpu-only",
         "stage-b-test-small-1-gpu",
         "stage-b-test-large-1-gpu",
         "stage-b-test-large-2-gpu",
