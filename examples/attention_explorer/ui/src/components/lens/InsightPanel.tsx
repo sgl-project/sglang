@@ -66,7 +66,17 @@ export function InsightPanel() {
   const tokenMetrics = getMetricsFromAttention(selectedAttention);
 
   // Get top-k from attention entry (only available in raw mode)
-  const layerId = selectedLayerId === -1 ? 31 : selectedLayerId;
+  // If layerId is -1 (auto), try common last-layer IDs or use entry's layer_id
+  const getEffectiveLayerId = (): number => {
+    if (selectedLayerId !== -1) return selectedLayerId;
+    // Try to get layer_id from the attention entry itself
+    if (selectedAttention && 'layer_id' in selectedAttention) {
+      return (selectedAttention as any).layer_id;
+    }
+    // Fallback: try common last-layer positions (31 for 32-layer, 27 for 28-layer models)
+    return 31;
+  };
+  const layerId = getEffectiveLayerId();
   const topK = selectedAttention ? getTopKForLayer(selectedAttention, layerId, 5) : [];
 
   // Use token-level metrics if available, fallback to session fingerprint
