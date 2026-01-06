@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
+    get_tp_group,
     get_tp_rank,
     get_tp_world_size,
 )
@@ -128,6 +129,31 @@ def _debug_tensor_stats(name: str, x: torch.Tensor, step: int) -> None:
         mean_v,
         std_v,
     )
+
+    if os.environ.get("WAN_DEBUG_TP_CHECK", "0") != "1":
+        return
+    if tp_world <= 1:
+        return
+
+    try:
+        # Check TP-rank consistency on a small scalar summary to keep overhead low.
+        # If TP is correct and deterministic enough, (mean, std) should match across tp ranks.
+        summary = torch.tensor([mean_v, std_v], device=x.device, dtype=torch.float32)
+        gathered = [torch.empty_like(summary) for _ in range(tp_world)]
+        torch.distributed.all_gather(gathered, summary, group=get_tp_group().device_group)
+        stacked = torch.stack(gathered, dim=0)
+        max_abs_diff = float((stacked - stacked[0]).abs().max().item())
+        if tp_rank == 0:
+            logger.info(
+                "WAN_DEBUG_TP_CHECK step=%s name=%s tp_world=%s max_abs_diff=%s summaries=%s",
+                step,
+                name,
+                tp_world,
+                max_abs_diff,
+                stacked.tolist(),
+            )
+    except Exception:
+        return
 
 
 class DenoisingStage(PipelineStage):
