@@ -17,7 +17,11 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::{
-    core::{CircuitState, ConnectionMode, RuntimeType, Worker, WorkerType},
+    core::{
+        circuit_breaker::CircuitState,
+        worker::{HealthChecker, RuntimeType, WorkerType},
+        ConnectionMode, Worker,
+    },
     mesh::OptionalMeshSyncManager,
     observability::metrics::Metrics,
 };
@@ -634,7 +638,7 @@ impl WorkerRegistry {
 
     /// Start a health checker for all workers in the registry
     /// This should be called once after the registry is populated with workers
-    pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
+    pub(crate) fn start_health_checker(&self, check_interval_secs: u64) -> HealthChecker {
         use std::sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -678,7 +682,7 @@ impl WorkerRegistry {
             }
         });
 
-        crate::core::HealthChecker::new(handle, shutdown)
+        HealthChecker::new(handle, shutdown)
     }
 }
 
@@ -722,7 +726,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig};
+    use crate::core::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder};
 
     #[test]
     fn test_worker_registry() {
@@ -743,7 +747,7 @@ mod tests {
                 .build(),
         );
 
-        // Register worker (WorkerFactory returns Box<dyn Worker>, convert to Arc)
+        // Register worker
         let worker_id = registry.register(Arc::from(worker));
 
         assert!(registry.get(&worker_id).is_some());
