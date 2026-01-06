@@ -1813,15 +1813,22 @@ def sample_generated_shared_prefix_requests(
         system_prompt = gen_prompt(tokenizer, system_prompt_lens[i].item())
         system_prompts.append(system_prompt)
 
-    # Generate questions: shape (num_groups * prompts_per_group, num_turns)
-    num_conversations = num_groups * prompts_per_group
-    questions = [
-        [
-            gen_prompt(tokenizer, question_lens[i * num_turns + t].item())
-            for t in range(num_turns)
-        ]
-        for i in range(num_conversations)
-    ]
+    # Generate questions: shape (num_groups, prompts_per_group, num_turns)
+    q_idx = 0
+    questions = []
+    for g in range(num_groups):
+        group_questions = []
+        for p in range(prompts_per_group):
+            turn_questions = [
+                gen_prompt(tokenizer, question_lens[q_idx + t].item())
+                for t in range(num_turns)
+            ]
+            group_questions.append(turn_questions)
+            q_idx += num_turns
+        questions.append(group_questions)
+
+    # Reshape output_lens to (num_groups, prompts_per_group)
+    output_lens = output_lens.reshape(num_groups, prompts_per_group)
 
     # Combine system prompts with questions
     input_requests = []
@@ -1838,8 +1845,7 @@ def sample_generated_shared_prefix_requests(
         for prompt_idx in tqdm(
             range(prompts_per_group), desc="Generating questions", leave=False
         ):
-            flat_index = group_idx * prompts_per_group + prompt_idx
-            turn_questions = questions[flat_index]
+            turn_questions = questions[group_idx][prompt_idx]
             turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[1:]
             full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
             prompt_len = (
@@ -1847,17 +1853,18 @@ def sample_generated_shared_prefix_requests(
                 if getattr(args, "gsp_fast_prepare", False)
                 else len(tokenizer.encode(turn_prompts[0]))
             )
+            output_len_val = output_lens[group_idx, prompt_idx].item()
 
             input_requests.append(
                 DatasetRow(
                     prompt=full_prompt,
                     prompt_len=prompt_len,
-                    output_len=output_lens[flat_index].item(),
+                    output_len=output_len_val,
                     routing_key=routing_key,
                 )
             )
             total_input_tokens += prompt_len
-            total_output_tokens += output_lens[flat_index].item()
+            total_output_tokens += output_len_val
 
     # Shuffle questions
     random.shuffle(input_requests)
@@ -1874,8 +1881,9 @@ def sample_generated_shared_prefix_requests(
         print(
             f"Average system prompt length: {sum(len(tokenizer.encode(sp)) for sp in system_prompts) / len(system_prompts):.1f} tokens"
         )
+        all_questions = [q for group in questions for conv in group for q in conv]
         print(
-            f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
+            f"Average question length: {sum(len(tokenizer.encode(q)) for q in all_questions) / len(all_questions):.1f} tokens\n"
         )
 
     # Save to cache
