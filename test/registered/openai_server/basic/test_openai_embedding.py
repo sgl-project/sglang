@@ -4,6 +4,7 @@ import unittest
 import openai
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -11,6 +12,9 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=70, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=141, suite="stage-b-test-small-1-gpu")
 
 
 class TestOpenAIEmbedding(CustomTestCase):
@@ -69,7 +73,6 @@ class TestOpenAIEmbedding(CustomTestCase):
         self.assertEqual(len(response.data), 1)
         self.assertTrue(len(response.data[0].embedding) > 0)
 
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         response = client.embeddings.create(
             model=self.model,
             input=[15339, 314, 703, 284, 612, 262, 10658, 10188, 286, 2061],
