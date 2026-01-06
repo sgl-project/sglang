@@ -1799,7 +1799,7 @@ def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
     try:
         return get_tp_group().rank_in_group
-    except Exception:
+    except (AssertionError, AttributeError):
         return 0
 
 
