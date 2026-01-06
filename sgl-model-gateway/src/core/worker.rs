@@ -8,7 +8,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use axum::body::Body;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::OnceCell, time};
 
@@ -1021,8 +1020,7 @@ impl WorkerLoadGuard {
         self,
         response: axum::response::Response,
     ) -> axum::response::Response {
-        let (parts, body) = response.into_parts();
-        axum::response::Response::from_parts(parts, Body::new(AttachedBody::new(body, self)))
+        AttachedBody::wrap_response(response, self)
     }
 }
 
@@ -1036,8 +1034,7 @@ pub fn attach_guards_to_response(
     guards: Vec<WorkerLoadGuard>,
     response: axum::response::Response,
 ) -> axum::response::Response {
-    let (parts, body) = response.into_parts();
-    axum::response::Response::from_parts(parts, Body::new(AttachedBody::new(body, guards)))
+    AttachedBody::wrap_response(response, guards)
 }
 
 /// Health checker handle with graceful shutdown

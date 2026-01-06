@@ -21,6 +21,13 @@ impl<T> AttachedBody<T> {
     }
 }
 
+impl<T: Send + Unpin + 'static> AttachedBody<T> {
+    pub fn wrap_response(response: axum::response::Response, attached: T) -> axum::response::Response {
+        let (parts, body) = response.into_parts();
+        axum::response::Response::from_parts(parts, Body::new(Self::new(body, attached)))
+    }
+}
+
 impl<T: Send + Unpin + 'static> http_body::Body for AttachedBody<T> {
     type Data = Bytes;
     type Error = axum::Error;
