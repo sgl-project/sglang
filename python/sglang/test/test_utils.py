@@ -571,48 +571,8 @@ def popen_launch_server(
     device: str = "auto",
     pd_separated: bool = False,
     num_replicas: Optional[int] = None,
-    max_retries: int = 3,
 ):
-    """Launch a server process with automatic device detection."""
-    last_exception = None
-    for attempt in range(max_retries):
-        if attempt > 0:
-            print(f"Retry attempt {attempt + 1}/{max_retries} for server launch...")
-            time.sleep(10)  # Wait before retry
-        try:
-            return _popen_launch_server_impl(
-                model=model,
-                base_url=base_url,
-                timeout=timeout,
-                api_key=api_key,
-                other_args=other_args,
-                env=env,
-                return_stdout_stderr=return_stdout_stderr,
-                device=device,
-                pd_separated=pd_separated,
-                num_replicas=num_replicas,
-            )
-        except Exception as e:
-            last_exception = e
-            print(f"Server launch attempt {attempt + 1} failed: {e}")
-            continue
-
-    raise last_exception
-
-
-def _popen_launch_server_impl(
-    model: str,
-    base_url: str,
-    timeout: float,
-    api_key: Optional[str] = None,
-    other_args: Optional[list[str]] = None,
-    env: Optional[dict] = None,
-    return_stdout_stderr: Optional[tuple] = None,
-    device: str = "auto",
-    pd_separated: bool = False,
-    num_replicas: Optional[int] = None,
-):
-    """Internal implementation of popen_launch_server (no retries).
+    """Launch a server process with automatic device detection.
 
     Args:
         device: Device type ("auto", "cuda", "rocm" or "cpu").
