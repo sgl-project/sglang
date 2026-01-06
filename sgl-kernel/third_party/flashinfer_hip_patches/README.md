@@ -1,67 +1,32 @@
-# FlashInfer HIP Patches
+# FlashInfer AMD/HIP Fork
 
-HIP/ROCm compatibility patches for [FlashInfer](https://github.com/flashinfer-ai/flashinfer).
+AMD MI300X compatible fork of [FlashInfer](https://github.com/flashinfer-ai/flashinfer).
 
 ## Quick Start
 
 ```bash
-# Build and install FlashInfer with HIP support
-./build_flashinfer_hip.sh --install
+# Install from AMD-compatible fork
+pip install git+https://github.com/sunxxuns/flashinfer.git
 
-# Or just build wheel
-./build_flashinfer_hip.sh
+# Or clone and install
+git clone https://github.com/sunxxuns/flashinfer.git
+cd flashinfer
+pip install -e . -v
 ```
 
-## Environment Variables
+## Fork Repository
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `FLASHINFER_REPO` | github.com/flashinfer-ai/flashinfer | FlashInfer repository URL |
-| `FLASHINFER_VERSION` | main | Branch/tag/commit to build |
-| `AMDGPU_TARGET` | auto-detected | Target GPU arch (gfx942, gfx950) |
-| `BUILD_DIR` | /tmp/flashinfer-hip-build | Build directory |
+**https://github.com/sunxxuns/flashinfer**
 
-## Updating Patches
+The fork includes all HIP/ROCm patches directly in the codebase.
 
-When FlashInfer upstream updates:
+## What's Included
 
-```bash
-# Go to your patched FlashInfer repo
-cd /path/to/flashinfer
-
-# Rebase on upstream
-git fetch origin
-git rebase origin/main
-
-# Regenerate patches
-git format-patch origin/main -o /path/to/sglang/sgl-kernel/third_party/flashinfer_hip_patches/
-```
-
-## Patch Contents
-
-The patches add `#ifdef __HIP_PLATFORM_AMD__` guards to provide:
-
-- **PTX → GCN intrinsic translations** (exp2, log2, rcp, shuffles)
-- **Type mappings** (cuda_fp16 → hip_fp16, bfloat16, etc.)
-- **JIT compilation support** for HIP/hipcc
-- **Memory operation replacements** (cp.async → regular loads)
-- **TRT-LLM common utilities** (cooperative_groups, reduce kernels)
-
-### Patch List
-
-| Patch | Description |
-|-------|-------------|
-| 0001-0005 | Core FlashInfer HIP support (math, vec_dtypes, pos_enc) |
-| 0006-feat-Add-TRT-LLM-norm-HIP-support | TRT-LLM norm kernel HIP compatibility |
-
-## Scope
-
-✅ Included:
-- Core math intrinsics
+✅ Working on AMD MI300X (gfx942):
+- Core math intrinsics (PTX → GCN translations)
 - Vector types (half, bfloat16, **FP8 FNUZ**)
-- JIT infrastructure
-- Basic attention kernels
-- **RMSNorm/LayerNorm kernels** (including fused variants)
+- JIT infrastructure for HIP/hipcc
+- **RMSNorm/LayerNorm kernels**
 - **RoPE kernels** (pos_enc.cuh)
 - **FP8 support** (using FNUZ types for gfx942)
 
@@ -75,17 +40,25 @@ The patches add `#ifdef __HIP_PLATFORM_AMD__` guards to provide:
 
 MI300X (gfx942) uses **FNUZ FP8 format** (not OCP format):
 - `HIP_FP8_TYPE_FNUZ=1`, `HIP_FP8_TYPE_OCP=0` on gfx942
-- OCP types (`__hip_fp8_e4m3`) have `__host__`-only default constructors
-- FNUZ types (`__hip_fp8_e4m3_fnuz`) have `__host__ __device__` constructors
+- OCP types have `__host__`-only default constructors
+- FNUZ types have `__host__ __device__` constructors
 
-The patches map CUDA FP8 types to HIP FNUZ types:
+The fork maps CUDA FP8 types to HIP FNUZ types:
 ```cpp
 using __nv_fp8_e4m3 = __hip_fp8_e4m3_fnuz;  // Works on gfx942
 using __nv_fp8_e5m2 = __hip_fp8_e5m2_fnuz;
 ```
 
-Note: FNUZ and OCP have slightly different numeric representations, but
-for inference workloads this difference is negligible.
+## Syncing with Upstream
+
+```bash
+cd flashinfer
+git remote add upstream https://github.com/flashinfer-ai/flashinfer.git
+git fetch upstream
+git merge upstream/main  # or rebase
+# Resolve conflicts in HIP-specific code
+git push origin main
+```
 
 ## License
 
