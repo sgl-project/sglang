@@ -292,6 +292,14 @@ TI2V_sampling_params = DiffusionSamplingParams(
     direct_url_test=True,
 )
 
+# set output_size="832x480" to make sure test could run in H100
+TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
+    prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
+    image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
+    direct_url_test=True,
+    output_size="832x480",
+)
+
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES_A: list[DiffusionTestCase] = [
@@ -507,7 +515,7 @@ TWO_GPU_CASES_A = [
             custom_validator="video",
             num_gpus=2,
         ),
-        TI2V_sampling_params,
+        TURBOWAN_I2V_sampling_params,
     ),
     DiffusionTestCase(
         "wan2_2_t2v_a14b_2gpu",
