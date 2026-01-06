@@ -16,7 +16,6 @@ class DummyConfig:
 
 CompressedTensorsConfig = DummyConfig
 
-from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -37,6 +36,7 @@ from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
