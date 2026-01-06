@@ -1093,7 +1093,7 @@ pub struct WorkerLoadGuard {
 
 impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
-        use crate::routers::header_utils::extract_routing_key;
+        use crate::policies::utils::extract_routing_key;
 
         worker.worker_load().increment();
 

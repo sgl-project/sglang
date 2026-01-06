@@ -799,7 +799,7 @@ mod tests {
         }
 
         assert_eq!(distribution.len(), 3, "Should use all 3 workers");
-        for (_, count) in &distribution {
+        for count in distribution.values() {
             assert_eq!(*count, 3, "Each worker should have exactly 3 papers");
         }
     }
