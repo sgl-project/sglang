@@ -1015,13 +1015,6 @@ impl WorkerLoadGuard {
         worker.increment_load();
         Self { worker }
     }
-
-    pub fn attach_to_response(
-        self,
-        response: axum::response::Response,
-    ) -> axum::response::Response {
-        AttachedBody::wrap_response(response, self)
-    }
 }
 
 impl Drop for WorkerLoadGuard {
