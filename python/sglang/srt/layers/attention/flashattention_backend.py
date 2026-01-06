@@ -11,7 +11,7 @@ import triton.language as tl
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.memory_pool import SWAKVPool
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
@@ -47,6 +47,8 @@ class FlashAttentionMetadata:
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+    # Page table for Sliding Window Attention
+    swa_page_table: torch.Tensor = None
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -338,9 +340,11 @@ class FlashAttentionBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
 
-        self.use_sliding_window_kv_pool = isinstance(
-            model_runner.token_to_kv_pool, SWAKVPool
+        self.use_sliding_window_kv_pool = (
+            isinstance(model_runner.token_to_kv_pool, SWAKVPool)
+            and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
+
         if self.use_sliding_window_kv_pool:
             self.token_to_kv_pool = model_runner.token_to_kv_pool
 
@@ -354,11 +358,12 @@ class FlashAttentionBackend(AttentionBackend):
         self.fa_impl_ver = fa_impl_ver
 
         # Local attention settings
-        self.attention_chunk_size = (
-            model_runner.attention_chunk_size
-            if hasattr(model_runner, "attention_chunk_size")
-            else None
-        )
+        self.has_local_attention = model_runner.model_config.is_local_attention_model
+        if self.has_local_attention:
+            assert (
+                model_runner.attention_chunk_size is not None
+            ), "Attention chunk size is required for local attention"
+            self.attention_chunk_size = model_runner.attention_chunk_size
 
         # For each layer, the sliding_window_size can be different. This is only used for preparing SWA metadata.
         # We use `layer.sliding_window_size` to decide whether to use SWA for each layer.
@@ -467,7 +472,7 @@ class FlashAttentionBackend(AttentionBackend):
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
             # TODO: we need to test this part for llama 4 eagle case
-            self._init_local_attn_metadata(forward_batch, metadata, device)
+            self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata.cache_seqlens_int32 = (
@@ -495,7 +500,7 @@ class FlashAttentionBackend(AttentionBackend):
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
 
-                self._init_local_attn_metadata(forward_batch, metadata, device)
+                self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
             else:
                 metadata.cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
@@ -621,7 +626,7 @@ class FlashAttentionBackend(AttentionBackend):
 
             # Setup local attention if enabled
             if forward_batch.forward_mode == ForwardMode.EXTEND:
-                self._init_local_attn_metadata(forward_batch, metadata, device)
+                self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
 
         # Encoder metadata for cross attention
         if forward_batch.encoder_lens is not None:
@@ -647,11 +652,24 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             ]
 
+        if self.use_sliding_window_kv_pool:
+            metadata.swa_page_table = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    metadata.page_table
+                )
+            )
+
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
+
+            if self.use_sliding_window_kv_pool:
+                metadata.swa_page_table = (
+                    metadata.swa_page_table[:, self.strided_indices] // self.page_size
+                )
+
             metadata.page_table = (
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
@@ -762,7 +780,8 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Check if we should use local attention
         use_local_attn = (
-            self.attention_chunk_size is not None
+            self.has_local_attention
+            and self.attention_chunk_size is not None
             and metadata.local_attn_metadata is not None
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
@@ -801,9 +820,12 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             page_table = metadata.page_table
             if is_swa_layer and self.use_sliding_window_kv_pool:
-                page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    page_table
-                )
+                if metadata.swa_page_table is not None:
+                    page_table = metadata.swa_page_table
+                else:
+                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        metadata.page_table
+                    )
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
@@ -1059,7 +1081,8 @@ class FlashAttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
         use_local_attn = (
-            self.attention_chunk_size is not None
+            self.has_local_attention
+            and self.attention_chunk_size is not None
             and local_attn_metadata is not None
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
@@ -1156,9 +1179,14 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 page_table = metadata.page_table
                 if is_swa_layer and self.use_sliding_window_kv_pool:
-                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        page_table
-                    )
+                    if metadata.swa_page_table is not None:
+                        page_table = metadata.swa_page_table
+                    else:
+                        page_table = (
+                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                                metadata.page_table
+                            )
+                        )
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
@@ -1326,7 +1354,7 @@ class FlashAttentionBackend(AttentionBackend):
         }
         # Only allocate local attention buffers if local attention is enabled
         # This prevents OOM errors when local attention is not being used
-        if self.attention_chunk_size is not None:
+        if self.has_local_attention:
             # Estimate maximum sizes for local attention metadata
             max_seq_len = self.max_context_len
             page_size = self.page_size or 1
@@ -1350,6 +1378,14 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device,
                 ),
             }
+
+        if self.use_sliding_window_kv_pool:
+            self.decode_cuda_graph_metadata["swa_page_table"] = torch.zeros(
+                max_bs,
+                max_num_pages,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
         # This is used by draft decode's first half of metadata when topk > 1
         if self.topk > 1:
@@ -1655,14 +1691,17 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
                 ]
+                if self.use_sliding_window_kv_pool:
+                    metadata.swa_page_table = self.decode_cuda_graph_metadata[
+                        "swa_page_table"
+                    ][:bs, :]
                 # Precompute cumulative sequence lengths
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
 
-                if self.attention_chunk_size is not None:
-                    self._update_local_attn_metadata_for_capture(metadata, batch_size)
+                self._maybe_update_local_attn_metadata_for_capture(metadata, batch_size)
 
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
@@ -1906,9 +1945,11 @@ class FlashAttentionBackend(AttentionBackend):
                     seq_lens,
                     0,
                     self.page_size,
+                    metadata.swa_page_table,
+                    self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
                 )
 
-                self._update_local_attn_metadata_for_replay(
+                self._maybe_update_local_attn_metadata_for_replay(
                     metadata,
                     bs,
                 )
@@ -2125,11 +2166,11 @@ class FlashAttentionBackend(AttentionBackend):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
 
-    def _init_local_attn_metadata(
+    def _maybe_init_local_attn_metadata(
         self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device
     ):
         """Centralized utility to initialize local_attn_metadata if chunked attention is enabled."""
-        if self.attention_chunk_size is None:
+        if not self.has_local_attention:
             metadata.local_attn_metadata = None
             return
 
@@ -2169,7 +2210,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
         metadata.local_attn_metadata = local_metadata
 
-    def _update_local_attn_metadata_for_capture(
+    def _maybe_update_local_attn_metadata_for_capture(
         self, metadata: FlashAttentionMetadata, bs: int
     ):
         """Update local attention metadata during CUDA graph capture phase.
@@ -2178,6 +2219,9 @@ class FlashAttentionBackend(AttentionBackend):
         during the CUDA graph capture phase, optimizing memory usage by creating views of
         pre-allocated buffers with exactly the sizes needed.
         """
+        if not self.has_local_attention:
+            return
+
         seq_lens_capture = metadata.cache_seqlens_int32
         max_seq_len = int(seq_lens_capture.max().item())
         page_table_capture = metadata.page_table
@@ -2225,13 +2269,13 @@ class FlashAttentionBackend(AttentionBackend):
             local_max_seq_len=max_seq_len,
         )
 
-    def _update_local_attn_metadata_for_replay(
+    def _maybe_update_local_attn_metadata_for_replay(
         self,
         metadata: FlashAttentionMetadata,
         bs: int,
     ):
         """Update preallocated local attention metadata in-place before CUDA graph replay."""
-        if self.attention_chunk_size is None:
+        if not self.has_local_attention:
             return
 
         # Access preallocated buffers
@@ -2540,6 +2584,8 @@ def normal_decode_set_metadata(
     seq_lens: torch.Tensor,
     seq_len_delta: int,
     page_size: int,
+    swa_page_table: Optional[torch.Tensor] = None,
+    token_to_kv_pool: Optional[SWAKVPool] = None,
 ):
     cache_seqlens_int32.copy_(seq_lens + seq_len_delta)
     cu_seqlens_k[1:].copy_(torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32))
@@ -2548,6 +2594,11 @@ def normal_decode_set_metadata(
         strided_indices[:max_seq_pages][None, :],
     ]
     page_table[:, :max_seq_pages].copy_(page_indices // page_size)
+
+    if swa_page_table is not None and token_to_kv_pool is not None:
+        assert isinstance(token_to_kv_pool, SWAKVPool)
+        swa_page_indices = token_to_kv_pool.translate_loc_from_full_to_swa(page_indices)
+        swa_page_table[:, :max_seq_pages].copy_(swa_page_indices // page_size)
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
