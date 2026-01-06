@@ -526,9 +526,9 @@ class EagleDraftWorker(BaseDraftWorker):
         ret_topk_p_list = []
         ret_topk_index_list = []
 
-        draft_logits_output, _ = self.draft_runner.forward(
+        draft_logits_output = self.draft_runner.forward(
             forward_batch, skip_attn_backend_init=True
-        )
+        ).logits_output
         # Reorganize the spec info for the next batch
         draft_logits_output.hidden_states = draft_logits_output.hidden_states[
             select_index
@@ -612,9 +612,9 @@ class EagleDraftWorker(BaseDraftWorker):
             #         f"xxxxxxxxx {step=} {forward_batch.input_ids=} {hidden_states.float().sum()=} {forward_batch.out_cache_loc=}"
             #     )
             # print(f"======xxx {forward_batch.forward_mode=}")
-            draft_logits_output, _ = self.draft_runner.forward(
+            draft_logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            )
+            ).logits_output
             probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             # if not forward_batch.forward_mode.is_idle():

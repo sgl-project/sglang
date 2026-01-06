@@ -450,7 +450,7 @@ class ForwardBatch:
         if enable_num_token_non_padded(model_runner.server_args):
             ret.num_token_non_padded = torch.tensor(
                 len(batch.input_ids), dtype=torch.int32
-            ).to(device, non_blocking=True)
+            ).pin_memory().to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = len(batch.input_ids)
 
         # For MLP sync
