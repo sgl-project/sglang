@@ -28,10 +28,6 @@ suites = {
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 6),
         TestFile("openai_server/validation/test_request_length_validation.py", 38),
         TestFile("ops/test_repeat_interleave.py", 60),
-        # quant tests moved to test/registered/quant/
-        TestFile("rl/test_fp32_lm_head.py", 9),
-        # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
-        TestFile("rl/test_update_weights_from_tensor.py", 195),
         TestFile("dllm/test_llada2_mini.py", 520),
         TestFile("test_abort.py", 131),
         TestFile("test_chunked_prefill.py", 312),
@@ -84,12 +80,10 @@ suites = {
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
         TestFile("models/test_kimi_linear_models.py", 90),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 132),
-        TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_disaggregation_basic.py", 400),
         TestFile("test_dp_attention.py", 350),
         TestFile("test_load_weights_from_remote_instance.py", 72),
-        TestFile("test_patch_torch.py", 19),
     ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 650),
@@ -97,7 +91,6 @@ suites = {
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
         TestFile("test_pp_single_node.py", 500),
         TestFile("test_epd_disaggregation.py", 150),
-        TestFile("rl/test_return_routed_experts.py", 300),
     ],
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
@@ -146,9 +139,6 @@ suites = {
     "__not_in_ci__": [
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
         TestFile("models/test_dummy_grok_models.py"),
-        TestFile(
-            "rl/test_update_weights_from_disk.py"
-        ),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("test_bench_one_batch.py"),
         TestFile("test_bench_serving.py"),
         TestFile("test_eval_accuracy_large.py"),
@@ -191,9 +181,6 @@ suite_amd = {
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
         TestFile("ops/test_repeat_interleave.py", 75),
-        # quant tests moved to test/registered/quant/
-        TestFile("rl/test_fp32_lm_head.py", 15),
-        # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("rotary_embedding/test_mrope.py", 15),
         TestFile("test_abort.py", 51),
         TestFile("test_bench_typebaseddispatcher.py", 10),
@@ -242,11 +229,8 @@ suite_amd = {
         TestFile("test_gpt_oss_1gpu.py", 750),
     ],
     "per-commit-2-gpu-amd": [
-        # TestFile("lora/test_lora_tp.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107. Moved to test/registered/lora/
-        TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_load_weights_from_remote_instance.py", 72),
-        # TestFile("test_patch_torch.py", 19), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
