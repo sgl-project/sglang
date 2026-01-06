@@ -344,7 +344,6 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 3. Feed-forward
@@ -495,7 +494,6 @@ class WanTransformerBlock_VSA(nn.Module):
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         if AttentionBackendEnum.VIDEO_SPARSE_ATTN in supported_attention_backends:
@@ -524,7 +522,6 @@ class WanTransformerBlock_VSA(nn.Module):
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 3. Feed-forward

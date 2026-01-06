@@ -293,7 +293,6 @@ class _ScaleResidualNormScaleShift(nn.Module):
         eps: float = 1e-6,
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
-        compute_dtype: torch.dtype | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -304,17 +303,10 @@ class _ScaleResidualNormScaleShift(nn.Module):
                 hidden_size, has_weight=elementwise_affine, eps=eps, dtype=dtype
             )
         elif norm_type == "layer":
-            if compute_dtype == torch.float32:
-                self.norm = FP32LayerNorm(
-                    hidden_size, elementwise_affine=elementwise_affine, eps=eps
-                )
-            else:
-                self.norm = LayerNorm(
-                    hidden_size,
-                    elementwise_affine=elementwise_affine,
-                    eps=eps,
-                    dtype=dtype,
-                )
+            # compute_dtype is hardcoded to fp32 in fused kernel
+            self.norm = FP32LayerNorm(
+                hidden_size, elementwise_affine=elementwise_affine, eps=eps
+            )
         else:
             raise NotImplementedError(f"Norm type {norm_type} not implemented")
 
@@ -450,12 +442,9 @@ class ScaleResidualLayerNormScaleShift(_ScaleResidualNormScaleShift):
         eps: float = 1e-6,
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
-        compute_dtype: torch.dtype | None = None,
         prefix: str = "",
     ):
-        super().__init__(
-            hidden_size, "layer", eps, elementwise_affine, dtype, compute_dtype, prefix
-        )
+        super().__init__(hidden_size, "layer", eps, elementwise_affine, dtype, prefix)
 
 
 class ScaleResidualRMSNormScaleShift(_ScaleResidualNormScaleShift):
@@ -465,12 +454,9 @@ class ScaleResidualRMSNormScaleShift(_ScaleResidualNormScaleShift):
         eps: float = 1e-6,
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
-        compute_dtype: torch.dtype | None = None,
         prefix: str = "",
     ):
-        super().__init__(
-            hidden_size, "rms", eps, elementwise_affine, dtype, compute_dtype, prefix
-        )
+        super().__init__(hidden_size, "rms", eps, elementwise_affine, dtype, prefix)
 
 
 class _NormScaleShift(nn.Module):
@@ -486,27 +472,18 @@ class _NormScaleShift(nn.Module):
         eps: float = 1e-6,
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
-        compute_dtype: torch.dtype | None = None,
         prefix: str = "",
     ):
         super().__init__()
-        self.compute_dtype = compute_dtype
         self.norm_type = norm_type
         self.eps = eps
         if norm_type == "rms":
             self.norm = RMSNorm(hidden_size, has_weight=elementwise_affine, eps=eps)
         elif norm_type == "layer":
-            if self.compute_dtype == torch.float32:
-                self.norm = FP32LayerNorm(
-                    hidden_size, elementwise_affine=elementwise_affine, eps=eps
-                )
-            else:
-                self.norm = nn.LayerNorm(
-                    hidden_size,
-                    elementwise_affine=elementwise_affine,
-                    eps=eps,
-                    dtype=dtype,
-                )
+            # compute_dtype is hardcoded to fp32 in fused kernel
+            self.norm = FP32LayerNorm(
+                hidden_size, elementwise_affine=elementwise_affine, eps=eps
+            )
         else:
             raise NotImplementedError(f"Norm type {norm_type} not implemented")
 
@@ -588,9 +565,7 @@ class _NormScaleShift(nn.Module):
             return y_2d.view(B, L, C)
         else:
             # Fallback path for triton kernel (not fused)
-            normalized = self.norm(x)
-            if self.compute_dtype == torch.float32:
-                normalized = normalized.float()
+            normalized = self.norm(x).float()
             if scale.dim() == 4:
                 num_frames = scale.shape[1]
                 frame_seqlen = normalized.shape[1] // num_frames
@@ -601,9 +576,7 @@ class _NormScaleShift(nn.Module):
                 ).flatten(1, 2)
             else:
                 output = normalized * (1.0 + scale) + shift
-            if self.compute_dtype == torch.float32:
-                output = output.to(x.dtype)
-            return output
+            return output.to(x.dtype)
 
 
 class LayerNormScaleShift(_NormScaleShift):
@@ -613,12 +586,9 @@ class LayerNormScaleShift(_NormScaleShift):
         eps: float = 1e-6,
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
-        compute_dtype: torch.dtype | None = None,
         prefix: str = "",
     ):
-        super().__init__(
-            hidden_size, "layer", eps, elementwise_affine, dtype, compute_dtype, prefix
-        )
+        super().__init__(hidden_size, "layer", eps, elementwise_affine, dtype, prefix)
 
 
 class RMSNormScaleShift(_NormScaleShift):
@@ -628,12 +598,9 @@ class RMSNormScaleShift(_NormScaleShift):
         eps: float = 1e-6,
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
-        compute_dtype: torch.dtype | None = None,
         prefix: str = "",
     ):
-        super().__init__(
-            hidden_size, "rms", eps, elementwise_affine, dtype, compute_dtype, prefix
-        )
+        super().__init__(hidden_size, "rms", eps, elementwise_affine, dtype, prefix)
 
 
 def apply_qk_norm(

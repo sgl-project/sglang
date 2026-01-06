@@ -296,22 +296,14 @@ class CausalWanTransformerBlock(nn.Module):
             raise Exception
         assert cross_attn_norm is True
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
-            dim,
-            eps=eps,
-            elementwise_affine=True,
-            dtype=torch.float32,
-            compute_dtype=torch.float32,
+            dim, eps=eps, elementwise_affine=True, dtype=torch.float32
         )
 
         # 2. Cross-attention
         # Only T2V for now
         self.attn2 = WanT2VCrossAttention(dim, num_heads, qk_norm=qk_norm, eps=eps)
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
-            dim,
-            eps=eps,
-            elementwise_affine=False,
-            dtype=torch.float32,
-            compute_dtype=torch.float32,
+            dim, eps=eps, elementwise_affine=False, dtype=torch.float32
         )
 
         # 3. Feed-forward
