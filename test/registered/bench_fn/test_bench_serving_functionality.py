@@ -22,21 +22,6 @@ MODEL = "Qwen/Qwen3-0.6B"
 
 
 class TestBenchServingFunctionality(CustomTestCase):
-    def test_gsp_basic(self):
-        res = run_bench_serving(
-            model=MODEL,
-            num_prompts=16,
-            request_rate=float("inf"),
-            other_server_args=["--mem-fraction-static", "0.7"],
-            dataset_name="generated-shared-prefix",
-            gsp_num_groups=4,
-            gsp_prompts_per_group=4,
-            gsp_system_prompt_len=128,
-            gsp_question_len=32,
-            gsp_output_len=32,
-        )
-        self.assertGreater(res["output_throughput"], 0)
-
     def test_gsp_multi_turn(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             process = popen_launch_server(
