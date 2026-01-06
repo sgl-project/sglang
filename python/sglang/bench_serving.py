@@ -1924,7 +1924,7 @@ async def get_request(
 
 
 def calculate_metrics(
-    input_requests: List[DatasetRow],
+    input_requests: Optional[List[DatasetRow]],
     outputs: List[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
@@ -1958,9 +1958,10 @@ def calculate_metrics(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
-            total_input += input_requests[i].prompt_len
-            total_input_text += input_requests[i].text_prompt_len
-            total_input_vision += input_requests[i].vision_prompt_len
+            if input_requests is not None:
+                total_input += input_requests[i].prompt_len
+                total_input_text += input_requests[i].text_prompt_len
+                total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
@@ -2268,6 +2269,9 @@ async def benchmark(
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
 
+    if is_multi_round:
+        warmup_outputs = [x for output in warmup_outputs for x in output]
+
     # Check if at least one warmup request succeeded
     if warmup_requests > 0 and not any(output.success for output in warmup_outputs):
         raise ValueError(
@@ -2373,6 +2377,9 @@ async def benchmark(
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
+    if is_multi_round:
+        outputs = [x for output in outputs for x in output]
+
     # Stop profiler
     if profile:
         if pd_separated:
@@ -2415,7 +2422,7 @@ async def benchmark(
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
-        input_requests=input_requests,
+        input_requests=None if is_multi_round else input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
