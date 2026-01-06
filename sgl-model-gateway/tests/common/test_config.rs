@@ -274,6 +274,13 @@ impl TestWorkerConfig {
         }
     }
 
+    /// Create multiple slow workers with sequential ports
+    pub fn slow_workers(start_port: u16, count: u16, delay_ms: u64) -> Vec<MockWorkerConfig> {
+        (0..count)
+            .map(|i| Self::slow(start_port + i, delay_ms))
+            .collect()
+    }
+
     /// Create a flaky worker config (for retry/fault tolerance tests)
     pub fn flaky(port: u16, fail_rate: f32) -> MockWorkerConfig {
         MockWorkerConfig {
