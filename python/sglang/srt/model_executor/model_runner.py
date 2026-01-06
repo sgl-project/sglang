@@ -611,7 +611,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize piecewise CUDA graph
         gc.collect()
         # torch.cuda.empty_cache()
-        # torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_peak_memory_stats()
         peak_bytes = torch.cuda.max_memory_allocated()
         unalloc_bytes = torch.cuda.memory_reserved() - torch.cuda.max_memory_allocated()
         stats = torch.cuda.memory_stats()
