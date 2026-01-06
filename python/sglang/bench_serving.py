@@ -1862,8 +1862,8 @@ def sample_generated_shared_prefix_requests(
             total_input_tokens += prompt_len
             total_output_tokens += output_len_val
 
-    # Shuffle questions
-    random.shuffle(input_requests)
+    if not getattr(args, "gsp_ordered", False):
+        random.shuffle(input_requests)
 
     # Print statistics
     print(f"\nGenerated shared prefix dataset statistics:")
