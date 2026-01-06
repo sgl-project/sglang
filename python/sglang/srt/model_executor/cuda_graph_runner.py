@@ -32,9 +32,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    set_graph_pool_id,
-)
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     graph_capture,
@@ -352,14 +349,6 @@ class CudaGraphRunner:
         if model_runner.spec_algorithm.is_eagle3():
             self.model_runner.model.set_eagle3_layers_to_capture()
 
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        peak_bytes = torch.cuda.max_memory_allocated()
-        log_info_on_rank0(
-            logger,
-            f"Peak memory allocated before cg capture: {peak_bytes / 1024 / 1024:.2f} MB",
-        )
         # Capture
         try:
             with model_capture_mode():
@@ -368,14 +357,6 @@ class CudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        peak_bytes = torch.cuda.max_memory_allocated()
-        log_info_on_rank0(
-            logger,
-            f"Peak memory allocated after cg capture: {peak_bytes / 1024 / 1024:.2f} MB",
-        )
 
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
@@ -734,10 +715,10 @@ class CudaGraphRunner:
             self.model_runner.tp_group.barrier()
             run_once()
 
-        if get_global_graph_memory_pool() is None:
-            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
-        # Set graph pool id globally to be able to use symmetric memory
-        set_graph_pool_id(get_global_graph_memory_pool())
+        # if get_global_graph_memory_pool() is None:
+        #     set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+        # # Set graph pool id globally to be able to use symmetric memory
+        # set_graph_pool_id(get_global_graph_memory_pool())
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
