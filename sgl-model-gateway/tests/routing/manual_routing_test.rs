@@ -179,10 +179,10 @@ mod manual_min_group_tests {
 
     #[tokio::test]
     async fn test_min_group_handles_multiple_routing_keys() {
-        let config = TestRouterConfig::manual_min_group(3810);
+        let config = TestRouterConfig::manual_min_group(3910);
 
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19810, 3))
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(29910, 3))
                 .await;
 
         let app = ctx.create_app().await;
@@ -242,10 +242,10 @@ mod manual_min_group_tests {
 
     #[tokio::test]
     async fn test_min_group_sticky_routing() {
-        let config = TestRouterConfig::manual_min_group(3811);
+        let config = TestRouterConfig::manual_min_group(3911);
 
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19811, 3))
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(29920, 3))
                 .await;
 
         let app = ctx.create_app().await;
@@ -295,10 +295,10 @@ mod manual_min_group_tests {
 
     #[tokio::test]
     async fn test_min_group_mixed_routing_keys() {
-        let config = TestRouterConfig::manual_min_group(3812);
+        let config = TestRouterConfig::manual_min_group(3912);
 
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19812, 2))
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(29930, 2))
                 .await;
 
         let app = ctx.create_app().await;
