@@ -40,7 +40,7 @@ use crate::{
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils, RouterTrait,
     },
-    utils::http_utils::AttachedBody,
+    core::AttachedBody,
 };
 
 /// Regular router that uses injected load balancing policies

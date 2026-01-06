@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use smg::{
     core::{BasicWorkerBuilder, Worker, WorkerLoadGuard},
-    utils::http_utils::AttachedBody,
+    core::AttachedBody,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;

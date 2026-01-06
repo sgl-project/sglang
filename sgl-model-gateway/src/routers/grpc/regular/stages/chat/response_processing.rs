@@ -18,7 +18,7 @@ use crate::{
             regular::{processor, streaming},
         },
     },
-    utils::http_utils::AttachedBody,
+    core::AttachedBody,
 };
 
 /// Chat response processing stage

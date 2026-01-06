@@ -15,7 +15,7 @@ use crate::{
             context::{FinalResponse, RequestContext, RequestType},
         },
     },
-    utils::http_utils::AttachedBody,
+    core::AttachedBody,
 };
 
 /// Harmony Response Processing stage: Parse and format Harmony responses
