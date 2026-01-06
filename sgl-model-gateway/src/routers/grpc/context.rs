@@ -24,7 +24,6 @@ use crate::{
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegistry},
     tool_parser::ParserFactory as ToolParserFactory,
-    utils::http_utils::AttachedBody,
 };
 
 /// Main request processing context
@@ -181,21 +180,11 @@ impl From<&WorkerSelection> for LoadGuards {
 }
 
 impl LoadGuards {
-    /// Attach these load guards to a Response, tying their lifetime to the response body.
-    ///
-    /// When the response body is fully consumed or dropped (e.g., client disconnects),
-    /// the guards are dropped and worker load is decremented automatically.
-    ///
-    /// This is the proper RAII pattern for SSE/streaming responses.
-    pub fn attach_to_response(
-        self,
-        response: axum::response::Response,
-    ) -> axum::response::Response {
-        let guards = match self {
+    pub fn into_vec(self) -> Vec<WorkerLoadGuard> {
+        match self {
             LoadGuards::Single(guard) => vec![guard],
             LoadGuards::Dual { prefill, decode } => vec![prefill, decode],
-        };
-        AttachedBody::wrap_response(response, guards)
+        }
     }
 }
 

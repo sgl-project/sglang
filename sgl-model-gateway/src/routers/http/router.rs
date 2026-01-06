@@ -19,6 +19,7 @@ use crate::{
         is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
         WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
+    utils::http_utils::AttachedBody,
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -626,10 +627,8 @@ impl Router {
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
 
-            // Attach load guard to response body for proper RAII lifecycle
-            // Guard is dropped when response body is consumed or client disconnects
             if let Some(guard) = load_guard {
-                response = guard.attach_to_response(response);
+                response = AttachedBody::wrap_response(response, guard);
             }
             response
         }
