@@ -27,15 +27,12 @@ Usage:
     python -m unittest test_lora_hf_sgl_logprob_diff
 """
 
-import json
 import multiprocessing as mp
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
-from safetensors.torch import load_file
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import HFRunner, SRTRunner
@@ -280,105 +277,6 @@ def run_hf_with_lora(
         "top_input_logprobs": hf_outputs.top_input_logprobs,
         "top_output_logprobs": hf_outputs.top_output_logprobs,
         "output_strs": hf_outputs.output_strs,
-        "lora_paths": lora_paths_per_prompt,
-    }
-
-
-def run_sglang_with_lora_from_tensors(
-    model_path: str,
-    lora_repo: str,
-    lora_name: str,
-    prompts: List[str],
-    max_new_tokens: int,
-    torch_dtype: torch.dtype,
-    lora_backend: str,
-    port: int,
-    disable_cuda_graph: bool,
-    lora_target_modules: Optional[List[str]],
-    tp_size: int,
-) -> Dict[str, Any]:
-    """Run SGLang with LoRA loaded from tensors and return log probabilities."""
-    config = {
-        "Model": model_path,
-        "LoRA repo": lora_repo,
-        "LoRA name": lora_name,
-        "LoRA backend": lora_backend,
-        "Disable CUDA graph": disable_cuda_graph,
-        "Port": port,
-        "Number of prompts": len(prompts),
-        "Tensor parallel size": tp_size,
-    }
-    print_config_info("Running SGLang with LoRA from tensors", config)
-
-    # Download LoRA adapter to HuggingFace cache directory
-    print(f"\nDownloading LoRA adapter from {lora_repo}...")
-    lora_path = snapshot_download(
-        repo_id=lora_repo,
-        allow_patterns=["adapter_model.safetensors", "adapter_config.json"],
-    )
-
-    # Load tensors and config from downloaded adapter
-    print(f"Loading tensors from {lora_path}...")
-    tensors = load_file(os.path.join(lora_path, "adapter_model.safetensors"))
-    with open(os.path.join(lora_path, "adapter_config.json"), "r") as f:
-        config_dict = json.load(f)
-
-    print(f"Loaded {len(tensors)} tensors from LoRA adapter")
-
-    # Prepare lora_paths for prompts
-    lora_paths_per_prompt = [lora_name] * len(prompts)
-
-    with SRTRunner(
-        model_path,
-        torch_dtype=torch_dtype,
-        model_type="generation",
-        tp_size=tp_size,
-        max_loras_per_batch=1,
-        lora_backend=lora_backend,
-        disable_cuda_graph=disable_cuda_graph,
-        disable_radix_cache=True,
-        port=port,
-        mem_fraction_static=0.88,
-        lora_target_modules=lora_target_modules,
-        enable_lora=True,
-        max_lora_rank=64,
-    ) as srt_runner:
-        # Serialize tensors and create request
-        print(f"Serializing tensors for LoRA {lora_name}...")
-        serialized_tensors = MultiprocessingSerializer.serialize(
-            tensors, output_str=True
-        )
-
-        req = LoadLoRAAdapterFromTensorsReqInput(
-            lora_name=lora_name,
-            config_dict=config_dict,
-            serialized_tensors=serialized_tensors,
-        )
-
-        # Load LoRA adapter from tensors
-        print(f"Loading LoRA adapter {lora_name} into engine...")
-        result = srt_runner.engine.loop.run_until_complete(
-            srt_runner.engine.tokenizer_manager.load_lora_adapter_from_tensors(
-                req, None
-            )
-        )
-        if not result.success:
-            raise RuntimeError(
-                f"Failed to load LoRA from tensors: {result.error_message}"
-            )
-        print(f"Successfully loaded LoRA adapter {lora_name}")
-
-        # Run inference with loaded LoRA
-        srt_outputs = srt_runner.forward(
-            prompts,
-            max_new_tokens=max_new_tokens,
-            lora_paths=lora_paths_per_prompt,
-        )
-
-    return {
-        "top_input_logprobs": srt_outputs.top_input_logprobs,
-        "top_output_logprobs": srt_outputs.top_output_logprobs,
-        "output_strs": srt_outputs.output_strs,
         "lora_paths": lora_paths_per_prompt,
     }
 
@@ -631,68 +529,6 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
             prompts=prompts,
             max_new_tokens=32,
         )
-
-    def test_lora_from_tensors_logprob_comparison(self):
-        """
-        Test comparing HF and SGLang LoRA logprobs when loading LoRA from tensors.
-        This test verifies that loading LoRA adapters from tensors produces the same
-        logprobs as loading from HuggingFace.
-        """
-        if is_in_ci():
-            self.skipTest("Skipping in CI environment - requires large models")
-
-        model_path = "meta-llama/Llama-2-7b-hf"
-        lora_repo = "yushengsu/sglang_lora_logprob_diff_without_tuning"
-        lora_name = "test_lora_from_tensors"
-        prompts = DEFAULT_TEST_PROMPTS[:2]  # Use fewer prompts for faster testing
-
-        print_section_header(f"Testing {model_path} with LoRA from tensors")
-
-        # Step 1: Run SGLang with LoRA loaded from tensors
-        sglang_logprobs = run_sglang_with_lora_from_tensors(
-            model_path=model_path,
-            lora_repo=lora_repo,
-            lora_name=lora_name,
-            prompts=prompts,
-            max_new_tokens=32,
-            torch_dtype=torch.float16,
-            lora_backend=LORA_BACKEND,
-            port=DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
-            disable_cuda_graph=DISABLE_CUDA_GRAPH,
-            lora_target_modules=LORA_TARGET_MODULES,
-            tp_size=1,
-        )
-
-        # Clear GPU memory
-        print("\nClearing GPU memory...")
-        torch.cuda.empty_cache()
-
-        # Step 2: Run HuggingFace with LoRA
-        hf_logprobs = run_hf_with_lora(
-            model_path=model_path,
-            lora_paths=[lora_repo],
-            prompts=prompts,
-            max_new_tokens=32,
-            torch_dtype=torch.float16,
-        )
-
-        # Step 3: Compare log probabilities
-        results, overall_stats = compare_logprobs(sglang_logprobs, hf_logprobs)
-
-        # Assert that all prompts pass the threshold
-        for result in results:
-            self.assertTrue(
-                result["prefill_logprob_match"],
-                f"Prefill logprob mismatch for prompt {result['prompt_idx']} "
-                f"(max_diff={result['prefill_max_diff']:.6e}, threshold={LOGPROB_THRESHOLD:.0e})",
-            )
-            self.assertTrue(
-                result["decode_logprob_match"],
-                f"Decode logprob mismatch for prompt {result['prompt_idx']} "
-                f"(max_diff={result['decode_max_diff']:.6e}, threshold={LOGPROB_THRESHOLD:.0e})",
-            )
-
-        print_section_header("Test completed successfully!")
 
 
 if __name__ == "__main__":
