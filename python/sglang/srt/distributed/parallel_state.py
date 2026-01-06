@@ -63,6 +63,9 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
+# check whether only enable symmetric_memory for dcp group
+_DCP_ENABLE_SYMM_ONLY = get_bool_env_var("SGLANG_DCP_SYMM_ONLY", "false")
+
 
 @dataclass
 class GraphCaptureContext:
@@ -317,7 +320,12 @@ class GroupCoordinator:
             TorchSymmMemCommunicator,
         )
 
-        self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
+        if _DCP_ENABLE_SYMM_ONLY:
+            self.is_symmetric_memory_enabled = (
+                lambda: group_name == "dcp" and is_symmetric_memory_enabled()
+            )
+        else:
+            self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
         self.use_symmetric_memory = use_symmetric_memory
         if is_hip():
             from sglang.srt.distributed.device_communicators.quick_all_reduce import (
