@@ -153,8 +153,6 @@ pub(crate) struct DispatchMetadata {
     pub model: String,
     pub created: u64,
     pub weight_version: Option<String>,
-    #[allow(dead_code)]
-    pub is_streaming: bool,
 }
 
 /// Load guards for worker load tracking
@@ -368,13 +366,13 @@ impl RequestContext {
     }
 }
 
+/// Some methods are kept for API completeness even if currently unused.
+#[allow(dead_code)]
 impl WorkerSelection {
-    #[allow(dead_code)]
     pub fn is_dual(&self) -> bool {
         matches!(self, Self::Dual { .. })
     }
 
-    #[allow(dead_code)]
     pub fn single(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Single { worker } => Some(worker),
@@ -401,7 +399,6 @@ impl WorkerSelection {
         }
     }
 
-    #[allow(dead_code)]
     #[allow(clippy::type_complexity)]
     pub fn dual(&self) -> Option<(&Arc<dyn Worker>, &Arc<dyn Worker>)> {
         match self {
@@ -410,7 +407,6 @@ impl WorkerSelection {
         }
     }
 
-    #[allow(dead_code)]
     pub fn prefill_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Dual { prefill, .. } => Some(prefill),
@@ -418,7 +414,6 @@ impl WorkerSelection {
         }
     }
 
-    #[allow(dead_code)]
     pub fn decode_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Dual { decode, .. } => Some(decode),
@@ -427,12 +422,9 @@ impl WorkerSelection {
     }
 }
 
+/// Some methods are kept for API completeness even if currently unused.
+#[allow(dead_code)]
 impl ClientSelection {
-    #[allow(dead_code)]
-    pub fn is_dual(&self) -> bool {
-        matches!(self, Self::Dual { .. })
-    }
-
     pub fn single(&self) -> Option<&GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
@@ -447,14 +439,6 @@ impl ClientSelection {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn dual(&self) -> Option<(&GrpcClient, &GrpcClient)> {
-        match self {
-            Self::Dual { prefill, decode } => Some((prefill, decode)),
-            _ => None,
-        }
-    }
-
     pub fn dual_mut(&mut self) -> Option<(&mut GrpcClient, &mut GrpcClient)> {
         match self {
             Self::Dual { prefill, decode } => Some((prefill, decode)),
@@ -462,7 +446,6 @@ impl ClientSelection {
         }
     }
 
-    #[allow(dead_code)]
     pub fn prefill_client(&self) -> Option<&GrpcClient> {
         match self {
             Self::Dual { prefill, .. } => Some(prefill),
@@ -470,7 +453,6 @@ impl ClientSelection {
         }
     }
 
-    #[allow(dead_code)]
     pub fn prefill_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
             Self::Dual { prefill, .. } => Some(prefill),
@@ -478,7 +460,6 @@ impl ClientSelection {
         }
     }
 
-    #[allow(dead_code)]
     pub fn decode_client(&self) -> Option<&GrpcClient> {
         match self {
             Self::Dual { decode, .. } => Some(decode),
@@ -486,7 +467,6 @@ impl ClientSelection {
         }
     }
 
-    #[allow(dead_code)]
     pub fn decode_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
             Self::Dual { decode, .. } => Some(decode),
