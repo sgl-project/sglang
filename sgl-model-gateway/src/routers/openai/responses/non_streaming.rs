@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use super::{
-    mcp::{execute_tool_loop, prepare_mcp_payload_for_streaming},
+    mcp::{execute_tool_loop, prepare_mcp_tools_as_functions},
     utils::{mask_tools_as_mcp, patch_streaming_response_json},
 };
 use crate::routers::{
@@ -71,7 +71,7 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
             server_keys: server_keys.clone(),
             ..McpLoopConfig::default()
         };
-        prepare_mcp_payload_for_streaming(&mut payload, mcp, &server_keys);
+        prepare_mcp_tools_as_functions(&mut payload, mcp, &server_keys);
 
         match execute_tool_loop(
             ctx.components.client(),
