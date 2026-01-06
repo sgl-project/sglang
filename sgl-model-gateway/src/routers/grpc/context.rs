@@ -179,14 +179,6 @@ impl From<&WorkerSelection> for LoadGuards {
     }
 }
 
-impl LoadGuards {
-    pub fn into_vec(self) -> Vec<WorkerLoadGuard> {
-        match self {
-            LoadGuards::Single(guard) => vec![guard],
-            LoadGuards::Dual { prefill, decode } => vec![prefill, decode],
-        }
-    }
-}
 
 /// Response processing state (Step 6)
 #[derive(Default)]

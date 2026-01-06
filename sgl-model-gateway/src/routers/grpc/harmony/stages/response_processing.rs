@@ -83,7 +83,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                         );
 
                     let response = match ctx.state.load_guards.take() {
-                        Some(guards) => AttachedBody::wrap_response(response, guards.into_vec()),
+                        Some(guards) => AttachedBody::wrap_response(response, guards),
                         None => response,
                     };
 
