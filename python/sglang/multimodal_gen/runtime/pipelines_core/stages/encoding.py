@@ -37,6 +37,14 @@ class EncodingStage(PipelineStage):
         super().__init__()
         self.vae: ParallelTiledVAE = vae
 
+    def load_model(self):
+        if self.server_args.vae_cpu_offload:
+            self.vae.to(get_local_torch_device())
+
+    def offload_model(self):
+        if self.server_args.vae_cpu_offload:
+            self.vae.to("cpu")
+
     @torch.no_grad()
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify encoding stage inputs."""
@@ -69,6 +77,7 @@ class EncodingStage(PipelineStage):
         """
         assert batch.latents is not None and isinstance(batch.latents, torch.Tensor)
 
+        self.load_model()
         self.vae = self.vae.to(get_local_torch_device())
 
         # Setup VAE precision
@@ -100,10 +109,5 @@ class EncodingStage(PipelineStage):
         # Update batch with encoded latents
         batch.latents = latents
 
-        # Offload models if needed
-        self.maybe_free_model_hooks()
-
-        if server_args.vae_cpu_offload:
-            self.vae.to("cpu")
-
+        self.offload_model()
         return batch

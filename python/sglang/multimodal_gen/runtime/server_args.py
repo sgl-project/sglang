@@ -365,10 +365,14 @@ class ServerArgs:
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = False
         else:
-            self.dit_cpu_offload = True
-            self.text_encoder_cpu_offload = True
-            self.image_encoder_cpu_offload = True
-            self.vae_cpu_offload = True
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = True
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = False
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = True
+            if self.vae_cpu_offload is None:
+                self.vae_cpu_offload = False
 
     def __post_init__(self):
         # configure logger before use

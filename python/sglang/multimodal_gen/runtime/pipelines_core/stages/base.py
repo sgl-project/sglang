@@ -208,6 +208,7 @@ class PipelineStage(ABC):
             perf_dump_path_provided=batch.perf_dump_path is not None,
             log_stage_start_end=not batch.is_warmup,
         ):
+            # TODO: wrap with context managers here as a unified entrance?
             result = self.forward(batch, server_args)
 
         # Post-execution output verification
