@@ -400,7 +400,7 @@ class ForwardBatch:
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
-    
+
     # For decode context parallel
     dcp_kv_indptr: Optional[torch.Tensor] = None
     dcp_kv_buffer: Optional[torch.Tensor] = None

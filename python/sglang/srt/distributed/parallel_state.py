@@ -273,24 +273,6 @@ class GroupCoordinator:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
 
-        # Cache symmetric memory policy for this group.
-        # - When enable_symm_mem is on and DCP is enabled (SGLANG_DCP > 1),
-        #   only the DCP group should use SymmetricMemoryContext.
-        # - When DCP is disabled, keep the original behavior.
-        try:
-            from sglang.srt.server_args import get_global_server_args
-
-            enable_symm_mem = bool(get_global_server_args().enable_symm_mem)
-        except Exception:
-            enable_symm_mem = False
-        try:
-            dcp_size = int(os.getenv("SGLANG_DCP", "1") or "1")
-        except Exception:
-            dcp_size = 1
-        self.symm_mem_enabled_for_group = bool(
-            enable_symm_mem and (group_name == "dcp" if dcp_size > 1 else True)
-        )
-
         # Import communicators
         self.use_pynccl = use_pynccl
         self.pynccl_use_current_stream = pynccl_use_current_stream

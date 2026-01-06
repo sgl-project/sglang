@@ -182,6 +182,7 @@ def concat_and_cast_mha_k_triton(
         rope_dim,
     )
 
+
 @triton.jit
 def pad_sequence_with_mask_kernel(
     input_ptr,  # (total_tokens, hidden)
@@ -278,6 +279,7 @@ def pad_sequence_with_mask(
     )
 
     return B, output, attn_mask
+
 
 @triton.jit
 def _correct_attn_cp_out_kernel(
@@ -465,4 +467,3 @@ def cp_lse_ag_out_rs(
     assert out.is_contiguous()
     out = cp_group.reduce_scatter_along_dim(out, dim=1)
     return out
-

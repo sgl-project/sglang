@@ -365,11 +365,8 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
 
-        # Init overlap
-        self.init_overlap()
-
-        # Init mlp sync flag
-        self.require_mlp_sync = require_mlp_sync(server_args)
+        # Init prefill truncation_align_size for chunked prefill with dcp
+        self.init_truncation_align_size_for_dcp()
 
         # Init request dispatcher
         self.init_request_dispatcher()

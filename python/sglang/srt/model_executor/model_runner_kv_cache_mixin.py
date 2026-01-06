@@ -6,9 +6,14 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
-from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.distributed.parallel_state import (
+    get_dcp_rank,
+    get_dcp_world_size,
+    get_world_group,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
+    DcpTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
@@ -610,22 +615,50 @@ class ModelRunnerKVCacheMixin:
                     )
                 else:
                     if self.page_size == 1:
-                        self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
-                        )
+                        if get_dcp_world_size() > 1:
+                            self.max_total_num_tokens *= get_dcp_world_size()
+                            self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
+                                self.max_total_num_tokens,
+                                1,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=self.token_to_kv_pool,
+                                need_sort=need_sort,
+                                dcp_rank=get_dcp_rank(),
+                                dcp_world_size=get_dcp_world_size(),
+                            )
+                        else:
+                            self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                                self.max_total_num_tokens,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=self.token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
                     else:
-                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
-                            page_size=self.page_size,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
-                        )
+                        if get_dcp_world_size() > 1:
+                            self.max_total_num_tokens *= get_dcp_world_size()
+                            self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
+                                self.max_total_num_tokens,
+                                self.page_size,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=self.token_to_kv_pool,
+                                need_sort=need_sort,
+                                dcp_rank=get_dcp_rank(),
+                                dcp_world_size=get_dcp_world_size(),
+                            )
+                        else:
+                            self.token_to_kv_pool_allocator = (
+                                PagedTokenToKVPoolAllocator(
+                                    self.max_total_num_tokens,
+                                    page_size=self.page_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                )
+                            )
 
         else:
             assert self.is_draft_worker

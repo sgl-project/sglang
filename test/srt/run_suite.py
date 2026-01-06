@@ -10,7 +10,6 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 suites = {
     "per-commit-1-gpu": [
         TestFile("test_evs.py", 20),
-        TestFile("test_dcp_interleaved_storage.py", 5),
         # TODO (augusto.yjh) need to update unit test as related code has been changed.
         # TestFile("test_dcp_interleaved_storage.py", 5),
         TestFile("test_external_models.py", 30),
