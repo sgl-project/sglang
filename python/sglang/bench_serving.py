@@ -1862,8 +1862,8 @@ def sample_generated_shared_prefix_requests(
             total_input_tokens += prompt_len
             total_output_tokens += output_len_val
 
-    # Shuffle questions
-    random.shuffle(input_requests)
+    if not getattr(args, "gsp_ordered", False):
+        random.shuffle(input_requests)
 
     # Print statistics
     print(f"\nGenerated shared prefix dataset statistics:")
@@ -3191,6 +3191,11 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of turns for multi-turn conversations. If > 1, each prompt becomes a list of questions sharing the same system prefix.",
+    )
+    group.add_argument(
+        "--gsp-ordered",
+        action="store_true",
+        help="Keep requests in order without shuffling. By default, requests are shuffled randomly.",
     )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(

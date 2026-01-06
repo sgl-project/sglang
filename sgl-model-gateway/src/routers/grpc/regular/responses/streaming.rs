@@ -29,7 +29,6 @@ use super::{
         build_next_request, convert_mcp_tools_to_chat_tools, extract_all_tool_calls_from_chat,
         prepare_chat_tools_and_choice, ToolLoopState,
     },
-    context::ResponsesContext,
     conversions,
 };
 use crate::{
@@ -50,6 +49,7 @@ use crate::{
         grpc::common::responses::{
             build_sse_response, persist_response_if_needed,
             streaming::{OutputItemType, ResponseStreamEventEmitter},
+            ResponsesContext,
         },
         mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
     },
