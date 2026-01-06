@@ -2,6 +2,17 @@
 #include "common.h"
 #include "vec.h"
 
+// debug
+template <typename T>
+void print_array(const T* data, int M, int N, int lda) {
+  for (int m = 0; m < M; ++m) {
+    for (int n = 0; n < N; ++n) {
+      std::cout << " " << float(data[m * lda + n]);
+    }
+    std::cout << std::endl;
+  }
+}
+
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
   using Vec = at::vec::Vectorized<scalar_t>;
@@ -212,8 +223,12 @@ struct flash_attn_softmax<at::BFloat16, BLOCK_M, BLOCK_N> {
         vb = (__m256i)(_mm512_cvtneps_pbh(va));
         _mm256_mask_storeu_epi16(reinterpret_cast<__m256i*>(s_delta2 + m * BLOCK_N + n), vmask, vb);
       }
+
+      // s' <- s' * m_delta + sum(s_delta)
       s_prime[m] *= m_delta;
       s_prime[m] += _mm512_reduce_add_ps(vsum);
+
+      m_prime[m] = m_i;
 
       // pad s_delta with 0, pad_size range from [0, 32)
       int pad_size = padded_n_size - n_size;

@@ -1,4 +1,5 @@
 #include "common.h"
+#include "flash_attn.h"
 #include "gemm.h"
 #include "vec.h"
 #include "vec_pack.h"
@@ -11,60 +12,6 @@ namespace {
 //   3. computes attention for prefix and extend separately
 //   4. TODO: apply head dimension blocking to optimize GQA
 //
-
-template <typename scalar_t>
-inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
-  constexpr int kVecSize = Vec::size();
-  const Vec data_vec = Vec(static_cast<scalar_t>(val));
-  int d = 0;
-#pragma GCC unroll 4
-  for (; d <= size - kVecSize; d += kVecSize) {
-    data_vec.store(out + d);
-  }
-  if (size - d > 0) {
-    data_vec.store(out + d, size - d);
-  }
-}
-
-template <typename scalar_t, int BLOCK_N>
-inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input) {
-  static_assert(BLOCK_N % 32 == 0);
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-
-  constexpr int COLS = BLOCK_N / 16;
-  auto store = [&](auto i) {
-    constexpr int col = i % COLS;
-    // for COLS = 2, 4 use 512bit store
-    if constexpr (col % 2 == 0) {
-      fVec a_fvec0 = fVec::loadu(input + col * 16);
-      fVec a_fvec1 = fVec::loadu(input + col * 16 + 16);
-      bVec out_bvec = convert_from_float_ext<scalar_t>(a_fvec0, a_fvec1);
-      out_bvec.store(out + col * 16);
-    }
-  };
-  Unroll<COLS>{}(store);
-}
-
-template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc, float s, int size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const fVec s_fvec = fVec(s);
-  int d = 0;
-#pragma GCC unroll 4
-  for (; d <= size - kVecSize; d += kVecSize) {
-    fVec a_fvec0 = fVec::loadu(acc + d) * s_fvec;
-    fVec a_fvec1 = fVec::loadu(acc + d + fVec::size()) * s_fvec;
-    bVec out_bvec = convert_from_float_ext<scalar_t>(a_fvec0, a_fvec1);
-    out_bvec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(acc[d] * s);
-  }
-}
 
 template <typename scalar_t, typename index_t, int BLOCK_M, int BLOCK_N>
 void extend_attention_kernel_impl(
@@ -96,7 +43,6 @@ void extend_attention_kernel_impl(
     int v_strideN,
     int v_strideH,
     float scaling,
-    float logit_cap,
     int max_num_reqs,
     int max_context_len,
     int max_total_num_tokens,
@@ -115,9 +61,6 @@ void extend_attention_kernel_impl(
   // we use same buffer for packed key and value
   const int ldb_tmp = std::max(head_size, head_size_v);
 
-  const bool has_logit_cap = logit_cap > 0;
-  float rlogit_cap = has_logit_cap ? 1 / logit_cap : 0.f;
-
   const int num_groups = num_heads / num_heads_kv;
   TORCH_CHECK(num_groups * num_heads_kv == num_heads);
 
@@ -133,15 +76,13 @@ void extend_attention_kernel_impl(
     // s_i and s_delta: [BLOCK_M, BLOCK_N]
     float* __restrict__ s_i = reinterpret_cast<float*>((char*)(buffer) + tid * buffer_size_per_thread);
     float* __restrict__ s_delta = s_i;
+    scalar_t* __restrict__ s_delta2 = reinterpret_cast<scalar_t*>(s_i);
 
     // v_prime: [BLOCK_M, head_size_v]
     float* __restrict__ v_prime = s_i + BLOCK_M * BLOCK_N;
 
-    // s_delta2: [BLOCK_M, BLOCK_N]; copy of s_delta in scalar_t
-    scalar_t* __restrict__ s_delta2 = reinterpret_cast<scalar_t*>(v_prime + BLOCK_M * head_size_v);
-
     // Btmp: [BLOCK_N, max(head_size, head_size_v)]
-    scalar_t* __restrict__ Btmp = s_delta2 + BLOCK_M * BLOCK_N;
+    scalar_t* __restrict__ Btmp = reinterpret_cast<scalar_t*>(v_prime + BLOCK_M * head_size_v);
 
     // init Btmp just once for each thread to prevent NaN
     fill_stub(Btmp, 0.f, BLOCK_N * ldb_tmp);
@@ -213,51 +154,8 @@ void extend_attention_kernel_impl(
             /* B     */ Btmp,
             /* C     */ s_i);
 
-        const Vec scale_vec = Vec(scaling);
-        for (int row = 0; row < m_size; ++row) {
-          // s_i <- s_i * scale
-          at::vec::map<float>(
-              [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-          // TODO: `tanh` from torch uses sleef u10, going to be slow
-          if (has_logit_cap) {
-            at::vec::map<float>(
-                [logit_cap, rlogit_cap](Vec x) { return Vec(logit_cap) * (x * Vec(rlogit_cap)).tanh(); },
-                s_i + row * BLOCK_N,
-                s_i + row * BLOCK_N,
-                n_size);
-          }
-
-          // m_i: max value per row
-          float m_i = at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
-          m_i = std::max(m_i, m_prime[row]);
-
-          // m_delta <- exp(m' - m_i)
-          float m_delta = std::exp(m_prime[row] - m_i);
-
-          // s_delta <- exp(s_i - m_i)
-          at::vec::map<float>(
-              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-          // s' <- s' * m_delta + sum(s_delta)
-          s_prime[row] *= m_delta;
-          s_prime[row] +=
-              at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
-
-          m_prime[row] = m_i;
-
-          // v' <- v' * m_delta
-          at::vec::map<float>(
-              [m_delta](Vec x) { return x * Vec(m_delta); },
-              v_prime + row * head_size_v,
-              v_prime + row * head_size_v,
-              head_size_v);
-
-          // pad s_delta with 0 first and then convert to scalar_t
-          fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-          copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
-        }
+        flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
+            s_i, s_delta, s_delta2, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, scaling);
 
         // get value and pack
         pack_vnni2<scalar_t, index_t>(
@@ -323,51 +221,8 @@ void extend_attention_kernel_impl(
           }
         }
 
-        const Vec scale_vec = Vec(scaling);
-        for (int row = 0; row < m_size; ++row) {
-          // s_i <- s_i * scale
-          at::vec::map<float>(
-              [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-          // TODO: `tanh` from torch uses sleef u10, going to be slow
-          if (has_logit_cap) {
-            at::vec::map<float>(
-                [logit_cap, rlogit_cap](Vec x) { return Vec(logit_cap) * (x * Vec(rlogit_cap)).tanh(); },
-                s_i + row * BLOCK_N,
-                s_i + row * BLOCK_N,
-                n_size);
-          }
-
-          // m_i: max value per row
-          float m_i = at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
-          m_i = std::max(m_i, m_prime[row]);
-
-          // m_delta <- exp(m' - m_i)
-          float m_delta = std::exp(m_prime[row] - m_i);
-
-          // s_delta <- exp(s_i - m_i)
-          at::vec::map<float>(
-              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-          // s' <- s' * m_delta + sum(s_delta)
-          s_prime[row] *= m_delta;
-          s_prime[row] +=
-              at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
-
-          m_prime[row] = m_i;
-
-          // v' <- v' * m_delta
-          at::vec::map<float>(
-              [m_delta](Vec x) { return x * Vec(m_delta); },
-              v_prime + row * head_size_v,
-              v_prime + row * head_size_v,
-              head_size_v);
-
-          // pad s_delta with 0 first and then convert to scalar_t
-          fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-          copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
-        }
+        flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
+            s_i, s_delta, s_delta2, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, scaling);
 
         // get value and pack
         pack_vnni2<scalar_t>(
@@ -412,7 +267,6 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
   const int size_per_thread =
       /* s_i     */ BLOCK_M * BLOCK_N * sizeof(float) +
       /* v_prime */ BLOCK_M * head_size_v * sizeof(float) +
-      /* s_delta */ BLOCK_M * BLOCK_N * sizeof(uint16_t) +
       /* Btmp    */ BLOCK_N * std::max(head_size, head_size_v) * sizeof(uint16_t);
 
   buffer.resize_({num_threads, size_per_thread});
@@ -452,7 +306,6 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         v_strideN,                                                                         \
         v_strideH,                                                                         \
         sm_scale,                                                                          \
-        logit_cap,                                                                         \
         max_num_reqs,                                                                      \
         max_context_len,                                                                   \
         max_total_num_tokens,                                                              \
