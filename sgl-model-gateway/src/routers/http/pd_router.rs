@@ -882,6 +882,8 @@ impl PDRouter {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = headers;
 
+        // Attach load guards to response body for proper RAII lifecycle
+        // Guards are dropped when response body is consumed or client disconnects
         let guards = vec![WorkerLoadGuard::new(prefill), WorkerLoadGuard::new(decode)];
         AttachedBody::wrap_response(response, guards)
     }

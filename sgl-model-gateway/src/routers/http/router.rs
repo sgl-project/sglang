@@ -627,6 +627,8 @@ impl Router {
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
 
+            // Attach load guard to response body for proper RAII lifecycle
+            // Guard is dropped when response body is consumed or client disconnects
             if let Some(guard) = load_guard {
                 response = AttachedBody::wrap_response(response, guard);
             }
