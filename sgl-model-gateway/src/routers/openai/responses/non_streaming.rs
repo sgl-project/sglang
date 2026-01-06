@@ -50,11 +50,15 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
         }
     };
 
-    if let Some(ref tools) = original_body.tools {
-        ensure_request_mcp_client(mcp_manager, tools.as_slice()).await;
-    }
+    let server_keys = match original_body.tools.as_ref() {
+        Some(tools) => match ensure_request_mcp_client(mcp_manager, tools.as_slice()).await {
+            Some((_manager, keys)) => keys,
+            None => Vec::new(),
+        },
+        None => Vec::new(),
+    };
 
-    let active_mcp = if mcp_manager.list_tools().is_empty() {
+    let active_mcp = if mcp_manager.list_tools_for_servers(&server_keys).is_empty() {
         None
     } else {
         Some(mcp_manager)
@@ -63,8 +67,11 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
     let mut response_json: Value;
 
     if let Some(mcp) = active_mcp {
-        let config = McpLoopConfig::default();
-        prepare_mcp_payload_for_streaming(&mut payload, mcp);
+        let config = McpLoopConfig {
+            server_keys: server_keys.clone(),
+            ..McpLoopConfig::default()
+        };
+        prepare_mcp_payload_for_streaming(&mut payload, mcp, &server_keys);
 
         match execute_tool_loop(
             ctx.components.client(),

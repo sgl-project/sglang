@@ -48,7 +48,14 @@ pub(super) async fn route_responses_internal(
     let modified_request = load_conversation_history(ctx, &request).await?;
 
     // 2. Check MCP connection and get whether MCP tools are present
-    let has_mcp_tools = ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref()).await?;
+    let (has_mcp_tools, server_keys) =
+        ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref()).await?;
+
+    // Set the server keys in the context
+    {
+        let mut servers = ctx.requested_servers.write().unwrap();
+        *servers = server_keys;
+    }
 
     let responses_response = if has_mcp_tools {
         debug!("MCP tools detected, using tool loop");
@@ -167,7 +174,10 @@ pub(super) async fn execute_tool_loop(
     );
 
     // Get MCP tools and convert to chat format (do this once before loop)
-    let mcp_tools = ctx.mcp_manager.list_tools();
+    let mcp_tools = {
+        let servers = ctx.requested_servers.read().unwrap();
+        ctx.mcp_manager.list_tools_for_servers(&servers)
+    };
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
     trace!(
         "Converted {} MCP tools to chat format",
@@ -399,7 +409,9 @@ pub(super) async fn execute_tool_loop(
             // Inject MCP metadata into output
             if state.total_calls > 0 {
                 // Prepend mcp_list_tools item
-                let mcp_list_tools = build_mcp_list_tools_item(&ctx.mcp_manager, &server_label);
+                let servers = ctx.requested_servers.read().unwrap();
+                let mcp_list_tools =
+                    build_mcp_list_tools_item(&ctx.mcp_manager, &server_label, &servers);
                 responses_response.output.insert(0, mcp_list_tools);
 
                 // Append all mcp_call items at the end

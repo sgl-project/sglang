@@ -3,7 +3,10 @@
 //! Bundles all dependencies needed by responses handlers to avoid passing
 //! 10+ parameters to every function.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock as StdRwLock},
+};
 
 use tokio::{sync::RwLock, task::JoinHandle};
 
@@ -50,6 +53,9 @@ pub(crate) struct ResponsesContext {
     /// MCP manager for tool support
     pub mcp_manager: Arc<McpManager>,
 
+    /// Server keys for MCP tools requested in this context
+    pub requested_servers: Arc<StdRwLock<Vec<String>>>,
+
     /// Background task handles for cancellation support
     pub background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 }
@@ -71,6 +77,7 @@ impl ResponsesContext {
             conversation_storage,
             conversation_item_storage,
             mcp_manager,
+            requested_servers: Arc::new(StdRwLock::new(Vec::new())),
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
         }
     }

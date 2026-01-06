@@ -202,6 +202,7 @@ pub(super) async fn execute_streaming_tool_calls(
 pub(super) fn prepare_mcp_payload_for_streaming(
     payload: &mut Value,
     active_mcp: &Arc<mcp::McpManager>,
+    server_keys: &[String],
 ) {
     if let Some(obj) = payload.as_object_mut() {
         // Remove any non-function tools from outgoing payload
@@ -217,7 +218,7 @@ pub(super) fn prepare_mcp_payload_for_streaming(
         }
 
         // Build function tools for all discovered MCP tools
-        let tools = active_mcp.list_tools();
+        let tools = active_mcp.list_tools_for_servers(server_keys);
         let mut tools_json = Vec::with_capacity(tools.len());
         for t in tools {
             let parameters = Value::Object((*t.input_schema).clone());
@@ -310,8 +311,9 @@ pub(super) fn send_mcp_list_tools_events(
     server_label: &str,
     output_index: usize,
     sequence_number: &mut u64,
+    server_keys: &[String],
 ) -> bool {
-    let tools_item_full = build_mcp_list_tools_item(mcp, server_label);
+    let tools_item_full = build_mcp_list_tools_item(mcp, server_label, server_keys);
     let item_id = tools_item_full
         .get("id")
         .and_then(|v| v.as_str())
@@ -464,13 +466,14 @@ pub(super) fn inject_mcp_metadata_streaming(
     state: &ToolLoopState,
     mcp: &Arc<mcp::McpManager>,
     server_label: &str,
+    server_keys: &[String],
 ) {
     if let Some(output_array) = response.get_mut("output").and_then(|v| v.as_array_mut()) {
         output_array.retain(|item| {
             item.get("type").and_then(|t| t.as_str()) != Some(ItemType::MCP_LIST_TOOLS)
         });
 
-        let list_tools_item = build_mcp_list_tools_item(mcp, server_label);
+        let list_tools_item = build_mcp_list_tools_item(mcp, server_label, server_keys);
         output_array.insert(0, list_tools_item);
 
         let mcp_call_items =
@@ -482,7 +485,7 @@ pub(super) fn inject_mcp_metadata_streaming(
         }
     } else if let Some(obj) = response.as_object_mut() {
         let mut output_items = Vec::new();
-        output_items.push(build_mcp_list_tools_item(mcp, server_label));
+        output_items.push(build_mcp_list_tools_item(mcp, server_label, server_keys));
         output_items.extend(build_executed_mcp_call_items(
             &state.conversation_history,
             server_label,
@@ -584,6 +587,7 @@ pub(super) async fn execute_tool_loop(
                     "max_tool_calls",
                     active_mcp,
                     original_body,
+                    &config.server_keys,
                 );
             }
 
@@ -634,7 +638,8 @@ pub(super) async fn execute_tool_loop(
                 let server_label = extract_server_label(original_body.tools.as_deref(), "mcp");
 
                 // Build mcp_list_tools item
-                let list_tools_item = build_mcp_list_tools_item(active_mcp, &server_label);
+                let list_tools_item =
+                    build_mcp_list_tools_item(active_mcp, &server_label, &config.server_keys);
 
                 // Insert at beginning of output array
                 if let Some(output_array) = response_json
@@ -668,6 +673,7 @@ pub(super) fn build_incomplete_response(
     reason: &str,
     active_mcp: &Arc<mcp::McpManager>,
     original_body: &ResponsesRequest,
+    server_keys: &[String],
 ) -> Result<Value, String> {
     let obj = response
         .as_object_mut()
@@ -712,7 +718,7 @@ pub(super) fn build_incomplete_response(
 
         // Add mcp_list_tools and executed mcp_call items at the beginning
         if state.total_calls > 0 || !mcp_call_items.is_empty() {
-            let list_tools_item = build_mcp_list_tools_item(active_mcp, &server_label);
+            let list_tools_item = build_mcp_list_tools_item(active_mcp, &server_label, server_keys);
             output_array.insert(0, list_tools_item);
 
             // Add mcp_call items for executed calls using helper
@@ -758,8 +764,12 @@ pub(super) fn build_incomplete_response(
 // ============================================================================
 
 /// Build a mcp_list_tools output item
-pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label: &str) -> Value {
-    let tools = mcp.list_tools();
+pub(super) fn build_mcp_list_tools_item(
+    mcp: &Arc<mcp::McpManager>,
+    server_label: &str,
+    server_keys: &[String],
+) -> Value {
+    let tools = mcp.list_tools_for_servers(server_keys);
     let tools_json: Vec<Value> = tools
         .iter()
         .map(|t| {

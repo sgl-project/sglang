@@ -47,11 +47,17 @@ pub(crate) async fn serve_harmony_responses_stream(
     };
 
     // Check MCP connection BEFORE starting stream and get whether MCP tools are present
-    let has_mcp_tools =
+    let (has_mcp_tools, server_keys) =
         match ensure_mcp_connection(&ctx.mcp_manager, current_request.tools.as_deref()).await {
-            Ok(has_mcp) => has_mcp,
+            Ok(result) => result,
             Err(response) => return response,
         };
+
+    // Set the server keys in the context
+    {
+        let mut servers = ctx.requested_servers.write().unwrap();
+        *servers = server_keys;
+    }
 
     // Create SSE channel
     let (tx, rx) = mpsc::unbounded_channel();
@@ -124,8 +130,11 @@ async fn execute_mcp_tool_loop_streaming(
     // Extract user's max_tool_calls limit (if set)
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
 
-    // Add static MCP tools from inventory
-    let mcp_tools = ctx.mcp_manager.list_tools();
+    // Add filtered MCP tools (static + requested dynamic) to the request
+    let mcp_tools = {
+        let servers = ctx.requested_servers.read().unwrap();
+        ctx.mcp_manager.list_tools_for_servers(&servers)
+    };
     if !mcp_tools.is_empty() {
         let mcp_response_tools = convert_mcp_tools_to_response_tools(&mcp_tools);
         let mut all_tools = current_request.tools.clone().unwrap_or_default();
