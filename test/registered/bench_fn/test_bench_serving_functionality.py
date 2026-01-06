@@ -71,16 +71,17 @@ class TestBenchServingFunctionality(CustomTestCase):
             and "request.finished" in line
             and not json.loads(line).get("rid", "").startswith("HEALTH_CHECK")
         ]
-
         self.assertEqual(len(reqs), NUM_CONVERSATIONS * NUM_TURNS)
 
-        lengths = sorted(len(r.get("obj", {}).get("text", "")) for r in reqs)
-        avg_short = sum(lengths[:NUM_CONVERSATIONS]) / NUM_CONVERSATIONS
-        avg_long = sum(lengths[-NUM_CONVERSATIONS:]) / NUM_CONVERSATIONS
-        self.assertGreater(
-            avg_long,
-            avg_short * 1.5,
-            f"Later turns should have longer prompts. Short: {avg_short}, Long: {avg_long}",
+        prompts = [r.get("obj", {}).get("text", "") for r in reqs]
+        prefix_pairs = sum(
+            1 for p1 in prompts for p2 in prompts if p1 != p2 and p2.startswith(p1)
+        )
+        expected_pairs = NUM_CONVERSATIONS * (NUM_TURNS - 1)
+        self.assertEqual(
+            prefix_pairs,
+            expected_pairs,
+            f"Expected {expected_pairs} prefix pairs, got {prefix_pairs}",
         )
 
 
