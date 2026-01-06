@@ -40,16 +40,6 @@
 
 namespace {
 
-template <typename T>
-void print_array(const T* data, int M, int N, int lda) {
-  for (int m = 0; m < M; ++m) {
-    for (int n = 0; n < N; ++n) {
-      std::cout << " " << float(data[m * lda + n]);
-    }
-    std::cout << std::endl;
-  }
-}
-
 template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 void flash_attn_kernel_impl(
     scalar_t* __restrict__ out,
