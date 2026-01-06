@@ -46,7 +46,57 @@ class TestLoRALoadFromTensor(CustomTestCase):
         with open(os.path.join(lora_adapter, "adapter_config.json"), "r") as f:
             cls.lora_config_dict = json.load(f)
 
-    def test_e2e_lora_load_from_tensor_params(self):
+    def test_lora_lru_eviction(self):
+        print("[Test]Testing LRU LoRA eviction...")
+        MAX_LOADED_LORAS = 8
+        print(f"[Test]Max loaded LoRAs: {MAX_LOADED_LORAS}")
+        test_engine = sgl.Engine(model_path=MODEL_PATH, enable_lora=True,
+            max_lora_rank=64,
+            lora_target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            mem_fraction_static=0.6,
+            log_level="error",
+            max_loaded_loras=MAX_LOADED_LORAS,
+        )
+        
+        # Load 10 LoRA adapters, max allowed is 8
+        # This should trigger LRU eviction when we exceed the limit
+        TEST_LORA_COUNT = 10
+        for i in range(TEST_LORA_COUNT):
+            print(f"[Test]Loading LoRA adapter {i+1}/10: self_cognition_Alice_{i}")
+            result = test_engine.load_lora_adapter_from_tensors(
+                lora_name=f"self_cognition_Alice_{i}",
+                tensors=self.lora_tensors,
+                config_dict=self.lora_config_dict
+            )
+            self.assertTrue(
+                result.success,
+                f"Failed to load LoRA adapter {i}: {result.error_message}",
+            )
+            print(f"[Test]Successfully loaded LoRA {i+1}, current loaded adapters: {list(result.loaded_adapters.keys())}")
+
+        EXPECTED_LORA_ADAPTERS = ['self_cognition_Alice_2', 'self_cognition_Alice_3', 'self_cognition_Alice_4', 'self_cognition_Alice_5', 'self_cognition_Alice_6', 'self_cognition_Alice_7', 'self_cognition_Alice_8', 'self_cognition_Alice_9']
+        EXPECTED_LORA_COUNT = 8
+        self.assertEqual(
+            len(result.loaded_adapters),
+            EXPECTED_LORA_COUNT,
+            f"Loaded adapters count does not match expected result: {len(result.loaded_adapters)} != {EXPECTED_LORA_COUNT}",
+        )
+        self.assertEqual(
+            list(result.loaded_adapters.keys()),
+            EXPECTED_LORA_ADAPTERS,
+            f"Loaded adapters do not match expected result: {list(result.loaded_adapters.keys())} != {EXPECTED_LORA_ADAPTERS}",
+        )
+        print(f"[Test]LRU eviction test passed! Final loaded adapters: {len(result.loaded_adapters)}")
+
+    def test_lora_e2e_load_from_tensor_params(self):
         print("[Test]Testing LoRA load from tensor params...")
 
         result = self.engine.load_lora_adapter_from_tensors(
