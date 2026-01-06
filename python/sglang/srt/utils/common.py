@@ -1815,6 +1815,7 @@ def crash_on_warnings():
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
+@functools.lru_cache(None)
 def print_warning_once(msg: str) -> None:
     # Set the stacklevel to 2 to print the caller's line info
     logger.warning(msg, stacklevel=2)
@@ -1884,6 +1885,77 @@ def get_device(device_id: Optional[int] = None) -> str:
             )
 
     raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU) is available.")
+
+
+def print_non_torch_memory_usage():
+    """Try to allocate a huge amount of memory to trigger OOM and parse memory info."""
+    import re
+
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() != 0:
+        return
+
+    def parse_memory_value(value_str: str, unit_str: str) -> float:
+        """Convert memory value to GiB."""
+        value = float(value_str)
+        unit = unit_str.lower()
+        if unit == "gib" or unit == "gb":
+            return value
+        elif unit == "mib" or unit == "mb":
+            return value / 1024
+        elif unit == "kib" or unit == "kb":
+            return value / (1024 * 1024)
+        elif unit == "bytes" or unit == "b":
+            return value / (1024 * 1024 * 1024)
+        else:
+            return value  # assume GiB
+
+    try:
+        torch.cuda.empty_cache()
+        x = torch.empty(100 * 1024 * 1024 * 1024, device="cuda")
+        del x  # unreachable, but for completeness
+    except Exception as e:
+        msg = str(e)
+
+        # Parse "Process X has Y memory in use"
+        process_mem_match = re.search(
+            r"has\s+([\d.]+)\s+(\w+)\s+memory\s+in\s+use", msg
+        )
+        # Parse "X is allocated by PyTorch"
+        allocated_match = re.search(
+            r"([\d.]+)\s+(\w+)\s+is\s+allocated\s+by\s+PyTorch", msg
+        )
+        # Parse "X is reserved by PyTorch but unallocated"
+        reserved_match = re.search(
+            r"([\d.]+)\s+(\w+)\s+is\s+reserved\s+by\s+PyTorch\s+but\s+unallocated", msg
+        )
+
+        if process_mem_match and allocated_match and reserved_match:
+            process_mem_gib = parse_memory_value(
+                process_mem_match.group(1), process_mem_match.group(2)
+            )
+            allocated_gib = parse_memory_value(
+                allocated_match.group(1), allocated_match.group(2)
+            )
+            reserved_gib = parse_memory_value(
+                reserved_match.group(1), reserved_match.group(2)
+            )
+
+            non_torch_gib = process_mem_gib - allocated_gib - reserved_gib
+
+            logger.info(
+                f"\n\n"
+                f"Memory breakdown: Process total={process_mem_gib:.2f} GiB, "
+                f"PyTorch allocated={allocated_gib:.2f} GiB, "
+                f"PyTorch reserved={reserved_gib:.2f} GiB, "
+                f"Non-torch memory={non_torch_gib:.2f} GiB"
+                f"\n\n"
+            )
+        else:
+            logger.warning(f"Could not parse memory info from OOM error: {msg}")
+
+    return non_torch_gib
 
 
 @lru_cache(maxsize=1)

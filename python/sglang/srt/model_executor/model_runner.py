@@ -808,6 +808,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info(
             f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
+
+        from sglang.srt.utils.common import print_non_torch_memory_usage
+
+        print_non_torch_memory_usage()
+
         return min_per_gpu_memory
 
     def load_model(self):

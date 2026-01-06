@@ -469,6 +469,10 @@ class CudaGraphRunner:
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
 
+        from sglang.srt.utils.common import print_non_torch_memory_usage
+
+        print_non_torch_memory_usage()
+
         def _capture_one_stream(stream_idx: Optional[int] = None):
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
@@ -526,6 +530,10 @@ class CudaGraphRunner:
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
+
+        from sglang.srt.utils.common import print_non_torch_memory_usage
+
+        print_non_torch_memory_usage()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
