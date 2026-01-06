@@ -122,6 +122,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         If continue_final_message is enabled and the last message is from assistant,
         extract its content and remove it from the message list.
+        Only processes text-based content (strings), ignoring multimodal content (lists).
 
         Args:
             messages: List of message dictionaries
@@ -130,7 +131,7 @@ class OpenAIServingChat(OpenAIServingBase):
         Returns:
             Tuple of (processed_messages, assistant_prefix)
             - processed_messages: Messages with last assistant message removed if continue_final_message is True
-            - assistant_prefix: Content of the last assistant message, or None
+            - assistant_prefix: Content of the last assistant message (string only), or None
         """
         assistant_prefix = None
         if (
@@ -138,8 +139,11 @@ class OpenAIServingChat(OpenAIServingBase):
             and messages[-1].get("role") == "assistant"
             and request.continue_final_message
         ):
-            assistant_prefix = messages[-1].get("content")
-            messages = messages[:-1]
+            last_content = messages[-1].get("content")
+            # Only process string content, ignore multimodal content (lists)
+            if isinstance(last_content, str):
+                assistant_prefix = last_content
+                messages = messages[:-1]
         return messages, assistant_prefix
 
     def _append_assistant_prefix_to_prompt_ids(
