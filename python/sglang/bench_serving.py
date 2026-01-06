@@ -1813,11 +1813,15 @@ def sample_generated_shared_prefix_requests(
         system_prompt = gen_prompt(tokenizer, system_prompt_lens[i].item())
         system_prompts.append(system_prompt)
 
-    # Generate questions
-    questions = []
-    for i in range(total_questions):
-        question = gen_prompt(tokenizer, question_lens[i].item())
-        questions.append(question)
+    # Generate questions: shape (num_groups * prompts_per_group, num_turns)
+    num_conversations = num_groups * prompts_per_group
+    questions = [
+        [
+            gen_prompt(tokenizer, question_lens[i * num_turns + t].item())
+            for t in range(num_turns)
+        ]
+        for i in range(num_conversations)
+    ]
 
     # Combine system prompts with questions
     input_requests = []
@@ -1835,11 +1839,8 @@ def sample_generated_shared_prefix_requests(
             range(prompts_per_group), desc="Generating questions", leave=False
         ):
             flat_index = group_idx * prompts_per_group + prompt_idx
-            q_start = flat_index * num_turns
-            turn_questions = questions[q_start : q_start + num_turns]
-            turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[
-                1:
-            ]
+            turn_questions = questions[flat_index]
+            turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[1:]
             full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
             prompt_len = (
                 1

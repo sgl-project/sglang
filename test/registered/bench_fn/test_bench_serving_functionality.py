@@ -80,9 +80,9 @@ class TestBenchServingFunctionality(CustomTestCase):
         turn2_reqs = [m for m in messages_list if len(m) == 3]
         turn3_reqs = [m for m in messages_list if len(m) == 5]
 
-        self.assertEqual(len(turn1_reqs), NUM_CONVERSATIONS, "Turn 1 should have 1 msg")
-        self.assertEqual(len(turn2_reqs), NUM_CONVERSATIONS, "Turn 2 should have 3 msgs")
-        self.assertEqual(len(turn3_reqs), NUM_CONVERSATIONS, "Turn 3 should have 5 msgs")
+        self.assertEqual(len(turn1_reqs), NUM_CONVERSATIONS)
+        self.assertEqual(len(turn2_reqs), NUM_CONVERSATIONS)
+        self.assertEqual(len(turn3_reqs), NUM_CONVERSATIONS)
 
         prefix_count = 0
         for t2 in turn2_reqs:
