@@ -23,9 +23,7 @@ use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::{
-    config::ManualAssignmentMode,
-    core::Worker,
-    observability::metrics::Metrics,
+    config::ManualAssignmentMode, core::Worker, observability::metrics::Metrics,
     routers::header_utils::extract_routing_key,
 };
 
