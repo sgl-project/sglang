@@ -23,7 +23,7 @@ use crate::{
 ///
 /// Checks if request declares MCP tools, and if so, validates that
 /// the MCP client can be created and connected.
-pub async fn ensure_mcp_connection(
+pub(crate) async fn ensure_mcp_connection(
     mcp_manager: &Arc<McpManager>,
     tools: Option<&[ResponseTool]>,
 ) -> Result<bool, Response> {
@@ -56,7 +56,7 @@ pub async fn ensure_mcp_connection(
 }
 
 /// Validate that workers are available for the requested model
-pub fn validate_worker_availability(
+pub(crate) fn validate_worker_availability(
     worker_registry: &Arc<WorkerRegistry>,
     model: &str,
 ) -> Option<Response> {
@@ -90,7 +90,7 @@ pub fn validate_worker_availability(
 ///   the initial conversion from ResponsesRequest to ChatCompletionRequest. MCP tools
 ///   are merged later by the tool loop before being sent to the chat pipeline, where
 ///   tool_choice constraints are generated for ALL tools (function + MCP combined).
-pub fn extract_tools_from_response_tools(
+pub(crate) fn extract_tools_from_response_tools(
     response_tools: Option<&[ResponseTool]>,
     include_mcp: bool,
 ) -> Vec<Tool> {
@@ -124,7 +124,7 @@ pub fn extract_tools_from_response_tools(
 ///
 /// Common helper function to avoid duplication across sync and streaming paths
 /// in both harmony and regular responses implementations.
-pub async fn persist_response_if_needed(
+pub(crate) async fn persist_response_if_needed(
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
     response_storage: Arc<dyn ResponseStorage>,
