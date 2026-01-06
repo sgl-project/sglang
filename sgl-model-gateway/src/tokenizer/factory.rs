@@ -452,7 +452,7 @@ mod tests {
         assert!(tokenizer.vocab_size() > 0);
 
         let text = "Hello, world!";
-        let encoding = tokenizer.encode(text).unwrap();
+        let encoding = tokenizer.encode(text, false).unwrap();
         let decoded = tokenizer.decode(encoding.token_ids(), false).unwrap();
         assert_eq!(decoded, text);
     }
