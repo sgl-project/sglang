@@ -67,28 +67,14 @@ def _validate_safetensors_file(file_path: str) -> bool:
 def _validate_safetensors_only(
     hf_folder: str, allow_patterns: List[str]
 ) -> Tuple[bool, List[str]]:
-    """
-    Simple validation that only checks safetensors files for corruption.
-
-    This is used for post-download validation where we just want to catch
-    corrupted/truncated downloads, not do full cache validation.
-
-    Args:
-        hf_folder: Path to the downloaded model folder
-        allow_patterns: Patterns used to match weight files
-
-    Returns:
-        Tuple of (is_valid, corrupted_files)
-    """
-    # Find all weight files that were downloaded
+    """Check safetensors files for corruption. Returns (is_valid, corrupted_files)."""
     weight_files: List[str] = []
     for pattern in allow_patterns:
         weight_files.extend(glob_module.glob(os.path.join(hf_folder, pattern)))
 
     if not weight_files:
-        return True, []  # No weight files to validate
+        return True, []
 
-    # Validate safetensors files only
     corrupted_files = []
     for f in weight_files:
         if f.endswith(".safetensors") and os.path.exists(f):
@@ -540,7 +526,6 @@ def ci_download_with_retry(
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
 
-        # Simple validation: just check for corrupted safetensors files
         is_valid, corrupted_files = _validate_safetensors_only(
             hf_folder, allow_patterns
         )

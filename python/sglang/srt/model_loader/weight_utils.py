@@ -485,22 +485,16 @@ def download_weights_from_hf(
                     )
                     return path
                 else:
-                    # Invalid cache - handle based on error type
                     log_info_on_rank0(
                         logger,
                         f"Local cache invalid for {model_name_or_path}: {error_msg}. "
                         "Will attempt to fix and re-download.",
                     )
                     if corrupted_files:
-                        # Selective cleanup: only remove corrupted files
                         remove_hf_weights(path, corrupted_files)
                     elif "Incomplete download" in (error_msg or ""):
-                        # Full cleanup for incomplete downloads
                         remove_hf_weights(path)
-                    # For missing shards, do NOT delete the entire cache.
-                    # Let snapshot_download handle it - it can download missing files.
-                    # IMPORTANT: Other processes (TP/EP ranks) may already be loading
-                    # weights from these files.
+                    # For missing shards, don't delete cache - let snapshot_download handle it
             else:
                 # Non-CI: skip full validation, just use the local cache
                 log_info_on_rank0(
