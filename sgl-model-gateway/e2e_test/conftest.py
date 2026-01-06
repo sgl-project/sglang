@@ -4,26 +4,23 @@ Markers
 -------
 This module defines several pytest markers for configuring E2E tests:
 
-@pytest.mark.model(name, scope="session")
+@pytest.mark.model(name)
     Specify which model to use for the test.
 
     Args:
         name: Model ID from MODEL_SPECS (e.g., "llama-8b", "qwen-7b")
-        scope: "session" (default) or "class"
-            - session: Pre-launched at test session start. Stays running.
-            - class: Launched on-demand when test class starts.
 
     GPU Resource Management:
         When GPUs are limited (e.g., 4 GPUs, 6 models), the model pool uses
-        LRU (Least Recently Used) eviction:
-        1. Session models are pre-launched until GPUs are full
-        2. Overflow models are queued for on-demand launch
-        3. When a queued model is needed, LRU model is evicted
-        4. Evicted models go back to queue and can be re-launched later
+        MRU (Most Recently Used) eviction:
+        1. Models are pre-launched until GPUs are full
+        2. When a test needs a model that isn't running, MRU model is evicted
+           (models just used are likely done, models not yet used are waiting)
+        3. The needed model is then launched on-demand
 
     Examples:
-        @pytest.mark.model("llama-8b")  # session scope, pre-launched
-        @pytest.mark.model("qwen-72b", scope="class")  # on-demand only
+        @pytest.mark.model("llama-8b")
+        @pytest.mark.model("qwen-72b")
 
 @pytest.mark.workers(count=1, prefill=None, decode=None)
     Configure worker topology for the test.
@@ -78,15 +75,6 @@ Test with specific model and multiple backends:
     @pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
     class TestQwen:
         def test_generate(self, setup_backend):
-            ...
-
-Large model loaded on-demand (class scope):
-
-    @pytest.mark.e2e
-    @pytest.mark.model("llama-70b", scope="class")
-    @pytest.mark.parametrize("setup_backend", ["http"], indirect=True)
-    class TestLargeModel:
-        def test_inference(self, setup_backend):
             ...
 
 PD disaggregation mode:
@@ -195,8 +183,8 @@ from infra import (
 
 # Global storage for scanned requirements
 _scanned_backends: set[str] = set()  # {"grpc", "http", "openai", ...}
-_session_models: set[str] = set()  # Models to pre-launch at session start
-_class_models: set[str] = set()  # Models to launch on-demand per class
+_scanned_models: set[str] = set()  # Models needed by tests
+_needs_default_model: bool = False  # True if any e2e test lacks explicit model marker
 
 
 def pytest_collection_modifyitems(
@@ -208,14 +196,13 @@ def pytest_collection_modifyitems(
 
     This runs after test collection but before tests execute.
     It extracts backend requirements from @pytest.mark.parametrize markers.
-
-    Models are categorized by scope:
-    - session: Pre-launched at session start (default)
-    - class: Launched on-demand when test class starts
     """
-    global _scanned_backends, _session_models, _class_models
+    global _scanned_backends, _scanned_models, _needs_default_model
 
     for item in items:
+        # Track if this test has an explicit model marker
+        has_model_marker = False
+
         # Scan parametrize markers for setup_backend
         for marker in item.iter_markers("parametrize"):
             if marker.args and len(marker.args) >= 2:
@@ -228,45 +215,44 @@ def pytest_collection_modifyitems(
                         _scanned_backends.update(param_values)
 
                 elif param_name == PARAM_MODEL or PARAM_MODEL in param_name:
-                    # Extract model names from parametrize - default to session scope
+                    # Extract model names from parametrize
                     if isinstance(param_values, (list, tuple)):
-                        _session_models.update(param_values)
+                        _scanned_models.update(param_values)
+                        has_model_marker = True
 
-        # Check for @pytest.mark.model("name", scope="...") markers
+        # Check for @pytest.mark.model("name") markers
         model_marker = item.get_closest_marker(PARAM_MODEL)
         if model_marker and model_marker.args:
             model_name = model_marker.args[0]
-            scope = model_marker.kwargs.get("scope", "session")
+            _scanned_models.add(model_name)
+            has_model_marker = True
 
-            if scope == "class":
-                _class_models.add(model_name)
-            else:
-                _session_models.add(model_name)
-
-    # Remove class models from session models (class scope takes precedence if mixed)
-    # Actually, keep both - a model can be used by both session and class scoped tests
-    # The model_pool will handle this by keeping session models running
+        # Check if this is an e2e test without an explicit model marker
+        # Such tests need the DEFAULT_MODEL
+        if not has_model_marker and item.get_closest_marker("e2e"):
+            _needs_default_model = True
 
     logger.info(
-        "Scanned test requirements - backends: %s, session models: %s, class models: %s",
+        "Scanned test requirements - backends: %s, models: %s, needs default: %s",
         _scanned_backends or {"(none)"},
-        _session_models or {"(none)"},
-        _class_models or {"(none)"},
+        _scanned_models or {"(none)"},
+        _needs_default_model,
     )
 
 
 def get_pool_requirements() -> list[tuple[str, ConnectionMode]]:
     """Build pool requirements from scanned test markers.
 
-    Only returns session-scoped models for pre-launching.
-    Class-scoped models are launched on-demand by model_pool.get().
-
     Returns:
-        List of (model_id, ConnectionMode) tuples to pre-launch.
+        List of (model_id, ConnectionMode) tuples to try to pre-launch.
+        Models that don't fit will be launched on-demand.
     """
-    # Only pre-launch session-scoped models
-    # Default model if none specified
-    models = _session_models or {DEFAULT_MODEL}
+    models = set(_scanned_models)
+
+    # Add DEFAULT_MODEL if any e2e test lacks an explicit model marker,
+    # or if no models were specified at all
+    if _needs_default_model or not models:
+        models.add(DEFAULT_MODEL)
 
     # Convert scanned string backends to ConnectionMode enums
     # Filter to local backends only (grpc, http) - cloud backends don't need workers
@@ -277,7 +263,7 @@ def get_pool_requirements() -> list[tuple[str, ConnectionMode]]:
             if mode in LOCAL_MODES:
                 local_modes.add(mode)
         except ValueError:
-            # Not a ConnectionMode (e.g., "openai", "xai") - skip
+            # Not a ConnectionMode (e.g., "openai", "xai", "pd") - skip
             pass
 
     # Default to HTTP if no local backends specified
@@ -293,15 +279,6 @@ def get_pool_requirements() -> list[tuple[str, ConnectionMode]]:
     return requirements
 
 
-def get_class_scoped_models() -> set[str]:
-    """Get models that are class-scoped (launched on-demand).
-
-    Returns:
-        Set of model IDs that should be launched on-demand.
-    """
-    return _class_models.copy()
-
-
 # ---------------------------------------------------------------------------
 # Custom pytest markers
 # ---------------------------------------------------------------------------
@@ -311,8 +288,7 @@ def pytest_configure(config: pytest.Config) -> None:
     """Register custom markers."""
     config.addinivalue_line(
         "markers",
-        "model(name, scope='session'): mark test to use a specific model "
-        "(scope: 'session' for pre-launched, 'class' for on-demand)",
+        "model(name): mark test to use a specific model from MODEL_SPECS",
     )
     config.addinivalue_line(
         "markers",
@@ -431,29 +407,8 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
     allocator = GPUAllocator()
     _model_pool = ModelPool(allocator)
 
-    # Register class-scoped models for on-demand launching
-    class_models = get_class_scoped_models()
-    if class_models:
-        _model_pool.register_class_scoped_models(class_models)
-
     startup_timeout = int(os.environ.get(ENV_STARTUP_TIMEOUT, "300"))
     _model_pool.startup(requirements=requirements, startup_timeout=startup_timeout)
-
-    # Pre-launch PD workers if 'pd' backend is detected
-    if "pd" in _scanned_backends:
-        logger.info("PD backend detected, pre-launching PD workers")
-        # Use default model for PD workers
-        pd_model = next(iter(_session_models), DEFAULT_MODEL)
-        if pd_model in MODEL_SPECS:
-            try:
-                _model_pool.launch_pd_workers(
-                    model_id=pd_model,
-                    num_prefill=1,
-                    num_decode=1,
-                    startup_timeout=startup_timeout,
-                )
-            except Exception as e:
-                logger.warning("Failed to pre-launch PD workers: %s", e)
 
     # Log final GPU allocation summary
     logger.info(_model_pool.allocator.summary())
@@ -624,12 +579,6 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
     if model_id is None:
         model_id = os.environ.get(ENV_MODEL, DEFAULT_MODEL)
 
-    # Get model scope from marker (session or class)
-    model_marker = request.node.get_closest_marker("model")
-    model_scope = "session"
-    if model_marker:
-        model_scope = model_marker.kwargs.get("scope", "session")
-
     # Get worker configuration from marker
     workers_config = _get_marker_kwargs(
         request, "workers", defaults={"count": 1, "prefill": None, "decode": None}
@@ -748,9 +697,7 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
         num_workers = workers_config.get("count") or 1
 
         try:
-            instance = model_pool.get(model_id, connection_mode, scope=model_scope)
-        except KeyError:
-            pytest.skip(f"Model {model_id}:{backend_name} not available in pool")
+            instance = model_pool.get(model_id, connection_mode)
         except RuntimeError as e:
             pytest.fail(str(e))
 
