@@ -552,8 +552,7 @@ pub async fn concurrency_limit_middleware(
 
                             // Wrap the response body with TokenGuardBody to return token when stream ends
                             let (parts, body) = response.into_parts();
-                            let guarded_body =
-                                TokenGuardBody::new(body, token_bucket, 1.0);
+                            let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
                             Response::from_parts(parts, Body::new(guarded_body))
                         }
                         Ok(Err(status)) => {

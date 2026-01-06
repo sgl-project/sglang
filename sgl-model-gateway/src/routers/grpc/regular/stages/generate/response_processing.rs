@@ -7,6 +7,7 @@ use axum::response::Response;
 use tracing::error;
 
 use crate::{
+    core::AttachedBody,
     routers::{
         error,
         grpc::{
@@ -15,7 +16,6 @@ use crate::{
             regular::{processor, streaming},
         },
     },
-    core::AttachedBody,
 };
 
 /// Generate response processing stage
