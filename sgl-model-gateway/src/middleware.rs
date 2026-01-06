@@ -43,12 +43,18 @@ use crate::{
     },
 };
 
+/// A guard that holds a token and returns it when dropped.
+/// This ensures that for streaming responses, the token is only returned after the entire
+/// stream has been sent to the client.
 pub struct TokenGuard {
+    /// The token bucket to return tokens to. Uses Option so we can take() on drop.
     token_bucket: Option<Arc<TokenBucket>>,
+    /// Number of tokens to return.
     tokens: f64,
 }
 
 impl TokenGuard {
+    /// Create a new TokenGuard that will return tokens when dropped.
     pub fn new(token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
         Self {
             token_bucket: Some(token_bucket),
@@ -64,6 +70,7 @@ impl Drop for TokenGuard {
                 "TokenGuard: stream ended, returning {} tokens to bucket",
                 self.tokens
             );
+            // Use lock-free sync return - no runtime needed, guaranteed token return
             bucket.return_tokens_sync(self.tokens);
         }
     }
