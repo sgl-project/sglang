@@ -1,6 +1,5 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# RL Update Weights from Tensor tests (1-GPU)
 register_cuda_ci(est_time=195, suite="stage-b-test-small-1-gpu")
 
 import gc

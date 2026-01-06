@@ -1,6 +1,9 @@
-from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_amd_ci(est_time=19, suite="per-commit-2-gpu-amd", disabled="see #11127")
+register_cuda_ci(est_time=19, suite="stage-b-test-large-2-gpu")
+register_amd_ci(
+    est_time=19, suite="stage-b-test-large-2-gpu-amd", disabled="see #11127"
+)
 
 import os
 import traceback

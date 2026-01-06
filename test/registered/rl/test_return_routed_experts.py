@@ -1,7 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# RL Return Routed Experts tests (4-GPU)
-register_cuda_ci(est_time=300, suite="per-commit-4-gpu")
+register_cuda_ci(est_time=300, suite="stage-c-test-large-4-gpu")
 
 import asyncio
 import logging
