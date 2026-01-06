@@ -158,7 +158,6 @@ class LlamaAttention(nn.Module):
         )
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
         self.rotary_dim = int(partial_rotary_factor * self.head_dim)
-        self.architectures = getattr(config, "architectures", [''])[0]
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
