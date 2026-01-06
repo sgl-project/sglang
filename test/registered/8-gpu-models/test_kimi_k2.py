@@ -44,7 +44,12 @@ class TestKimiK2Unified(unittest.TestCase):
             models=variants,
             test_name="Kimi-K2-Thinking Unified",
             accuracy_params=AccuracyTestParams(
-                dataset="gpqa", baseline_accuracy=GPQA_BASELINE
+                dataset="gpqa",
+                baseline_accuracy=GPQA_BASELINE,
+                num_examples=198,
+                num_threads=198,
+                max_tokens=120000,
+                temperature=0.1,
             ),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_kimi_k2_thinking",
