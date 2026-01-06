@@ -1805,6 +1805,7 @@ def sample_generated_shared_prefix_requests(
         range_ratio=range_ratio,
         num=num_groups * prompts_per_group,
     )
+    output_lens = output_lens.reshape(num_groups, prompts_per_group)
     del system_prompt_len, question_len, output_len
 
     # Generate system prompts for each group
@@ -1826,9 +1827,6 @@ def sample_generated_shared_prefix_requests(
             group_questions.append(turn_questions)
             q_idx += num_turns
         questions.append(group_questions)
-
-    # Reshape output_lens to (num_groups, prompts_per_group)
-    output_lens = output_lens.reshape(num_groups, prompts_per_group)
 
     # Combine system prompts with questions
     input_requests = []
