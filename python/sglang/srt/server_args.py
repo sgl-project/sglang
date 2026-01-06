@@ -933,14 +933,14 @@ class ServerArgs:
                     reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
 
             # For piecewise cuda graphs
-            if self.enable_piecewise_cuda_graph:
-                # Piecewise cuda graph memory overhead is constructed by the max capture size and the number of capture ranges.
-                if self.piecewise_cuda_graph_max_tokens <= 1024:
-                    reserved_mem += 1024 + 8 * len(self.piecewise_cuda_graph_tokens)
-                else:
-                    reserved_mem += 1024 * 1.5 + 8 * len(
-                        self.piecewise_cuda_graph_tokens
-                    )
+            # if self.enable_piecewise_cuda_graph:
+            #     # Piecewise cuda graph memory overhead is constructed by the max capture size and the number of capture ranges.
+            #     if self.piecewise_cuda_graph_max_tokens <= 1024:
+            #         reserved_mem += 1024 + 8 * len(self.piecewise_cuda_graph_tokens)
+            #     else:
+            #         reserved_mem += 1024 * 1.5 + 8 * len(
+            #             self.piecewise_cuda_graph_tokens
+            #         )
 
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
