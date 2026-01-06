@@ -207,6 +207,10 @@ class ServerArgs:
     # Compilation
     enable_torch_compile: bool = False
 
+    # warmup
+    warmup: bool = False
+    warmup_resolutions: list[str] = None
+
     disable_autocast: bool | None = None
 
     # VSA parameters
@@ -220,9 +224,9 @@ class ServerArgs:
     # TODO: do not hard code
     master_port: int | None = None
 
-    # http server endpoint config, would be ignored in local mode
-    host: str | None = None
-    port: int | None = None
+    # http server endpoint config
+    host: str | None = "127.0.0.1"
+    port: int | None = 30000
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -290,6 +294,17 @@ class ServerArgs:
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
 
+        # handle warmup
+        if self.warmup_resolutions is not None:
+            self.warmup = True
+
+        if self.warmup:
+            logger.info(
+                "Warmup enabled, the launch time is expected to be longer than usual"
+            )
+
+        # network initialization: port and host
+        self.port = self.settle_port(self.port)
         # Add randomization to avoid race condition when multiple servers start simultaneously
         initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
         self.scheduler_port = self.settle_port(initial_scheduler_port)
@@ -306,6 +321,7 @@ class ServerArgs:
                     "Failed to load V-MoBA config from %s: %s", self.moba_config_path, e
                 )
                 raise
+
         self.check_server_args()
 
         # log clean server_args
@@ -453,6 +469,24 @@ class ServerArgs:
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
+
+        # warmup
+        parser.add_argument(
+            "--warmup",
+            action=StoreBoolean,
+            default=ServerArgs.warmup,
+            help="Perform some warmup after server starts (if `--warmup-resolutions` is specified) or before processing the first request (if `--warmup-resolutions` is not specified)."
+            "Recommended to enable when benchmarking to ensure fair comparison and best performance."
+            "When enabled with `--warmup-resolutions` unspecified, look for the line ending with `(with warmup excluded)` for actual processing time.",
+        )
+        parser.add_argument(
+            "--warmup-resolutions",
+            type=str,
+            nargs="+",
+            default=ServerArgs.warmup_resolutions,
+            help="Specify resolutions for server to warmup. e.g., `--warmup-resolutions 256x256, 720x720`",
+        )
+
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
@@ -575,12 +609,15 @@ class ServerArgs:
         else:
             return f"http://{self.host}:{self.port}"
 
+    @property
     def scheduler_endpoint(self):
         """
-        Internal endpoint for scheduler
-
+        Internal endpoint for scheduler.
+        Prefers the configured host but normalizes localhost -> 127.0.0.1 to avoid ZMQ issues.
         """
-        scheduler_host = self.host or "localhost"
+        scheduler_host = self.host
+        if scheduler_host is None or scheduler_host == "localhost":
+            scheduler_host = "127.0.0.1"
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
     def settle_port(
@@ -622,16 +659,6 @@ class ServerArgs:
             f"Failed to find available port after {max_attempts} attempts "
             f"(started from port {original_port})"
         )
-
-    def post_init_serve(self):
-        """
-        Post init when in serve mode
-        """
-        if self.host is None:
-            self.host = "localhost"
-        if self.port is None:
-            self.port = 3000
-        self.port = self.settle_port(self.port)
 
     @classmethod
     def from_cli_args(

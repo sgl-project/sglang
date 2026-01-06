@@ -88,7 +88,7 @@ class Req:
 
     # Batch info
     num_outputs_per_prompt: int = 1
-    seed: int | None = None
+    seed: int | None = 42
     seeds: list[int] | None = None
     generator_device: str = (
         "cuda"  # Device for random generator: "cuda", "musa" or "cpu"
@@ -159,6 +159,7 @@ class Req:
     # Misc
     save_output: bool = True
     return_frames: bool = False
+    is_warmup: bool = False
 
     # TeaCache parameters
     enable_teacache: bool = False
@@ -227,6 +228,9 @@ class Req:
 
         self.timings = RequestTimings(request_id=self.request_id)
 
+        if self.is_warmup:
+            self.num_inference_steps = 1
+
     def adjust_size(self, server_args: ServerArgs):
         pass
 
@@ -234,6 +238,8 @@ class Req:
         return pprint.pformat(asdict(self), indent=2, width=120)
 
     def log(self, server_args: ServerArgs):
+        if self.is_warmup:
+            return
         # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
         if self.height:
             target_height = align_to(self.height, 16)
