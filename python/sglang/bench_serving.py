@@ -1794,39 +1794,31 @@ def sample_generated_shared_prefix_requests(
         range_ratio=range_ratio,
         num=num_groups,
     )
-    total_questions = num_groups * prompts_per_group * num_turns
     question_lens = compute_random_lens(
         full_len=question_len,
         range_ratio=range_ratio,
-        num=total_questions,
-    )
+        num=num_groups * prompts_per_group * num_turns,
+    ).reshape(num_groups, prompts_per_group, num_turns)
     output_lens = compute_random_lens(
         full_len=output_len,
         range_ratio=range_ratio,
         num=num_groups * prompts_per_group,
-    )
-    output_lens = output_lens.reshape(num_groups, prompts_per_group)
+    ).reshape(num_groups, prompts_per_group)
     del system_prompt_len, question_len, output_len
 
     # Generate system prompts for each group
-    system_prompts = []
-    for i in range(num_groups):
-        system_prompt = gen_prompt(tokenizer, system_prompt_lens[i].item())
-        system_prompts.append(system_prompt)
+    system_prompts = [
+        gen_prompt(tokenizer, system_prompt_lens[i].item()) for i in range(num_groups)
+    ]
 
     # Generate questions: shape (num_groups, prompts_per_group, num_turns)
-    q_idx = 0
-    questions = []
-    for g in range(num_groups):
-        group_questions = []
-        for p in range(prompts_per_group):
-            turn_questions = [
-                gen_prompt(tokenizer, question_lens[q_idx + t].item())
-                for t in range(num_turns)
-            ]
-            group_questions.append(turn_questions)
-            q_idx += num_turns
-        questions.append(group_questions)
+    questions = [
+        [
+            [gen_prompt(tokenizer, question_lens[g, p, t].item()) for t in range(num_turns)]
+            for p in range(prompts_per_group)
+        ]
+        for g in range(num_groups)
+    ]
 
     # Combine system prompts with questions
     input_requests = []
