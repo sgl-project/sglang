@@ -258,17 +258,23 @@ fn select_min_by<F>(healthy_indices: &[usize], get_value: F) -> usize
 where
     F: Fn(usize) -> usize,
 {
-    let min_val = healthy_indices
-        .iter()
-        .map(|&idx| get_value(idx))
-        .min()
-        .unwrap_or(0);
+    let mut min_val = usize::MAX;
+    let mut candidates = Vec::new();
 
-    let candidates: Vec<usize> = healthy_indices
-        .iter()
-        .filter(|&&idx| get_value(idx) == min_val)
-        .copied()
-        .collect();
+    for &idx in healthy_indices {
+        let val = get_value(idx);
+        match val.cmp(&min_val) {
+            std::cmp::Ordering::Less => {
+                min_val = val;
+                candidates.clear();
+                candidates.push(idx);
+            }
+            std::cmp::Ordering::Equal => {
+                candidates.push(idx);
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
 
     if candidates.len() == 1 {
         candidates[0]
