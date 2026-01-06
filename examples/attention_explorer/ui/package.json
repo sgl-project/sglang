@@ -16,8 +16,10 @@
     "test:headed": "playwright test --headed"
   },
   "dependencies": {
+    "@types/react-window": "^1.8.8",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "react-window": "^2.2.4",
     "zustand": "^4.5.0"
   },
   "devDependencies": {
