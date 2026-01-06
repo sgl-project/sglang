@@ -27,7 +27,8 @@ import uuid
 import warnings
 from argparse import ArgumentParser
 from copy import deepcopy
-from dataclasses import dataclass, field
+import copy
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import lru_cache
 from json import JSONDecodeError
@@ -2122,15 +2123,8 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
         for round_index in range(len(prompts)):
             prev_messages.append({"role": "user", "content": prompts[round_index]})
 
-            inner_input = RequestFuncInput(
-                prompt=prev_messages,
-                model=request_func_input.model,
-                api_url=request_func_input.api_url,
-                prompt_len=request_func_input.prompt_len,
-                output_len=request_func_input.output_len,
-                lora_name=request_func_input.lora_name,
-                extra_request_body=request_func_input.extra_request_body,
-                image_data=None,
+            inner_input = replace(
+                request_func_input, prompt=copy.deepcopy(prev_messages)
             )
             output = await request_func(
                 inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
