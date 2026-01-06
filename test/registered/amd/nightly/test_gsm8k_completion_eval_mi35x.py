@@ -33,7 +33,7 @@ import numpy as np
 
 # HuggingFace Hub for model cache checking and download progress
 try:
-    from huggingface_hub import HfFileSystem, snapshot_download
+    from huggingface_hub import HfFileSystem
     from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
 
     HF_HUB_AVAILABLE = True
@@ -365,7 +365,9 @@ def log_model_status(config: "BaseModelConfig") -> Tuple[bool, str]:
     is_accessible, access_msg = check_hf_repo_access(model_path)
     if is_accessible:
         print(f"  ✅ HF ACCESS: {access_msg}")
-        print(f"  📥 Model will be downloaded from HuggingFace to {os.environ.get('HF_HOME', '~/.cache/huggingface')}")
+        print(
+            f"  📥 Model will be downloaded from HuggingFace to {os.environ.get('HF_HOME', '~/.cache/huggingface')}"
+        )
         return True, f"Will download from HF: {access_msg}"
     else:
         print(f"  ❌ HF ACCESS: {access_msg}")
@@ -545,15 +547,17 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
                     print(f"\n❌ MODEL NOT AVAILABLE: {status_msg}")
                     print(f"⏭️ SKIPPING: {config.model_path}")
                     status = "⏭️ SKIP"
-                    all_results.append({
-                        "model": config.model_path,
-                        "tp_size": config.tp_size,
-                        "accuracy": None,
-                        "threshold": config.accuracy_threshold,
-                        "passed": True,
-                        "skipped": True,
-                        "error": status_msg,
-                    })
+                    all_results.append(
+                        {
+                            "model": config.model_path,
+                            "tp_size": config.tp_size,
+                            "accuracy": None,
+                            "threshold": config.accuracy_threshold,
+                            "passed": True,
+                            "skipped": True,
+                            "error": status_msg,
+                        }
+                    )
                 else:
                     try:
                         print(f"\n🚀 Launching server for {config.model_path}...")
@@ -565,7 +569,9 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
                         print(f"⏱️  Server startup: {startup_time:.1f}s")
 
                         try:
-                            print(f"📊 Running GSM8K benchmark ({self.num_questions} questions)...")
+                            print(
+                                f"📊 Running GSM8K benchmark ({self.num_questions} questions)..."
+                            )
                             bench_start = time.time()
                             for attempt in range(3):
                                 try:
@@ -575,7 +581,9 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
                                         num_shots=5,
                                         parallel=64,
                                     )
-                                    print(f"   Attempt {attempt + 1}: accuracy={acc:.3f}")
+                                    print(
+                                        f"   Attempt {attempt + 1}: accuracy={acc:.3f}"
+                                    )
                                     if acc >= config.accuracy_threshold:
                                         break
                                 except Exception as e:
@@ -588,36 +596,42 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
                             passed = acc >= config.accuracy_threshold
                             status = "✅ PASS" if passed else "❌ FAIL"
 
-                            print(f"\n📈 Results: accuracy={acc:.3f} (threshold: {config.accuracy_threshold})")
+                            print(
+                                f"\n📈 Results: accuracy={acc:.3f} (threshold: {config.accuracy_threshold})"
+                            )
                             print(f"⏱️  Total: {total_time:.1f}s")
 
-                            all_results.append({
-                                "model": config.model_path,
-                                "tp_size": config.tp_size,
-                                "accuracy": acc,
-                                "threshold": config.accuracy_threshold,
-                                "startup_time": startup_time,
-                                "bench_time": bench_time,
-                                "total_time": total_time,
-                                "passed": passed,
-                                "skipped": False,
-                                "error": None,
-                            })
+                            all_results.append(
+                                {
+                                    "model": config.model_path,
+                                    "tp_size": config.tp_size,
+                                    "accuracy": acc,
+                                    "threshold": config.accuracy_threshold,
+                                    "startup_time": startup_time,
+                                    "bench_time": bench_time,
+                                    "total_time": total_time,
+                                    "passed": passed,
+                                    "skipped": False,
+                                    "error": None,
+                                }
+                            )
 
                         except Exception as e:
                             error_message = str(e)
                             total_time = time.time() - model_start
                             print(f"\n❌ Error: {error_message}")
                             status = "❌ ERROR"
-                            all_results.append({
-                                "model": config.model_path,
-                                "tp_size": config.tp_size,
-                                "accuracy": None,
-                                "threshold": config.accuracy_threshold,
-                                "passed": False,
-                                "skipped": False,
-                                "error": error_message,
-                            })
+                            all_results.append(
+                                {
+                                    "model": config.model_path,
+                                    "tp_size": config.tp_size,
+                                    "accuracy": None,
+                                    "threshold": config.accuracy_threshold,
+                                    "passed": False,
+                                    "skipped": False,
+                                    "error": error_message,
+                                }
+                            )
 
                         finally:
                             print(f"\n🛑 Stopping server...")
@@ -628,44 +642,58 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
                         total_time = time.time() - model_start
                         print(f"\n❌ Error launching server: {error_message}")
                         status = "❌ ERROR"
-                        all_results.append({
-                            "model": config.model_path,
-                            "tp_size": config.tp_size,
-                            "accuracy": None,
-                            "threshold": config.accuracy_threshold,
-                            "passed": False,
-                            "skipped": False,
-                            "error": error_message,
-                        })
+                        all_results.append(
+                            {
+                                "model": config.model_path,
+                                "tp_size": config.tp_size,
+                                "accuracy": None,
+                                "threshold": config.accuracy_threshold,
+                                "passed": False,
+                                "skipped": False,
+                                "error": error_message,
+                            }
+                        )
 
                 # Add to summary
                 acc_str = f"{acc:.3f}" if acc is not None else "N/A"
-                startup_str = f"{startup_time:.0f}s" if startup_time is not None else "N/A"
+                startup_str = (
+                    f"{startup_time:.0f}s" if startup_time is not None else "N/A"
+                )
                 bench_str = f"{bench_time:.0f}s" if bench_time is not None else "N/A"
                 total_str = f"{total_time:.0f}s" if total_time is not None else "N/A"
                 summary += f"| {config.model_path} | {config.tp_size} | {acc_str} | {config.accuracy_threshold} | {startup_str} | {bench_str} | {total_str} | {status} |\n"
 
         # Final summary
         total_test_time = time.time() - total_test_start
-        failed_models = [r for r in all_results if not r["passed"] and not r.get("skipped", False)]
+        failed_models = [
+            r for r in all_results if not r["passed"] and not r.get("skipped", False)
+        ]
         skipped_models = [r for r in all_results if r.get("skipped", False)]
-        passed_models = [r for r in all_results if r["passed"] and not r.get("skipped", False)]
+        passed_models = [
+            r for r in all_results if r["passed"] and not r.get("skipped", False)
+        ]
 
         print(f"\n{'='*60}")
         print(f"SUMMARY - MI35x Model Group: {self.model_group}")
         print(f"{'='*60}")
         print(summary)
-        print(f"\n📊 Passed: {len(passed_models)} | Failed: {len(failed_models)} | Skipped: {len(skipped_models)}")
+        print(
+            f"\n📊 Passed: {len(passed_models)} | Failed: {len(failed_models)} | Skipped: {len(skipped_models)}"
+        )
         print(f"⏱️  Total: {total_test_time:.1f}s ({total_test_time/60:.1f} min)")
 
         if is_in_ci():
             write_github_step_summary(summary)
 
         if failed_models:
-            failure_msg = "\n".join([f"- {r['model']}: {r.get('error', 'below threshold')}" for r in failed_models])
+            failure_msg = "\n".join(
+                [
+                    f"- {r['model']}: {r.get('error', 'below threshold')}"
+                    for r in failed_models
+                ]
+            )
             raise AssertionError(f"The following models failed:\n{failure_msg}")
 
 
 if __name__ == "__main__":
     unittest.main()
-

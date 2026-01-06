@@ -22,7 +22,9 @@ from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 # Register for AMD CI - DeepSeek-R1-MXFP4 benchmark (~300 min)
-register_amd_ci(est_time=18000, suite="nightly-perf-8-gpu-deepseek-r1-mxfp4", nightly=True)
+register_amd_ci(
+    est_time=18000, suite="nightly-perf-8-gpu-deepseek-r1-mxfp4", nightly=True
+)
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
@@ -113,7 +115,9 @@ class TestNightlyDeepseekR1MXFP4Performance(unittest.TestCase):
         is_local_path = self.model.startswith("/")
         if is_local_path and not os.path.exists(self.model):
             print(f"\n⏭️ SKIPPING: Local model not found at {self.model}")
-            self.runner.full_report += f"\n⏭️ Test skipped: Local model not found at {self.model}\n"
+            self.runner.full_report += (
+                f"\n⏭️ Test skipped: Local model not found at {self.model}\n"
+            )
             self.runner.write_final_report()
             return
 
@@ -121,7 +125,9 @@ class TestNightlyDeepseekR1MXFP4Performance(unittest.TestCase):
         if is_local_path:
             print(f"📁 Using local model: {self.model}")
         else:
-            print(f"📥 Using HuggingFace model: {self.model} (will download if not cached)")
+            print(
+                f"📥 Using HuggingFace model: {self.model} (will download if not cached)"
+            )
 
         try:
             for variant_config in self.variants:
@@ -158,4 +164,3 @@ class TestNightlyDeepseekR1MXFP4Performance(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
