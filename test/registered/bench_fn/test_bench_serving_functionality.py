@@ -74,18 +74,24 @@ class TestBenchServingFunctionality(CustomTestCase):
         ]
         self.assertEqual(len(reqs), NUM_CONVERSATIONS * NUM_TURNS)
 
-        message_counts = [len(r.get("obj", {}).get("messages", [])) for r in reqs]
-        turn1_count = sum(1 for c in message_counts if c == 1)
-        turn2_count = sum(1 for c in message_counts if c == 3)
-        turn3_count = sum(1 for c in message_counts if c == 5)
+        messages_list = [r.get("obj", {}).get("messages", []) for r in reqs]
+        turn1_reqs = [m for m in messages_list if len(m) == 1]
+        turn2_reqs = [m for m in messages_list if len(m) == 3]
+        turn3_reqs = [m for m in messages_list if len(m) == 5]
 
-        self.assertEqual(turn1_count, NUM_CONVERSATIONS, "Turn 1 should have 1 message")
-        self.assertEqual(
-            turn2_count, NUM_CONVERSATIONS, "Turn 2 should have 3 messages"
-        )
-        self.assertEqual(
-            turn3_count, NUM_CONVERSATIONS, "Turn 3 should have 5 messages"
-        )
+        self.assertEqual(len(turn1_reqs), NUM_CONVERSATIONS, "Turn 1 should have 1 msg")
+        self.assertEqual(len(turn2_reqs), NUM_CONVERSATIONS, "Turn 2 should have 3 msgs")
+        self.assertEqual(len(turn3_reqs), NUM_CONVERSATIONS, "Turn 3 should have 5 msgs")
+
+        prefix_count = 0
+        for t2 in turn2_reqs:
+            if any(t2[:1] == t1 for t1 in turn1_reqs):
+                prefix_count += 1
+        for t3 in turn3_reqs:
+            if any(t3[:3] == t2 for t2 in turn2_reqs):
+                prefix_count += 1
+        expected = NUM_CONVERSATIONS * 2
+        self.assertEqual(prefix_count, expected, f"Expected {expected} prefix pairs")
 
 
 if __name__ == "__main__":
