@@ -12,6 +12,7 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
+import copy
 import importlib.util
 import io
 import json
@@ -27,7 +28,6 @@ import uuid
 import warnings
 from argparse import ArgumentParser
 from copy import deepcopy
-import copy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import lru_cache
@@ -1815,7 +1815,10 @@ def sample_generated_shared_prefix_requests(
     # Generate questions: shape (num_groups, prompts_per_group, num_turns)
     questions = [
         [
-            [gen_prompt(tokenizer, question_lens[g, p, t].item()) for t in range(num_turns)]
+            [
+                gen_prompt(tokenizer, question_lens[g, p, t].item())
+                for t in range(num_turns)
+            ]
             for p in range(prompts_per_group)
         ]
         for g in range(num_groups)

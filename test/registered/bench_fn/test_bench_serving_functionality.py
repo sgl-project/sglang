@@ -66,7 +66,6 @@ class TestBenchServingFunctionality(CustomTestCase):
                 kill_process_tree(process.pid)
 
     def _verify_multi_turn_logs(self, content: str):
-        # Parse all request.finished events (obj.text is the chat-template-applied prompt)
         reqs = []
         for line in content.splitlines():
             if not line.startswith("{"):
@@ -76,15 +75,12 @@ class TestBenchServingFunctionality(CustomTestCase):
                 continue
             text = obj.get("obj", {}).get("text")
             rid = obj.get("rid", "")
-            # Skip health check and warmup requests
             if text and not rid.startswith("HEALTH_CHECK"):
                 reqs.append(text)
 
-        # Should have at least the expected number of benchmark requests
         self.assertGreaterEqual(len(reqs), NUM_CONVERSATIONS * NUM_TURNS)
 
-        # Verify prefix relationships: in multi-turn, later turns include earlier turns
-        # Sort by length to find prefix chains
+        # Verify prefix relationships
         reqs_sorted = sorted(reqs, key=len)
         prefix_count = 0
         for i, text in enumerate(reqs_sorted):
@@ -93,7 +89,6 @@ class TestBenchServingFunctionality(CustomTestCase):
                     prefix_count += 1
                     break
 
-        # Each conversation's turn 1 & 2 should be prefixes of later turns
         expected = NUM_CONVERSATIONS * (NUM_TURNS - 1)
         self.assertGreaterEqual(
             prefix_count, expected, f"Expected at least {expected} prefix pairs"
