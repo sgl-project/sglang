@@ -2,7 +2,7 @@ use std::sync::{Arc, OnceLock};
 
 use axum::Router;
 use reqwest::Client;
-use sgl_model_gateway::{
+use smg::{
     app_context::AppContext,
     config::RouterConfig,
     core::{

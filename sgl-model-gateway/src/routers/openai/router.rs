@@ -23,14 +23,8 @@ use super::{
         ComponentRefs, PayloadState, RequestContext, ResponsesComponents, SharedComponents,
         WorkerSelection,
     },
-    conversations::persist_conversation_items,
-    mcp::{
-        ensure_request_mcp_client, execute_tool_loop, prepare_mcp_payload_for_streaming,
-        McpLoopConfig,
-    },
     provider::ProviderRegistry,
-    responses::{mask_tools_as_mcp, patch_streaming_response_json},
-    streaming::handle_streaming_response,
+    responses::{handle_non_streaming_response, handle_streaming_response},
 };
 use crate::{
     app_context::AppContext,
@@ -366,128 +360,6 @@ impl OpenAIRouter {
                 }
             }
         }
-    }
-
-    async fn handle_non_streaming_response(&self, mut ctx: RequestContext) -> Response {
-        let payload_state = ctx.take_payload().expect("Payload not prepared");
-        let mut payload = payload_state.json;
-        let url = payload_state.url;
-        let previous_response_id = payload_state.previous_response_id;
-        let original_body = ctx.responses_request();
-        let worker = ctx.worker().expect("Worker not selected");
-        let mcp_manager = ctx.components.mcp_manager().expect("MCP manager required");
-
-        if let Some(ref tools) = original_body.tools {
-            ensure_request_mcp_client(mcp_manager, tools.as_slice()).await;
-        }
-
-        let active_mcp = if mcp_manager.list_tools().is_empty() {
-            None
-        } else {
-            Some(mcp_manager)
-        };
-
-        let mut response_json: Value;
-
-        if let Some(mcp) = active_mcp {
-            let config = McpLoopConfig::default();
-            prepare_mcp_payload_for_streaming(&mut payload, mcp);
-
-            match execute_tool_loop(
-                ctx.components.client(),
-                &url,
-                ctx.headers(),
-                payload,
-                original_body,
-                mcp,
-                &config,
-            )
-            .await
-            {
-                Ok(resp) => response_json = resp,
-                Err(err) => {
-                    worker.circuit_breaker().record_failure();
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": {"message": err}})),
-                    )
-                        .into_response();
-                }
-            }
-        } else {
-            let mut request_builder = ctx.components.client().post(&url).json(&payload);
-            let auth_header = extract_auth_header(ctx.headers(), worker.api_key());
-            request_builder = apply_provider_headers(request_builder, &url, auth_header.as_ref());
-
-            let response = match request_builder.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    worker.circuit_breaker().record_failure();
-                    tracing::error!(
-                        url = %url,
-                        error = %e,
-                        "Failed to forward request to OpenAI"
-                    );
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        format!("Failed to forward request to OpenAI: {}", e),
-                    )
-                        .into_response();
-                }
-            };
-
-            if !response.status().is_success() {
-                worker.circuit_breaker().record_failure();
-                let status = StatusCode::from_u16(response.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let body = response.text().await.unwrap_or_default();
-                return (status, body).into_response();
-            }
-
-            response_json = match response.json::<Value>().await {
-                Ok(r) => r,
-                Err(e) => {
-                    worker.circuit_breaker().record_failure();
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to parse upstream response: {}", e),
-                    )
-                        .into_response();
-                }
-            };
-
-            worker.circuit_breaker().record_success();
-        }
-
-        mask_tools_as_mcp(&mut response_json, original_body);
-        patch_streaming_response_json(
-            &mut response_json,
-            original_body,
-            previous_response_id.as_deref(),
-        );
-
-        if let Err(err) = persist_conversation_items(
-            ctx.components
-                .conversation_storage()
-                .expect("Conversation storage required")
-                .clone(),
-            ctx.components
-                .conversation_item_storage()
-                .expect("Conversation item storage required")
-                .clone(),
-            ctx.components
-                .response_storage()
-                .expect("Response storage required")
-                .clone(),
-            &response_json,
-            original_body,
-        )
-        .await
-        {
-            warn!("Failed to persist conversation items: {}", err);
-        }
-
-        (StatusCode::OK, Json(response_json)).into_response()
     }
 }
 
@@ -1078,7 +950,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let response = if ctx.is_streaming() {
             handle_streaming_response(ctx).await
         } else {
-            self.handle_non_streaming_response(ctx).await
+            handle_non_streaming_response(ctx).await
         };
 
         // Record duration only for successful requests (errors tracked inside handlers)
