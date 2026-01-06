@@ -3,12 +3,14 @@
 //! Bundles all dependencies needed by responses handlers to avoid passing
 //! 10+ parameters to every function.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock as StdRwLock},
+};
 
 use tokio::{sync::RwLock, task::JoinHandle};
 
 use crate::{
-    core::WorkerRegistry,
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     grpc_client::SglangSchedulerClient,
     mcp::McpManager,
@@ -36,12 +38,8 @@ pub(crate) struct ResponsesContext {
     /// Chat pipeline for executing requests
     pub pipeline: Arc<RequestPipeline>,
 
-    /// Shared components (tokenizer, parsers, worker_registry)
+    /// Shared components (tokenizer, parsers)
     pub components: Arc<SharedComponents>,
-
-    /// Worker registry for validation
-    #[allow(dead_code)]
-    pub worker_registry: Arc<WorkerRegistry>,
 
     /// Response storage backend
     pub response_storage: Arc<dyn ResponseStorage>,
@@ -55,6 +53,9 @@ pub(crate) struct ResponsesContext {
     /// MCP manager for tool support
     pub mcp_manager: Arc<McpManager>,
 
+    /// Server keys for MCP tools requested in this context
+    pub requested_servers: Arc<StdRwLock<Vec<String>>>,
+
     /// Background task handles for cancellation support
     pub background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 }
@@ -64,7 +65,6 @@ impl ResponsesContext {
     pub fn new(
         pipeline: Arc<RequestPipeline>,
         components: Arc<SharedComponents>,
-        worker_registry: Arc<WorkerRegistry>,
         response_storage: Arc<dyn ResponseStorage>,
         conversation_storage: Arc<dyn ConversationStorage>,
         conversation_item_storage: Arc<dyn ConversationItemStorage>,
@@ -73,11 +73,11 @@ impl ResponsesContext {
         Self {
             pipeline,
             components,
-            worker_registry,
             response_storage,
             conversation_storage,
             conversation_item_storage,
             mcp_manager,
+            requested_servers: Arc::new(StdRwLock::new(Vec::new())),
             background_tasks: Arc::new(RwLock::new(HashMap::new())),
         }
     }

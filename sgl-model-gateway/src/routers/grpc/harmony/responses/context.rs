@@ -1,6 +1,6 @@
 //! Context for Harmony Responses execution
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use crate::{
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
@@ -22,6 +22,9 @@ pub(crate) struct HarmonyResponsesContext {
 
     /// MCP manager for tool execution
     pub mcp_manager: Arc<McpManager>,
+
+    /// Server keys for MCP tools requested in this context
+    pub requested_servers: Arc<StdRwLock<Vec<String>>>,
 
     /// Response storage for loading conversation history
     pub response_storage: Arc<dyn ResponseStorage>,
@@ -47,6 +50,7 @@ impl HarmonyResponsesContext {
             pipeline,
             components,
             mcp_manager,
+            requested_servers: Arc::new(StdRwLock::new(Vec::new())),
             response_storage,
             conversation_storage,
             conversation_item_storage,

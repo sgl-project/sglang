@@ -175,8 +175,9 @@ pub(super) fn generate_mcp_id(prefix: &str) -> String {
 pub(super) fn build_mcp_list_tools_item(
     mcp: &Arc<McpManager>,
     server_label: &str,
+    server_keys: &[String],
 ) -> ResponseOutputItem {
-    let tools = mcp.list_tools();
+    let tools = mcp.list_tools_for_servers(server_keys);
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
         .map(|t| McpToolInfo {
