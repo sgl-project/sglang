@@ -78,7 +78,10 @@ class TestBenchServingFunctionality(CustomTestCase):
         messages_list = [r.get("obj", {}).get("messages", []) for r in reqs]
 
         # Group by turn: turn i has (2*i - 1) messages
-        turns = [[m for m in messages_list if len(m) == 2 * i - 1] for i in range(1, NUM_TURNS + 1)]
+        turns = [
+            [m for m in messages_list if len(m) == 2 * i - 1]
+            for i in range(1, NUM_TURNS + 1)
+        ]
         for i, turn in enumerate(turns):
             self.assertEqual(len(turn), NUM_CONVERSATIONS, f"Turn {i+1} count mismatch")
 
