@@ -32,7 +32,8 @@ logger = logging.getLogger(__name__)
 
 # Validation marker version - increment when validation logic changes
 # v2: Added trust_remote_code module validation (modeling_*.py must exist in snapshot)
-VALIDATION_MARKER_VERSION = "2"
+# v3: Added remote file existence checks for hf_quant_config.json
+VALIDATION_MARKER_VERSION = "3"
 
 
 def _remote_file_exists(
