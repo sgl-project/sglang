@@ -11,10 +11,7 @@ use axum::{body::Body, response::Response};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
-use smg::{
-    core::{BasicWorkerBuilder, Worker, WorkerLoadGuard},
-    utils::http_utils::AttachedBody,
-};
+use smg::core::{AttachedBody, BasicWorkerBuilder, Worker, WorkerLoadGuard};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 

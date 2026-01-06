@@ -10,6 +10,7 @@ use axum::response::Response;
 use tracing::error;
 
 use crate::{
+    core::AttachedBody,
     routers::{
         error,
         grpc::{
@@ -18,7 +19,6 @@ use crate::{
             regular::{processor, streaming},
         },
     },
-    utils::http_utils::AttachedBody,
 };
 
 /// Chat response processing stage

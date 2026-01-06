@@ -8,6 +8,7 @@ use tracing::error;
 
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
 use crate::{
+    core::AttachedBody,
     routers::{
         error,
         grpc::{
@@ -15,7 +16,6 @@ use crate::{
             context::{FinalResponse, RequestContext, RequestType},
         },
     },
-    utils::http_utils::AttachedBody,
 };
 
 /// Harmony Response Processing stage: Parse and format Harmony responses

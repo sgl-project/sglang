@@ -34,7 +34,7 @@ pub use job_queue::{Job, JobQueue, JobQueueConfig};
 pub use model_card::{ModelCard, ProviderType};
 pub use retry::{is_retryable_status, RetryExecutor};
 pub use worker::{
-    BasicWorker, ConnectionMode, HealthConfig, RuntimeType, Worker, WorkerLoad, WorkerLoadGuard,
+    AttachedBody, BasicWorker, ConnectionMode, HealthConfig, RuntimeType, Worker, WorkerLoad, WorkerLoadGuard,
     WorkerType,
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
