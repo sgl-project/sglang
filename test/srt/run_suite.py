@@ -123,7 +123,6 @@ suites = {
         TestFile("test_bench_one_batch.py"),
         TestFile("test_bench_serving.py"),
         TestFile("test_eval_accuracy_large.py"),
-        TestFile("test_gpt_oss_common.py"),
         TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
