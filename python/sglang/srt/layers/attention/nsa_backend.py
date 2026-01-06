@@ -1860,7 +1860,7 @@ class NativeSparseAttnMultiStepBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        if envs.NSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
+        if envs.SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
             # Precompute metadata once (shared across all backends)
             precomputed = self.attn_backends[0]._precompute_replay_metadata(
                 bs=bs,
