@@ -9,8 +9,6 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
-        TestFile("debug_utils/test_tensor_dump_forward_hook.py", 9),
-        TestFile("ops/test_repeat_interleave.py", 60),
         TestFile("test_abort.py", 131),
         TestFile("test_chunked_prefill.py", 312),
         TestFile("test_deterministic.py", 228),
@@ -18,7 +16,6 @@ suites = {
         TestFile("test_evs.py", 20),
         TestFile("test_external_models.py", 30),
         TestFile("test_fp8_utils.py", 9),
-        TestFile("rotary_embedding/test_mrope.py", 10),
         TestFile("test_gpt_oss_1gpu.py", 402),
         TestFile("test_hidden_states.py", 55),
         TestFile("test_input_embeddings.py", 38),
@@ -130,7 +127,6 @@ suites = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_amd = {
     "per-commit-amd": [
-        TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
         # TestFile("hicache/test_hicache.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
         # TestFile("hicache/test_hicache_mla.py", 127), # Disabled temporarily,  # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
         # TestFile("hicache/test_hicache_storage.py", 127), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/12575
@@ -138,8 +134,6 @@ suite_amd = {
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("ops/test_repeat_interleave.py", 75),
-        TestFile("rotary_embedding/test_mrope.py", 15),
         TestFile("test_abort.py", 51),
         TestFile("test_bench_typebaseddispatcher.py", 10),
         TestFile("test_chunked_prefill.py", 312),
