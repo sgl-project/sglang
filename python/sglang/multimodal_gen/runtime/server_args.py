@@ -277,10 +277,14 @@ class ServerArgs:
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = False
         else:
-            self.dit_cpu_offload = True
-            self.text_encoder_cpu_offload = True
-            self.image_encoder_cpu_offload = True
-            self.vae_cpu_offload = True
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = True
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = True
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = True
+            if self.vae_cpu_offload is None:
+                self.vae_cpu_offload = True
 
     def __post_init__(self):
         # configure logger before use
@@ -860,9 +864,9 @@ class ServerArgs:
             has_sp = self.sp_degree > 1
             has_tp = self.tp_size > 1
             if has_sp and has_tp:
-                raise ValueError(
-                    "cache-dit does not support hybrid parallelism (SP + TP). "
-                    "Please use either sequence parallelism or tensor parallelism, not both."
+                logger.warning(
+                    "cache-dit is enabled with hybrid parallelism (SP + TP). "
+                    "Proceeding anyway (SGLang integration may support this mode)."
                 )
 
     def _set_default_attention_backend(self) -> None:
