@@ -2251,6 +2251,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        log_info_on_rank0(
+            logger,
+            f"Forward size: {forward_batch.input_ids.shape[0]}",
+        )
         gc.collect()
         # torch.cuda.empty_cache()
         # torch.cuda.reset_peak_memory_stats()

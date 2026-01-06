@@ -32,6 +32,9 @@ from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    set_graph_pool_id,
+)
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     graph_capture,
@@ -715,10 +718,10 @@ class CudaGraphRunner:
             self.model_runner.tp_group.barrier()
             run_once()
 
-        # if get_global_graph_memory_pool() is None:
-        #     set_global_graph_memory_pool(self.device_module.graph_pool_handle())
-        # # Set graph pool id globally to be able to use symmetric memory
-        # set_graph_pool_id(get_global_graph_memory_pool())
+        if get_global_graph_memory_pool() is None:
+            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+        # Set graph pool id globally to be able to use symmetric memory
+        set_graph_pool_id(get_global_graph_memory_pool())
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
