@@ -158,7 +158,9 @@ pub(crate) struct DispatchMetadata {
 /// Load guards for worker load tracking
 /// Automatically decrements load when dropped
 pub(crate) enum LoadGuards {
-    Single { _guard: WorkerLoadGuard },
+    Single {
+        _guard: WorkerLoadGuard,
+    },
     Dual {
         _prefill: WorkerLoadGuard,
         _decode: WorkerLoadGuard,
