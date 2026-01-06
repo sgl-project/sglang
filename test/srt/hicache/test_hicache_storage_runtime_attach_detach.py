@@ -118,11 +118,18 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
         self.assertEqual(code, 200, body)
         return json.loads(body)
 
-    def _attach_file_backend(self, extra_cfg: dict):
+    def _attach_backend(
+        self,
+        backend: str,
+        extra_cfg: dict,
+        prefetch_policy: str = "timeout",
+        write_policy: str = "write_through",
+    ):
         payload = {
-            "hicache_storage_backend": "file",
+            "hicache_storage_backend": backend,
             "hicache_storage_backend_extra_config_json": json.dumps(extra_cfg),
-            "hicache_storage_prefetch_policy": "timeout",
+            "hicache_storage_prefetch_policy": prefetch_policy,
+            "hicache_write_policy": write_policy,
         }
         return self._http_post_json(
             f"{self.base_url}/attach_hicache_storage_backend", payload, timeout=30
@@ -146,7 +153,12 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             "prefetch_timeout_base": 3,
             "prefetch_timeout_per_ki_token": 0.01,
         }
-        code_attach, body_attach = self._attach_file_backend(extra_cfg)
+        code_attach, body_attach = self._attach_backend(
+            backend="file",
+            extra_cfg=extra_cfg,
+            prefetch_policy="timeout",
+            write_policy="write_back",
+        )
         self.assertEqual(code_attach, 200, f"{code_attach} - {body_attach}")
 
         status1 = self._get_backend_status()
@@ -156,16 +168,44 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             json.dumps(extra_cfg),
         )
         self.assertEqual(status1.get("hicache_storage_prefetch_policy"), "timeout")
+        self.assertEqual(status1.get("hicache_write_policy"), "write_back")
 
-        # 3) Attach again should be rejected (already enabled)
-        code_attach_again, body_attach_again = self._attach_file_backend(extra_cfg)
+        # 3) Attach again succeeds with policies updated
+        code_attach_again, body_attach_again = self._attach_backend(
+            backend="file",
+            extra_cfg=extra_cfg,
+            prefetch_policy="wait_complete",
+            write_policy="write_through_selective",
+        )
+        self.assertEqual(
+            code_attach_again, 200, f"{code_attach_again} - {body_attach_again}"
+        )
+
+        status2 = self._get_backend_status()
+        self.assertEqual(
+            status2.get("hicache_storage_backend_extra_config"),
+            json.dumps(extra_cfg),
+        )
+        self.assertEqual(
+            status2.get("hicache_storage_prefetch_policy"), "wait_complete"
+        )
+        self.assertEqual(status2.get("hicache_write_policy"), "write_through_selective")
+
+        # 4) Attach again with different backend should be rejected
+        code_attach_again, body_attach_again = self._attach_backend(
+            backend="mooncake", extra_cfg=extra_cfg
+        )
         self.assertNotEqual(code_attach_again, 200, body_attach_again)
 
-        # 4) Detach should succeed and be idempotent
+        # 5) Detach should succeed and be idempotent
         code_detach, body_detach = self._detach_backend()
         self.assertEqual(code_detach, 200, f"{code_detach} - {body_detach}")
-        status2 = self._get_backend_status()
-        self.assertIsNone(status2.get("hicache_storage_backend"))
+        status3 = self._get_backend_status()
+        self.assertIsNone(status3.get("hicache_storage_backend"))
+        self.assertEqual(
+            status3.get("hicache_storage_prefetch_policy"), "wait_complete"
+        )
+        self.assertEqual(status3.get("hicache_write_policy"), "write_through_selective")
 
         code_detach_again, body_detach_again = self._detach_backend()
         self.assertEqual(
@@ -174,11 +214,19 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             f"{code_detach_again} - {body_detach_again}",
         )
 
-        # 5) Re-attach after detach should succeed
-        code_attach2, body_attach2 = self._attach_file_backend(extra_cfg)
+        # 6) Re-attach after detach should succeed
+        code_attach2, body_attach2 = self._attach_backend(
+            backend="file", extra_cfg=extra_cfg
+        )
         self.assertEqual(code_attach2, 200, f"{code_attach2} - {body_attach2}")
-        status3 = self._get_backend_status()
-        self.assertEqual(status3.get("hicache_storage_backend"), "file")
+        status4 = self._get_backend_status()
+        self.assertEqual(status4.get("hicache_storage_backend"), "file")
+        self.assertEqual(
+            status4.get("hicache_storage_backend_extra_config"),
+            json.dumps(extra_cfg),
+        )
+        self.assertEqual(status4.get("hicache_storage_prefetch_policy"), "timeout")
+        self.assertEqual(status4.get("hicache_write_policy"), "write_through")
 
         # Cleanup: detach for test isolation
         code_detach2, body_detach2 = self._detach_backend()
