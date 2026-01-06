@@ -1,4 +1,4 @@
-//! Connection mode detection step.
+//! Tokenizer registration step for local workers.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -18,15 +18,9 @@ pub struct RegisterTokenizerStep;
 #[async_trait]
 impl StepExecutor for RegisterTokenizerStep {
     async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let labels: Arc<HashMap<String, String>> = context
-            .get("labels")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("labels".to_string()))?;
-        let app_context: Arc<AppContext> = context
-            .get("app_context")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let workers: Arc<Vec<Arc<dyn Worker>>> = context
-            .get("workers")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+        let labels: Arc<HashMap<String, String>> = context.get_or_err("labels")?;
+        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+        let workers: Arc<Vec<Arc<dyn Worker>>> = context.get_or_err("workers")?;
 
         for worker in workers.iter() {
             let model_id = worker.model_id().to_string();

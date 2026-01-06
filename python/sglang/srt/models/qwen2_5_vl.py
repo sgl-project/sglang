@@ -47,6 +47,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -75,7 +76,7 @@ from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -114,12 +115,21 @@ class Qwen2_5_VLMLP(nn.Module):
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
         )
-        self.act = ACT2FN[hidden_act]
+        self.hidden_act = hidden_act
+        if self.hidden_act == "silu":
+            self.act = SiluAndMul()
+        else:
+            base_act = ACT2FN[self.hidden_act]
+
+            def _act_fn(x: torch.Tensor) -> torch.Tensor:
+                gate, up = x.chunk(2, dim=-1)
+                return base_act(gate) * up
+
+            self.act = _act_fn
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = self.act(gate) * up
+        x = self.act(gate_up)
         x_down, _ = self.down_proj(x)
         return x_down
 
@@ -443,7 +453,9 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             ]
         )
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
-
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if is_npu():
+            cu_seqlens = cu_seqlens.to("cpu")
         # transformers
         x = x.unsqueeze(1)
         for layer_num, blk in enumerate(self.blocks):
@@ -783,7 +795,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            if self.pp_group.is_last_rank and "model.embed_tokens.weight" in name:
+            if (
+                self.config.tie_word_embeddings
+                and self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+            ):
                 if "lm_head.weight" in params_dict:
                     lm_head_param = params_dict["lm_head.weight"]
                     weight_loader = getattr(

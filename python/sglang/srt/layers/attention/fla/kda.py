@@ -1147,7 +1147,6 @@ def chunk_kda_fwd(
     scale: float,
     initial_state: torch.Tensor,
     initial_state_indices: torch.Tensor,
-    output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
 ):
     chunk_size = 64
@@ -1180,7 +1179,6 @@ def chunk_kda_fwd(
         gk=g,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
-        output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
     )
     del w, u, kg
