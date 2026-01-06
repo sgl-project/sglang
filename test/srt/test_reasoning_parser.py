@@ -4,6 +4,7 @@ from sglang.srt.parser.reasoning_parser import (
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
     KimiDetector,
+    Olmo3Detector,
     Qwen3Detector,
     ReasoningParser,
     StreamingParseResult,
@@ -310,6 +311,56 @@ class TestKimiDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "answer")
 
 
+class TestOlmo3Detector(CustomTestCase):
+    def setUp(self):
+        self.detector = Olmo3Detector()
+
+    def test_detect_and_parse_olmo3_format(self):
+        text = "<think>Reason through it</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Reason through it")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_without_tags(self):
+        text = "Direct output without reasoning markers."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, text)
+
+    def test_streaming_split_tokens(self):
+        chunks = ["<th", "ink>", "Thinking...", "</th", "ink>", "Answer."]
+        reasoning_text = ""
+        normal_text = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk)
+            reasoning_text += result.reasoning_text
+            normal_text += result.normal_text
+        self.assertIn("Thinking", reasoning_text)
+        self.assertTrue(normal_text.endswith("Answer."))
+
+    def test_streaming_no_stream_reasoning(self):
+        detector = Olmo3Detector(stream_reasoning=False)
+        detector.parse_streaming_increment("<think>")
+        detector.parse_streaming_increment("step 1.")
+        detector.parse_streaming_increment(" step 2.")
+        result = detector.parse_streaming_increment("</think>Final response.")
+        self.assertIn("step 2", result.reasoning_text)
+        self.assertEqual(result.normal_text, "Final response.")
+
+    def test_detect_and_parse_truncated_reasoning(self):
+        text = "<think>Reasoning without closing tag"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Reasoning without closing tag")
+        self.assertEqual(result.normal_text, "")
+
+    def test_force_reasoning_without_tags(self):
+        detector = Olmo3Detector(force_reasoning=True)
+        text = "Reasoning output even without think tags"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, text)
+        self.assertEqual(result.normal_text, "")
+
+
 class TestReasoningParser(CustomTestCase):
     def test_init_valid_model(self):
         """Test initialization with valid model types."""
@@ -321,6 +372,9 @@ class TestReasoningParser(CustomTestCase):
 
         parser = ReasoningParser("kimi")
         self.assertIsInstance(parser.detector, KimiDetector)
+
+        parser = ReasoningParser("olmo3")
+        self.assertIsInstance(parser.detector, Olmo3Detector)
 
     def test_init_invalid_model(self):
         """Test initialization with invalid model type."""
