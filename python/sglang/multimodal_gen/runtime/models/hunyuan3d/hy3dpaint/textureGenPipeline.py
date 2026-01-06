@@ -186,7 +186,12 @@ class Hunyuan3DPaintPipeline:
         self.render.save_mesh(output_mesh_path, downsample=True)
 
         if save_glb:
-            convert_obj_to_glb(output_mesh_path, output_mesh_path.replace(".obj", ".glb"))
-            output_glb_path = output_mesh_path.replace(".obj", ".glb")
+            try:
+                convert_obj_to_glb(
+                    output_mesh_path, output_mesh_path.replace(".obj", ".glb")
+                )
+                output_glb_path = output_mesh_path.replace(".obj", ".glb")
+            except Exception as exc:
+                warnings.warn(f"GLB export skipped: {exc}")
 
         return output_mesh_path

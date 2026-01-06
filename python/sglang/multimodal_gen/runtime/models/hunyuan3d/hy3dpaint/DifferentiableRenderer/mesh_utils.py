@@ -14,7 +14,10 @@
 
 import os
 import cv2
-import bpy
+try:
+    import bpy  # type: ignore
+except Exception:
+    bpy = None
 import math
 import numpy as np
 from io import StringIO
@@ -265,6 +268,11 @@ def convert_obj_to_glb(
     merge_vertices: bool = False,
 ) -> bool:
     """Convert OBJ file to GLB format using Blender."""
+    if bpy is None:
+        raise RuntimeError(
+            "Blender Python API (bpy) is not available. "
+            "Install Blender or disable GLB export."
+        )
     try:
         _setup_blender_scene()
         _clear_scene_objects()
