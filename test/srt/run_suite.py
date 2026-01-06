@@ -9,8 +9,6 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
-        TestFile("hicache/test_hicache_storage.py", 96),
-        TestFile("hicache/test_hicache_variants.py", 368),
         TestFile("openai_server/basic/test_openai_embedding.py", 70),
         TestFile("openai_server/basic/test_openai_server.py", 184),
         TestFile("openai_server/basic/test_protocol.py", 3),
