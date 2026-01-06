@@ -392,8 +392,6 @@ class Envs:
     SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(False)
     SGLANG_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
 
-    # Tool-Call behavior
-    SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
 
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)

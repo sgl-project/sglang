@@ -1,15 +1,10 @@
 import json
 import logging
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    StructureInfo,
-    ToolCallItem,
-    _GetInfoFunc,
-)
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
@@ -327,9 +322,56 @@ class MistralDetector(BaseFormatDetector):
 
         return None
 
-    def structure_info(self) -> _GetInfoFunc:
-        return lambda name: StructureInfo(
-            begin='[TOOL_CALLS] [{"name":"' + name + '", "arguments":',
-            end="}]",
-            trigger="[TOOL_CALLS]",
-        )
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        """Build structural tag for Mistral format.
+
+        Uses nested tags_with_separator structure to properly handle:
+        - Outer wrapper: [TOOL_CALLS] [...]
+        - Inner tool calls with ", " separator
+        """
+        inner_tags = []
+
+        for tool in tools:
+            name = tool.function.name
+            if not name:
+                continue
+
+            # Always include schema
+            schema = tool.function.parameters or {}
+
+            inner_tags.append(
+                {
+                    "begin": '{"name":"' + name + '", "arguments":',
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema,
+                    },
+                    "end": "}",
+                }
+            )
+
+        return {
+            "format": {
+                "type": "triggered_tags",
+                "triggers": ["[TOOL_CALLS]"],
+                "tags": [
+                    {
+                        "begin": "[TOOL_CALLS] [",
+                        "end": "]",
+                        "content": {
+                            "type": "tags_with_separator",
+                            "separator": ", ",
+                            "tags": inner_tags,
+                            "stop_after_first": stop_after_first,
+                        },
+                    }
+                ],
+                "at_least_one": at_least_one,
+                "stop_after_first": True,
+            }
+        }

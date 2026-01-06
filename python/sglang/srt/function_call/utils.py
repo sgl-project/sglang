@@ -102,13 +102,17 @@ def _get_tool_schema(tool: Tool) -> dict:
 
 
 def get_json_schema_constraint(
-    tools: List[Tool], tool_choice: Union[ToolChoice, Literal["required"]]
+    tools: List[Tool],
+    tool_choice: Union[ToolChoice, Literal["required"]],
+    parallel_tool_calls: bool = True,
 ) -> Optional[dict]:
     """
     Get the JSON schema constraint for the specified tool choice.
 
     Args:
+        tools: List of available tools
         tool_choice: The tool choice specification
+        parallel_tool_calls: Whether to allow multiple tool calls (default: True)
 
     Returns:
         JSON schema dict, or None if no valid tools found
@@ -116,6 +120,7 @@ def get_json_schema_constraint(
 
     if isinstance(tool_choice, ToolChoice):
         # For specific function choice, return the user's parameters schema directly
+        # Always maxItems: 1 for specific function choice
         fn_name = tool_choice.function.name
         for tool in tools:
             if tool.function.name == fn_name:
@@ -135,6 +140,9 @@ def get_json_schema_constraint(
                 "anyOf": [_get_tool_schema(tool) for tool in tools],
             },
         }
+        # Add maxItems: 1 when parallel_tool_calls is False
+        if not parallel_tool_calls:
+            json_schema["maxItems"] = 1
         json_schema_defs = _get_tool_schema_defs(tools)
         if json_schema_defs:
             json_schema["$defs"] = json_schema_defs

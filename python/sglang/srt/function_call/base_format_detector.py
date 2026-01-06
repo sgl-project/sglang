@@ -9,11 +9,7 @@ from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    ToolCallItem,
-    _GetInfoFunc,
-)
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.utils import (
     _find_common_prefix,
     _is_complete_json,
@@ -325,15 +321,11 @@ class BaseFormatDetector(ABC):
         return True
 
     @abstractmethod
-    def structure_info(self) -> _GetInfoFunc:
-        """
-        Return a function that creates StructureInfo for constrained generation.
-
-        The returned function takes a tool name and returns a StructureInfo object
-        containing the begin/end patterns and trigger tokens needed for constrained
-        generation of function calls in this format.
-
-        Returns:
-            A function that takes a tool name (str) and returns StructureInfo
-        """
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        """Build xgrammar structural tag for this model's format."""
         raise NotImplementedError()

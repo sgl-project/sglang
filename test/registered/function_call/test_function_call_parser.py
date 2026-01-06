@@ -1,5 +1,6 @@
 import json
 import unittest
+from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -515,6 +516,14 @@ class TestBaseFormatDetector(unittest.TestCase):
             def structure_info(self):
                 # Not used in streaming tests
                 pass
+
+            def build_structural_tag(
+                self,
+                tools: List[Tool],
+                at_least_one: bool = False,
+                stop_after_first: bool = False,
+            ) -> Dict[str, Any]:
+                raise NotImplementedError()
 
         self.detector = TestFormatDetector()
         self.tools = [
@@ -2592,13 +2601,6 @@ class TestJsonArrayParser(unittest.TestCase):
             ),
         ]
         self.detector = JsonArrayParser()
-
-    def test_json_detector_has_no_ebnf(self):
-        """JsonArrayParser no longer exposes EBNF generation helpers."""
-        self.assertFalse(
-            hasattr(self.detector, "build_ebnf"),
-            "JsonArrayParser should not expose EBNF helpers after cleanup",
-        )
 
     def test_parse_streaming_increment_malformed_json(self):
         """Test parsing with malformed JSON"""

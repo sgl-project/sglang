@@ -1,16 +1,11 @@
 import json
 import logging
 import re
-from typing import List
+from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    StructureInfo,
-    ToolCallItem,
-    _GetInfoFunc,
-)
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
@@ -198,9 +193,57 @@ class DeepSeekV31Detector(BaseFormatDetector):
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=current_text)
 
-    def structure_info(self) -> _GetInfoFunc:
-        return lambda name: StructureInfo(
-            begin="<｜tool▁call▁begin｜>" + name + "<｜tool▁sep｜>",
-            end="<｜tool▁call▁end｜>",
-            trigger="<｜tool▁call▁begin｜>",
-        )
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        """Build structural tag for DeepSeek V3.1 wrapper format.
+
+        Uses dual triggers to support multiple tool calls:
+        - First trigger: <｜tool▁calls▁begin｜> for the first tool call
+        - Second trigger: <｜tool▁call▁begin｜> for subsequent tool calls
+        """
+        tags = []
+        for tool in tools:
+            name = tool.function.name
+            if not name:
+                continue
+
+            schema = tool.function.parameters or {}
+
+            # Tag for FIRST tool call (includes outer wrapper)
+            tags.append(
+                {
+                    "begin": "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>"
+                    + name
+                    + "<｜tool▁sep｜>",
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema,
+                    },
+                    "end": "<｜tool▁call▁end｜>",
+                }
+            )
+            # Tag for SUBSEQUENT tool calls (no outer wrapper)
+            tags.append(
+                {
+                    "begin": "<｜tool▁call▁begin｜>" + name + "<｜tool▁sep｜>",
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema,
+                    },
+                    "end": "<｜tool▁call▁end｜>",
+                }
+            )
+
+        return {
+            "format": {
+                "type": "triggered_tags",
+                "triggers": ["<｜tool▁calls▁begin｜>", "<｜tool▁call▁begin｜>"],
+                "tags": tags,
+                "at_least_one": at_least_one,
+                "stop_after_first": stop_after_first,
+            }
+        }
