@@ -29,7 +29,7 @@ impl StepExecutor for UpdateRemainingPoliciesStep {
         );
 
         for model_id in affected_models.iter() {
-            let remaining_workers = app_context.worker_registry.get_by_model_fast(model_id);
+            let remaining_workers = app_context.worker_registry.get_by_model(model_id);
 
             if let Some(policy) = app_context.policy_registry.get_policy(model_id) {
                 if policy.name() == "cache_aware" && !remaining_workers.is_empty() {
