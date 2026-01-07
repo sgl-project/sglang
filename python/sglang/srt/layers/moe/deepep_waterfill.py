@@ -204,7 +204,8 @@ class DeepEPWaterfillBalancer:
     
     # Minimum tokens to send to a remote rank for shared expert
     # If a rank would receive fewer tokens than this, compute locally instead
-    MIN_TOKENS_PER_RANK = 16
+    # Set to 128 to ensure good tile utilization (typical tile size is 128)
+    MIN_TOKENS_PER_RANK = 128
 
     def __init__(
         self,
@@ -300,6 +301,27 @@ class DeepEPWaterfillBalancer:
                         f"[DeepEP Waterfill] rank={self.rank} "
                         f"redirected sparse ranks {sparse_ranks.tolist()} to local, "
                         f"dest_counts: {dest_counts.tolist()} -> {new_dest_counts.tolist()}"
+                    )
+
+        # Check if local shared count is too small for efficient tile utilization
+        # If so, redirect local tokens to the best remote rank
+        local_count = (shared_destination == self.rank).sum().item()
+        if 0 < local_count < self.MIN_TOKENS_PER_RANK and num_tokens >= self.MIN_BATCH_FOR_BALANCE:
+            # Find the rank with most shared tokens (excluding source rank)
+            dest_counts = torch.bincount(shared_destination, minlength=self.world_size)
+            dest_counts[self.rank] = -1  # Exclude source rank
+            best_remote_rank = dest_counts.argmax().item()
+            
+            if dest_counts[best_remote_rank] > 0:
+                # Redirect local tokens to best remote rank
+                local_mask = shared_destination == self.rank
+                shared_destination[local_mask] = best_remote_rank
+                
+                if DEEPEP_WATERFILL_DEBUG:
+                    print(
+                        f"[DeepEP Waterfill] rank={self.rank} "
+                        f"local_count={local_count} < MIN={self.MIN_TOKENS_PER_RANK}, "
+                        f"redirecting to rank {best_remote_rank}"
                     )
 
         # Expand topk to include shared expert
