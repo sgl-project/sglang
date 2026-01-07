@@ -55,17 +55,34 @@ class PrefillDelayer:
         self._queue_min_ratio = server_args.prefill_delayer_queue_min_ratio
         # Fall back to 5000ms if unset; this is a local safety cap, not a
         # semantic default, so we don't surface it via ServerArgs.
+        benchmark_target_batch_wait_ms = server_args.prefill_delayer_max_delay_ms
         self._max_delay_ms = server_args.prefill_delayer_max_delay_ms
         if self._max_delay_ms is None:
             self._max_delay_ms = 5000.0
         self._queue_trigger_enabled = self._queue_min_ratio is not None
+        self._benchmark_target_batch_size = (
+            envs.SGLANG_BENCHMARK_TARGET_BATCH_SIZE.get()
+        )
+        if (
+            self._benchmark_target_batch_size is not None
+            and self._benchmark_target_batch_size <= 0
+        ):
+            raise ValueError("SGLANG_BENCHMARK_TARGET_BATCH_SIZE must be positive")
+        self._benchmark_target_batch_wait_ms = benchmark_target_batch_wait_ms
+        if (
+            benchmark_target_batch_wait_ms is not None
+            and benchmark_target_batch_wait_ms < 0
+        ):
+            self._benchmark_target_batch_wait_ms = None
         logger.info(
             f"PrefillDelayer initialized with "
             f"max_delay_passes={self._max_delay_passes} "
             f"token_usage_low_watermark={self._token_usage_low_watermark} "
             f"queue_min_ratio={self._queue_min_ratio} "
             f"max_delay_ms={self._max_delay_ms} "
-            f"queue_trigger_enabled={self._queue_trigger_enabled}"
+            f"queue_trigger_enabled={self._queue_trigger_enabled} "
+            f"benchmark_target_batch_size={self._benchmark_target_batch_size} "
+            f"benchmark_target_batch_wait_ms={self._benchmark_target_batch_wait_ms}"
         )
         self.dp_size = dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
@@ -174,6 +191,47 @@ class PrefillDelayer:
             num_prefillable=global_prefillable.sum().item(),
             num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
         )
+
+        if (
+            self._benchmark_target_batch_size is not None
+            and global_waiting_queue_len.max().item() > 0
+        ):
+            target_bs = self._benchmark_target_batch_size
+            if not self.enable_dp_attention:
+                max_running_requests = (
+                    max_running_requests + self.dp_size - 1
+                ) // self.dp_size
+            min_waiting_queue = int(global_waiting_queue_len.min().item())
+            min_available_slots = max_running_requests - int(
+                global_running_batch.max().item()
+            )
+            target_ready = (
+                min_waiting_queue >= target_bs and min_available_slots >= target_bs
+            )
+
+            if not target_ready:
+                if self._benchmark_target_batch_wait_ms is not None:
+                    elapsed_ms = (
+                        0.0
+                        if prev_state is None
+                        else (time.perf_counter() - prev_state.start_time) * 1000.0
+                    )
+                    if elapsed_ms >= self._benchmark_target_batch_wait_ms:
+                        return _NegotiateOutput(
+                            next_state=None,
+                            output_allow=True,
+                            output_reason="target_batch_timeout",
+                            **debug_info,
+                        )
+
+                next_state = prev_state or _State()
+                next_state = next_state.bump_delayed_count()
+                return _NegotiateOutput(
+                    next_state=next_state,
+                    output_allow=False,
+                    output_reason="target_batch",
+                    **debug_info,
+                )
 
         # Compute outputs
         if prefillable_status == "all":
@@ -309,9 +367,19 @@ class PrefillDelayer:
 
 
 class PrefillDelayerSinglePassExecutor:
-    def __init__(self, prefill_delayer: PrefillDelayer, token_usage: float):
+    def __init__(
+        self,
+        prefill_delayer: PrefillDelayer,
+        token_usage: float,
+        running_batch: int = 0,
+        max_running_requests: int = 0,
+        waiting_queue_len: int = 0,
+    ):
         self._prefill_delayer = prefill_delayer
         self._token_usage = token_usage
+        self._running_batch = running_batch
+        self._max_running_requests = max_running_requests
+        self._waiting_queue_len = waiting_queue_len
         self._result: Optional[_NegotiateOutput] = None
 
     @property
@@ -331,19 +399,29 @@ class PrefillDelayerSinglePassExecutor:
     def negotiate_should_allow_prefill(
         self,
         local_prefillable: bool,
-        running_batch: int = 0,
+        running_batch: Optional[int] = None,
         max_prefill_bs: int = 0,
-        max_running_requests: int = 0,
-        waiting_queue_len: int = 0,
+        max_running_requests: Optional[int] = None,
+        waiting_queue_len: Optional[int] = None,
     ) -> bool:
         if not self._called:
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
                 local_prefillable=local_prefillable,
                 token_usage=self._token_usage,
-                running_batch=running_batch,
+                running_batch=(
+                    self._running_batch if running_batch is None else running_batch
+                ),
                 max_prefill_bs=max_prefill_bs,
-                max_running_requests=max_running_requests,
-                waiting_queue_len=waiting_queue_len,
+                max_running_requests=(
+                    self._max_running_requests
+                    if max_running_requests is None
+                    else max_running_requests
+                ),
+                waiting_queue_len=(
+                    self._waiting_queue_len
+                    if waiting_queue_len is None
+                    else waiting_queue_len
+                ),
             )
         return self._result.output_allow
 
@@ -373,6 +451,8 @@ def _record_single_pass_result(
                 "wait_success",
                 "no_wait",
                 "delay",
+                "target_batch",
+                "target_batch_timeout",
             }
 
     if metrics_collector is not None:

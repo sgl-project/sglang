@@ -3,6 +3,7 @@ import os
 import re
 import time
 import unittest
+from contextlib import ExitStack
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional
@@ -12,6 +13,7 @@ import requests
 import torch
 
 from sglang.bench_serving import run_benchmark
+from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -66,6 +68,7 @@ class NegotiateTestCase:
     # to exercise the legacy slot-only code paths.
     queue_min_ratio: Optional[float] = None
     max_delay_ms: Optional[float] = None
+    benchmark_target_batch_size: Optional[int] = None
 
 
 def _run_negotiate_test(rank, test_cases):
@@ -73,40 +76,47 @@ def _run_negotiate_test(rank, test_cases):
     cpu_group = torch.distributed.new_group(backend="gloo")
 
     for case in test_cases:
-        delayer = PrefillDelayer(
-            dp_size=world_size,
-            attn_tp_size=1,
-            cpu_group=cpu_group,
-            server_args=SimpleNamespace(
-                enable_dp_attention=True,
-                disaggregation_mode="null",
-                disable_overlap_schedule=False,
-                prefill_delayer_queue_min_ratio=case.queue_min_ratio,
-                prefill_delayer_max_delay_ms=case.max_delay_ms,
-            ),
-            max_delay_passes=case.max_delay_passes,
-            token_usage_low_watermark=case.token_usage_low_watermark,
-        )
-
-        for call in case.calls:
-            if call.sleep_before_s > 0:
-                time.sleep(call.sleep_before_s)
-
-            extra_kwargs = {}
-            if call.running_batch is not None:
-                extra_kwargs["running_batch"] = call.running_batch[rank]
-            if call.max_prefill_bs is not None:
-                extra_kwargs["max_prefill_bs"] = call.max_prefill_bs[rank]
-            if call.waiting_queue_len is not None:
-                extra_kwargs["waiting_queue_len"] = call.waiting_queue_len[rank]
-            if call.max_running_requests is not None:
-                extra_kwargs["max_running_requests"] = call.max_running_requests
-
-            result = delayer._negotiate_should_allow_prefill(
-                local_prefillable=call.prefillable[rank],
-                token_usage=call.token_usage[rank],
-                **extra_kwargs,
+        with ExitStack() as stack:
+            if case.benchmark_target_batch_size is not None:
+                stack.enter_context(
+                    envs.SGLANG_BENCHMARK_TARGET_BATCH_SIZE.override(
+                        case.benchmark_target_batch_size
+                    )
+                )
+            delayer = PrefillDelayer(
+                dp_size=world_size,
+                attn_tp_size=1,
+                cpu_group=cpu_group,
+                server_args=SimpleNamespace(
+                    enable_dp_attention=True,
+                    disaggregation_mode="null",
+                    disable_overlap_schedule=False,
+                    prefill_delayer_queue_min_ratio=case.queue_min_ratio,
+                    prefill_delayer_max_delay_ms=case.max_delay_ms,
+                ),
+                max_delay_passes=case.max_delay_passes,
+                token_usage_low_watermark=case.token_usage_low_watermark,
             )
+
+            for call in case.calls:
+                if call.sleep_before_s > 0:
+                    time.sleep(call.sleep_before_s)
+
+                extra_kwargs = {}
+                if call.running_batch is not None:
+                    extra_kwargs["running_batch"] = call.running_batch[rank]
+                if call.max_prefill_bs is not None:
+                    extra_kwargs["max_prefill_bs"] = call.max_prefill_bs[rank]
+                if call.waiting_queue_len is not None:
+                    extra_kwargs["waiting_queue_len"] = call.waiting_queue_len[rank]
+                if call.max_running_requests is not None:
+                    extra_kwargs["max_running_requests"] = call.max_running_requests
+
+                result = delayer._negotiate_should_allow_prefill(
+                    local_prefillable=call.prefillable[rank],
+                    token_usage=call.token_usage[rank],
+                    **extra_kwargs,
+                )
 
         assert (result.output_allow, result.output_reason) == (
             case.expected_allow,
@@ -346,6 +356,88 @@ _NEGOTIATE_TEST_CASES = [
         ],
         expected_allow=True,
         expected_reason="wait_success",
+    ),
+    NegotiateTestCase(
+        name="benchmark_target_waits_until_each_rank_can_reach_target",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        benchmark_target_batch_size=4,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                max_prefill_bs=[4, 4, 4, 4],
+                waiting_queue_len=[2, 2, 2, 2],
+                max_running_requests=4,
+            )
+        ],
+        expected_allow=False,
+        expected_reason="target_batch",
+    ),
+    NegotiateTestCase(
+        name="benchmark_target_waits_until_each_rank_has_target_slots",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        benchmark_target_batch_size=4,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[1, 1, 1, 1],
+                max_prefill_bs=[4, 4, 4, 4],
+                waiting_queue_len=[4, 4, 4, 4],
+                max_running_requests=4,
+            )
+        ],
+        expected_allow=False,
+        expected_reason="target_batch",
+    ),
+    NegotiateTestCase(
+        name="benchmark_target_allows_when_each_rank_can_prefill_target",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        benchmark_target_batch_size=4,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                max_prefill_bs=[4, 4, 4, 4],
+                waiting_queue_len=[4, 4, 4, 4],
+                max_running_requests=4,
+            )
+        ],
+        expected_allow=True,
+        expected_reason="no_wait",
+    ),
+    NegotiateTestCase(
+        name="benchmark_target_wall_clock_timeout",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        benchmark_target_batch_size=4,
+        max_delay_ms=50,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                max_prefill_bs=[4, 4, 4, 4],
+                waiting_queue_len=[2, 2, 2, 2],
+                max_running_requests=4,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                max_prefill_bs=[4, 4, 4, 4],
+                waiting_queue_len=[2, 2, 2, 2],
+                max_running_requests=4,
+                sleep_before_s=0.2,  # > max_delay_ms (50ms)
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="target_batch_timeout",
     ),
 ]
 
