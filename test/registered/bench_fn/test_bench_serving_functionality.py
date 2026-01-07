@@ -109,8 +109,8 @@ class TestBenchServingCustomHeaders(CustomTestCase):
         headers = parse_custom_headers(["=NoKey"])
         self.assertEqual(headers, {})
 
+    # TODO: Using well-implemented mock server, e.g. the on in sgl-router
     def test_custom_headers_sent_to_server(self):
-        # TODO: In the future, consider using router's mock server for more realistic testing.
         import queue
 
         received_requests = queue.Queue()
