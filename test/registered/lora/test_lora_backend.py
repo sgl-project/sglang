@@ -33,7 +33,7 @@ register_cuda_ci(est_time=200, suite="stage-b-test-small-1-gpu")
 register_amd_ci(
     est_time=200,
     suite="stage-b-test-small-1-gpu",
-    disabled="see https://github.com/sg1-project/sglang/issues/13107",
+    disabled="see https://github.com/sgl-project/sglang/issues/13107",
 )
 
 
