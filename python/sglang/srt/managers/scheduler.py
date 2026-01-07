@@ -1821,10 +1821,15 @@ class Scheduler(
                 self.chunked_req = None
 
         skip_prefill_scheduler = False
-        if self.schedule_enhancer and not self.schedule_enhancer.get_schedule_decision(
-            self.running_batch, self.max_prefill_bs
+        chunked_back = None
+        if (
+            self.chunked_req
+            and self.schedule_enhancer
+            and not self.schedule_enhancer.get_schedule_decision(
+                self.running_batch, self.max_prefill_bs
+            )
         ):
-            # Decrease prefill idle as much as possible during high dp load.
+            # Backup chunk req when prefill needs to be skipped.
             skip_prefill_scheduler = True
             chunked_back = self.chunked_req
             self.chunked_req = None
@@ -1868,6 +1873,16 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
+        if (
+            not self.chunked_req
+            and self.schedule_enhancer
+            and not self.schedule_enhancer.get_schedule_decision(
+                self.running_batch, self.max_prefill_bs
+            )
+        ):
+            # Decrease prefill idle as much as possible during high dp load.
+            skip_prefill_scheduler = True
+
         if skip_prefill_scheduler:
             new_batch = None
         else:
@@ -1899,7 +1914,7 @@ class Scheduler(
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
-        if skip_prefill_scheduler:
+        if chunked_back:
             self.chunked_req = chunked_back
         return ret
 
