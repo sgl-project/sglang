@@ -1,6 +1,7 @@
 #pragma once
 #include "common.h"
 #include "vec.h"
+#include "vec_pack.h"
 
 // debug
 template <typename T>
