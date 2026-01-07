@@ -35,6 +35,8 @@ from .gpu_allocator import (
     nvml_context,
     wait_for_gpu_memory_to_clear,
 )
+from .gpu_monitor import GPUMonitor
+from .gpu_monitor import should_monitor as should_monitor_gpu
 from .model_pool import ModelInstance, ModelPool
 from .model_specs import (  # Default model paths; Model groups
     CHAT_MODELS,
@@ -104,6 +106,9 @@ __all__ = [
     "wait_for_health",
     "wait_for_workers_ready",
     "detect_ib_device",
+    # GPU monitoring
+    "GPUMonitor",
+    "should_monitor_gpu",
     # Model management
     "ModelInstance",
     "ModelPool",
