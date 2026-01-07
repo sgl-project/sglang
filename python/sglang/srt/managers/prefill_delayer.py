@@ -108,7 +108,8 @@ class PrefillDelayerSinglePassExecutor:
     def maybe_create(prefill_delayer: PrefillDelayer):
         return (
             PrefillDelayerSinglePassExecutor(prefill_delayer)
-            if prefill_delayer else None
+            if prefill_delayer
+            else None
         )
 
     def __init__(self, prefill_delayer: PrefillDelayer):
