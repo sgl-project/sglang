@@ -130,10 +130,13 @@ def _setup_pd_backend(
     import openai
     from infra import ConnectionMode, Gateway, WorkerIdentity, WorkerType
 
+    logger.info("Setting up PD backend for model %s", model_id)
+
     # Check PD requirements
     try:
         import sgl_kernel  # noqa: F401
     except ImportError:
+        logger.info("Skipping PD test: sgl_kernel not available")
         pytest.skip("sgl_kernel not available, required for PD disaggregation")
 
     try:
@@ -212,6 +215,16 @@ def _setup_pd_backend(
         new_instances = model_pool.launch_workers(
             workers_to_launch, startup_timeout=300
         )
+
+        if not new_instances:
+            # Release any existing workers we acquired
+            for w in existing_prefills + existing_decodes:
+                w.release()
+            pytest.fail(
+                f"Failed to launch PD workers: needed {len(workers_to_launch)} workers "
+                f"but could not allocate GPUs (all in use or timeout)"
+            )
+
         # Acquire newly launched instances (launch_workers doesn't auto-acquire)
         for inst in new_instances:
             inst.acquire()
@@ -223,7 +236,16 @@ def _setup_pd_backend(
 
     # All workers in prefills and decodes are now acquired
 
-    model_path = prefills[0].model_path if prefills else None
+    if not prefills or not decodes:
+        # This shouldn't happen but guard against it
+        for w in prefills + decodes:
+            w.release()
+        pytest.fail(
+            f"PD setup incomplete: have {len(prefills)} prefill, {len(decodes)} decode "
+            f"(need {num_prefill} prefill, {num_decode} decode)"
+        )
+
+    model_path = prefills[0].model_path
 
     # Launch PD gateway
     gateway = Gateway()
