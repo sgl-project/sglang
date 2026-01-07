@@ -674,7 +674,7 @@ class HiCacheController:
             except Exception as e:
                 logger.error(e)
                 break
-        logger.warning("Prefetch IO auxiliary thread exiting.")
+        logger.error("Prefetch IO auxiliary thread exiting.")
 
     def prefetch_rate_limited(self) -> bool:
         """
@@ -770,7 +770,7 @@ class HiCacheController:
             except Exception as e:
                 logger.error(e)
                 break
-        logger.warning("Prefetch thread exiting.")
+        logger.error("Prefetch thread exiting.")
 
     def write_storage(
         self,
@@ -844,4 +844,4 @@ class HiCacheController:
             except Exception as e:
                 logger.error(e)
                 break
-        logger.warning("Backup thread exiting.")
+        logger.error("Backup thread exiting.")
