@@ -325,6 +325,7 @@ class FlashAttentionBackend(AttentionBackend):
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
+        self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.forward_metadata: FlashAttentionMetadata = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
@@ -1574,20 +1575,25 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                 }
 
-        self.encoder_metadata = {
-            "encoder_page_table": torch.zeros(
-                max_bs,
-                self.max_context_len,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "encoder_lens_int32": torch.zeros(
-                max_bs, dtype=torch.int32, device=self.device
-            ),
-            "encoder_cu_seqlens_k": torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
-            ),
-        }
+        # Only allocate encoder metadata for encoder-decoder models
+        if self.is_encoder_decoder:
+            self.encoder_metadata = {
+                "encoder_page_table": torch.zeros(
+                    max_bs,
+                    self.max_context_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "encoder_lens_int32": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+                "encoder_cu_seqlens_k": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+            }
+        else:
+            # For decoder-only models, skip encoder_metadata allocation
+            self.encoder_metadata = {}
 
     def init_forward_metadata_capture_cuda_graph(
         self,
