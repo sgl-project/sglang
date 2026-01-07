@@ -24,9 +24,26 @@ enum NormType : int {
   RMSNorm = 1,
 };
 
+// gate_mode:
+// NoGate: no gate (scalar 1.0), residual_output = residual + x
+// Gate2D: 2D gate [M, N] or [1, N]
+// GateB1N: Bx1xN gate [B, 1, N]
+// GateBF1N: BxFx1xN gate [B, F, 1, N]
+enum class GateMode : int {
+  NoGate = 0,
+  Gate2D = 1,
+  GateB1N = 2,
+  GateBF1N = 3,
+};
+
 template <NormType NT>
 struct NormTag {
   static constexpr NormType value = NT;
+};
+
+template <GateMode GM>
+struct GateModeTag {
+  static constexpr GateMode value = GM;
 };
 
 template <int V>
@@ -697,12 +714,8 @@ void fused_rmsnorm_scale_shift(
 // Fused Residual + Gate + LayerNorm/RMSNorm + Scale/Shift
 // =========================
 
-// gate_mode:
-// 0: no gate (scalar 1.0), residual_output = residual + x
-// 1: 2D gate [M, N]
-// 2: Bx1xN gate [B, 1, N]
-// 3: BxFx1xN gate [B, F, 1, N]
-template <typename T, int ITEM_PER_THREAD, NormType norm_type, bool scalar_both>
+// See GateMode enum for gate mode definitions.
+template <typename T, int ITEM_PER_THREAD, NormType norm_type, bool scalar_both, GateMode gate_mode>
 __global__ void norm_e4_fused_res_gate_scale_shift_2d(
     T* __restrict__ output,
     T* __restrict__ residual_out,
@@ -712,12 +725,11 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
     const T* __restrict__ beta,
     const T* __restrict__ scale,
     const T* __restrict__ shift,
-    const T* __restrict__ gate_mn,  // used when gate_mode == 1
-    const T* __restrict__ gate_b1,  // used when gate_mode == 2 (flattened [B,1,N] -> [B,N])
+    const T* __restrict__ gate_mn,  // used when gate_mode == Gate2D
+    const T* __restrict__ gate_b1,  // used when gate_mode == GateB1N (flattened [B,1,N] -> [B,N])
     const int m,
     const int n,
-    const int gate_mode,
-    const int rows_per_b,  // valid when gate_mode == 2
+    const int rows_per_b,  // valid when gate_mode == GateB1N
     bool affine,
     bool is_scale_c_1,
     bool is_shift_c_1,
@@ -732,8 +744,12 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
   const int n_4 = n / 4;
   const int offset = m_idx * n_4;
 
-  const int b = (gate_mode == 2) ? (m_idx / rows_per_b) : 0;
-  const int gate_b_base = (gate_mode == 2) ? (b * n_4) : 0;
+  int b = 0;
+  int gate_b_base = 0;
+  if constexpr (gate_mode == GateMode::GateB1N) {
+    b = m_idx / rows_per_b;
+    gate_b_base = b * n_4;
+  }
 
 #pragma unroll
   for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
@@ -743,11 +759,11 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
       x_v.load(x, offset + index);
       r_v.load(residual, offset + index);
 
-      if (gate_mode == 0) {
+      if constexpr (gate_mode == GateMode::NoGate) {
         g_v.fill(T(1.0f));
-      } else if (gate_mode == 1) {
+      } else if constexpr (gate_mode == GateMode::Gate2D) {
         g_v.load(gate_mn, is_gate_c_1 ? index : (offset + index));
-      } else {  // gate_mode == 2
+      } else {  // gate_mode == GateMode::GateB1N
         g_v.load(gate_b1, gate_b_base + index);
       }
 
@@ -853,7 +869,7 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
   }
 }
 
-template <typename T, int ITEM_PER_THREAD, NormType norm_type>
+template <typename T, int ITEM_PER_THREAD, NormType norm_type, GateMode gate_mode>
 __global__ void norm_e4_fused_res_gate_scale_shift_4d(
     T* __restrict__ output,
     T* __restrict__ residual_out,
@@ -863,12 +879,9 @@ __global__ void norm_e4_fused_res_gate_scale_shift_4d(
     const T* __restrict__ beta,
     const T* __restrict__ scale4d,
     const T* __restrict__ shift4d,
-    const T* __restrict__ gate_mn,  // unused for 4d
-    const T* __restrict__ gate_b1,  // unused for 4d
-    const T* __restrict__ gate4d,   // used when gate_mode == 3
+    const T* __restrict__ gate4d,  // used when gate_mode == GateBF1N
     const int m,
     const int n,
-    const int gate_mode,  // 0 or 3 expected here
     const int B,
     const int F,
     const int frame_seqlen,
@@ -898,9 +911,9 @@ __global__ void norm_e4_fused_res_gate_scale_shift_4d(
       x_v.load(x, offset + index);
       r_v.load(residual, offset + index);
 
-      if (gate_mode == 0) {
+      if constexpr (gate_mode == GateMode::NoGate) {
         g_v.fill(T(1.0f));
-      } else {  // gate_mode == 3
+      } else {  // gate_mode == GateBF1N
         g_v.load(gate4d, base4d + index);
       }
 
@@ -1046,33 +1059,33 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
       "scale/shift must be 2D [M, N] , 2D [1, N], 3D [1, 1, N], 4D [B, F, 1, N], or scalar");
 
   // Determine gate mode
-  int gate_mode = 0;
+  GateMode gate_mode = GateMode::NoGate;
   bool is_gate_c_1 = false;
   if (gate_opt.has_value()) {
     const auto& gate = gate_opt.value();
     RuntimeCheck(gate.dtype() == x.dtype(), "gate must have same dtype as x");
     if (gate.ndim() == 2) {
       if (gate.size(0) == M && gate.size(1) == N) {
-        gate_mode = 1;
+        gate_mode = GateMode::Gate2D;
       } else if (gate.size(0) == 1 && gate.size(1) == N) {
-        gate_mode = 1;
+        gate_mode = GateMode::Gate2D;
         is_gate_c_1 = true;
       } else {
         RuntimeCheck(false, "2D gate must be [M, N] or [1, N]");
       }
     } else if (gate.ndim() == 3) {
       if (gate.size(0) == 1 && gate.size(1) == 1 && gate.size(2) == N) {
-        gate_mode = 1;
+        gate_mode = GateMode::Gate2D;
         is_gate_c_1 = true;
       } else {
         RuntimeCheck(gate.size(1) == 1 && gate.size(2) == N, "3D gate must be [B, 1, N]");
         const int64_t B = gate.size(0);
         RuntimeCheck((M % B) == 0, "M must be divisible by B for 3D gate [B,1,N]");
-        gate_mode = 2;
+        gate_mode = GateMode::GateB1N;
       }
     } else if (gate.ndim() == 4) {
       RuntimeCheck(gate.size(2) == 1 && gate.size(3) == N, "4D gate must be [B, F, 1, N]");
-      gate_mode = 3;
+      gate_mode = GateMode::GateBF1N;
     } else {
       RuntimeCheck(false, "Unsupported gate shape. Use [M,N], [B,1,N], [B,F,1,N] , 2D [1, N], 3D [1, 1, N]");
     }
@@ -1081,7 +1094,26 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
   auto dispatch = [&](auto launch_kernel) {
     auto dispatch_dtype = [&](auto dtype) {
       auto dispatch_item_per_thread = [&](auto item_per_thread_tag) {
-        auto dispatch_norm_type = [&](auto norm_tag) { launch_kernel(dtype, item_per_thread_tag, norm_tag); };
+        auto dispatch_norm_type = [&](auto norm_tag) {
+          auto dispatch_gate_mode = [&](auto gate_mode_tag) {
+            launch_kernel(dtype, item_per_thread_tag, norm_tag, gate_mode_tag);
+          };
+
+          switch (gate_mode) {
+            case GateMode::NoGate:
+              dispatch_gate_mode(GateModeTag<GateMode::NoGate>{});
+              break;
+            case GateMode::Gate2D:
+              dispatch_gate_mode(GateModeTag<GateMode::Gate2D>{});
+              break;
+            case GateMode::GateB1N:
+              dispatch_gate_mode(GateModeTag<GateMode::GateB1N>{});
+              break;
+            case GateMode::GateBF1N:
+              dispatch_gate_mode(GateModeTag<GateMode::GateBF1N>{});
+              break;
+          }
+        };
 
         if (norm_type == 0) {
           dispatch_norm_type(NormTag<NormType::LayerNorm>{});
@@ -1110,20 +1142,21 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
   };
 
   if (use_2d || scalar_both) {
-    const int rows_per_b = (gate_mode == 2) ? (int)(M / gate_opt.value().size(0)) : 0;
+    const int rows_per_b = (gate_mode == GateMode::GateB1N) ? (int)(M / gate_opt.value().size(0)) : 0;
     if (scalar_both) {
       RuntimeCheck(
-          gate_mode != 3,
+          gate_mode != GateMode::GateBF1N,
           "When skipping with scalar scale/shift, 4D gate is not supported. Provide 2D/3D gate or 4D scale/shift.");
     }
 
-    auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
+    auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag, auto gate_mode_tag) {
       using T = typename decltype(dtype_tag)::T;
       using IPT = decltype(ipt_tag);
       using NT = decltype(norm_tag);
+      using GM = decltype(gate_mode_tag);
       if (scalar_both) {
         LaunchKernel(grid, block, x.device())(
-            norm_e4_fused_res_gate_scale_shift_2d<T, IPT::value, NT::value, true>,
+            norm_e4_fused_res_gate_scale_shift_2d<T, IPT::value, NT::value, true, GM::value>,
             (T*)y.data_ptr(),
             (T*)residual_out.data_ptr(),
             (const T*)x.data_ptr(),
@@ -1132,11 +1165,10 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
             (const T*)beta_ptr,
             (const T*)scale.data_ptr(),
             (const T*)shift.data_ptr(),
-            (gate_mode == 1) ? (const T*)gate_opt.value().data_ptr() : nullptr,
-            (gate_mode == 2) ? (const T*)gate_opt.value().data_ptr() : nullptr,
+            (gate_mode == GateMode::Gate2D) ? (const T*)gate_opt.value().data_ptr() : nullptr,
+            (gate_mode == GateMode::GateB1N) ? (const T*)gate_opt.value().data_ptr() : nullptr,
             (int)M,
             (int)N,
-            gate_mode,
             rows_per_b,
             affine,
             is_scale_c_1,
@@ -1145,7 +1177,7 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
             eps);
       } else {
         LaunchKernel(grid, block, x.device())(
-            norm_e4_fused_res_gate_scale_shift_2d<T, IPT::value, NT::value, false>,
+            norm_e4_fused_res_gate_scale_shift_2d<T, IPT::value, NT::value, false, GM::value>,
             (T*)y.data_ptr(),
             (T*)residual_out.data_ptr(),
             (const T*)x.data_ptr(),
@@ -1154,11 +1186,10 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
             (const T*)beta_ptr,
             (const T*)scale.data_ptr(),
             (const T*)shift.data_ptr(),
-            (gate_mode == 1) ? (const T*)gate_opt.value().data_ptr() : nullptr,
-            (gate_mode == 2) ? (const T*)gate_opt.value().data_ptr() : nullptr,
+            (gate_mode == GateMode::Gate2D) ? (const T*)gate_opt.value().data_ptr() : nullptr,
+            (gate_mode == GateMode::GateB1N) ? (const T*)gate_opt.value().data_ptr() : nullptr,
             (int)M,
             (int)N,
-            gate_mode,
             rows_per_b,
             affine,
             is_scale_c_1,
@@ -1176,14 +1207,17 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
   const int64_t B = scale.size(0);
   const int64_t F = scale.size(1);
   const int frame_seqlen = (int)(M / (B * F));
-  RuntimeCheck(gate_mode == 0 || gate_mode == 3, "When scale/shift are 4D, gate must be none or 4D [B,F,1,N]");
+  RuntimeCheck(
+      gate_mode == GateMode::NoGate || gate_mode == GateMode::GateBF1N,
+      "When scale/shift are 4D, gate must be none or 4D [B,F,1,N]");
 
-  auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
+  auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag, auto gate_mode_tag) {
     using T = typename decltype(dtype_tag)::T;
     using IPT = decltype(ipt_tag);
     using NT = decltype(norm_tag);
+    using GM = decltype(gate_mode_tag);
     LaunchKernel(grid, block, x.device())(
-        norm_e4_fused_res_gate_scale_shift_4d<T, IPT::value, NT::value>,
+        norm_e4_fused_res_gate_scale_shift_4d<T, IPT::value, NT::value, GM::value>,
         (T*)y.data_ptr(),
         (T*)residual_out.data_ptr(),
         (const T*)x.data_ptr(),
@@ -1192,12 +1226,9 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
         (const T*)beta_ptr,
         (const T*)scale.data_ptr(),
         (const T*)shift.data_ptr(),
-        nullptr,
-        nullptr,
-        (gate_mode == 3) ? (const T*)gate_opt.value().data_ptr() : nullptr,
+        (gate_mode == GateMode::GateBF1N) ? (const T*)gate_opt.value().data_ptr() : nullptr,
         (int)M,
         (int)N,
-        gate_mode,
         (int)B,
         (int)F,
         frame_seqlen,
