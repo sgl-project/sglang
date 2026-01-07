@@ -63,8 +63,11 @@ class DpPaddingMode(IntEnum):
     ) -> DpPaddingMode:
         sum_len = sum(global_num_tokens)
         avg_len = sum_len / len(global_num_tokens)
+        unbalanced_threshold = 0.8
         # Avoid SUM_LEN mode in prefill when token counts are balanced across ranks.
-        if is_extend_in_batch and any(gt < avg_len * 0.8 for gt in global_num_tokens):
+        if is_extend_in_batch and any(
+            gt < avg_len * unbalanced_threshold for gt in global_num_tokens
+        ):
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
