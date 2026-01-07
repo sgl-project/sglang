@@ -27,17 +27,23 @@ import requests
 from typing import List, Dict, Any, Optional
 
 
-def tokenize(text: str, base_url: str) -> List[str]:
+def tokenize(text: str, base_url: str) -> List[Dict]:
     """Get tokens from the server's tokenizer."""
     try:
         resp = requests.post(
             f"{base_url}/tokenize",
-            json={"text": text},
+            json={"text": text, "add_special_tokens": True},
             timeout=10
         )
         if resp.status_code == 200:
             data = resp.json()
-            return data.get("tokens", [])
+            # Returns list of token IDs or token info
+            token_ids = data.get("token_ids", data.get("tokens", []))
+            # Also try to get text
+            token_texts = data.get("token_texts", [])
+            if token_texts:
+                return [{"id": tid, "text": txt} for tid, txt in zip(token_ids, token_texts)]
+            return [{"id": tid, "text": f"[{tid}]"} for tid in token_ids]
     except Exception as e:
         print(f"Tokenize failed: {e}")
     return []
@@ -66,55 +72,34 @@ def run_needle_test(base_url: str, verbose: bool = False) -> Dict[str, Any]:
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 20,
         "temperature": 0.0,  # Deterministic
-        "stream": True,
-        "extra_body": {
-            "return_attention_tokens": True,
-        }
+        "stream": False,  # Non-streaming to get attention in response
+        "return_attention_tokens": True,  # Top-level flag
     }
 
     try:
         resp = requests.post(
             f"{base_url}/v1/chat/completions",
             json=payload,
-            stream=True,
-            timeout=60
+            timeout=120
         )
 
         if resp.status_code != 200:
             return {"status": "FAIL", "error": f"HTTP {resp.status_code}: {resp.text}"}
 
-        # Parse SSE stream
-        generated_tokens = []
-        attention_data = []
+        data = resp.json()
+        choices = data.get('choices', [])
+        if not choices:
+            return {"status": "FAIL", "error": "No choices in response"}
 
-        for line in resp.iter_lines():
-            if not line:
-                continue
-            line = line.decode('utf-8')
-            if line.startswith('data: '):
-                data_str = line[6:]
-                if data_str == '[DONE]':
-                    break
-                try:
-                    data = json.loads(data_str)
+        # Extract content
+        message = choices[0].get('message', {})
+        generated_text = message.get('content', '')
 
-                    # Extract token
-                    choices = data.get('choices', [])
-                    if choices:
-                        delta = choices[0].get('delta', {})
-                        content = delta.get('content', '')
-                        if content:
-                            generated_tokens.append(content)
+        # Extract attention data
+        attention_data = choices[0].get('attention_tokens', [])
 
-                        # Extract attention
-                        attn = delta.get('attention_tokens')
-                        if attn:
-                            attention_data.append(attn)
-
-                except json.JSONDecodeError:
-                    continue
-
-        generated_text = ''.join(generated_tokens)
+        # Tokenize generated text (approximate by splitting)
+        generated_tokens = list(generated_text)  # Character-level fallback
         print(f"\nGenerated: {generated_text}")
         print(f"Tokens: {generated_tokens[:10]}...")  # First 10
         print(f"Attention entries: {len(attention_data)}")

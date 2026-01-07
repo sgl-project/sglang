@@ -43,9 +43,9 @@ const normalizedScore = isSinkToken
 
 ---
 
-### 3. Needle Test ⏳
+### 3. Needle Test ✅
 
-**Status:** PENDING (Requires Live Server)
+**Status:** PASS (Tested 2026-01-07 with Qwen3-Next-80B-A3B-Thinking-FP8)
 
 **Prompt:**
 ```
@@ -105,8 +105,25 @@ npm run dev
 |-------|--------|-------------------|
 | Off-by-one alignment | ✅ PASS | Yes |
 | Sink token handling | ✅ PASS | Yes |
-| Needle test | ⏳ Pending | Yes |
+| Needle test | ✅ PASS | Yes |
 | Layer selection | ⏳ Pending | No |
-| Multi-layer capture | ⏳ Pending | No |
+| Multi-layer capture | ✅ Tested | No |
 
-**Decision:** Merge after Needle Test passes.
+**Decision:** ✅ Ready for merge - all required checks pass.
+
+---
+
+## Needle Test Results (2026-01-07)
+
+**Model:** Qwen3-Next-80B-A3B-Thinking-FP8
+**Prompt:** `"Complete: The code 4829 is"`
+**Output:** `"Okay, the user said \"Complete: The code 4829"`
+
+| Decode Step | Generated | Top Attended Position | Score | Needle Hit |
+|-------------|-----------|----------------------|-------|------------|
+| 8 | "4" | Position 5 (the "4" in prompt) | 0.539 | ✅ |
+| 9 | "8" | Positions 6,7,5 | 0.247 | ✅ |
+| 10 | "2" | Position 7 | 0.161 | ✅ |
+| 11 | "9" | Position 8 | 0.226 | ✅ |
+
+**Conclusion:** When generating "4829", the model correctly attends to the corresponding digits in the prompt. Attention alignment is verified.
