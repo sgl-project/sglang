@@ -406,9 +406,11 @@ def initialize_model_parallel(
 
     try:
         from .yunchang import PROCESS_GROUP as _YC_PROCESS_GROUP
-        from .yunchang import set_seq_parallel_pg as _set_seq_parallel_pg
+        from .yunchang import (
+            set_seq_parallel_pg_by_sp_groups as _set_seq_parallel_pg_by_sp_groups,
+        )
     except ImportError:
-        _set_seq_parallel_pg = None
+        _set_seq_parallel_pg_by_sp_groups = None
 
         class _DummyProcessGroup:
             ULYSSES_PG = torch.distributed.group.WORLD
@@ -416,11 +418,15 @@ def initialize_model_parallel(
 
         PROCESS_GROUP = _DummyProcessGroup()
     else:
-        _set_seq_parallel_pg(
+        # Build yunchang SP sub-groups based on the true SP groups. This is
+        # critical when TP>1, because SP groups may be strided in global ranks
+        # (e.g., tp-sp order).
+        sp_groups = rank_generator.get_ranks("sp")
+        _set_seq_parallel_pg_by_sp_groups(
             sp_ulysses_degree=ulysses_degree,
             sp_ring_degree=ring_degree,
-            rank=get_world_group().rank_in_group,
-            world_size=dit_parallel_size,
+            rank=get_world_group().rank,
+            sp_groups=sp_groups,
         )
         PROCESS_GROUP = _YC_PROCESS_GROUP
 
