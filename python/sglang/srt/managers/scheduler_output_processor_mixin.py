@@ -1345,6 +1345,7 @@ class SchedulerOutputProcessorMixin:
         customized_info = {}
         output_attention_tokens = None
         output_moe_routing = None
+        output_logit_lens = None
 
         queue_times = []
         forward_entry_times = []
@@ -1560,6 +1561,11 @@ class SchedulerOutputProcessorMixin:
                         output_moe_routing = []
                     output_moe_routing.append(req.moe_routing)
 
+                if getattr(req, 'return_logit_lens', False):
+                    if output_logit_lens is None:
+                        output_logit_lens = []
+                    output_logit_lens.append(getattr(req, 'logit_lens', None))
+
             if (
                 req.finished()
                 and self.attn_tp_rank == 0
@@ -1612,6 +1618,7 @@ class SchedulerOutputProcessorMixin:
                     customized_info=customized_info,
                     output_attention_tokens=output_attention_tokens,
                     output_moe_routing=output_moe_routing,
+                    output_logit_lens=output_logit_lens,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,

@@ -4,6 +4,7 @@ import { ChatView } from './components/views/ChatView';
 import { InspectView } from './components/views/InspectView';
 import { ManifoldView } from './components/views/ManifoldView';
 import { RouterView } from './components/views/RouterView';
+import { LogitLensView } from './components/views/LogitLensView';
 import { ComparisonView } from './components/comparison';
 import { InsightPanel } from './components/lens/InsightPanel';
 import { TokenLensDrawer } from './components/lens/TokenLensDrawer';
@@ -24,6 +25,8 @@ export default function App() {
         return <RouterView />;
       case 'compare':
         return <ComparisonView />;
+      case 'lens':
+        return <LogitLensView />;
       default:
         return <ChatView />;
     }

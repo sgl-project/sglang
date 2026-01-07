@@ -15,9 +15,12 @@
 
 import dataclasses
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.logit_lens.types import LogitLensOutput
 import triton
 import triton.language as tl
 from torch import nn
@@ -87,6 +90,8 @@ class LogitsProcessorOutput:
     # MoE routing capture: List[(layer_id, topk_ids, topk_weights)]
     # topk_ids: [num_tokens, top_k], topk_weights: [num_tokens, top_k]
     moe_routing_buffer: Optional[List[tuple]] = None
+    # Logit lens: intermediate layer predictions projected to vocabulary
+    logit_lens_output: Optional["LogitLensOutput"] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
