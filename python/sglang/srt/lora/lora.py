@@ -122,6 +122,80 @@ class LoRAAdapter(nn.Module):
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
         # Collect target q/k/v modules. This process is necessary since there might be no lora attached to k_proj
+        # Additionally, handle DeepSeek fused projection naming (q_a_proj / kv_a_proj_with_mqa and q_b_proj / kv_b_proj).
+        #
+        # For DeepSeek-style fused projections:
+        # - A weights: stack as [q_a, kv_a, kv_a] along the output dimension to form qkv A.
+        # - B weights: split kv_b evenly along the output dimension to [k_b, v_b] and stack as [q_b, k_b, v_b].
+        #
+        # We synthesize qkv_proj.* entries so that the rest of the LoRA pipeline can operate on normalized names.
+        ds_q_a = [n for n in weight_names if ("q_a_proj" in n and "lora_A" in n)]
+        for q_a_name in ds_q_a:
+            kv_a_name = q_a_name.replace("q_a_proj", "kv_a_proj_with_mqa")
+            if kv_a_name in weights:
+                qkv_a_name = q_a_name.replace("q_a_proj", "qkv_proj")
+                A_q = weights[q_a_name]
+                A_kv = weights[kv_a_name]
+                # Align row-rank to configured LoRA r
+                r = int(self.config.r)
+                if A_q.shape[0] != r:
+                    A_q = A_q[:r, :]
+                if A_kv.shape[0] != r:
+                    A_kv = A_kv[:r, :]
+                # Construct qkv A by duplicating kv_a for both K and V slices
+                weights[qkv_a_name] = torch.cat((A_q, A_kv, A_kv), dim=0)
+                # Remove original fused entries to avoid downstream name matching issues
+                try:
+                    weights.pop(q_a_name)
+                except KeyError:
+                    pass
+                try:
+                    weights.pop(kv_a_name)
+                except KeyError:
+                    pass
+
+        ds_q_b = [n for n in weight_names if ("q_b_proj" in n and "lora_B" in n)]
+        for q_b_name in ds_q_b:
+            kv_b_name = q_b_name.replace("q_b_proj", "kv_b_proj")
+            if kv_b_name in weights:
+                qkv_b_name = q_b_name.replace("q_b_proj", "qkv_proj")
+                B_q = weights[q_b_name]
+                B_kv = weights[kv_b_name]
+                # Align column-rank to configured LoRA r
+                r = int(self.config.r)
+                if B_q.shape[1] != r:
+                    B_q = B_q[:, :r]
+                if B_kv.shape[1] != r:
+                    B_kv = B_kv[:, :r]
+                # Split kv_b equally across K and V along the output dimension
+                split = B_kv.shape[0] // 2
+                B_k = B_kv[:split, :]
+                B_v = B_kv[split:, :]
+                weights[qkv_b_name] = torch.cat((B_q, B_k, B_v), dim=0)
+                # Remove original fused entries to avoid downstream name matching issues
+                try:
+                    weights.pop(q_b_name)
+                except KeyError:
+                    pass
+                try:
+                    weights.pop(kv_b_name)
+                except KeyError:
+                    pass
+
+        # Refresh weight_names after potential synthesis above
+        weight_names = list(weights.keys())
+        # Final cleanup: remove any remaining DeepSeek fused entries (both A and B) to
+        # ensure downstream name matching only sees normalized targets.
+        for name in list(weights.keys()):
+            if (
+                ("q_a_proj" in name)
+                or ("kv_a_proj_with_mqa" in name)
+                or ("q_b_proj" in name)
+                or ("kv_b_proj" in name)
+            ):
+                weights.pop(name, None)
+        weight_names = list(weights.keys())
+
         target_module = set()
         for weight_name in weight_names:
             if "k_proj" in weight_name:
@@ -168,7 +242,22 @@ class LoRAAdapter(nn.Module):
                 k_name = weight_name.replace("qkv_proj", "k_proj")
                 v_name = weight_name.replace("qkv_proj", "v_proj")
                 if "lora_A" in weight_name:
-                    weights[qkv_name] = weights[qkv_name].repeat(3, 1)
+                    # Only stack if current rows == r. If already 3r, no-op.
+                    r = int(self.config.r)
+                    rows = weights[qkv_name].shape[0]
+                    if rows == r:
+                        weights[qkv_name] = weights[qkv_name].repeat(3, 1)
+                    elif rows == 3 * r:
+                        pass
+                    else:
+                        # Bring to 3r rows by tiling or truncating
+                        if rows > 3 * r:
+                            weights[qkv_name] = weights[qkv_name][: 3 * r, :]
+                        else:
+                            reps = (3 * r + rows - 1) // rows
+                            weights[qkv_name] = weights[qkv_name].repeat(reps, 1)[
+                                : 3 * r, :
+                            ]
                 # else: no-op as LoRA B weight is already stacked.
 
     def normalize_gate_up_proj(
@@ -195,5 +284,20 @@ class LoRAAdapter(nn.Module):
                 # If gate_up_proj is already stacked, we normalize it following the SGL convention
                 gate_up_name = weight_name
                 if "lora_A" in weight_name:
-                    weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
+                    # Only stack if current rows == r. If already 2r, no-op.
+                    r = int(self.config.r)
+                    rows = weights[gate_up_name].shape[0]
+                    if rows == r:
+                        weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
+                    elif rows == 2 * r:
+                        pass
+                    else:
+                        # Bring to 2r rows by tiling or truncating
+                        if rows > 2 * r:
+                            weights[gate_up_name] = weights[gate_up_name][: 2 * r, :]
+                        else:
+                            reps = (2 * r + rows - 1) // rows
+                            weights[gate_up_name] = weights[gate_up_name].repeat(
+                                reps, 1
+                            )[: 2 * r, :]
                 # else: no-op as LoRA B weight is already stacked.
