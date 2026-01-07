@@ -800,16 +800,24 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             num_pages, self.page_size, self.kv_cache_dim
         )
 
-        # Split into ckv_cache and kpe_cache (contiguous copies needed)
-        ckv_cache = kv_buffer_paged[..., : self.kv_lora_rank].contiguous()
-        kpe_cache = kv_buffer_paged[..., self.kv_lora_rank :].contiguous()
-
         # Get output cache locations
         out_cache_loc = forward_batch.out_cache_loc
         nnz = out_cache_loc.shape[0]
 
         # Prepare kv_indices (page indices for each token)
-        kv_indices = (out_cache_loc // self.page_size).int()
+        kv_indices_orig = (out_cache_loc // self.page_size).int()
+
+        # OPTIMIZATION: Only copy the pages we need, not the entire cache
+        # Get unique pages that will be modified
+        unique_pages, inverse_indices = kv_indices_orig.unique(return_inverse=True)
+        num_unique_pages = unique_pages.shape[0]
+
+        # Copy only the unique pages (much smaller than full cache)
+        ckv_cache = kv_buffer_paged[unique_pages, :, : self.kv_lora_rank].contiguous()
+        kpe_cache = kv_buffer_paged[unique_pages, :, self.kv_lora_rank :].contiguous()
+
+        # Remap kv_indices to point into the small buffers (0, 1, 2, ... instead of original page numbers)
+        kv_indices = inverse_indices.int()
 
         # Prepare batch_indices and positions
         # positions = page positions (position within page) for cache indexing
@@ -859,8 +867,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         # Copy modified caches back to original buffer
-        kv_buffer_paged[..., : self.kv_lora_rank] = ckv_cache
-        kv_buffer_paged[..., self.kv_lora_rank :] = kpe_cache
+        # We already have unique_pages from the optimization above
+        kv_buffer_paged[unique_pages, :, : self.kv_lora_rank] = ckv_cache
+        kv_buffer_paged[unique_pages, :, self.kv_lora_rank :] = kpe_cache
 
         return q_out
 
