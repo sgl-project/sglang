@@ -1,0 +1,1194 @@
+#!/usr/bin/env python3
+"""
+RAPIDS cuML Sidecar for GPU-Accelerated Attention Clustering
+
+A separate background process that:
+1. Receives fingerprint vectors from SGLang scheduler (via ZMQ or HTTP)
+2. Runs GPU-accelerated HDBSCAN clustering via cuML
+3. Publishes cluster centroids back to scheduler for online routing
+4. Persists fingerprints to SQLite for discovery job batch processing
+5. Loads discovery artifacts for zone-based classification
+
+Architecture:
+    SGLang Scheduler  --fingerprints-->  RAPIDS Sidecar  --centroids-->  Proxy Router
+         (ZMQ PUSH)        (ZMQ PULL)           |
+         |<----------- manifold hints ----------|
+                                                |
+                                           SQLite DB
+                                                |
+                                                v
+                                          Discovery Job
+                                         (PCA/UMAP/HDBSCAN)
+                                                |
+                                                v
+                                        Parquet Artifacts
+
+Requirements:
+    pip install pyzmq  # For ZMQ streaming
+    pip install cuml-cu12  # or cuml-cu11 for CUDA 11
+    # OR use CPU fallback: pip install hdbscan scikit-learn
+
+Usage:
+    # Start sidecar with ZMQ listener and SQLite storage
+    python rapids_sidecar.py --zmq-bind tcp://*:9001 --port 9000 \\
+        --db ./fingerprints.db --discovery-dir ./discovery_outputs
+
+    # SGLang server connects to sidecar via ZMQ
+    python -m sglang.launch_server \\
+        --model-path your-model \\
+        --return-attention-tokens \\
+        --attention-fingerprint-mode \\
+        --attention-sidecar-url tcp://localhost:9001 \\
+        --disable-cuda-graph
+
+    # Query centroids via HTTP
+    curl http://localhost:9000/centroids
+
+    # Classify using discovery artifacts
+    curl -X POST http://localhost:9000/classify -d '{"vector": [0.7, ...]}'
+
+Alternative HTTP-only mode (for debugging):
+    python rapids_sidecar.py --port 9000  # No ZMQ
+
+    # Send fingerprints via HTTP
+    curl -X POST http://localhost:9000/fingerprint -d '{
+        "request_id": "req-123",
+        "vector": [0.7, 0.5, 0.6, 1.2, ...],
+        "metadata": {"prompt_type": "code"}
+    }'
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import struct
+import time
+import threading
+from collections import deque
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+import numpy as np
+from dataclasses import dataclass, asdict, field
+from enum import Enum
+
+# Try to import discovery classifier
+try:
+    from discovery import SidecarClassifier
+    HAS_DISCOVERY = True
+except ImportError:
+    HAS_DISCOVERY = False
+
+# Try ZMQ for high-performance streaming
+try:
+    import zmq
+    HAS_ZMQ = True
+except ImportError:
+    HAS_ZMQ = False
+
+# Try RAPIDS cuML first, fallback to CPU
+try:
+    import cudf
+    import cuml
+    from cuml.cluster import HDBSCAN as cuHDBSCAN
+    HAS_RAPIDS = True
+except ImportError:
+    HAS_RAPIDS = False
+
+try:
+    import hdbscan
+    from sklearn.preprocessing import StandardScaler
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+
+# Simple HTTP server
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.parse
+
+
+class ClusteringBackend(Enum):
+    RAPIDS = "rapids"
+    CPU = "cpu"
+    ONLINE = "online"  # Lightweight online clustering (no scipy/sklearn needed)
+    NONE = "none"
+
+
+class FingerprintStorage:
+    """
+    SQLite-based fingerprint storage for discovery job batch processing.
+
+    Uses the schema from discovery/schema.sql to store fingerprints,
+    enabling the discovery job to run batch clustering/embedding.
+    """
+
+    FINGERPRINT_DIM = 20  # Schema v1 fingerprint size
+
+    def __init__(self, db_path: str, session_id: Optional[str] = None):
+        self.db_path = db_path
+        self.session_id = session_id or f"sidecar_{int(time.time())}"
+        self._conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.Lock()
+        self._initialized = False
+        self._write_count = 0
+        self._batch_buffer: List[Tuple] = []
+        self._batch_size = 100
+
+    def _ensure_initialized(self):
+        """Initialize database connection and session."""
+        if self._initialized:
+            return
+
+        self._conn = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,
+            timeout=30.0,
+        )
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+
+        # Verify schema exists
+        cursor = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='fingerprints'"
+        )
+        if cursor.fetchone() is None:
+            raise RuntimeError(
+                f"Database {self.db_path} missing fingerprints table. "
+                f"Initialize with: sqlite3 {self.db_path} < discovery/schema.sql"
+            )
+
+        # Insert session record
+        self._conn.execute(
+            """INSERT OR IGNORE INTO sessions (session_id, name, model_id)
+               VALUES (?, ?, ?)""",
+            (self.session_id, "rapids_sidecar", "unknown"),
+        )
+        self._conn.commit()
+        self._initialized = True
+
+    def store(
+        self,
+        request_id: str,
+        step: int,
+        fingerprint: np.ndarray,
+        zone: Optional[str] = None,
+        cluster_id: Optional[int] = None,
+        confidence: Optional[float] = None,
+        metadata: Optional[Dict] = None,
+    ):
+        """Store a fingerprint to the database (batched for efficiency)."""
+        with self._lock:
+            self._ensure_initialized()
+
+            # Pack fingerprint as binary blob
+            fp_list = fingerprint.tolist()[:self.FINGERPRINT_DIM]
+            # Pad if needed
+            while len(fp_list) < self.FINGERPRINT_DIM:
+                fp_list.append(0.0)
+            fp_blob = struct.pack(f'<{self.FINGERPRINT_DIM}f', *fp_list)
+
+            self._batch_buffer.append((
+                request_id,
+                self.session_id,
+                step,
+                fp_blob,
+                zone,
+                confidence,
+                cluster_id if cluster_id is not None else -1,
+            ))
+
+            if len(self._batch_buffer) >= self._batch_size:
+                self._flush_batch()
+
+    def _flush_batch(self):
+        """Flush buffered fingerprints to database."""
+        if not self._batch_buffer:
+            return
+
+        try:
+            self._conn.executemany(
+                """INSERT OR REPLACE INTO fingerprints
+                   (request_id, session_id, step, fingerprint,
+                    manifold_zone, manifold_confidence, cluster_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                self._batch_buffer,
+            )
+            self._conn.commit()
+            self._write_count += len(self._batch_buffer)
+            self._batch_buffer.clear()
+        except Exception as e:
+            print(f"SQLite write error: {e}")
+
+    def flush(self):
+        """Force flush any buffered fingerprints."""
+        with self._lock:
+            self._flush_batch()
+
+    def get_stats(self) -> Dict:
+        """Get storage statistics."""
+        with self._lock:
+            if not self._initialized:
+                return {"initialized": False}
+
+            cursor = self._conn.execute(
+                "SELECT COUNT(*) FROM fingerprints WHERE session_id = ?",
+                (self.session_id,),
+            )
+            count = cursor.fetchone()[0]
+
+            return {
+                "initialized": True,
+                "db_path": self.db_path,
+                "session_id": self.session_id,
+                "session_fingerprints": count,
+                "total_writes": self._write_count,
+                "buffer_size": len(self._batch_buffer),
+            }
+
+    def close(self):
+        """Close database connection."""
+        with self._lock:
+            self._flush_batch()
+            if self._conn:
+                # Update session end time
+                self._conn.execute(
+                    "UPDATE sessions SET end_time = datetime('now') WHERE session_id = ?",
+                    (self.session_id,),
+                )
+                self._conn.commit()
+                self._conn.close()
+                self._conn = None
+
+
+class DiscoveryIntegration:
+    """
+    Integration with discovery job artifacts for zone classification.
+
+    Loads discovery artifacts (PCA/UMAP models, cluster data) and provides
+    classification using the pre-trained manifold.
+    """
+
+    def __init__(self, discovery_dir: str, auto_reload_interval: float = 300.0):
+        self.discovery_dir = Path(discovery_dir)
+        self.auto_reload_interval = auto_reload_interval
+        self._classifier: Optional['SidecarClassifier'] = None
+        self._last_reload = 0
+        self._lock = threading.Lock()
+        self._reload_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    def start(self):
+        """Start auto-reload background thread."""
+        self._load_classifier()
+        if self.auto_reload_interval > 0:
+            self._reload_thread = threading.Thread(
+                target=self._reload_loop, daemon=True
+            )
+            self._reload_thread.start()
+
+    def stop(self):
+        """Stop auto-reload thread."""
+        self._stop_event.set()
+        if self._reload_thread:
+            self._reload_thread.join(timeout=2)
+
+    def _reload_loop(self):
+        """Background loop to reload discovery artifacts."""
+        while not self._stop_event.is_set():
+            time.sleep(self.auto_reload_interval)
+            if self._stop_event.is_set():
+                break
+            self._load_classifier()
+
+    def _load_classifier(self):
+        """Load or reload discovery classifier."""
+        if not HAS_DISCOVERY:
+            return
+
+        latest_path = self.discovery_dir / "latest"
+        if not latest_path.exists():
+            return
+
+        try:
+            with self._lock:
+                # SidecarClassifier handles hot-reload internally
+                if self._classifier is None:
+                    self._classifier = SidecarClassifier(str(self.discovery_dir))
+                else:
+                    # Force reload check
+                    self._classifier._check_reload()
+                self._last_reload = time.time()
+        except Exception as e:
+            print(f"Discovery classifier load error: {e}")
+
+    def classify(self, fingerprint: np.ndarray) -> Optional[Dict]:
+        """
+        Classify fingerprint using discovery artifacts.
+
+        Returns schema v1 classification result or None if not available.
+        """
+        with self._lock:
+            if self._classifier is None:
+                return None
+            try:
+                return self._classifier.classify(fingerprint)
+            except Exception as e:
+                print(f"Classification error: {e}")
+                return None
+
+    def is_available(self) -> bool:
+        """Check if discovery classifier is loaded."""
+        with self._lock:
+            return self._classifier is not None
+
+    def get_status(self) -> Dict:
+        """Get discovery integration status."""
+        with self._lock:
+            if self._classifier is None:
+                return {
+                    "available": False,
+                    "discovery_dir": str(self.discovery_dir),
+                    "has_discovery_module": HAS_DISCOVERY,
+                }
+
+            stats = self._classifier.stats
+            return {
+                "available": True,
+                "discovery_dir": str(self.discovery_dir),
+                "run_id": stats.get("run_id"),
+                "cluster_count": stats.get("cluster_count"),
+                "classification_count": stats.get("classification_count"),
+                "last_reload": self._last_reload,
+            }
+
+    def reload(self) -> bool:
+        """Force reload discovery artifacts."""
+        try:
+            self._load_classifier()
+            return True
+        except Exception:
+            return False
+
+
+class OnlineMicroCluster:
+    """
+    Micro-cluster for online clustering (DenStream-style).
+
+    Maintains running statistics that can be updated incrementally:
+    - Centroid (weighted average of points)
+    - Weight (decayed sum of points)
+    - Radius (approximate cluster spread)
+    """
+
+    def __init__(self, point: np.ndarray, cluster_id: int, decay: float = 0.99):
+        self.cluster_id = cluster_id
+        self.decay = decay
+        self.centroid = point.copy()
+        self.weight = 1.0
+        self.sq_sum = np.sum(point ** 2)
+        self.n_points = 1
+        self.last_update = time.time()
+
+    def distance(self, point: np.ndarray) -> float:
+        """Euclidean distance from point to centroid."""
+        return float(np.linalg.norm(point - self.centroid))
+
+    def add_point(self, point: np.ndarray):
+        """Add point to cluster with decay on old points."""
+        # Decay existing weight
+        self.weight *= self.decay
+        self.sq_sum *= self.decay
+
+        # Add new point
+        self.centroid = (self.centroid * self.weight + point) / (self.weight + 1)
+        self.weight += 1
+        self.sq_sum += np.sum(point ** 2)
+        self.n_points += 1
+        self.last_update = time.time()
+
+    @property
+    def radius(self) -> float:
+        """Approximate cluster radius (std dev from centroid)."""
+        if self.weight < 2:
+            return 0.0
+        variance = max(0, self.sq_sum / self.weight - np.sum(self.centroid ** 2))
+        return float(np.sqrt(variance))
+
+    def is_stale(self, max_age: float = 300) -> bool:
+        """Check if cluster hasn't been updated recently."""
+        return time.time() - self.last_update > max_age
+
+
+@dataclass
+class ClusterCentroid:
+    """Cluster centroid with metadata."""
+    cluster_id: int
+    centroid: List[float]
+    size: int
+    traits: List[str]
+    sampling_hint: Dict[str, float]  # Suggested sampling params
+
+
+@dataclass
+class FingerprintEntry:
+    """Stored fingerprint with metadata."""
+    request_id: str
+    vector: np.ndarray
+    timestamp: float
+    metadata: Dict
+
+
+class RAPIDSSidecar:
+    """
+    GPU-accelerated clustering sidecar.
+
+    Maintains a buffer of fingerprints and periodically re-clusters
+    to discover attention manifolds.
+
+    Supports two modes for receiving fingerprints:
+    - ZMQ PULL: High-performance streaming from SGLang scheduler
+    - HTTP POST: For debugging and manual testing
+    """
+
+    def __init__(
+        self,
+        buffer_size: int = 10000,
+        min_cluster_size: int = 10,
+        recluster_interval: float = 60.0,
+        feature_dim: int = 20,
+        zmq_bind: Optional[str] = None,
+        online_mode: bool = False,
+        online_threshold: float = 2.0,  # Distance threshold for new cluster
+        online_max_clusters: int = 50,
+        db_path: Optional[str] = None,
+        discovery_dir: Optional[str] = None,
+        discovery_reload_interval: float = 300.0,
+    ):
+        self.buffer_size = buffer_size
+        self.min_cluster_size = min_cluster_size
+        self.recluster_interval = recluster_interval
+        self.feature_dim = feature_dim
+        self.zmq_bind = zmq_bind
+        self.online_mode = online_mode
+        self.online_threshold = online_threshold
+        self.online_max_clusters = online_max_clusters
+
+        # Fingerprint buffer (ring buffer)
+        self.fingerprints: deque = deque(maxlen=buffer_size)
+        self.lock = threading.Lock()
+
+        # Clustering state
+        self.centroids: Dict[int, ClusterCentroid] = {}
+        self.last_cluster_time = 0
+        self.cluster_labels: Optional[np.ndarray] = None
+
+        # Online clustering state
+        self._micro_clusters: Dict[int, OnlineMicroCluster] = {}
+        self._next_cluster_id = 0
+
+        # ZMQ receiver state
+        self._zmq_context = None
+        self._zmq_socket = None
+        self._zmq_thread = None
+        self._zmq_received = 0
+
+        # SQLite storage (optional)
+        self._storage: Optional[FingerprintStorage] = None
+        if db_path:
+            self._storage = FingerprintStorage(db_path)
+            print(f"SQLite storage enabled: {db_path}")
+
+        # Discovery integration (optional)
+        self._discovery: Optional[DiscoveryIntegration] = None
+        if discovery_dir:
+            self._discovery = DiscoveryIntegration(
+                discovery_dir, auto_reload_interval=discovery_reload_interval
+            )
+            print(f"Discovery integration enabled: {discovery_dir}")
+
+        # Backend selection
+        if online_mode:
+            self.backend = ClusteringBackend.ONLINE
+            print("Using ONLINE clustering mode (real-time updates)")
+        elif HAS_RAPIDS:
+            self.backend = ClusteringBackend.RAPIDS
+            print("Using RAPIDS cuML backend (GPU)")
+        elif HAS_SKLEARN:
+            self.backend = ClusteringBackend.CPU
+            print("Using CPU backend (hdbscan + sklearn)")
+        else:
+            self.backend = ClusteringBackend.NONE
+            print("WARNING: No clustering backend available!")
+
+        # Background clustering thread
+        self._stop_event = threading.Event()
+        self._cluster_thread = threading.Thread(target=self._cluster_loop, daemon=True)
+
+    def start(self):
+        """Start background threads (clustering + optional ZMQ receiver)."""
+        self._cluster_thread.start()
+
+        # Start ZMQ receiver if configured
+        if self.zmq_bind and HAS_ZMQ:
+            self._start_zmq_receiver()
+
+        # Start discovery integration if configured
+        if self._discovery:
+            self._discovery.start()
+
+    def stop(self):
+        """Stop all background threads."""
+        self._stop_event.set()
+        self._cluster_thread.join(timeout=5)
+
+        # Stop ZMQ receiver
+        if self._zmq_socket:
+            self._zmq_socket.close()
+        if self._zmq_context:
+            self._zmq_context.term()
+        if self._zmq_thread:
+            self._zmq_thread.join(timeout=2)
+
+        # Stop discovery integration
+        if self._discovery:
+            self._discovery.stop()
+
+        # Close storage
+        if self._storage:
+            self._storage.close()
+
+    def _start_zmq_receiver(self):
+        """Start ZMQ PULL socket to receive fingerprints from scheduler."""
+        try:
+            self._zmq_context = zmq.Context()
+            self._zmq_socket = self._zmq_context.socket(zmq.PULL)
+            self._zmq_socket.bind(self.zmq_bind)
+            self._zmq_socket.setsockopt(zmq.RCVHWM, 10000)  # High water mark
+            print(f"ZMQ receiver bound to {self.zmq_bind}")
+
+            self._zmq_thread = threading.Thread(target=self._zmq_loop, daemon=True)
+            self._zmq_thread.start()
+        except Exception as e:
+            print(f"Failed to start ZMQ receiver: {e}")
+            self._zmq_socket = None
+
+    def _zmq_loop(self):
+        """Background loop to receive fingerprints via ZMQ."""
+        poller = zmq.Poller()
+        poller.register(self._zmq_socket, zmq.POLLIN)
+
+        while not self._stop_event.is_set():
+            try:
+                # Poll with 100ms timeout so we can check stop_event
+                socks = dict(poller.poll(100))
+
+                if self._zmq_socket in socks:
+                    message = self._zmq_socket.recv(flags=zmq.NOBLOCK)
+                    data = json.loads(message.decode())
+
+                    self.add_fingerprint(
+                        request_id=data.get("request_id", "unknown"),
+                        vector=data["vector"],
+                        metadata=data.get("metadata"),
+                    )
+                    self._zmq_received += 1
+
+            except zmq.Again:
+                pass  # No message available
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    print(f"ZMQ receive error: {e}")
+
+    def add_fingerprint(
+        self,
+        request_id: str,
+        vector: List[float],
+        metadata: Optional[Dict] = None,
+        step: int = 0,
+    ) -> Optional[Dict]:
+        """
+        Add a fingerprint to the buffer (and update online clusters if enabled).
+
+        Returns discovery classification result if discovery is available.
+        """
+        vec = np.array(vector, dtype=np.float32)
+        entry = FingerprintEntry(
+            request_id=request_id,
+            vector=vec,
+            timestamp=time.time(),
+            metadata=metadata or {},
+        )
+
+        # Classify using discovery if available
+        classification = None
+        zone = None
+        cluster_id = None
+        confidence = None
+        if self._discovery and self._discovery.is_available():
+            classification = self._discovery.classify(vec)
+            if classification:
+                manifold = classification.get("manifold", {})
+                zone = manifold.get("zone")
+                cluster_id = manifold.get("cluster_id")
+                confidence = manifold.get("confidence")
+
+        with self.lock:
+            self.fingerprints.append(entry)
+
+            # Update online clusters in real-time
+            if self.online_mode:
+                self._update_online_clusters(vec)
+
+        # Store in SQLite if enabled (outside lock for better concurrency)
+        if self._storage:
+            self._storage.store(
+                request_id=request_id,
+                step=step,
+                fingerprint=vec,
+                zone=zone,
+                cluster_id=cluster_id,
+                confidence=confidence,
+                metadata=metadata,
+            )
+
+        return classification
+
+    def _update_online_clusters(self, point: np.ndarray):
+        """Update online micro-clusters with a new point (called with lock held)."""
+        # Find nearest micro-cluster
+        best_cluster = None
+        best_dist = float('inf')
+
+        for mc in self._micro_clusters.values():
+            dist = mc.distance(point)
+            if dist < best_dist:
+                best_dist = dist
+                best_cluster = mc
+
+        # Decide: add to existing cluster or create new one
+        if best_cluster is not None and best_dist < self.online_threshold:
+            # Add to nearest cluster
+            best_cluster.add_point(point)
+        else:
+            # Create new cluster
+            if len(self._micro_clusters) < self.online_max_clusters:
+                new_mc = OnlineMicroCluster(point, self._next_cluster_id)
+                self._micro_clusters[self._next_cluster_id] = new_mc
+                self._next_cluster_id += 1
+            else:
+                # Too many clusters - merge with nearest
+                if best_cluster is not None:
+                    best_cluster.add_point(point)
+
+        # Prune stale clusters periodically
+        if len(self._micro_clusters) > 0:
+            stale_ids = [cid for cid, mc in self._micro_clusters.items() if mc.is_stale()]
+            for cid in stale_ids:
+                del self._micro_clusters[cid]
+
+        # Update centroids from micro-clusters
+        self._sync_centroids_from_microclusters()
+
+    def _sync_centroids_from_microclusters(self):
+        """Convert micro-clusters to ClusterCentroid objects."""
+        new_centroids = {}
+        for cid, mc in self._micro_clusters.items():
+            traits = self._interpret_centroid(mc.centroid)
+            sampling_hint = self._get_sampling_hint(traits)
+            new_centroids[cid] = ClusterCentroid(
+                cluster_id=cid,
+                centroid=mc.centroid.tolist(),
+                size=mc.n_points,
+                traits=traits,
+                sampling_hint=sampling_hint,
+            )
+        self.centroids = new_centroids
+
+    def get_centroids(self) -> Dict[int, Dict]:
+        """Get current cluster centroids."""
+        return {k: asdict(v) for k, v in self.centroids.items()}
+
+    def predict_cluster(self, vector: List[float]) -> Tuple[int, float]:
+        """
+        Predict cluster for new fingerprint using nearest centroid.
+
+        Returns (cluster_id, distance). Returns (-1, inf) if no centroids.
+        """
+        if not self.centroids:
+            return -1, float('inf')
+
+        vec = np.array(vector, dtype=np.float32)
+        best_cluster = -1
+        best_dist = float('inf')
+
+        for cluster_id, centroid in self.centroids.items():
+            cent = np.array(centroid.centroid, dtype=np.float32)
+            dist = float(np.linalg.norm(vec - cent))  # Convert to Python float
+            if dist < best_dist:
+                best_dist = dist
+                best_cluster = cluster_id
+
+        return best_cluster, best_dist
+
+    def _cluster_loop(self):
+        """Background clustering loop."""
+        while not self._stop_event.is_set():
+            try:
+                time.sleep(1)  # Check every second
+
+                # Check if it's time to recluster
+                if time.time() - self.last_cluster_time < self.recluster_interval:
+                    continue
+
+                # Need minimum samples
+                with self.lock:
+                    n_samples = len(self.fingerprints)
+                    if n_samples < self.min_cluster_size * 2:
+                        continue
+
+                    # Copy data for clustering
+                    vectors = np.stack([fp.vector for fp in self.fingerprints])
+
+                self._run_clustering(vectors)
+                self.last_cluster_time = time.time()
+
+            except Exception as e:
+                print(f"Clustering error: {e}")
+
+    def _run_clustering(self, vectors: np.ndarray):
+        """Run HDBSCAN clustering on fingerprint vectors."""
+        print(f"Clustering {len(vectors)} fingerprints...")
+
+        if self.backend == ClusteringBackend.RAPIDS:
+            labels, centroids = self._cluster_rapids(vectors)
+        elif self.backend == ClusteringBackend.CPU:
+            labels, centroids = self._cluster_cpu(vectors)
+        else:
+            return
+
+        self.cluster_labels = labels
+
+        # Build centroid objects
+        new_centroids = {}
+        for cluster_id, centroid in centroids.items():
+            mask = labels == cluster_id
+            size = int(mask.sum())
+
+            # Interpret centroid to get traits
+            traits = self._interpret_centroid(centroid)
+            sampling_hint = self._get_sampling_hint(traits)
+
+            new_centroids[cluster_id] = ClusterCentroid(
+                cluster_id=cluster_id,
+                centroid=centroid.tolist(),
+                size=size,
+                traits=traits,
+                sampling_hint=sampling_hint,
+            )
+
+        self.centroids = new_centroids
+        print(f"Found {len(new_centroids)} clusters")
+
+    def _cluster_rapids(self, vectors: np.ndarray) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
+        """RAPIDS cuML clustering."""
+        import cupy as cp
+
+        # Scale features
+        vectors_gpu = cp.asarray(vectors)
+        mean = vectors_gpu.mean(axis=0)
+        std = vectors_gpu.std(axis=0) + 1e-9
+        vectors_scaled = (vectors_gpu - mean) / std
+
+        # Convert to cuDF
+        df = cudf.DataFrame(vectors_scaled)
+
+        # HDBSCAN
+        clusterer = cuHDBSCAN(
+            min_cluster_size=self.min_cluster_size,
+            min_samples=max(1, self.min_cluster_size // 2),
+            cluster_selection_method='leaf',
+            prediction_data=True,
+        )
+        labels = clusterer.fit_predict(df)
+        labels = cp.asnumpy(labels.values)
+
+        # Compute centroids
+        centroids = {}
+        for cluster_id in set(labels) - {-1}:
+            mask = labels == cluster_id
+            centroids[int(cluster_id)] = vectors[mask].mean(axis=0)
+
+        return labels, centroids
+
+    def _cluster_cpu(self, vectors: np.ndarray) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
+        """CPU fallback clustering."""
+        # Scale features
+        scaler = StandardScaler()
+        vectors_scaled = scaler.fit_transform(vectors)
+
+        # HDBSCAN
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=self.min_cluster_size,
+            min_samples=max(1, self.min_cluster_size // 2),
+            cluster_selection_method='leaf',
+        )
+        labels = clusterer.fit_predict(vectors_scaled)
+
+        # Compute centroids
+        centroids = {}
+        for cluster_id in set(labels) - {-1}:
+            mask = labels == cluster_id
+            centroids[int(cluster_id)] = vectors[mask].mean(axis=0)
+
+        return labels, centroids
+
+    def _interpret_centroid(self, centroid: np.ndarray) -> List[str]:
+        """Interpret centroid to extract trait labels."""
+        traits = []
+
+        # First 4 elements are: local_mass, mid_mass, long_mass, entropy
+        local_mass = centroid[0] if len(centroid) > 0 else 0
+        mid_mass = centroid[1] if len(centroid) > 1 else 0
+        long_mass = centroid[2] if len(centroid) > 2 else 0
+        entropy = centroid[3] if len(centroid) > 3 else 0
+
+        # Hubness (from histogram peak)
+        histogram = centroid[4:] if len(centroid) > 4 else []
+        if len(histogram) > 0:
+            hubness = 1 - entropy  # Inverse of normalized entropy
+
+        # Classify based on mass distribution
+        if local_mass > 0.6:
+            traits.append("syntax_floor")
+            traits.append("local_attention")
+        elif mid_mass > 0.4:
+            traits.append("semantic_bridge")
+            traits.append("retrieval_heavy")
+        elif long_mass > 0.3:
+            traits.append("long_range")
+            traits.append("context_aware")
+
+        # Entropy-based traits
+        if entropy < 0.5:
+            traits.append("focused")
+        elif entropy > 0.7:
+            traits.append("diffuse")
+
+        # Check for periodicity (comb pattern in histogram)
+        if len(histogram) > 4:
+            even_sum = sum(histogram[::2])
+            odd_sum = sum(histogram[1::2])
+            if abs(even_sum - odd_sum) > 0.2:
+                traits.append("periodic")
+
+        return traits if traits else ["neutral"]
+
+    def _get_sampling_hint(self, traits: List[str]) -> Dict[str, float]:
+        """Get sampling parameter hints based on traits."""
+        hints = {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "repetition_penalty": 1.0,
+        }
+
+        if "syntax_floor" in traits or "local_attention" in traits:
+            # Structured output (code, JSON)
+            hints["temperature"] = 0.2
+            hints["top_p"] = 0.95
+
+        if "semantic_bridge" in traits:
+            # Reasoning/retrieval
+            hints["temperature"] = 0.5
+            hints["repetition_penalty"] = 1.1
+
+        if "diffuse" in traits:
+            # Creative/chat
+            hints["temperature"] = 0.8
+            hints["top_p"] = 0.85
+
+        if "focused" in traits:
+            hints["temperature"] = min(hints["temperature"], 0.3)
+
+        return hints
+
+    def classify_fingerprint(self, vector: List[float]) -> Dict:
+        """
+        Classify a fingerprint using discovery artifacts.
+
+        This is a read-only operation that doesn't add to buffer or storage.
+        Falls back to online centroid classification if discovery unavailable.
+        """
+        vec = np.array(vector, dtype=np.float32)
+
+        # Try discovery classification first
+        if self._discovery and self._discovery.is_available():
+            result = self._discovery.classify(vec)
+            if result:
+                return result
+
+        # Fall back to centroid classification
+        cluster_id, distance = self.predict_cluster(vector)
+        centroid = self.centroids.get(cluster_id)
+
+        return {
+            "manifold": {
+                "zone": centroid.traits[0] if centroid and centroid.traits else "unknown",
+                "confidence": max(0, 1 - distance / 5.0),  # Heuristic confidence
+                "cluster_id": cluster_id,
+                "cluster_label": None,
+            },
+            "schema_version": 1,
+            "source": "centroid_fallback",
+        }
+
+    def get_discovery_status(self) -> Dict:
+        """Get discovery integration status."""
+        if self._discovery:
+            return self._discovery.get_status()
+        return {"available": False, "reason": "not_configured"}
+
+    def reload_discovery(self) -> bool:
+        """Force reload discovery artifacts."""
+        if self._discovery:
+            return self._discovery.reload()
+        return False
+
+    def get_stats(self) -> Dict:
+        """Get sidecar statistics."""
+        stats = {
+            "backend": self.backend.value,
+            "buffer_size": len(self.fingerprints),
+            "buffer_capacity": self.buffer_size,
+            "n_clusters": len(self.centroids),
+            "last_cluster_time": self.last_cluster_time,
+            "zmq_enabled": self.zmq_bind is not None,
+            "zmq_received": self._zmq_received,
+        }
+
+        # Add storage stats
+        if self._storage:
+            stats["storage"] = self._storage.get_stats()
+        else:
+            stats["storage"] = {"enabled": False}
+
+        # Add discovery stats
+        if self._discovery:
+            stats["discovery"] = self._discovery.get_status()
+        else:
+            stats["discovery"] = {"available": False}
+
+        return stats
+
+
+class SidecarHandler(BaseHTTPRequestHandler):
+    """HTTP handler for sidecar API."""
+
+    sidecar: RAPIDSSidecar = None
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+
+        if parsed.path == "/centroids":
+            data = self.sidecar.get_centroids()
+            self._send_json(data)
+
+        elif parsed.path == "/stats":
+            data = self.sidecar.get_stats()
+            self._send_json(data)
+
+        elif parsed.path == "/health":
+            self._send_json({"status": "ok"})
+
+        elif parsed.path == "/discovery/status":
+            # Get discovery integration status
+            data = self.sidecar.get_discovery_status()
+            self._send_json(data)
+
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+
+        if parsed.path == "/fingerprint":
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+            data = json.loads(body)
+
+            classification = self.sidecar.add_fingerprint(
+                request_id=data.get("request_id", "unknown"),
+                vector=data["vector"],
+                metadata=data.get("metadata"),
+                step=data.get("step", 0),
+            )
+            response = {"status": "accepted"}
+            if classification:
+                response["classification"] = classification
+            self._send_json(response)
+
+        elif parsed.path == "/classify":
+            # Classify fingerprint using discovery artifacts (read-only)
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+            data = json.loads(body)
+
+            result = self.sidecar.classify_fingerprint(data["vector"])
+            self._send_json(result)
+
+        elif parsed.path == "/predict":
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+            data = json.loads(body)
+
+            cluster_id, distance = self.sidecar.predict_cluster(data["vector"])
+            centroid = self.sidecar.centroids.get(cluster_id)
+
+            response = {
+                "cluster_id": cluster_id,
+                "distance": distance,
+                "traits": centroid.traits if centroid else [],
+                "sampling_hint": centroid.sampling_hint if centroid else {},
+            }
+            self._send_json(response)
+
+        elif parsed.path == "/recluster":
+            # Force recluster
+            self.sidecar.last_cluster_time = 0
+            self._send_json({"status": "triggered"})
+
+        elif parsed.path == "/discovery/reload":
+            # Force reload discovery artifacts
+            success = self.sidecar.reload_discovery()
+            self._send_json({
+                "status": "reloaded" if success else "failed",
+                "discovery": self.sidecar.get_discovery_status(),
+            })
+
+        elif parsed.path == "/storage/flush":
+            # Flush storage buffer to SQLite
+            if self.sidecar._storage:
+                self.sidecar._storage.flush()
+                self._send_json({
+                    "status": "flushed",
+                    "storage": self.sidecar._storage.get_stats(),
+                })
+            else:
+                self._send_json({"status": "storage_disabled"})
+
+        else:
+            self.send_error(404)
+
+    def _send_json(self, data):
+        response = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(response))
+        self.end_headers()
+        self.wfile.write(response)
+
+    def log_message(self, format, *args):
+        pass  # Suppress logging
+
+
+def main():
+    parser = argparse.ArgumentParser(description="RAPIDS clustering sidecar")
+    parser.add_argument("--port", type=int, default=9000,
+                        help="HTTP port for querying centroids (default: 9000)")
+    parser.add_argument("--zmq-bind", type=str, default=None,
+                        help="ZMQ bind address for fingerprint streaming. "
+                             "Example: 'tcp://*:9001'. Must match SGLang's --attention-sidecar-url "
+                             "(but use '*' instead of 'localhost' for binding)")
+    parser.add_argument("--buffer-size", type=int, default=10000,
+                        help="Fingerprint buffer size (default: 10000)")
+    parser.add_argument("--min-cluster-size", type=int, default=10,
+                        help="Minimum cluster size for HDBSCAN (default: 10)")
+    parser.add_argument("--recluster-interval", type=float, default=60.0,
+                        help="Seconds between reclustering (default: 60)")
+    parser.add_argument("--online", action="store_true",
+                        help="Enable online clustering mode (real-time updates, no batching)")
+    parser.add_argument("--online-threshold", type=float, default=2.0,
+                        help="Distance threshold for creating new cluster in online mode (default: 2.0)")
+    parser.add_argument("--online-max-clusters", type=int, default=50,
+                        help="Maximum number of clusters in online mode (default: 50)")
+
+    # Storage and discovery options
+    parser.add_argument("--db", type=str, default=None,
+                        help="SQLite database path for fingerprint storage. "
+                             "Initialize with: sqlite3 <db> < discovery/schema.sql")
+    parser.add_argument("--discovery-dir", type=str, default=None,
+                        help="Directory containing discovery job artifacts. "
+                             "Should contain a 'latest' symlink to current run.")
+    parser.add_argument("--discovery-reload-interval", type=float, default=300.0,
+                        help="Seconds between discovery artifact reload checks (default: 300)")
+
+    args = parser.parse_args()
+
+    # Check ZMQ availability
+    if args.zmq_bind and not HAS_ZMQ:
+        print("ERROR: pyzmq not installed. Install with: pip install pyzmq")
+        print("Falling back to HTTP-only mode.")
+        args.zmq_bind = None
+
+    # Create sidecar
+    sidecar = RAPIDSSidecar(
+        buffer_size=args.buffer_size,
+        min_cluster_size=args.min_cluster_size,
+        recluster_interval=args.recluster_interval,
+        zmq_bind=args.zmq_bind,
+        online_mode=args.online,
+        online_threshold=args.online_threshold,
+        online_max_clusters=args.online_max_clusters,
+        db_path=args.db,
+        discovery_dir=args.discovery_dir,
+        discovery_reload_interval=args.discovery_reload_interval,
+    )
+    sidecar.start()
+
+    # Set up handler
+    SidecarHandler.sidecar = sidecar
+
+    # Start server
+    server = HTTPServer(('0.0.0.0', args.port), SidecarHandler)
+    print(f"\n{'='*60}")
+    print(f"RAPIDS Clustering Sidecar")
+    print(f"{'='*60}")
+    print(f"HTTP API:         http://0.0.0.0:{args.port}")
+    if args.zmq_bind:
+        print(f"ZMQ Receiver:     {args.zmq_bind}")
+    else:
+        print(f"ZMQ Receiver:     disabled (use --zmq-bind to enable)")
+    print(f"Backend:          {sidecar.backend.value}")
+    if args.online:
+        print(f"Online mode:      threshold={args.online_threshold}, max_clusters={args.online_max_clusters}")
+    else:
+        print(f"Buffer size:      {args.buffer_size}")
+        print(f"Recluster:        every {args.recluster_interval}s")
+    if args.db:
+        print(f"SQLite storage:   {args.db}")
+    if args.discovery_dir:
+        print(f"Discovery dir:    {args.discovery_dir}")
+        print(f"Discovery reload: every {args.discovery_reload_interval}s")
+    print(f"{'='*60}")
+    print(f"\nEndpoints:")
+    print(f"  GET  /centroids       - Current cluster centroids")
+    print(f"  GET  /stats           - Sidecar statistics")
+    print(f"  GET  /health          - Health check")
+    print(f"  GET  /discovery/status - Discovery integration status")
+    print(f"  POST /fingerprint     - Submit fingerprint (stores + classifies)")
+    print(f"  POST /classify        - Classify fingerprint (read-only)")
+    print(f"  POST /predict         - Predict cluster for fingerprint")
+    print(f"  POST /recluster       - Force recluster")
+    print(f"  POST /discovery/reload - Reload discovery artifacts")
+    print(f"  POST /storage/flush    - Flush storage buffer to SQLite")
+    print(f"\nPress Ctrl+C to stop\n")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        sidecar.stop()
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()

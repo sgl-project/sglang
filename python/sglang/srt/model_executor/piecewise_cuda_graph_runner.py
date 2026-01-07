@@ -375,6 +375,9 @@ class PiecewiseCudaGraphRunner:
             ):
                 if start_len is not None and start_len < seq_len:
                     return False
+        # Attention capture requires dynamic computation that cannot be replayed
+        if getattr(forward_batch, "capture_attention_tokens", False):
+            return False
         if num_tokens <= self.max_num_tokens:
             return True
         return False
@@ -663,6 +666,9 @@ class PiecewiseCudaGraphRunner:
             temperature=forward_batch.temperature,
             top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
             top_p=forward_batch.top_p,
+            capture_attention_tokens=forward_batch.capture_attention_tokens,
+            attention_top_k=forward_batch.attention_top_k,
+            attention_capture_layer_ids=forward_batch.attention_capture_layer_ids,
         )
 
         return static_forward_batch

@@ -432,12 +432,19 @@ class CudaGraphRunner:
             else True
         )
 
+        # Attention capture requires dynamic computation that cannot be replayed
+        # from CUDA graphs, so skip graphs when capture is enabled
+        is_attention_capture_disabled = not getattr(
+            forward_batch, "capture_attention_tokens", False
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_attention_capture_disabled
         )
 
     def _init_profile_context_and_memory_record(self):
@@ -639,6 +646,13 @@ class CudaGraphRunner:
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
+        # Attention token capture must be disabled during CUDA graph capture
+        # because the capture code uses tensor.item() which is not supported during stream capture.
+        # Actual attention capture happens at runtime, not during graph capture.
+        capture_attention_tokens = False
+        attention_top_k = 5  # dummy value
+        attention_capture_layer_ids = None
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -670,6 +684,9 @@ class CudaGraphRunner:
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            capture_attention_tokens=capture_attention_tokens,
+            attention_top_k=attention_top_k,
+            attention_capture_layer_ids=attention_capture_layer_ids,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 

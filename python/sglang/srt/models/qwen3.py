@@ -32,7 +32,11 @@ from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
-Qwen3Config = None
+# Qwen3 shares architecture with Qwen2, so we use the same config class
+try:
+    from transformers import Qwen2Config as Qwen3Config
+except ImportError:
+    Qwen3Config = None
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()

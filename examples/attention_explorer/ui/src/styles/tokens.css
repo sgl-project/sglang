@@ -1,0 +1,51 @@
+:root {
+  /* Colors */
+  --bg: #0b0d12;
+  --panel: #121624;
+  --panel2: #0f1320;
+  --text: #e8eaf2;
+  --muted: #aab0c0;
+  --accent: #7aa2ff;
+  --good: #55d6a6;
+  --warn: #ffcc66;
+  --bad: #ff6b6b;
+  --border: rgba(255, 255, 255, 0.08);
+
+  /* Effects */
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  --radius: 14px;
+  --radius-sm: 10px;
+
+  /* Typography */
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+
+  /* Spacing */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+}
+
+/* Reset */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  font-family: var(--sans);
+  background: radial-gradient(1200px 800px at 20% 10%, rgba(122, 162, 255, 0.12), transparent 50%),
+              radial-gradient(1000px 700px at 80% 20%, rgba(85, 214, 166, 0.10), transparent 55%),
+              var(--bg);
+  color: var(--text);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
