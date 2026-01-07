@@ -335,20 +335,28 @@ class Indexer(MultiPlatformOp):
         # deep_gemm.fp8_paged_mqa_logits only supports next_n in {1, 2}
         total_tokens = q_fp8.shape[0]
         use_next_n_2 = False
-        batch_size = block_tables.shape[0]
+        batch_size = 0
         tokens_per_req = 1
 
-        if (
-            NSA_ENABLE_NEXT_N_2
-            and is_speculative
-            and total_tokens >= 2
-            and batch_size > 0
-        ):
-            if total_tokens % batch_size == 0:
-                tokens_per_req = total_tokens // batch_size
-                # Use next_n=2 if each request has >= 2 tokens and even number of tokens
-                if tokens_per_req >= 2 and tokens_per_req % 2 == 0:
-                    use_next_n_2 = True
+        if NSA_ENABLE_NEXT_N_2 and is_speculative and total_tokens >= 2:
+            extend_lens = forward_batch.extend_seq_lens_cpu
+            if isinstance(extend_lens, torch.Tensor):
+                extend_lens = extend_lens.tolist()
+
+            if extend_lens:
+                if len(set(extend_lens)) == 1:
+                    tokens_per_req = int(extend_lens[0])
+                    batch_size = len(extend_lens)
+                    # Use next_n=2 if each request has >= 2 tokens and even number of tokens
+                    if (
+                        batch_size > 0
+                        and tokens_per_req >= 2
+                        and tokens_per_req % 2 == 0
+                        and total_tokens == batch_size * tokens_per_req
+                    ):
+                        block_rows = block_tables.shape[0]
+                        if block_rows in (batch_size, total_tokens):
+                            use_next_n_2 = True
 
         if use_next_n_2:
             return self._get_topk_paged_next_n_2(
@@ -456,8 +464,19 @@ class Indexer(MultiPlatformOp):
         seqlens_for_pairs = seqlens_reshaped[:, 1::2].reshape(-1).contiguous()
 
         # Repeat block_tables for each pair within a request
-        # block_tables: [batch_size, max_blocks] -> [new_batch_size, max_blocks]
-        block_tables_expanded = block_tables.repeat_interleave(num_pairs_per_req, dim=0)
+        # block_tables can be either:
+        # - per-token (speculative path): [total_tokens, max_blocks]
+        # - per-request: [batch_size, max_blocks]
+        # Expand to [new_batch_size, max_blocks] with minimal copies.
+        if block_tables.shape[0] == total_tokens:
+            block_tables_reshaped = block_tables.view(batch_size, tokens_per_req, -1)
+            block_tables_expanded = block_tables_reshaped[:, ::2, :].reshape(
+                new_batch_size, -1
+            )
+        else:
+            block_tables_expanded = block_tables.repeat_interleave(
+                num_pairs_per_req, dim=0
+            )
 
         # Get schedule metadata for the new batch configuration
         schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
