@@ -496,8 +496,8 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 std::tuple<at::Tensor, at::Tensor>
 apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
   RECORD_FUNCTION("sgl-kernel::apply_rotary_pos_emb_cpu", std::vector<c10::IValue>({query, key}));
-  CHECK_INPUT(query);
-  CHECK_INPUT(key);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
   CHECK_INPUT(cos);
   CHECK_INPUT(sin);
   CHECK_DIM(3, query);
