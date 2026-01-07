@@ -283,6 +283,20 @@ class CudaIpcTensorTransportProxy:
 
         return state
 
+    def _bump_sync_flag(self) -> None:
+        """
+        bump sync_flag
+        """
+        open(SHM_LOCK_FILE, "a").close()
+        # write the shm_sync_buffer with a file lock
+        with open(SHM_LOCK_FILE, "w+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            sync_flag = self.get_sync_flag
+            sync_flag += 1
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+        self.close_shm()
+
     def reconstruct_on_target_device(self, rebuild_device_idx):
         rebuild_device = torch.device(f"cuda:{rebuild_device_idx}")
         if (
@@ -314,27 +328,30 @@ class CudaIpcTensorTransportProxy:
             )
 
             try:
-                target_device = torch.device(f"cuda:{source_device_index}")
-                with torch.cuda.device(target_device):
+                source_device = torch.device(f"cuda:{source_device_index}")
+                with torch.cuda.device(source_device):
                     storage = torch.UntypedStorage._new_shared_cuda(*handle)
                     slice_tensor = torch.empty(
-                        0, dtype=dtype, device=target_device
+                        0, dtype=dtype, device=source_device
                     ).set_(storage, storage_offset=s_offset, size=shape, stride=stride)
 
+                if rebuild_device_idx == source_device_index:
+                    reconstructed_tensor = slice_tensor.view(recons_dtype).view(
+                        recons_shape
+                    )
+
+                    self._bump_sync_flag()
+                    self.reconstruct_tensor = reconstructed_tensor
+                    return reconstructed_tensor
+
+                with torch.cuda.device(rebuild_device):
                     reconstructed_tensor = torch.empty(
                         recons_shape, dtype=recons_dtype, device=rebuild_device
                     ).contiguous()
-                    reconstructed_tensor.view(torch.int8).view(-1).copy_(slice_tensor)
 
-                    open(SHM_LOCK_FILE, "a").close()
-                    # write the shm_sync_buffer with a file lock
-                    with open(SHM_LOCK_FILE, "w+") as f:
-                        fcntl.flock(f, fcntl.LOCK_EX)
-                        sync_flag = self.get_sync_flag
-                        sync_flag += 1
-                        fcntl.flock(f, fcntl.LOCK_UN)
+                reconstructed_tensor.view(torch.int8).view(-1).copy_(slice_tensor)
 
-                    self.close_shm()
+                self._bump_sync_flag()
 
             except Exception as e:
                 logger.info(f"Error: Failed to deserialize from CUDA IPC handle ({e}).")
