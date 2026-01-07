@@ -49,11 +49,12 @@ class HiCacheEvalMixin:
         # Verify accuracy consistency
         accuracy_diff = abs(metrics["score"] - metrics_cached["score"])
         print(f"Accuracy difference after cache flush: {accuracy_diff:.4f}")
-        self.assertLess(
-            accuracy_diff,
-            0.05,
-            "Accuracy should be consistent between cache states",
-        )
+        if accuracy_diff > 0:
+            self.assertLess(
+                accuracy_diff,
+                0.05,
+                "Accuracy should be consistent between cache states",
+            )
 
 
 class HiCacheMGSMEvalMixin:
