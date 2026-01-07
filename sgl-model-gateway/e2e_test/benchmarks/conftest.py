@@ -179,6 +179,16 @@ def genai_bench_runner():
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout, stderr = proc.communicate()
+            logger.error("genai-bench timed out after %ds", timeout)
+
+        # Log output if process failed or for debugging
+        if proc.returncode != 0:
+            logger.error(
+                "genai-bench exited with code %d\nstdout:\n%s\nstderr:\n%s",
+                proc.returncode,
+                stdout or "(empty)",
+                stderr or "(empty)",
+            )
 
         try:
             # Parse and validate results
@@ -193,6 +203,16 @@ def genai_bench_runner():
                 gpu_monitor.stop()
                 gpu_monitor.log_summary()
                 gpu_monitor.assert_thresholds(thresholds)
+
+        except AssertionError:
+            # Log genai-bench output when results not found
+            logger.error(
+                "genai-bench output (returncode=%d):\nstdout:\n%s\nstderr:\n%s",
+                proc.returncode,
+                stdout or "(empty)",
+                stderr or "(empty)",
+            )
+            raise
 
         finally:
             _cleanup_procs(kill_procs, drain_delay_sec)
