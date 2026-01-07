@@ -1539,7 +1539,7 @@ class WanDecoder3d(nn.Module):
 
                 # Create and add the upsampling block
                 if is_residual:
-                    up_block = WanDistResidualUpBlock(
+                    up_block = WanResidualUpBlock(
                         in_dim=in_dim,
                         out_dim=out_dim,
                         num_res_blocks=num_res_blocks,
