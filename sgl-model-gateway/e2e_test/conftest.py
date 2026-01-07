@@ -143,8 +143,15 @@ if not _wheel_installed and str(_SRC) not in sys.path:
 
 
 def _setup_logging() -> None:
-    """Configure clean logging to stdout with timestamps."""
-    fmt = "%(asctime)s.%(msecs)03d [%(name)s] %(message)s"
+    """Configure clean logging to stdout with timestamps and thread info.
+
+    In parallel mode (--tests-per-worker > 1), logs from different threads
+    would be interleaved. Including thread name helps identify which test
+    produced each log line.
+    """
+    # Include thread name for parallel execution readability
+    # MainThread for sequential, Thread-N for parallel workers
+    fmt = "%(asctime)s.%(msecs)03d [%(threadName)s] [%(name)s] %(message)s"
     datefmt = "%H:%M:%S"
 
     handler = logging.StreamHandler(sys.stdout)
@@ -172,11 +179,14 @@ logger = logging.getLogger(__name__)
 
 def pytest_runtest_logstart(nodeid: str, location: tuple) -> None:
     """Print clear test header at start of each test."""
+    import threading
+
     from infra import LOG_SEPARATOR_WIDTH
 
     test_name = nodeid.split("::")[-1] if "::" in nodeid else nodeid
+    thread_name = threading.current_thread().name
     print(f"\n{'=' * LOG_SEPARATOR_WIDTH}")
-    print(f"TEST: {test_name}")
+    print(f"[{thread_name}] TEST: {test_name}")
     print(f"{'=' * LOG_SEPARATOR_WIDTH}")
 
 
