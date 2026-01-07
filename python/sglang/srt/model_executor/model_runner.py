@@ -38,6 +38,7 @@ from sglang.srt.configs import (
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3NextConfig,
+    Lfm2Config,
 )
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -1478,7 +1479,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def mamba2_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, FalconH1Config | NemotronHConfig):
+        if isinstance(config, FalconH1Config | NemotronHConfig | Lfm2Config):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
             return config.llm_config
