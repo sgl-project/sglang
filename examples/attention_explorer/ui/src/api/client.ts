@@ -117,6 +117,7 @@ export class AttentionStreamClient {
 
         for (const event of events) {
           if (event === '[DONE]') {
+            localStorage.setItem('__done_received__', 'true');
             this.config.onFinish?.(buffer.toResponse());
             return;
           }
@@ -124,7 +125,7 @@ export class AttentionStreamClient {
           try {
             const chunk: ChatCompletionChunkWithAttention = JSON.parse(event);
             const delta = chunk.choices[0]?.delta;
-            const choice = chunk.choices[0] as any; // For nested attention_tokens
+            const choice = chunk.choices[0] as any;
 
             if (delta?.content) {
               const tokens = tokenizeIncremental(delta.content, buffer.pendingText);
@@ -171,7 +172,7 @@ export class AttentionStreamClient {
           } catch (e) {
             // Only warn if it looks like a real parse error (not empty/partial data)
             if (event.length > 10) {
-              console.warn('Failed to parse SSE event:', event.slice(0, 100) + '...', e);
+              console.warn('[Client] Failed to parse SSE event (len=' + event.length + '):', event.slice(0, 200) + '...', e);
             }
           }
         }

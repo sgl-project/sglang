@@ -11,7 +11,7 @@ export interface UseAttentionStreamOptions {
 }
 
 export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
-  const { baseUrl = 'http://localhost:30000', model = 'Qwen/Qwen3-Next-80B-A3B-Thinking-FP8' } = options;
+  const { baseUrl = 'http://localhost:8000', model = 'Qwen/Qwen3-Next-80B-A3B-Thinking-FP8' } = options;
 
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<Error | null>(null);
@@ -79,7 +79,6 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
         appendToken(token);
       },
       onAttention: (entry) => {
-        // Store attention in the session (will be matched to tokens by step)
         appendAttention(entry);
 
         if (isFingerprintMode(entry)) {
