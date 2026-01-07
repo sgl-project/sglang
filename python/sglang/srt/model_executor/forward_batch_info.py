@@ -83,8 +83,13 @@ class ForwardMode(IntEnum):
     TARGET_VERIFY = auto()
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
+    SIMPLE_DRAFT_EXTEND = auto()
+    SIMPLE_TARGET_VERIFY = auto()
 
     DRAFT_EXTEND_V2 = auto()
+
+    SIMPLE_DRAFT_EXTEND = auto()
+    SIMPLE_TARGET_VERIFY = auto()
 
     # Used in disaggregated decode worker
     # Represent a batch of requests having their KV cache ready to start decoding
@@ -99,7 +104,7 @@ class ForwardMode(IntEnum):
     def is_prefill(self):
         return self.is_extend()
 
-    def is_extend(self, include_draft_extend_v2: bool = False):
+    def is_extend(self,include_draft_extend_v2: bool = False):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
@@ -107,6 +112,7 @@ class ForwardMode(IntEnum):
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
+            or self == ForwardMode.SIMPLE_DRAFT_EXTEND
             or self == ForwardMode.DLLM_EXTEND
         )
 
@@ -133,13 +139,19 @@ class ForwardMode(IntEnum):
     def is_decode_or_idle(self):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
+    def is_simple_draft(self):
+        return self == ForwardMode.SIMPLE_DRAFT_EXTEND
+
+    def is_simple_verify(self):
+        return self == ForwardMode.SIMPLE_TARGET_VERIFY
+
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
 
     def is_draft_extend(self, include_v2: bool = False):
         return self == ForwardMode.DRAFT_EXTEND or (
             include_v2 and self == ForwardMode.DRAFT_EXTEND_V2
-        )
+        ) or self == ForwardMode.SIMPLE_DRAFT_EXTEND
 
     def is_draft_extend_v2(self):
         # For fixed shape logits output in eagle v2 worker
@@ -151,6 +163,7 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.SPLIT_PREFILL
+            or self == ForwardMode.SIMPLE_DRAFT_EXTEND
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
         )
 
@@ -178,6 +191,11 @@ class ForwardMode(IntEnum):
     def is_prebuilt(self):
         return self == ForwardMode.PREBUILT
 
+    def is_simple_draft(self):
+        return self == ForwardMode.SIMPLE_DRAFT_EXTEND
+
+    def is_simple_verify(self):
+        return self == ForwardMode.SIMPLE_TARGET_VERIFY
     def is_dllm_extend(self):
         return self == ForwardMode.DLLM_EXTEND
 
@@ -376,6 +394,7 @@ class ForwardBatch:
     spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
+    simple_eagle_skip_attn_backend_init: bool = False
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
