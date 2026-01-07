@@ -114,19 +114,33 @@ class TestBenchServingCustomHeaders(CustomTestCase):
         received_headers = {}
 
         class HeaderEchoHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                if self.path == "/v1/models":
+                    self.wfile.write(
+                        json.dumps({"data": [{"id": "test-model"}]}).encode()
+                    )
+                elif self.path == "/get_server_info":
+                    self.wfile.write(json.dumps({}).encode())
+                else:
+                    self.wfile.write(b"{}")
+
             def do_POST(self):
                 received_headers.update(self.headers)
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"headers": dict(self.headers)}).encode())
+                self.wfile.write(json.dumps({"error": "mock"}).encode())
 
             def log_message(self, format, *args):
                 pass
 
         server = HTTPServer(("127.0.0.1", 0), HeaderEchoHandler)
         port = server.server_address[1]
-        server_thread = threading.Thread(target=server.handle_request)
+        server_thread = threading.Thread(target=server.serve_forever)
+        server_thread.daemon = True
         server_thread.start()
 
         try:
@@ -145,8 +159,7 @@ class TestBenchServingCustomHeaders(CustomTestCase):
         except Exception:
             pass
         finally:
-            server_thread.join(timeout=5)
-            server.server_close()
+            server.shutdown()
 
         self.assertEqual(received_headers.get("X-Custom-Test"), "TestValue123")
         self.assertEqual(received_headers.get("X-Another"), "AnotherVal")
