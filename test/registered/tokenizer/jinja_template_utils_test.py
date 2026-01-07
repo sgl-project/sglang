@@ -8,11 +8,10 @@ from sglang.srt.parser.jinja_template_utils import (
     detect_jinja_template_content_format,
     process_content_for_template_format,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=7, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=1, suite="stage-b-test-small-1-gpu")
+register_cpu_ci(est_time=7, suite="stage-a-cpu-only")
 
 
 class TestTemplateContentFormatDetection(CustomTestCase):
