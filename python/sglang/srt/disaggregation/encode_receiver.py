@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class EmbeddingData:
-    def __init__(self, req_id, num_parts, part_idx, image_grid_dim, embedding=None):
+    def __init__(self, req_id, num_parts, part_idx, image_grid_dim, embedding=None,error_msg=None):
         self.req_id = req_id
         self.num_parts = num_parts
         self.part_idx = part_idx
@@ -42,6 +42,7 @@ class EmbeddingData:
             self.image_grid_dim if i == self.part_idx else None
             for i in range(self.num_parts)
         ]
+        self.error_msg = error_msg
 
     def add(self, embedding_data):
         assert self.req_id == embedding_data.req_id
@@ -66,7 +67,7 @@ class EmbeddingData:
         return sum(self.ready_list) == self.num_parts
 
     def __repr__(self):
-        return f"EmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx})"
+        return f"EmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx}) error_msg={self.error_msg}"
 
     def copy_without_embedding(self):
         new_data = EmbeddingData(
@@ -74,6 +75,7 @@ class EmbeddingData:
             num_parts=self.num_parts,
             part_idx=self.part_idx,
             image_grid_dim=self.image_grid_dim,
+            error_msg=self.error_msg,
         )
         new_data.send_time = self.send_time
         new_data.dtype = self.dtype
@@ -107,7 +109,9 @@ class WaitingImageRequest:
         )
         logger.info(f"Waiting for input {self.embedding_port = }")
         self.recv_embedding_data = None
-        self.ready = False
+        # ok = 1 pending=0 fial =-1
+        self.status = 0
+        self.error_msg = None
 
     def send_encode_request(self):
         async def _send_single_request(session, url, payload):
@@ -163,7 +167,7 @@ class WaitingImageRequest:
         )
 
     def _try_recv_mm_data(self):
-        if self.ready:
+        if self.status != 0:
             return
         while self.recv_embedding_data is None or not self.recv_embedding_data.ready:
             try:
@@ -171,8 +175,16 @@ class WaitingImageRequest:
             except zmq.Again:
                 # No data available yet, wait a bit and retry
                 return
-
             recv_obj: EmbeddingData = pickle.loads(parts[0])
+            if getattr(recv_obj, "error_msg", None) is not None:
+                logger.info(
+                    f"❌ Received error signal from encoder for {self.rid}: {recv_obj.error_msg}"
+                )
+                self.error_msg = recv_obj.error_msg
+                self.status = -1 
+                self.recv_socket.close()
+                return
+
             buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
             recv_obj.embedding = torch.frombuffer(buffer, dtype=recv_obj.dtype).reshape(
                 recv_obj.shape
@@ -191,7 +203,7 @@ class WaitingImageRequest:
         )
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = mm_inputs["input_ids"]
-        self.ready = True
+        self.status = 1
         self.recv_socket.close()
 
 
@@ -290,12 +302,12 @@ class MMReceiver:
                 new_recv_reqs.append(recv_req)
 
         if len(self.waiting_list) == 0:
-            return new_recv_reqs
+            return new_recv_reqs, []
 
         local_status = []
         for waiting_req in self.waiting_list:
             waiting_req._try_recv_mm_data()
-            local_status.append(waiting_req.ready)
+            local_status.append(waiting_req.status)
 
         local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
 
@@ -306,14 +318,19 @@ class MMReceiver:
         )
 
         new_waiting = []
+        abort_reqs = []
         for i, waiting_req in enumerate(self.waiting_list):
-            if local_status[i].item():
+            if local_status[i].item() > 0 :
                 new_recv_reqs.append(waiting_req.recv_req)
             else:
-                new_waiting.append(waiting_req)
+                if local_status[i].item() < 0:
+                    logger.info(f"💕 Add one abort...")
+                    abort_reqs.append((waiting_req.recv_req, waiting_req.error_msg))
+                else:
+                    new_waiting.append(waiting_req)
 
         self.waiting_list = new_waiting
-        return new_recv_reqs
+        return new_recv_reqs, abort_reqs
 
     # For zmq_to_scheduler
     def _run_encode_in_thread(
@@ -389,6 +406,16 @@ class MMReceiver:
             ]
 
             responses = await asyncio.gather(*tasks)
+            for response in responses:
+                if response.status != 200:
+                    try:
+                        err_data = await response.json()
+                        msg = err_data.get("message", "Unknown encoder error")
+                    except:
+                        msg = await response.text()
+
+                    logger.error(f"❎ Encoder returned error {response.status}: {msg}")
+                    return
             response_json_list_unsort = [
                 await response.json() for response in responses
             ]

@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
+rid_to_err_msg : Dict[str, str] = dict()
 
 use_image_processor_gpu = (
     int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
@@ -196,6 +197,7 @@ class MMEncoder:
                 )
 
             self.embedding_to_send = dict()
+            self.background_tasks: Set[asyncio.Task] = set()
 
         logger.info(f"rank {rank} init finish ")
 
@@ -365,7 +367,7 @@ class MMEncoder:
             if url is not None
             else f"tcp://{prefill_host}:{embedding_port}"
         )
-        logger.info(f"{endpoint = }")
+        # logger.info(f"{endpoint = }")
         socket = get_zmq_socket(
             self.context,
             zmq.PUSH,
@@ -377,26 +379,43 @@ class MMEncoder:
             socket.send_multipart([pickle.dumps(mm_data)])
         else:
             new_mm_data = mm_data.copy_without_embedding()
+            if new_mm_data.error_msg is not None:
+                logger.info(f"🥵 sending to {endpoint = } {new_mm_data = }")
+                socket.send_multipart([pickle.dumps(new_mm_data)])
+                return
+
             embedding_tensor = TensorWrapper(mm_data.embedding)
             socket.send_multipart(
                 [pickle.dumps(new_mm_data), embedding_tensor.__buffer__()]
             )
 
     async def encode(self, mm_items, req_id, num_parts, part_idx):
-        start_time = time.time()
-        image_grid_dim, mm_embedding = await self._encode(mm_items)
-        end_time = time.time()
-        logger.info(f"🕛 encode cost = {(end_time - start_time) * 1000:.2f}ms")
-        if self.rank == 0:
-            mm_data = EmbeddingData(
-                req_id,
-                num_parts,
-                part_idx,
-                image_grid_dim,
-                mm_embedding,
+        try:
+            start_time = time.time()
+            image_grid_dim, mm_embedding = await self._encode(mm_items)
+            end_time = time.time()
+            logger.info(f"🕛 encode cost = {(end_time - start_time) * 1000:.2f}ms")
+
+            if self.rank == 0:
+                mm_data = EmbeddingData(
+                    req_id, num_parts, part_idx, image_grid_dim, mm_embedding
+                )
+                self.embedding_to_send[req_id] = mm_data
+            return (
+                mm_embedding.nbytes,
+                mm_embedding.shape[0],
+                mm_embedding.shape[1],
+                None,
             )
-            self.embedding_to_send[mm_data.req_id] = mm_data
-        return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"❌ Rank {self.rank} encode failed: {error_msg}")
+            if self.rank == 0:
+                mm_data = EmbeddingData(req_id, num_parts, part_idx, None, None)
+                mm_data.error_msg = error_msg
+                self.embedding_to_send[req_id] = mm_data
+                logger.info(f"{mm_data = }")
+            return 0, 0, 0, error_msg
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
@@ -624,55 +643,90 @@ def launch_server(server_args: ServerArgs):
 
 @app.post("/encode")
 async def handle_encode_request(request: dict):
-    # broadcast request
-    request.update({"enter_time": time.time()})
-    for socket in send_sockets:
-        socket.send_pyobj(request)
+    req_id = request["req_id"]
+    try:
+        def start_background_send(req_id):
+            task = asyncio.create_task(encoder.send_with_url(req_id=req_id))
+            encoder.background_tasks.add(task)
+            task.add_done_callback(encoder.background_tasks.discard)
 
-    nbytes, embedding_len, embedding_dim = await encoder.encode(
-        mm_items=request["mm_items"],
-        req_id=request["req_id"],
-        num_parts=request["num_parts"],
-        part_idx=request["part_idx"],
-    )
-    if encoder.server_args.encoder_transfer_backend == "mooncake":
-        del request["mm_items"]
-        request.update(
-            {
-                "embedding_size": nbytes,
-                "embedding_len": embedding_len,
-                "embedding_dim": embedding_dim,
-            }
-        )
-        return ORJSONResponse(content=request)
-    elif encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
-        logger.info(f"{request['embedding_port'] = }")
-        if request["embedding_port"] is None:
-            await encoder.send_with_url(
-                req_id=request["req_id"],
-            )
-        else:
-            assert type(request["embedding_port"]) == list
-            tasks = []
-            for embedding_port in request["embedding_port"]:
-                tasks.append(
-                    encoder.send(
-                        req_id=request["req_id"],
-                        prefill_host=request["prefill_host"],
-                        embedding_port=embedding_port,
-                    )
-                )
-            await asyncio.gather(*tasks)
-            encoder.embedding_to_send.pop(request["req_id"], None)
-        return ORJSONResponse(content=None)
-    elif encoder.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
-        await encoder.send(
+        # broadcast request
+        request.update({"enter_time": time.time()})
+        for socket in send_sockets:
+            socket.send_pyobj(request)
+
+        nbytes, embedding_len, embedding_dim, error_msg = await encoder.encode(
+            mm_items=request["mm_items"],
             req_id=request["req_id"],
-            prefill_host=request["prefill_host"],
-            embedding_port=request["embedding_port"],
+            num_parts=request["num_parts"],
+            part_idx=request["part_idx"],
         )
-        encoder.embedding_to_send.pop(request["req_id"], None)
-        return ORJSONResponse(content=None)
+
+        if error_msg:
+            if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+                if request["embedding_port"] is None:
+                    start_background_send(req_id)
+                else:
+                    for port in request["embedding_port"]:
+                        await encoder.send(
+                            req_id=req_id,
+                            prefill_host=request["prefill_host"],
+                            embedding_port=port,
+                        )
+            return ORJSONResponse(
+                status_code=500,
+                content={"status": "error", "message": error_msg, "req_id": req_id},
+            )
+        if encoder.server_args.encoder_transfer_backend == "mooncake":
+            del request["mm_items"]
+            request.update(
+                {
+                    "embedding_size": nbytes,
+                    "embedding_len": embedding_len,
+                    "embedding_dim": embedding_dim,
+                }
+            )
+            return ORJSONResponse(content=request)
+        elif encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+            logger.info(f"{request['embedding_port'] = }")
+            if request["embedding_port"] is None:
+                await encoder.send_with_url(
+                    req_id=request["req_id"],
+                )
+            else:
+                assert type(request["embedding_port"]) == list
+                tasks = []
+                for embedding_port in request["embedding_port"]:
+                    tasks.append(
+                        encoder.send(
+                            req_id=request["req_id"],
+                            prefill_host=request["prefill_host"],
+                            embedding_port=embedding_port,
+                        )
+                    )
+                await asyncio.gather(*tasks)
+                encoder.embedding_to_send.pop(request["req_id"], None)
+            return ORJSONResponse(content=None)
+        elif encoder.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
+            await encoder.send(
+                req_id=request["req_id"],
+                prefill_host=request["prefill_host"],
+                embedding_port=request["embedding_port"],
+            )
+            encoder.embedding_to_send.pop(request["req_id"], None)
+            return ORJSONResponse(content=None)
+    except Exception as e:
+        error_msg = str(e)
+        logger.info(f"❌ Encoder logic failed for {req_id}: {error_msg}")
+        rid_to_err_msg[req_id] = error_msg
+        return ORJSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": error_msg,
+                "req_id": req_id,
+            },
+        )
 
 
 @app.post("/send")

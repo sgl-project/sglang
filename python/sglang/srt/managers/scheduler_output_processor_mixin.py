@@ -1073,7 +1073,7 @@ class SchedulerOutputProcessorMixin:
         if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
-
+            logger.info(f"{rids = }")
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,
