@@ -21,8 +21,8 @@ use crate::{
     tokenizer::{
         cache::{CacheConfig, CachedTokenizer},
         factory as tokenizer_factory,
+        registry::TokenizerRegistry,
         traits::Tokenizer,
-        TokenizerRegistry,
     },
     tool_parser::ParserFactory as ToolParserFactory,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},

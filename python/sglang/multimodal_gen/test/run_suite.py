@@ -153,8 +153,10 @@ def run_pytest(files, filter_expr=None):
         cmd = list(base_cmd)
         if i > 0:
             cmd.append("--last-failed")
-        else:
-            cmd.extend(files)
+        # Always include files to constrain test discovery scope
+        # This prevents pytest from scanning the entire rootdir and
+        # discovering unrelated tests that may have missing dependencies
+        cmd.extend(files)
 
         if i > 0:
             print(

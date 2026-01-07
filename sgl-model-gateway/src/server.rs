@@ -23,13 +23,16 @@ use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::{
+        job_queue::{JobQueue, JobQueueConfig},
         steps::{
             create_external_worker_registration_workflow, create_mcp_registration_workflow,
             create_tokenizer_registration_workflow, create_wasm_module_registration_workflow,
             create_wasm_module_removal_workflow, create_worker_registration_workflow,
             create_worker_removal_workflow, create_worker_update_workflow,
         },
-        Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
+        worker::WorkerType,
+        worker_manager::WorkerManager,
+        Job,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{

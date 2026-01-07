@@ -5,7 +5,7 @@ use crate::core::{Worker, WorkerRegistry};
 /// Harmony model detector
 ///
 /// Detects if a model name indicates support for Harmony encoding/parsing.
-pub struct HarmonyDetector;
+pub(crate) struct HarmonyDetector;
 
 impl HarmonyDetector {
     /// Check if a worker is a Harmony/GPT-OSS model.

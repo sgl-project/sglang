@@ -50,6 +50,8 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 300
 
 jobs:
   # General tests - 1 GPU

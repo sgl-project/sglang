@@ -19,7 +19,6 @@ from sglang.srt.layers.quantization.awq_triton import (
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-# AWQ dequantization tests (AMD only)
 register_amd_ci(est_time=2, suite="stage-a-test-1")
 
 device = "cuda"

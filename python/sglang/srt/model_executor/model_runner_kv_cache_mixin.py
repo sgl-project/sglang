@@ -125,8 +125,6 @@ class ModelRunnerKVCacheMixin:
             )
         elif mambaish := self.mambaish_config:
             num_layers = len(mambaish.full_attention_layer_ids)
-        elif self.model_config.full_attention_layer_ids:
-            num_layers = len(self.model_config.full_attention_layer_ids)
         else:
             num_layers = self.num_effective_layers
 
@@ -202,31 +200,7 @@ class ModelRunnerKVCacheMixin:
 
     def set_num_tokens_hybrid_swa(self: ModelRunner):
         page_size = self.server_args.page_size
-        if (
-            "Llama4ForConditionalGeneration"
-            in self.model_config.hf_config.architectures
-        ):
-            temp_ratio = (
-                (1 - self.is_hybrid_swa)
-                + self.is_hybrid_swa
-                * self.attention_chunk_size
-                / self.model_config.context_len
-            )
-            self.swa_max_total_num_tokens = (
-                4 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
-            )
-            self.full_max_total_num_tokens = (
-                4 * self.max_total_num_tokens
-                - 12 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
-            )
-            self.swa_max_total_num_tokens = (
-                self.swa_max_total_num_tokens // page_size * page_size
-            )
-            self.full_max_total_num_tokens = (
-                self.full_max_total_num_tokens // page_size * page_size
-            )
-            self.max_total_num_tokens = self.full_max_total_num_tokens
-        elif "MiMoV2MTP" in self.model_config.hf_config.architectures:
+        if "MiMoV2MTP" in self.model_config.hf_config.architectures:
             assert self.is_draft_worker
             # MiMoV2MTP uses SWA, so set full KV cache to 0
             self.full_max_total_num_tokens = 0

@@ -9,8 +9,10 @@ use super::discover_dp::DpInfo;
 use crate::{
     app_context::AppContext,
     core::{
-        BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, DPAwareWorkerBuilder,
-        HealthConfig, ModelCard, RuntimeType, Worker, WorkerType, UNKNOWN_MODEL_ID,
+        circuit_breaker::CircuitBreakerConfig,
+        model_card::ModelCard,
+        worker::{HealthConfig, RuntimeType, WorkerType},
+        BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, UNKNOWN_MODEL_ID,
     },
     protocols::worker_spec::WorkerConfigRequest,
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},

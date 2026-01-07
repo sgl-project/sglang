@@ -579,6 +579,16 @@ TWO_GPU_CASES_B = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
+        "zimage_image_t2i_2_gpus",
+        DiffusionServerArgs(
+            model_path="Tongyi-MAI/Z-Image-Turbo",
+            modality="image",
+            num_gpus=2,
+            ulysses_degree=2,
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
         "flux_image_t2i_2_gpus",
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.1-dev",

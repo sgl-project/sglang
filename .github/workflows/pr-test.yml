@@ -526,6 +526,49 @@ jobs:
           # temporarily put backend-independent cpu tests here
           python3 run_suite.py --hw cpu --suite default $CONTINUE_ON_ERROR_FLAG
 
+  stage-a-cpu-only:
+    needs: [check-changes, call-gate]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-a-cpu-only') ||
+        (
+          !inputs.target_stage &&
+          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (needs.check-changes.outputs.main_package == 'true')
+        )
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -e "python/[dev]"
+
+      - name: Run test
+        timeout-minutes: 10
+        run: |
+          cd test/
+          CONTINUE_ON_ERROR_FLAG=""
+          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+          fi
+          python3 run_suite.py --hw cpu --suite stage-a-cpu-only $CONTINUE_ON_ERROR_FLAG
+
   stage-b-test-small-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
     if: |
@@ -544,7 +587,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0, 1, 2, 3, 4, 5, 6, 7]
+        partition: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -571,7 +614,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 11 $CONTINUE_ON_ERROR_FLAG
 
   stage-b-test-large-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
@@ -903,7 +946,7 @@ jobs:
       fail-fast: false
       max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel) }}
       matrix:
-        part: [0, 1, 2, 3, 4, 5]
+        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -934,7 +977,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 6 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
 
   stage-b-test-4-gpu-b200:
@@ -1752,6 +1795,7 @@ jobs:
         multimodal-gen-test-2-gpu,
 
         stage-a-test-1,
+        stage-a-cpu-only,
         stage-b-test-small-1-gpu,
         stage-b-test-large-1-gpu,
         stage-b-test-large-2-gpu,

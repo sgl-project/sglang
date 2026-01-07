@@ -8,8 +8,10 @@ use tracing::{debug, info};
 use crate::{
     app_context::AppContext,
     core::{
-        model_card::ModelCard, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
-        HealthConfig, RuntimeType, Worker, WorkerType,
+        circuit_breaker::CircuitBreakerConfig,
+        model_card::ModelCard,
+        worker::{HealthConfig, RuntimeType, WorkerType},
+        BasicWorkerBuilder, ConnectionMode, Worker,
     },
     protocols::worker_spec::WorkerConfigRequest,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},

@@ -18,13 +18,13 @@ use crate::{
 };
 
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
-pub struct WorkerSelectionStage {
+pub(crate) struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     mode: WorkerSelectionMode,
 }
 
-pub enum WorkerSelectionMode {
+pub(crate) enum WorkerSelectionMode {
     /// Regular mode: select single worker
     Regular,
     /// PD mode: select prefill + decode workers

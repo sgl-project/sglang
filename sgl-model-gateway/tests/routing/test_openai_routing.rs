@@ -18,9 +18,7 @@ use axum::{
 };
 use serde_json::json;
 use smg::{
-    config::{
-        ConfigError, ConfigValidator, HistoryBackend, OracleConfig, RouterConfig, RoutingMode,
-    },
+    config::{ConfigError, HistoryBackend, OracleConfig, RouterConfig, RoutingMode},
     data_connector::{ResponseId, StoredResponse},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
@@ -857,8 +855,9 @@ fn oracle_config_validation_requires_config_when_enabled() {
         .history_backend(HistoryBackend::Oracle)
         .build_unchecked();
 
-    let err =
-        ConfigValidator::validate(&config).expect_err("config should fail without oracle details");
+    let err = config
+        .validate()
+        .expect_err("config should fail without oracle details");
 
     match err {
         ConfigError::MissingRequired { field } => {
@@ -883,7 +882,7 @@ fn oracle_config_validation_accepts_dsn_only() {
         })
         .build_unchecked();
 
-    ConfigValidator::validate(&config).expect("dsn-based config should validate");
+    config.validate().expect("dsn-based config should validate");
 }
 
 #[test]
@@ -901,5 +900,7 @@ fn oracle_config_validation_accepts_wallet_alias() {
         })
         .build_unchecked();
 
-    ConfigValidator::validate(&config).expect("wallet-based config should validate");
+    config
+        .validate()
+        .expect("wallet-based config should validate");
 }

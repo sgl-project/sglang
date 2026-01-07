@@ -20,7 +20,7 @@ use crate::{
 /// Tool execution result
 ///
 /// Contains the result of executing a single MCP tool.
-pub struct ToolResult {
+pub(crate) struct ToolResult {
     /// Tool call ID (for matching with request)
     pub call_id: String,
 
@@ -202,7 +202,7 @@ pub(super) async fn execute_mcp_tools(
 ///
 /// Converts MCP Tool entries (from rmcp SDK) to ResponseTool format so the model
 /// knows about available MCP tools when making tool calls.
-pub fn convert_mcp_tools_to_response_tools(mcp_tools: &[mcp::Tool]) -> Vec<ResponseTool> {
+pub(crate) fn convert_mcp_tools_to_response_tools(mcp_tools: &[mcp::Tool]) -> Vec<ResponseTool> {
     mcp_tools
         .iter()
         .map(|tool_info| ResponseTool {
