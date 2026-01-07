@@ -58,15 +58,6 @@ class LlguidanceWorker:
         pass
 
     def forward_batch_generation(self, batch: ScheduleBatch, **kwargs) -> GenerationBatchResult:
-        # create grammar if needed
-        # for req in batch.reqs:
-        #     if req.sampling_params.lark_grammar is not None and req.lark_grammar_object is None:
-        #         req.lark_grammar_object = self.grammar_backend.dispatch_ebnf(req.sampling_params.lark_grammar)
-
-        # for i, req in enumerate(batch.reqs):
-        #     if req.grammar:
-        #         ff_tokens = req.grammar.ll_matcher.compute_ff_tokens()
-
         # Update fields
         to_process_output_ids = False
         if not batch.forward_mode.is_extend():
@@ -183,31 +174,21 @@ class LlguidanceWorker:
         model_worker_batch = batch.get_model_worker_batch()
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch
-        )        
-
-        logits_output, next_token_ids, can_run_cuda_graph = (
-            batch_result.logits_output,
-            batch_result.next_token_ids,
-            batch_result.can_run_cuda_graph,
-        )        
+        )               
 
         if to_process_output_ids:
+            logits_output, next_token_ids, can_run_cuda_graph = (
+                batch_result.logits_output,
+                batch_result.next_token_ids,
+                batch_result.can_run_cuda_graph,
+            ) 
             next_token_ids_cpu = next_token_ids.cpu()
             for i, req in enumerate(batch.reqs):
                 if req.grammar:
                     req.grammar.accept_token(next_token_ids[i].item())
-                    ff_tokens = req.grammar.ll_matcher.compute_ff_tokens()
 
                 req.output_ids.append(next_token_ids_cpu[i].item())
 
             batch.forward_mode = ForwardMode.DECODE
-
-        # return GenerationBatchResult(
-        #     logits_output=logits_output,
-        #     next_token_ids=next_token_ids,
-        #     num_accepted_tokens=num_accepted_tokens,
-        #     can_run_cuda_graph=can_run_cuda_graph,
-        #     accept_lens=accept_lens,
-        # )
 
         return batch_result
