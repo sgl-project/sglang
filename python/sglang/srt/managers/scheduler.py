@@ -317,9 +317,6 @@ class Scheduler(
         # Init model configs
         self.init_model_config()
 
-        # Init inter-process communication
-        self.init_ipc_channels(port_args)
-
         # Init PD-multiplexing context
         if self.enable_pdmux:
             self.init_pdmux()
@@ -335,6 +332,9 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
+
+        # Init inter-process communication
+        self.init_ipc_channels(port_args)
 
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
