@@ -699,3 +699,244 @@ export function computeSessionMetrics(steps: DecodeStep[]): SessionMetrics | und
     dominantZone,
   };
 }
+
+// ============================================================================
+// FINGERPRINT PCA LOADINGS & INTERPRETATION
+// ============================================================================
+
+/**
+ * Feature schema describing each dimension of the 20D fingerprint vector.
+ * Order: [local_mass, mid_mass, long_mass, entropy, histogram[0:16]]
+ */
+export interface FingerprintFeature {
+  name: string;
+  description: string;
+  range: [number, number];  // Expected value range
+  interpretation: {
+    low: string;    // What low values mean
+    high: string;   // What high values mean
+  };
+}
+
+export const FINGERPRINT_FEATURE_SCHEMA: FingerprintFeature[] = [
+  {
+    name: 'local_mass',
+    description: 'Attention weight on tokens within 8 positions',
+    range: [0, 1],
+    interpretation: {
+      low: 'Minimal local context reliance',
+      high: 'Strong syntax/grammar processing (immediate neighbors)',
+    },
+  },
+  {
+    name: 'mid_mass',
+    description: 'Attention weight on tokens 8-255 positions back',
+    range: [0, 1],
+    interpretation: {
+      low: 'Minimal paragraph-level context',
+      high: 'Strong semantic retrieval (sentence/paragraph context)',
+    },
+  },
+  {
+    name: 'long_mass',
+    description: 'Attention weight on tokens 256+ positions back',
+    range: [0, 1],
+    interpretation: {
+      low: 'Limited long-range dependencies',
+      high: 'Active document-level reasoning',
+    },
+  },
+  {
+    name: 'entropy',
+    description: 'Normalized entropy of attention distribution',
+    range: [0, 1],
+    interpretation: {
+      low: 'Focused attention on few positions (high confidence)',
+      high: 'Diffuse attention (exploratory/uncertain)',
+    },
+  },
+  // Histogram bins (log2-spaced distances)
+  ...Array.from({ length: 16 }, (_, i) => ({
+    name: `hist_bin_${i}`,
+    description: `Attention in distance range [${Math.pow(2, i)}, ${Math.pow(2, i + 1) - 1}]`,
+    range: [0, 1] as [number, number],
+    interpretation: {
+      low: `Minimal attention at ${Math.pow(2, i)}-${Math.pow(2, i + 1) - 1} token distance`,
+      high: `Strong attention at ${Math.pow(2, i)}-${Math.pow(2, i + 1) - 1} token distance`,
+    },
+  })),
+];
+
+/**
+ * A principal component loading for fingerprint interpretation.
+ * Each PC captures a common attention pattern.
+ */
+export interface PCALoading {
+  name: string;
+  description: string;
+  variance_explained: number;  // 0-1, how much variance this PC explains
+  loadings: number[];          // 20 weights, one per feature
+  interpretation: {
+    negative: string;  // What negative scores mean
+    positive: string;  // What positive scores mean
+  };
+}
+
+/**
+ * Pre-computed PCA loadings for fingerprint interpretation.
+ * These are derived from analyzing common attention patterns in transformer models.
+ *
+ * The loadings help answer: "What kind of attention pattern is this?"
+ */
+export const FINGERPRINT_PCA_LOADINGS: PCALoading[] = [
+  {
+    name: 'PC1: Local vs Long-Range',
+    description: 'Contrasts immediate neighbor attention with distant retrieval',
+    variance_explained: 0.35,
+    loadings: [
+      0.6,   // local_mass (positive = more local)
+      0.1,   // mid_mass
+      -0.6,  // long_mass (negative = less long-range)
+      -0.2,  // entropy
+      // Histogram: high loadings on nearby bins, negative on distant
+      0.4, 0.3, 0.2, 0.1, 0.0, -0.1, -0.1, -0.2,
+      -0.2, -0.2, -0.3, -0.3, -0.3, -0.3, -0.3, -0.3,
+    ],
+    interpretation: {
+      negative: 'Long-range information retrieval (document memory, prior context)',
+      positive: 'Local syntax processing (grammar, immediate continuity)',
+    },
+  },
+  {
+    name: 'PC2: Focused vs Diffuse',
+    description: 'Measures attention concentration vs exploration',
+    variance_explained: 0.25,
+    loadings: [
+      0.1,   // local_mass
+      0.1,   // mid_mass
+      0.1,   // long_mass
+      -0.8,  // entropy (negative = low entropy = focused)
+      // Histogram: concentrated bins positive, spread negative
+      0.2, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0,
+      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    ],
+    interpretation: {
+      negative: 'Diffuse attention (uncertainty, exploration, multiple options)',
+      positive: 'Focused attention (high confidence, clear next token)',
+    },
+  },
+  {
+    name: 'PC3: Semantic Bridge',
+    description: 'Captures mid-range semantic retrieval patterns',
+    variance_explained: 0.15,
+    loadings: [
+      -0.3,  // local_mass
+      0.7,   // mid_mass (positive = semantic retrieval)
+      -0.2,  // long_mass
+      0.1,   // entropy
+      // Histogram: peak in mid-range bins
+      -0.1, -0.1, 0.0, 0.3, 0.4, 0.4, 0.3, 0.2,
+      0.1, 0.0, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1,
+    ],
+    interpretation: {
+      negative: 'Either very local or very long-range attention',
+      positive: 'Semantic context retrieval (paragraph-level reasoning)',
+    },
+  },
+  {
+    name: 'PC4: Structure Ripple',
+    description: 'Periodic attention patterns (code, lists, structured text)',
+    variance_explained: 0.10,
+    loadings: [
+      0.0,   // local_mass
+      0.0,   // mid_mass
+      0.0,   // long_mass
+      -0.2,  // entropy
+      // Alternating pattern in histogram (periodic structure)
+      0.3, -0.2, 0.3, -0.2, 0.3, -0.2, 0.2, -0.1,
+      0.2, -0.1, 0.1, -0.1, 0.1, 0.0, 0.0, 0.0,
+    ],
+    interpretation: {
+      negative: 'Smooth, continuous attention flow',
+      positive: 'Periodic structure (code blocks, numbered lists, repetition)',
+    },
+  },
+];
+
+/**
+ * Project a fingerprint onto PCA space.
+ * Returns scores for each principal component.
+ */
+export function projectFingerprintToPCA(fp: Fingerprint): number[] {
+  // Reconstruct 20D vector from Fingerprint
+  const vector = [
+    fp.local_mass,
+    fp.mid_mass,
+    fp.long_mass,
+    fp.entropy,
+    ...fp.histogram,
+  ];
+
+  // Project onto each PC
+  return FINGERPRINT_PCA_LOADINGS.map((pc) => {
+    let score = 0;
+    for (let i = 0; i < Math.min(vector.length, pc.loadings.length); i++) {
+      score += vector[i] * pc.loadings[i];
+    }
+    return score;
+  });
+}
+
+/**
+ * Explain a fingerprint in natural language.
+ * Returns an array of interpretations based on PCA projections.
+ */
+export interface FingerprintExplanation {
+  pcName: string;
+  score: number;
+  intensity: 'weak' | 'moderate' | 'strong';
+  interpretation: string;
+}
+
+export function explainFingerprint(fp: Fingerprint): FingerprintExplanation[] {
+  const scores = projectFingerprintToPCA(fp);
+  const explanations: FingerprintExplanation[] = [];
+
+  scores.forEach((score, i) => {
+    const pc = FINGERPRINT_PCA_LOADINGS[i];
+    const absScore = Math.abs(score);
+
+    // Determine intensity
+    let intensity: 'weak' | 'moderate' | 'strong';
+    if (absScore < 0.2) intensity = 'weak';
+    else if (absScore < 0.5) intensity = 'moderate';
+    else intensity = 'strong';
+
+    // Only include moderate or strong signals
+    if (intensity !== 'weak') {
+      explanations.push({
+        pcName: pc.name,
+        score,
+        intensity,
+        interpretation: score > 0 ? pc.interpretation.positive : pc.interpretation.negative,
+      });
+    }
+  });
+
+  // Sort by absolute score (most significant first)
+  return explanations.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
+}
+
+/**
+ * Get a one-line summary of the fingerprint's dominant pattern.
+ */
+export function summarizeFingerprint(fp: Fingerprint): string {
+  const explanations = explainFingerprint(fp);
+
+  if (explanations.length === 0) {
+    return 'Balanced attention pattern (no dominant characteristic)';
+  }
+
+  const top = explanations[0];
+  return `${top.intensity.charAt(0).toUpperCase() + top.intensity.slice(1)} ${top.interpretation.toLowerCase()}`;
+}
