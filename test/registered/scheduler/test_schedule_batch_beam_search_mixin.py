@@ -9,6 +9,10 @@ from sglang.srt.managers.schedule_batch_beam_search_mixin import (
     ScheduleBatchBeamSearchMixin,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="per-commit-1-gpu")
+register_amd_ci(est_time=5, suite="per-commit-1-gpu-amd")
 
 
 class TestPrepareForBeamSearchDecode(unittest.TestCase):
