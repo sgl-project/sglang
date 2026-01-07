@@ -95,7 +95,7 @@ import subprocess
 import sys
 from importlib.util import find_spec
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -660,8 +660,8 @@ def _get_marker_value(
     request: pytest.FixtureRequest,
     marker_name: str,
     arg_index: int = 0,
-    default: any = None,
-) -> any:
+    default: Any = None,
+) -> Any:
     """Get a value from a pytest marker.
 
     Args:
@@ -684,8 +684,8 @@ def _get_marker_value(
 def _get_marker_kwargs(
     request: pytest.FixtureRequest,
     marker_name: str,
-    defaults: dict[str, any] | None = None,
-) -> dict[str, any]:
+    defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Get keyword arguments from a pytest marker.
 
     Args:
