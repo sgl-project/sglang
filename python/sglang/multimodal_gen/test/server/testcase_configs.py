@@ -25,8 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
-from sglang.test.test_utils import is_in_amd_ci
 
 
 @dataclass
@@ -485,7 +485,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
 ]
 
 # Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
-if not is_in_amd_ci():
+if not current_platform.is_hip():
     ONE_GPU_CASES_B.append(
         DiffusionTestCase(
             "turbo_wan2_1_t2v_1.3b",
@@ -557,7 +557,7 @@ TWO_GPU_CASES_A = [
 ]
 
 # Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
-if not is_in_amd_ci():
+if not current_platform.is_hip():
     TWO_GPU_CASES_A.append(
         DiffusionTestCase(
             "turbo_wan2_2_i2v_a14b_2gpu",
