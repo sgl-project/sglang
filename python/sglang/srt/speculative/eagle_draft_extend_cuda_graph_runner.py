@@ -100,7 +100,10 @@ class EAGLEDraftExtendCudaGraphRunner:
                 (3, self.max_num_token), dtype=torch.int64
             )
 
-            if self.eagle_worker.speculative_algorithm.is_eagle3():
+            if (
+                self.eagle_worker.speculative_algorithm.is_eagle3()
+                and self.eagle_worker.eagle_use_aux_hidden_state
+            ):
                 self.hidden_states = torch.zeros(
                     (
                         self.max_num_token,
@@ -189,6 +192,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
