@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
-import signal
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import httpx
@@ -15,40 +14,186 @@ import httpx
 if TYPE_CHECKING:
     import openai
 
-from .gpu_allocator import GPUAllocator, GPUSlot
+from .constants import (
+    DEFAULT_HOST,
+    DEFAULT_MODEL,
+    DEFAULT_STARTUP_TIMEOUT,
+    ENV_SHOW_WORKER_LOGS,
+    HEALTH_CHECK_INTERVAL,
+    LOCAL_MODES,
+    ConnectionMode,
+    WorkerType,
+)
+from .gpu_allocator import GPUAllocator, GPUSlot, get_open_port
 from .model_specs import MODEL_SPECS, get_model_spec
+from .process_utils import detect_ib_device
 
 logger = logging.getLogger(__name__)
 
-# Default timeout for model startup (seconds)
-DEFAULT_STARTUP_TIMEOUT = 300
-# Health check interval (seconds)
-HEALTH_CHECK_INTERVAL = 5
-# Host for model servers
-DEFAULT_HOST = "127.0.0.1"
+
+@dataclass(frozen=True)
+class WorkerIdentity:
+    """Unique identity for a single worker instance.
+
+    Each worker is uniquely identified by (model_id, mode, worker_type, index).
+    For example:
+    - llama-8b:http (regular worker, index 0)
+    - llama-8b:http:prefill_0 (first prefill worker)
+    - llama-8b:http:prefill_1 (second prefill worker)
+    - llama-8b:http:decode_0 (first decode worker)
+
+    Frozen/hashable so it can be used in sets and as dict keys for deduplication.
+    """
+
+    model_id: str
+    mode: ConnectionMode = ConnectionMode.HTTP
+    worker_type: WorkerType = WorkerType.REGULAR
+    index: int = 0
+
+    @property
+    def is_prefill(self) -> bool:
+        """Check if this is a prefill worker."""
+        return self.worker_type == WorkerType.PREFILL
+
+    @property
+    def is_decode(self) -> bool:
+        """Check if this is a decode worker."""
+        return self.worker_type == WorkerType.DECODE
+
+    @property
+    def is_regular(self) -> bool:
+        """Check if this is a regular worker."""
+        return self.worker_type == WorkerType.REGULAR
+
+    @property
+    def key(self) -> str:
+        """Unique key for this worker instance."""
+        if self.worker_type == WorkerType.REGULAR:
+            if self.index == 0:
+                return f"{self.model_id}:{self.mode.value}"
+            return f"{self.model_id}:{self.mode.value}:{self.index}"
+        return (
+            f"{self.model_id}:{self.mode.value}:{self.worker_type.value}_{self.index}"
+        )
+
+    def __str__(self) -> str:
+        """String representation for logging."""
+        return self.key
 
 
 @dataclass
 class ModelInstance:
-    """A running model instance."""
+    """A running model instance.
+
+    Contains both identity (model_id, mode, worker_type) and runtime state
+    (process, port, gpu_slot, etc.).
+    """
 
     model_id: str
+    mode: ConnectionMode
     model_path: str
     base_url: str
+    port: int
     process: subprocess.Popen
-    gpu_slot: GPUSlot
-    grpc_mode: bool = False
+    gpu_slot: GPUSlot | None
+    key: str  # Unique instance key (e.g., "llama-8b:http:prefill_0")
+    worker_type: WorkerType = WorkerType.REGULAR
+    bootstrap_port: int | None = None  # For prefill workers in PD mode
+    last_used: float = 0.0  # Timestamp for MRU eviction
+    _healthy: bool = False  # Track if initial health check passed
+
+    @property
+    def identity(self) -> WorkerIdentity:
+        """Get the identity (model_id, mode, worker_type) of this instance."""
+        return WorkerIdentity(
+            model_id=self.model_id,
+            mode=self.mode,
+            worker_type=self.worker_type,
+        )
+
+    @property
+    def worker_url(self) -> str:
+        """URL to use when connecting router to this worker."""
+        if self.mode == ConnectionMode.GRPC:
+            return f"grpc://{DEFAULT_HOST}:{self.port}"
+        return self.base_url
 
     def is_alive(self) -> bool:
         """Check if the process is still running."""
         return self.process.poll() is None
 
     def health_check(self, timeout: float = 5.0) -> bool:
-        """Check if the model server is healthy via HTTP."""
+        """Check if the model server is healthy.
+
+        Uses HTTP /health endpoint for HTTP workers, gRPC health check for gRPC workers.
+        """
+        if self.mode == ConnectionMode.GRPC:
+            return self._grpc_health_check(timeout)
+        return self._http_health_check(timeout)
+
+    def _http_health_check(self, timeout: float = 5.0) -> bool:
+        """Check health via HTTP /health endpoint."""
         try:
             resp = httpx.get(f"{self.base_url}/health", timeout=timeout)
             return resp.status_code == 200
         except (httpx.RequestError, httpx.TimeoutException):
+            return False
+
+    def deep_health_check(self, timeout: float = 30.0) -> bool:
+        """Deep health check that verifies the model can actually generate.
+
+        Uses /health_generate for HTTP workers (runs actual inference).
+        For gRPC workers, falls back to standard health check.
+        """
+        if self.mode == ConnectionMode.GRPC:
+            # For gRPC, use standard health check (no /health_generate equivalent)
+            return self._grpc_health_check(timeout)
+
+        try:
+            resp = httpx.get(f"{self.base_url}/health_generate", timeout=timeout)
+            return resp.status_code == 200
+        except (httpx.RequestError, httpx.TimeoutException):
+            return False
+
+    def _grpc_health_check(self, timeout: float = 5.0) -> bool:
+        """Check health via gRPC health check protocol."""
+        try:
+            import grpc
+            from grpc_health.v1 import health_pb2, health_pb2_grpc
+        except ImportError as e:
+            logger.debug("gRPC libraries not available: %s", e)
+            return False
+
+        try:
+            channel = grpc.insecure_channel(f"{DEFAULT_HOST}:{self.port}")
+            try:
+                stub = health_pb2_grpc.HealthStub(channel)
+                request = health_pb2.HealthCheckRequest(service="")
+                response = stub.Check(request, timeout=timeout)
+                is_serving = response.status == health_pb2.HealthCheckResponse.SERVING
+                if is_serving:
+                    logger.debug(
+                        "gRPC health check passed for port %d (status: SERVING)",
+                        self.port,
+                    )
+                return is_serving
+            finally:
+                channel.close()
+        except grpc.RpcError as e:
+            # gRPC-specific errors (connection refused, deadline exceeded, etc.)
+            logger.debug(
+                "gRPC health check failed for port %d: %s",
+                self.port,
+                e.code() if hasattr(e, "code") else str(e),
+            )
+            return False
+        except Exception as e:
+            # Other errors
+            logger.debug(
+                "gRPC health check error for port %d: %s",
+                self.port,
+                str(e),
+            )
             return False
 
     def terminate(self, timeout: float = 10.0) -> None:
@@ -56,20 +201,45 @@ class ModelInstance:
         if self.process.poll() is not None:
             return  # Already terminated
 
-        logger.info("Terminating model %s (PID %d)", self.model_id, self.process.pid)
+        logger.info("Terminating %s (PID %d)", self.key, self.process.pid)
 
         # Try graceful shutdown first
         self.process.terminate()
         try:
             self.process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            logger.warning("Model %s did not terminate, killing", self.model_id)
+            logger.warning("%s did not terminate, killing", self.key)
             self.process.kill()
             self.process.wait()
 
 
 class ModelPool:
-    """Manages a pool of pre-loaded models across GPUs."""
+    """Manages long-running SGLang worker processes across GPUs.
+
+    Workers are expensive to start (~30-60s due to model loading), so this pool
+    keeps them running and allows reuse across multiple tests. Routers can then
+    be launched cheaply (~1-2s) pointing to these workers.
+
+    Startup behavior:
+    - Workers are pre-launched at startup until GPUs are full
+    - When a test needs a model that isn't running, MRU model is evicted
+      (models just used are likely done, models not yet used are waiting)
+    - The needed model is then launched on-demand
+
+    Instance keys:
+    - Regular workers: "model_id:mode" (e.g., "llama-8b:http")
+    - PD workers: "model_id:mode:worker_type" (e.g., "llama-8b:http:prefill")
+
+    Limitations:
+    - Currently one worker instance per (model_id, mode) combination
+    - @pytest.mark.workers(count=n) duplicates URLs to router, not distinct workers
+    - For true multi-worker LB testing, extend to support multiple instances
+
+    Usage:
+        pool = ModelPool()
+        pool.startup(requirements=[("llama-8b", ConnectionMode.HTTP)])
+        instance = pool.get("llama-8b", "http")  # Pre-launched or on-demand
+    """
 
     def __init__(self, allocator: GPUAllocator | None = None):
         """Initialize the model pool.
@@ -78,68 +248,166 @@ class ModelPool:
             allocator: GPU allocator to use. If None, creates a new one.
         """
         self.allocator = allocator or GPUAllocator()
-        self.instances: dict[str, ModelInstance] = {}
+        self.instances: dict[str, ModelInstance] = {}  # key = "model_id:mode"
         self._startup_timeout = DEFAULT_STARTUP_TIMEOUT
 
     def startup(
         self,
-        model_ids: list[str] | None = None,
-        grpc_mode: bool = False,
+        requirements: list[WorkerIdentity] | None = None,
         startup_timeout: int = DEFAULT_STARTUP_TIMEOUT,
     ) -> None:
-        """Spin up models in parallel on assigned GPU slots.
+        """Start worker processes for the required workers in order.
+
+        Workers are launched sequentially (one Popen at a time) but boot up
+        concurrently since model loading happens in parallel across processes.
+        This method blocks until all workers pass health checks.
+
+        All worker types (regular, prefill, decode) are handled uniformly.
+        Each WorkerIdentity uniquely identifies a worker by (model_id, mode,
+        worker_type, index).
 
         Args:
-            model_ids: List of model IDs to start. If None, starts all in MODEL_SPECS.
-            grpc_mode: If True, launch workers in gRPC mode.
-            startup_timeout: Timeout in seconds for each model to become healthy.
+            requirements: List of WorkerIdentity specifying what to start.
+                         If None, starts default model in HTTP mode.
+            startup_timeout: Timeout in seconds for all models to become healthy.
         """
         self._startup_timeout = startup_timeout
 
-        # Determine which models to start
-        if model_ids is None:
-            model_ids = list(MODEL_SPECS.keys())
+        if requirements is None:
+            requirements = [WorkerIdentity(DEFAULT_MODEL, ConnectionMode.HTTP)]
 
-        # Filter to models we have specs for
-        specs_to_start = {
-            mid: MODEL_SPECS[mid] for mid in model_ids if mid in MODEL_SPECS
-        }
+        # Validate requirements
+        valid_requirements: list[WorkerIdentity] = []
+        for identity in requirements:
+            if identity.model_id not in MODEL_SPECS:
+                logger.warning("Unknown model %s, skipping", identity.model_id)
+                continue
+            if identity.mode not in LOCAL_MODES:
+                logger.warning(
+                    "Invalid mode %s for %s, skipping", identity.mode, identity.model_id
+                )
+                continue
+            valid_requirements.append(identity)
 
-        if not specs_to_start:
-            logger.warning("No valid model specs to start")
+        if not valid_requirements:
+            logger.warning("No valid requirements to start")
             return
 
-        # Allocate GPU slots
-        slots = self.allocator.allocate_slots(specs_to_start)
+        logger.info(
+            "Starting model pool with %d workers: %s",
+            len(valid_requirements),
+            [str(r) for r in valid_requirements],
+        )
 
-        if not slots:
-            logger.warning("No GPU slots allocated")
-            return
+        # Detect IB device once for PD workers
+        has_pd = any(r.is_prefill or r.is_decode for r in valid_requirements)
+        ib_device = detect_ib_device() if has_pd else None
+        if ib_device:
+            logger.info("Detected InfiniBand device: %s", ib_device)
 
-        logger.info(self.allocator.summary())
+        # Track bootstrap ports for PD groups (all PD workers of same model/mode share one)
+        pd_bootstrap_ports: dict[tuple[str, ConnectionMode], int] = {}
 
-        # Launch all models in parallel
-        for slot in slots:
-            if slot.assigned_model:
-                self._launch_model(slot, grpc_mode=grpc_mode)
+        deferred: list[str] = []
 
-        # Wait for all to be healthy
+        # Process requirements in order - all workers treated uniformly
+        for identity in valid_requirements:
+            spec = get_model_spec(identity.model_id)
+            tp = spec.get("tp", 1)
+
+            # Check if we have enough GPUs
+            available_gpus = self.allocator.available_gpus()
+            if len(available_gpus) < tp:
+                logger.info(
+                    "Not enough GPUs for %s (need %d, have %d), deferring",
+                    identity,
+                    tp,
+                    len(available_gpus),
+                )
+                deferred.append(str(identity))
+                continue
+
+            # Allocate GPU slot
+            allocation_specs = {
+                identity.key: {
+                    "model": spec["model"],
+                    "memory_gb": spec.get("memory_gb", 16),
+                    "tp": tp,
+                }
+            }
+            slots = self.allocator.allocate_slots(allocation_specs, preserve_order=True)
+            if not slots:
+                deferred.append(str(identity))
+                continue
+
+            # Get bootstrap port for PD workers (shared within model/mode group)
+            bootstrap_port = None
+            if identity.is_prefill or identity.is_decode:
+                pd_key = (identity.model_id, identity.mode)
+                if pd_key not in pd_bootstrap_ports:
+                    pd_bootstrap_ports[pd_key] = get_open_port()
+                bootstrap_port = pd_bootstrap_ports[pd_key]
+
+            # Launch the worker
+            self._launch_model(
+                model_id=identity.model_id,
+                mode=identity.mode,
+                gpu_slot=slots[0],
+                worker_type=identity.worker_type,
+                bootstrap_port=bootstrap_port if identity.is_prefill else None,
+                ib_device=(
+                    ib_device if (identity.is_prefill or identity.is_decode) else None
+                ),
+                instance_key=identity.key,
+            )
+
+        # Log deferred workers
+        if deferred:
+            logger.info(
+                "%d workers deferred for on-demand launch: %s",
+                len(deferred),
+                deferred,
+            )
+
+        # Wait for all launched models to be healthy
         self._wait_all_healthy()
 
-    def _launch_model(self, slot: GPUSlot, grpc_mode: bool = False) -> None:
-        """Launch a model on the given GPU slot."""
-        model_id = slot.assigned_model
-        if not model_id:
-            return
+    def _launch_model(
+        self,
+        model_id: str,
+        mode: ConnectionMode,
+        gpu_slot: GPUSlot | None = None,
+        worker_type: WorkerType = WorkerType.REGULAR,
+        bootstrap_port: int | None = None,
+        ib_device: str | None = None,
+        instance_key: str | None = None,
+    ) -> ModelInstance:
+        """Launch a model instance.
 
+        Args:
+            model_id: Model identifier from MODEL_SPECS.
+            mode: Connection mode (HTTP or GRPC).
+            gpu_slot: GPU slot assignment, or None for auto.
+            worker_type: Worker type (REGULAR, PREFILL, or DECODE).
+            bootstrap_port: Bootstrap port for prefill workers in PD mode.
+            ib_device: InfiniBand device for PD disaggregation.
+            instance_key: Custom instance key, or None to auto-generate.
+
+        Returns:
+            The launched ModelInstance.
+        """
         spec = get_model_spec(model_id)
         model_path = spec["model"]
         tp_size = spec.get("tp", 1)
-        port = slot.port
+        features = spec.get("features", [])
 
-        # Build environment with CUDA_VISIBLE_DEVICES
+        # Get port - use slot's port if available, otherwise find open port
+        port = gpu_slot.port if gpu_slot else get_open_port()
+
+        # Build environment
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = slot.cuda_visible_devices()
+        if gpu_slot:
+            env["CUDA_VISIBLE_DEVICES"] = gpu_slot.cuda_visible_devices()
 
         # Build command
         cmd = [
@@ -148,6 +416,8 @@ class ModelPool:
             "sglang.launch_server",
             "--model-path",
             model_path,
+            "--host",
+            DEFAULT_HOST,
             "--port",
             str(port),
             "--tp-size",
@@ -156,52 +426,100 @@ class ModelPool:
             "warning",
         ]
 
-        if grpc_mode:
+        if mode == ConnectionMode.GRPC:
             cmd.append("--grpc-mode")
 
-        logger.info(
-            "Launching %s on GPUs %s port %d: %s",
-            model_id,
-            slot.gpu_ids,
-            port,
-            " ".join(cmd),
-        )
+        # Embedding model flag
+        if "embedding" in features:
+            cmd.append("--is-embedding")
+
+        # PD disaggregation arguments
+        if worker_type == WorkerType.PREFILL:
+            cmd.extend(["--disaggregation-mode", "prefill"])
+            if bootstrap_port:
+                cmd.extend(["--disaggregation-bootstrap-port", str(bootstrap_port)])
+            if ib_device:
+                cmd.extend(["--disaggregation-ib-device", ib_device])
+        elif worker_type == WorkerType.DECODE:
+            cmd.extend(["--disaggregation-mode", "decode"])
+            # Base GPU ID 0 since CUDA_VISIBLE_DEVICES remaps the GPU
+            cmd.extend(["--base-gpu-id", "0"])
+            if ib_device:
+                cmd.extend(["--disaggregation-ib-device", ib_device])
+
+        # Build key based on worker type (or use custom key)
+        if instance_key:
+            key = instance_key
+        elif worker_type == WorkerType.REGULAR:
+            key = f"{model_id}:{mode.value}"
+        else:
+            key = f"{model_id}:{mode.value}:{worker_type.value}"
+
+        gpu_info = gpu_slot.gpu_ids if gpu_slot else "auto"
+        logger.info("Launching %s on GPUs %s port %d", key, gpu_info, port)
+
+        show_output = os.environ.get(ENV_SHOW_WORKER_LOGS, "0") == "1"
 
         # Start the process
         proc = subprocess.Popen(
             cmd,
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            # Use process group for clean shutdown
+            stdout=None if show_output else subprocess.PIPE,
+            stderr=None if show_output else subprocess.PIPE,
             start_new_session=True,
         )
 
         base_url = f"http://{DEFAULT_HOST}:{port}"
         instance = ModelInstance(
             model_id=model_id,
+            mode=mode,
             model_path=model_path,
             base_url=base_url,
+            port=port,
             process=proc,
-            gpu_slot=slot,
-            grpc_mode=grpc_mode,
+            gpu_slot=gpu_slot,
+            key=key,
+            worker_type=worker_type,
+            bootstrap_port=bootstrap_port,
+            last_used=time.time(),
         )
-        self.instances[model_id] = instance
+        self.instances[key] = instance
+        return instance
 
     def _wait_all_healthy(self) -> None:
-        """Wait for all model instances to become healthy."""
+        """Wait for all model instances to become healthy.
+
+        Only checks workers that haven't been marked healthy yet,
+        avoiding redundant health checks on already-verified workers.
+        """
         start_time = time.time()
-        pending = set(self.instances.keys())
+        # Only wait for workers that haven't been verified healthy yet
+        pending = {key for key, inst in self.instances.items() if not inst._healthy}
+        check_count = 0
+
+        if not pending:
+            logger.info("All workers already healthy, skipping health check")
+            return
+
+        logger.info(
+            "Waiting for %d workers to become healthy (timeout: %ds)...",
+            len(pending),
+            self._startup_timeout,
+        )
 
         while pending and (time.time() - start_time) < self._startup_timeout:
-            for model_id in list(pending):
-                instance = self.instances[model_id]
+            check_count += 1
+            elapsed = time.time() - start_time
+
+            for key in list(pending):
+                instance = self.instances[key]
 
                 # Check if process died
                 if not instance.is_alive():
                     logger.error(
-                        "Model %s (PID %d) died during startup",
-                        model_id,
+                        "[%.1fs] %s (PID %d) died during startup",
+                        elapsed,
+                        key,
                         instance.process.pid,
                     )
                     # Read stderr for debugging
@@ -209,62 +527,419 @@ class ModelPool:
                         stderr = instance.process.stderr.read()
                         if stderr:
                             logger.error("Stderr: %s", stderr.decode()[-2000:])
-                    pending.discard(model_id)
+                    pending.discard(key)
                     continue
 
                 # Check health
                 if instance.health_check():
                     logger.info(
-                        "Model %s is healthy at %s", model_id, instance.base_url
+                        "[%.1fs] %s is healthy at %s (router url: %s) (check #%d)",
+                        elapsed,
+                        key,
+                        instance.base_url,
+                        instance.worker_url,
+                        check_count,
                     )
-                    pending.discard(model_id)
+                    instance._healthy = True
+                    pending.discard(key)
 
             if pending:
+                # Log progress every 30 seconds
+                if check_count % 15 == 0:  # ~30s at 2s interval
+                    logger.info(
+                        "[%.1fs] Still waiting for %d workers: %s",
+                        elapsed,
+                        len(pending),
+                        list(pending),
+                    )
                 time.sleep(HEALTH_CHECK_INTERVAL)
 
         if pending:
+            elapsed = time.time() - start_time
             logger.error(
-                "Models failed to start within %ds: %s",
+                "[%.1fs] Models failed to start within %ds: %s",
+                elapsed,
                 self._startup_timeout,
                 pending,
             )
             # Terminate failed instances
-            for model_id in pending:
-                self.instances[model_id].terminate()
-                del self.instances[model_id]
+            for key in pending:
+                self.instances[key].terminate()
+                del self.instances[key]
+        else:
+            elapsed = time.time() - start_time
+            logger.info(
+                "[%.1fs] All %d workers healthy after %d health checks",
+                elapsed,
+                len(self.instances),
+                check_count,
+            )
 
-    def get_client(self, model_id: str) -> "openai.OpenAI":
+    def get(
+        self,
+        model_id: str,
+        mode: ConnectionMode | str,
+        worker_type: WorkerType | str = WorkerType.REGULAR,
+    ) -> ModelInstance:
+        """Get a model instance by model_id, mode, and worker_type.
+
+        If the model is not running, it will be launched on-demand with MRU
+        eviction if GPU resources are constrained.
+
+        Args:
+            model_id: The model ID (e.g., "llama-8b")
+            mode: The mode (ConnectionMode.HTTP or ConnectionMode.GRPC, or string)
+            worker_type: The worker type (REGULAR, PREFILL, DECODE). Defaults to REGULAR.
+
+        Returns:
+            ModelInstance for the requested model/mode/worker_type.
+
+        Raises:
+            RuntimeError: If worker process died or failed health check.
+        """
+        # Accept both enum and string for convenience
+        if isinstance(mode, str):
+            mode = ConnectionMode(mode)
+        if isinstance(worker_type, str):
+            worker_type = WorkerType(worker_type)
+
+        if worker_type == WorkerType.REGULAR:
+            key = f"{model_id}:{mode.value}"
+        else:
+            key = f"{model_id}:{mode.value}:{worker_type.value}"
+
+        # Check if instance exists - if not, launch on-demand with eviction
+        if key not in self.instances:
+            logger.info(
+                "Model %s not running, launching on-demand with MRU eviction if needed",
+                key,
+            )
+            self._ensure_gpu_available(model_id)
+
+            # Allocate GPU slot for this model
+            spec = get_model_spec(model_id)
+            allocation_specs = {
+                key: {
+                    "model": spec["model"],
+                    "memory_gb": spec.get("memory_gb", 16),
+                    "tp": spec.get("tp", 1),
+                }
+            }
+            slots = self.allocator.allocate_slots(allocation_specs)
+            if not slots:
+                raise RuntimeError(
+                    f"Failed to allocate GPU slot for {model_id} after eviction"
+                )
+            gpu_slot = slots[0]
+
+            self._launch_model(model_id, mode, gpu_slot=gpu_slot)
+            self._wait_for_instance(key)
+
+        instance = self.instances[key]
+
+        # Update last_used timestamp
+        instance.last_used = time.time()
+
+        # Verify worker is still alive and healthy
+        if not instance.is_alive():
+            raise RuntimeError(f"Worker {key} process died (was healthy at startup)")
+
+        if not instance.deep_health_check(timeout=30.0):
+            raise RuntimeError(
+                f"Worker {key} failed deep health check (health_generate) - "
+                "model may be stuck or crashed"
+            )
+
+        logger.info("Worker %s passed deep health check", key)
+        return instance
+
+    def _evict_for_gpus(
+        self,
+        required_gpus: int,
+        exclude_model_id: str | None = None,
+        exclude_mode: ConnectionMode | None = None,
+        exclude_worker_types: set[WorkerType] | None = None,
+    ) -> None:
+        """Evict models until we have enough GPUs available.
+
+        Uses MRU (most recently used) eviction strategy - evicts models that
+        were just used first, keeping models that haven't been used yet
+        (which are likely waiting for upcoming tests).
+
+        Args:
+            required_gpus: Number of GPUs needed.
+            exclude_model_id: Model ID to exclude from eviction.
+            exclude_mode: Connection mode to exclude from eviction (optional).
+            exclude_worker_types: Worker types to exclude from eviction.
+                If None, falls back to excluding by model_id only (backward compatible).
+        """
+        available = self.allocator.available_gpus()
+        if len(available) >= required_gpus:
+            return  # Already have enough
+
+        # Sort by last_used descending (MRU eviction) - evict most recently used first
+        # Store (dict_key, instance) tuples to preserve the actual key for eviction
+        evictable: list[tuple[str, ModelInstance]] = []
+        for dict_key, inst in self.instances.items():
+            if exclude_worker_types is not None:
+                # Precise matching with worker types
+                # Must match model_id AND worker_type, mode is optional
+                if (
+                    exclude_model_id is not None
+                    and inst.model_id == exclude_model_id
+                    and inst.worker_type in exclude_worker_types
+                ):
+                    # If mode is specified, also require mode match
+                    if exclude_mode is None or inst.mode == exclude_mode:
+                        continue
+            else:
+                # Backward compatible: exclude by model_id only
+                if exclude_model_id is not None and inst.model_id == exclude_model_id:
+                    continue
+            evictable.append((dict_key, inst))
+
+        evictable.sort(key=lambda x: x[1].last_used, reverse=True)
+
+        freed_gpus = len(available)
+        for dict_key, inst in evictable:
+            if freed_gpus >= required_gpus:
+                break
+
+            logger.info("Evicting model %s (MRU) to free GPUs", dict_key)
+            self._evict_instance(dict_key)
+            if inst.gpu_slot:
+                freed_gpus += len(inst.gpu_slot.gpu_ids)
+
+    def _ensure_gpu_available(self, model_id: str) -> None:
+        """Ensure GPU is available for a model, evicting if needed.
+
+        Args:
+            model_id: Model ID that needs GPU resources.
+
+        Raises:
+            RuntimeError: If not enough GPUs after eviction.
+        """
+        spec = get_model_spec(model_id)
+        required_gpus = spec.get("tp", 1)
+
+        # Exclude REGULAR workers of same model from eviction (keep them)
+        # but allow evicting PD workers (PREFILL/DECODE) to free GPUs
+        self._evict_for_gpus(
+            required_gpus,
+            exclude_model_id=model_id,
+            exclude_worker_types={WorkerType.REGULAR},
+        )
+
+        available = self.allocator.available_gpus()
+        if len(available) < required_gpus:
+            raise RuntimeError(
+                f"Cannot launch {model_id}: need {required_gpus} GPUs, "
+                f"only {len(available)} available after eviction"
+            )
+
+    def _evict_instance(self, key: str) -> None:
+        """Evict a model instance and free its resources.
+
+        Args:
+            key: Instance key to evict.
+        """
+        if key not in self.instances:
+            return
+
+        instance = self.instances[key]
+        instance.terminate()
+
+        # Release GPU slot back to allocator
+        if instance.gpu_slot:
+            self.allocator.release_slot(instance.gpu_slot)
+
+        del self.instances[key]
+        logger.info("Evicted instance %s", key)
+
+    def _wait_for_instance(self, key: str, timeout: float | None = None) -> None:
+        """Wait for a specific instance to become healthy.
+
+        Args:
+            key: Instance key to wait for.
+            timeout: Timeout in seconds. Defaults to _startup_timeout.
+        """
+        if timeout is None:
+            timeout = self._startup_timeout
+
+        start_time = time.time()
+        instance = self.instances.get(key)
+        if not instance:
+            raise KeyError(f"Instance {key} not found")
+
+        while (time.time() - start_time) < timeout:
+            if not instance.is_alive():
+                raise RuntimeError(f"Worker {key} died during startup")
+
+            if instance.health_check():
+                logger.info("Instance %s is healthy", key)
+                instance._healthy = True
+                return
+
+            time.sleep(HEALTH_CHECK_INTERVAL)
+
+        raise TimeoutError(f"Instance {key} did not become healthy within {timeout}s")
+
+    def get_workers_by_type(
+        self, model_id: str, worker_type: WorkerType
+    ) -> list[ModelInstance]:
+        """Get all workers of a specific type for a model.
+
+        Args:
+            model_id: The model ID.
+            worker_type: The worker type to filter by.
+
+        Returns:
+            List of matching ModelInstance objects.
+        """
+        return [
+            inst
+            for inst in self.instances.values()
+            if inst.model_id == model_id and inst.worker_type == worker_type
+        ]
+
+    def launch_workers(
+        self,
+        workers: list[WorkerIdentity],
+        startup_timeout: int = DEFAULT_STARTUP_TIMEOUT,
+        allow_eviction: bool = True,
+    ) -> list[ModelInstance]:
+        """Launch workers of any type.
+
+        This is the unified method for launching workers. It handles all worker
+        types (regular, prefill, decode) uniformly.
+
+        Args:
+            workers: List of WorkerIdentity objects specifying workers to launch.
+            startup_timeout: Timeout for workers to become healthy.
+            allow_eviction: If True, evict MRU models to free GPUs.
+
+        Returns:
+            List of launched ModelInstance objects.
+        """
+        if not workers:
+            return []
+
+        self._startup_timeout = startup_timeout
+
+        # Validate all workers
+        valid_workers: list[WorkerIdentity] = []
+        for w in workers:
+            if w.model_id not in MODEL_SPECS:
+                logger.warning("Unknown model %s, skipping", w.model_id)
+                continue
+            if w.mode not in LOCAL_MODES:
+                logger.warning("Invalid mode %s, skipping", w.mode)
+                continue
+            valid_workers.append(w)
+
+        if not valid_workers:
+            return []
+
+        # Calculate total GPUs needed
+        total_gpus = 0
+        for w in valid_workers:
+            spec = get_model_spec(w.model_id)
+            total_gpus += spec.get("tp", 1)
+
+        # Check if we have enough GPUs
+        available = self.allocator.available_gpus()
+        if len(available) < total_gpus:
+            if allow_eviction:
+                logger.info(
+                    "Need %d GPUs for %d workers, only %d available. Evicting...",
+                    total_gpus,
+                    len(valid_workers),
+                    len(available),
+                )
+                self._evict_for_gpus(total_gpus)
+            else:
+                logger.warning(
+                    "Need %d GPUs, only %d available. Skipping launch.",
+                    total_gpus,
+                    len(available),
+                )
+                return []
+
+        # Build allocation specs
+        allocation_specs = {}
+        for w in valid_workers:
+            spec = get_model_spec(w.model_id)
+            allocation_specs[w.key] = {
+                "model": spec["model"],
+                "memory_gb": spec.get("memory_gb", 16),
+                "tp": spec.get("tp", 1),
+            }
+
+        # Allocate GPU slots
+        slots = self.allocator.allocate_slots(allocation_specs, preserve_order=True)
+        slot_map = {s.assigned_model: s for s in slots}
+
+        if not slots:
+            raise RuntimeError(
+                f"Failed to allocate GPU slots for {len(valid_workers)} workers"
+            )
+
+        # Detect IB device for PD workers
+        has_pd = any(w.is_prefill or w.is_decode for w in valid_workers)
+        ib_device = detect_ib_device() if has_pd else None
+
+        # Track bootstrap ports for PD groups (shared within model/mode)
+        pd_bootstrap_ports: dict[tuple[str, ConnectionMode], int] = {}
+
+        instances: list[ModelInstance] = []
+        for w in valid_workers:
+            # Get bootstrap port for PD workers
+            bootstrap_port = None
+            if w.is_prefill or w.is_decode:
+                pd_key = (w.model_id, w.mode)
+                if pd_key not in pd_bootstrap_ports:
+                    pd_bootstrap_ports[pd_key] = get_open_port()
+                bootstrap_port = pd_bootstrap_ports[pd_key]
+
+            instance = self._launch_model(
+                model_id=w.model_id,
+                mode=w.mode,
+                gpu_slot=slot_map.get(w.key),
+                worker_type=w.worker_type,
+                bootstrap_port=bootstrap_port if w.is_prefill else None,
+                ib_device=ib_device if (w.is_prefill or w.is_decode) else None,
+                instance_key=w.key,
+            )
+            instances.append(instance)
+
+        self._wait_all_healthy()
+        return instances
+
+    def get_client(
+        self, model_id: str, mode: ConnectionMode | str = ConnectionMode.HTTP
+    ) -> "openai.OpenAI":
         """Get OpenAI client for a specific model.
 
         Args:
             model_id: The model ID to get a client for.
+            mode: The mode (ConnectionMode.HTTP or ConnectionMode.GRPC). Defaults to HTTP.
 
         Returns:
             OpenAI client configured for this model.
-
-        Raises:
-            KeyError: If model is not running.
         """
         import openai
 
-        if model_id not in self.instances:
-            raise KeyError(
-                f"Model {model_id} not running. Available: {list(self.instances.keys())}"
-            )
-
-        instance = self.instances[model_id]
+        instance = self.get(model_id, mode)
         return openai.OpenAI(
             base_url=f"{instance.base_url}/v1",
             api_key="not-used",
         )
 
-    def get_base_url(self, model_id: str) -> str:
+    def get_base_url(
+        self, model_id: str, mode: ConnectionMode | str = ConnectionMode.HTTP
+    ) -> str:
         """Get the base URL for a specific model."""
-        if model_id not in self.instances:
-            raise KeyError(
-                f"Model {model_id} not running. Available: {list(self.instances.keys())}"
-            )
-        return self.instances[model_id].base_url
+        return self.get(model_id, mode).base_url
 
     def shutdown(self) -> None:
         """Tear down all models."""

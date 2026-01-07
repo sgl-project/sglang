@@ -26,7 +26,7 @@ pub use kimik2::KimiK2Parser;
 pub use llama::LlamaParser;
 pub use minimax_m2::MinimaxM2Parser;
 pub use mistral::MistralParser;
-pub use passthrough::PassthroughParser;
+pub(crate) use passthrough::PassthroughParser;
 pub use pythonic::PythonicParser;
 pub use qwen::QwenParser;
 pub use step3::Step3Parser;

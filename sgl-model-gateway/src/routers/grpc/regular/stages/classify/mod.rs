@@ -4,6 +4,6 @@
 //! as the scheduler treats classify as an embedding request and returns logits.
 //! Only response processing is classify-specific (softmax + label mapping).
 
-pub mod response_processing;
+pub(crate) mod response_processing;
 
-pub use response_processing::ClassifyResponseProcessingStage;
+pub(crate) use response_processing::ClassifyResponseProcessingStage;

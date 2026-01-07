@@ -761,6 +761,25 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
         )
 
+        max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
+        self.prefill_delayer_wait_forward_passes = Histogram(
+            name="sglang:prefill_delayer_wait_forward_passes",
+            documentation="Histogram of forward passes waited by prefill delayer.",
+            labelnames=labels.keys(),
+            buckets=[5, 20, max_delay_passes - 1],
+        )
+        self.prefill_delayer_wait_seconds = Histogram(
+            name="sglang:prefill_delayer_wait_seconds",
+            documentation="Histogram of wait time in seconds by prefill delayer.",
+            labelnames=labels.keys(),
+            buckets=[5, 20, 100, 500],
+        )
+        self.prefill_delayer_timeouts_total = Counter(
+            name="sglang:prefill_delayer_timeouts_total",
+            documentation="Total number of prefill delayer timeouts.",
+            labelnames=labels.keys(),
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -780,6 +799,14 @@ class SchedulerMetricsCollector:
 
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
+
+    def observe_prefill_delayer_wait(
+        self, forward_passes: int, wait_seconds: float, is_timeout: bool
+    ) -> None:
+        self._log_histogram(self.prefill_delayer_wait_forward_passes, forward_passes)
+        self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
+        if is_timeout:
+            self.prefill_delayer_timeouts_total.labels(**self.labels).inc(1)
 
     def increment_retracted_reqs(
         self,
