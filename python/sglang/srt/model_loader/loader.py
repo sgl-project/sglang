@@ -1243,6 +1243,12 @@ class DummyModelLoader(BaseModelLoader):
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
+                    # Skip FusedMoE layers already quantized during init (FP8 or FP4)
+                    if (
+                        hasattr(module, "is_weights_quantized")
+                        and module.is_weights_quantized()
+                    ):
+                        continue
                     quant_method.process_weights_after_loading(module)
 
             # NOTE(woosuk): For accurate performance evaluation, we assign
