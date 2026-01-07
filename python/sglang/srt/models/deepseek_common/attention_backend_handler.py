@@ -1,9 +1,9 @@
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.models.deepseek.attention_forward_methods.forward_methods import (
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
-from sglang.srt.models.deepseek.utils import _is_hip
+from sglang.srt.models.deepseek_common.utils import _is_hip
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import use_intel_amx_backend
 

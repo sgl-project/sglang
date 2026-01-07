@@ -136,13 +136,13 @@ from sglang.srt.model_loader.utils import (
     should_deepgemm_weight_requant_ue8m0,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.deepseek.attention_backend_handler import (
+from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
 )
-from sglang.srt.models.deepseek.attention_forward_methods.forward_methods import (
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
-from sglang.srt.models.deepseek.utils import (
+from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _is_cpu,
     _is_cpu_amx_available,
