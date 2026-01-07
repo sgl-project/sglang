@@ -90,6 +90,7 @@ __all__ = [
     "CompressedTensorsW8A8Fp8MoEMethod",
     "NPUCompressedTensorsW8A8Int8MoEMethod",
     "CompressedTensorsWNA16MoEMethod",
+    "CompressedTensorsWNA16MarlinMoEMethod",
     "NPUCompressedTensorsW4A16Int4DynamicMoEMethod",
 ]
 
@@ -999,7 +1000,7 @@ class NPUCompressedTensorsW8A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
         return self.kernel.apply(layer, dispatch_output)
 
 
-class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
+class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
     def __init__(self, quant_config: CompressedTensorsConfig, num_gpu_experts=-1):
         self.quant_config = quant_config
