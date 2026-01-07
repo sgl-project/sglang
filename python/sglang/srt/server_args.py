@@ -622,11 +622,13 @@ class ServerArgs:
     # For model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
+    remote_instance_weight_loader_client_id: Optional[str] = None
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
     remote_instance_weight_loader_backend: Literal["transfer_engine", "nccl"] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
+    remote_instance_keepalive: bool = False
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -2303,6 +2305,13 @@ class ServerArgs:
         )
         os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = (
             "1" if self.enable_deterministic_inference else "0"
+        )
+        if not self.remote_instance_keepalive:
+            self.remote_instance_keepalive = get_bool_env_var(
+                "SGLANG_REMOTE_INSTANCE_KEEPALIVE"
+            )
+        os.environ["SGLANG_REMOTE_INSTANCE_KEEPALIVE"] = (
+            "1" if self.remote_instance_keepalive else "0"
         )
         # Set the highest strict level for Kimi K2 tool calls
         if (
@@ -4462,6 +4471,19 @@ class ServerArgs:
             "--remote-instance-weight-loader-start-seed-via-transfer-engine",
             action="store_true",
             help="Start seed server via transfer engine backend for remote instance weight loader.",
+        )
+        parser.add_argument(
+            "--remote-instance-weight-loader-client-id",
+            type=str,
+            default=ServerArgs.remote_instance_weight_loader_client_id,
+            help="Optional client identifier to namespace remote_instance NCCL process groups.",
+        )
+        parser.add_argument(
+            "--remote-instance-keepalive",
+            action="store_true",
+            default=ServerArgs.remote_instance_keepalive,
+            help="Keep one NCCL process group alive to avoid NET plugin unload/reload issues. "
+            "Can also be enabled via SGLANG_REMOTE_INSTANCE_KEEPALIVE=1.",
         )
 
         # For PD-Multiplexing

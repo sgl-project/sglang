@@ -151,6 +151,7 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
+    remote_instance_destroy_process_group,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_tp_gather,
@@ -847,6 +848,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             download_dir=self.server_args.download_dir,
             model_loader_extra_config=self.server_args.model_loader_extra_config,
             tp_rank=self.tp_rank,
+            remote_instance_weight_loader_client_id=self.server_args.remote_instance_weight_loader_client_id,
             remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
@@ -867,14 +869,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
             if self.tp_rank == 0:
-                instance_ip = socket.gethostbyname(socket.gethostname())
+                client_id = (
+                    self.server_args.remote_instance_weight_loader_client_id
+                    or socket.gethostbyname(socket.gethostname())
+                )
                 t = threading.Thread(
                     target=trigger_init_weights_send_group_for_remote_instance_request,
                     args=(
                         self.server_args.remote_instance_weight_loader_seed_instance_ip,
                         self.server_args.remote_instance_weight_loader_seed_instance_service_port,
                         self.server_args.remote_instance_weight_loader_send_weights_group_ports,
-                        instance_ip,
+                        client_id,
                     ),
                 )
                 t.start()
@@ -1170,12 +1175,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         success = False
         message = ""
         try:
-            for _, weights in self.model.named_parameters():
-                torch.distributed.broadcast(
-                    weights,
-                    src=0,
-                    group=send_group,
+            bucket_cap_mb = int(
+                os.environ.get("SGLANG_REMOTE_INSTANCE_COALESCE_BROADCAST_MB", "0")
+            )
+
+            if bucket_cap_mb > 0 and hasattr(torch.distributed, "_broadcast_coalesced"):
+                tensors = [p.detach() for _, p in self.model.named_parameters()]
+                torch.distributed._broadcast_coalesced(
+                    send_group,
+                    tensors,
+                    bucket_cap_mb,
+                    0,
                 )
+            else:
+                for _, weights in self.model.named_parameters():
+                    torch.distributed.broadcast(
+                        weights,
+                        src=0,
+                        group=send_group,
+                    )
+            torch.cuda.synchronize()
             success = True
             message = f"Succeeded to send weights through {master_address}:{group_port} {group_name}."
         except Exception as e:
@@ -1184,7 +1203,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # destroy the process group after sending weights
         del self._weights_send_group[group_name]
-        torch.distributed.distributed_c10d.destroy_process_group(send_group)
+        if success:
+            remote_instance_destroy_process_group(
+                send_group,
+                tag=f"seed_send tp_rank={self.tp_rank} master={master_address}:{group_port} group_name={group_name}",
+            )
+        else:
+            torch.distributed.distributed_c10d.destroy_process_group(send_group)
         torch.cuda.empty_cache()
         return success, message
 

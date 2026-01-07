@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import builtins
 import ctypes
 import functools
@@ -1852,6 +1853,71 @@ def init_custom_process_group(
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
 
     return pg
+
+
+_REMOTE_INSTANCE_KEEPALIVE_LOCK = threading.Lock()
+_REMOTE_INSTANCE_KEEPALIVE_PG = None
+_REMOTE_INSTANCE_KEEPALIVE_TAG = None
+_REMOTE_INSTANCE_KEEPALIVE_REGISTERED = False
+
+
+def _destroy_remote_instance_keepalive_pg() -> None:
+    global _REMOTE_INSTANCE_KEEPALIVE_PG, _REMOTE_INSTANCE_KEEPALIVE_TAG
+    with _REMOTE_INSTANCE_KEEPALIVE_LOCK:
+        pg = _REMOTE_INSTANCE_KEEPALIVE_PG
+        tag = _REMOTE_INSTANCE_KEEPALIVE_TAG
+        _REMOTE_INSTANCE_KEEPALIVE_PG = None
+        _REMOTE_INSTANCE_KEEPALIVE_TAG = None
+
+    if pg is None:
+        return
+
+    try:
+        dist.distributed_c10d.destroy_process_group(pg)
+    except Exception:
+        logger.debug(
+            "[remote_instance] KEEPALIVE destroy at exit failed (tag=%s). Ignoring.",
+            tag,
+            exc_info=True,
+        )
+
+
+def remote_instance_destroy_process_group(pg, *, tag: str = "") -> None:
+    """Destroy a PG, unless remote_instance keepalive captures the first PG."""
+    global _REMOTE_INSTANCE_KEEPALIVE_PG, _REMOTE_INSTANCE_KEEPALIVE_TAG, _REMOTE_INSTANCE_KEEPALIVE_REGISTERED
+
+    if pg is None:
+        return
+
+    if get_bool_env_var("SGLANG_REMOTE_INSTANCE_KEEPALIVE"):
+        with _REMOTE_INSTANCE_KEEPALIVE_LOCK:
+            if _REMOTE_INSTANCE_KEEPALIVE_PG is None:
+                _REMOTE_INSTANCE_KEEPALIVE_PG = pg
+                _REMOTE_INSTANCE_KEEPALIVE_TAG = tag
+                if not _REMOTE_INSTANCE_KEEPALIVE_REGISTERED:
+                    atexit.register(_destroy_remote_instance_keepalive_pg)
+                    _REMOTE_INSTANCE_KEEPALIVE_REGISTERED = True
+                logger.warning(
+                    "[remote_instance] KEEPALIVE enabled: keeping one NCCL process group alive (tag=%s)",
+                    tag,
+                )
+                return
+            if pg is _REMOTE_INSTANCE_KEEPALIVE_PG:
+                logger.debug(
+                    "[remote_instance] KEEPALIVE: attempted to destroy keepalive PG (tag=%s). Ignoring.",
+                    tag,
+                )
+                return
+
+    try:
+        dist.distributed_c10d.destroy_process_group(pg)
+    except Exception:
+        logger.debug(
+            "Failed to destroy process group %s (tag=%s). Ignoring.",
+            pg,
+            tag,
+            exc_info=True,
+        )
 
 
 def crash_on_warnings():

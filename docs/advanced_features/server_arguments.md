@@ -443,6 +443,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--remote-instance-weight-loader-seed-instance-ip` | The ip of the seed instance for loading weights from remote instance. | `None` | Type: str |
 | `--remote-instance-weight-loader-seed-instance-service-port` | The service port of the seed instance for loading weights from remote instance. | `None` | Type: int |
 | `--remote-instance-weight-loader-send-weights-group-ports` | The communication group ports for loading weights from remote instance. | `None` | Type: JSON list |
+| `--remote-instance-weight-loader-client-id` | Optional client identifier to namespace remote_instance NCCL process groups. | `None` | Type: str |
+| `--remote-instance-keepalive` | Keep one NCCL process group alive to avoid NET plugin unload/reload issues. | `False` | bool flag (set to enable) |
 
 ## For PD-Multiplexing
 | Argument | Description | Defaults | Options |
