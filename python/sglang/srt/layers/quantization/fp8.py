@@ -807,7 +807,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
                 from sglang.srt.layers import deep_gemm_wrapper
                 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
-                from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
                 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
                 from sglang.srt.model_loader.utils import (
                     should_deepgemm_weight_requant_ue8m0,
@@ -819,7 +818,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 will_use_deepgemm = moe_runner_backend.is_deep_gemm()
                 if moe_runner_backend.is_auto():
                     will_use_deepgemm = deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-                        get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+                        get_moe_a2a_backend().is_deepep()
+                        or get_moe_a2a_backend().is_mooncake()
                     )
 
                 if (
