@@ -5,13 +5,13 @@ import { useTraceStore } from '../stores/useTraceStore';
 import { AttentionStreamClient } from '../api/client';
 import { extractFingerprint } from '../api/types';
 
-export interface UseAttentionStreamOptions {
-  baseUrl?: string;
-  model?: string;
-}
+export function useAttentionStream() {
+  // Get baseUrl and model from store - these are configurable
+  const baseUrl = useUIStore((state) => state.baseUrl);
+  const modelName = useUIStore((state) => state.modelName);
 
-export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
-  const { baseUrl = 'http://localhost:8000', model = 'Qwen/Qwen3-Next-80B-A3B-Thinking-FP8' } = options;
+  // Use 'default' as model fallback - SGLang accepts this to use the loaded model
+  const model = modelName && modelName !== 'Not connected' ? modelName : 'default';
 
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<Error | null>(null);
