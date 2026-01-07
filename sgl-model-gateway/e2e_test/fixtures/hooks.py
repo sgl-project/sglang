@@ -269,21 +269,38 @@ def get_pool_requirements() -> list["WorkerIdentity"]:
 # ---------------------------------------------------------------------------
 
 
+def _count_gpus_without_cuda() -> int:
+    """Count available GPUs without initializing CUDA.
+
+    Uses nvidia-smi to avoid CUDA initialization, which is critical for
+    pytest-parallel compatibility. CUDA cannot be re-initialized after a fork.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return len([line for line in result.stdout.strip().split("\n") if line])
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        pass
+    return 0
+
+
 def validate_gpu_requirements() -> tuple[int, int]:
     """Check if there are enough GPUs for any single test.
+
+    Uses nvidia-smi instead of torch.cuda to avoid CUDA initialization,
+    which would break pytest-parallel (CUDA cannot be re-initialized after fork).
 
     Returns:
         Tuple of (max_required_gpus, available_gpus).
     """
-    available_gpus = 0
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            available_gpus = torch.cuda.device_count()
-    except ImportError:
-        pass
-
+    available_gpus = _count_gpus_without_cuda()
     return _max_test_gpu_requirement, available_gpus
 
 
