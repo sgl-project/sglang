@@ -186,7 +186,7 @@ jobs:
             extra_deps: ""
             env_vars: "SHOW_ROUTER_LOGS=1"
             reruns: "--reruns 3 --reruns-delay 2"
-          - name: router-embeddings
+          - name: e2e
             timeout: 45
             test_dirs: "e2e_test/router e2e_test/embeddings"
             extra_deps: ""
