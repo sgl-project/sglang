@@ -565,7 +565,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert is_sm100_supported() or is_sm90_supported()
 
     @staticmethod
-    def is_deepgemm_enabled() -> bool:
+    def is_deepgemm_moe_runner_backend_enabled() -> bool:
         """Check if MoE will actually use DeepGEMM runner for FP8."""
         from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -826,7 +826,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
                 # Check if MoE will actually use DeepGEMM runner
-                will_use_deepgemm = self.is_deepgemm_enabled()
+                will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
 
                 if (
                     should_deepgemm_weight_requant_ue8m0(
@@ -1127,7 +1127,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
-            if self.is_deepgemm_enabled():
+            if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
