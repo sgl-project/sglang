@@ -138,8 +138,8 @@ def parse_custom_headers(header_list: List[str]) -> Dict[str, str]:
 
 def get_request_headers() -> Dict[str, str]:
     headers = get_auth_headers()
-    if hasattr(args, "header") and args.header:
-        headers.update(parse_custom_headers(args.header))
+    if h := getattr(args, "header", None):
+        headers.update(parse_custom_headers(h))
     return headers
 
 
