@@ -464,6 +464,5 @@ def cp_lse_ag_out_rs(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
     out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, ctx)
-    assert out.is_contiguous()
     out = cp_group.reduce_scatter_along_dim(out, dim=1)
     return out
