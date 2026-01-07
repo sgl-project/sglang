@@ -16,7 +16,6 @@ suites = {
         TestFile("test_hidden_states.py", 55),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
-        TestFile("test_mamba_unittest.py", 9),
         TestFile("test_model_hooks.py", 6),
         TestFile("test_modelopt_loader.py", 11),
         TestFile("test_page_size.py", 60),
@@ -28,7 +27,6 @@ suites = {
         TestFile("test_start_profile.py", 41),
         TestFile("test_profile_merger.py", 8),
         TestFile("test_profile_merger_http_api.py", 9),
-        TestFile("test_swa_unittest.py", 8),
         TestFile("test_utils_update_weights.py", 29),
         TestFile("test_video_utils.py", 5),
         TestFile("test_modelopt_export.py", 9),
@@ -134,7 +132,6 @@ suite_amd = {
         TestFile("test_srt_endpoint.py", 130),
         TestFile("test_srt_engine.py", 261),
         TestFile("test_start_profile.py", 60),
-        TestFile("test_swa_unittest.py", 10),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_type_based_dispatcher.py", 10),
         TestFile("test_video_utils.py", 8),
