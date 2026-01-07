@@ -10,6 +10,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
+from sglang.jit_kernel.diffusion.fused_norm_scale_shift import fused_norm_scale_shift
+from sglang.jit_kernel.diffusion.fused_scale_residual_norm_scale_shift import (
+    fused_scale_residual_norm_scale_shift,
+)
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
@@ -17,10 +21,15 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     norm_infer,
     rms_norm_fn,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+
+_is_cuda = current_platform.is_cuda()
 
 
 # Copied and adapted from sglang
+
+
 @CustomOp.register("rms_norm")
 class RMSNorm(CustomOp):
     """Root mean square normalization.
@@ -57,6 +66,7 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         shape = x.shape
+        device = x.device
         x = x.reshape(-1, shape[-1])
         if residual is not None:
             residual_shape = residual.shape
@@ -71,7 +81,7 @@ class RMSNorm(CustomOp):
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x.view(shape), residual.view(residual_shape)
         else:
-            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            out = rmsnorm(x, self.weight.data.to(device), self.variance_epsilon)
         out = out.view(shape)
         return out
 
@@ -255,20 +265,66 @@ class ScaleResidual(nn.Module):
 class FP32LayerNorm(nn.LayerNorm):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         origin_dtype = inputs.dtype
+        device = inputs.device
         return F.layer_norm(
             inputs.float(),
             self.normalized_shape,
-            self.weight.float() if self.weight is not None else None,
-            self.bias.float() if self.bias is not None else None,
+            self.weight.float().to(device=device) if self.weight is not None else None,
+            self.bias.float().to(device=device) if self.bias is not None else None,
             self.eps,
         ).to(origin_dtype)
 
 
-class ScaleResidualLayerNormScaleShift(nn.Module):
+################################################################################
+# Fused norm kernel
+################################################################################
+def get_gate_arg(gate: torch.Tensor, shape: Tuple, dtype: torch.dtype, device):
+    if isinstance(gate, int):
+        # used by cross-attention, should be 1
+        assert gate == 1
+        return None
+    elif isinstance(gate, torch.Tensor):
+        if (
+            (gate.dim() == 2 and gate.shape[0] == 1)
+            or (gate.dim() == 3)
+            or (gate.dim() == 4)
+        ):
+            # gate.shape: [batch_size, num_frames, 1, inner_dim]
+            # gate.shape: [batch_size, 1, inner_dim]
+            return gate.contiguous().to(dtype=dtype, device=device)
+        elif gate.dim() == 2:
+            return (
+                gate.expand(-1, shape[-1])
+                .contiguous()
+                .view(-1, shape[-1])
+                .to(dtype=dtype, device=device)
+            )
+    else:
+        raise ValueError(f"Gate type {type(gate)} not supported")
+
+
+def get_norm_scale_shift_arg(t: torch.Tensor, shape: Tuple, dtype: torch.dtype, device):
+    if t.dim() == 0 or (t.dim() == 1 and t.numel() == 1):
+        t = t.reshape(1)
+    elif (
+        (t.dim() == 2 and t.shape[0] == 1)
+        or (t.dim() == 3 and t.shape[0] == 1 and t.shape[1] == 1)
+        or (t.dim() == 4)
+    ):
+        # Do nothing
+        pass
+    elif t.dim() == 2 or t.dim() == 3:
+        t = t.expand(shape).view(-1, shape[-1])
+    else:
+        raise ValueError(f"Scale/shift tensor dimension {t.dim()} not supported")
+    return t.contiguous().to(dtype=dtype, device=device)
+
+
+class _ScaleResidualNormScaleShift(CustomOp):
     """
     Fused operation that combines:
     1. Gated residual connection
-    2. LayerNorm
+    2. LayerNorm or RMSNorm
     3. Scale and shift operations
 
     This reduces memory bandwidth by combining memory-bound operations.
@@ -277,34 +333,26 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        norm_type: str = "rms",
+        norm_type: str,
         eps: float = 1e-6,
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
-        compute_dtype: torch.dtype | None = None,
         prefix: str = "",
     ):
         super().__init__()
+        self.norm_type = norm_type
+        self.eps = eps
         if norm_type == "rms":
-            self.norm = RMSNorm(
-                hidden_size, has_weight=elementwise_affine, eps=eps, dtype=dtype
-            )
+            self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif norm_type == "layer":
-            if compute_dtype == torch.float32:
-                self.norm = FP32LayerNorm(
-                    hidden_size, elementwise_affine=elementwise_affine, eps=eps
-                )
-            else:
-                self.norm = LayerNorm(
-                    hidden_size,
-                    elementwise_affine=elementwise_affine,
-                    eps=eps,
-                    dtype=dtype,
-                )
+            # compute_dtype is hardcoded to fp32 in fused kernel
+            self.norm = FP32LayerNorm(
+                hidden_size, elementwise_affine=elementwise_affine, eps=eps
+            )
         else:
             raise NotImplementedError(f"Norm type {norm_type} not implemented")
 
-    def forward(
+    def forward_cuda(
         self,
         residual: torch.Tensor,
         x: torch.Tensor,
@@ -322,8 +370,50 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             - residual value (value after residual connection
               but before normalization)
         """
+        if x.shape[-1] % 4 != 0:
+            # Only support 4-aligned hidden sizes for the fused path
+            return self.forward_native(residual, x, gate, shift, scale)
+
+        origin_shape = x.shape
+        device = x.device
+        x_2d = x.contiguous().view(-1, origin_shape[-1])
+        residual_2d = residual.contiguous().view(-1, origin_shape[-1])
+
+        # gamma/beta
+        gamma_opt = getattr(self.norm, "weight", None)
+        if gamma_opt is not None:
+            gamma_opt = gamma_opt.contiguous().to(dtype=x.dtype, device=device)
+        beta_opt = getattr(self.norm, "bias", None)
+        if beta_opt is not None:
+            beta_opt = beta_opt.contiguous().to(dtype=x.dtype, device=device)
+        gate_opt = get_gate_arg(gate, origin_shape, x.dtype, device)
+        scale_arg = get_norm_scale_shift_arg(scale, origin_shape, x.dtype, device)
+        shift_arg = get_norm_scale_shift_arg(shift, origin_shape, x.dtype, device)
+
+        y_2d, residual_output = fused_scale_residual_norm_scale_shift(
+            residual_2d,
+            x_2d,
+            gate_opt,
+            gamma_opt,
+            beta_opt,
+            scale_arg,
+            shift_arg,
+            self.norm_type,
+            self.eps,
+        )
+        return y_2d.view(origin_shape), residual_output.view(origin_shape)
+
+    def forward_native(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Fallback path for triton kernel (not fused)
         # x.shape: [batch_size, seq_len, inner_dim]
-        # Apply residual connection with gating
+        # Compute residual_output to return (kernel also computes this internally)
         if isinstance(gate, int):
             # used by cross-attention, should be 1
             assert gate == 1
@@ -337,30 +427,40 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
                     x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
                 ).flatten(1, 2)
             else:
-                # used by bidirectional self attention
                 # gate.shape: [batch_size, 1, inner_dim]
                 residual_output = residual + x * gate
         else:
             raise ValueError(f"Gate type {type(gate)} not supported")
-        # residual_output.shape: [batch_size, seq_len, inner_dim]
-
-        # Apply normalization
         normalized = self.norm(residual_output)
-
-        # modulated = fused_scale_shift(
-        #     normalized,
-        #     scale,
-        #     shift,
-        # )
-        modulated = fuse_scale_shift_kernel(
-            normalized,
-            scale,
-            shift,
-        )
+        modulated = fuse_scale_shift_kernel(normalized, scale, shift)
         return modulated, residual_output
 
 
-class LayerNormScaleShift(nn.Module):
+class ScaleResidualLayerNormScaleShift(_ScaleResidualNormScaleShift):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = False,
+        dtype: torch.dtype = torch.float32,
+        prefix: str = "",
+    ):
+        super().__init__(hidden_size, "layer", eps, elementwise_affine, dtype, prefix)
+
+
+class ScaleResidualRMSNormScaleShift(_ScaleResidualNormScaleShift):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = False,
+        dtype: torch.dtype = torch.float32,
+        prefix: str = "",
+    ):
+        super().__init__(hidden_size, "rms", eps, elementwise_affine, dtype, prefix)
+
+
+class _NormScaleShift(CustomOp):
     """
     Fused operation that combines LayerNorm with scale and shift operations.
     This reduces memory bandwidth by combining memory-bound operations.
@@ -369,59 +469,88 @@ class LayerNormScaleShift(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        norm_type: str = "rms",
+        norm_type: str,
         eps: float = 1e-6,
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
-        compute_dtype: torch.dtype | None = None,
         prefix: str = "",
     ):
         super().__init__()
-        self.compute_dtype = compute_dtype
+        self.norm_type = norm_type
+        self.eps = eps
         if norm_type == "rms":
-            self.norm = RMSNorm(hidden_size, has_weight=elementwise_affine, eps=eps)
+            self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif norm_type == "layer":
-            if self.compute_dtype == torch.float32:
-                self.norm = FP32LayerNorm(
-                    hidden_size, elementwise_affine=elementwise_affine, eps=eps
-                )
-            else:
-                self.norm = nn.LayerNorm(
-                    hidden_size,
-                    elementwise_affine=elementwise_affine,
-                    eps=eps,
-                    dtype=dtype,
-                )
+            # compute_dtype is hardcoded to fp32 in fused kernel
+            self.norm = FP32LayerNorm(
+                hidden_size, elementwise_affine=elementwise_affine, eps=eps, dtype=dtype
+            )
         else:
             raise NotImplementedError(f"Norm type {norm_type} not implemented")
 
-    def forward(
+    def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         """Apply ln followed by scale and shift in a single fused operation."""
-        # x.shape: [batch_size, seq_len, inner_dim]
+        if x.shape[-1] % 4 != 0:
+            # Only support 4-aligned hidden sizes for the fused path
+            return self.forward_native(x, shift, scale)
+
+        gamma_opt = getattr(self.norm, "weight", None)
+        beta_opt = getattr(self.norm, "bias", None)
+        if (
+            gamma_opt is None
+            and beta_opt is None
+            and (scale.dim() == 4 or shift.dim() == 4)
+        ):
+            # Only 2D scale/shift are supported by the no_affine kernel.
+            return self.forward_native(x, shift, scale)
+
+        origin_shape = x.shape
+        device = x.device
+        if gamma_opt is not None:
+            gamma_opt = gamma_opt.contiguous().to(dtype=x.dtype, device=device)
+        if beta_opt is not None:
+            beta_opt = beta_opt.contiguous().to(dtype=x.dtype, device=device)
+        x_2d = x.contiguous().view(-1, origin_shape[-1])
+        scale_arg = get_norm_scale_shift_arg(scale, origin_shape, x.dtype, device)
+        shift_arg = get_norm_scale_shift_arg(shift, origin_shape, x.dtype, device)
+        y_2d = fused_norm_scale_shift(
+            x_2d, gamma_opt, beta_opt, scale_arg, shift_arg, self.norm_type, self.eps
+        )
+        return y_2d.view(origin_shape)
+
+    def forward_native(
+        self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        # Fallback path for triton kernel (not fused)
         normalized = self.norm(x)
-        if self.compute_dtype == torch.float32:
-            normalized = normalized.float()
+        modulated = fuse_scale_shift_kernel(normalized, scale, shift)
+        return modulated.to(x.dtype)
 
-        if scale.dim() == 4:
-            # scale.shape: [batch_size, num_frames, 1, inner_dim]
-            num_frames = scale.shape[1]
-            frame_seqlen = normalized.shape[1] // num_frames
-            output = (
-                normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
-                * (1.0 + scale)
-                + shift
-            ).flatten(1, 2)
-        else:
-            # scale.shape: [batch_size, 1, inner_dim]
-            # shift.shape: [batch_size, 1, inner_dim]
-            output = normalized * (1.0 + scale) + shift
 
-        if self.compute_dtype == torch.float32:
-            output = output.to(x.dtype)
+class LayerNormScaleShift(_NormScaleShift):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = False,
+        dtype: torch.dtype = torch.float32,
+        prefix: str = "",
+    ):
+        super().__init__(hidden_size, "layer", eps, elementwise_affine, dtype, prefix)
 
-        return output
+
+class RMSNormScaleShift(_NormScaleShift):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = False,
+        dtype: torch.dtype = torch.float32,
+        prefix: str = "",
+    ):
+        super().__init__(hidden_size, "rms", eps, elementwise_affine, dtype, prefix)
 
 
 def apply_qk_norm(
@@ -469,3 +598,14 @@ def apply_qk_norm(
     q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
     k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
     return q_out, k_out
+
+
+# TODO: Workaround, fuse norm with new select01 kernel
+def apply_layernorm_only(x: torch.Tensor, layernorm_scale_shift: LayerNormScaleShift):
+    return norm_infer(
+        x.view(-1, x.shape[-1]),
+        layernorm_scale_shift.norm.weight,
+        layernorm_scale_shift.norm.bias,
+        eps=layernorm_scale_shift.eps,
+        is_rms_norm=False,
+    ).view(x.shape)
