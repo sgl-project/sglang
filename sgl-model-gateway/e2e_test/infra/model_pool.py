@@ -246,11 +246,15 @@ class ModelPool:
         requirements: list[WorkerIdentity] | None = None,
         startup_timeout: int = DEFAULT_STARTUP_TIMEOUT,
     ) -> None:
-        """Start worker processes for the required workers.
+        """Start worker processes for the required workers in order.
 
         Workers are launched sequentially (one Popen at a time) but boot up
         concurrently since model loading happens in parallel across processes.
         This method blocks until all workers pass health checks.
+
+        For PD workers (prefill/decode), both must be launched together as a pair.
+        If there aren't enough GPUs for the full pair, PD workers are deferred
+        to on-demand launch (which can evict other models).
 
         Args:
             requirements: List of WorkerIdentity specifying what to start.
@@ -271,8 +275,7 @@ class ModelPool:
                 seen.add(req)
                 unique_requirements.append(req)
 
-        # Validate and filter to regular workers only
-        # (PD workers are launched on-demand via launch_pd_workers)
+        # Validate requirements
         valid_requirements: list[WorkerIdentity] = []
         for identity in unique_requirements:
             if identity.model_id not in MODEL_SPECS:
@@ -282,9 +285,6 @@ class ModelPool:
                 logger.warning(
                     "Invalid mode %s for %s, skipping", identity.mode, identity.model_id
                 )
-                continue
-            if identity.is_prefill or identity.is_decode:
-                logger.info("PD worker %s will be launched on-demand", identity)
                 continue
             valid_requirements.append(identity)
 
@@ -296,53 +296,162 @@ class ModelPool:
             "Starting model pool with: %s", [str(r) for r in valid_requirements]
         )
 
-        # Build allocation specs - each worker needs its own slot
-        # Use str(identity) as the allocation key
-        allocation_specs = {}
+        # Identify PD pairs: (model_id, mode) -> {prefill: bool, decode: bool}
+        pd_pairs: dict[tuple[str, ConnectionMode], dict[str, bool]] = {}
         for identity in valid_requirements:
-            spec = MODEL_SPECS[identity.model_id]
-            allocation_specs[str(identity)] = {
-                "model": spec["model"],
-                "memory_gb": spec.get("memory_gb", 16),
-                "tp": spec.get("tp", 1),
-            }
+            if identity.is_prefill or identity.is_decode:
+                key = (identity.model_id, identity.mode)
+                if key not in pd_pairs:
+                    pd_pairs[key] = {"prefill": False, "decode": False}
+                if identity.is_prefill:
+                    pd_pairs[key]["prefill"] = True
+                else:
+                    pd_pairs[key]["decode"] = True
 
-        # Allocate GPU slots (preserve test order so earlier tests get models first)
-        slots = self.allocator.allocate_slots(allocation_specs, preserve_order=True)
+        # Detect IB device once for PD workers
+        ib_device = detect_ib_device() if pd_pairs else None
+        if ib_device:
+            logger.info("Detected InfiniBand device: %s", ib_device)
 
-        # Track which models got slots
-        launched_keys = set()
+        # Track PD pairs we've already launched
+        pd_pairs_launched: set[tuple[str, ConnectionMode]] = set()
+        deferred: list[str] = []
 
-        if not slots:
-            logger.warning("No GPU slots allocated, launching without GPU assignment")
-            # Fallback: launch without specific GPU assignment
-            for identity in valid_requirements:
-                self._launch_model(identity.model_id, identity.mode, gpu_slot=None)
-                launched_keys.add(str(identity))
-        else:
-            # Launch on allocated slots
-            for slot in slots:
-                if slot.assigned_model:
-                    # Parse key back to identity components
-                    parts = slot.assigned_model.split(":")
-                    model_id = parts[0]
-                    mode = ConnectionMode(parts[1])
-                    worker_type = (
-                        WorkerType(parts[2]) if len(parts) > 2 else WorkerType.REGULAR
+        # Process requirements in order
+        for identity in valid_requirements:
+            spec = get_model_spec(identity.model_id)
+            tp = spec.get("tp", 1)
+
+            if identity.is_regular:
+                # Regular worker - allocate and launch
+                available_gpus = self.allocator.available_gpus()
+                if len(available_gpus) >= tp:
+                    allocation_specs = {
+                        str(identity): {
+                            "model": spec["model"],
+                            "memory_gb": spec.get("memory_gb", 16),
+                            "tp": tp,
+                        }
+                    }
+                    slots = self.allocator.allocate_slots(
+                        allocation_specs, preserve_order=True
                     )
-                    self._launch_model(
-                        model_id, mode, gpu_slot=slot, worker_type=worker_type
+                    if slots:
+                        self._launch_model(
+                            identity.model_id,
+                            identity.mode,
+                            gpu_slot=slots[0],
+                            worker_type=WorkerType.REGULAR,
+                        )
+                    else:
+                        deferred.append(str(identity))
+                else:
+                    logger.info(
+                        "Not enough GPUs for %s (need %d, have %d), deferring",
+                        identity,
+                        tp,
+                        len(available_gpus),
                     )
-                    launched_keys.add(slot.assigned_model)
+                    deferred.append(str(identity))
 
-        # Log models that will be launched on-demand (not enough GPUs to pre-launch)
-        all_keys = set(allocation_specs.keys())
-        deferred_keys = all_keys - launched_keys
-        if deferred_keys:
+            else:
+                # PD worker - need to launch as pair
+                pd_key = (identity.model_id, identity.mode)
+
+                # Skip if we already launched this pair
+                if pd_key in pd_pairs_launched:
+                    continue
+
+                # Check if both prefill and decode are in requirements
+                pair_info = pd_pairs.get(pd_key, {})
+                has_both = pair_info.get("prefill") and pair_info.get("decode")
+
+                if not has_both:
+                    logger.warning(
+                        "PD pair %s:%s is incomplete (prefill=%s, decode=%s), skipping",
+                        pd_key[0],
+                        pd_key[1].value,
+                        pair_info.get("prefill"),
+                        pair_info.get("decode"),
+                    )
+                    deferred.append(str(identity))
+                    continue
+
+                # Check if we have enough GPUs for both workers
+                required_gpus = tp * 2  # One for prefill, one for decode
+                available_gpus = self.allocator.available_gpus()
+
+                if len(available_gpus) >= required_gpus:
+                    # Allocate slots for both
+                    prefill_key = f"{identity.model_id}:{identity.mode.value}:prefill_0"
+                    decode_key = f"{identity.model_id}:{identity.mode.value}:decode_0"
+                    allocation_specs = {
+                        prefill_key: {
+                            "model": spec["model"],
+                            "memory_gb": spec.get("memory_gb", 16),
+                            "tp": tp,
+                        },
+                        decode_key: {
+                            "model": spec["model"],
+                            "memory_gb": spec.get("memory_gb", 16),
+                            "tp": tp,
+                        },
+                    }
+                    slots = self.allocator.allocate_slots(
+                        allocation_specs, preserve_order=True
+                    )
+                    slot_map = {s.assigned_model: s for s in slots}
+
+                    if len(slots) >= 2:
+                        # Launch prefill
+                        bootstrap_port = get_open_port()
+                        self._launch_model(
+                            identity.model_id,
+                            identity.mode,
+                            gpu_slot=slot_map.get(prefill_key),
+                            worker_type=WorkerType.PREFILL,
+                            bootstrap_port=bootstrap_port,
+                            ib_device=ib_device,
+                            instance_key=prefill_key,
+                        )
+                        # Launch decode
+                        self._launch_model(
+                            identity.model_id,
+                            identity.mode,
+                            gpu_slot=slot_map.get(decode_key),
+                            worker_type=WorkerType.DECODE,
+                            ib_device=ib_device,
+                            instance_key=decode_key,
+                        )
+                        pd_pairs_launched.add(pd_key)
+                        logger.info(
+                            "Launched PD pair for %s:%s",
+                            identity.model_id,
+                            identity.mode.value,
+                        )
+                    else:
+                        logger.warning(
+                            "Failed to allocate slots for PD pair %s:%s",
+                            identity.model_id,
+                            identity.mode.value,
+                        )
+                        deferred.append(f"{identity.model_id}:{identity.mode.value}:pd")
+                else:
+                    logger.info(
+                        "Not enough GPUs for PD pair %s:%s (need %d, have %d), deferring",
+                        identity.model_id,
+                        identity.mode.value,
+                        required_gpus,
+                        len(available_gpus),
+                    )
+                    deferred.append(f"{identity.model_id}:{identity.mode.value}:pd")
+
+        # Log deferred workers
+        if deferred:
             logger.info(
-                "%d models deferred for on-demand launch: %s",
-                len(deferred_keys),
-                deferred_keys,
+                "%d workers deferred for on-demand launch: %s",
+                len(deferred),
+                deferred,
             )
 
         # Wait for all launched models to be healthy
