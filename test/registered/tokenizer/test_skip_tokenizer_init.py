@@ -7,12 +7,11 @@ import json
 import unittest
 
 import requests
-
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from transformers import AutoProcessor, AutoTokenizer
 
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
