@@ -166,7 +166,12 @@ def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     stride_x1 = x1.stride(0)
     stride_x2 = x2.stride(0)
 
-    B_padded = (B + B2 + 3) // 4 * 4  # align to 16 bytes
+    # We found that custom all-reduce `sglang::cross_device_reduce_1stage`
+    # is much faster than the nccl all-reduce in torch.
+    # However, `should_custom_ar` checks if the reduced buffer is 16-byte aligned.
+    # RMSNormTP reduces a [B, 2] fp32 tensor, so we pad the total element count to
+    # satisfy the alignment requirement.
+    B_padded = (B + B2 + 3) // 4 * 4
 
     sum_sq = torch.empty(B_padded, device=x1.device, dtype=torch.float32)
 
