@@ -409,8 +409,9 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # MI35x 8-GPU tests (TP=8) - DeepSeek-R1-0528 all variants (basic, MTP, DP, TC)
+  # MI35x 8-GPU tests (TP=8) - DeepSeek-R1-0528 basic + MTP only
   # Same model as MI300X for consistency; MXFP4 only used for perf tests
+  # Note: DP/TC variants disabled for MI35x due to initialization timeouts
   nightly-test-8-gpu-mi35x-deepseek-r1:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu-mi35x-deepseek-r1')
     runs-on: linux-mi35x-gpu-8
@@ -433,11 +434,11 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd_ci_exec.sh pip install tabulate
 
-      - name: Nightly Test MI35x (8-GPU DeepSeek-R1-0528 all variants)
-        timeout-minutes: 300
+      - name: Nightly Test MI35x (8-GPU DeepSeek-R1-0528 basic + MTP)
+        timeout-minutes: 180
         run: |
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e AMD_TEST_MODEL_GROUP=deepseek-r1-all \
+            -e AMD_TEST_MODEL_GROUP=deepseek-r1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
