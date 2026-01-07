@@ -105,7 +105,7 @@ impl ToolCallMode {
 ///
 /// Returns an SSE stream that parses Harmony tokens incrementally and
 /// emits ChatCompletionChunk events for streaming responses.
-pub struct HarmonyStreamingProcessor;
+pub(crate) struct HarmonyStreamingProcessor;
 
 impl HarmonyStreamingProcessor {
     /// Create a new Harmony streaming processor

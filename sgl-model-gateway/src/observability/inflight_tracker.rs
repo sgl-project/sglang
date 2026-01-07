@@ -1,7 +1,7 @@
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, LazyLock, OnceLock,
     },
     time::Instant,
 };
@@ -11,10 +11,37 @@ use dashmap::DashMap;
 use super::metrics::Metrics;
 use crate::policies::utils::PeriodicTask;
 
+struct NumericalBuckets {
+    upper_bounds: &'static [u64],
+    le_labels: Vec<&'static str>,
+    gt_labels: Vec<&'static str>,
+}
+
+impl NumericalBuckets {
+    fn new(upper_bounds: &'static [u64]) -> Self {
+        let leak_str = |n: u64| Box::leak(n.to_string().into_boxed_str()) as &'static str;
+
+        let mut le_labels: Vec<&'static str> = upper_bounds.iter().map(|&b| leak_str(b)).collect();
+        le_labels.push("+Inf");
+
+        let mut gt_labels: Vec<&'static str> = vec!["0"];
+        gt_labels.extend(upper_bounds.iter().map(|&b| leak_str(b)));
+
+        Self {
+            upper_bounds,
+            le_labels,
+            gt_labels,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.le_labels.len()
+    }
+}
+
 const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400];
-const AGE_BUCKET_LABELS: &[&str] = &[
-    "30", "60", "180", "300", "600", "1200", "3600", "7200", "14400", "28800", "86400", "+Inf",
-];
+static AGE_BUCKETS: LazyLock<NumericalBuckets> =
+    LazyLock::new(|| NumericalBuckets::new(AGE_BUCKET_BOUNDS));
 
 pub struct InFlightRequestTracker {
     requests: DashMap<u64, Instant>,
@@ -56,34 +83,33 @@ impl InFlightRequestTracker {
         self.requests.is_empty()
     }
 
-    pub fn compute_bucket_counts(&self) -> [usize; AGE_BUCKET_LABELS.len()] {
+    pub fn compute_bucket_counts(&self) -> Vec<usize> {
+        let buckets = &*AGE_BUCKETS;
         let now = Instant::now();
-        let inf_idx = AGE_BUCKET_LABELS.len() - 1;
+        let inf_idx = buckets.len() - 1;
 
-        let mut non_cumulative_counts = [0usize; AGE_BUCKET_LABELS.len()];
+        let mut counts = vec![0usize; buckets.len()];
         for entry in self.requests.iter() {
             let age_secs = now.duration_since(*entry.value()).as_secs();
-            let bucket_idx = AGE_BUCKET_BOUNDS
+            let bucket_idx = buckets
+                .upper_bounds
                 .iter()
                 .position(|&bound| age_secs <= bound)
                 .unwrap_or(inf_idx);
-            non_cumulative_counts[bucket_idx] += 1;
-        }
-
-        let mut counts = [0usize; AGE_BUCKET_LABELS.len()];
-        let mut cumulative = 0;
-        for i in 0..counts.len() {
-            cumulative += non_cumulative_counts[i];
-            counts[i] = cumulative;
+            counts[bucket_idx] += 1;
         }
 
         counts
     }
 
     fn sample_and_record(&self) {
+        let buckets = &*AGE_BUCKETS;
         let counts = self.compute_bucket_counts();
-        for (i, &label) in AGE_BUCKET_LABELS.iter().enumerate() {
-            Metrics::set_inflight_request_age_count(label, counts[i]);
+        for ((&gt, &le), &count) in std::iter::zip(
+            std::iter::zip(&buckets.gt_labels, &buckets.le_labels),
+            &counts,
+        ) {
+            Metrics::set_inflight_request_age_count(gt, le, count);
         }
     }
 }
@@ -150,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_bucket_counts() {
+    fn test_bucket_counts() {
         let tracker = InFlightRequestTracker::new();
         let now = Instant::now();
 
@@ -162,13 +188,13 @@ mod tests {
         tracker.insert_with_time(6, now - Duration::from_secs(700));
 
         let counts = tracker.compute_bucket_counts();
-        assert_eq!(counts[0], 1, "bucket 0");
-        assert_eq!(counts[1], 2, "bucket 1");
-        assert_eq!(counts[2], 3, "bucket 2");
-        assert_eq!(counts[3], 4, "bucket 3");
-        assert_eq!(counts[4], 5, "bucket 4");
-        assert_eq!(counts[5], 6, "bucket 5");
-        assert_eq!(*counts.last().unwrap(), 6, "bucket +Inf");
+        assert_eq!(counts[0], 1, "bucket <=30s");
+        assert_eq!(counts[1], 1, "bucket <=60s");
+        assert_eq!(counts[2], 1, "bucket <=180s");
+        assert_eq!(counts[3], 1, "bucket <=300s");
+        assert_eq!(counts[4], 1, "bucket <=600s");
+        assert_eq!(counts[5], 1, "bucket <=1200s");
+        assert_eq!(*counts.last().unwrap(), 0, "bucket +Inf");
     }
 
     #[test]
@@ -180,9 +206,8 @@ mod tests {
         tracker.insert_with_time(2, now - Duration::from_secs(31));
 
         let counts = tracker.compute_bucket_counts();
-        assert_eq!(counts[0], 1, "bucket 0 includes exact boundary");
-        assert_eq!(counts[1], 2, "bucket 1 includes both");
-        assert_eq!(*counts.last().unwrap(), 2, "bucket +Inf includes all");
+        assert_eq!(counts[0], 1, "bucket <=30s includes exact boundary");
+        assert_eq!(counts[1], 1, "bucket <=60s has one request (31s)");
     }
 
     #[test]
@@ -219,5 +244,25 @@ mod tests {
         assert_ne!(g1.request_id, g2.request_id);
         assert_ne!(g2.request_id, g3.request_id);
         assert_eq!(tracker.len(), 3);
+    }
+
+    #[test]
+    fn test_age_buckets_labels() {
+        let buckets = NumericalBuckets::new(&[10, 30, 60]);
+
+        assert_eq!(buckets.le_labels, vec!["10", "30", "60", "+Inf"]);
+        assert_eq!(buckets.gt_labels, vec!["0", "10", "30", "60"]);
+        assert_eq!(buckets.len(), 4);
+    }
+
+    #[test]
+    fn test_age_buckets_global() {
+        let buckets = &*AGE_BUCKETS;
+
+        assert_eq!(buckets.le_labels.first(), Some(&"30"));
+        assert_eq!(buckets.le_labels.last(), Some(&"+Inf"));
+        assert_eq!(buckets.gt_labels.first(), Some(&"0"));
+        assert_eq!(buckets.gt_labels.last(), Some(&"86400"));
+        assert_eq!(buckets.le_labels.len(), buckets.gt_labels.len());
     }
 }
