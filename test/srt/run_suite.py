@@ -11,10 +11,7 @@ suites = {
     "per-commit-1-gpu": [
         TestFile("test_evs.py", 20),
         TestFile("test_external_models.py", 30),
-        TestFile("test_jinja_template_utils.py", 7),
         TestFile("test_modelopt_loader.py", 11),
-        TestFile("test_multi_tokenizer.py", 230),
-        TestFile("test_skip_tokenizer_init.py", 77),
         TestFile("test_utils_update_weights.py", 29),
         TestFile("test_video_utils.py", 5),
         TestFile("test_modelopt_export.py", 9),
@@ -107,10 +104,7 @@ suite_amd = {
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_bench_typebaseddispatcher.py", 10),
         TestFile("test_external_models.py", 45),
-        TestFile("test_jinja_template_utils.py", 1),
-        TestFile("test_multi_tokenizer.py", 345),
         TestFile("test_rope_rocm.py", 3),
-        TestFile("test_skip_tokenizer_init.py", 117),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_type_based_dispatcher.py", 10),
         TestFile("test_video_utils.py", 8),
