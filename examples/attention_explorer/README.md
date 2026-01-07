@@ -1,14 +1,98 @@
 # SGLang Attention Explorer
 
-A web-based visualization tool for exploring attention patterns in LLM inference.
+A comprehensive interpretability dashboard for exploring attention patterns, behavioral zones, and routing decisions in LLM inference.
 
 ## Features
 
-- Real-time attention visualization during text generation
-- Token-level attention mapping (which tokens attend to which)
-- Support for thinking/reasoning models (Qwen3-Next, etc.)
-- Interactive token selection with bidirectional attention display
-- True probability calculation for accurate attention weights
+- **Real-time attention visualization** during text generation
+- **Token Lens** with hover/pin interactions and sink token handling
+- **Fingerprint-based zone classification** (syntax, semantic, long-range, etc.)
+- **Manifold discovery** with persistent clustering and UMAP projection
+- **Actionable Router** with sampling recommendations
+- **Cross-run comparison** to diff attention patterns between sessions
+- **Think segmentation** for reasoning models with collapsible sections
+- **Export/Import** traces as JSONL for replay and analysis
+- **Privacy controls** with system prompt masking and guardrails
+
+## Quick Start with React UI
+
+### 1. Start SGLang Server
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-7B-Instruct \
+  --return-attention-tokens \
+  --attention-tokens-top-k 32
+```
+
+### 2. Start the React UI
+
+```bash
+cd examples/attention_explorer/ui
+npm install
+npm run dev
+```
+
+Open http://localhost:3001 in your browser.
+
+### 3. Explore Attention Patterns
+
+- **Chat View**: Interactive chat with real-time attention streaming
+- **Inspect View**: Layer-by-layer attention breakdown
+- **Manifold View**: 2D projection of behavioral clusters
+- **Router View**: Zone detection with sampling recommendations
+- **Compare View**: Side-by-side session comparison
+
+## UI Views
+
+### Chat View
+The primary interface for interactive exploration:
+- Real-time token streaming with attention overlays
+- Click tokens to pin them in the Token Lens drawer
+- Hover to see attention links
+- Think section collapsing for reasoning models
+- Segment timeline showing think vs output phases
+
+### Token Lens Drawer
+Slides in from right on token hover/click:
+- **Links Tab**: Top-k attended positions with scores
+- **Signal Tab**: Fingerprint metrics, distance histogram, zone classification
+- **MoE Tab**: Expert routing information (for MoE models)
+
+### Inspect View
+Detailed attention analysis:
+- Layer selector for multi-layer inspection
+- Top-k attended positions with scores
+- Segment filtering (think vs output)
+- Virtualized token list for long sequences
+
+### Manifold View
+Behavioral clustering and discovery:
+- 2D UMAP projection of fingerprint space
+- Cluster visualization with zone labels
+- Scope selector (session/recent/saved/all)
+- Click points to load saved sessions
+- Session details panel with metrics
+
+### Router View
+Dynamic zone detection and recommendations:
+- Real-time zone classification with confidence
+- Evidence meters showing classification signals
+- Recommended settings (temperature, top_p, capture mode)
+- "Apply to Next Run" persistence via localStorage
+
+### Compare View
+Cross-session analysis:
+- Select two saved traces for side-by-side comparison
+- Overall similarity score (cosine + zone match + entropy)
+- Key differences in human-readable format
+- Metrics diff with colored bars
+- Distance histogram overlay
+- PCA interpretation of fingerprint differences
+
+## Legacy HTML Explorer
+
+For quick debugging without npm:
 
 ## Usage
 
@@ -332,3 +416,257 @@ The sidecar interprets fingerprint patterns into semantic traits:
 - `periodic`: Regular attention patterns (code, repetition)
 
 These traits inform sampling hints (temperature, top_p) for optimized generation.
+
+## Zone Classification
+
+Attention patterns are classified into behavioral zones based on fingerprint metrics:
+
+| Zone | Signal | Description |
+|------|--------|-------------|
+| `syntax_floor` | local_mass > 0.5 | Local syntax/grammar processing (immediate neighbors) |
+| `semantic_bridge` | mid_mass > 0.5 | Paragraph-level semantic retrieval |
+| `long_range` | long_mass > 0.3 | Document-level dependencies |
+| `structure_ripple` | fft_low > 0.6 | Periodic patterns (code, lists, structured text) |
+| `diffuse` | high entropy | Exploratory/uncertain attention |
+
+Distance bands for mass calculation:
+- **Local**: 0-32 tokens (syntax/immediate context)
+- **Mid**: 33-256 tokens (semantic/paragraph level)
+- **Long**: 257+ tokens (document-level/cross-context)
+
+## PCA Interpretation
+
+The 20D fingerprint vector is interpreted via pre-computed PCA loadings:
+
+| PC | Name | Variance | Interpretation |
+|----|------|----------|----------------|
+| PC1 | Local vs Long-Range | 35% | Positive = local syntax, Negative = long-range retrieval |
+| PC2 | Focused vs Diffuse | 25% | Positive = high confidence, Negative = exploratory |
+| PC3 | Semantic Bridge | 15% | Positive = paragraph-level reasoning |
+| PC4 | Structure Ripple | 10% | Positive = periodic patterns (code, lists) |
+
+The UI provides natural language explanations based on PCA projections:
+- "Strong local syntax processing (immediate neighbors)"
+- "Moderate semantic context retrieval (paragraph-level reasoning)"
+- "Weak long-range information retrieval"
+
+## Capabilities Endpoint
+
+Query server capabilities before making requests:
+
+```bash
+curl http://localhost:30000/v1/attention/capabilities
+```
+
+Response:
+```json
+{
+  "supported": true,
+  "modes": ["raw", "sketch", "fingerprint"],
+  "max_top_k": 64,
+  "max_layers": 32,
+  "features": {
+    "include_prompt_attention": true,
+    "head_filtering": true,
+    "moe_routing": true,
+    "logit_lens": false
+  },
+  "guardrails": {
+    "max_concurrent_capture": 10,
+    "requires_api_key": false,
+    "system_prompt_masked": false
+  }
+}
+```
+
+## Privacy & Guardrails
+
+### System Prompt Masking
+
+Prevent system prompt structure leakage via attention patterns:
+
+```bash
+python -m sglang.launch_server \
+  --model-path your-model \
+  --return-attention-tokens \
+  --attention-mask-system-prompt
+```
+
+Or per-request:
+```python
+extra_body={
+    "return_attention_tokens": True,
+    "attention_mask_prefix": 100  # Mask first 100 tokens
+}
+```
+
+### Multi-Tenant Guardrails
+
+For shared deployments:
+
+| Argument | Description |
+|----------|-------------|
+| `--attention-api-key KEY` | Require API key for attention endpoints |
+| `--attention-cors-origins` | Allowed CORS origins (default: `["*"]`) |
+| `--attention-max-concurrent-capture N` | Limit concurrent capture sessions |
+| `--attention-disable-in-production` | Auto-disable if not in debug mode |
+
+### Head Filtering
+
+Capture attention from specific heads only:
+
+```python
+extra_body={
+    "return_attention_tokens": True,
+    "attention_capture_head_ids": [0, 1, 2, 3]  # Only these heads
+}
+```
+
+Useful for mechanistic interpretability to isolate specific head behaviors.
+
+## Export/Import Traces
+
+### Export
+
+Click "Export" in the UI top bar to download current session as JSONL:
+
+```jsonl
+{"record_type":"header","version":"1.0","trace_id":"trace-123","model":"Qwen2.5-7B"}
+{"record_type":"message","id":"user-1","role":"user","content":"Hello"}
+{"record_type":"token","index":0,"text":"Hi","segmentId":"assistant-1-main"}
+{"record_type":"step","tokenIndex":0,"attention":{...},"fingerprint":{...}}
+{"record_type":"segment","id":"assistant-1-think","type":"assistant_think",...}
+{"record_type":"metrics","avgEntropy":0.45,"dominantZone":"semantic_bridge",...}
+```
+
+### Import
+
+Click "Import" to load a previously exported trace for replay, comparison, or analysis.
+
+## Discovery Pipeline
+
+For building persistent manifold visualizations over time:
+
+### 1. Database Schema
+
+The discovery pipeline uses SQLite with tables for:
+- `fingerprints`: 20D vectors with request metadata
+- `sessions`: Chat session summaries
+- `discovery_runs`: PCA/UMAP/clustering job metadata
+- `clusters`: Cluster centroids and zone assignments
+
+### 2. Run Discovery Job
+
+```bash
+python examples/attention_explorer/discovery/run_discovery.py \
+  --db ./attention_data.db \
+  --output-dir ./discovery_artifacts \
+  --min-samples 100
+```
+
+Pipeline stages:
+1. PCA dimensionality reduction (20D → intermediate)
+2. UMAP projection to 2D
+3. HDBSCAN clustering
+4. Zone assignment based on cluster centroids
+5. Artifact export (Parquet + model files)
+
+### 3. Sidecar Integration
+
+```bash
+python -m sglang.srt.attention_sidecar \
+  --db ./attention_data.db \
+  --discovery-dir ./discovery_artifacts \
+  --auto-reload-interval 300
+```
+
+Endpoints:
+- `POST /classify`: Classify a fingerprint against artifacts
+- `GET /discovery/status`: Current artifact status
+- `POST /discovery/reload`: Reload artifacts from disk
+- `POST /storage/flush`: Flush buffered fingerprints to SQLite
+
+## Overhead Estimates
+
+| Mode | Per-Step Size | Notes |
+|------|---------------|-------|
+| Raw (k=16) | ~200 bytes | Scales with top_k |
+| Raw (k=64) | ~800 bytes | |
+| Sketch (1 layer) | ~500 bytes | Scales with layers |
+| Sketch (32 layers) | ~16 KB | |
+| Fingerprint | ~64 bytes | Fixed size |
+
+The Overhead HUD in the UI shows real-time metrics:
+- Token count and tokens/second
+- Attention data bytes received
+- Current capture mode
+
+Control overhead with:
+- `--attention-chunk-size`: Trade memory vs latency (default: 2048)
+- `--attention-capture-stride`: Skip steps (e.g., 2 = every other step)
+- `--attention-fingerprint-max-steps`: Early exit for fingerprint mode
+
+## Troubleshooting
+
+### Attention data not showing
+1. Verify server started with `--return-attention-tokens`
+2. Check capabilities: `curl http://localhost:30000/v1/attention/capabilities`
+3. Ensure `return_attention_tokens: true` in request
+4. Check browser console for SSE parsing errors
+
+### UI shows "Disconnected"
+1. Check server is running on expected port
+2. Verify CORS settings if UI on different origin
+3. Check browser console for WebSocket/SSE errors
+
+### High memory usage
+1. Reduce `--attention-tokens-top-k`
+2. Increase `--attention-capture-stride`
+3. Use fingerprint mode instead of raw
+4. Enable `--attention-fingerprint-max-steps`
+
+### Manifold view empty
+1. Save some traces first (manifold needs data)
+2. If using sidecar, ensure discovery artifacts exist
+3. Check sidecar is running with correct `--discovery-dir`
+
+### Compare view has no sessions
+1. Save current trace before comparing
+2. Complete at least one generation (need attention data)
+3. Check that sessions have fingerprint data
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     SGLang Server                           │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
+│  │ Model Runner│──│ Attention   │──│ SSE Stream          │ │
+│  │             │  │ Capture     │  │ (attention_tokens)  │ │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   Attention Explorer UI                      │
+│  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐    │
+│  │ Chat   │ │Inspect │ │Manifold│ │ Router │ │Compare │    │
+│  └────────┘ └────────┘ └────────┘ └────────┘ └────────┘    │
+│                         │                                   │
+│                   TraceSession                              │
+│              (canonical data model)                         │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ (optional)
+┌─────────────────────────────────────────────────────────────┐
+│                     Sidecar Service                         │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
+│  │ SQLite      │  │ Discovery   │  │ Classification      │ │
+│  │ Storage     │  │ Artifacts   │  │ Endpoints           │ │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## License
+
+Apache 2.0 - Same as SGLang
