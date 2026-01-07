@@ -15,8 +15,8 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=160, suite="stage-b-test-large-2-gpu")
 
 
-class TestPiecewiseCudaGraphFusedMoE(CustomTestCase):
-    """Test piecewise CUDA graph with FusedMoE Backend"""
+class TestPiecewiseCudaGraphTP(CustomTestCase):
+    """Test piecewise CUDA graph with normal TP"""
 
     @classmethod
     def setUpClass(cls):
@@ -31,8 +31,6 @@ class TestPiecewiseCudaGraphFusedMoE(CustomTestCase):
                 "--piecewise-cuda-graph-compiler",
                 "eager",
                 "--tp",
-                "2",
-                "--ep-size",
                 "2",
             ],
         )
