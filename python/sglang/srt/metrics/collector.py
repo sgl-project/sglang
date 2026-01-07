@@ -761,11 +761,12 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
         )
 
+        max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
         self.prefill_delayer_wait_forward_passes = Histogram(
             name="sglang:prefill_delayer_wait_forward_passes",
             documentation="Histogram of forward passes waited by prefill delayer.",
             labelnames=labels.keys(),
-            buckets=[5, 20, 99, 100],
+            buckets=[5, 20, max_delay_passes - 1, max_delay_passes],
         )
         self.prefill_delayer_wait_seconds = Histogram(
             name="sglang:prefill_delayer_wait_seconds",
