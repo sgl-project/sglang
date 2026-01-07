@@ -212,6 +212,11 @@ def _setup_pd_backend(
         prefills = existing_prefills + new_prefills
         decodes = existing_decodes + new_decodes
 
+    # Acquire references to prevent eviction during test
+    all_workers = prefills + decodes
+    for worker in all_workers:
+        worker.acquire()
+
     model_path = prefills[0].model_path if prefills else None
 
     # Launch PD gateway
@@ -244,6 +249,9 @@ def _setup_pd_backend(
     finally:
         logger.info("Tearing down PD gateway")
         gateway.shutdown()
+        # Release references to allow eviction
+        for worker in all_workers:
+            worker.release()
 
 
 def _setup_local_backend(
@@ -260,6 +268,7 @@ def _setup_local_backend(
     from infra import Gateway, WorkerIdentity, WorkerType
 
     num_workers = workers_config.get("count") or 1
+    instances: list = []  # Track instances for reference counting
 
     try:
         if num_workers > 1:
@@ -290,8 +299,13 @@ def _setup_local_backend(
             model_path = instances[0].model_path
         else:
             instance = model_pool.get(model_id, connection_mode)
+            instances = [instance]
             worker_urls = [instance.worker_url]
             model_path = instance.model_path
+
+        # Acquire references to prevent eviction during test
+        for inst in instances:
+            inst.acquire()
     except RuntimeError as e:
         pytest.fail(str(e))
 
@@ -324,6 +338,9 @@ def _setup_local_backend(
     finally:
         logger.info("Tearing down gateway for %s backend", backend_name)
         gateway.shutdown()
+        # Release references to allow eviction
+        for inst in instances:
+            inst.release()
 
 
 def _setup_cloud_backend(backend_name: str):
@@ -382,6 +399,9 @@ def backend_router(request: pytest.FixtureRequest, model_pool: "ModelPool"):
     except RuntimeError as e:
         pytest.fail(str(e))
 
+    # Acquire reference to prevent eviction during test
+    instance.acquire()
+
     gateway = Gateway()
     gateway.start(
         worker_urls=[instance.worker_url],
@@ -392,3 +412,5 @@ def backend_router(request: pytest.FixtureRequest, model_pool: "ModelPool"):
         yield gateway
     finally:
         gateway.shutdown()
+        # Release reference to allow eviction
+        instance.release()

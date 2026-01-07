@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import httpx
@@ -102,6 +103,10 @@ class ModelInstance:
     last_used: float = 0.0  # Timestamp for MRU eviction
     _healthy: bool = False  # Track if initial health check passed
 
+    # Reference counting for safe parallel test execution
+    _ref_count: int = 0
+    _ref_lock: threading.Lock = field(default_factory=threading.Lock)
+
     @property
     def identity(self) -> WorkerIdentity:
         """Get the identity (model_id, mode, worker_type) of this instance."""
@@ -110,6 +115,44 @@ class ModelInstance:
             mode=self.mode,
             worker_type=self.worker_type,
         )
+
+    @property
+    def is_in_use(self) -> bool:
+        """Check if this instance has active references (tests using it)."""
+        with self._ref_lock:
+            return self._ref_count > 0
+
+    def acquire(self) -> None:
+        """Acquire a reference to this instance.
+
+        Call this before using the instance in a test to prevent eviction.
+        Must be paired with a release() call when done.
+        Also updates last_used timestamp atomically with ref count.
+        """
+        with self._ref_lock:
+            self._ref_count += 1
+            self.last_used = time.time()
+            logger.debug(
+                "Acquired reference to %s (ref_count=%d)", self.key, self._ref_count
+            )
+
+    def release(self) -> None:
+        """Release a reference to this instance.
+
+        Call this when done using the instance in a test.
+        """
+        with self._ref_lock:
+            if self._ref_count > 0:
+                self._ref_count -= 1
+                logger.debug(
+                    "Released reference to %s (ref_count=%d)",
+                    self.key,
+                    self._ref_count,
+                )
+            else:
+                logger.warning(
+                    "Attempted to release reference to %s with ref_count=0", self.key
+                )
 
     @property
     def worker_url(self) -> str:
@@ -629,8 +672,8 @@ class ModelPool:
 
         instance = self.instances[key]
 
-        # Update last_used timestamp
-        instance.last_used = time.time()
+        # Note: last_used is updated in acquire() which should be called by fixtures
+        # to prevent eviction during test execution
 
         # Verify worker is still alive and healthy
         if not instance.is_alive():
@@ -671,8 +714,15 @@ class ModelPool:
 
         # Sort by last_used descending (MRU eviction) - evict most recently used first
         # Store (dict_key, instance) tuples to preserve the actual key for eviction
+        # Note: Make a copy of items to avoid RuntimeError if dict is modified during iteration
         evictable: list[tuple[str, ModelInstance]] = []
-        for dict_key, inst in self.instances.items():
+        for dict_key, inst in list(self.instances.items()):
+            # Skip instances with active references (tests using them)
+            if inst.is_in_use:
+                logger.debug(
+                    "Skipping eviction of %s - has active references", dict_key
+                )
+                continue
             if exclude_worker_types is not None:
                 # Precise matching with worker types
                 # Must match model_id AND worker_type, mode is optional
