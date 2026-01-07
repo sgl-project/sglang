@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -11,6 +12,11 @@ from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
 global _use_multi_stream
+
+# Enable next_n=2 optimization for speculative decoding in deep_gemm.fp8_paged_mqa_logits
+# This processes pairs of tokens together instead of one at a time, reducing kernel overhead.
+# Set to "0" to disable and fall back to next_n=1 behavior.
+NSA_ENABLE_NEXT_N_2 = os.environ.get("SGLANG_NSA_ENABLE_NEXT_N_2", "1") == "1"
 
 if is_cuda():
     try:
@@ -307,13 +313,59 @@ class Indexer(MultiPlatformOp):
         )
 
         blocksize = page_size
-        if (
+        is_speculative = (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
-        ):
+        )
+        if is_speculative:
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
+
+        # Prepare kv_cache shape
+        assert len(kv_cache_fp8.shape) == 2
+        block_kv = 64
+        num_heads_kv = 1
+        head_dim_with_sf = 132
+        kv_cache_fp8 = kv_cache_fp8.view(
+            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+        )
+
+        # Check if we can use next_n=2 for speculative decoding
+        # deep_gemm.fp8_paged_mqa_logits only supports next_n in {1, 2}
+        total_tokens = q_fp8.shape[0]
+        use_next_n_2 = False
+        batch_size = block_tables.shape[0]
+        tokens_per_req = 1
+
+        if (
+            NSA_ENABLE_NEXT_N_2
+            and is_speculative
+            and total_tokens >= 2
+            and batch_size > 0
+        ):
+            if total_tokens % batch_size == 0:
+                tokens_per_req = total_tokens // batch_size
+                # Use next_n=2 if each request has >= 2 tokens and even number of tokens
+                if tokens_per_req >= 2 and tokens_per_req % 2 == 0:
+                    use_next_n_2 = True
+
+        if use_next_n_2:
+            return self._get_topk_paged_next_n_2(
+                forward_batch=forward_batch,
+                q_fp8=q_fp8,
+                weights=weights,
+                metadata=metadata,
+                kv_cache_fp8=kv_cache_fp8,
+                block_tables=block_tables,
+                max_seq_len=max_seq_len,
+                seqlens_expanded=seqlens_32,
+                batch_size=batch_size,
+                tokens_per_req=tokens_per_req,
+                blocksize=blocksize,
+            )
+
+        # Fall back to next_n=1 path
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
@@ -324,13 +376,6 @@ class Indexer(MultiPlatformOp):
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
-        assert len(kv_cache_fp8.shape) == 2
-        block_kv = 64
-        num_heads_kv = 1
-        head_dim_with_sf = 132
-        kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-        )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
@@ -346,6 +391,96 @@ class Indexer(MultiPlatformOp):
         )
 
         # NOTE(dark): logits should be cleaned in topk_transform
+        topk_result = metadata.topk_transform(logits, self.index_topk)
+        return topk_result
+
+    def _get_topk_paged_next_n_2(
+        self,
+        forward_batch: ForwardBatch,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        kv_cache_fp8: torch.Tensor,
+        block_tables: torch.Tensor,
+        max_seq_len: int,
+        seqlens_expanded: torch.Tensor,
+        batch_size: int,
+        tokens_per_req: int,
+        blocksize: int,
+    ) -> torch.Tensor:
+        """
+        Process speculative decode tokens with next_n=2 for better performance.
+
+        Instead of processing each token separately (next_n=1), we process pairs
+        of tokens together (next_n=2). This reduces kernel launch overhead and
+        improves GPU utilization.
+
+        For tokens_per_req=4 with batch_size=2:
+        - Original: 8 tokens as 8 batch elements with next_n=1
+        - Optimized: 8 tokens as 4 batch elements with next_n=2
+
+        The reshaping treats each consecutive pair of tokens as one batch element:
+        - Pair 0: tokens 0,1 of request 0
+        - Pair 1: tokens 2,3 of request 0
+        - Pair 2: tokens 0,1 of request 1
+        - Pair 3: tokens 2,3 of request 1
+        """
+        total_tokens = q_fp8.shape[0]
+        heads = q_fp8.shape[1]
+        head_dim = q_fp8.shape[2]
+        num_pairs_per_req = tokens_per_req // 2
+        new_batch_size = batch_size * num_pairs_per_req
+
+        # Reshape q_fp8: [total_tokens, heads, dim] -> [new_batch_size, 2, heads, dim]
+        # Current layout: [req0_tok0, req0_tok1, req0_tok2, req0_tok3, req1_tok0, ...]
+        # After reshape: [[req0_tok0, req0_tok1], [req0_tok2, req0_tok3], [req1_tok0, req1_tok1], ...]
+        q_fp8_reshaped = q_fp8.view(batch_size, tokens_per_req, heads, head_dim)
+        q_fp8_reshaped = q_fp8_reshaped.view(
+            batch_size, num_pairs_per_req, 2, heads, head_dim
+        )
+        q_fp8_reshaped = q_fp8_reshaped.view(new_batch_size, 2, heads, head_dim)
+
+        # Weights: [total_tokens, heads, 1] -> [total_tokens, heads]
+        # The layout already matches the reshaped query
+        assert len(weights.shape) == 3
+        weights_squeezed = weights.squeeze(2)
+
+        # Seqlens for next_n=2: use the second token's seqlen in each pair
+        # seqlens_expanded: [seq0_t0, seq0_t1, seq0_t2, seq0_t3, seq1_t0, ...]
+        # For next_n=2 kernel: context_lens determines the mask such that
+        #   token 0 attends to positions 0..(context_len-2)
+        #   token 1 attends to positions 0..(context_len-1)
+        # So we need the seqlen of the second token in each pair
+        seqlens_reshaped = seqlens_expanded.view(batch_size, tokens_per_req)
+        # Take indices 1, 3, 5, ... (second token of each pair)
+        seqlens_for_pairs = seqlens_reshaped[:, 1::2].reshape(-1).contiguous()
+
+        # Repeat block_tables for each pair within a request
+        # block_tables: [batch_size, max_blocks] -> [new_batch_size, max_blocks]
+        block_tables_expanded = block_tables.repeat_interleave(num_pairs_per_req, dim=0)
+
+        # Get schedule metadata for the new batch configuration
+        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+            seqlens_for_pairs, blocksize, self.sm_count
+        )
+
+        # Call kernel with next_n=2
+        logits = deep_gemm.fp8_paged_mqa_logits(
+            q_fp8_reshaped,
+            kv_cache_fp8,
+            weights_squeezed,
+            seqlens_for_pairs,
+            block_tables_expanded,
+            schedule_metadata,
+            max_seq_len,
+            clean_logits=False,
+        )
+
+        # Logits shape: [new_batch_size * 2, max_model_len] = [total_tokens, max_model_len]
+        # The layout is: [req0_tok0, req0_tok1, req0_tok2, req0_tok3, req1_tok0, ...]
+        # This matches the original token order, so topk_transform works directly
+
+        # Apply topk transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
         return topk_result
 
