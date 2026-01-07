@@ -18,6 +18,7 @@ from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -69,7 +70,6 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLCausalLMOutputWithPast,
     Qwen2_5_VLModelOutputWithPast,
     Qwen2_5_VLRotaryEmbedding,
-    Qwen2MLP,
     apply_multimodal_rotary_pos_emb,
     eager_attention_forward,
 )
@@ -109,17 +109,29 @@ class Qwen2_5_VLAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.q_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=True
+        self.q_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.num_heads * self.head_dim,
+            bias=True,
+            gather_output=True,
         )
-        self.k_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        self.k_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=True,
+            gather_output=True,
         )
-        self.v_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        self.v_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=True,
+            gather_output=True,
         )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        self.o_proj = ColumnParallelLinear(
+            self.num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+            gather_output=True,
         )
         self.sliding_window = (
             config.sliding_window
@@ -156,9 +168,9 @@ class Qwen2_5_VLAttention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        query_states, _ = self.q_proj(hidden_states)
+        key_states, _ = self.k_proj(hidden_states)
+        value_states, _ = self.v_proj(hidden_states)
 
         query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
@@ -201,7 +213,7 @@ class Qwen2_5_VLAttention(nn.Module):
         # )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        attn_output, _ = self.o_proj(attn_output)
         return attn_output
 
 
@@ -220,7 +232,12 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             )
         self.self_attn = Qwen2_5_VLAttention(config, layer_idx)
 
-        self.mlp = Qwen2MLP(config)
+        self.mlp = Qwen2_5_VLMLP(
+            in_features=config.hidden_size,
+            hidden_features=config.intermediate_size,
+            bias=getattr(config, "mlp_bias", False),
+            hidden_act=config.hidden_act,
+        )
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -1121,6 +1138,11 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         loaded_params: set[str] = set()
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        stacked_params_mapping = [
+            # (param_name, weight_name, shard_id)
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1130,14 +1152,27 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
                 if not self.enable_image_understanding:
                     continue
                 name = name.replace("visual.", "model.visual.")
-            try:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+            loaded = False
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
                     continue
-                param = params_dict[name]
-            except KeyError:
-                raise
+                model_param_name = name.replace(weight_name, param_name)
+                if model_param_name not in params_dict:
+                    continue
+                param = params_dict[model_param_name]
+                weight_loader = param.weight_loader
+                loaded_weight = loaded_weight.to(param.dtype)
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(model_param_name)
+                loaded = True
+                break
+            if loaded:
+                continue
 
+            # Skip loading extra bias for GPTQ models.
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             loaded_weight = loaded_weight.to(param.dtype)
             weight_loader(param, loaded_weight)
