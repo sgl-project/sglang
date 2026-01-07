@@ -1690,15 +1690,47 @@ def sample_image_requests(
 
     dataset: List[DatasetRow] = []
     total_image_bytes = 0
-    for i in range(num_requests):
-        # Get the number of images for this request
-        request_image_count = int(image_counts[i])
 
+    special_tokens = None
+
+    # Extract special token strings and convert to token_id
+    special_token_strings = []
+    special_token_ids = set()
+
+    if hasattr(processor.tokenizer, "special_tokens"):
+        # Extract all special tokens from tokenizer.special_tokens dictionary
+        for key, value in processor.tokenizer.special_tokens.items():
+            if isinstance(value, str):
+                special_token_strings.append(value)
+            elif isinstance(value, list):
+                special_token_strings.extend(value)
+
+    # Also extract from additional_special_tokens
+    if hasattr(processor.tokenizer, "additional_special_tokens"):
+        special_token_strings.extend(processor.tokenizer.additional_special_tokens)
+
+    # Convert to token_id
+    if special_token_strings and hasattr(processor.tokenizer, "convert_tokens_to_ids"):
+        special_token_ids = set(
+            processor.tokenizer.convert_tokens_to_ids(special_token_strings)
+        )
+
+    # Merge all_special_ids and special_token_ids converted from strings
+    if special_tokens is not None and special_token_ids:
+        merged_special_tokens = special_tokens | special_token_ids
+    elif special_tokens is not None:
+        merged_special_tokens = special_tokens
+    elif special_token_ids:
+        merged_special_tokens = special_token_ids
+    else:
+        merged_special_tokens = None
+    for i in range(num_requests):
         # Generate text prompt
         text_prompt = gen_mm_prompt(
             processor.tokenizer,
             processor.image_token_id if hasattr(processor, "image_token_id") else None,
             int(input_lens[i]),
+            merged_special_tokens,
         )
 
         # Generate image list
@@ -1748,11 +1780,15 @@ def gen_prompt(tokenizer, token_num):
     return tokenizer.decode(selected_tokens)
 
 
-def gen_mm_prompt(tokenizer, image_pad_id, token_num):
+def gen_mm_prompt(tokenizer, image_pad_id, token_num, special_tokens):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = list(tokenizer.get_vocab().values())
     if image_pad_id:
         all_available_tokens.remove(image_pad_id)
+    if special_tokens:
+        all_available_tokens = [
+            t for t in all_available_tokens if t not in special_tokens
+        ]
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
