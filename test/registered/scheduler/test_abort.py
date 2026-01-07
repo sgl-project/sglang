@@ -7,6 +7,7 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -15,6 +16,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
     run_and_check_memory_leak,
 )
+
+register_cuda_ci(est_time=131, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=51, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestAbort(CustomTestCase):
