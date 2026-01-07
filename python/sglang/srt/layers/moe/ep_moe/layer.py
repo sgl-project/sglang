@@ -612,25 +612,21 @@ class MoriEPMoE(FusedMoE):
         output_dtype = hidden_states.dtype
         scale = None
 
-        enable_fp8 = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
+        #enable_fp8 = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
 
-        if enable_fp8:
-            # FP8 quant
-            if num_token > 0:
-                # NOTE: aiter is able to handle token=0 case in UT. But for some reason it failed at e2e case. Root cause TBD.
-                hidden_states, scale = self.quant_func(hidden_states, quant_dtype=fp8_dtype)
-            else:
-                hidden_states = torch.empty(hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device)
-                scale = torch.empty((0, self.hidden_size // 128), dtype=torch.float32, device=hidden_states.device)
+        #if enable_fp8:
+        #    # FP8 quant
+        #    if num_token > 0:
+        #        # NOTE: aiter is able to handle token=0 case in UT. But for some reason it failed at e2e case. Root cause TBD.
+        #        hidden_states, scale = self.quant_func(hidden_states, quant_dtype=fp8_dtype)
+        #    else:
+        #        hidden_states = torch.empty(hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device)
+        #        scale = torch.empty((0, self.hidden_size // 128), dtype=torch.float32, device=hidden_states.device)
 
         # dispatch
-        (
-            dispatch_a1,
-            dispatch_weights,
-            dispatch_scale,
-            dispatch_ids,
-            dispatch_recv_token_num,
-        ) = self.dispatcher.dispatch(hidden_states, topk_output, scale=scale)
+        dispatch_output = self.dispatcher.dispatch(hidden_states, topk_output)#, scale=scale)
+
+        dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights, dispatch_recv_token_num = dispatch_output
         #assert dispatch_scale is not None
         # fused moe
         hidden_states = fused_moe(
@@ -653,11 +649,18 @@ class MoriEPMoE(FusedMoE):
             dtype=output_dtype,
         )
 
+        combine_input_wrapper = MoriEPNormalCombineInput
+        combine_input = combine_input_wrapper(
+            hidden_states=hidden_states,
+            topk_ids=topk_output.topk_ids,
+            topk_weights=topk_output.topk_weights,
+        )
+
         # combine
         result = self.dispatcher.combine(
-            hidden_states,
-            topk_output.topk_ids,
-        )[0]
+            combine_input
+        )
+
         return result[:num_token]
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
