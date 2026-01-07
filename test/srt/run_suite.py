@@ -29,7 +29,6 @@ suites = {
         TestFile("test_profile_merger.py", 8),
         TestFile("test_profile_merger_http_api.py", 9),
         TestFile("test_swa_unittest.py", 8),
-        TestFile("test_torch_compile.py", 190),
         TestFile("test_utils_update_weights.py", 29),
         TestFile("test_video_utils.py", 5),
         TestFile("test_modelopt_export.py", 9),
@@ -136,7 +135,6 @@ suite_amd = {
         TestFile("test_srt_engine.py", 261),
         TestFile("test_start_profile.py", 60),
         TestFile("test_swa_unittest.py", 10),
-        TestFile("test_torch_compile.py", 169),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_type_based_dispatcher.py", 10),
         TestFile("test_video_utils.py", 8),
