@@ -805,10 +805,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             else:
                 # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
+                from sglang.srt.layers import deep_gemm_wrapper
                 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+                from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+                from sglang.srt.layers.moe.utils import get_moe_a2a_backend
                 from sglang.srt.model_loader.utils import (
                     should_deepgemm_weight_requant_ue8m0,
                 )
+
+                # Check if MoE will actually use DeepGEMM runner
+                # This mirrors the logic in create_moe_runner
+                moe_runner_backend = get_moe_runner_backend()
+                will_use_deepgemm = moe_runner_backend.is_deep_gemm()
+                if moe_runner_backend.is_auto():
+                    will_use_deepgemm = deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
+                        get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+                    )
 
                 if (
                     should_deepgemm_weight_requant_ue8m0(
@@ -816,7 +828,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             self.quant_config, "weight_block_size", None
                         ),
                     )
-                    and get_moe_runner_backend().is_deep_gemm()
+                    and will_use_deepgemm
                     and not layer.w13_weight_scale_inv.format_ue8m0
                 ):
                     assert isinstance(
