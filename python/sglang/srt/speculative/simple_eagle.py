@@ -52,7 +52,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.speculative.spec_utils import (
     detect_nan,
-    # draft_tp_context,
     fast_topk,
     generate_token_bitmask,
     load_token_map,
@@ -505,7 +504,6 @@ class SimpleEagleWorker(TpModelWorker):
             accept_length_cpu_for_draft_extend = accept_length_for_draft_extend.tolist()
 
             # here, we extend draft tokens anyway cause we want to adopt to cuda graph.
-
             last = accept_index[:, 1]
             first = accept_index[:, 0]
             save_index = torch.where(last != -1, last, first)
@@ -575,7 +573,6 @@ class SimpleEagleWorker(TpModelWorker):
         has_finished = False
         accept_index_cpu = accept_index.tolist()
         next_token_ids_cpu = next_token_ids.tolist()
-
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
             new_accept_index_ = []
             for j, idx in enumerate(accept_index_row):
@@ -766,6 +763,7 @@ class SimpleEagleWorker(TpModelWorker):
             next_token_ids = token_indices.squeeze(-1)
             draft_token = forward_batch.input_ids[2 * indices + 1]
             target_token = next_token_ids[2 * indices]
+
             mask = draft_token == target_token
             accept_index[:, 1] = torch.where(mask, 2 * indices + 1, accept_index[:, 1])
         else:

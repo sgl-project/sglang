@@ -489,18 +489,9 @@ class PipelineConfig:
         # 1. Get the pipeline config class from the registry
         model_info = get_model_info(model_path)
 
-        # 2. Instantiate PipelineConfig
-        if model_info is None:
-            # The error is already logged in get_model_info.
-            # We raise an exception here to stop the execution.
-            raise ValueError(
-                f"Failed to get model info for '{model_path}'. "
-                "Please check the model path and ensure it is registered correctly."
-            )
-
         pipeline_config = model_info.pipeline_config_cls()
 
-        # 3. Load PipelineConfig from a json file or a PipelineConfig object if provided
+        # 2. Load PipelineConfig from a json file or a PipelineConfig object if provided
         if isinstance(pipeline_config_or_path, str):
             pipeline_config.load_from_json(pipeline_config_or_path)
             kwargs[prefix_with_dot + "pipeline_config_path"] = pipeline_config_or_path
@@ -509,7 +500,7 @@ class PipelineConfig:
         elif isinstance(pipeline_config_or_path, dict):
             pipeline_config.update_pipeline_config(pipeline_config_or_path)
 
-        # 4. Update PipelineConfig from CLI arguments if provided
+        # 3. Update PipelineConfig from CLI arguments if provided
         kwargs[prefix_with_dot + "model_path"] = model_path
         pipeline_config.update_config_from_dict(kwargs, config_cli_prefix)
         return pipeline_config

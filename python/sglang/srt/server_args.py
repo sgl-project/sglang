@@ -394,6 +394,7 @@ class ServerArgs:
     requests_all_greedy: Optional[bool] = True
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
+    requests_all_greedy: Optional[bool] = True
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -1669,7 +1670,7 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE","SIMPLE_EAGLE"):
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE", "SIMPLE_EAGLE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
                 raise ValueError(
@@ -1801,6 +1802,17 @@ class ServerArgs:
                 # TODO: support dp attention for ngram speculative decoding
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
+                )
+                
+            # Set parameters for SIMPLE_EAGLE
+            if self.speculative_algorithm == "SIMPLE_EAGLE":
+                self.speculative_num_steps = 1
+                self.speculative_eagle_topk = 1
+                self.speculative_num_draft_tokens = 2
+                self.attention_backend = "flashinfer"
+                logger.warning(
+                    "SIMPLE_EAGLE only supports using flashinfer attention backend currently. "
+                    "Attention backend is automatically set to flashinfer."
                 )
 
     def _handle_load_format(self):
@@ -2895,8 +2907,8 @@ class ServerArgs:
         parser.add_argument(
             "--requests-all-greedy",
             type=bool,
-            help="Determine which type of cuda graph builds, all-greedy or all-sampling.",
             default=ServerArgs.requests_all_greedy,
+            help="Determine which type of cuda graph builds, all-greedy or all-sampling.",
         )
         parser.add_argument(
             "--mm-attention-backend",
@@ -2928,7 +2940,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM","SIMPLE_EAGLE"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SIMPLE_EAGLE"],
             help="Speculative algorithm.",
         )
         parser.add_argument(

@@ -2682,6 +2682,7 @@ class ModelRunner:
             and not self.spec_algorithm.is_simple_eagle()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
+            and not self.spec_algorithm.is_simple_eagle() # Simple eagle use own cuda graph in simple_eagle_cuda_graph_runner
         )
 
         if can_run_graph:

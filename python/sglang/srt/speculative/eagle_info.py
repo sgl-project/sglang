@@ -38,6 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
+    create_extend_spec_info,
 )
 from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
 
@@ -701,41 +702,15 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id,
             next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
-
+        
     def prepare_extend_after_decode_for_simple_eagle(
         self,
         batch: ScheduleBatch,
         speculative_num_steps: int,
     ):
-        assert len(self.verified_id) == len(batch.out_cache_loc)
-        self.accept_length.add_(1)
-        batch.extend_lens = self.accept_length.clone()
-        batch.extend_num_tokens = sum(batch.extend_lens)
-        batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
-        batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
+        if batch.forward_mode.is_idle():
+            return
 
-        self.positions = torch.empty_like(self.verified_id, dtype=torch.long)
-        new_verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
-
-        create_extend_spec_info[(self.accept_length.numel(),)](
-            self.verified_id,
-            batch.seq_lens,
-            self.accept_length,
-            torch.cumsum(self.accept_length, axis=0, dtype=torch.int),
-            self.positions,
-            new_verified_id,
-            next_power_of_2(speculative_num_steps + 1),
-        )
-
-        batch.seq_lens_sum = sum(batch.seq_lens)
-        batch.input_ids = self.verified_id
-        self.verified_id = new_verified_id
-
-    def prepare_extend_after_decode_for_simple_eagle(
-        self,
-        batch: ScheduleBatch,
-        speculative_num_steps: int,
-    ):
         assert len(self.verified_id) == len(batch.out_cache_loc)
         self.accept_length.add_(1)
         batch.extend_lens = self.accept_length.clone()
