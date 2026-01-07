@@ -450,6 +450,21 @@ Consider updating perf_baselines.json with the snippets below:
         assert output_after_set is not None, "Generation after set_lora failed"
         logger.info("[LoRA E2E] Generation after set_lora succeeded")
 
+        # Test 4: list_loras - API should return the expected list of LoRA adapters
+        logger.info("[LoRA E2E] Testing list_loras for %s", case.id)
+        resp = requests.get(f"{base_url}/list_loras")
+        assert resp.status_code == 200, f"list_loras failed: {resp.text}"
+        lora_info = resp.json()
+        logger.info("[LoRA E2E] list_loras returned %s", lora_info)
+        assert (
+            isinstance(lora_info["loaded_adapters"], list)
+            and len(lora_info["loaded_adapters"]) > 0
+        ), "loaded_adapters should be a non-empty list"
+        assert any(
+            a.get("nickname") == "default" for a in lora_info["loaded_adapters"]
+        ), f"nickname 'default' not found in loaded_adapters: {lora_info['loaded_adapters']}"
+        logger.info("[LoRA E2E] list_loras returned expected LoRA adapters")
+
         logger.info("[LoRA E2E] All LoRA API E2E tests passed for %s", case.id)
 
     def _test_lora_dynamic_switch_e2e(
