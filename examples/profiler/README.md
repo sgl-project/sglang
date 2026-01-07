@@ -129,4 +129,10 @@ A summary file (`*_summary.json`) is generated with statistics:
 ## Supported Workers
 
 - **LLM**: `python/sglang/srt/managers/tp_worker.py`
-- **Diffusion**: `python/sglang/multimodal_gen/runtime/managers/gpu_worker.py`
+- **Diffusion**: `python/sglang/multimodal_gen/runtime/managers/gpu_worker.py` (deduplication enabled by default)
+
+## Notes
+
+- For **diffusion models**, deduplication is enabled by default (`SGLANG_PROFILE_SHAPES_DEDUPE=1`) since the same operations run ~50 times during inference
+- For **LLM models**, deduplication is disabled by default since prefill and decode have different shapes
+- Set `SGLANG_PROFILE_SHAPES_DEDUPE=0` to disable deduplication if needed
