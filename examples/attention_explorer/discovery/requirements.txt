@@ -1,0 +1,18 @@
+# Discovery Pipeline Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core
+numpy>=1.21.0
+pandas>=1.3.0
+pyarrow>=8.0.0
+
+# Embedding & Clustering
+scikit-learn>=1.0.0
+umap-learn>=0.5.0
+hdbscan>=0.8.28
+
+# Model persistence
+joblib>=1.1.0
+
+# Optional: For faster UMAP on large datasets
+# pynndescent>=0.5.0
