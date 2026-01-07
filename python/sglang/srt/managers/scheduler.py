@@ -2060,7 +2060,15 @@ class Scheduler(
                 # Without this, the slot remains held by a waiting request, causing
                 # check_memory() to detect a "memory leak" and crash the server.
                 # The next schedule round will re-allocate safely via match_prefix().
-                if req.mamba_pool_idx is not None:
+                #
+                # Note: In disaggregation DECODE mode, mamba state is transferred from PREFILL and
+                # is not recoverable if freed, so we do not free it here. To avoid false-positive
+                # leak checks in this situation, self_check_during_idle skips memory checking when
+                # the waiting queue is not empty.
+                if (
+                    req.mamba_pool_idx is not None
+                    and self.disaggregation_mode != DisaggregationMode.DECODE
+                ):
                     self.req_to_token_pool.mamba_pool.free(
                         req.mamba_pool_idx.unsqueeze(-1)
                     )
