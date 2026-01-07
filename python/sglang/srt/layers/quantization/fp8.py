@@ -564,6 +564,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert is_sm100_supported() or is_sm90_supported()
 
+    @staticmethod
+    def is_deepgemm_enabled() -> bool:
+        """Check if MoE will actually use DeepGEMM runner for FP8."""
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_deep_gemm():
+            return True
+        if moe_runner_backend.is_auto():
+            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
+                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            )
+        return False
+
     def create_weights(
         self,
         layer: Module,
@@ -805,22 +820,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             else:
                 # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
-                from sglang.srt.layers import deep_gemm_wrapper
                 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
-                from sglang.srt.layers.moe.utils import get_moe_a2a_backend
                 from sglang.srt.model_loader.utils import (
                     should_deepgemm_weight_requant_ue8m0,
                 )
 
                 # Check if MoE will actually use DeepGEMM runner
-                # This mirrors the logic in create_moe_runner
-                moe_runner_backend = get_moe_runner_backend()
-                will_use_deepgemm = moe_runner_backend.is_deep_gemm()
-                if moe_runner_backend.is_auto():
-                    will_use_deepgemm = deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-                        get_moe_a2a_backend().is_deepep()
-                        or get_moe_a2a_backend().is_mooncake()
-                    )
+                will_use_deepgemm = self.is_deepgemm_enabled()
 
                 if (
                     should_deepgemm_weight_requant_ue8m0(
@@ -1117,17 +1123,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-
-        from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
-            ):
+            if self.is_deepgemm_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
