@@ -671,10 +671,6 @@ class HiCacheController:
                 )
             except Empty:
                 continue
-            except Exception as e:
-                logger.error(e)
-                break
-        logger.warning("Prefetch IO auxiliary thread exiting.")
 
     def prefetch_rate_limited(self) -> bool:
         """
@@ -767,11 +763,6 @@ class HiCacheController:
             except Empty:
                 continue
 
-            except Exception as e:
-                logger.error(e)
-                break
-        logger.warning("Prefetch thread exiting.")
-
     def write_storage(
         self,
         host_indices: torch.Tensor,
@@ -840,8 +831,3 @@ class HiCacheController:
 
             except Empty:
                 continue
-
-            except Exception as e:
-                logger.error(e)
-                break
-        logger.warning("Backup thread exiting.")
