@@ -185,26 +185,9 @@ class DFlashVerifyInput(SpecInput):
             kv_indices,
             req_to_token.size(1),
         )
-
-        # Causal custom mask for the verify block:
-        # - all query tokens can attend to all prefix tokens
-        # - within the block, use a lower-triangular mask
-        prefix_mask = torch.full(
-            (paged_kernel_lens_sum * self.draft_token_num,),
-            True,
-            dtype=torch.bool,
-            device=device,
-        )
-        tri = torch.tril(
-            torch.ones(
-                (self.draft_token_num, self.draft_token_num),
-                dtype=torch.bool,
-                device=device,
-            )
-        ).flatten()
-        custom_mask = torch.cat([prefix_mask, tri.repeat(bs)], dim=0)
-
-        return kv_indices, cum_kv_seq_len, qo_indptr, custom_mask
+        # DFlash verify is a standard causal block prefill. Let the attention backend
+        # apply its built-in causal masking; no custom mask is required here.
+        return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def verify(
         self,

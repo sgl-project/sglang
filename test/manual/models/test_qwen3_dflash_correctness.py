@@ -54,6 +54,7 @@ class TestQwen3DFlashCorrectness(CustomTestCase):
             "SGLANG_DFLASH_PROMPT",
             "How many positive whole-number divisors does 196 have?",
         )
+        attention_backend = os.getenv("SGLANG_DFLASH_ATTENTION_BACKEND", "flashinfer")
 
         baseline_port = find_available_port(20000)
         dflash_port = find_available_port(baseline_port + 1)
@@ -67,6 +68,8 @@ class TestQwen3DFlashCorrectness(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--disable-radix-cache",
+                "--attention-backend",
+                attention_backend,
             ],
         )
         try:
@@ -83,6 +86,8 @@ class TestQwen3DFlashCorrectness(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--disable-radix-cache",
+                "--attention-backend",
+                attention_backend,
                 "--speculative-algorithm",
                 "DFLASH",
                 "--speculative-draft-model-path",
