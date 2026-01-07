@@ -21,6 +21,10 @@ class _DelayInfo:
     delayed_count: int
     start_time: float
 
+    @classmethod
+    def create_now(cls) -> "_DelayInfo":
+        return cls(delayed_count=0, start_time=time.perf_counter())
+
 
 class PrefillDelayer:
     def __init__(
@@ -64,9 +68,7 @@ class PrefillDelayer:
 
         if global_mixed_prefillable:
             if self._curr_delay_info is None:
-                self._curr_delay_info = _DelayInfo(
-                    delayed_count=0, start_time=time.perf_counter()
-                )
+                self._curr_delay_info = _DelayInfo.create_now()
             self._curr_delay_info.delayed_count += 1
             if self._curr_delay_info.delayed_count < self.max_delay_passes:
                 return False
@@ -77,10 +79,11 @@ class PrefillDelayer:
                 f"PrefillDelayer timeout thus not forbid prefill (prefillable: {global_prefillable.sum()})"
             )
 
-        self._record_metrics_and_reset(is_timeout=is_timeout)
+        self._record_metrics(is_timeout=is_timeout)
+        self._curr_delay_info = None
         return True
 
-    def _record_metrics_and_reset(self, is_timeout: bool) -> None:
+    def _record_metrics(self, is_timeout: bool) -> None:
         if self._curr_delay_info is not None and self._metrics_collector is not None:
             wait_seconds = time.perf_counter() - self._curr_delay_info.start_time
             self._metrics_collector.observe_prefill_delayer_wait(
@@ -88,7 +91,6 @@ class PrefillDelayer:
                 wait_seconds=wait_seconds,
                 is_timeout=is_timeout,
             )
-        self._curr_delay_info = None
 
     def _gather_info(self, local_prefillable: bool):
         local_info = torch.tensor(
