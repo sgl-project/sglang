@@ -99,7 +99,6 @@ suite_amd = {
         TestFile("test_rope_rocm.py", 3),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_type_based_dispatcher.py", 10),
-        TestFile("test_video_utils.py", 8),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
         # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
