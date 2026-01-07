@@ -8,14 +8,6 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
-    "per-commit-1-gpu": [
-        TestFile("test_evs.py", 20),
-        TestFile("test_external_models.py", 30),
-        TestFile("test_modelopt_loader.py", 11),
-        TestFile("test_utils_update_weights.py", 29),
-        TestFile("test_video_utils.py", 5),
-        TestFile("test_modelopt_export.py", 9),
-    ],
     "per-commit-2-gpu": [
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),

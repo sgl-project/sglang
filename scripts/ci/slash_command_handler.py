@@ -154,7 +154,6 @@ def handle_rerun_stage(
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
         "quantization-test",
-        "unit-test-backend-1-gpu",
         "unit-test-backend-2-gpu",
         "stage-b-test-4-gpu-b200",
         "unit-test-backend-4-gpu",
