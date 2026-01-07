@@ -317,9 +317,6 @@ class Scheduler(
         # Init model configs
         self.init_model_config()
 
-        # Init metrics stats
-        self.init_metrics(tp_rank, pp_rank, dp_rank)
-
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
@@ -335,6 +332,9 @@ class Scheduler(
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
+
+        # Init metrics stats
+        self.init_metrics(tp_rank, pp_rank, dp_rank)
 
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
