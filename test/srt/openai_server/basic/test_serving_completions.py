@@ -175,7 +175,7 @@ class ServingCompletionTestCase(unittest.TestCase):
 
         self.assertEqual(len(response.choices), 1)
         self.assertEqual(response.choices[0].text, " world")
-        self.assertIsNone(response.choices[0].logprobs)
+        self.assertEqual(len(response.choices[0].logprobs.top_logprobs), 0)
 
 
 if __name__ == "__main__":

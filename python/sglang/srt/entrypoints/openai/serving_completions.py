@@ -398,9 +398,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 logprobs = to_openai_style_logprobs(
                     input_token_logprobs=input_token_logprobs,
                     input_top_logprobs=input_top_logprobs,
-                    output_token_logprobs=ret_item["meta_info"][
-                        "output_token_logprobs"
-                    ],
+                    output_token_logprobs=ret_item["meta_info"].get(
+                        "output_token_logprobs", []
+                    ),
                     output_top_logprobs=ret_item["meta_info"].get(
                         "output_top_logprobs", []
                     ),
