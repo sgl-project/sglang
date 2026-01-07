@@ -104,16 +104,19 @@ class PrefillDelayer:
 
 
 class PrefillDelayerSinglePassExecutor:
+    @staticmethod
+    def maybe_create(prefill_delayer: PrefillDelayer):
+        return (
+            PrefillDelayerSinglePassExecutor(prefill_delayer)
+            if prefill_delayer else None
+        )
+
     def __init__(self, prefill_delayer: PrefillDelayer):
         self._prefill_delayer = prefill_delayer
         self._result: Optional[bool] = None
 
-    @property
-    def _called(self) -> bool:
-        return self._result is not None
-
     def maybe_negotiate_should_allow_prefill(self, local_prefillable: bool) -> bool:
-        if not self._called:
+        if self._result is None:
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
                 local_prefillable=local_prefillable
             )
