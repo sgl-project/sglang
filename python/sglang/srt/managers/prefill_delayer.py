@@ -39,8 +39,9 @@ class PrefillDelayer:
         self.cpu_group = tp_worker.get_tp_group().cpu_group
 
         self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
-        self._curr_delay_info: Optional[_DelayInfo] = None
         self._metrics_collector = metrics_collector
+
+        self._curr_delay_info: Optional[_DelayInfo] = None
 
         assert (
             server_args.enable_dp_attention
