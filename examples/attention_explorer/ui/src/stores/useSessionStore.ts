@@ -22,7 +22,12 @@ interface SessionState {
   clear: () => void;
 }
 
-export const useSessionStore = create<SessionState>((set, get) => ({
+export const useSessionStore = create<SessionState>((set, get) => {
+  // Expose store for E2E testing/debugging
+  if (typeof window !== 'undefined') {
+    (window as any).__SESSION_STORE__ = { get };
+  }
+  return {
   messages: [],
   currentTokens: [],
   currentAttention: new Map(),
@@ -165,4 +170,4 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       isStreaming: false,
     });
   },
-}));
+}});  // Close both return object and create callback

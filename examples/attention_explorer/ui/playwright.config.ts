@@ -42,6 +42,14 @@ export default defineConfig({
         testIgnore: /.*/
       } : {}),
     },
+    {
+      name: 'screenshots',
+      testMatch: /product-screenshots\.spec\.ts/,
+      use: {
+        ...devices['Desktop Chrome'],
+        viewport: { width: 1920, height: 1080 },
+      },
+    },
   ],
 
   webServer: {
