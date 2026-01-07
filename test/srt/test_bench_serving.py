@@ -432,9 +432,7 @@ class TestBenchServing(CustomTestCase):
                 "fp8",
                 "--pp-size",
                 "2",
-                "--mem-fraction-static" if is_in_amd_ci() else "",
-                "0.7" if is_in_amd_ci() else "",
-            ],
+            ] + (["--mem-fraction-static", "0.7"] if is_in_amd_ci() else []),
             need_warmup=False,
             seed=42,
         )
