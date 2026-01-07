@@ -946,6 +946,11 @@ class TokenizeRequest(BaseModel):
         default=True,
         description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
     )
+    return_texts: bool = Field(
+        default=False,
+        description="If True, also return the text representation of each token. "
+        "Useful for attention visualization where token texts are needed.",
+    )
 
 
 class TokenizeResponse(BaseModel):
@@ -954,6 +959,10 @@ class TokenizeResponse(BaseModel):
     tokens: Union[List[int], List[List[int]]]
     count: Union[int, List[int]]
     max_model_len: int
+    texts: Optional[Union[List[str], List[List[str]]]] = Field(
+        default=None,
+        description="Text representation of each token. Only returned if return_texts=True.",
+    )
 
 
 class DetokenizeRequest(BaseModel):

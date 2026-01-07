@@ -422,6 +422,7 @@ class ForwardBatch:
     capture_attention_tokens: bool = False
     attention_top_k: int = 5
     attention_window: int = 0  # Context window for capture (0 = all tokens)
+    attention_chunk_size: int = 2048  # Chunk size for extraction kernel
     # Multi-layer capture: dict of layer_id -> AttentionTokenInfo
     attention_token_infos: Optional[Dict[int, "AttentionTokenInfo"]] = None
     # Legacy single-layer field (for backward compatibility)
@@ -608,6 +609,7 @@ class ForwardBatch:
             ret.capture_attention_tokens = True
             ret.attention_top_k = batch.attention_top_k
             ret.attention_window = model_runner.server_args.attention_tokens_window
+            ret.attention_chunk_size = model_runner.server_args.attention_chunk_size
             ret.attention_token_infos = {}  # Initialize multi-layer storage
 
             # Check if fingerprint mode is enabled (production path)

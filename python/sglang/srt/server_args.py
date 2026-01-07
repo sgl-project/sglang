@@ -620,6 +620,9 @@ class ServerArgs:
     # Sketch mode: compute per-layer summary sketches (top_hubs, dist_hist, entropy)
     # Bandwidth-efficient for very long outputs (86k+) - ~500 bytes per layer vs raw edges
     attention_sketch_mode: bool = False
+    # Chunk size for attention extraction kernel (memory/latency tradeoff)
+    # Larger chunks = more memory but fewer kernel launches
+    attention_chunk_size: int = 2048
 
     # Privacy: mask attention to system prompt tokens
     # Prevents leaking system prompt structure/length through attention patterns
@@ -4518,6 +4521,14 @@ class ServerArgs:
             help="Enable sketch mode for attention capture. Returns per-layer summary sketches "
                  "(top_hubs, dist_hist, entropy) instead of raw edges. Bandwidth-efficient for "
                  "very long outputs (86k+). ~500 bytes per layer. (default: False)",
+        )
+        parser.add_argument(
+            "--attention-chunk-size",
+            type=int,
+            default=ServerArgs.attention_chunk_size,
+            help="Chunk size for attention extraction kernel. Larger chunks use more memory "
+                 "but have fewer kernel launches. Tune based on GPU memory and context length. "
+                 "(default: 2048)",
         )
         parser.add_argument(
             "--attention-mask-system-prompt",

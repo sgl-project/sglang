@@ -6,6 +6,15 @@ export type DrawerState = 'closed' | 'hovering' | 'pinned';
 export type DrawerTab = 'links' | 'signal' | 'moe';
 export type MetricScope = 'all' | 'think' | 'output' | 'boundary';
 
+// Overhead stats for the HUD
+export interface OverheadStats {
+  tokenCount: number;
+  attentionBytes: number;
+  attentionMode: 'raw' | 'sketch' | 'fingerprint' | null;
+  streamStartTime: number | null;
+  lastTokenTime: number | null;
+}
+
 interface UIState {
   view: View;
   program: Program;
@@ -30,6 +39,9 @@ interface UIState {
 
   // Metric scope for InsightPanel
   metricScope: MetricScope;
+
+  // Overhead stats (latency, bytes, mode)
+  overheadStats: OverheadStats;
 
   setView: (v: View) => void;
   setProgram: (p: Program) => void;
@@ -56,6 +68,12 @@ interface UIState {
 
   // Metric scope actions
   setMetricScope: (scope: MetricScope) => void;
+
+  // Overhead stats actions
+  startStreamStats: () => void;
+  recordAttentionEntry: (bytes: number, mode: 'raw' | 'sketch' | 'fingerprint') => void;
+  incrementTokenCount: () => void;
+  resetStats: () => void;
 }
 
 const HOVER_CLOSE_DELAY = 300; // ms before drawer closes after mouse leaves
@@ -84,6 +102,15 @@ export const useUIStore = create<UIState>((set, get) => ({
 
   // Metric scope
   metricScope: 'all',
+
+  // Overhead stats
+  overheadStats: {
+    tokenCount: 0,
+    attentionBytes: 0,
+    attentionMode: null,
+    streamStartTime: null,
+    lastTokenTime: null,
+  },
 
   setView: (view) => set({ view }),
   setProgram: (program) => set({ program }),
@@ -198,4 +225,42 @@ export const useUIStore = create<UIState>((set, get) => ({
   },
 
   setMetricScope: (metricScope) => set({ metricScope }),
+
+  // Overhead stats actions
+  startStreamStats: () => set({
+    overheadStats: {
+      tokenCount: 0,
+      attentionBytes: 0,
+      attentionMode: null,
+      streamStartTime: Date.now(),
+      lastTokenTime: null,
+    },
+  }),
+
+  recordAttentionEntry: (bytes, mode) => set((state) => ({
+    overheadStats: {
+      ...state.overheadStats,
+      attentionBytes: state.overheadStats.attentionBytes + bytes,
+      attentionMode: mode,
+      lastTokenTime: Date.now(),
+    },
+  })),
+
+  incrementTokenCount: () => set((state) => ({
+    overheadStats: {
+      ...state.overheadStats,
+      tokenCount: state.overheadStats.tokenCount + 1,
+      lastTokenTime: Date.now(),
+    },
+  })),
+
+  resetStats: () => set({
+    overheadStats: {
+      tokenCount: 0,
+      attentionBytes: 0,
+      attentionMode: null,
+      streamStartTime: null,
+      lastTokenTime: null,
+    },
+  }),
 }));
