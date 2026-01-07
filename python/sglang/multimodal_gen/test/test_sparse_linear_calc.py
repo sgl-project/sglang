@@ -25,7 +25,8 @@ for seed in [0, 42, 128, 1024]:
     torch.manual_seed(seed)
 
     # test case
-    B, H, L, D = 1, 12, 32760, 128
+    # B, H, L, D = 1, 12, 32760, 128
+    B, H, L, D = 1, 40, 32760, 128
     q = torch.randn(B, H, L, D)
     k = torch.randn(B, H, L, D)
     v = torch.randn(B, H, L, D)
