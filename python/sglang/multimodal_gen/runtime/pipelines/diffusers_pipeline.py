@@ -470,6 +470,9 @@ class DiffusersPipeline(ComposedPipelineBase):
         # Apply attention backend if specified
         self._apply_attention_backend(pipe, server_args)
 
+        # Apply cache-dit acceleration if configured
+        pipe = self._apply_cache_dit(pipe, server_args)
+
         logger.info("Loaded diffusers pipeline: %s", pipe.__class__.__name__)
         return pipe
 
@@ -524,6 +527,129 @@ class DiffusersPipeline(ComposedPipelineBase):
                         component_name,
                         e,
                     )
+
+    def _apply_cache_dit(self, pipe: Any, server_args: ServerArgs) -> Any:
+        """Enable cache-dit for diffusers pipeline if configured."""
+        cache_dit_config = getattr(server_args, "cache_dit_config", None)
+        if not cache_dit_config:
+            return pipe
+
+        try:
+            import cache_dit
+        except ImportError as e:
+            raise RuntimeError(
+                "cache-dit is required for --cache-dit-config. "
+                "Install it with `pip install cache-dit`."
+            ) from e
+
+        cache_options = self._load_cache_dit_options(cache_dit, cache_dit_config)
+        parallelism_config = cache_options.get("parallelism_config")
+        if parallelism_config is not None:
+            self._resolve_cache_dit_extra_parallel_modules(
+                pipe,
+                parallelism_config,
+                cache_dit,
+            )
+
+        try:
+            pipe = cache_dit.enable_cache(pipe, **cache_options)
+        except Exception:
+            logger.exception("Failed to enable cache-dit for diffusers pipeline")
+            raise
+
+        logger.info("Enabled cache-dit for diffusers pipeline")
+        return pipe
+
+    def _load_cache_dit_options(self, cache_dit: Any, cache_dit_config: Any) -> dict:
+        """Load cache-dit options from a path or dict."""
+        if isinstance(cache_dit_config, str):
+            config_dict = ServerArgs.load_config_file(cache_dit_config)
+        elif isinstance(cache_dit_config, dict):
+            config_dict = cache_dit_config
+        else:
+            raise ValueError(
+                "cache_dit_config must be a file path or a dict, got "
+                f"{type(cache_dit_config).__name__}"
+            )
+
+        if not isinstance(config_dict, dict):
+            raise ValueError(
+                "cache_dit_config must resolve to a dict, got "
+                f"{type(config_dict).__name__}"
+            )
+
+        if "cache_config" in config_dict:
+            cache_options = cache_dit.load_options(config_dict["cache_config"])
+            parallelism_config = config_dict.get("parallelism_config")
+            if parallelism_config is not None:
+                cache_options["parallelism_config"] = cache_dit.ParallelismConfig(
+                    **parallelism_config
+                )
+            return cache_options
+
+        return cache_dit.load_options(config_dict)
+
+    def _resolve_cache_dit_extra_parallel_modules(
+        self,
+        pipe: Any,
+        parallelism_config: Any,
+        cache_dit: Any,
+    ) -> None:
+        parallel_kwargs = getattr(parallelism_config, "parallel_kwargs", None)
+        if not isinstance(parallel_kwargs, dict):
+            return
+
+        extra_modules = parallel_kwargs.get("extra_parallel_modules")
+        if not extra_modules:
+            return
+
+        resolved_modules = []
+        for module in extra_modules:
+            if isinstance(module, str):
+                resolved = self._lookup_parallel_module(pipe, module, cache_dit)
+                if resolved is None:
+                    logger.warning(
+                        "cache-dit extra_parallel_modules entry '%s' could not be resolved",
+                        module,
+                    )
+                    continue
+                resolved_modules.append(resolved)
+            else:
+                resolved_modules.append(module)
+
+        parallel_kwargs["extra_parallel_modules"] = resolved_modules
+
+    def _lookup_parallel_module(
+        self,
+        pipe: Any,
+        name: str,
+        cache_dit: Any,
+    ) -> Any | None:
+        if name == "text_encoder":
+            return self._get_default_text_encoder(pipe, cache_dit)
+
+        if hasattr(pipe, name):
+            return getattr(pipe, name)
+
+        return None
+
+    def _get_default_text_encoder(self, pipe: Any, cache_dit: Any) -> Any | None:
+        try:
+            from cache_dit.serve.utils import get_text_encoder_from_pipe
+
+            encoder, _ = get_text_encoder_from_pipe(pipe)
+            if encoder is not None:
+                return encoder
+        except Exception:
+            pass
+
+        for attr in ["text_encoder_2", "text_encoder_3", "text_encoder"]:
+            if hasattr(pipe, attr):
+                encoder = getattr(pipe, attr)
+                if encoder is not None:
+                    return encoder
+
+        return None
 
     def _get_device_map(self, server_args: ServerArgs) -> str | None:
         """
