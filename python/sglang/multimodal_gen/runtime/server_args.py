@@ -236,6 +236,9 @@ class ServerArgs:
     # Attention
     attention_backend: str = None
     diffusers_attention_backend: str = None  # for diffusers backend only
+    cache_dit_config: str | dict[str, Any] | None = (
+        None  # cache-dit config for diffusers
+    )
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
@@ -461,6 +464,12 @@ class ServerArgs:
             default=None,
             help="Attention backend for diffusers pipelines (e.g., flash, _flash_3_hub, sage, xformers). "
             "See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends",
+        )
+        parser.add_argument(
+            "--cache-dit-config",
+            type=str,
+            default=ServerArgs.cache_dit_config,
+            help="Path to a Cache-DiT YAML/JSON config. Enables cache-dit for diffusers backend.",
         )
 
         # HuggingFace specific parameters

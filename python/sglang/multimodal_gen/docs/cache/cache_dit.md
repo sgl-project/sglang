@@ -24,6 +24,39 @@ sglang generate --model-path Qwen/Qwen-Image \
     --prompt "A beautiful sunset over the mountains"
 ```
 
+## Diffusers Backend
+
+To enable Cache-DiT for the diffusers backend, pass a cache-dit config file:
+
+```bash
+sglang generate --model-path Qwen/Qwen-Image \
+    --backend diffusers \
+    --cache-dit-config ./cache_dit_config.yaml \
+    --prompt "A curious raccoon"
+```
+
+Cache-DiT accepts its native config format. SGLang also supports a nested layout
+with `cache_config` and `parallelism_config`:
+
+```yaml
+cache_config:
+  cache_type: DBCache
+  Fn_compute_blocks: 1
+  Bn_compute_blocks: 0
+  max_warmup_steps: 8
+  warmup_interval: 2
+  max_cached_steps: -1
+  max_continuous_cached_steps: 2
+  residual_diff_threshold: 0.12
+  enable_taylorseer: true
+  taylorseer_order: 1
+parallelism_config:
+  ulysses_size: 4
+  parallel_kwargs:
+    attention_backend: native
+    extra_parallel_modules: ["text_encoder", "vae"]
+```
+
 ## Advanced Configuration
 
 ### DBCache Parameters
@@ -151,8 +184,8 @@ SGLang Diffusion x Cache-DiT supports almost all models originally supported in 
 
 ## Limitations
 
-- **Single GPU only**: Distributed support (TP/SP) is not yet validated; Cache-DiT will be automatically disabled when
-  `world_size > 1`
+- **SGLang-native pipelines**: Distributed support (TP/SP) is not yet validated; Cache-DiT will be automatically
+  disabled when `world_size > 1`. The diffusers backend uses cache-dit's native parallelism when configured.
 - **SCM minimum steps**: SCM requires >= 8 inference steps to be effective
 - **Model support**: Only models registered in Cache-DiT's BlockAdapterRegister are supported
 
