@@ -1005,7 +1005,8 @@ class ServerArgs:
             + list(range(48, 257, 16))
             + list(range(288, 513, 32))
             + list(range(640, 1024 + 1, 64))
-            + list(range(1152, self.piecewise_cuda_graph_max_tokens + 1, 128))
+            + list(range(1152, 4096 + 1, 256))
+            + list(range(4608, self.piecewise_cuda_graph_max_tokens + 1, 512))
         )
 
         capture_sizes = [
