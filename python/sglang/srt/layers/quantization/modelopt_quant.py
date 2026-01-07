@@ -1513,7 +1513,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # For other backends, ensure the per-input block dimension is aligned to 16.
                 assert (
                     weight_scale.shape[assert_dim] % block_size == 0
-                ), f"Expected {name}_weight_scale.dim({assert_dim}) to be divisible by {block_size}"
+                ), f"Expected {name}_weight_scale.dim({assert_dim}) to be divisible by {block_size}, got {weight_scale.shape[assert_dim]}"
             assert (
                 weight_scale.dtype == torch.float8_e4m3fn
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
