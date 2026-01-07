@@ -39,6 +39,10 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.models.transformers import maybe_prefix
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 NestedTensors: TypeAlias = Union[
     list["NestedTensors"],
@@ -1454,7 +1458,6 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
-
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1511,6 +1514,36 @@ class DeepseekOCRForCausalLM(nn.Module):
             raise RuntimeError(
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        if _is_cpu and _is_cpu_amx_available:
+            from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+
+            layer_ids = int(self.config.num_hidden_layers)
+            first_k_dense_replace_id = (
+                self.config.first_k_dense_replace
+                if hasattr(self.config, "first_k_dense_replace")
+                else -1
+            )
+            moe_layer_freq_id = (
+                self.config.moe_layer_freq
+                if hasattr(self.config, "moe_layer_freq")
+                else 1
+            )
+            for layer_id in range(0, layer_ids):
+                if (
+                    layer_id >= first_k_dense_replace_id
+                    and layer_id % moe_layer_freq_id == 0
+                ):
+                    if (
+                        hasattr(self.model, "model")
+                        and hasattr(self.model.model, "layers")
+                        and hasattr(self.model.model.layers[layer_id], "mlp")
+                    ):
+                        self_moe = self.model.model.layers[layer_id].mlp
+                        if hasattr(self_moe, "w1") and hasattr(self_moe, "w2"):
+                            _amx_process_weight_after_loading(self_moe, ["w1", "w2"])
 
 
 EntryClass = [DeepseekOCRForCausalLM]
