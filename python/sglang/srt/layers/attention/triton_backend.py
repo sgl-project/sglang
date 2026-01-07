@@ -1399,7 +1399,7 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indices,
                 sm_scale,
                 top_k=forward_batch.attention_top_k,
-                chunk_size=2048,  # Tuned for memory/accuracy tradeoff
+                chunk_size=forward_batch.attention_chunk_size,
                 window=forward_batch.attention_window,
             )
 

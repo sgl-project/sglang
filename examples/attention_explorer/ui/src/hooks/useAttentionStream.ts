@@ -19,6 +19,9 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
   const program = useUIStore((state) => state.program);
   const setConnected = useUIStore((state) => state.setConnected);
   const setModelName = useUIStore((state) => state.setModelName);
+  const startStreamStats = useUIStore((state) => state.startStreamStats);
+  const recordAttentionEntry = useUIStore((state) => state.recordAttentionEntry);
+  const incrementTokenCount = useUIStore((state) => state.incrementTokenCount);
   const addMessage = useSessionStore((state) => state.addMessage);
   const appendToken = useSessionStore((state) => state.appendToken);
   const appendAttention = useSessionStore((state) => state.appendAttention);
@@ -78,6 +81,7 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
       program,
       onToken: (token) => {
         appendToken(token);
+        incrementTokenCount();
       },
       onAttention: (entry) => {
         appendAttention(entry);
@@ -86,6 +90,18 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
         // This enables Manifold/Router views with raw attention data
         const fp = extractFingerprint(entry);
         if (fp) setFingerprint(fp);
+
+        // Record overhead stats based on mode
+        // Estimated bytes per entry: raw ~200B, sketch ~500B/layer, fingerprint ~64B
+        const mode = entry.mode as 'raw' | 'sketch' | 'fingerprint';
+        let bytes = 64; // default fingerprint size
+        if (mode === 'raw') {
+          bytes = 200 + (entry as any).layers ? Object.keys((entry as any).layers).length * 150 : 0;
+        } else if (mode === 'sketch') {
+          const layerCount = (entry as any).layer_sketches ? Object.keys((entry as any).layer_sketches).length : 1;
+          bytes = 500 * layerCount;
+        }
+        recordAttentionEntry(bytes, mode);
       },
       onMoE: (entry) => {
         appendMoE(entry);
@@ -106,7 +122,7 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
     return () => {
       client.abort();
     };
-  }, [baseUrl, model, program, appendToken, appendAttention, appendMoE, setFingerprint, finishStreaming]);
+  }, [baseUrl, model, program, appendToken, appendAttention, appendMoE, setFingerprint, finishStreaming, incrementTokenCount, recordAttentionEntry]);
 
   useEffect(() => {
     clientRef.current?.setProgram(program);
@@ -125,6 +141,9 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
 
       setIsStreaming(true);
       setError(null);
+
+      // Start overhead stats tracking for this stream
+      startStreamStats();
 
       // Add user message (will sync to TraceStore)
       addMessage({
@@ -150,7 +169,7 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
         setIsStreaming(false);
       }
     },
-    [addMessage, initTrace, startStreaming, finishStreaming]
+    [addMessage, initTrace, startStreaming, finishStreaming, startStreamStats]
   );
 
   const abort = useCallback(() => {

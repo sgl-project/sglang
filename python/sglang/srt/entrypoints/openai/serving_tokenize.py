@@ -37,6 +37,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
             tokenizer = self.tokenizer_manager.tokenizer
             max_model_len = getattr(tokenizer, "model_max_length", -1)
 
+            texts = None
             if isinstance(request.prompt, str):
                 token_ids = tokenizer.encode(
                     request.prompt,
@@ -44,6 +45,12 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 )
                 tokens = token_ids
                 count = len(token_ids)
+                # Return text representation of each token if requested
+                if request.return_texts:
+                    texts = [
+                        tokenizer.decode([tid], skip_special_tokens=False)
+                        for tid in token_ids
+                    ]
             elif isinstance(request.prompt, list):
                 token_ids_list = [
                     tokenizer.encode(
@@ -53,13 +60,22 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 ]
                 tokens = token_ids_list
                 count = [len(ids) for ids in token_ids_list]
+                # Return text representation of each token if requested
+                if request.return_texts:
+                    texts = [
+                        [
+                            tokenizer.decode([tid], skip_special_tokens=False)
+                            for tid in ids
+                        ]
+                        for ids in token_ids_list
+                    ]
             else:
                 return self.create_error_response(
                     f"Invalid prompt type: {type(request.prompt)}. Expected str or List[str]."
                 )
 
             return TokenizeResponse(
-                tokens=tokens, count=count, max_model_len=max_model_len
+                tokens=tokens, count=count, max_model_len=max_model_len, texts=texts
             )
         except Exception as e:
             logger.error("Error during tokenization", exc_info=True)

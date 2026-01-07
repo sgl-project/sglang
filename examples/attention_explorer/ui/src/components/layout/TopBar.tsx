@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useUIStore } from '../../stores/useUIStore';
 import { View, Program } from '../../api/types';
+import { OverheadHUD } from './OverheadHUD';
 
 const VIEWS: { id: View; label: string; icon: string }[] = [
   { id: 'chat', label: 'Chat', icon: '💬' },
@@ -72,6 +73,7 @@ export function TopBar() {
       </div>
 
       <div className="right">
+        <OverheadHUD />
         <div className={`pill ${isConnected ? 'connected-pill' : 'disconnected-pill'}`}>
           <span className={`dot ${isConnected ? 'connected' : ''}`} style={{
             animation: isConnected ? 'pulse 2s infinite' : undefined
