@@ -653,9 +653,10 @@ class GroupCoordinator:
             # Convert negative dim to positive.
             dim += input_.dim()
 
-        # Note: This will produce an incorrect answer if we don't make
-        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-        input_tensor = input_.movedim(0, dim).contiguous()
+        with self.use_symmetric_memory(self):
+            # Note: This will produce an incorrect answer if we don't make
+            # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
+            input_tensor = input_.movedim(0, dim).contiguous()
 
         assert input_tensor.shape[0] % world_size == 0
         chunk_size = input_tensor.shape[0] // world_size
