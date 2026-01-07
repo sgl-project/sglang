@@ -29,7 +29,7 @@ class TestLlama4Unified(unittest.TestCase):
             "--trust-remote-code",
             "--chat-template=llama-4",
             "--mem-fraction-static=0.8",
-            "--context-length=8192",
+            "--context-length=1000000",
         ]
 
         variants = [
