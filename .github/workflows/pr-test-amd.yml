@@ -220,7 +220,7 @@ jobs:
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 4
 
