@@ -318,7 +318,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Flag to enable FlashInfer's append_paged_mla_kv_cache for FP8 KV cache
         # This is experimental and can be enabled for testing
         # Set to True to use FlashInfer's append instead of triton's set_mla_kv_buffer
-        self.use_flashinfer_mla_append = True
+        self.use_flashinfer_mla_append = False
+
+        # Flag to enable the fused rope_quantize_fp8_append_paged_kv_cache kernel
+        # This combines RoPE application, FP8 quantization, and KV cache append
+        # into a single kernel call for better performance
+        # Set to True to use the fused kernel instead of separate calls
+        self.use_fused_rope_quantize_append = True
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -872,6 +878,120 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         kv_buffer_paged[..., : self.kv_lora_rank] = ckv_cache
         kv_buffer_paged[..., self.kv_lora_rank :] = kpe_cache
 
+    def fused_rope_quantize_and_append_kv_cache(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+    ) -> torch.Tensor:
+        """Fused RoPE application, FP8 quantization, and KV cache append.
+
+        This combines mla_rope_quantize_fp8 and append_paged_mla_kv_cache into
+        a single fused kernel call using rope_quantize_fp8_append_paged_kv_cache.
+
+        Args:
+            q_nope: Query no-position-encoding component [seq_len, num_heads, kv_lora_rank]
+            q_rope: Query RoPE component [seq_len, num_heads, qk_rope_head_dim]
+            k_nope: Key no-position-encoding component [seq_len, kv_lora_rank]
+            k_rope: Key RoPE component [seq_len, qk_rope_head_dim]
+            layer: The attention layer
+            forward_batch: Forward batch containing position and cache info
+            cos_sin_cache: Precomputed cosine/sine cache for RoPE
+            is_neox: Whether to use NeoX-style RoPE
+
+        Returns:
+            merged_q_out: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=FP8
+        """
+        attn_dtype = torch.float8_e4m3fn
+        q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
+
+        # Allocate output tensor for merged query (nope + rope)
+        q_out = q_rope.new_empty(
+            q_len,
+            num_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            dtype=attn_dtype,
+        )
+
+        # Get the paged KV cache buffer for this layer
+        kv_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+
+        # Reshape to paged layout: [num_pages, page_size, kv_cache_dim]
+        num_tokens = kv_buffer.shape[0]
+        num_pages = num_tokens // self.page_size
+        kv_buffer_paged = kv_buffer.squeeze(1).view(
+            num_pages, self.page_size, self.kv_cache_dim
+        )
+
+        # Split into ckv_cache and kpe_cache (contiguous copies needed)
+        ckv_cache = kv_buffer_paged[..., : self.kv_lora_rank].contiguous()
+        kpe_cache = kv_buffer_paged[..., self.kv_lora_rank :].contiguous()
+
+        # Get output cache locations
+        out_cache_loc = forward_batch.out_cache_loc
+        nnz = out_cache_loc.shape[0]
+
+        # Prepare kv_indices (page indices for each token)
+        kv_indices = (out_cache_loc // self.page_size).int()
+
+        # Prepare batch_indices and positions
+        # positions = page positions (position within page) for cache indexing
+        if forward_batch.forward_mode.is_decode_or_idle():
+            batch_indices = torch.arange(nnz, dtype=torch.int32, device=out_cache_loc.device)
+            positions = (out_cache_loc % self.page_size).int()
+            kv_indptr = torch.arange(nnz + 1, dtype=torch.int32, device=out_cache_loc.device)
+        else:
+            extend_seq_lens = forward_batch.extend_seq_lens
+            bs = forward_batch.batch_size
+            batch_indices = torch.repeat_interleave(
+                torch.arange(bs, dtype=torch.int32, device=out_cache_loc.device),
+                extend_seq_lens.int(),
+            )
+            positions = (out_cache_loc % self.page_size).int()
+            kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=out_cache_loc.device)
+            kv_indptr[1:] = torch.cumsum(extend_seq_lens, dim=0).int()
+
+        # Prepare pos_ids - MUST be sliced to nnz, int32, and contiguous
+        # The fused kernel requires pos_ids to exactly match the number of tokens
+        pos_ids_sliced = forward_batch.positions[:nnz].int().contiguous()
+
+        # Call the fused FlashInfer kernel
+        # For MLA mode: v=None, paged_kv_cache=(ckv_cache, kpe_cache)
+        # Returns: (q_rope_out, q_nope_out)
+        q_rope_out, q_nope_out = flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
+            q_rope=q_rope,
+            k_rope=k_rope,
+            q_nope=q_nope,
+            k_nope=k_nope,
+            v=None,  # MLA mode - no separate V tensor
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=pos_ids_sliced,
+            paged_kv_cache=(ckv_cache, kpe_cache),
+            kv_indices=kv_indices,
+            kv_indptr=kv_indptr,
+            batch_indices=batch_indices,
+            positions=positions,
+            is_neox=is_neox,
+            quantize_dtype=attn_dtype,
+            quant_scale_q=1.0,
+            quant_scale_kv=1.0,
+            page_size=self.page_size,
+            kv_layout="NHD",
+            q_rope_out=q_out[..., self.kv_lora_rank :],  # RoPE part at end
+            q_nope_out=q_out[..., : self.kv_lora_rank],  # Nope part at beginning
+        )
+
+        # Copy modified caches back to original buffer
+        kv_buffer_paged[..., : self.kv_lora_rank] = ckv_cache
+        kv_buffer_paged[..., self.kv_lora_rank :] = kpe_cache
+
+        return q_out
+
     def pad_draft_extend_query(
         self,
         q: torch.Tensor,
@@ -968,24 +1088,43 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MLA kernel."""
         merge_query = q_rope is not None
+
         if self.data_type == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert all(
                 x is not None for x in [q_rope, k_rope, cos_sin_cache]
             ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
-            q, k, k_rope = self.quantize_and_rope_for_fp8(
-                q,
-                q_rope,
-                k.squeeze(1),
-                k_rope.squeeze(1),
-                forward_batch,
-                cos_sin_cache,
-                is_neox,
-            )
-            merge_query = False
 
-        # Save KV cache if requested
+            if self.use_fused_rope_quantize_append and save_kv_cache:
+                # Fused path: RoPE + quantize + KV cache append in one kernel
+                q = self.fused_rope_quantize_and_append_kv_cache(
+                    q,  # q_nope
+                    q_rope,
+                    k.squeeze(1),  # k_nope
+                    k_rope.squeeze(1),
+                    layer,
+                    forward_batch,
+                    cos_sin_cache,
+                    is_neox,
+                )
+                merge_query = False
+                # KV cache already saved by fused kernel, skip separate save
+                save_kv_cache = False
+            else:
+                # Separated path: quantize first, then append
+                q, k, k_rope = self.quantize_and_rope_for_fp8(
+                    q,
+                    q_rope,
+                    k.squeeze(1),
+                    k_rope.squeeze(1),
+                    forward_batch,
+                    cos_sin_cache,
+                    is_neox,
+                )
+                merge_query = False
+
+        # Save KV cache if requested (skipped if fused path was used)
         if save_kv_cache:
             assert (
                 k is not None and k_rope is not None
@@ -1100,6 +1239,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
+
         if (
             self.data_type == torch.float8_e4m3fn
         ) and forward_batch.forward_mode.is_target_verify():
@@ -1108,18 +1248,36 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert all(
                 x is not None for x in [q_rope, k_rope, cos_sin_cache]
             ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
-            q, k, k_rope = self.quantize_and_rope_for_fp8(
-                q,
-                q_rope,
-                k.squeeze(1),
-                k_rope.squeeze(1),
-                forward_batch,
-                cos_sin_cache,
-                is_neox,
-            )
-            merge_query = False
 
-        # Save KV cache if requested
+            if self.use_fused_rope_quantize_append and save_kv_cache:
+                # Fused path: RoPE + quantize + KV cache append in one kernel
+                q = self.fused_rope_quantize_and_append_kv_cache(
+                    q,  # q_nope
+                    q_rope,
+                    k.squeeze(1),  # k_nope
+                    k_rope.squeeze(1),
+                    layer,
+                    forward_batch,
+                    cos_sin_cache,
+                    is_neox,
+                )
+                merge_query = False
+                # KV cache already saved by fused kernel, skip separate save
+                save_kv_cache = False
+            else:
+                # Separated path: quantize first, then append
+                q, k, k_rope = self.quantize_and_rope_for_fp8(
+                    q,
+                    q_rope,
+                    k.squeeze(1),
+                    k_rope.squeeze(1),
+                    forward_batch,
+                    cos_sin_cache,
+                    is_neox,
+                )
+                merge_query = False
+
+        # Save KV cache if requested (skipped if fused path was used)
         if save_kv_cache:
             assert (
                 k is not None and k_rope is not None
