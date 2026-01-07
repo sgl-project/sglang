@@ -244,19 +244,27 @@ class GPUAllocator:
             logger.warning("Failed to detect GPUs: %s", e)
             return []
 
-    def allocate_slots(self, model_specs: dict[str, dict]) -> list[GPUSlot]:
+    def allocate_slots(
+        self, model_specs: dict[str, dict], preserve_order: bool = False
+    ) -> list[GPUSlot]:
         """Allocate GPU slots based on model memory requirements.
 
-        Uses a first-fit decreasing bin-packing algorithm:
+        Uses a first-fit decreasing bin-packing algorithm by default:
         1. Sort models by memory requirement (largest first)
         2. For each model, find the first GPU(s) that can fit it
         3. For multi-GPU models, find consecutive GPUs
+
+        When preserve_order=True, processes models in dict insertion order
+        (test collection order) instead of sorting by memory. This ensures
+        models needed by earlier tests are allocated first.
 
         Note: This method tracks used GPUs across multiple calls, so subsequent
         allocations will use different GPUs than previous ones.
 
         Args:
             model_specs: Dict of model_id -> spec dict with 'memory_gb' and 'tp' keys
+            preserve_order: If True, allocate in dict order (test order) instead
+                           of sorting by memory size. Default False.
 
         Returns:
             List of GPUSlots with assigned models (only the newly allocated slots)
@@ -265,17 +273,21 @@ class GPUAllocator:
             logger.warning("No GPUs available for allocation")
             return []
 
-        # Sort models by memory requirement (largest first for better packing)
-        sorted_models = sorted(
-            model_specs.items(),
-            key=lambda x: x[1].get("memory_gb", 0),
-            reverse=True,
-        )
+        if preserve_order:
+            # Process in dict insertion order (test collection order)
+            ordered_models = list(model_specs.items())
+        else:
+            # Sort models by memory requirement (largest first for better packing)
+            ordered_models = sorted(
+                model_specs.items(),
+                key=lambda x: x[1].get("memory_gb", 0),
+                reverse=True,
+            )
 
         # Track new slots allocated in this call
         new_slots: list[GPUSlot] = []
 
-        for model_id, spec in sorted_models:
+        for model_id, spec in ordered_models:
             memory_gb = spec.get("memory_gb", 16)
             tp_size = spec.get("tp", 1)
 

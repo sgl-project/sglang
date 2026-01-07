@@ -37,7 +37,7 @@ from .gpu_allocator import (
 )
 from .gpu_monitor import GPUMonitor
 from .gpu_monitor import should_monitor as should_monitor_gpu
-from .model_pool import ModelInstance, ModelPool
+from .model_pool import ModelInstance, ModelPool, WorkerIdentity
 from .model_specs import (  # Default model paths; Model groups
     CHAT_MODELS,
     DEFAULT_EMBEDDING_MODEL_PATH,
@@ -63,10 +63,11 @@ from .process_utils import (
 from .run_eval import run_eval
 
 __all__ = [
-    # Enums
+    # Enums and Identity
     "ConnectionMode",
     "WorkerType",
     "Runtime",
+    "WorkerIdentity",
     # Convenience sets
     "LOCAL_MODES",
     "LOCAL_RUNTIMES",
