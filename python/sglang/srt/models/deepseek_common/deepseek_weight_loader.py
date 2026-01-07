@@ -79,6 +79,16 @@ logger = logging.getLogger(__name__)
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 class DeepseekV2WeightLoaderMixin:
+    """Mixin for loading weights in DeepSeek V2/V3 models.
+
+    Handles checkpoint loading with support for:
+    - Tensor/pipeline parallelism
+    - Multiple quantization formats (FP8, INT8, AWQ, etc.)
+    - MoE expert weight loading
+    - NextN speculative decoding weights
+    - Shared expert fusion optimization
+    """
+
     model: nn.Module
     config: PretrainedConfig
     quant_config: Optional[QuantizationConfig]
@@ -90,6 +100,12 @@ class DeepseekV2WeightLoaderMixin:
         weights: Iterable[Tuple[str, torch.Tensor]],
         is_nextn: bool = False,
     ):
+        """Load model weights from checkpoint.
+
+        Args:
+            weights: Iterable of (weight_name, weight_tensor) pairs
+            is_nextn: Whether loading NextN speculative decoding weights
+        """
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -373,7 +389,17 @@ class DeepseekV2WeightLoaderMixin:
         is_nextn: bool = False,
         weight_names: Optional[Iterable[str]] = None,
     ) -> None:
-        # Perform post-processing after loading weights
+        """Post-process weights after loading.
+
+        Handles kv_b_proj weight processing including:
+        - AWQ dequantization
+        - FP8/INT8 requantization and block-wise to tensor-wise conversion
+        - Splitting weights into w_kc and w_vc components for MLA
+
+        Args:
+            is_nextn: Whether processing NextN weights
+            weight_names: Optional list of loaded weight names to determine which layers to process
+        """
         if is_nextn:
             layer_ids = [self.config.num_hidden_layers]
         else:
@@ -571,7 +597,16 @@ class DeepseekV2WeightLoaderMixin:
     def _maybe_quant_weights_to_fp8_ue8m0(
         self, weights, attn_quant_modules, is_nextn=False
     ):
-        # Quantize some weights to fp8 ue8m0 for DeepSeek nvfp4 checkpoint
+        """Optionally quantize weights to FP8 UE8M0 format for DeepSeek nvfp4 checkpoints.
+
+        Args:
+            weights: Iterable of (name, tensor) weight pairs
+            attn_quant_modules: List of attention module names to quantize
+            is_nextn: Whether processing NextN weights
+
+        Returns:
+            List of (name, tensor) pairs with quantized weights
+        """
         partial_names = []
         nextn_layer_id = (
             0 if self.config.num_hidden_layers == 1 else self.config.num_hidden_layers
@@ -624,7 +659,7 @@ class DeepseekV2WeightLoaderMixin:
         return list(weights_dict.items())
 
     def _mark_nextn_moe_weights_as_ue8m0(self):
-        # Mark the ue8m0 flag of nextn moe weights as True to avoid requantization
+        """Mark NextN MoE weight scales as UE8M0 format to avoid requantization."""
         experts = self.model.decoder.mlp.experts
         w13_scale = (
             experts.w13_weight_scale_inv
