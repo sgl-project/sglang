@@ -442,7 +442,14 @@ class SparseLinearAttention(nn.Module):
             ksum = torch.sum(k, dim=-2, keepdim=True)
             return (q @ kvsum) / (1e-5 + (q * ksum).sum(dim=-1, keepdim=True))
 
-        o_l = calc_linear(q, k, v)
+        def torch_calc_linear(q, k, v):
+            kv = torch.matmul(k.transpose(-1, -2), v)
+            k_sum = torch.sum(k, dim=-2, keepdim=True)
+            return torch.matmul(q, kv) / (
+                1e-5 + torch.matmul(q, k_sum.transpose(-1, -2))
+            )
+
+        o_l = torch_calc_linear(q, k, v)
 
         with torch.amp.autocast("cuda", dtype=self.dtype):
             o_l = self.proj_l(o_l)
