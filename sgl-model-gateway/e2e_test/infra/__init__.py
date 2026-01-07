@@ -17,6 +17,8 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     HEALTH_CHECK_INTERVAL,
     LOCAL_MODES,
     LOCAL_RUNTIMES,
+    LOG_SEPARATOR_WIDTH,
+    MAX_RETRY_ATTEMPTS,
     PARAM_BACKEND_ROUTER,
     PARAM_MODEL,
     PARAM_SETUP_BACKEND,
@@ -82,6 +84,8 @@ __all__ = [
     "DEFAULT_STARTUP_TIMEOUT",
     "DEFAULT_ROUTER_TIMEOUT",
     "HEALTH_CHECK_INTERVAL",
+    "MAX_RETRY_ATTEMPTS",
+    "LOG_SEPARATOR_WIDTH",
     # Env vars
     "ENV_MODELS",
     "ENV_BACKENDS",

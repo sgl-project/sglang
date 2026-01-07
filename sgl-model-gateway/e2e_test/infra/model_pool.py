@@ -305,9 +305,6 @@ class ModelPool:
         if ib_device:
             logger.info("Detected InfiniBand device: %s", ib_device)
 
-        # Track bootstrap ports for PD groups (all PD workers of same model/mode share one)
-        pd_bootstrap_ports: dict[tuple[str, ConnectionMode], int] = {}
-
         deferred: list[str] = []
 
         # Process requirements in order - all workers treated uniformly
@@ -340,13 +337,8 @@ class ModelPool:
                 deferred.append(str(identity))
                 continue
 
-            # Get bootstrap port for PD workers (shared within model/mode group)
-            bootstrap_port = None
-            if identity.is_prefill or identity.is_decode:
-                pd_key = (identity.model_id, identity.mode)
-                if pd_key not in pd_bootstrap_ports:
-                    pd_bootstrap_ports[pd_key] = get_open_port()
-                bootstrap_port = pd_bootstrap_ports[pd_key]
+            # Each prefill worker needs its own bootstrap port for PD communication
+            bootstrap_port = get_open_port() if identity.is_prefill else None
 
             # Launch the worker
             self._launch_model(
@@ -354,7 +346,7 @@ class ModelPool:
                 mode=identity.mode,
                 gpu_slot=slots[0],
                 worker_type=identity.worker_type,
-                bootstrap_port=bootstrap_port if identity.is_prefill else None,
+                bootstrap_port=bootstrap_port,
                 ib_device=(
                     ib_device if (identity.is_prefill or identity.is_decode) else None
                 ),
@@ -888,25 +880,17 @@ class ModelPool:
         has_pd = any(w.is_prefill or w.is_decode for w in valid_workers)
         ib_device = detect_ib_device() if has_pd else None
 
-        # Track bootstrap ports for PD groups (shared within model/mode)
-        pd_bootstrap_ports: dict[tuple[str, ConnectionMode], int] = {}
-
         instances: list[ModelInstance] = []
         for w in valid_workers:
-            # Get bootstrap port for PD workers
-            bootstrap_port = None
-            if w.is_prefill or w.is_decode:
-                pd_key = (w.model_id, w.mode)
-                if pd_key not in pd_bootstrap_ports:
-                    pd_bootstrap_ports[pd_key] = get_open_port()
-                bootstrap_port = pd_bootstrap_ports[pd_key]
+            # Each prefill worker needs its own bootstrap port for PD communication
+            bootstrap_port = get_open_port() if w.is_prefill else None
 
             instance = self._launch_model(
                 model_id=w.model_id,
                 mode=w.mode,
                 gpu_slot=slot_map.get(w.key),
                 worker_type=w.worker_type,
-                bootstrap_port=bootstrap_port if w.is_prefill else None,
+                bootstrap_port=bootstrap_port,
                 ib_device=ib_device if (w.is_prefill or w.is_decode) else None,
                 instance_key=w.key,
             )

@@ -140,9 +140,9 @@ def pytest_runtest_logstart(nodeid: str, location: tuple) -> None:
     """Print clear test header at start of each test."""
     # Extract test name from nodeid (e.g., "test_mmlu.py::TestMMLU::test_mmlu_basic[grpc]")
     test_name = nodeid.split("::")[-1] if "::" in nodeid else nodeid
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * LOG_SEPARATOR_WIDTH}")
     print(f"TEST: {test_name}")
-    print(f"{'='*60}")
+    print(f"{'=' * LOG_SEPARATOR_WIDTH}")
 
 
 # Path setup for imports
@@ -172,6 +172,7 @@ from infra import (
     ENV_SKIP_MODEL_POOL,
     ENV_STARTUP_TIMEOUT,
     LOCAL_MODES,
+    LOG_SEPARATOR_WIDTH,
     PARAM_MODEL,
     PARAM_SETUP_BACKEND,
     ConnectionMode,
@@ -434,17 +435,18 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     max_required, available_gpus = validate_gpu_requirements()
 
     if max_required > available_gpus:
+        sep = "=" * LOG_SEPARATOR_WIDTH
         raise pytest.UsageError(
-            f"\n{'='*60}\n"
+            f"\n{sep}\n"
             f"GPU REQUIREMENTS EXCEEDED\n"
-            f"{'='*60}\n"
+            f"{sep}\n"
             f"Test '{_max_test_name}' requires {max_required} GPUs\n"
             f"Available: {available_gpus} GPUs\n"
             f"\nOptions:\n"
             f"  1. Run tests that fit: pytest -k 'not {_max_test_name.split('::')[0]}'\n"
             f"  2. Reduce workers: @pytest.mark.workers(prefill=1, decode=1)\n"
             f"  3. Skip GPU tests: SKIP_MODEL_POOL=1 pytest\n"
-            f"{'='*60}"
+            f"{sep}"
         )
 
     logger.info(

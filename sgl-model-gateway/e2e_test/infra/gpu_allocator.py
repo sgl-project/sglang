@@ -227,7 +227,7 @@ class GPUAllocator:
                     name = pynvml.nvmlDeviceGetName(handle)
                     # Handle bytes vs string return type (varies by pynvml version)
                     if isinstance(name, bytes):
-                        name = name.decode("utf-8")
+                        name = name.decode("utf-8", errors="replace")
                     mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
                     # Convert bytes to MB
                     memory_mb = mem_info.total // (1024 * 1024)
