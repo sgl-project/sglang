@@ -24,10 +24,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.layers.communicator import enable_nextn_moe_sparse_fully_dp
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
+    enable_nextn_moe_sparse_fully_dp,
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -89,12 +89,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 logger = logging.getLogger(__name__)
 
 
-def create_moe_dispatcher(
-    moe_runner_config: MoeRunnerConfig, is_nextn: Optional[bool] = None
-) -> BaseDispatcher:
+def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none():
-        return StandardDispatcher(moe_runner_config, is_nextn)
+        return StandardDispatcher(moe_runner_config)
     elif a2a_backend.is_deepep() or a2a_backend.is_mooncake():
         return MaybeTboDeepEPDispatcher(
             group=get_tp_group().device_group,
@@ -176,7 +174,6 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
-        is_nextn: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -191,7 +188,7 @@ class FusedMoE(torch.nn.Module):
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
         )
-        if enable_nextn_moe_sparse_fully_dp(is_nextn):
+        if enable_nextn_moe_sparse_fully_dp():
             self.moe_ep_size = 1
             self.moe_ep_rank = 0
             self.moe_tp_size = 1
@@ -278,7 +275,7 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
-        self.dispatcher = create_moe_dispatcher(self.moe_runner_config, is_nextn)
+        self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
 
         self.should_fuse_routed_scaling_factor_in_topk = isinstance(
             self.quant_method, ModelOptNvFp4FusedMoEMethod

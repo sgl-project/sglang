@@ -133,6 +133,8 @@ TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 MOE_QUANTIZATION: Optional[str] = None
+ENABLE_NEXTN_MOE_SPARSE_FULLY_DP: bool = False
+SPECULATIVE_MOE_TP_SIZE: Optional[int] = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -147,6 +149,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     global MOE_QUANTIZATION
+    global SPECULATIVE_MOE_TP_SIZE
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
@@ -169,6 +172,7 @@ def initialize_moe_config(server_args: ServerArgs):
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     )
     MOE_QUANTIZATION = server_args.quantization
+    SPECULATIVE_MOE_TP_SIZE = server_args.speculative_moe_tp_size
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -262,6 +266,13 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
     )
 
 
+def enable_nextn_moe_sparse_fully_dp() -> bool:
+    """
+    This value will be set to True in the speculative context if --speculative-moe-tp-size is 1.
+    """
+    return ENABLE_NEXTN_MOE_SPARSE_FULLY_DP
+
+
 @contextmanager
 def speculative_moe_backend_context():
     """
@@ -285,6 +296,7 @@ def speculative_moe_a2a_backend_context():
     """
     global MOE_A2A_BACKEND
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+    global ENABLE_NEXTN_MOE_SPARSE_FULLY_DP
     original_backend = MOE_A2A_BACKEND
     original_disable_flashinfer_cutlass_moe_fp4_allgather = (
         DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
@@ -293,12 +305,16 @@ def speculative_moe_a2a_backend_context():
         MOE_A2A_BACKEND = get_speculative_moe_a2a_backend()
         # Disable FP4 allgather for spec decode since MTP layers are unquantized
         DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = True
+        # If --speculative-moe-tp-size is 1, enable fully DP for nextn MoE sparse layers in speculative decoding
+        if SPECULATIVE_MOE_TP_SIZE is not None and SPECULATIVE_MOE_TP_SIZE == 1:
+            ENABLE_NEXTN_MOE_SPARSE_FULLY_DP = True
         yield
     finally:
         MOE_A2A_BACKEND = original_backend
         DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
             original_disable_flashinfer_cutlass_moe_fp4_allgather
         )
+        ENABLE_NEXTN_MOE_SPARSE_FULLY_DP = False
 
 
 # The type of method in top-K routing, for use in torch custom op

@@ -74,7 +74,6 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
-    enable_nextn_moe_sparse_fully_dp,
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
@@ -92,6 +91,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    enable_nextn_moe_sparse_fully_dp,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -617,7 +617,7 @@ class DeepseekV2MoE(nn.Module):
         is_nextn: bool = False,
     ):
         super().__init__()
-        if enable_nextn_moe_sparse_fully_dp(is_nextn):
+        if enable_nextn_moe_sparse_fully_dp():
             self.tp_size = 1
             self.moe_ep_size = 1
         else:
@@ -667,7 +667,7 @@ class DeepseekV2MoE(nn.Module):
             + self.num_fused_shared_experts
             + (
                 0
-                if enable_nextn_moe_sparse_fully_dp(is_nextn)
+                if enable_nextn_moe_sparse_fully_dp()
                 else get_global_server_args().ep_num_redundant_experts
             ),
             num_fused_shared_experts=self.num_fused_shared_experts,
@@ -681,7 +681,6 @@ class DeepseekV2MoE(nn.Module):
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
             prefix=add_prefix("experts", prefix),
-            is_nextn=is_nextn,
         )
 
         self.topk = TopK(
@@ -725,7 +724,7 @@ class DeepseekV2MoE(nn.Module):
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
                     or get_moe_a2a_backend().is_ascend_fuseep()
-                    or enable_nextn_moe_sparse_fully_dp(is_nextn)
+                    or enable_nextn_moe_sparse_fully_dp()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -2802,7 +2801,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
             is_next_layer_sparse=is_next_layer_sparse,
-            is_nextn=is_nextn,
         )
 
         if self.is_layer_sparse:
@@ -2855,7 +2853,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                     is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
                 ),
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
-                is_nextn=is_nextn,
             )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:

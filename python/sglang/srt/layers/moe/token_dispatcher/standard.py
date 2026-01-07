@@ -12,7 +12,6 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.layers.communicator import enable_nextn_moe_sparse_fully_dp
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_local_dp_buffer,
@@ -28,6 +27,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
+    enable_nextn_moe_sparse_fully_dp,
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -81,9 +81,9 @@ assert isinstance(StandardCombineInput, CombineInput)
 
 class StandardDispatcher(BaseDispatcher):
 
-    def __init__(self, moe_runner_config: MoeRunnerConfig, is_nextn: bool):
+    def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
-        if enable_nextn_moe_sparse_fully_dp(is_nextn):
+        if enable_nextn_moe_sparse_fully_dp():
             self.moe_ep_size = 1
             self.moe_ep_rank = 0
         else:
