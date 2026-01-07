@@ -657,7 +657,7 @@ class LoRAPipeline(ComposedPipelineBase):
         logger.info(
             "Rank %d: LoRA adapter(s) %s applied to %d layers (targets: %s, strengths: %s)",
                 rank,
-                ", ".join(lora_paths) if lora_paths else None,
+                ", ".join(map(str, lora_paths)) if lora_paths else None,
                 adapted_count,
                 ", ".join(targets) if len(set(targets)) > 1 else targets[0],
                 ", ".join(f"{s:.2f}" for s in strengths) if len(strengths) > 1 else f"{strengths[0]:.2f}",

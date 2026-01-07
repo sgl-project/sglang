@@ -144,6 +144,26 @@ class BaseLayerWithLoRA(nn.Module):
         self.merge_lora_weights()
 
     @torch.no_grad()
+    def _merge_lora_into_data(
+        self, data: torch.Tensor, lora_list: list[tuple[torch.nn.Parameter, torch.nn.Parameter, str | None, float]]
+    ) -> None:
+        """
+        Merge all LoRA adapters into the data tensor in-place.
+        
+        Args:
+            data: The base weight tensor to merge LoRA into (modified in-place)
+            lora_list: List of (lora_A, lora_B, lora_path, lora_strength) tuples
+        """
+        # Merge all LoRA adapters in order
+        for lora_A, lora_B, _, lora_strength in lora_list:
+            lora_delta = self.slice_lora_b_weights(lora_B.to(data)) @ self.slice_lora_a_weights(lora_A.to(data))
+            # Apply lora_alpha / lora_rank scaling for consistency with forward()
+            if self.lora_alpha is not None and self.lora_rank is not None:
+                if self.lora_alpha != self.lora_rank:
+                    lora_delta = lora_delta * (self.lora_alpha / self.lora_rank)
+            data += lora_strength * lora_delta
+
+    @torch.no_grad()
     def merge_lora_weights(self, strength: float | None = None) -> None:
         if strength is not None:
             self.strength = strength
@@ -179,14 +199,7 @@ class BaseLayerWithLoRA(nn.Module):
                 get_local_torch_device()
             ).full_tensor()
             
-            # Merge all LoRA adapters in order
-            for lora_A, lora_B, _, lora_strength in lora_list:
-                lora_delta = self.slice_lora_b_weights(lora_B.to(data)) @ self.slice_lora_a_weights(lora_A.to(data))
-                # Apply lora_alpha / lora_rank scaling for consistency with forward()
-                if self.lora_alpha is not None and self.lora_rank is not None:
-                    if self.lora_alpha != self.lora_rank:
-                        lora_delta = lora_delta * (self.lora_alpha / self.lora_rank)
-                data += lora_strength * lora_delta
+            self._merge_lora_into_data(data, lora_list)
             
             unsharded_base_layer.weight = nn.Parameter(data.to(current_device))
             if isinstance(getattr(self.base_layer, "bias", None), DTensor):
@@ -211,16 +224,7 @@ class BaseLayerWithLoRA(nn.Module):
             current_device = self.base_layer.weight.data.device
             data = self.base_layer.weight.data.to(get_local_torch_device())
             
-            # Merge all LoRA adapters in order
-            for lora_A, lora_B, _, lora_strength in lora_list:
-                lora_delta = self.slice_lora_b_weights(
-                    lora_B.to(data)
-                ) @ self.slice_lora_a_weights(lora_A.to(data))
-                # Apply lora_alpha / lora_rank scaling for consistency with forward()
-                if self.lora_alpha is not None and self.lora_rank is not None:
-                    if self.lora_alpha != self.lora_rank:
-                        lora_delta = lora_delta * (self.lora_alpha / self.lora_rank)
-                data += lora_strength * lora_delta
+            self._merge_lora_into_data(data, lora_list)
             
             self.base_layer.weight.data = data.to(current_device, non_blocking=True)
 
