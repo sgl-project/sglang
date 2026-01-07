@@ -1,4 +1,6 @@
 import logging
+import os
+import time
 from copy import copy
 from dataclasses import dataclass
 from typing import ClassVar, List, Optional, Tuple
@@ -49,6 +51,10 @@ if is_cuda():
     )
 
 logger = logging.getLogger(__name__)
+
+# Profiling for V1 vs V2 comparison (set SGLANG_PROFILE_SPEC_SYNC=1 to enable)
+_PROFILE_SYNC = os.environ.get("SGLANG_PROFILE_SPEC_SYNC", "0") == "1"
+_v1_sync_stats = {"tolist_ns": 0, "count": 0}
 
 
 @dataclass
@@ -102,7 +108,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
-
         if batch.forward_mode.is_idle():
             return
 
@@ -387,8 +392,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         unfinished_index = []
         unfinished_accept_index = []
+        if _PROFILE_SYNC:
+            _t0 = time.perf_counter_ns()
         accept_index_cpu = accept_index.tolist()
         predict_cpu = predict.tolist()
+        if _PROFILE_SYNC:
+            _v1_sync_stats["tolist_ns"] += time.perf_counter_ns() - _t0
+            _v1_sync_stats["count"] += 1
+            if _v1_sync_stats["count"] % 50 == 0:
+                avg = _v1_sync_stats["tolist_ns"] / _v1_sync_stats["count"] / 1e6
+                print(
+                    f"[V1 SYNC STATS] n={_v1_sync_stats['count']} tolist={avg:.3f}ms/step"
+                )
         has_finished = False
 
         # Iterate every accepted token and check if req has finished after append the token
@@ -412,9 +427,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         try:
                             req.grammar.accept_token(id)
                         except ValueError as e:
-                            logger.info(
-                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                            )
+                            logger.info(f"{i=}, {req=}\n{accept_index=}\n{predict=}\n")
                             raise e
             # Update KV cache tracking for the accepted tokens
             req.kv_committed_len += num_accepted
@@ -658,7 +671,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         return self.num_tokens_per_batch, self.num_tokens_for_logprob_per_batch
 
     def prepare_for_extend(self, batch: ScheduleBatch):
-
         if batch.forward_mode.is_idle():
             return
 
@@ -698,7 +710,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         batch: ScheduleBatch,
         speculative_num_steps: int,
     ):
-
         if batch.forward_mode.is_idle():
             return
 

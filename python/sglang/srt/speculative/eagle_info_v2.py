@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +51,10 @@ if is_cuda():
         tree_speculative_sampling_target_only,
     )
 
+# Profiling for V1 vs V2 comparison (set SGLANG_PROFILE_SPEC_SYNC=1 to enable)
+_PROFILE_SYNC = os.environ.get("SGLANG_PROFILE_SPEC_SYNC", "0") == "1"
+_sync_stats = {"wait_verify_ns": 0, "seq_lens_cpu_ns": 0, "count": 0}
+
 
 @triton.jit
 def assign_draft_cache_locs_page_size_1(
@@ -77,6 +83,18 @@ def assign_draft_cache_locs_page_size_1(
         tl.store(out_cache_ptr + copy_offset, data, mask=mask)
 
 
+def print_sync_stats():
+    """Print accumulated sync stats. Call at end of generation."""
+    if _PROFILE_SYNC and _sync_stats["count"] > 0:
+        avg_wait = _sync_stats["wait_verify_ns"] / _sync_stats["count"] / 1e6
+        avg_cpu = _sync_stats["seq_lens_cpu_ns"] / _sync_stats["count"] / 1e6
+        print(
+            f"[V2 SYNC STATS] n={_sync_stats['count']} "
+            f"wait_verify={avg_wait:.3f}ms seq_lens_cpu={avg_cpu:.3f}ms "
+            f"total={avg_wait + avg_cpu:.3f}ms/step"
+        )
+
+
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
@@ -89,7 +107,11 @@ class EagleDraftInputV2Mixin:
         bs = batch.batch_size()
 
         # Now seq_lens is correct
+        if _PROFILE_SYNC:
+            _t0 = time.perf_counter_ns()
         batch.maybe_wait_verify_done()
+        if _PROFILE_SYNC:
+            _sync_stats["wait_verify_ns"] += time.perf_counter_ns() - _t0
 
         page_size = batch.token_to_kv_pool_allocator.page_size
         cur_kv_lens_cpu = []
@@ -136,7 +158,20 @@ class EagleDraftInputV2Mixin:
         )
 
         # FIXME(lsyin): make this sync optional
+        if _PROFILE_SYNC:
+            _t1 = time.perf_counter_ns()
         batch.seq_lens_cpu = batch.seq_lens.cpu()
+        if _PROFILE_SYNC:
+            _sync_stats["seq_lens_cpu_ns"] += time.perf_counter_ns() - _t1
+            _sync_stats["count"] += 1
+            if _sync_stats["count"] % 50 == 0:
+                avg_wait = _sync_stats["wait_verify_ns"] / _sync_stats["count"] / 1e6
+                avg_cpu = _sync_stats["seq_lens_cpu_ns"] / _sync_stats["count"] / 1e6
+                print(
+                    f"[V2 SYNC STATS] n={_sync_stats['count']} "
+                    f"wait_verify={avg_wait:.3f}ms seq_lens_cpu={avg_cpu:.3f}ms "
+                    f"total={avg_wait + avg_cpu:.3f}ms/step"
+                )
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
     def prepare_for_v2_draft(
@@ -409,7 +444,6 @@ def fill_accepted_out_cache_loc(
     if src > -1:
         value = tl.load(out_cache_loc + src)
         tl.store(accepted_out_cache_loc + dst, value)
-
 
 
 @triton.jit
