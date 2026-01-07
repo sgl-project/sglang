@@ -11,7 +11,7 @@ use tracing::{debug, error};
 // Import embedding-specific and classify-specific stages
 use super::regular::stages::classify::ClassifyResponseProcessingStage;
 use super::{
-    common::stages::*,
+    common::{responses::ResponsesContext, stages::*},
     context::*,
     harmony,
     regular::{
@@ -753,7 +753,7 @@ impl RequestPipeline {
     pub async fn execute_harmony_responses(
         &self,
         request: &crate::protocols::responses::ResponsesRequest,
-        harmony_ctx: &harmony::responses::HarmonyResponsesContext,
+        harmony_ctx: &ResponsesContext,
     ) -> Result<harmony::ResponsesIterationResult, Response> {
         // Create RequestContext for this Responses request
         let mut ctx = RequestContext::for_responses(
@@ -816,7 +816,7 @@ impl RequestPipeline {
     pub async fn execute_harmony_responses_streaming(
         &self,
         request: &crate::protocols::responses::ResponsesRequest,
-        harmony_ctx: &harmony::responses::HarmonyResponsesContext,
+        harmony_ctx: &ResponsesContext,
     ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
         // Create RequestContext for this Responses request
         let mut ctx = RequestContext::for_responses(
