@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
-from sglang.srt.utils.custom_op import register_custom_op
+
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
@@ -37,7 +37,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import direct_register_custom_op, is_cuda, is_npu
+from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils.custom_op import register_custom_op
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -1023,7 +1024,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
 
-
             if (
                 forward_batch.forward_mode.is_extend()
                 and get_forward_context() is not None
@@ -1119,8 +1119,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         has_initial_state = extend_prefix_lens > 0
 
-
-
         mixed_qkv = causal_conv1d_fn(
             mixed_qkv,
             conv_weights,
@@ -1141,7 +1139,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             head_v_dim,
         )
 
-
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         if is_npu():
@@ -1160,14 +1157,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             **recurrent_state_indices_args,
         )
         if is_npu():
-            last_recurrent_state = last_recurrent_state.to(
-                ssm_states.dtype, copy=False
-            )
+            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
 
-        self._track_mamba_state_extend(
-            forward_batch, h, ssm_states, forward_metadata
-        )
+        self._track_mamba_state_extend(forward_batch, h, ssm_states, forward_metadata)
 
         return core_attn_out
 
@@ -1498,6 +1491,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 :, src_track_indices, track_steps
             ].to(conv_states.dtype, copy=False)
 
+
 @register_custom_op(mutates_args=["core_attn_out"])
 def causal_conv1d_gdn_with_output(
     mixed_qkv: torch.Tensor,
@@ -1541,11 +1535,10 @@ def causal_conv1d_gdn_with_output(
             head_k_dim,
             head_v_dim,
             forward_batch,
-            forward_batch.attn_backend.linear_attn_backend.forward_metadata
+            forward_batch.attn_backend.linear_attn_backend.forward_metadata,
         )
     )
 
     assert core_attn_out.numel() == core_attn_out_ret.numel()
     core_attn_out.view_as(core_attn_out_ret).copy_(core_attn_out_ret)
     return
-

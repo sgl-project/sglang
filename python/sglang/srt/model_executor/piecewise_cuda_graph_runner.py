@@ -477,9 +477,13 @@ class PiecewiseCudaGraphRunner:
                 return_logprob=False,
                 extend_num_tokens=num_tokens,
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
-                extend_prefix_lens=torch.tensor([num_tokens], device=self.device, dtype=torch.int32),
+                extend_prefix_lens=torch.tensor(
+                    [num_tokens], device=self.device, dtype=torch.int32
+                ),
                 extend_start_loc=torch.tensor([0], device=self.device),
-                extend_prefix_lens_cpu=torch.tensor([num_tokens], device="cpu", dtype=torch.int32),
+                extend_prefix_lens_cpu=torch.tensor(
+                    [num_tokens], device="cpu", dtype=torch.int32
+                ),
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
