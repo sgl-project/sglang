@@ -1397,6 +1397,16 @@ async def attention_capabilities():
                 "description": "Project intermediate layer outputs to vocabulary space",
                 "status": "planned",  # Will show token prediction evolution through layers
             },
+            "pca_loadings": {
+                "enabled": True,  # Client-side PCA loadings for fingerprint interpretation
+                "description": "Pre-defined principal components for fingerprint analysis",
+                "components": [
+                    {"name": "PC1: Local vs Long-Range", "variance": 0.35},
+                    {"name": "PC2: Focused vs Diffuse", "variance": 0.25},
+                    {"name": "PC3: Semantic Bridge", "variance": 0.15},
+                    {"name": "PC4: Structure Ripple", "variance": 0.10},
+                ],
+            },
         },
         "guardrails": {
             "api_key_required": server_args.attention_capture_api_key is not None,
