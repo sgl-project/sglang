@@ -754,6 +754,27 @@
             "expected_avg_denoise_ms": 260.76,
             "expected_median_denoise_ms": 247.84
         },
+      "turbo_wan2_1_t2v_1.3b": {
+            "stages_ms": {
+                "InputValidationStage": 0.06,
+                "TextEncodingStage": 2508.95,
+                "ConditioningStage": 0.04,
+                "TimestepPreparationStage": 73.51,
+                "LatentPreparationStage": 1.34,
+                "DmdDenoisingStage": 1285.25,
+                "DecodingStage": 805.04,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 897.62,
+                "1": 126.04,
+                "2": 126.52,
+                "3": 128.26
+            },
+            "expected_e2e_ms": 4686.66,
+            "expected_avg_denoise_ms": 319.61,
+            "expected_median_denoise_ms": 127.39
+        },
         "wan2_2_ti2v_5b": {
             "stages_ms": {
                 "InputValidationStage": 96.27,

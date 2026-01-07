@@ -55,6 +55,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
 )
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
+    Turbo_Wan2_2_I2V_A14B_SamplingParam,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
     Wan2_2_I2V_A14B_SamplingParam,
     Wan2_2_T2V_A14B_SamplingParam,
@@ -361,7 +362,7 @@ def _register_configs():
         ],
     )
     register_configs(
-        sampling_param_cls=Wan2_2_I2V_A14B_SamplingParam,
+        sampling_param_cls=Turbo_Wan2_2_I2V_A14B_SamplingParam,
         pipeline_config_cls=TurboWanI2V720Config,
         hf_model_paths=[
             "IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
