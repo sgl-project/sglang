@@ -31,9 +31,53 @@ from .process_utils import detect_ib_device
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class WorkerIdentity:
+    """Identity of a worker type (not unique per instance).
+
+    Used for:
+    - Requirements scanning (what types of workers do tests need)
+    - Grouping workers by type
+
+    For unique instance identification, use ModelInstance.key which
+    includes an index when there are multiple workers of the same type.
+
+    Frozen/hashable so it can be used in sets and as dict keys for deduplication.
+    """
+
+    model_id: str
+    mode: ConnectionMode = ConnectionMode.HTTP
+    worker_type: WorkerType = WorkerType.REGULAR
+
+    @property
+    def is_prefill(self) -> bool:
+        """Check if this is a prefill worker."""
+        return self.worker_type == WorkerType.PREFILL
+
+    @property
+    def is_decode(self) -> bool:
+        """Check if this is a decode worker."""
+        return self.worker_type == WorkerType.DECODE
+
+    @property
+    def is_regular(self) -> bool:
+        """Check if this is a regular worker."""
+        return self.worker_type == WorkerType.REGULAR
+
+    def __str__(self) -> str:
+        """String representation for logging."""
+        if self.worker_type == WorkerType.REGULAR:
+            return f"{self.model_id}:{self.mode.value}"
+        return f"{self.model_id}:{self.mode.value}:{self.worker_type.value}"
+
+
 @dataclass
 class ModelInstance:
-    """A running model instance."""
+    """A running model instance.
+
+    Contains both identity (model_id, mode, worker_type) and runtime state
+    (process, port, gpu_slot, etc.).
+    """
 
     model_id: str
     mode: ConnectionMode
@@ -42,21 +86,20 @@ class ModelInstance:
     port: int
     process: subprocess.Popen
     gpu_slot: GPUSlot | None
+    key: str  # Unique instance key (e.g., "llama-8b:http:prefill_0")
     worker_type: WorkerType = WorkerType.REGULAR
     bootstrap_port: int | None = None  # For prefill workers in PD mode
     last_used: float = 0.0  # Timestamp for MRU eviction
     _healthy: bool = False  # Track if initial health check passed
 
     @property
-    def key(self) -> str:
-        """Unique key for this instance.
-
-        Regular: 'model_id:mode' (e.g., 'llama-8b:http')
-        PD workers: 'model_id:mode:worker_type' (e.g., 'llama-8b:http:prefill')
-        """
-        if self.worker_type == WorkerType.REGULAR:
-            return f"{self.model_id}:{self.mode.value}"
-        return f"{self.model_id}:{self.mode.value}:{self.worker_type.value}"
+    def identity(self) -> WorkerIdentity:
+        """Get the identity (model_id, mode, worker_type) of this instance."""
+        return WorkerIdentity(
+            model_id=self.model_id,
+            mode=self.mode,
+            worker_type=self.worker_type,
+        )
 
     @property
     def worker_url(self) -> str:
@@ -200,58 +243,65 @@ class ModelPool:
 
     def startup(
         self,
-        requirements: list[tuple[str, ConnectionMode]] | None = None,
+        requirements: list[WorkerIdentity] | None = None,
         startup_timeout: int = DEFAULT_STARTUP_TIMEOUT,
     ) -> None:
-        """Start worker processes for the required models.
+        """Start worker processes for the required workers.
 
         Workers are launched sequentially (one Popen at a time) but boot up
         concurrently since model loading happens in parallel across processes.
         This method blocks until all workers pass health checks.
 
         Args:
-            requirements: List of (model_id, mode) tuples specifying what to start.
-                         mode is ConnectionMode.HTTP or ConnectionMode.GRPC.
+            requirements: List of WorkerIdentity specifying what to start.
                          If None, starts default model in HTTP mode.
             startup_timeout: Timeout in seconds for all models to become healthy.
         """
         self._startup_timeout = startup_timeout
 
         if requirements is None:
-            requirements = [(DEFAULT_MODEL, ConnectionMode.HTTP)]
+            requirements = [WorkerIdentity(DEFAULT_MODEL, ConnectionMode.HTTP)]
 
         # Deduplicate while preserving order (first occurrence wins)
-        seen: set[tuple[str, ConnectionMode]] = set()
-        unique_requirements = []
+        # WorkerIdentity is frozen/hashable
+        seen: set[WorkerIdentity] = set()
+        unique_requirements: list[WorkerIdentity] = []
         for req in requirements:
             if req not in seen:
                 seen.add(req)
                 unique_requirements.append(req)
 
-        # Validate
-        valid_requirements = []
-        for model_id, mode in unique_requirements:
-            if model_id not in MODEL_SPECS:
-                logger.warning("Unknown model %s, skipping", model_id)
+        # Validate and filter to regular workers only
+        # (PD workers are launched on-demand via launch_pd_workers)
+        valid_requirements: list[WorkerIdentity] = []
+        for identity in unique_requirements:
+            if identity.model_id not in MODEL_SPECS:
+                logger.warning("Unknown model %s, skipping", identity.model_id)
                 continue
-            if mode not in LOCAL_MODES:
-                logger.warning("Invalid mode %s for %s, skipping", mode, model_id)
+            if identity.mode not in LOCAL_MODES:
+                logger.warning(
+                    "Invalid mode %s for %s, skipping", identity.mode, identity.model_id
+                )
                 continue
-            valid_requirements.append((model_id, mode))
+            if identity.is_prefill or identity.is_decode:
+                logger.info("PD worker %s will be launched on-demand", identity)
+                continue
+            valid_requirements.append(identity)
 
         if not valid_requirements:
             logger.warning("No valid requirements to start")
             return
 
-        logger.info("Starting model pool with: %s", valid_requirements)
+        logger.info(
+            "Starting model pool with: %s", [str(r) for r in valid_requirements]
+        )
 
-        # Build allocation specs - each (model, mode) combo needs its own slot
-        # Use "model_id:mode" as the allocation key
+        # Build allocation specs - each worker needs its own slot
+        # Use str(identity) as the allocation key
         allocation_specs = {}
-        for model_id, mode in valid_requirements:
-            spec = MODEL_SPECS[model_id]
-            key = f"{model_id}:{mode.value}"
-            allocation_specs[key] = {
+        for identity in valid_requirements:
+            spec = MODEL_SPECS[identity.model_id]
+            allocation_specs[str(identity)] = {
                 "model": spec["model"],
                 "memory_gb": spec.get("memory_gb", 16),
                 "tp": spec.get("tp", 1),
@@ -266,17 +316,23 @@ class ModelPool:
         if not slots:
             logger.warning("No GPU slots allocated, launching without GPU assignment")
             # Fallback: launch without specific GPU assignment
-            for model_id, mode in valid_requirements:
-                self._launch_model(model_id, mode, gpu_slot=None)
-                launched_keys.add(f"{model_id}:{mode.value}")
+            for identity in valid_requirements:
+                self._launch_model(identity.model_id, identity.mode, gpu_slot=None)
+                launched_keys.add(str(identity))
         else:
             # Launch on allocated slots
             for slot in slots:
                 if slot.assigned_model:
-                    # Parse "model_id:mode" back
-                    model_id, mode_str = slot.assigned_model.rsplit(":", 1)
-                    mode = ConnectionMode(mode_str)
-                    self._launch_model(model_id, mode, gpu_slot=slot)
+                    # Parse key back to identity components
+                    parts = slot.assigned_model.split(":")
+                    model_id = parts[0]
+                    mode = ConnectionMode(parts[1])
+                    worker_type = (
+                        WorkerType(parts[2]) if len(parts) > 2 else WorkerType.REGULAR
+                    )
+                    self._launch_model(
+                        model_id, mode, gpu_slot=slot, worker_type=worker_type
+                    )
                     launched_keys.add(slot.assigned_model)
 
         # Log models that will be launched on-demand (not enough GPUs to pre-launch)
@@ -398,6 +454,7 @@ class ModelPool:
             port=port,
             process=proc,
             gpu_slot=gpu_slot,
+            key=key,
             worker_type=worker_type,
             bootstrap_port=bootstrap_port,
             last_used=time.time(),

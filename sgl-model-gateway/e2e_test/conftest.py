@@ -175,15 +175,17 @@ from infra import (
     PARAM_MODEL,
     PARAM_SETUP_BACKEND,
     ConnectionMode,
+    WorkerIdentity,
+    WorkerType,
 )
 
 # ---------------------------------------------------------------------------
-# Test collection: scan for required backends
+# Test collection: scan for required workers
 # ---------------------------------------------------------------------------
 
 # Global storage for scanned requirements (ordered by test collection order)
-_scanned_backends: set[str] = set()  # {"grpc", "http", "openai", ...}
-_scanned_models: list[str] = []  # Models needed by tests, in test order
+# Each entry is a WorkerIdentity with model_id, mode, and worker_type
+_scanned_requirements: list[WorkerIdentity] = []
 _needs_default_model: bool = False  # True if any e2e test lacks explicit model marker
 
 
@@ -192,98 +194,137 @@ def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],
 ) -> None:
-    """Scan collected tests to determine required backends and models.
+    """Scan collected tests to determine required workers.
 
     This runs after test collection but before tests execute.
-    It extracts backend requirements from @pytest.mark.parametrize markers.
+    It extracts WorkerIdentity requirements from markers in test collection order,
+    so models needed by earlier tests are launched first.
     """
-    global _scanned_backends, _scanned_models, _needs_default_model
+    global _scanned_requirements, _needs_default_model
 
     for item in items:
-        # Track if this test has an explicit model marker
-        has_model_marker = False
+        # Extract model from marker or use default
+        model_marker = item.get_closest_marker(PARAM_MODEL)
+        model_id = model_marker.args[0] if model_marker and model_marker.args else None
 
-        # Scan parametrize markers for setup_backend
+        # Check parametrize for model
+        if model_id is None:
+            for marker in item.iter_markers("parametrize"):
+                if marker.args and len(marker.args) >= 2:
+                    param_name = marker.args[0]
+                    if param_name == PARAM_MODEL or PARAM_MODEL in param_name:
+                        param_values = marker.args[1]
+                        if isinstance(param_values, (list, tuple)) and param_values:
+                            model_id = param_values[0]  # First model in parametrize
+                        break
+
+        # Extract backends from parametrize
+        backends: list[str] = []
         for marker in item.iter_markers("parametrize"):
             if marker.args and len(marker.args) >= 2:
                 param_name = marker.args[0]
                 param_values = marker.args[1]
-
                 if param_name == PARAM_SETUP_BACKEND:
-                    # Extract backend names from parametrize values
                     if isinstance(param_values, (list, tuple)):
-                        _scanned_backends.update(param_values)
+                        backends.extend(param_values)
 
-                elif param_name == PARAM_MODEL or PARAM_MODEL in param_name:
-                    # Extract model names from parametrize (preserve order)
-                    if isinstance(param_values, (list, tuple)):
-                        for model in param_values:
-                            if model not in _scanned_models:
-                                _scanned_models.append(model)
-                        has_model_marker = True
+        # Check for PD workers marker (@pytest.mark.workers(prefill=N, decode=N))
+        workers_marker = item.get_closest_marker("workers")
+        is_pd_test = False
+        if workers_marker:
+            prefill = workers_marker.kwargs.get("prefill")
+            decode = workers_marker.kwargs.get("decode")
+            if prefill or decode:
+                is_pd_test = True
 
-        # Check for @pytest.mark.model("name") markers
-        model_marker = item.get_closest_marker(PARAM_MODEL)
-        if model_marker and model_marker.args:
-            model_name = model_marker.args[0]
-            if model_name not in _scanned_models:
-                _scanned_models.append(model_name)
-            has_model_marker = True
-
-        # Check if this is an e2e test without an explicit model marker
-        # Such tests need the DEFAULT_MODEL
-        if not has_model_marker and item.get_closest_marker("e2e"):
+        # Track if this test needs default model
+        is_e2e = item.get_closest_marker("e2e") is not None
+        if model_id is None and is_e2e:
             _needs_default_model = True
+            model_id = DEFAULT_MODEL
+
+        # Add WorkerIdentity requirements in order
+        if model_id and backends:
+            for backend in backends:
+                # "pd" backend means PD workers
+                if backend == "pd":
+                    is_pd_test = True
+                    # PD workers default to HTTP mode
+                    mode = ConnectionMode.HTTP
+                else:
+                    try:
+                        mode = ConnectionMode(backend)
+                    except ValueError:
+                        # Cloud backend (openai, xai, etc.) - skip
+                        continue
+
+                if is_pd_test or backend == "pd":
+                    # PD tests need prefill and decode workers
+                    for wt in (WorkerType.PREFILL, WorkerType.DECODE):
+                        identity = WorkerIdentity(model_id, mode, wt)
+                        if identity not in _scanned_requirements:
+                            _scanned_requirements.append(identity)
+                else:
+                    # Regular worker
+                    identity = WorkerIdentity(model_id, mode, WorkerType.REGULAR)
+                    if identity not in _scanned_requirements:
+                        _scanned_requirements.append(identity)
+
+        elif model_id and is_e2e:
+            # E2E test without explicit backend - will use HTTP by default
+            identity = WorkerIdentity(model_id, ConnectionMode.HTTP, WorkerType.REGULAR)
+            if identity not in _scanned_requirements:
+                _scanned_requirements.append(identity)
 
     logger.info(
-        "Scanned test requirements - backends: %s, models (in test order): %s, needs default: %s",
-        _scanned_backends or {"(none)"},
-        _scanned_models or ["(none)"],
+        "Scanned test requirements (in test order): %s, needs default: %s",
+        [str(r) for r in _scanned_requirements] or ["(none)"],
         _needs_default_model,
     )
 
 
-def get_pool_requirements() -> list[tuple[str, ConnectionMode]]:
+def get_pool_requirements() -> list[WorkerIdentity]:
     """Build pool requirements from scanned test markers.
 
     Returns:
-        List of (model_id, ConnectionMode) tuples to try to pre-launch.
-        Models are ordered by first appearance in test collection order,
-        so models needed by earlier tests are launched first.
+        List of WorkerIdentity objects to try to pre-launch.
+        Requirements are ordered by first appearance in test collection order,
+        so workers needed by earlier tests are launched first.
+
+    Note:
+        If a model's first test needs PD workers (prefill/decode), we skip
+        pre-launching regular workers for that model (they'd be evicted
+        immediately when PD workers are launched).
     """
-    # Preserve order from test collection (list, not set)
-    models = list(_scanned_models)
+    # Track which models have PD workers as their first requirement
+    # These models shouldn't have regular workers pre-launched
+    models_with_pd_first: set[str] = set()
+    first_worker_type_per_model: dict[str, WorkerType] = {}
 
-    # Add DEFAULT_MODEL if any e2e test lacks an explicit model marker,
-    # or if no models were specified at all
-    if _needs_default_model and DEFAULT_MODEL not in models:
-        # Prepend default model since tests without explicit markers run first
-        models.insert(0, DEFAULT_MODEL)
-    elif not models:
-        models = [DEFAULT_MODEL]
+    for identity in _scanned_requirements:
+        if identity.model_id not in first_worker_type_per_model:
+            first_worker_type_per_model[identity.model_id] = identity.worker_type
+            if identity.is_prefill or identity.is_decode:
+                models_with_pd_first.add(identity.model_id)
+                logger.info(
+                    "Model %s has PD test first - skipping regular worker pre-launch",
+                    identity.model_id,
+                )
 
-    # Convert scanned string backends to ConnectionMode enums
-    # Filter to local backends only (grpc, http) - cloud backends don't need workers
-    local_modes: list[ConnectionMode] = []
-    for backend in _scanned_backends:
-        try:
-            mode = ConnectionMode(backend)
-            if mode in LOCAL_MODES and mode not in local_modes:
-                local_modes.append(mode)
-        except ValueError:
-            # Not a ConnectionMode (e.g., "openai", "xai", "pd") - skip
-            pass
+    # Filter requirements:
+    # - Skip regular workers for models that have PD first
+    # - Keep PD workers (they'll be launched on-demand, but track order)
+    requirements: list[WorkerIdentity] = []
+    for identity in _scanned_requirements:
+        if identity.model_id in models_with_pd_first and identity.is_regular:
+            continue  # Skip regular workers - PD test runs first
 
-    # Default to HTTP if no local backends specified
-    if not local_modes:
-        local_modes = [ConnectionMode.HTTP]
+        if identity not in requirements:
+            requirements.append(identity)
 
-    # Build requirements: each model needs each mode
-    # Order: model order takes priority (models used first are launched first)
-    requirements: list[tuple[str, ConnectionMode]] = []
-    for model in models:
-        for mode in local_modes:
-            requirements.append((model, mode))
+    # Add default if no requirements
+    if not requirements:
+        requirements.append(WorkerIdentity(DEFAULT_MODEL, ConnectionMode.HTTP))
 
     return requirements
 
@@ -397,15 +438,20 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
         if not backend_modes:
             backend_modes = {ConnectionMode.HTTP}
 
-        requirements = [(m, b) for m in models for b in backend_modes]
-        logger.info("Using env var requirements: %s", requirements)
+        # Create WorkerIdentity objects (regular workers only from env vars)
+        requirements = [
+            WorkerIdentity(m, b, WorkerType.REGULAR)
+            for m in models
+            for b in backend_modes
+        ]
+        logger.info("Using env var requirements: %s", [str(r) for r in requirements])
     else:
         # Use scanned requirements from test markers
         requirements = get_pool_requirements()
-        logger.info("Using scanned requirements: %s", requirements)
+        logger.info("Using scanned requirements: %s", [str(r) for r in requirements])
 
     # Filter to valid models
-    requirements = [(m, b) for m, b in requirements if m in MODEL_SPECS]
+    requirements = [r for r in requirements if r.model_id in MODEL_SPECS]
 
     if not requirements:
         logger.warning("No valid requirements, model pool will be empty")
