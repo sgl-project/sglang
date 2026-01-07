@@ -378,6 +378,9 @@ class Envs:
     # Attention
     SGLANG_USE_PAGED_ATTENTION = EnvBool(False)
 
+    # MoE dual stream
+    SGLANG_MOE_USE_DUAL_STREAM = EnvBool(False)
+
     # fmt: on
 
 
