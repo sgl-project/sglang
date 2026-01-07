@@ -125,7 +125,6 @@ suite_amd = {
         TestFile("test_external_models.py", 45),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
-        TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_model_hooks.py", 10),
         TestFile("test_page_size.py", 60),
         TestFile("test_profile_merger.py", 12),
