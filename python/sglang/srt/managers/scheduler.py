@@ -616,6 +616,7 @@ class Scheduler(
         self.is_hybrid_ssm = (
             self.tp_worker.model_runner.hybrid_gdn_config is not None
             or self.tp_worker.model_runner.mamba2_config is not None
+            or self.tp_worker.model_runner.kimi_linear_config is not None
         )
 
         if self.is_hybrid_swa:
