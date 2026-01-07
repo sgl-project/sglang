@@ -315,23 +315,27 @@ async def async_request_openai_chat_completions(
 
     # image
     if request_func_input.image_data:
-        content_items.extend([
-            {
-                "type": "image_url",
-                "image_url": {"url": img_url},
-            }
-            for img_url in request_func_input.image_data
-        ])
+        content_items.extend(
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": img_url},
+                }
+                for img_url in request_func_input.image_data
+            ]
+        )
 
     # audio
     if request_func_input.audio_data:
-        content_items.extend([
-            {
-                "type": "audio_url",
-                "audio_url": {"url": audio_url},
-            }
-            for audio_url in request_func_input.audio_data
-        ])
+        content_items.extend(
+            [
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": audio_url},
+                }
+                for audio_url in request_func_input.audio_data
+            ]
+        )
 
     # text
     if request_func_input.prompt:
@@ -741,8 +745,8 @@ def get_processor(
         pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
 
     # Disable truncation when loading the processor for a quantized model.
-    # Truncation affects the `create_mm_data_row` function’s ability to correctly 
-    # count input tokens (text/vision) for bench serving, which may lead to 
+    # Truncation affects the `create_mm_data_row` function’s ability to correctly
+    # count input tokens (text/vision) for bench serving, which may lead to
     # inaccurate token statistics.
     return AutoProcessor.from_pretrained(
         pretrained_model_name_or_path,
@@ -1327,6 +1331,7 @@ def sample_random_requests(
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
 
+
 # Function from https://github.com/sgl-project/sglang/pull
 def encode_wav_data_url(y: np.ndarray, sr: int) -> str:
     import io
@@ -1358,6 +1363,7 @@ def encode_wav_data_url(y: np.ndarray, sr: int) -> str:
     b64 = pybase64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:audio/wav;base64,{b64}"
 
+
 def generate_dummy_audio(duration_s=10, sr=1600):
     """
     Generate a float32 audio array of `duration_s` seconds at sampling rate `sr`.
@@ -1369,10 +1375,11 @@ def generate_dummy_audio(duration_s=10, sr=1600):
     y = np.random.uniform(low=-1.0, high=1.0, size=num_samples).astype(np.float32)
     return y, sr
 
+
 def build_no_speical_token_table(tokenizer, special_tokens=None):
     """
     build no special token to replace special token randomly generated
-    for Qwen3-Omni 
+    for Qwen3-Omni
     """
     vocab = tokenizer.get_vocab().values()
     special_set = set(special_tokens or [])
@@ -1388,6 +1395,7 @@ def build_no_speical_token_table(tokenizer, special_tokens=None):
 
     return np.array(safe_tokens, dtype=np.int32)
 
+
 def sample_random_omni_requests(
     input_len: int,
     output_len: int,
@@ -1397,15 +1405,15 @@ def sample_random_omni_requests(
     processor: AutoProcessor,
     tokenizer: PreTrainedTokenizerBase,
     return_text: bool = True,
-    skip_special_tokens: bool = True, 
+    skip_special_tokens: bool = True,
 ) -> List[DatasetRow]:
     """
     Omni request temporary limitation:
     ----------------------------------
     Currently this benchmark only tests the (audio + text) modality.
     Audio is generated as a dummy waveform and paired
-    with the provided random text prompt. 
-    `skip_speical_tokens` default true to avoid common mistakes made 
+    with the provided random text prompt.
+    `skip_speical_tokens` default true to avoid common mistakes made
     in Qwen3-Omni's preprocessing
     """
     input_lens = np.random.randint(
@@ -1441,8 +1449,8 @@ def sample_random_omni_requests(
         for j in range(input_lens[i]):
             tid = (offsets[i] + i + j) % tokenizer.vocab_size
             if (
-                no_special_tokens is not None 
-                and special_tokens is not None 
+                no_special_tokens is not None
+                and special_tokens is not None
                 and tid in special_tokens
             ):
                 idx = (tid + j) % len(no_special_tokens)
@@ -1455,7 +1463,7 @@ def sample_random_omni_requests(
         if audio_length and audio_length > 0:
             y, sr = generate_dummy_audio(audio_length, 1600)
             data_url = encode_wav_data_url(y, sr)
-            audio_list = [data_url] 
+            audio_list = [data_url]
         else:
             audio_list = None
         input_requests.append(
@@ -1468,9 +1476,12 @@ def sample_random_omni_requests(
         )
 
     print(f"#Input text tokens: {np.sum(input_lens)}")
-    print(f"#Total input audio lengths: {audio_length*num_prompts if audio_length and audio_length > 0 else 0} seconds")
+    print(
+        f"#Total input audio lengths: {audio_length*num_prompts if audio_length and audio_length > 0 else 0} seconds"
+    )
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
+
 
 def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
     """Parse image resolution into (width, height).
@@ -1641,11 +1652,11 @@ def sample_image_requests(
         and processor.tokenizer.all_special_ids is not None
     ):
         special_tokens = set(processor.tokenizer.all_special_ids)
- 
+
     # Extract special token strings and convert to token_id
     special_token_strings = []
     special_token_ids = set()
-    
+
     if hasattr(processor.tokenizer, "special_tokens"):
         # Extract all special tokens from tokenizer.special_tokens dictionary
         for key, value in processor.tokenizer.special_tokens.items():
@@ -1653,15 +1664,17 @@ def sample_image_requests(
                 special_token_strings.append(value)
             elif isinstance(value, list):
                 special_token_strings.extend(value)
-    
+
     # Also extract from additional_special_tokens
     if hasattr(processor.tokenizer, "additional_special_tokens"):
         special_token_strings.extend(processor.tokenizer.additional_special_tokens)
-    
+
     # Convert to token_id
     if special_token_strings and hasattr(processor.tokenizer, "convert_tokens_to_ids"):
-        special_token_ids = set(processor.tokenizer.convert_tokens_to_ids(special_token_strings))
-    
+        special_token_ids = set(
+            processor.tokenizer.convert_tokens_to_ids(special_token_strings)
+        )
+
     # Merge all_special_ids and special_token_ids converted from strings
     if special_tokens is not None and special_token_ids:
         merged_special_tokens = special_tokens | special_token_ids

@@ -314,10 +314,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 assistant_prefix = openai_compatible_messages[-1]["content"]
                 openai_compatible_messages = openai_compatible_messages[:-1]
 
+        # Optimization: For multimodal, skip tokenization (tokenize=False)
+        # The processor will do tokenization later with proper multimodal placeholders
+        # For non-multimodal, tokenize here (tokenize=True) to avoid redundant tokenization
+        should_tokenize = not is_multimodal
         try:
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+            result = self.tokenizer_manager.tokenizer.apply_chat_template(
                 openai_compatible_messages,
-                tokenize=True,
+                tokenize=should_tokenize,
                 add_generation_prompt=True,
                 tools=tools,
                 reasoning_effort=request.reasoning_effort,
@@ -334,9 +338,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 if tools
                 else None
             )
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+            result = self.tokenizer_manager.tokenizer.apply_chat_template(
                 openai_compatible_messages,
-                tokenize=True,
+                tokenize=should_tokenize,
                 add_generation_prompt=True,
                 tools=tools,
                 reasoning_effort=request.reasoning_effort,
@@ -345,14 +349,30 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
             )
 
+        # Handle assistant prefix
         if assistant_prefix:
-            encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
-            if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
-                encoded = encoded[1:]
-            prompt_ids += encoded
+            if is_multimodal:
+                # For multimodal: result is text, just concatenate
+                result = result + assistant_prefix
+            else:
+                # For non-multimodal: result is token IDs, encode and concatenate
+                encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
+                if (
+                    encoded
+                    and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id
+                ):
+                    encoded = encoded[1:]
+                result = result + encoded
 
+        # Assign to prompt or prompt_ids based on type
         if is_multimodal:
-            prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+            # For multimodal: result is text string
+            prompt = result
+            prompt_ids = []
+        else:
+            # For non-multimodal: result is token IDs list
+            prompt = ""
+            prompt_ids = result
 
         stop = request.stop
         image_data = image_data if image_data else None
