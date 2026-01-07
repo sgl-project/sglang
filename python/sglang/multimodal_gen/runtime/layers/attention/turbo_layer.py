@@ -437,11 +437,6 @@ class SparseLinearAttention(nn.Module):
         q = self.feature_map_q(q).contiguous().to(self.dtype)  # c_q
         k = self.feature_map_k(k).contiguous().to(self.dtype)  # c_k
 
-        def calc_linear(q, k, v):
-            kvsum = k.transpose(-1, -2) @ v
-            ksum = torch.sum(k, dim=-2, keepdim=True)
-            return (q @ kvsum) / (1e-5 + (q * ksum).sum(dim=-1, keepdim=True))
-
         def torch_calc_linear(q, k, v):
             kv = torch.matmul(k.transpose(-1, -2), v)
             k_sum = torch.sum(k, dim=-2, keepdim=True)
