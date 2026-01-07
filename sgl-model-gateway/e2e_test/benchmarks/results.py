@@ -25,9 +25,15 @@ class BenchmarkResult:
         stats = data.get("aggregated_metrics", {}).get("stats", {})
         return cls(
             ttft_mean=float(stats.get("ttft", {}).get("mean", float("inf"))),
-            e2e_latency_mean=float(stats.get("e2e_latency", {}).get("mean", float("inf"))),
-            input_throughput_mean=float(stats.get("input_throughput", {}).get("mean", 0.0)),
-            output_throughput_mean=float(stats.get("output_throughput", {}).get("mean", 0.0)),
+            e2e_latency_mean=float(
+                stats.get("e2e_latency", {}).get("mean", float("inf"))
+            ),
+            input_throughput_mean=float(
+                stats.get("input_throughput", {}).get("mean", 0.0)
+            ),
+            output_throughput_mean=float(
+                stats.get("output_throughput", {}).get("mean", 0.0)
+            ),
             file_name=path.name,
         )
 
@@ -48,8 +54,18 @@ class BenchmarkResult:
         checks = [
             ("ttft_mean_max", self.ttft_mean, "<=", "TTFT"),
             ("e2e_latency_mean_max", self.e2e_latency_mean, "<=", "E2E latency"),
-            ("input_throughput_mean_min", self.input_throughput_mean, ">=", "Input throughput"),
-            ("output_throughput_mean_min", self.output_throughput_mean, ">=", "Output throughput"),
+            (
+                "input_throughput_mean_min",
+                self.input_throughput_mean,
+                ">=",
+                "Input throughput",
+            ),
+            (
+                "output_throughput_mean_min",
+                self.output_throughput_mean,
+                ">=",
+                "Output throughput",
+            ),
         ]
         for key, value, op, name in checks:
             if key not in thresholds:

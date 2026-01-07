@@ -84,7 +84,14 @@ jobs:
           python -c "import sglang_router; print('Python package: OK')"
           python -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
           python -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
-  gateway-unit-tests:
+
+      - name: Run Python unit tests
+        run: |
+          cd bindings/python
+          python3 -m pip install pytest pytest-cov pytest-xdist
+          pytest -q tests --cov=sglang_router --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
+
+  unit-tests:
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
@@ -148,80 +155,45 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  gateway-benchmarks:
+  gateway-e2e:
+    name: ${{ matrix.name }}
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: benchmarks
+            timeout: 32
+            test_dirs: "e2e_test/benchmarks"
+            extra_deps: "genai-bench==0.0.3"
+            env_vars: ""
+            reruns: ""
+            upload_benchmarks: true
+          - name: response-api
+            timeout: 32
+            test_dirs: "e2e_test/e2e_response_api"
+            extra_deps: ""
+            env_vars: "SHOW_ROUTER_LOGS=1"
+            reruns: "--reruns 3 --reruns-delay 2"
+            setup_oracle: true
+            setup_brave: true
+          - name: grpc
+            timeout: 32
+            test_dirs: "e2e_test/e2e_grpc"
+            extra_deps: ""
+            env_vars: "SHOW_ROUTER_LOGS=1"
+            reruns: "--reruns 3 --reruns-delay 2"
+          - name: router-embeddings
+            timeout: 45
+            test_dirs: "e2e_test/router e2e_test/embeddings"
+            extra_deps: ""
+            env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
+            reruns: "--reruns 2 --reruns-delay 5"
     runs-on: 4-gpu-a10
-    timeout-minutes: 32
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install rust dependencies
-        run: |
-          bash scripts/ci/ci_install_rust.sh
-
-      - name: Configure sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-        with:
-          version: "v0.12.0"
-          disable_annotations: true
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: sgl-model-gateway
-          shared-key: "rust-cache"
-          cache-all-crates: true
-          cache-on-failure: true
-          save-if: true
-
-      - name: Install SGLang dependencies
-        run: |
-          sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
-
-      - name: Build python binding
-        run: |
-          source "$HOME/.cargo/env"
-          export RUSTC_WRAPPER=sccache
-          cd sgl-model-gateway/bindings/python
-          python3 -m pip install --upgrade pip maturin
-          pip uninstall -y sglang-router || true
-          maturin build --profile ci --features vendored-openssl --out dist
-          pip install dist/*.whl
-
-      - name: Run Python unit tests
-        run: |
-          cd sgl-model-gateway/bindings/python
-          source "$HOME/.cargo/env"
-          python3 -m pip install pytest pytest-cov pytest-xdist
-          pytest -q tests --cov=sglang_router --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
-
-      - name: Run benchmark tests
-        run: |
-          bash scripts/killall_sglang.sh "nuk_gpus"
-          cd sgl-model-gateway
-          source "$HOME/.cargo/env"
-          python3 -m pip install pytest httpx openai grpcio grpcio-health-checking numpy
-          python3 -m pip --no-cache-dir install --upgrade genai-bench==0.0.3
-          ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest e2e_test/benchmarks -s -vv -o log_cli=true --log-cli-level=INFO
-
-      - name: Upload benchmark results
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: genai-bench-results-all-policies
-          path: sgl-model-gateway/benchmark_**/
-
-  gateway-e2e-grpc-response-api:
-    if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-    runs-on: 4-gpu-a10
-    timeout-minutes: 32
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -250,6 +222,7 @@ jobs:
           sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
 
       - name: Setup Oracle Instant Client
+        if: matrix.setup_oracle
         run: |
           sudo apt-get install -y unzip
           INSTANT_CLIENT_DIR="/home/ubuntu/instant-client"
@@ -269,6 +242,7 @@ jobs:
           echo "LD_LIBRARY_PATH=/home/ubuntu/instant-client/instantclient_23_9:\$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       - name: Start Oracle Database
+        if: matrix.setup_oracle
         run: |
           docker run -d -p 1521:1521 -e ORACLE_PASSWORD=oracle --name oracle-db gvenzl/oracle-xe:21-slim
           echo "Starting Oracle DB..."
@@ -279,6 +253,7 @@ jobs:
           echo "ATP_DSN=localhost:1521/XEPDB1" >> $GITHUB_ENV
 
       - name: Start Brave MCP Server
+        if: matrix.setup_brave
         run: |
           docker run -d --rm \
             -p 8001:8080 \
@@ -299,88 +274,38 @@ jobs:
           maturin build --profile ci --features vendored-openssl --out dist
           pip install dist/*.whl
 
-      - name: Run Python E2E response API tests
+      - name: Install e2e test dependencies
         run: |
-          python3 -m pip install pytest-rerunfailures
-          bash scripts/killall_sglang.sh "nuk_gpus"
-          cd sgl-model-gateway
-          source "$HOME/.cargo/env"
-          SHOW_ROUTER_LOGS=1 pytest --reruns 3 --reruns-delay 2 e2e_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=INFO
+          python3 -m pip install pytest pytest-rerunfailures httpx openai grpcio grpcio-health-checking numpy
+          if [ -n "${{ matrix.extra_deps }}" ]; then
+            python3 -m pip --no-cache-dir install --upgrade ${{ matrix.extra_deps }}
+          fi
 
-      - name: Run Python E2E gRPC tests
+      - name: Run E2E tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-model-gateway
           source "$HOME/.cargo/env"
-          SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest e2e_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
+          ${{ matrix.env_vars }} ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest ${{ matrix.reruns }} ${{ matrix.test_dirs }} -s -vv -o log_cli=true --log-cli-level=INFO
+
+      - name: Upload benchmark results
+        if: matrix.upload_benchmarks && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: genai-bench-results-all-policies
+          path: sgl-model-gateway/benchmark_**/
 
       - name: Cleanup Brave MCP Server
-        if: always()
+        if: always() && matrix.setup_brave
         run: |
           docker stop brave-search-server || true
           docker rm brave-search-server || true
 
       - name: Cleanup Oracle Database
-        if: always()
+        if: always() && matrix.setup_oracle
         run: |
           docker stop oracle-db || true
           docker rm oracle-db || true
-
-
-  gateway-e2e:
-    if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-    runs-on: 4-gpu-a10
-    timeout-minutes: 45
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install rust dependencies
-        run: |
-          bash scripts/ci/ci_install_rust.sh
-
-      - name: Configure sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-        with:
-          version: "v0.12.0"
-          disable_annotations: true
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: sgl-model-gateway
-          shared-key: "rust-cache"
-          cache-all-crates: true
-          cache-on-failure: true
-          save-if: true
-
-      - name: Install SGLang dependencies
-        run: |
-          sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
-
-      - name: Build python binding
-        run: |
-          source "$HOME/.cargo/env"
-          export RUSTC_WRAPPER=sccache
-          cd sgl-model-gateway/bindings/python
-          python3 -m pip install --upgrade pip maturin
-          pip uninstall -y sglang-router || true
-          maturin build --profile ci --features vendored-openssl --out dist
-          pip install dist/*.whl
-
-      - name: Install e2e test dependencies
-        run: |
-          python3 -m pip install pytest pytest-rerunfailures httpx openai grpcio grpcio-health-checking numpy
-
-      - name: Run gateway e2e tests
-        run: |
-          bash scripts/killall_sglang.sh "nuk_gpus"
-          cd sgl-model-gateway
-          source "$HOME/.cargo/env"
-          ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 pytest --reruns 2 --reruns-delay 5 e2e_test/router e2e_test/embeddings -s -vv -o log_cli=true --log-cli-level=INFO
 
   docker-build-test:
     if: |
@@ -406,14 +331,14 @@ jobs:
           cache-to: type=gha,mode=max
 
   finish:
-    needs: [maturin-build-test, gateway-unit-tests, gateway-benchmarks, gateway-e2e-grpc-response-api, gateway-e2e, docker-build-test]
+    needs: [maturin-build-test, unit-tests, gateway-e2e, docker-build-test]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
         run: echo "This is an empty step to ensure that all jobs are completed."
 
   summarize-benchmarks:
-    needs: gateway-benchmarks
+    needs: gateway-e2e
     runs-on: ubuntu-latest
     if: success()
 

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Generate benchmark summary for GitHub Actions."""
 
 from __future__ import annotations
@@ -21,7 +20,10 @@ def discover_benchmarks(base_dir: Path) -> list[tuple[Path, str]]:
             continue
         # Find result JSON (exclude metadata and gpu files)
         for json_file in folder.glob("*.json"):
-            if "experiment_metadata" not in json_file.name and "gpu_utilization" not in json_file.name:
+            if (
+                "experiment_metadata" not in json_file.name
+                and "gpu_utilization" not in json_file.name
+            ):
                 # Generate label from folder name: benchmark_cache_aware_pd_grpc -> cache_aware pd grpc
                 label = folder.name.replace("benchmark_", "").replace("_", " ")
                 results.append((json_file, label))
@@ -40,7 +42,9 @@ def generate_summary(base_dir: Path) -> str:
     benchmarks = discover_benchmarks(base_dir)
 
     if not benchmarks:
-        return "## Gateway E2E Genai-Bench Results Summary\n\nNo benchmark results found."
+        return (
+            "## Gateway E2E Genai-Bench Results Summary\n\nNo benchmark results found."
+        )
 
     lines = [
         "## Gateway E2E Genai-Bench Results Summary",
@@ -80,7 +84,9 @@ def generate_summary(base_dir: Path) -> str:
                     "| GPU | Mean (%) | p5 | p10 | p25 | p50 | p75 | p90 | p95 |",
                     "|-----|----------|----|-----|-----|-----|-----|-----|-----|",
                 ]
-                for gpu_id, stats in sorted(gpu.per_gpu.items(), key=lambda x: int(x[0])):
+                for gpu_id, stats in sorted(
+                    gpu.per_gpu.items(), key=lambda x: int(x[0])
+                ):
                     gpu_lines.append(
                         f"| {gpu_id} | {stats.get('mean', 0):.2f} | "
                         f"{stats.get('p5', 0):.2f} | {stats.get('p10', 0):.2f} | "
