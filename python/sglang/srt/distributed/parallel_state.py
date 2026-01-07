@@ -656,9 +656,7 @@ class GroupCoordinator:
         with self.use_symmetric_memory(self):
             # Note: This will produce an incorrect answer if we don't make
             # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-            input_tensor = input_.movedim(0, dim).clone(
-                memory_format=torch.contiguous_format
-            )
+            input_tensor = input_.movedim(0, dim).contiguous()
 
         assert input_tensor.shape[0] % world_size == 0
         chunk_size = input_tensor.shape[0] // world_size
@@ -669,7 +667,6 @@ class GroupCoordinator:
                 output_shape,
                 dtype=input_tensor.dtype,
                 device=input_tensor.device,
-                memory_format=torch.contiguous_format,
             )
 
         self.reduce_scatter_tensor(output_tensor, input_tensor)
@@ -834,10 +831,7 @@ class GroupCoordinator:
         # Allocate output tensor.
         with self.use_symmetric_memory(self):
             output_tensor = torch.empty(
-                output_size,
-                dtype=input_.dtype,
-                device=input_.device,
-                memory_format=torch.contiguous_format,
+                output_size, dtype=input_.dtype, device=input_.device
             )
 
         # All-gather.
