@@ -31,6 +31,7 @@ RUN if [ -n "$APTMIRROR" ];then sed -i "s|.*.ubuntu.com|$APTMIRROR|g" /etc/apt/s
 
 # Install development tools and utilities
 RUN apt-get update -y && apt upgrade -y && apt-get install -y \
+    unzip \
     build-essential \
     cmake \
     vim \
