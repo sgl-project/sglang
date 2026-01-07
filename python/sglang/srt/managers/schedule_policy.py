@@ -619,7 +619,7 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if (self.prefill_delayer_single_pass is not None) and (
-                not self.prefill_delayer_single_pass.maybe_negotiate_should_allow_prefill(
+                not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                     local_prefillable=True
                 )
             ):
