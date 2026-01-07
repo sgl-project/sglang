@@ -17,7 +17,7 @@ use crate::{
 
 /// Passthrough parser that returns text unchanged with no tool calls
 #[derive(Default)]
-pub struct PassthroughParser;
+pub(crate) struct PassthroughParser;
 
 impl PassthroughParser {
     pub fn new() -> Self {
