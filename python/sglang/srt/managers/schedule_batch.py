@@ -717,6 +717,7 @@ class Req:
         attention_capture_layer_id: Optional[int] = None,
         attention_capture_layer_ids: Optional[List[int]] = None,
         attention_sketch_mode: bool = False,
+        attention_fingerprint_mode: Optional[bool] = None,
         return_moe_routing: bool = False,
         moe_routing_top_k: int = 2,
         moe_capture_layer_ids: Optional[List[int]] = None,
@@ -790,7 +791,7 @@ class Req:
         self.attention_tokens_decode_step: int = 0  # Counter for stride calculation
         # Per-request capture control (None = use batch defaults from server_args)
         # These can be set via API or overridden by sidecar feedback
-        self.attention_fingerprint_mode: Optional[bool] = None
+        self.attention_fingerprint_mode: Optional[bool] = attention_fingerprint_mode
         self.attention_fingerprint_max_steps: Optional[int] = None
         self.attention_stride: Optional[int] = None  # Override stride for this request
         self.attention_max_tokens: Optional[int] = None  # Override max tokens for this request
