@@ -315,16 +315,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
 
-        # Flag to enable FlashInfer's append_paged_mla_kv_cache for FP8 KV cache
-        # This is experimental and can be enabled for testing
-        # Set to True to use FlashInfer's append instead of triton's set_mla_kv_buffer
-        self.use_flashinfer_mla_append = False
-
         # Flag to enable the fused rope_quantize_fp8_append_paged_kv_cache kernel
         # This combines RoPE application, FP8 quantization, and KV cache append
         # into a single kernel call for better performance
         # Set to True to use the fused kernel instead of separate calls
-        self.use_fused_rope_quantize_append = True
+        self.use_fused_rope_quantize_append = True  # PERF TEST: fused path
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -755,129 +750,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         return q_out, k_nope_out, k_rope_out
 
-    def append_kv_cache_with_flashinfer(
-        self,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        k_nope: torch.Tensor,
-        k_rope: torch.Tensor,
-    ):
-        """Append KV cache using FlashInfer's append_paged_mla_kv_cache.
-
-        This replaces the triton-based set_mla_kv_buffer with FlashInfer's
-        append_paged_mla_kv_cache for better integration with FlashInfer.
-
-        Note: The current SGLang memory layout stores k_nope and k_rope concatenated
-        in a single buffer. FlashInfer's append_paged_mla_kv_cache expects separate
-        ckv_cache and kpe_cache tensors. This implementation creates contiguous
-        copies which are then written back - this is not optimal but allows
-        verification of correctness. A future optimization would restructure
-        the memory pool to use separate buffers.
-
-        Args:
-            layer: The attention layer
-            forward_batch: Forward batch containing cache location info
-            k_nope: Key nope tensor, shape [nnz, kv_lora_rank], FP8 dtype
-            k_rope: Key rope tensor, shape [nnz, qk_rope_head_dim], FP8 dtype
-        """
-        # Get the paged KV cache buffer for this layer
-        # Shape: [num_tokens, 1, kv_cache_dim] where kv_cache_dim = kv_lora_rank + qk_rope_head_dim
-        kv_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-
-        # Reshape to paged layout: [num_pages, page_size, kv_cache_dim]
-        # Remove the head dimension (which is always 1 for MLA)
-        num_tokens = kv_buffer.shape[0]
-        num_pages = num_tokens // self.page_size
-        kv_buffer_paged = kv_buffer.squeeze(1).view(
-            num_pages, self.page_size, self.kv_cache_dim
-        )
-
-        # Split into ckv_cache (k_nope) and kpe_cache (k_rope) parts
-        # These are views into the buffer. FlashInfer should modify them in-place.
-        # Note: These slices are non-contiguous in the last dimension.
-        # We need to make them contiguous for FlashInfer, then copy back.
-        ckv_cache = kv_buffer_paged[..., : self.kv_lora_rank].contiguous()
-        kpe_cache = kv_buffer_paged[..., self.kv_lora_rank :].contiguous()
-
-        # Get output cache locations (flat token indices)
-        out_cache_loc = forward_batch.out_cache_loc
-        nnz = out_cache_loc.shape[0]
-
-        # Prepare indices for append operation
-        # kv_indices: page indices for each token
-        kv_indices = (out_cache_loc // self.page_size).int()
-
-        # batch_indices: which request each token belongs to
-        # positions: position within each page for each token
-        if forward_batch.forward_mode.is_decode_or_idle():
-            # Decode mode: each token is one request
-            batch_indices = torch.arange(nnz, dtype=torch.int32, device=out_cache_loc.device)
-            # Position within page
-            positions = (out_cache_loc % self.page_size).int()
-            # Each request has 1 token, so kv_indptr is simple range
-            kv_indptr = torch.arange(
-                nnz + 1, dtype=torch.int32, device=out_cache_loc.device
-            )
-        else:
-            # Extend mode: use extend_seq_lens to compute batch_indices
-            extend_seq_lens = forward_batch.extend_seq_lens
-            bs = forward_batch.batch_size
-
-            # Create batch indices: repeat batch index for each token in that batch
-            batch_indices = torch.repeat_interleave(
-                torch.arange(bs, dtype=torch.int32, device=out_cache_loc.device),
-                extend_seq_lens.int(),
-            )
-
-            # Positions within page for each token
-            positions = (out_cache_loc % self.page_size).int()
-
-            # kv_indptr: cumulative sum of tokens per request
-            kv_indptr = torch.zeros(
-                bs + 1, dtype=torch.int32, device=out_cache_loc.device
-            )
-            kv_indptr[1:] = torch.cumsum(extend_seq_lens, dim=0).int()
-
-        # Compute kv_last_page_len for each request
-        # For decode: each request has 1 token, so last_page_len is position + 1
-        # For extend: need to compute based on total sequence length
-        if forward_batch.forward_mode.is_decode_or_idle():
-            # In decode, each token goes to a specific position in a page
-            # kv_last_page_len is (position_in_page + 1) for each request
-            kv_last_page_len = (positions + 1).int()
-        else:
-            # For extend, compute based on sequence lengths
-            # kv_last_page_len[i] = seq_lens[i] % page_size, or page_size if exactly full
-            seq_lens = forward_batch.seq_lens
-            kv_last_page_len = (seq_lens % self.page_size).int()
-            # If remainder is 0, the last page is full (page_size entries)
-            kv_last_page_len = torch.where(
-                kv_last_page_len == 0,
-                torch.full_like(kv_last_page_len, self.page_size),
-                kv_last_page_len,
-            )
-
-        # Call FlashInfer's append_paged_mla_kv_cache
-        # API: append_ckv, append_kpe, batch_indices, positions, ckv_cache, kpe_cache,
-        #      kv_indices, kv_indptr, kv_last_page_len
-        flashinfer.page.append_paged_mla_kv_cache(
-            k_nope,  # append_ckv
-            k_rope,  # append_kpe
-            batch_indices,
-            positions,
-            ckv_cache,
-            kpe_cache,
-            kv_indices,
-            kv_indptr,
-            kv_last_page_len,
-        )
-
-        # Copy modified caches back to original buffer
-        # This is necessary because we made contiguous copies above
-        # TODO: Optimize by restructuring memory pool to use separate ckv/kpe buffers
-        kv_buffer_paged[..., : self.kv_lora_rank] = ckv_cache
-        kv_buffer_paged[..., self.kv_lora_rank :] = kpe_cache
-
     def fused_rope_quantize_and_append_kv_cache(
         self,
         q_nope: torch.Tensor,
@@ -1129,17 +1001,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            if (
-                self.use_flashinfer_mla_append
-                and self.data_type == torch.float8_e4m3fn
-            ):
-                # Use FlashInfer's append_paged_mla_kv_cache for FP8 path
-                self.append_kv_cache_with_flashinfer(layer, forward_batch, k, k_rope)
-            else:
-                # Use triton-based set_mla_kv_buffer
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, k_rope
-                )
+            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, k_rope
+            )
 
         # Prepare query tensor inline
         if merge_query:
@@ -1282,18 +1146,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            if (
-                self.use_flashinfer_mla_append
-                and self.data_type == torch.float8_e4m3fn
-                and forward_batch.forward_mode.is_target_verify()
-            ):
-                # Use FlashInfer's append_paged_mla_kv_cache for FP8 path
-                self.append_kv_cache_with_flashinfer(layer, forward_batch, k, k_rope)
-            else:
-                # Use triton-based set_mla_kv_buffer
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, k_rope
-                )
+            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, k_rope
+            )
 
         # TODO refactor to avoid code duplication
         # Prepare query tensor inline
