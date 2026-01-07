@@ -176,9 +176,9 @@ def _print_prefill_delayer_metrics(base_url: str):
     print("=== PrefillDelayer Metrics ===")
     for line in prefill_delayer_metrics:
         print(line)
-    assert "sglang_prefill_delayer_wait_forward_passes" in metrics_text
-    assert "sglang_prefill_delayer_wait_seconds" in metrics_text
-    assert "sglang_prefill_delayer_timeouts_total" in metrics_text
+    assert "sglang:prefill_delayer_wait_forward_passes" in metrics_text
+    assert "sglang:prefill_delayer_wait_seconds" in metrics_text
+    assert "sglang:prefill_delayer_timeouts_total" in metrics_text
 
 
 if __name__ == "__main__":
