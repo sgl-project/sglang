@@ -334,3 +334,37 @@ def cutlass_fp4_group_mm(
         params["blockscale_offsets"],
     )
     return c.to(dtype=out_dtype)
+
+
+def moe_wna16_gemm(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    b_qweight: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_qzeros: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    experts_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    top_k: int,
+    BLOCK_SIZE_M: int,
+    BLOCK_SIZE_N: int,
+    BLOCK_SIZE_K: int,
+    bit: int,
+) -> torch.Tensor:
+    torch.ops.sgl_kernel.moe_wna16_gemm(
+        input,
+        output,
+        b_qweight,
+        b_scales,
+        b_qzeros,
+        topk_weights,
+        sorted_token_ids,
+        experts_ids,
+        num_tokens_post_pad,
+        top_k,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
+        bit,
+    )

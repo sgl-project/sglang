@@ -282,6 +282,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "-> ()");
   m.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
 
+  m.def(
+      "moe_wna16_gemm(Tensor input, Tensor! output, Tensor b_qweight, "
+      "Tensor b_scales, Tensor? b_qzeros, "
+      "Tensor? topk_weights, Tensor sorted_token_ids, "
+      "Tensor expert_ids, Tensor num_tokens_post_pad, "
+      "int top_k, int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, "
+      "int bit) -> Tensor");
+  m.impl("moe_wna16_gemm", torch::kCUDA, &moe_wna16_gemm);
+
   /*
    * From csrc/moe/cutlass_moe/w4a8
    */

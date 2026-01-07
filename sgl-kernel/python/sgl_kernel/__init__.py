@@ -99,6 +99,7 @@ from sgl_kernel.moe import (
     prepare_moe_input,
     topk_sigmoid,
     topk_softmax,
+    moe_wna16_gemm,
 )
 from sgl_kernel.quantization import (
     ggml_dequantize,
