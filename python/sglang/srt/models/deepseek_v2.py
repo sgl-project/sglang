@@ -715,6 +715,7 @@ class DeepseekV2MoE(nn.Module):
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
                     or get_moe_a2a_backend().is_ascend_fuseep()
+                    or get_moe_a2a_backend().is_mori()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -757,6 +758,7 @@ class DeepseekV2MoE(nn.Module):
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_mori()
         ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
@@ -777,6 +779,7 @@ class DeepseekV2MoE(nn.Module):
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_mori()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
@@ -1141,13 +1144,13 @@ class DeepseekV2MoE(nn.Module):
             torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
             x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
         else:
-            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if not (self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter):
                 final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
@@ -3369,7 +3372,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
             disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
-        elif disable_reason is None and get_moe_a2a_backend().is_deepep():
+        elif disable_reason is None and (get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori()):
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."

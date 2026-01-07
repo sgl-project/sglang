@@ -22,6 +22,11 @@ from sglang.srt.layers.moe.token_dispatcher.mooncake import (
     MooncakeDispatchOutput,
     MooncakeEPDispatcher,
 )
+from sglang.srt.layers.moe.token_dispatcher.moriep import (
+    MoriEPNormalDispatchOutput,
+    MoriEPNormalCombineInput,
+    MoriEPDispatcher
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
     StandardDispatcher,
@@ -40,6 +45,9 @@ __all__ = [
     "MooncakeCombineInput",
     "MooncakeDispatchOutput",
     "MooncakeEPDispatcher",
+    "MoriEPNormalDispatchOutput",
+    "MoriEPNormalCombineInput",
+    "MoriEPDispatcher",
     "StandardDispatcher",
     "StandardDispatchOutput",
     "StandardCombineInput",
