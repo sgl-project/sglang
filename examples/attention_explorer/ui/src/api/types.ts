@@ -16,7 +16,7 @@ export type ManifoldZone =
   | 'unknown';
 
 export type Program = 'prod' | 'debug' | 'discovery';
-export type View = 'chat' | 'inspect' | 'manifold' | 'router';
+export type View = 'chat' | 'inspect' | 'manifold' | 'router' | 'compare';
 
 export const SCHEMA_VERSION = 1;
 
@@ -939,4 +939,81 @@ export function summarizeFingerprint(fp: Fingerprint): string {
 
   const top = explanations[0];
   return `${top.intensity.charAt(0).toUpperCase() + top.intensity.slice(1)} ${top.interpretation.toLowerCase()}`;
+}
+
+// ============================================================================
+// CROSS-RUN COMPARISON TYPES
+// ============================================================================
+
+/**
+ * Metrics difference between two trace sessions.
+ * Positive values mean right session has higher values.
+ */
+export interface MetricsDiff {
+  entropyDiff: number;      // right - left
+  localMassDiff: number;
+  midMassDiff: number;
+  longMassDiff: number;
+  hubnessDiff?: number;
+  consensusDiff?: number;
+}
+
+/**
+ * Fingerprint comparison with per-component differences.
+ */
+export interface FingerprintDiff {
+  histogramDiff: number[];  // Per-bin difference (right - left)
+  pcaDiff: number[];        // PC score differences
+  cosineSimilarity: number; // 0-1, how similar the fingerprints are
+  euclideanDistance: number; // L2 distance between fingerprints
+}
+
+/**
+ * Zone comparison between two sessions.
+ */
+export interface ZoneComparison {
+  leftZone: ManifoldZone;
+  rightZone: ManifoldZone;
+  zoneChanged: boolean;
+  leftConfidence: number;   // How clearly the left session falls in its zone
+  rightConfidence: number;  // How clearly the right session falls in its zone
+}
+
+/**
+ * Complete comparison result between two trace sessions.
+ */
+export interface ComparisonResult {
+  // Session identifiers
+  leftTraceId: string;
+  rightTraceId: string;
+
+  // Session-level diffs
+  metricsDiff: MetricsDiff;
+
+  // Fingerprint comparison
+  fingerprintDiff: FingerprintDiff;
+
+  // Zone transition analysis
+  zoneComparison: ZoneComparison;
+
+  // Summary
+  overallSimilarity: number;  // 0-1, aggregate similarity score
+  keyDifferences: string[];   // Human-readable difference descriptions
+
+  // Timestamps
+  computedAt: number;
+}
+
+/**
+ * Summary info for session selection dropdown.
+ */
+export interface SessionSummary {
+  id: string;
+  model: string;
+  createdAt: number;
+  messageCount: number;
+  tokenCount: number;
+  dominantZone: ManifoldZone;
+  avgEntropy: number;
+  label?: string;  // Optional user-friendly label
 }
