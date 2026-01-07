@@ -9,7 +9,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
@@ -22,7 +21,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     apply_qk_norm,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
@@ -52,6 +51,57 @@ def _get_qkv_projections(
         txt_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return img_query, img_key, img_value, txt_query, txt_key, txt_value
+
+
+class QwenImageTPFeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        dim_out: Optional[int] = None,
+        mult: float = 4.0,
+        activation_fn: str = "gelu-approximate",
+        bias: bool = True,
+    ):
+        super().__init__()
+        if dim_out is None:
+            dim_out = dim
+        inner_dim = int(dim * mult)
+
+        # Match diffusers FeedForward naming: net.0.proj, net.1, net.2
+        self.net = nn.ModuleList(
+            [
+                _TPProjLayer(
+                    dim,
+                    inner_dim,
+                    bias=bias,
+                ),
+                _get_ffn_activation(activation_fn),
+                ColumnParallelLinear(inner_dim, dim_out, bias=bias, gather_output=True),
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.net[0](x)
+        x = self.net[1](x)
+        x, _ = self.net[2](x)
+        return x
+
+
+def _get_ffn_activation(activation_fn: str) -> nn.Module:
+    # Keep a simple GELU path for now; extend if new activations are needed.
+    if activation_fn == "gelu":
+        return nn.GELU()
+    return nn.GELU(approximate="tanh")
+
+
+class _TPProjLayer(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, bias: bool = True):
+        super().__init__()
+        self.proj = ColumnParallelLinear(in_dim, out_dim, bias=bias, gather_output=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, _ = self.proj(x)
+        return x
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -478,34 +528,44 @@ class QwenImageCrossAttention(nn.Module):
         # Use separate Q/K/V projections
         self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
         self.inner_kv_dim = self.inner_dim
-        self.to_q = ReplicatedLinear(dim, self.inner_dim, bias=True)
-        self.to_k = ReplicatedLinear(dim, self.inner_dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, self.inner_dim, bias=True)
+        self.to_q = ColumnParallelLinear(
+            dim, self.inner_dim, bias=True, gather_output=True
+        )
+        self.to_k = ColumnParallelLinear(
+            dim, self.inner_dim, bias=True, gather_output=True
+        )
+        self.to_v = ColumnParallelLinear(
+            dim, self.inner_dim, bias=True, gather_output=True
+        )
 
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
             self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
         if added_kv_proj_dim is not None:
-            self.add_q_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=True
+            self.add_q_proj = ColumnParallelLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True, gather_output=True
             )
-            self.add_k_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=True
+            self.add_k_proj = ColumnParallelLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True, gather_output=True
             )
-            self.add_v_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=True
+            self.add_v_proj = ColumnParallelLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True, gather_output=True
             )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+            self.to_add_out = ColumnParallelLinear(
+                self.inner_dim, self.dim, bias=out_bias, gather_output=True
+            )
         else:
             self.to_add_out = None
 
         if not pre_only:
             self.to_out = nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+                ColumnParallelLinear(
+                    self.inner_dim, self.dim, bias=out_bias, gather_output=True
+                )
             )
         else:
             self.to_out = None
@@ -652,7 +712,7 @@ class QwenImageTransformerBlock(nn.Module):
             head_dim=attention_head_dim,
         )
         self.img_norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.img_mlp = FeedForward(
+        self.img_mlp = QwenImageTPFeedForward(
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
 
@@ -666,7 +726,7 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
         self.txt_norm2 = LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.txt_mlp = FeedForward(
+        self.txt_mlp = QwenImageTPFeedForward(
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
 
