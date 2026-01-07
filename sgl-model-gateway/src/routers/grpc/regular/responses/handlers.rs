@@ -34,13 +34,13 @@ use axum::{
 use tracing::debug;
 use uuid::Uuid;
 
-use super::{
-    common::load_conversation_history, context::ResponsesContext, conversions, non_streaming,
-    streaming,
-};
+use super::{common::load_conversation_history, conversions, non_streaming, streaming};
 use crate::{
     protocols::responses::ResponsesRequest,
-    routers::{error, grpc::common::responses::ensure_mcp_connection},
+    routers::{
+        error,
+        grpc::common::responses::{ensure_mcp_connection, ResponsesContext},
+    },
 };
 
 /// Main handler for POST /v1/responses

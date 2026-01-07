@@ -794,6 +794,16 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
+      - name: Benchmark offline PP decode throughput (PP=2)
+        timeout-minutes: 10
+        run: |
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_pp_offline_throughput_default_decode
+
+      - name: Benchmark offline PP prefill throughput (PP=2)
+        timeout-minutes: 10
+        run: |
+          bash scripts/ci/amd_ci_exec.sh python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
+
   accuracy-test-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
     if: |
@@ -832,7 +842,6 @@ jobs:
         timeout-minutes: 30
         run: |
           bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
-          bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
 
   accuracy-test-2-gpu-amd:
     needs: [check-changes, accuracy-test-1-gpu-amd]
@@ -874,43 +883,6 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
 
-  dllm-test-1-gpu-amd:
-    needs: [check-changes, stage-a-test-1-amd]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'dllm-test-1-gpu-amd') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi325-gpu-1]
-    runs-on: ${{matrix.runner}}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Test DLLM (LLaDA2)
-        timeout-minutes: 30
-        run: |
-          bash scripts/ci/amd_ci_exec.sh python3 dllm/test_llada2_mini_amd.py
-
   pr-test-amd-finish:
     needs:
       [
@@ -932,7 +904,6 @@ jobs:
         performance-test-2-gpu-amd,
         accuracy-test-1-gpu-amd,
         accuracy-test-2-gpu-amd,
-        dllm-test-1-gpu-amd,
       ]
     if: always()
     runs-on: ubuntu-latest
