@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-from typing import Any, Dict, List, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -679,31 +679,18 @@ class QwenImageTransformerBlock(nn.Module):
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
 
-    @overload
     def _modulate(
         self,
-        x,
-        mod_params,
-        norm_module: LayerNormScaleShift,
-        gate_x=None,
-        residual_x=None,
-        index=None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
-
-    @overload
-    def _modulate(
-        self,
-        x,
-        mod_params,
-        norm_module: ScaleResidualLayerNormScaleShift,
-        gate_x=...,
-        residual_x=...,
-        index=None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
-
-    def _modulate(
-        self, x, mod_params, norm_module, index=None, gate_x=None, residual_x=None
-    ):
+        x: torch.Tensor,
+        mod_params: torch.Tensor,
+        norm_module: Union[LayerNormScaleShift, ScaleResidualLayerNormScaleShift],
+        index: Optional[torch.Tensor] = None,
+        gate_x: Optional[torch.Tensor] = None,
+        residual_x: Optional[torch.Tensor] = None,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         # Apply attention gates and add residual (like in Megatron)
         #   - residual_out = gate_x * x + residual_x
         # - x = norm(residual_out) * (1 + scale) + shift
