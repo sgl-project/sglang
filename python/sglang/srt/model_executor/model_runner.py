@@ -2249,7 +2249,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
-        output.expert_distribution_metrics = recorder_outputs.get("metrics")
+        output.expert_distribution_metrics = recorder_outputs.get("metrics") if recorder_outputs else None
 
         # Copy cached routing experts' buffers back to CPU cache
         get_global_experts_capturer().on_forward_end(

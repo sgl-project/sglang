@@ -227,6 +227,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     moe_routing_top_k: Union[List[int], int] = 2
     moe_capture_layer_ids: Optional[Union[List[List[int]], List[int]]] = None
 
+    # Logit lens: project hidden states through unembedding matrix
+    return_logit_lens: Union[List[bool], bool] = False
+    logit_lens_top_k: Union[List[int], int] = 5
+    logit_lens_layer_ids: Optional[Union[List[List[int]], List[int]]] = None
+
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     # Session info for continual prompting
@@ -814,6 +819,11 @@ class TokenizedGenerateReqInput(BaseReq):
     return_moe_routing: bool = False
     moe_routing_top_k: int = 2
     moe_capture_layer_ids: Optional[List[int]] = None
+
+    # Logit lens: project hidden states through unembedding matrix
+    return_logit_lens: bool = False
+    logit_lens_top_k: int = 5
+    logit_lens_layer_ids: Optional[List[int]] = None
 
 
 @dataclass

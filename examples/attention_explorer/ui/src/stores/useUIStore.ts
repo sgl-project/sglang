@@ -88,7 +88,7 @@ export const useUIStore = create<UIState>((set, get) => ({
   segment: 'output',
   isConnected: false,
   modelName: 'Not connected',
-  baseUrl: 'http://localhost:8000',
+  baseUrl: 'http://localhost:30000',
 
   tokenDetail: null,
   tokenDetailLoading: false,
