@@ -6,12 +6,13 @@ for MI35x-specific models that differ from MI300X configurations.
 
 MI35x-specific models:
 - GPT-OSS series: Uses openai/gpt-oss-* (not lmsys/gpt-oss-*-bf16)
-- DeepSeek-R1-MXFP4: Uses quantized MXFP4 variant
+- DeepSeek-R1-0528: Same model as MI300X (MXFP4 only used for perf tests)
 
 Model groups are selected via AMD_TEST_MODEL_GROUP environment variable:
 - "gpt-oss" (default): GPT-OSS models with MI35x paths
-- "deepseek-r1-mxfp4": DeepSeek-R1-MXFP4 basic + MTP (nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4)
-- "deepseek-r1-mxfp4-dp-tc": DeepSeek-R1-MXFP4 DP + TC (nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4-dp-tc)
+- "deepseek-r1": DeepSeek-R1-0528 basic + MTP (same as MI300X)
+- "deepseek-r1-dp-tc": DeepSeek-R1-0528 DP + TC (same as MI300X)
+- "deepseek-r1-all": All DeepSeek-R1-0528 variants (basic, MTP, DP, TC)
 
 Registry: nightly-amd-8-gpu-mi35x suite (8-GPU tests on MI35x)
 """
@@ -70,6 +71,9 @@ class BaseModelConfig:
     tokenizer_path: Optional[str] = None
     timeout: Optional[int] = None
     local_path: Optional[str] = None  # Preferred local path (checked first before HF)
+    variant: Optional[str] = (
+        None  # Test variant name (e.g., "basic", "MTP", "DP", "TC")
+    )
 
     def __post_init__(self):
         if self.other_args is None:
@@ -81,6 +85,12 @@ class BaseModelConfig:
         """Return local_path if it exists, otherwise model_path (HF ID)."""
         if self.local_path and os.path.exists(self.local_path):
             return self.local_path
+        return self.model_path
+
+    def get_display_name(self) -> str:
+        """Return display name for logs/summary (model + variant if set)."""
+        if self.variant:
+            return f"{self.model_path} ({self.variant})"
         return self.model_path
 
 
@@ -129,38 +139,39 @@ MI35X_GPT_OSS_MODELS = [
     ),
 ]
 
-# Group 2: DeepSeek-R1-MXFP4 basic + MTP (MI35x specific quantized model)
-# Runner: nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4
-# Uses local path if available, otherwise downloads from HuggingFace
-MI35X_DEEPSEEK_R1_MXFP4_MODELS = [
-    # DeepSeek-R1-MXFP4 basic
+# Group 2: DeepSeek-R1-0528 basic + MTP (same model as MI300X for consistency)
+# Runner: nightly-test-8-gpu-mi35x-deepseek-r1
+# Note: MXFP4 variant only used for perf tests (test_deepseek_r1_mxfp4_perf.py)
+MI35X_DEEPSEEK_R1_MODELS = [
+    # DeepSeek-R1-0528 basic - reasoning model, ~80GB per GPU
     BaseModelConfig(
-        model_path="amd/DeepSeek-R1-MXFP4-Preview",  # HF fallback
-        local_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",  # Preferred local
+        model_path="deepseek-ai/DeepSeek-R1-0528",
         tp_size=8,
         accuracy_threshold=0.93,
-        timeout=3600,
+        timeout=3600,  # 1 hour for large model
+        variant="basic",
         other_args=[
-            "--trust-remote-code",
+            "--attention-backend",
+            "aiter",
             "--chunked-prefill-size",
             "131072",
             "--disable-radix-cache",
             "--mem-fraction-static",
             "0.85",
-            "--dp-size",
-            "8",
+            "--trust-remote-code",
         ],
-        env_vars={},
+        env_vars={
+            "SGLANG_USE_AITER": "1",
+        },
     ),
-    # DeepSeek-R1-MXFP4 with MTP (EAGLE speculative decoding)
+    # DeepSeek-R1-0528 with MTP (EAGLE speculative decoding)
     BaseModelConfig(
-        model_path="amd/DeepSeek-R1-MXFP4-Preview",  # HF fallback
-        local_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",  # Preferred local
+        model_path="deepseek-ai/DeepSeek-R1-0528",
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=3600,
+        variant="MTP",
         other_args=[
-            "--trust-remote-code",
             "--chunked-prefill-size",
             "131072",
             "--speculative-algorithm",
@@ -173,24 +184,25 @@ MI35X_DEEPSEEK_R1_MXFP4_MODELS = [
             "4",
             "--mem-fraction-static",
             "0.7",
+            "--trust-remote-code",
         ],
-        env_vars={"SGLANG_USE_ROCM700A": "1", "SGLANG_USE_AITER": "1"},
+        env_vars={
+            "SGLANG_USE_AITER": "1",
+        },
     ),
 ]
 
-# Group 3: DeepSeek-R1-MXFP4 with DP + TC (requires ROCm 7.0+)
-# Runner: nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4-dp-tc
-# Uses local path if available, otherwise downloads from HuggingFace
-MI35X_DEEPSEEK_R1_MXFP4_DP_TC_MODELS = [
-    # DeepSeek-R1-MXFP4 with DP attention
+# Group 3: DeepSeek-R1-0528 with DP + TC (requires ROCm 7.0+)
+# Runner: nightly-test-8-gpu-mi35x-deepseek-r1-dp-tc
+MI35X_DEEPSEEK_R1_DP_TC_MODELS = [
+    # DeepSeek-R1-0528 with DP attention
     BaseModelConfig(
-        model_path="amd/DeepSeek-R1-MXFP4-Preview",  # HF fallback
-        local_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",  # Preferred local
+        model_path="deepseek-ai/DeepSeek-R1-0528",
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=3600,
+        variant="DP",
         other_args=[
-            "--trust-remote-code",
             "--chunked-prefill-size",
             "131072",
             "--dp-size",
@@ -198,18 +210,21 @@ MI35X_DEEPSEEK_R1_MXFP4_DP_TC_MODELS = [
             "--enable-dp-attention",
             "--mem-fraction-static",
             "0.85",
+            "--trust-remote-code",
         ],
-        env_vars={"SGLANG_USE_ROCM700A": "1", "SGLANG_USE_AITER": "1"},
+        env_vars={
+            "SGLANG_USE_ROCM700A": "1",
+            "SGLANG_USE_AITER": "1",
+        },
     ),
-    # DeepSeek-R1-MXFP4 with torch compile
+    # DeepSeek-R1-0528 with torch compile
     BaseModelConfig(
-        model_path="amd/DeepSeek-R1-MXFP4-Preview",  # HF fallback
-        local_path="/data2/models/amd-DeepSeek-R1-MXFP4-Preview",  # Preferred local
+        model_path="deepseek-ai/DeepSeek-R1-0528",
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=7200,  # 2 hours for compilation
+        variant="TC",
         other_args=[
-            "--trust-remote-code",
             "--chunked-prefill-size",
             "131072",
             "--mem-fraction-static",
@@ -218,8 +233,12 @@ MI35X_DEEPSEEK_R1_MXFP4_DP_TC_MODELS = [
             "8",
             "--enable-torch-compile",
             "--disable-cuda-graph",
+            "--trust-remote-code",
         ],
-        env_vars={"SGLANG_USE_ROCM700A": "1", "SGLANG_USE_AITER": "1"},
+        env_vars={
+            "SGLANG_USE_ROCM700A": "1",
+            "SGLANG_USE_AITER": "1",
+        },
     ),
 ]
 
@@ -230,18 +249,25 @@ def get_model_group() -> str:
 
 
 def get_models_for_group(group: str) -> List[BaseModelConfig]:
-    """Get the list of models for a given group."""
+    """Get the list of models for a given group.
+
+    Note: DeepSeek-R1-MXFP4 is only used for perf tests, not accuracy tests.
+    See test_deepseek_r1_mxfp4_perf.py for MXFP4 perf tests.
+    """
     if group == "gpt-oss":
         return MI35X_GPT_OSS_MODELS
-    elif group == "deepseek-r1-mxfp4":
-        return MI35X_DEEPSEEK_R1_MXFP4_MODELS
-    elif group == "deepseek-r1-mxfp4-dp-tc":
-        return MI35X_DEEPSEEK_R1_MXFP4_DP_TC_MODELS
+    elif group == "deepseek-r1":
+        return MI35X_DEEPSEEK_R1_MODELS
+    elif group == "deepseek-r1-dp-tc":
+        return MI35X_DEEPSEEK_R1_DP_TC_MODELS
+    elif group == "deepseek-r1-all":
+        # All DeepSeek-R1-0528 variants: basic, MTP, DP, TC
+        return MI35X_DEEPSEEK_R1_MODELS + MI35X_DEEPSEEK_R1_DP_TC_MODELS
     elif group == "all":
         return (
             MI35X_GPT_OSS_MODELS
-            + MI35X_DEEPSEEK_R1_MXFP4_MODELS
-            + MI35X_DEEPSEEK_R1_MXFP4_DP_TC_MODELS
+            + MI35X_DEEPSEEK_R1_MODELS
+            + MI35X_DEEPSEEK_R1_DP_TC_MODELS
         )
     else:
         print(f"[WARNING] Unknown model group '{group}', using 'gpt-oss'")
@@ -530,9 +556,10 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
         )
 
         for config in self.models:
-            with self.subTest(model=config.model_path):
+            display_name = config.get_display_name()
+            with self.subTest(model=display_name):
                 print(f"\n{'='*60}")
-                print(f"Testing: {config.model_path} (TP={config.tp_size})")
+                print(f"Testing: {display_name} (TP={config.tp_size})")
                 print(f"{'='*60}")
 
                 error_message = None
@@ -545,11 +572,11 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
 
                 if not is_available:
                     print(f"\n❌ MODEL NOT AVAILABLE: {status_msg}")
-                    print(f"⏭️ SKIPPING: {config.model_path}")
+                    print(f"⏭️ SKIPPING: {display_name}")
                     status = "⏭️ SKIP"
                     all_results.append(
                         {
-                            "model": config.model_path,
+                            "model": display_name,
                             "tp_size": config.tp_size,
                             "accuracy": None,
                             "threshold": config.accuracy_threshold,
@@ -560,7 +587,7 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
                     )
                 else:
                     try:
-                        print(f"\n🚀 Launching server for {config.model_path}...")
+                        print(f"\n🚀 Launching server for {display_name}...")
                         server_start = time.time()
                         process = popen_launch_server_for_base_model(
                             self.base_url, config
@@ -603,7 +630,7 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
 
                             all_results.append(
                                 {
-                                    "model": config.model_path,
+                                    "model": display_name,
                                     "tp_size": config.tp_size,
                                     "accuracy": acc,
                                     "threshold": config.accuracy_threshold,
@@ -623,7 +650,7 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
                             status = "❌ ERROR"
                             all_results.append(
                                 {
-                                    "model": config.model_path,
+                                    "model": display_name,
                                     "tp_size": config.tp_size,
                                     "accuracy": None,
                                     "threshold": config.accuracy_threshold,
@@ -644,7 +671,7 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
                         status = "❌ ERROR"
                         all_results.append(
                             {
-                                "model": config.model_path,
+                                "model": display_name,
                                 "tp_size": config.tp_size,
                                 "accuracy": None,
                                 "threshold": config.accuracy_threshold,
@@ -654,14 +681,14 @@ class TestMI35xGsm8kCompletionEval(unittest.TestCase):
                             }
                         )
 
-                # Add to summary
+                # Add to summary (use display name to show variant)
                 acc_str = f"{acc:.3f}" if acc is not None else "N/A"
                 startup_str = (
                     f"{startup_time:.0f}s" if startup_time is not None else "N/A"
                 )
                 bench_str = f"{bench_time:.0f}s" if bench_time is not None else "N/A"
                 total_str = f"{total_time:.0f}s" if total_time is not None else "N/A"
-                summary += f"| {config.model_path} | {config.tp_size} | {acc_str} | {config.accuracy_threshold} | {startup_str} | {bench_str} | {total_str} | {status} |\n"
+                summary += f"| {display_name} | {config.tp_size} | {acc_str} | {config.accuracy_threshold} | {startup_str} | {bench_str} | {total_str} | {status} |\n"
 
         # Final summary
         total_test_time = time.time() - total_test_start

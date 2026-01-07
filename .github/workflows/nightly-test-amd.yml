@@ -1,6 +1,10 @@
 name: Nightly Test (AMD)
 
 on:
+  # TODO: Remove pull_request trigger before merging
+  pull_request:
+    branches:
+      - main
   schedule:
     - cron: '0 0 * * *'
   push:
@@ -22,7 +26,6 @@ on:
           - 'nightly-test-8-gpu-gpt-oss'
           - 'nightly-test-8-gpu-grok'
           - 'nightly-test-8-gpu-deepseek-r1'
-          - 'nightly-test-8-gpu-deepseek-r1-dp-tc'
           - 'nightly-perf-8-gpu-grok'
           - 'nightly-perf-8-gpu-deepseek-v3'
           - 'nightly-perf-8-gpu-deepseek-v31'
@@ -31,8 +34,7 @@ on:
           - 'nightly-test-2-gpu-vlm-mi35x'
           - 'nightly-test-8-gpu-mi35x-gpt-oss'
           - 'nightly-test-8-gpu-mi35x-grok'
-          - 'nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4'
-          - 'nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4-dp-tc'
+          - 'nightly-test-8-gpu-mi35x-deepseek-r1'
           - 'nightly-perf-8-gpu-mi35x-grok'
           - 'nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4'
   workflow_call:
@@ -168,7 +170,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # 8-GPU tests (TP=8) - DeepSeek-R1 (reasoning model)
+  # 8-GPU tests (TP=8) - DeepSeek-R1 all variants (basic, MTP, DP, TC)
   nightly-test-8-gpu-deepseek-r1:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu-deepseek-r1')
     runs-on: linux-mi325-gpu-8
@@ -188,39 +190,10 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
-      - name: Nightly Test (8-GPU DeepSeek-R1)
+      - name: Nightly Test (8-GPU DeepSeek-R1 all variants)
         run: |
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e AMD_TEST_MODEL_GROUP=deepseek-r1 \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
-  # 8-GPU tests (TP=8) - DeepSeek-R1 + DP + TC combined (requires ROCm 7.0+)
-  nightly-test-8-gpu-deepseek-r1-dp-tc:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu-deepseek-r1-dp-tc')
-    runs-on: linux-mi325-gpu-8
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-
-      - name: Setup docker
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Nightly Test (8-GPU DeepSeek-R1 DP+TC)
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e AMD_TEST_MODEL_GROUP=deepseek-r1-dp-tc \
+            -e AMD_TEST_MODEL_GROUP=deepseek-r1-all \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -436,9 +409,10 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # MI35x 8-GPU tests (TP=8) - DeepSeek-R1-MXFP4 basic + MTP (MI35x quantized variant)
-  nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4')
+  # MI35x 8-GPU tests (TP=8) - DeepSeek-R1-0528 all variants (basic, MTP, DP, TC)
+  # Same model as MI300X for consistency; MXFP4 only used for perf tests
+  nightly-test-8-gpu-mi35x-deepseek-r1:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu-mi35x-deepseek-r1')
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -459,44 +433,11 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd_ci_exec.sh pip install tabulate
 
-      - name: Nightly Test MI35x (8-GPU DeepSeek-R1-MXFP4 basic+MTP)
-        timeout-minutes: 180
+      - name: Nightly Test MI35x (8-GPU DeepSeek-R1-0528 all variants)
+        timeout-minutes: 300
         run: |
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e AMD_TEST_MODEL_GROUP=deepseek-r1-mxfp4 \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
-  # MI35x 8-GPU tests (TP=8) - DeepSeek-R1-MXFP4 DP + TC (requires ROCm 7.0+)
-  nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4-dp-tc:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4-dp-tc')
-    runs-on: linux-mi35x-gpu-8
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-
-      - name: Setup docker
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/amd_ci_install_dependency.sh
-          # Install tabulate for run_suite.py (missing in MI35x container)
-          bash scripts/ci/amd_ci_exec.sh pip install tabulate
-
-      - name: Nightly Test MI35x (8-GPU DeepSeek-R1-MXFP4 DP+TC)
-        timeout-minutes: 180
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e AMD_TEST_MODEL_GROUP=deepseek-r1-mxfp4-dp-tc \
+            -e AMD_TEST_MODEL_GROUP=deepseek-r1-all \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
@@ -571,7 +512,6 @@ jobs:
       - nightly-test-8-gpu-gpt-oss
       - nightly-test-8-gpu-grok
       - nightly-test-8-gpu-deepseek-r1
-      - nightly-test-8-gpu-deepseek-r1-dp-tc
       - nightly-perf-8-gpu-grok
       - nightly-perf-8-gpu-deepseek-v3
       - nightly-perf-8-gpu-deepseek-v31
@@ -580,8 +520,7 @@ jobs:
       - nightly-test-2-gpu-vlm-mi35x
       - nightly-test-8-gpu-mi35x-gpt-oss
       - nightly-test-8-gpu-mi35x-grok
-      - nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4
-      - nightly-test-8-gpu-mi35x-deepseek-r1-mxfp4-dp-tc
+      - nightly-test-8-gpu-mi35x-deepseek-r1
       - nightly-perf-8-gpu-mi35x-grok
       - nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4
     runs-on: ubuntu-latest

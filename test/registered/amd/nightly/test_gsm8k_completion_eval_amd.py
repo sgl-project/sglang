@@ -73,12 +73,21 @@ class BaseModelConfig:
     env_vars: Optional[dict] = None
     tokenizer_path: Optional[str] = None
     timeout: Optional[int] = None  # Custom timeout for server launch (seconds)
+    variant: Optional[str] = (
+        None  # Test variant name (e.g., "basic", "MTP", "DP", "TC")
+    )
 
     def __post_init__(self):
         if self.other_args is None:
             self.other_args = []
         if self.env_vars is None:
             self.env_vars = {}
+
+    def get_display_name(self) -> str:
+        """Return display name for logs/summary (model + variant if set)."""
+        if self.variant:
+            return f"{self.model_path} ({self.variant})"
+        return self.model_path
 
 
 # =============================================================================
@@ -199,94 +208,10 @@ AMD_GROK_MODELS = [
     ),
 ]
 
-# Group 3: DeepSeek-V3 with DP Attention
-# Runner: nightly-amd-8-gpu-deepseek-v3-dp
-# Note: Uses DP attention (dp-size=8) for better performance, requires ROCm 7.0+
-AMD_DEEPSEEK_V3_DP_MODELS = [
-    # DeepSeek-V3-0324 with DP attention
-    BaseModelConfig(
-        model_path="deepseek-ai/DeepSeek-V3-0324",
-        tp_size=8,
-        accuracy_threshold=0.93,
-        timeout=3600,  # 1 hour for large model
-        other_args=[
-            "--chunked-prefill-size",
-            "131072",
-            "--dp-size",
-            "8",
-            "--enable-dp-attention",
-            "--mem-fraction-static",
-            "0.85",
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "SGLANG_USE_ROCM700A": "1",
-            "SGLANG_USE_AITER": "1",
-        },
-    ),
-]
+# Note: DeepSeek-V3 accuracy tests removed - V3 only used for perf tests
+# See test_deepseek_v3_perf.py and test_deepseek_v31_perf.py for V3 perf tests
 
-# Group 3b: DeepSeek-V3 with Torch Compile
-# Runner: nightly-amd-8-gpu-deepseek-v3-tc
-# Note: Uses torch compile for performance optimization, requires ROCm 7.0+
-AMD_DEEPSEEK_V3_TC_MODELS = [
-    # DeepSeek-V3-0324 with torch compile
-    BaseModelConfig(
-        model_path="deepseek-ai/DeepSeek-V3-0324",
-        tp_size=8,
-        accuracy_threshold=0.93,
-        timeout=7200,  # 2 hours for compilation + large model
-        other_args=[
-            "--chunked-prefill-size",
-            "131072",
-            "--mem-fraction-static",
-            "0.70",  # Reduced further for torch compile
-            "--cuda-graph-max-bs",
-            "8",  # Reduced from 16 to reduce memory
-            "--enable-torch-compile",
-            "--disable-cuda-graph",  # Disable cuda graph to avoid memory issues
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "SGLANG_USE_ROCM700A": "1",
-            "SGLANG_USE_AITER": "1",
-        },
-    ),
-]
-
-# Group 3c: DeepSeek-V3 with MTP (EAGLE speculative decoding)
-# Runner: nightly-amd-8-gpu-deepseek-v3-mtp
-# Note: Uses MTP for improved throughput, requires ROCm 7.0+
-AMD_DEEPSEEK_V3_MTP_MODELS = [
-    # DeepSeek-V3-0324 with MTP (EAGLE speculative decoding)
-    BaseModelConfig(
-        model_path="deepseek-ai/DeepSeek-V3-0324",
-        tp_size=8,
-        accuracy_threshold=0.93,
-        timeout=3600,  # 1 hour for large model
-        other_args=[
-            "--chunked-prefill-size",
-            "131072",
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-num-steps",
-            "3",
-            "--speculative-eagle-topk",
-            "1",
-            "--speculative-num-draft-tokens",
-            "4",
-            "--mem-fraction-static",
-            "0.7",
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "SGLANG_USE_ROCM700A": "1",
-            "SGLANG_USE_AITER": "1",
-        },
-    ),
-]
-
-# Group 4: DeepSeek-R1 (reasoning model) - Basic + MTP combined
+# Group 3: DeepSeek-R1 (reasoning model) - Basic + MTP combined
 # Runner: nightly-amd-8-gpu-deepseek-r1
 AMD_DEEPSEEK_R1_MODELS = [
     # DeepSeek-R1-0528 basic - reasoning model, ~80GB per GPU
@@ -295,6 +220,7 @@ AMD_DEEPSEEK_R1_MODELS = [
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=3600,  # 1 hour for large model
+        variant="basic",
         other_args=[
             "--attention-backend",
             "aiter",
@@ -315,6 +241,7 @@ AMD_DEEPSEEK_R1_MODELS = [
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=3600,
+        variant="MTP",
         other_args=[
             "--chunked-prefill-size",
             "131072",
@@ -346,6 +273,7 @@ AMD_DEEPSEEK_R1_DP_TC_MODELS = [
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=3600,
+        variant="DP",
         other_args=[
             "--chunked-prefill-size",
             "131072",
@@ -367,6 +295,7 @@ AMD_DEEPSEEK_R1_DP_TC_MODELS = [
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=7200,  # 2 hours for compilation
+        variant="TC",
         other_args=[
             "--chunked-prefill-size",
             "131072",
@@ -392,28 +321,26 @@ def get_model_group() -> str:
 
 
 def get_models_for_group(group: str) -> List[BaseModelConfig]:
-    """Get the list of models for a given group."""
+    """Get the list of models for a given group.
+
+    Note: DeepSeek-V3 is only used for perf tests, not accuracy tests.
+    See test_deepseek_v3_perf.py and test_deepseek_v31_perf.py.
+    """
     if group == "gpt-oss":
         return AMD_GPT_OSS_MODELS
     elif group == "grok":
         return AMD_GROK_MODELS
-    elif group == "deepseek-v3-dp":
-        return AMD_DEEPSEEK_V3_DP_MODELS
-    elif group == "deepseek-v3-tc":
-        return AMD_DEEPSEEK_V3_TC_MODELS
-    elif group == "deepseek-v3-mtp":
-        return AMD_DEEPSEEK_V3_MTP_MODELS
     elif group == "deepseek-r1":
         return AMD_DEEPSEEK_R1_MODELS
     elif group == "deepseek-r1-dp-tc":
         return AMD_DEEPSEEK_R1_DP_TC_MODELS
+    elif group == "deepseek-r1-all":
+        # All DeepSeek-R1 variants: basic, MTP, DP, TC
+        return AMD_DEEPSEEK_R1_MODELS + AMD_DEEPSEEK_R1_DP_TC_MODELS
     elif group == "all":
         return (
             AMD_GPT_OSS_MODELS
             + AMD_GROK_MODELS
-            + AMD_DEEPSEEK_V3_DP_MODELS
-            + AMD_DEEPSEEK_V3_TC_MODELS
-            + AMD_DEEPSEEK_V3_MTP_MODELS
             + AMD_DEEPSEEK_R1_MODELS
             + AMD_DEEPSEEK_R1_DP_TC_MODELS
         )
@@ -754,9 +681,10 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
         )
 
         for config in self.models:
-            with self.subTest(model=config.model_path):
+            display_name = config.get_display_name()
+            with self.subTest(model=display_name):
                 print(f"\n{'='*60}")
-                print(f"Testing: {config.model_path} (TP={config.tp_size})")
+                print(f"Testing: {display_name} (TP={config.tp_size})")
                 print(f"{'='*60}")
 
                 error_message = None
@@ -770,12 +698,12 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
 
                 if not is_available:
                     print(f"\n❌ MODEL NOT AVAILABLE: {status_msg}")
-                    print(f"⏭️ SKIPPING: {config.model_path}")
+                    print(f"⏭️ SKIPPING: {display_name}")
                     status = f"⏭️ SKIP"
                     skipped = True
                     all_results.append(
                         {
-                            "model": config.model_path,
+                            "model": display_name,
                             "tp_size": config.tp_size,
                             "accuracy": None,
                             "threshold": config.accuracy_threshold,
@@ -792,7 +720,7 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                 else:
                     try:
                         # Launch server with timing
-                        print(f"\n🚀 Launching server for {config.model_path}...")
+                        print(f"\n🚀 Launching server for {display_name}...")
                         server_start = time.time()
                         process = popen_launch_server_for_base_model(
                             self.base_url, config
@@ -830,7 +758,7 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
 
                             total_time = time.time() - model_start
 
-                            print(f"\n📈 Results for {config.model_path}:")
+                            print(f"\n📈 Results for {display_name}:")
                             print(
                                 f"   Accuracy: {acc:.3f} (threshold: {config.accuracy_threshold})"
                             )
@@ -851,7 +779,7 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
 
                             all_results.append(
                                 {
-                                    "model": config.model_path,
+                                    "model": display_name,
                                     "tp_size": config.tp_size,
                                     "accuracy": acc,
                                     "threshold": config.accuracy_threshold,
@@ -873,7 +801,7 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                             status = "❌ ERROR"
                             all_results.append(
                                 {
-                                    "model": config.model_path,
+                                    "model": display_name,
                                     "tp_size": config.tp_size,
                                     "accuracy": None,
                                     "threshold": config.accuracy_threshold,
@@ -889,7 +817,7 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                             )
 
                         finally:
-                            print(f"\n🛑 Stopping server for {config.model_path}...")
+                            print(f"\n🛑 Stopping server for {display_name}...")
                             kill_process_tree(process.pid)
 
                     except Exception as e:
@@ -899,7 +827,7 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                         status = "❌ ERROR"
                         all_results.append(
                             {
-                                "model": config.model_path,
+                                "model": display_name,
                                 "tp_size": config.tp_size,
                                 "accuracy": None,
                                 "threshold": config.accuracy_threshold,
@@ -914,14 +842,14 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                             }
                         )
 
-                # Add to summary with runtime
+                # Add to summary with runtime (use display name to show variant)
                 acc_str = f"{acc:.3f}" if acc is not None else "N/A"
                 startup_str = (
                     f"{startup_time:.0f}s" if startup_time is not None else "N/A"
                 )
                 bench_str = f"{bench_time:.0f}s" if bench_time is not None else "N/A"
                 total_str = f"{total_time:.0f}s" if total_time is not None else "N/A"
-                summary += f"| {config.model_path} | {config.tp_size} | {acc_str} | {config.accuracy_threshold} | {startup_str} | {bench_str} | {total_str} | {status} |\n"
+                summary += f"| {display_name} | {config.tp_size} | {acc_str} | {config.accuracy_threshold} | {startup_str} | {bench_str} | {total_str} | {status} |\n"
 
         # Calculate total test runtime
         total_test_time = time.time() - total_test_start
