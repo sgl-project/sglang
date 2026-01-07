@@ -173,12 +173,10 @@ class QuantizationConfig(ABC):
         # Check if this is a ModelOpt config
         quant_algo = hf_quant_config.get("quant_algo", "").upper()
 
-        # If user specified generic "modelopt", auto-detect the specific method
-        if user_quant == "modelopt":
-            if "FP8" in quant_algo:
-                return "modelopt_fp8"
-            elif "NVFP4" in quant_algo or "FP4" in quant_algo:
-                return "modelopt_fp4"
+        if "FP8" in quant_algo:
+            return "modelopt_fp8"
+        elif "NVFP4" in quant_algo or "FP4" in quant_algo:
+            return "modelopt_fp4"
 
         # The hf_quant_config may be a parsed quant config, so we need to check the
         # quant_method.

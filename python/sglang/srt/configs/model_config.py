@@ -765,25 +765,6 @@ class ModelConfig:
                     self.quantization = quantization_override
                     break
 
-            # NextN/MTP draft models for these architectures are not FP4 quantized,
-            # disable quantization to avoid loader errors
-            nextn_architectures_without_fp4 = [
-                "DeepseekV3ForCausalLMNextN",
-                "Glm4MoeForCausalLMNextN",
-                "BailingMoeForCausalLMNextN",
-            ]
-            if (
-                self.is_draft_model
-                and self.hf_config.architectures[0] in nextn_architectures_without_fp4
-                and self.quantization == "modelopt_fp4"
-            ):
-                logger.info(
-                    f"Disabling modelopt_fp4 quantization for draft model "
-                    f"({self.hf_config.architectures[0]}) as NextN layers are not FP4 quantized."
-                )
-                self.quantization = None
-                return
-
             # Verify quantization configurations.
             if self.quantization is None:
                 self.quantization = quant_method
