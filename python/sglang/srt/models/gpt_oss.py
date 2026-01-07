@@ -113,6 +113,7 @@ class GptOssSparseMoeBlock(nn.Module):
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=True,
+            layer_id=layer_id,
         )
 
         self.top_k = config.num_experts_per_tok
@@ -395,12 +396,14 @@ class GptOssDecoderLayer(nn.Module):
         self.is_layer_sparse = True
         self.is_nextn = False
         is_previous_layer_sparse = True
+        is_next_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:

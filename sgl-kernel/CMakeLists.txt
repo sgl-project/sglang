@@ -56,7 +56,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        ffe2b6b97420a9f8c58268ca55755168e6e2f360
+    GIT_TAG        54f99a8af537b3c6eb4819b69907ccbe2b600792
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -124,13 +124,15 @@ if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
     set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "ccache")
 endif()
 
-# Enable gencode below SM90
-option(ENABLE_BELOW_SM90 "Enable below SM90" ON)
-
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-    set(ENABLE_BELOW_SM90 OFF)
+# Configure gencode below SM90
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+    set(DEFAULT_ENABLE_BELOW_SM90 OFF)
     message(STATUS "For aarch64, disable gencode below SM90 by default")
+else()
+    set(DEFAULT_ENABLE_BELOW_SM90 ON)
 endif()
+
+option(ENABLE_BELOW_SM90 "Enable gencode below SM90" ${DEFAULT_ENABLE_BELOW_SM90})
 
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
@@ -278,8 +280,12 @@ set(SOURCES
     "csrc/elementwise/copy.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
+    "csrc/elementwise/pos_enc.cu"
     "csrc/elementwise/topk.cu"
+    "csrc/sgl_diffusion/elementwise/timestep_embedding.cu"
     "csrc/expert_specialization/es_fp8_blockwise.cu"
+    "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
+    "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
 
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
@@ -590,9 +596,40 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
 # ============================ Extra Install: FA4 ============================= #
 # TODO: find a better install condition.
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
-    # flash_attn/cute
-    install(DIRECTORY "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute/"
-            DESTINATION "flash_attn/cute"
+
+    set(FLASH_ATTN_CUTE_SRC "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute")
+    set(FLASH_ATTN_CUTE_DST "${CMAKE_CURRENT_BINARY_DIR}/flash_attn_origin/cute")
+
+    file(MAKE_DIRECTORY "${FLASH_ATTN_CUTE_DST}")
+
+    file(COPY "${FLASH_ATTN_CUTE_SRC}/"
+         DESTINATION "${FLASH_ATTN_CUTE_DST}"
+         PATTERN ".git*" EXCLUDE
+         PATTERN "__pycache__" EXCLUDE)
+
+    file(GLOB_RECURSE FLASH_ATTN_CUTE_DST_PY
+         "${FLASH_ATTN_CUTE_DST}/*.py")
+
+    foreach(FILE_PATH IN LISTS FLASH_ATTN_CUTE_DST_PY)
+        file(READ "${FILE_PATH}" FILE_CONTENT)
+
+        set(MODIFIED_CONTENT "${FILE_CONTENT}")
+
+        # The main goal is to avoid using "flash_attn" so that other libraries (such as transformers) do not mistakenly assume that "flash_attn" is already installed.
+
+        string(REPLACE "flash_attn.cute"
+                       "flash_attn_origin.cute"
+                       MODIFIED_CONTENT "${MODIFIED_CONTENT}")
+
+        if (NOT FILE_CONTENT STREQUAL MODIFIED_CONTENT)
+            file(WRITE "${FILE_PATH}" "${MODIFIED_CONTENT}")
+            message(STATUS "  - [FA4 Patch] Patched: ${FILE_PATH}")
+        endif()
+    endforeach()
+
+    install(DIRECTORY "${FLASH_ATTN_CUTE_DST}/"
+            DESTINATION "flash_attn_origin/cute"
             PATTERN ".git*" EXCLUDE
             PATTERN "__pycache__" EXCLUDE)
-    endif()
+
+endif()
