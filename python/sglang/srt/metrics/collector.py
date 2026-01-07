@@ -765,7 +765,7 @@ class SchedulerMetricsCollector:
             name="sglang:prefill_delayer_wait_forward_passes",
             documentation="Histogram of forward passes waited by prefill delayer.",
             labelnames=labels.keys(),
-            buckets=[5, 20, 100],
+            buckets=[5, 20, 99, 100],
         )
         self.prefill_delayer_wait_seconds = Histogram(
             name="sglang:prefill_delayer_wait_seconds",
@@ -773,8 +773,8 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             buckets=[5, 20, 100, 500],
         )
-        self.prefill_delayer_timeout_total = Counter(
-            name="sglang:prefill_delayer_timeout_total",
+        self.prefill_delayer_timeouts_total = Counter(
+            name="sglang:prefill_delayer_timeouts_total",
             documentation="Total number of prefill delayer timeouts.",
             labelnames=labels.keys(),
         )
@@ -805,7 +805,7 @@ class SchedulerMetricsCollector:
         self._log_histogram(self.prefill_delayer_wait_forward_passes, forward_passes)
         self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
         if is_timeout:
-            self.prefill_delayer_timeout_total.labels(**self.labels).inc(1)
+            self.prefill_delayer_timeouts_total.labels(**self.labels).inc(1)
 
     def increment_retracted_reqs(
         self,

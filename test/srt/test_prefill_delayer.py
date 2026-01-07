@@ -140,6 +140,7 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
 
 def _launch_server(*, model, base_url, prefill_delayer: bool, other_args):
     os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
+    world_size = os.environ.get("SGLANG_TEST_WORLD_SIZE", "8")
 
     with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
         prefill_delayer
@@ -151,10 +152,10 @@ def _launch_server(*, model, base_url, prefill_delayer: bool, other_args):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "8",
+                world_size,
                 "--enable-dp-attention",
                 "--dp",
-                "8",
+                world_size,
                 "--chunked-prefill-size",
                 "131072",
                 "--mem-fraction-static",
@@ -177,7 +178,7 @@ def _print_prefill_delayer_metrics(base_url: str):
         print(line)
     assert "sglang_prefill_delayer_wait_forward_passes" in metrics_text
     assert "sglang_prefill_delayer_wait_seconds" in metrics_text
-    assert "sglang_prefill_delayer_timeout_total" in metrics_text
+    assert "sglang_prefill_delayer_timeouts_total" in metrics_text
 
 
 if __name__ == "__main__":
