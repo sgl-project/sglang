@@ -15,7 +15,7 @@ use super::{
     common::{
         build_mcp_list_tools_item, build_next_request, convert_mcp_tools_to_chat_tools,
         extract_all_tool_calls_from_chat, load_conversation_history, prepare_chat_tools_and_choice,
-        ToolLoopState,
+        ExtractedToolCall, ToolLoopState,
     },
     conversions,
 };
@@ -232,9 +232,10 @@ pub(super) async fn execute_tool_loop(
             // Separate MCP and function tool calls
             let mcp_tool_names: std::collections::HashSet<&str> =
                 mcp_tools.iter().map(|t| t.name.as_ref()).collect();
-            let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
-                .into_iter()
-                .partition(|(_, tool_name, _)| mcp_tool_names.contains(tool_name.as_str()));
+            let (mcp_tool_calls, function_tool_calls): (Vec<ExtractedToolCall>, Vec<_>) =
+                tool_calls
+                    .into_iter()
+                    .partition(|tc| mcp_tool_names.contains(tc.name.as_str()));
 
             trace!(
                 "Separated tool calls: {} MCP, {} function",
@@ -312,18 +313,18 @@ pub(super) async fn execute_tool_loop(
             }
 
             // Execute all MCP tools
-            for (call_id, tool_name, args_json_str) in mcp_tool_calls {
+            for tool_call in mcp_tool_calls {
                 trace!(
                     "Calling MCP tool '{}' (call_id: {}) with args: {}",
-                    tool_name,
-                    call_id,
-                    args_json_str
+                    tool_call.name,
+                    tool_call.call_id,
+                    tool_call.arguments
                 );
 
                 let tool_start = Instant::now();
                 let (output_str, success, error) = match ctx
                     .mcp_manager
-                    .call_tool(tool_name.as_str(), args_json_str.as_str())
+                    .call_tool(tool_call.name.as_str(), tool_call.arguments.as_str())
                     .await
                 {
                     Ok(result) => match serde_json::to_string(&result) {
@@ -348,12 +349,12 @@ pub(super) async fn execute_tool_loop(
                 // Record MCP tool metrics
                 Metrics::record_mcp_tool_duration(
                     &current_request.model,
-                    &tool_name,
+                    &tool_call.name,
                     tool_duration,
                 );
                 Metrics::record_mcp_tool_call(
                     &current_request.model,
-                    &tool_name,
+                    &tool_call.name,
                     if success {
                         metrics_labels::RESULT_SUCCESS
                     } else {
@@ -363,9 +364,9 @@ pub(super) async fn execute_tool_loop(
 
                 // Record the call in state
                 state.record_call(
-                    call_id,
-                    tool_name,
-                    args_json_str,
+                    tool_call.call_id,
+                    tool_call.name,
+                    tool_call.arguments,
                     output_str,
                     success,
                     error,

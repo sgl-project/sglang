@@ -17,6 +17,8 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     HEALTH_CHECK_INTERVAL,
     LOCAL_MODES,
     LOCAL_RUNTIMES,
+    LOG_SEPARATOR_WIDTH,
+    MAX_RETRY_ATTEMPTS,
     PARAM_BACKEND_ROUTER,
     PARAM_MODEL,
     PARAM_SETUP_BACKEND,
@@ -35,7 +37,9 @@ from .gpu_allocator import (
     nvml_context,
     wait_for_gpu_memory_to_clear,
 )
-from .model_pool import ModelInstance, ModelPool
+from .gpu_monitor import GPUMonitor
+from .gpu_monitor import should_monitor as should_monitor_gpu
+from .model_pool import ModelInstance, ModelPool, WorkerIdentity
 from .model_specs import (  # Default model paths; Model groups
     CHAT_MODELS,
     DEFAULT_EMBEDDING_MODEL_PATH,
@@ -61,10 +65,11 @@ from .process_utils import (
 from .run_eval import run_eval
 
 __all__ = [
-    # Enums
+    # Enums and Identity
     "ConnectionMode",
     "WorkerType",
     "Runtime",
+    "WorkerIdentity",
     # Convenience sets
     "LOCAL_MODES",
     "LOCAL_RUNTIMES",
@@ -79,6 +84,8 @@ __all__ = [
     "DEFAULT_STARTUP_TIMEOUT",
     "DEFAULT_ROUTER_TIMEOUT",
     "HEALTH_CHECK_INTERVAL",
+    "MAX_RETRY_ATTEMPTS",
+    "LOG_SEPARATOR_WIDTH",
     # Env vars
     "ENV_MODELS",
     "ENV_BACKENDS",
@@ -104,6 +111,9 @@ __all__ = [
     "wait_for_health",
     "wait_for_workers_ready",
     "detect_ib_device",
+    # GPU monitoring
+    "GPUMonitor",
+    "should_monitor_gpu",
     # Model management
     "ModelInstance",
     "ModelPool",

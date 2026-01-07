@@ -64,7 +64,10 @@ class TestWorkerAPI:
 
 @pytest.mark.e2e
 class TestIGWMode:
-    """Tests for IGW mode - start gateway empty, add workers via API."""
+    """Tests for IGW mode - start gateway empty, add workers via API.
+
+    Workers are launched on-demand via model_pool.get().
+    """
 
     def test_igw_start_empty(self, model_pool: ModelPool):
         """Test starting gateway in IGW mode with no workers."""
@@ -131,7 +134,7 @@ class TestIGWMode:
             gateway.shutdown()
 
     def test_igw_multiple_workers(self, model_pool: ModelPool):
-        """Test adding multiple workers to IGW gateway."""
+        """Test adding multiple workers (HTTP + gRPC) to IGW gateway."""
         http_instance = model_pool.get("llama-8b", ConnectionMode.HTTP)
         grpc_instance = model_pool.get("llama-8b", ConnectionMode.GRPC)
 

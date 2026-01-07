@@ -1,3 +1,9 @@
+"""Legacy port utilities.
+
+DEPRECATED: This module will be removed during e2e_response_api migration.
+Use infra.get_open_port() instead.
+"""
+
 import socket
 
 

@@ -2,6 +2,8 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import requests
+
 from sglang.bench_serving import run_benchmark
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
@@ -88,6 +90,7 @@ def _run_throughput_test(
             **other_benchmark_args,
         )
         res = run_benchmark(args)
+        _print_prefill_delayer_metrics(base_url, expect_metrics=prefill_delayer)
     finally:
         kill_process_tree(process.pid)
 
@@ -137,6 +140,7 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
 
 def _launch_server(*, model, base_url, prefill_delayer: bool, other_args):
     os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
+    world_size = os.environ.get("SGLANG_TEST_WORLD_SIZE", "8")
 
     with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
         prefill_delayer
@@ -148,17 +152,34 @@ def _launch_server(*, model, base_url, prefill_delayer: bool, other_args):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "8",
+                world_size,
                 "--enable-dp-attention",
                 "--dp",
-                "8",
+                world_size,
                 "--chunked-prefill-size",
                 "131072",
                 "--mem-fraction-static",
                 "0.6",
+                "--enable-metrics",
                 *(other_args or []),
             ],
         )
+
+
+def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool):
+    metrics_response = requests.get(f"{base_url}/metrics")
+    assert metrics_response.status_code == 200
+    metrics_text = metrics_response.text
+    prefill_delayer_metrics = [
+        line for line in metrics_text.split("\n") if "prefill_delayer" in line
+    ]
+    print("=== PrefillDelayer Metrics ===")
+    for line in prefill_delayer_metrics:
+        print(line)
+    if expect_metrics:
+        assert "sglang:prefill_delayer_wait_forward_passes" in metrics_text
+        assert "sglang:prefill_delayer_wait_seconds" in metrics_text
+        assert "sglang:prefill_delayer_timeouts_total" in metrics_text
 
 
 if __name__ == "__main__":

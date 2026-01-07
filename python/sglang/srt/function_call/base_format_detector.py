@@ -83,7 +83,7 @@ class BaseFormatDetector(ABC):
 
             results.append(
                 ToolCallItem(
-                    tool_index=-1,  # Caller should update this based on the actual tools array called
+                    tool_index=tool_indices.get(name, -1),
                     name=name,
                     parameters=json.dumps(
                         act.get("parameters") or act.get("arguments", {}),

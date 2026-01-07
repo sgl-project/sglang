@@ -25,7 +25,6 @@ if is_npu():
 
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
-    NSA_DUAL_STREAM,
     cp_all_gather_rerange_output,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
@@ -802,8 +801,7 @@ class Indexer(MultiPlatformOp):
         )
 
         enable_dual_stream = (
-            NSA_DUAL_STREAM
-            and self.alt_stream is not None
+            self.alt_stream is not None
             and get_is_capture_mode()
             and q_lora.shape[0] > 0
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD

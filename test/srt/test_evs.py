@@ -51,4 +51,6 @@ def test_replace_offsets_with_tokens_per_frame():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+
+    sys.exit(pytest.main([__file__]))

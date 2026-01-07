@@ -778,6 +778,7 @@ def get_benchmark_args(
     gsp_question_len=32,
     gsp_output_len=32,
     gsp_num_turns=1,
+    header=None,
 ):
     return SimpleNamespace(
         backend=backend,
@@ -818,6 +819,7 @@ def get_benchmark_args(
         gsp_question_len=gsp_question_len,
         gsp_output_len=gsp_output_len,
         gsp_num_turns=gsp_num_turns,
+        header=header,
     )
 
 

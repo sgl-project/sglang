@@ -386,7 +386,7 @@ jobs:
 
       - name: Run common 8-GPU model tests
         if: always()
-        timeout-minutes: 200
+        timeout-minutes: 300
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}

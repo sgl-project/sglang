@@ -18,16 +18,14 @@
 
 use std::sync::Arc;
 
-use http::header::HeaderName;
 use rand::Rng as _;
 
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
-use crate::{core::Worker, observability::metrics::Metrics};
-
-/// Header for direct worker targeting by index (0-based)
-static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
-/// Header for consistent hash routing
-static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
+use crate::{
+    core::Worker,
+    observability::metrics::Metrics,
+    routers::header_utils::{extract_routing_key, extract_target_worker},
+};
 
 /// Execution branch for metrics
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,18 +110,8 @@ impl ConsistentHashingPolicy {
             return (None, Branch::NoHealthyWorkers);
         }
 
-        // Extract routing headers - to_str() is O(1), just validates ASCII, no allocation
-        let target_worker = info
-            .headers
-            .and_then(|h| h.get(&HEADER_TARGET_WORKER))
-            .and_then(|v| v.to_str().ok())
-            .filter(|s| !s.is_empty());
-
-        let routing_key = info
-            .headers
-            .and_then(|h| h.get(&HEADER_ROUTING_KEY))
-            .and_then(|v| v.to_str().ok())
-            .filter(|s| !s.is_empty());
+        let target_worker = extract_target_worker(info.headers);
+        let routing_key = extract_routing_key(info.headers);
 
         // Priority 1: X-SMG-Target-Worker - direct routing by worker index
         // O(1) parse + O(1) bounds check + O(1) health check

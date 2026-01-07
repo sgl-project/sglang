@@ -114,10 +114,18 @@ pub(super) fn prepare_chat_tools_and_choice(
     };
 }
 
+/// Tool call extracted from a ChatCompletionResponse
+#[derive(Debug, Clone)]
+pub(super) struct ExtractedToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
 /// Extract all tool calls from chat response (for parallel tool call support)
 pub(super) fn extract_all_tool_calls_from_chat(
     response: &crate::protocols::chat::ChatCompletionResponse,
-) -> Vec<(String, String, String)> {
+) -> Vec<ExtractedToolCall> {
     // Check if response has choices with tool calls
     let Some(choice) = response.choices.first() else {
         return Vec::new();
@@ -128,16 +136,14 @@ pub(super) fn extract_all_tool_calls_from_chat(
     if let Some(tool_calls) = &message.tool_calls {
         tool_calls
             .iter()
-            .map(|tool_call| {
-                (
-                    tool_call.id.clone(),
-                    tool_call.function.name.clone(),
-                    tool_call
-                        .function
-                        .arguments
-                        .clone()
-                        .unwrap_or_else(|| "{}".to_string()),
-                )
+            .map(|tool_call| ExtractedToolCall {
+                call_id: tool_call.id.clone(),
+                name: tool_call.function.name.clone(),
+                arguments: tool_call
+                    .function
+                    .arguments
+                    .clone()
+                    .unwrap_or_else(|| "{}".to_string()),
             })
             .collect()
     } else {

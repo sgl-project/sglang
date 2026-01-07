@@ -132,6 +132,17 @@ def get_auth_headers() -> Dict[str, str]:
         return {}
 
 
+def parse_custom_headers(header_list: List[str]) -> Dict[str, str]:
+    return {k: v for h in header_list for k, _, v in [h.partition("=")] if k and v}
+
+
+def get_request_headers() -> Dict[str, str]:
+    headers = get_auth_headers()
+    if h := getattr(args, "header", None):
+        headers.update(parse_custom_headers(h))
+    return headers
+
+
 # trt llm does not support ignore_eos
 # https://github.com/triton-inference-server/tensorrtllm_backend/issues/505
 async def async_request_trt_llm(
@@ -236,7 +247,7 @@ async def async_request_openai_completions(
         if request_func_input.image_data:
             payload.update({"image_data": request_func_input.image_data})
 
-        headers = get_auth_headers()
+        headers = get_request_headers()
         if request_func_input.routing_key:
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
@@ -377,7 +388,7 @@ async def async_request_openai_chat_completions(
             payload["model"] = request_func_input.lora_name
             payload["lora_path"] = request_func_input.lora_name
 
-        headers = get_auth_headers()
+        headers = get_request_headers()
         if request_func_input.routing_key:
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
@@ -495,7 +506,7 @@ async def async_request_truss(
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
-        headers = get_auth_headers()
+        headers = get_request_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -583,7 +594,7 @@ async def async_request_sglang_generate(
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
 
-        headers = get_auth_headers()
+        headers = get_request_headers()
         if request_func_input.routing_key:
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
@@ -3227,6 +3238,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--tag", type=str, default=None, help="The tag to be dumped to output."
+    )
+    parser.add_argument(
+        "--header",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
     )
     args = parser.parse_args()
     run_benchmark(args)

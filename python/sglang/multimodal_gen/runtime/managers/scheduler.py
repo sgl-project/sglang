@@ -170,6 +170,7 @@ class Scheduler:
         if isinstance(req, Req):
             warmup_req = deepcopy(req)
             warmup_req.is_warmup = True
+            warmup_req.extra["cache_dit_num_inference_steps"] = req.num_inference_steps
             warmup_req.num_inference_steps = 1
             recv_reqs.insert(0, (identity, warmup_req))
             logger.info("Server warming up....")

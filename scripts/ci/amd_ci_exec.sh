@@ -60,9 +60,10 @@ if docker exec \
   "${ENV_ARGS[@]}" \
   ci_sglang "$@"; then
   exit 0
+else
+  FIRST_EXIT_CODE=$?
 fi
 
-FIRST_EXIT_CODE=$?
 echo "First attempt failed with exit code $FIRST_EXIT_CODE"
 echo "Retrying with HF_HUB_OFFLINE=1 (offline mode)..."
 

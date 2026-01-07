@@ -14,7 +14,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# W8A8 quantization server integration tests
 register_cuda_ci(est_time=160, suite="stage-b-test-small-1-gpu")
 
 
