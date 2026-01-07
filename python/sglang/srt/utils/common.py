@@ -312,11 +312,13 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     falsy_values = ("false", "0")
 
     if (value not in truthy_values) and (value not in falsy_values):
-        if value not in _warned_bool_env_var_keys:
+        # Warn once per env var key (not per value), otherwise different keys that share the
+        # same invalid value may suppress warnings incorrectly.
+        if name not in _warned_bool_env_var_keys:
             logger.warning(
                 f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
             )
-        _warned_bool_env_var_keys.add(value)
+        _warned_bool_env_var_keys.add(name)
 
     return value in truthy_values
 
@@ -836,6 +838,7 @@ def load_audio(
 class ImageData:
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    max_dynamic_patch: Optional[int] = None
 
 
 def load_image(
@@ -1498,8 +1501,28 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
+class RefCountedGauge:
+    def __init__(self, gauge):
+        self._gauge = gauge
+        self._refcount: Dict[str, int] = {}
+
+    def inc(self, key: str):
+        if key in self._refcount:
+            self._refcount[key] += 1
+        else:
+            self._refcount[key] = 1
+            self._gauge.inc()
+
+    def dec(self, key: str):
+        if key in self._refcount:
+            self._refcount[key] -= 1
+            if self._refcount[key] == 0:
+                del self._refcount[key]
+                self._gauge.dec()
+
+
 def add_prometheus_track_response_middleware(app):
-    from prometheus_client import Counter
+    from prometheus_client import Counter, Gauge
 
     http_request_counter = Counter(
         name="sglang:http_requests_total",
@@ -1513,24 +1536,48 @@ def add_prometheus_track_response_middleware(app):
         labelnames=["endpoint", "status_code", "method"],
     )
 
+    http_requests_active = Gauge(
+        name="sglang:http_requests_active",
+        documentation="Number of currently active HTTP requests",
+        labelnames=["endpoint", "method"],
+        multiprocess_mode="livesum",
+    )
+
+    routing_keys_active = RefCountedGauge(
+        Gauge(
+            name="sglang:routing_keys_active",
+            documentation="Number of unique routing keys with active requests",
+            multiprocess_mode="livesum",
+        )
+    )
+
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
         # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
         # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
         path, is_handled_path = _get_fastapi_request_path(request)
         method = request.method
+        routing_key = request.headers.get("x-smg-routing-key")
 
         http_request_counter.labels(endpoint=path, method=method).inc()
+        http_requests_active.labels(endpoint=path, method=method).inc()
+        if routing_key:
+            routing_keys_active.inc(routing_key)
 
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
 
-        http_response_counter.labels(
-            endpoint=path,
-            method=method,
-            status_code=str(response.status_code),
-        ).inc()
+            http_response_counter.labels(
+                endpoint=path,
+                method=method,
+                status_code=str(response.status_code),
+            ).inc()
 
-        return response
+            return response
+        finally:
+            http_requests_active.labels(endpoint=path, method=method).dec()
+            if routing_key:
+                routing_keys_active.dec(routing_key)
 
 
 # https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
@@ -1968,12 +2015,6 @@ def get_compiler_backend(mode=None) -> str:
 
 
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
-
-
-# Some backends use pytorch version < 2.4.0 which doesn't
-# support `torch.library.custom_op`.
-def supports_custom_op() -> bool:
-    return hasattr(torch.library, "custom_op")
 
 
 def direct_register_custom_op(
@@ -2415,10 +2456,6 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     logger.info(
         f"Dummy health check server started in background thread at {host}:{port}"
     )
-
-
-def create_checksum(directory: str):
-    raise NotImplementedError()
 
 
 def set_cuda_arch():
