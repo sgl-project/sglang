@@ -26,7 +26,10 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
-    observability::metrics::{method_to_static_str, metrics_labels, Metrics},
+    observability::{
+        inflight_tracker::InFlightRequestTracker,
+        metrics::{method_to_static_str, metrics_labels, Metrics},
+    },
     routers::error::extract_error_code_from_response,
     server::AppState,
     wasm::{
@@ -66,23 +69,12 @@ impl TokenGuardBody {
 impl Drop for TokenGuardBody {
     fn drop(&mut self) {
         if let Some(bucket) = self.token_bucket.take() {
-            let tokens = self.tokens;
             debug!(
                 "TokenGuardBody: stream ended, returning {} tokens to bucket",
-                tokens
+                self.tokens
             );
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    bucket.return_tokens(tokens).await;
-                });
-            } else {
-                // Runtime not available (e.g., during shutdown)
-                // Tokens will be lost, but this is acceptable during shutdown
-                warn!(
-                    "TokenGuardBody: Cannot return {} tokens - no Tokio runtime available",
-                    tokens
-                );
-            }
+            // Use lock-free sync return - no runtime needed, guaranteed token return
+            bucket.return_tokens_sync(self.tokens);
         }
     }
 }
@@ -156,7 +148,7 @@ pub async fn auth_middleware(
 /// Alphanumeric characters for request ID generation (as bytes for O(1) indexing)
 const REQUEST_ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-/// Generate OpenAI-compatible request ID based on endpoint
+/// Generate OpenAI-compatible request ID based on endpoint.
 fn generate_request_id(path: &str) -> String {
     let prefix = if path.contains("/chat/completions") {
         "chatcmpl-"
@@ -280,7 +272,7 @@ impl<B> MakeSpan<B> for RequestSpan {
         // Don't try to extract request ID here - it won't be available yet
         // The RequestIdLayer runs after TraceLayer creates the span
         info_span!(
-            target: "sgl_model_gateway::otel-trace",
+            target: "smg::otel-trace",
             "http_request",
             method = %request.method(),
             uri = %request.uri(),
@@ -289,7 +281,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             status_code = Empty,
             latency = Empty,
             error = Empty,
-            module = "sglang::router_rs"
+            module = "smg"
         )
     }
 }
@@ -308,9 +300,13 @@ impl<B> OnRequest<B> for RequestLogger {
             span.record("request_id", request_id.0.as_str());
         }
 
+        let method = method_to_static_str(request.method().as_str());
+        let path = normalize_path_for_metrics(request.uri().path());
+        Metrics::record_http_request(method, &path);
+
         // Log the request start
         info!(
-            target: "sgl_model_gateway::request",
+            target: "smg::request",
             "started processing request"
         );
     }
@@ -349,17 +345,17 @@ impl<B> OnResponse<B> for ResponseLogger {
         let _enter = span.enter();
         if status.is_server_error() {
             error!(
-                target: "sgl_model_gateway::response",
+                target: "smg::response",
                 "request failed with server error"
             );
         } else if status.is_client_error() {
             warn!(
-                target: "sgl_model_gateway::response",
+                target: "smg::response",
                 "request failed with client error"
             );
         } else {
             info!(
-                target: "sgl_model_gateway::response",
+                target: "smg::response",
                 "finished processing request"
             );
         }
@@ -603,12 +599,14 @@ pub async fn concurrency_limit_middleware(
 static ACTIVE_HTTP_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)
-#[derive(Clone, Copy, Default)]
-pub struct HttpMetricsLayer;
+#[derive(Clone)]
+pub struct HttpMetricsLayer {
+    tracker: Arc<InFlightRequestTracker>,
+}
 
 impl HttpMetricsLayer {
-    pub fn new() -> Self {
-        Self
+    pub fn new(tracker: Arc<InFlightRequestTracker>) -> Self {
+        Self { tracker }
     }
 }
 
@@ -616,7 +614,10 @@ impl<S> Layer<S> for HttpMetricsLayer {
     type Service = HttpMetricsMiddleware<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        HttpMetricsMiddleware { inner }
+        HttpMetricsMiddleware {
+            inner,
+            in_flight_request_tracker: self.tracker.clone(),
+        }
     }
 }
 
@@ -624,6 +625,7 @@ impl<S> Layer<S> for HttpMetricsLayer {
 #[derive(Clone)]
 pub struct HttpMetricsMiddleware<S> {
     inner: S,
+    in_flight_request_tracker: Arc<InFlightRequestTracker>,
 }
 
 impl<S> Service<Request> for HttpMetricsMiddleware<S>
@@ -647,14 +649,19 @@ where
         let start = Instant::now();
 
         let mut inner = self.inner.clone();
+        let in_flight_request_tracker = self.in_flight_request_tracker.clone();
 
         Box::pin(async move {
             // Increment inside async block - ensures no leak if future is dropped before polling
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
             Metrics::set_http_connections_active(active as usize);
 
+            let guard = in_flight_request_tracker.track();
+
             // Capture result before decrementing to ensure decrement happens on error too
             let result = inner.call(req).await;
+
+            drop(guard);
 
             // Always decrement, regardless of success or failure
             let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
@@ -663,25 +670,10 @@ where
             let response = result?;
 
             let duration = start.elapsed();
-            let status_class = status_to_class(response.status().as_u16());
-
-            Metrics::record_http_request(method, &path, status_class);
             Metrics::record_http_duration(method, &path, duration);
 
             Ok(response)
         })
-    }
-}
-
-#[inline]
-fn status_to_class(status: u16) -> &'static str {
-    match status {
-        100..=199 => "1xx",
-        200..=299 => "2xx",
-        300..=399 => "3xx",
-        400..=499 => "4xx",
-        500..=599 => "5xx",
-        _ => "unknown",
     }
 }
 

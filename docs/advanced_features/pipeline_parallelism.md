@@ -24,6 +24,69 @@ When `--enable-dynamic-chunking` is enabled, each chunk size of a sequence is de
 
 **`SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR`** is a parameter that controls the smoothing factor for the dynamic chunking algorithm, defaulting to 0.75. It determines how much the chunk size can change during the prefill phase. A larger value means a more aggressive chunk size change, which may lead to better performance but also to greater chunk size changes (the chunk size at the end may become very small, which could lead to performance degradation) and more total chunks. When it is set to 1, the chunk size will be adjusted strictly based on the aforementioned quadratic model that predicts the next chunk size. A smaller value means a more conservative chunk size change, which may lead to smaller chunk size changes and fewer total chunks. When it is set to 0, the chunk size will not be adjusted dynamically, so it is identical to the traditional way with a fixed chunked prefill size.
 
+## Best Practice for Pipeline Parallelism
+
+### Tuning the Chunked Prefill Size
+Optimizing the chunked prefill size is crucial for balancing pipeline efficiency and resource utilization. The ideal size depends on factors including model architecture, hardware configuration, and typical input lengths. We recommend starting with a small chunk size, such as 4K, and gradually increasing it until you find the optimal size for your specific use case. Alternatively, you can analyze the hardware capacity and determine the optimal chunk size based on the roofline model.
+
+### Enable Dynamic Chunking and Adjust Smoothing Factor (Experimental feature)
+SGLang also offers a dynamic chunking solution that could further improve performance. This feature is currently an experimental feature that requires a certain amount of tuning experimentation and may not be suitable for all workloads. In addition, fine-tuning the smoothing factor can help optimize performance for specific workloads and model characteristics.
+
+### Case Study on NVIDIA H20
+
+When evaluating pipeline parallelism with fixed chunked prefill sizes from 2K to 16K, experiment results show that a 4K chunk size delivered optimal prefill TTFT performance for the DeepSeek-V3.1, and a 6K chunk size delivered optimal prefill TTFT performance for the Qwen3-235B-A22B-Thinking-2507-FP8.
+
+When enabling dynamic chunking, we first scale the optimal fixed chunked prefill size by a factor of 3 as the initial chunk size. Through experimentation, we found that a multiplier of 2-3 provides an appropriate balance—avoiding excessive initial pipeline bubbles while ensuring that subsequent chunks don't become too small as context length increases. With the default dynamic chunking smoothing factor of 0.75, we performed parameter tuning and determined that a value of 0.65 works optimally with the 12K initial chunk size for the DeepSeek-V3.1, while a value of 0.8 works optimally with the 18K initial chunk size for the Qwen3-235B-A22B-Thinking-2507-FP8.
+
+#### DeepSeek-V3.1 with 128K Input Token Length
+```bash
+# prefill node 0 (fixed chunked prefill size)
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.1 --trust-remote-code \
+  --nnodes 4 --node-rank 0 --tp 8 --pp-size 4 \
+  --port 30000 --dist-init-addr 192.168.0.137:62001 \
+  --disable-radix-cache --mem-fraction-static 0.8  \
+  --attention-backend fa3 --host 0.0.0.0 --watchdog-timeout 3600 \
+  --max-running-requests 128 --chunked-prefill-size 4096
+```
+
+```bash
+# prefill node 0 (with dynamic chunking)
+export SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR=0.65
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.1 --trust-remote-code \
+  --nnodes 4 --node-rank 0 --tp 8 --pp-size 4 \
+  --port 30000 --dist-init-addr 192.168.0.137:62001 \
+  --disable-radix-cache --mem-fraction-static 0.8  \
+  --attention-backend fa3 --host 0.0.0.0 --watchdog-timeout 3600 \
+  --max-running-requests 128 --chunked-prefill-size 12288 --enable-dynamic-chunking
+```
+
+#### Qwen3-235B-A22B-Thinking-2507-FP8 with 128K Input Token Length
+```bash
+# prefill node 0 (fixed chunked prefill size)
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3-235B-A22B-Thinking-2507-FP8 --trust-remote-code \
+  --nnodes 2 --node-rank 0 --tp 4 --pp-size 2 \
+  --port 30000 --dist-init-addr 192.168.0.137:62001 \
+  --disable-radix-cache --mem-fraction-static 0.8  \
+  --attention-backend fa3 --host 0.0.0.0 --watchdog-timeout 3600 \
+  --max-running-requests 128 --chunked-prefill-size 6144
+```
+
+```bash
+# prefill node 0 (with dynamic chunking)
+export SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR=0.8
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3-235B-A22B-Thinking-2507-FP8 --trust-remote-code \
+  --nnodes 2 --node-rank 0 --tp 4 --pp-size 2 \
+  --port 30000 --dist-init-addr 192.168.0.137:62001 \
+  --disable-radix-cache --mem-fraction-static 0.8  \
+  --attention-backend fa3 --host 0.0.0.0 --watchdog-timeout 3600 \
+  --max-running-requests 128 --chunked-prefill-size 18432 --enable-dynamic-chunking
+```
+
+Note: `--disable-radix-cache` is enabled only for reproducible benchmarking purposes. It is not recommended to use it in production.
 
 ## Best Practice for Pipeline Parallelism with PD Disaggregation
 To be added. Stay tuned for the latest updates on Pipeline Parallelism with PD Disaggregation.

@@ -133,7 +133,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # Simulate the eagle run.
         if self.spec_algorithm.is_eagle():
             num_states = server_args.speculative_eagle_topk
-            if server_args.enable_mtp:
+            if server_args.enable_multi_layer_eagle:
                 num_states *= server_args.speculative_num_steps
             topk_p = torch.stack(
                 [

@@ -19,9 +19,7 @@ use crate::routers::{
 };
 
 /// Chat response processing stage
-///
-/// Extracts chat-specific response processing logic from the old unified ResponseProcessingStage.
-pub struct ChatResponseProcessingStage {
+pub(crate) struct ChatResponseProcessingStage {
     processor: processor::ResponseProcessor,
     streaming_processor: Arc<streaming::StreamingProcessor>,
 }
@@ -79,12 +77,25 @@ impl ChatResponseProcessingStage {
             })?
             .clone();
 
+        // Get cached tokenizer (resolved once in preparation stage)
+        let tokenizer = ctx.tokenizer_arc().ok_or_else(|| {
+            error!(
+                function = "ChatResponseProcessingStage::process_chat_response",
+                "Tokenizer not cached in context"
+            );
+            error::internal_error(
+                "tokenizer_not_cached",
+                "Tokenizer not cached in context - preparation stage may have been skipped",
+            )
+        })?;
+
         if is_streaming {
             // Streaming: Use StreamingProcessor and return SSE response
             let response = self.streaming_processor.clone().process_streaming_response(
                 execution_result,
                 ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
                 dispatch,
+                tokenizer,
             );
 
             // Attach load guards to response body for proper RAII lifecycle
@@ -118,6 +129,7 @@ impl ChatResponseProcessingStage {
                 execution_result,
                 chat_request,
                 dispatch,
+                tokenizer,
                 stop_decoder,
                 request_logprobs,
             )

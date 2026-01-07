@@ -55,6 +55,32 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _extract_max_dynamic_patch(request: ChatCompletionRequest):
+    img_vals = []
+    vid_vals = []
+    for msg in request.messages or []:
+        content = getattr(msg, "content", None)
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            # pydantic object or dict type
+            if getattr(part, "type", None) == "image_url":
+                iu = getattr(part, "image_url", None)
+                mdp = getattr(iu, "max_dynamic_patch", None) if iu else None
+                if mdp is not None:
+                    img_vals.append(int(mdp))
+            elif getattr(part, "type", None) == "video_url":
+                vu = getattr(part, "video_url", None)
+                mdp = getattr(vu, "max_dynamic_patch", None) if vu else None
+                if mdp is not None:
+                    vid_vals.append(int(mdp))
+
+    # TODO(yuan-luo): per-item max_dynamic_patch for both image and video
+    img_max_dynamic_patch = min(img_vals) if img_vals else None
+    vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
+    return img_max_dynamic_patch, vid_max_dynamic_patch
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -133,7 +159,7 @@ class OpenAIServingChat(OpenAIServingBase):
             max_output_tokens
             and server_context_length
             and max_output_tokens > server_context_length
-        ):
+        ) and not self.tokenizer_manager.server_args.allow_auto_truncate:
             return (
                 f"max_completion_tokens is too large: {max_output_tokens}."
                 f"This model supports at most {server_context_length} completion tokens."
@@ -195,6 +221,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if first_adapter:
                 self._validate_lora_enabled(first_adapter)
 
+        img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
+            request
+        )
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -219,6 +248,9 @@ class OpenAIServingChat(OpenAIServingBase):
             priority=request.priority,
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            image_max_dynamic_patch=img_max_dynamic_patch,
+            video_max_dynamic_patch=vid_max_dynamic_patch,
+            max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
         )
 
         return adapted_request, request
