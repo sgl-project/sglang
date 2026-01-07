@@ -157,8 +157,21 @@ class PiecewiseCudaGraphRunner:
             "eager",
             "inductor",
         ], "By now, only eager and inductor are supported for piecewise cuda graph compiler."
+
+        piecewise_cuda_graph_tokens = [
+            token
+            for token in self.model_runner.server_args.piecewise_cuda_graph_tokens
+            if token <= self.model_runner.model_config.context_len
+        ]
+        if len(piecewise_cuda_graph_tokens) != len(
+            self.model_runner.server_args.piecewise_cuda_graph_tokens
+        ):
+            log_info_on_rank0(
+                logger,
+                f"Truncate piecewise_cuda_graph_tokens to {piecewise_cuda_graph_tokens} since model context length is {self.model_runner.model_config.context_len}",
+            )
         self.compile_config = CompilationConfig(
-            self.model_runner.server_args.piecewise_cuda_graph_tokens,
+            piecewise_cuda_graph_tokens,
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
             self.model_runner.server_args.enable_torch_compile_debug_mode,
         )
