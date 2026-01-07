@@ -56,6 +56,12 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
+if _is_npu:
+    from sgl_kernel_npu.fla.utils import (
+        fused_qkvzba_split_reshape_cat_torch,
+    )
+    fused_qkvzba_split_reshape_cat = fused_qkvzba_split_reshape_cat_torch
+
 import triton
 import triton.language as tl
 

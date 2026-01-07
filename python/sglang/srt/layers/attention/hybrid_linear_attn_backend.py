@@ -1,6 +1,7 @@
 from typing import Optional, Union
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from einops import rearrange
@@ -46,18 +47,52 @@ if is_cuda():
     causal_conv1d_fn = causal_conv1d_fn_cuda
 elif is_npu():
     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
-    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
-        fused_sigmoid_gating_delta_rule_update_npu,
-    )
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu,
-        causal_conv1d_update_npu,
+    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update_npu
+    from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
+    from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_fn_npu
+
+
+    from sglang.srt.hardware_backend.npu.cmo import (
+        get_or_create_conv1d_stream,
+        get_or_create_cache_update_stream,
     )
 
+    def causal_conv1d_update_dual_stream(
+        hidden_state: torch.Tensor,    
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        activation: Union[bool, str, None] = None,
+        conv_state_indices: Optional[torch.Tensor] = None,
+    ):
+        conv_state_tmp = conv_state[conv_state_indices]
+        state_len = conv_state_tmp.shape[-1]
+        hidden_state = hidden_state.unsqueeze(-1)
+        hidden_states_new = torch.cat([conv_state_tmp, hidden_state], dim=-1).to(weight.dtype)
+
+        current_stream = torch.npu.current_stream()
+        conv1d_stream = get_or_create_conv1d_stream()
+        conv1d_stream.wait_stream(current_stream)
+        with torch.npu.stream(conv1d_stream):
+            out = torch.sum(hidden_states_new * weight, dim=-1, keepdim=True)
+            out = F.silu(out)
+            out = out.to(hidden_state.dtype)
+
+        cache_update_stream = get_or_create_cache_update_stream()
+        cache_update_stream.wait_stream(current_stream)
+        with torch.npu.stream(cache_update_stream):
+            current_state = hidden_states_new[:, :, -state_len:]
+            conv_state[conv_state_indices] = current_state
+
+        current_stream.wait_stream(conv1d_stream)
+        current_stream.wait_stream(cache_update_stream)
+        return out.squeeze(-1)
+
+    fused_gdn_gating = fused_gdn_gating_npu
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
     causal_conv1d_fn = causal_conv1d_fn_npu
-    causal_conv1d_update = causal_conv1d_update_npu
+    causal_conv1d_update = causal_conv1d_update_dual_stream
 
 
 # Kernel to track mamba states if needed based on track mask
