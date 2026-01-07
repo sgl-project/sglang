@@ -1,6 +1,6 @@
 """Constants and enums for E2E test infrastructure."""
 
-from enum import Enum, auto
+from enum import Enum
 
 
 class ConnectionMode(str, Enum):
