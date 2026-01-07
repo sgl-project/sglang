@@ -159,9 +159,9 @@ class FingerprintStorage:
 
         # Insert session record
         self._conn.execute(
-            """INSERT OR IGNORE INTO sessions (session_id, start_time, model_name, metadata)
-               VALUES (?, datetime('now'), ?, ?)""",
-            (self.session_id, "unknown", json.dumps({"source": "rapids_sidecar"})),
+            """INSERT OR IGNORE INTO sessions (session_id, name, model_id)
+               VALUES (?, ?, ?)""",
+            (self.session_id, "rapids_sidecar", "unknown"),
         )
         self._conn.commit()
         self._initialized = True
@@ -173,8 +173,7 @@ class FingerprintStorage:
         fingerprint: np.ndarray,
         zone: Optional[str] = None,
         cluster_id: Optional[int] = None,
-        layer_idx: int = -1,
-        head_idx: int = -1,
+        confidence: Optional[float] = None,
         metadata: Optional[Dict] = None,
     ):
         """Store a fingerprint to the database (batched for efficiency)."""
@@ -190,14 +189,12 @@ class FingerprintStorage:
 
             self._batch_buffer.append((
                 request_id,
+                self.session_id,
                 step,
                 fp_blob,
                 zone,
-                cluster_id,
-                layer_idx,
-                head_idx,
-                json.dumps(metadata) if metadata else None,
-                self.session_id,
+                confidence,
+                cluster_id if cluster_id is not None else -1,
             ))
 
             if len(self._batch_buffer) >= self._batch_size:
@@ -210,10 +207,10 @@ class FingerprintStorage:
 
         try:
             self._conn.executemany(
-                """INSERT INTO fingerprints
-                   (request_id, step, fingerprint, zone, cluster_id,
-                    layer_idx, head_idx, metadata, session_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT OR REPLACE INTO fingerprints
+                   (request_id, session_id, step, fingerprint,
+                    manifold_zone, manifold_confidence, cluster_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 self._batch_buffer,
             )
             self._conn.commit()
@@ -608,8 +605,6 @@ class RAPIDSSidecar:
         vector: List[float],
         metadata: Optional[Dict] = None,
         step: int = 0,
-        layer_idx: int = -1,
-        head_idx: int = -1,
     ) -> Optional[Dict]:
         """
         Add a fingerprint to the buffer (and update online clusters if enabled).
@@ -628,11 +623,14 @@ class RAPIDSSidecar:
         classification = None
         zone = None
         cluster_id = None
+        confidence = None
         if self._discovery and self._discovery.is_available():
             classification = self._discovery.classify(vec)
             if classification:
-                zone = classification.get("manifold", {}).get("zone")
-                cluster_id = classification.get("manifold", {}).get("cluster_id")
+                manifold = classification.get("manifold", {})
+                zone = manifold.get("zone")
+                cluster_id = manifold.get("cluster_id")
+                confidence = manifold.get("confidence")
 
         with self.lock:
             self.fingerprints.append(entry)
@@ -649,8 +647,7 @@ class RAPIDSSidecar:
                 fingerprint=vec,
                 zone=zone,
                 cluster_id=cluster_id,
-                layer_idx=layer_idx,
-                head_idx=head_idx,
+                confidence=confidence,
                 metadata=metadata,
             )
 
@@ -726,7 +723,7 @@ class RAPIDSSidecar:
 
         for cluster_id, centroid in self.centroids.items():
             cent = np.array(centroid.centroid, dtype=np.float32)
-            dist = np.linalg.norm(vec - cent)
+            dist = float(np.linalg.norm(vec - cent))  # Convert to Python float
             if dist < best_dist:
                 best_dist = dist
                 best_cluster = cluster_id
@@ -1023,8 +1020,6 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 vector=data["vector"],
                 metadata=data.get("metadata"),
                 step=data.get("step", 0),
-                layer_idx=data.get("layer_idx", -1),
-                head_idx=data.get("head_idx", -1),
             )
             response = {"status": "accepted"}
             if classification:
