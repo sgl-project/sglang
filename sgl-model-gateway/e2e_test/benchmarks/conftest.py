@@ -152,13 +152,20 @@ def genai_bench_runner():
         )
         timeout = timeout_sec or int(os.environ.get("GENAI_BENCH_TEST_TIMEOUT", "120"))
 
-        proc = subprocess.Popen(
-            cmd,
-            env=os.environ.copy(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                env=os.environ.copy(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError:
+            pytest.fail(f"genai-bench executable not found at {cli}")
+        except PermissionError:
+            pytest.fail(f"Permission denied executing {cli}")
+        except OSError as e:
+            pytest.fail(f"Failed to start genai-bench: {e}")
 
         # Start GPU monitor if needed
         gpu_monitor: GPUMonitor | None = None

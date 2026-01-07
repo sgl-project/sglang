@@ -30,11 +30,9 @@ if TYPE_CHECKING:
     from .simple_eval_common import Eval
 
 from .simple_eval_common import ChatCompletionSampler, set_ulimit
+from .simple_eval_mmlu import MMLU_DATASET_URL
 
 logger = logging.getLogger(__name__)
-
-# MMLU dataset URL
-MMLU_DATASET_URL = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
 
 
 @dataclass
