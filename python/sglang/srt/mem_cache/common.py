@@ -342,7 +342,16 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req, pre_len in zip(batch.reqs, batch.prefix_lens):
-            batch.tree_cache.evict_swa(req, pre_len)
+            if batch.enable_overlap:
+                # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
+                if req.extend_batch_idx < 2:
+                    continue
+                else:
+                    batch.tree_cache.evict_swa(
+                        req, pre_len - batch.tree_cache.chunked_prefill_size
+                    )
+            else:
+                batch.tree_cache.evict_swa(req, pre_len)
 
     bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
@@ -435,7 +444,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req in batch.reqs:
-            batch.tree_cache.evict_swa(req, req.seqlen - 1)
+            # We set evict_swa condition here with two reasons:
+            # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
+            # 2. Evict swa every window_size tokens to reduce the overhead.
+            if req.decode_batch_idx % batch.tree_cache.window_size == 1:
+                batch.tree_cache.evict_swa(req, req.seqlen - 1)
 
     bs = batch.seq_lens.shape[0]
 

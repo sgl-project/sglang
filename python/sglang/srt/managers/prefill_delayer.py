@@ -1,18 +1,36 @@
 import logging
-from typing import Optional
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var
 
+if TYPE_CHECKING:
+    from sglang.srt.metrics.collector import SchedulerMetricsCollector
+
 _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _DelayInfo:
+    delayed_count: int = 0
+    start_time: float = field(default_factory=time.perf_counter)
+
+
 class PrefillDelayer:
-    def __init__(self, dp_size, attn_tp_size, tp_worker, server_args):
+    def __init__(
+        self,
+        dp_size,
+        attn_tp_size,
+        tp_worker,
+        server_args,
+        metrics_collector: Optional["SchedulerMetricsCollector"] = None,
+    ):
         self.global_info = torch.empty(
             (dp_size, attn_tp_size, 1),
             dtype=torch.int64,
@@ -20,8 +38,10 @@ class PrefillDelayer:
         )
         self.cpu_group = tp_worker.get_tp_group().cpu_group
 
-        self.curr_delayed_count = 0
         self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
+        self._metrics_collector = metrics_collector
+
+        self._curr_delay_info: Optional[_DelayInfo] = None
 
         assert (
             server_args.enable_dp_attention
@@ -43,17 +63,30 @@ class PrefillDelayer:
         )
 
         if global_mixed_prefillable:
-            self.curr_delayed_count += 1
-            if self.curr_delayed_count < self.max_delay_passes:
+            if self._curr_delay_info is None:
+                self._curr_delay_info = _DelayInfo()
+            self._curr_delay_info.delayed_count += 1
+            if self._curr_delay_info.delayed_count < self.max_delay_passes:
                 return False
 
-        if _DEBUG_LOG and global_mixed_prefillable:
+        is_timeout = global_mixed_prefillable
+        if _DEBUG_LOG and is_timeout:
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill (prefillable: {global_prefillable.sum()})"
             )
 
-        self.curr_delayed_count = 0
+        self._record_metrics(is_timeout=is_timeout)
+        self._curr_delay_info = None
         return True
+
+    def _record_metrics(self, is_timeout: bool) -> None:
+        if self._curr_delay_info is not None and self._metrics_collector is not None:
+            wait_seconds = time.perf_counter() - self._curr_delay_info.start_time
+            self._metrics_collector.observe_prefill_delayer_wait(
+                forward_passes=self._curr_delay_info.delayed_count,
+                wait_seconds=wait_seconds,
+                is_timeout=is_timeout,
+            )
 
     def _gather_info(self, local_prefillable: bool):
         local_info = torch.tensor(

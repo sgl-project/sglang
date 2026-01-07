@@ -61,6 +61,8 @@ DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instru
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
+# Hybrid Mamba models
+DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 # VL test models
 DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
@@ -776,6 +778,7 @@ def get_benchmark_args(
     gsp_question_len=32,
     gsp_output_len=32,
     gsp_num_turns=1,
+    header=None,
 ):
     return SimpleNamespace(
         backend=backend,
@@ -816,6 +819,7 @@ def get_benchmark_args(
         gsp_question_len=gsp_question_len,
         gsp_output_len=gsp_output_len,
         gsp_num_turns=gsp_num_turns,
+        header=header,
     )
 
 
