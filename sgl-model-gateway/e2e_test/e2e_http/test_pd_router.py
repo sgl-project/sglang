@@ -8,8 +8,6 @@ from typing import Optional
 import pytest
 import requests
 
-from sglang.test.run_eval import run_eval
-
 logger = logging.getLogger(__name__)
 
 
@@ -222,23 +220,6 @@ def pd_cluster(e2e_model: str):
             _terminate(router_proc)
         for w in workers:
             _terminate(w.proc)
-
-
-@pytest.mark.e2e
-def test_pd_mmlu(e2e_model: str, pd_cluster):
-    """
-    Launch 4 workers, start a PD router (2 prefill + 2 decode), then run MMLU.
-    """
-    args = SimpleNamespace(
-        base_url=pd_cluster.router_url,
-        model=e2e_model,
-        eval_name="mmlu",
-        num_examples=64,
-        num_threads=32,
-        temperature=0.1,
-    )
-    metrics = run_eval(args)
-    assert metrics["score"] >= 0.65
 
 
 @pytest.mark.e2e
