@@ -1,16 +1,14 @@
 //! Shared helpers and state tracking for Harmony Responses
 
-use std::sync::Arc;
-
 use axum::response::Response;
 use serde_json::{from_value, json, to_string, Value};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use super::{context::HarmonyResponsesContext, execution::ToolResult};
+use super::execution::ToolResult;
 use crate::{
     data_connector::ResponseId,
-    mcp::McpManager,
+    mcp,
     protocols::{
         common::{ToolCall, ToolChoice, ToolChoiceValue},
         responses::{
@@ -19,7 +17,7 @@ use crate::{
             ResponsesRequest, ResponsesResponse, StringOrContentParts,
         },
     },
-    routers::error,
+    routers::{error, grpc::common::responses::ResponsesContext},
 };
 
 /// Record of a single MCP tool call execution
@@ -217,10 +215,10 @@ pub(super) fn build_next_request_with_tools(
 pub(super) fn inject_mcp_metadata(
     response: &mut ResponsesResponse,
     tracking: &McpCallTracking,
-    mcp_manager: &Arc<McpManager>,
+    mcp_tools: &[mcp::Tool],
 ) {
     // Build mcp_list_tools item
-    let tools = mcp_manager.list_tools();
+    let tools = mcp_tools;
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
         .map(|t| McpToolInfo {
@@ -273,7 +271,7 @@ pub(super) fn inject_mcp_metadata(
 /// If the request has `previous_response_id`, loads the response chain from storage
 /// and prepends the conversation history to the request input items.
 pub(super) async fn load_previous_messages(
-    ctx: &HarmonyResponsesContext,
+    ctx: &ResponsesContext,
     request: ResponsesRequest,
 ) -> Result<ResponsesRequest, Response> {
     let Some(ref prev_id_str) = request.previous_response_id else {

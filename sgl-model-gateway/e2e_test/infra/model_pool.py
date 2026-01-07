@@ -44,6 +44,8 @@ class ModelInstance:
     gpu_slot: GPUSlot | None
     worker_type: WorkerType = WorkerType.REGULAR
     bootstrap_port: int | None = None  # For prefill workers in PD mode
+    last_used: float = 0.0  # Timestamp for MRU eviction
+    _healthy: bool = False  # Track if initial health check passed
 
     @property
     def key(self) -> str:
@@ -166,9 +168,10 @@ class ModelPool:
     be launched cheaply (~1-2s) pointing to these workers.
 
     Startup behavior:
-    - Workers are launched sequentially (one subprocess.Popen at a time)
-    - But they boot up concurrently (overlapping model loading)
-    - _wait_all_healthy() blocks until all workers respond to health checks
+    - Workers are pre-launched at startup until GPUs are full
+    - When a test needs a model that isn't running, MRU model is evicted
+      (models just used are likely done, models not yet used are waiting)
+    - The needed model is then launched on-demand
 
     Instance keys:
     - Regular workers: "model_id:mode" (e.g., "llama-8b:http")
@@ -176,16 +179,13 @@ class ModelPool:
 
     Limitations:
     - Currently one worker instance per (model_id, mode) combination
-    - @pytest.mark.workers(n) duplicates URLs to router, not distinct workers
+    - @pytest.mark.workers(count=n) duplicates URLs to router, not distinct workers
     - For true multi-worker LB testing, extend to support multiple instances
 
     Usage:
         pool = ModelPool()
         pool.startup(requirements=[("llama-8b", ConnectionMode.HTTP)])
-
-        instance = pool.get("llama-8b", "http")
-        # instance.base_url -> "http://127.0.0.1:30000"
-        # instance.worker_url -> URL for router to connect to
+        instance = pool.get("llama-8b", "http")  # Pre-launched or on-demand
     """
 
     def __init__(self, allocator: GPUAllocator | None = None):
@@ -253,11 +253,15 @@ class ModelPool:
         # Allocate GPU slots
         slots = self.allocator.allocate_slots(allocation_specs)
 
+        # Track which models got slots
+        launched_keys = set()
+
         if not slots:
             logger.warning("No GPU slots allocated, launching without GPU assignment")
             # Fallback: launch without specific GPU assignment
             for model_id, mode in valid_requirements:
                 self._launch_model(model_id, mode, gpu_slot=None)
+                launched_keys.add(f"{model_id}:{mode.value}")
         else:
             # Launch on allocated slots
             for slot in slots:
@@ -266,8 +270,19 @@ class ModelPool:
                     model_id, mode_str = slot.assigned_model.rsplit(":", 1)
                     mode = ConnectionMode(mode_str)
                     self._launch_model(model_id, mode, gpu_slot=slot)
+                    launched_keys.add(slot.assigned_model)
 
-        # Wait for all to be healthy
+        # Log models that will be launched on-demand (not enough GPUs to pre-launch)
+        all_keys = set(allocation_specs.keys())
+        deferred_keys = all_keys - launched_keys
+        if deferred_keys:
+            logger.info(
+                "%d models deferred for on-demand launch: %s",
+                len(deferred_keys),
+                deferred_keys,
+            )
+
+        # Wait for all launched models to be healthy
         self._wait_all_healthy()
 
     def _launch_model(
@@ -295,6 +310,7 @@ class ModelPool:
         spec = get_model_spec(model_id)
         model_path = spec["model"]
         tp_size = spec.get("tp", 1)
+        features = spec.get("features", [])
 
         # Get port - use slot's port if available, otherwise find open port
         port = gpu_slot.port if gpu_slot else get_open_port()
@@ -323,6 +339,10 @@ class ModelPool:
 
         if mode == ConnectionMode.GRPC:
             cmd.append("--grpc-mode")
+
+        # Embedding model flag
+        if "embedding" in features:
+            cmd.append("--is-embedding")
 
         # PD disaggregation arguments
         if worker_type == WorkerType.PREFILL:
@@ -367,15 +387,25 @@ class ModelPool:
             gpu_slot=gpu_slot,
             worker_type=worker_type,
             bootstrap_port=bootstrap_port,
+            last_used=time.time(),
         )
         self.instances[key] = instance
         return instance
 
     def _wait_all_healthy(self) -> None:
-        """Wait for all model instances to become healthy."""
+        """Wait for all model instances to become healthy.
+
+        Only checks workers that haven't been marked healthy yet,
+        avoiding redundant health checks on already-verified workers.
+        """
         start_time = time.time()
-        pending = set(self.instances.keys())
+        # Only wait for workers that haven't been verified healthy yet
+        pending = {key for key, inst in self.instances.items() if not inst._healthy}
         check_count = 0
+
+        if not pending:
+            logger.info("All workers already healthy, skipping health check")
+            return
 
         logger.info(
             "Waiting for %d workers to become healthy (timeout: %ds)...",
@@ -409,12 +439,14 @@ class ModelPool:
                 # Check health
                 if instance.health_check():
                     logger.info(
-                        "[%.1fs] %s is healthy at %s (check #%d)",
+                        "[%.1fs] %s is healthy at %s (router url: %s) (check #%d)",
                         elapsed,
                         key,
                         instance.base_url,
+                        instance.worker_url,
                         check_count,
                     )
+                    instance._healthy = True
                     pending.discard(key)
 
             if pending:
@@ -457,6 +489,9 @@ class ModelPool:
     ) -> ModelInstance:
         """Get a model instance by model_id, mode, and worker_type.
 
+        If the model is not running, it will be launched on-demand with MRU
+        eviction if GPU resources are constrained.
+
         Args:
             model_id: The model ID (e.g., "llama-8b")
             mode: The mode (ConnectionMode.HTTP or ConnectionMode.GRPC, or string)
@@ -466,7 +501,7 @@ class ModelPool:
             ModelInstance for the requested model/mode/worker_type.
 
         Raises:
-            KeyError: If model/mode/worker_type combination is not running.
+            RuntimeError: If worker process died or failed health check.
         """
         # Accept both enum and string for convenience
         if isinstance(mode, str):
@@ -479,12 +514,37 @@ class ModelPool:
         else:
             key = f"{model_id}:{mode.value}:{worker_type.value}"
 
+        # Check if instance exists - if not, launch on-demand with eviction
         if key not in self.instances:
-            raise KeyError(
-                f"{key} not running. Available: {list(self.instances.keys())}"
+            logger.info(
+                "Model %s not running, launching on-demand with MRU eviction if needed",
+                key,
             )
+            self._ensure_gpu_available(model_id)
+
+            # Allocate GPU slot for this model
+            spec = get_model_spec(model_id)
+            allocation_specs = {
+                key: {
+                    "model": spec["model"],
+                    "memory_gb": spec.get("memory_gb", 16),
+                    "tp": spec.get("tp", 1),
+                }
+            }
+            slots = self.allocator.allocate_slots(allocation_specs)
+            if not slots:
+                raise RuntimeError(
+                    f"Failed to allocate GPU slot for {model_id} after eviction"
+                )
+            gpu_slot = slots[0]
+
+            self._launch_model(model_id, mode, gpu_slot=gpu_slot)
+            self._wait_for_instance(key)
 
         instance = self.instances[key]
+
+        # Update last_used timestamp
+        instance.last_used = time.time()
 
         # Verify worker is still alive and healthy
         if not instance.is_alive():
@@ -498,6 +558,111 @@ class ModelPool:
 
         logger.info("Worker %s passed deep health check", key)
         return instance
+
+    def _evict_for_gpus(
+        self, required_gpus: int, exclude_model_id: str | None = None
+    ) -> None:
+        """Evict models until we have enough GPUs available.
+
+        Uses MRU (most recently used) eviction strategy - evicts models that
+        were just used first, keeping models that haven't been used yet
+        (which are likely waiting for upcoming tests).
+
+        Args:
+            required_gpus: Number of GPUs needed.
+            exclude_model_id: Model ID to exclude from eviction (test may need
+                multiple modes of the same model).
+        """
+        available = self.allocator.available_gpus()
+        if len(available) >= required_gpus:
+            return  # Already have enough
+
+        # Sort by last_used descending (MRU eviction) - evict most recently used first
+        # Exclude instances of the same model_id (test may need multiple modes)
+        evictable = [
+            inst
+            for inst in self.instances.values()
+            if exclude_model_id is None or inst.model_id != exclude_model_id
+        ]
+        evictable.sort(key=lambda x: x.last_used, reverse=True)
+
+        freed_gpus = len(available)
+        for inst in evictable:
+            if freed_gpus >= required_gpus:
+                break
+
+            logger.info("Evicting model %s (MRU) to free GPUs", inst.key)
+            self._evict_instance(inst.key)
+            if inst.gpu_slot:
+                freed_gpus += len(inst.gpu_slot.gpu_ids)
+
+    def _ensure_gpu_available(self, model_id: str) -> None:
+        """Ensure GPU is available for a model, evicting if needed.
+
+        Args:
+            model_id: Model ID that needs GPU resources.
+
+        Raises:
+            RuntimeError: If not enough GPUs after eviction.
+        """
+        spec = get_model_spec(model_id)
+        required_gpus = spec.get("tp", 1)
+
+        self._evict_for_gpus(required_gpus, exclude_model_id=model_id)
+
+        available = self.allocator.available_gpus()
+        if len(available) < required_gpus:
+            raise RuntimeError(
+                f"Cannot launch {model_id}: need {required_gpus} GPUs, "
+                f"only {len(available)} available after eviction"
+            )
+
+    def _evict_instance(self, key: str) -> None:
+        """Evict a model instance and free its resources.
+
+        Args:
+            key: Instance key to evict.
+        """
+        if key not in self.instances:
+            return
+
+        instance = self.instances[key]
+        instance.terminate()
+
+        # Release GPU slot back to allocator
+        if instance.gpu_slot:
+            self.allocator.release_slot(instance.gpu_slot)
+
+        del self.instances[key]
+        logger.info("Evicted instance %s", key)
+
+    def _wait_for_instance(self, key: str, timeout: float | None = None) -> None:
+        """Wait for a specific instance to become healthy.
+
+        Args:
+            key: Instance key to wait for.
+            timeout: Timeout in seconds. Defaults to _startup_timeout.
+        """
+        if timeout is None:
+            timeout = self._startup_timeout
+
+        start_time = time.time()
+        instance = self.instances.get(key)
+        if not instance:
+            raise KeyError(f"Instance {key} not found")
+
+        while (time.time() - start_time) < timeout:
+            if not instance.is_alive():
+                raise RuntimeError(f"Worker {key} died during startup")
+
+            if instance.health_check():
+                logger.info("Instance %s is healthy", key)
+                instance._healthy = True
+                return
+
+            time.sleep(HEALTH_CHECK_INTERVAL)
+
+        raise TimeoutError(f"Instance {key} did not become healthy within {timeout}s")
 
     def get_workers_by_type(
         self, model_id: str, worker_type: WorkerType
@@ -524,6 +689,7 @@ class ModelPool:
         num_decode: int = 1,
         mode: ConnectionMode = ConnectionMode.HTTP,
         startup_timeout: int = DEFAULT_STARTUP_TIMEOUT,
+        allow_eviction: bool = True,
     ) -> tuple[list[ModelInstance], list[ModelInstance]]:
         """Launch prefill and decode workers for PD disaggregation.
 
@@ -533,6 +699,8 @@ class ModelPool:
             num_decode: Number of decode workers to launch. Defaults to 1.
             mode: Connection mode (HTTP or GRPC).
             startup_timeout: Timeout for workers to become healthy.
+            allow_eviction: If True, evict MRU models to free GPUs. If False,
+                return empty lists when not enough GPUs available.
 
         Returns:
             Tuple of (prefill_instances, decode_instances).
@@ -547,6 +715,29 @@ class ModelPool:
         if ib_device:
             logger.info("Detected InfiniBand device: %s", ib_device)
 
+        # Calculate total GPUs needed for PD workers
+        tp = spec.get("tp", 1)
+        required_gpus = (num_prefill + num_decode) * tp
+
+        # Check if we have enough GPUs
+        available = self.allocator.available_gpus()
+        if len(available) < required_gpus:
+            if allow_eviction:
+                logger.info(
+                    "Need %d GPUs for PD workers, only %d available. Evicting MRU models...",
+                    required_gpus,
+                    len(available),
+                )
+                self._evict_for_gpus(required_gpus, exclude_model_id=model_id)
+            else:
+                logger.info(
+                    "Need %d GPUs for PD workers, only %d available. "
+                    "Skipping pre-launch (eviction not allowed).",
+                    required_gpus,
+                    len(available),
+                )
+                return [], []
+
         # Build allocation specs for all PD workers
         # Each worker needs its own GPU slot
         allocation_specs = {}
@@ -555,14 +746,14 @@ class ModelPool:
             allocation_specs[key] = {
                 "model": spec["model"],
                 "memory_gb": spec.get("memory_gb", 16),
-                "tp": spec.get("tp", 1),
+                "tp": tp,
             }
         for i in range(num_decode):
             key = f"{model_id}:{mode.value}:decode_{i}"
             allocation_specs[key] = {
                 "model": spec["model"],
                 "memory_gb": spec.get("memory_gb", 16),
-                "tp": spec.get("tp", 1),
+                "tp": tp,
             }
 
         # Allocate GPU slots
@@ -570,8 +761,9 @@ class ModelPool:
         slot_map = {slot.assigned_model: slot for slot in slots}
 
         if not slots:
-            logger.warning(
-                "No GPU slots allocated for PD workers, launching without GPU assignment"
+            raise RuntimeError(
+                f"Failed to allocate GPU slots for PD workers after eviction. "
+                f"Need {required_gpus} GPUs."
             )
 
         prefill_instances: list[ModelInstance] = []
