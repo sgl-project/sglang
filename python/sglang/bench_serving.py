@@ -140,6 +140,8 @@ def get_request_headers() -> Dict[str, str]:
     headers = get_auth_headers()
     if h := getattr(args, "header", None):
         headers.update(parse_custom_headers(h))
+    if getattr(args, "offline_mode", False):
+        headers["X-SMG-Offline"] = "1"
     return headers
 
 
@@ -405,8 +407,35 @@ async def async_request_openai_chat_completions(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
-                    if args.disable_stream:
-                        # Non-streaming response
+                    if getattr(args, "offline_mode", False):
+                        receipt_data = await response.json()
+                        receipt_id = receipt_data["receipt_id"]
+                        base_url = api_url.rsplit("/v1/", 1)[0]
+                        retrieve_url = f"{base_url}/query_maybe_retrieve"
+                        retrieve_payload = {"receipt_id": receipt_id}
+                        while True:
+                            async with session.post(retrieve_url, json=retrieve_payload) as poll_resp:
+                                if poll_resp.status == 200:
+                                    poll_text = await poll_resp.text()
+                                    try:
+                                        poll_data = json.loads(poll_text)
+                                        if poll_data.get("status") == "pending":
+                                            await asyncio.sleep(60)
+                                            continue
+                                    except JSONDecodeError:
+                                        pass
+                                    response_json = json.loads(poll_text)
+                                    output.generated_text = response_json["choices"][0]["message"]["content"]
+                                    output.success = True
+                                    output.latency = time.perf_counter() - st
+                                    output.ttft = output.latency
+                                    output.output_len = response_json.get("usage", {}).get("completion_tokens", output_len)
+                                    break
+                                else:
+                                    output.error = f"Poll failed: {poll_resp.status}"
+                                    output.success = False
+                                    break
+                    elif args.disable_stream:
                         response_json = await response.json()
                         output.generated_text = response_json["choices"][0]["message"][
                             "content"
@@ -3017,6 +3046,11 @@ if __name__ == "__main__":
         "--disable-stream",
         action="store_true",
         help="Disable streaming mode.",
+    )
+    parser.add_argument(
+        "--offline-mode",
+        action="store_true",
+        help="Use offline mode with X-SMG-Offline header for long-running requests.",
     )
     parser.add_argument(
         "--return-logprob",

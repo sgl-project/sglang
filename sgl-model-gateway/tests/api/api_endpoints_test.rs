@@ -1884,3 +1884,224 @@ mod rerank_tests {
         ctx.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod offline_mode_tests {
+    use smg::routers::offline_hack::STORE;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_query_maybe_retrieve_pending() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({"receipt_id": "nonexistent"});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/query_maybe_retrieve")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["status"], "pending");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_query_maybe_retrieve_found() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app().await;
+
+        let receipt_id = "test-receipt-123";
+        let test_body = r#"{"choices":[{"message":{"content":"test response"}}]}"#;
+        STORE.store(
+            receipt_id.to_string(),
+            bytes::Bytes::from(test_body),
+            StatusCode::OK,
+        );
+
+        let payload = json!({"receipt_id": receipt_id});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/query_maybe_retrieve")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body_json["choices"][0]["message"]["content"],
+            "test response"
+        );
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_query_maybe_retrieve_removes_after_get() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app().await;
+
+        let receipt_id = "test-receipt-456";
+        let test_body = r#"{"result":"ok"}"#;
+        STORE.store(
+            receipt_id.to_string(),
+            bytes::Bytes::from(test_body),
+            StatusCode::OK,
+        );
+
+        let payload = json!({"receipt_id": receipt_id});
+        let req1 = Request::builder()
+            .method("POST")
+            .uri("/query_maybe_retrieve")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+        let body1 = axum::body::to_bytes(resp1.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json1: serde_json::Value = serde_json::from_slice(&body1).unwrap();
+        assert_eq!(body_json1["result"], "ok");
+
+        let req2 = Request::builder()
+            .method("POST")
+            .uri("/query_maybe_retrieve")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let body2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(body_json2["status"], "pending");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_offline_mode_header_check() {
+        use axum::http::HeaderMap;
+        use smg::routers::offline_hack::is_offline_mode;
+
+        assert!(!is_offline_mode(None));
+
+        let empty_headers = HeaderMap::new();
+        assert!(!is_offline_mode(Some(&empty_headers)));
+
+        let mut headers_with_offline = HeaderMap::new();
+        headers_with_offline.insert("X-SMG-Offline", "1".parse().unwrap());
+        assert!(is_offline_mode(Some(&headers_with_offline)));
+
+        let mut headers_with_zero = HeaderMap::new();
+        headers_with_zero.insert("X-SMG-Offline", "0".parse().unwrap());
+        assert!(!is_offline_mode(Some(&headers_with_zero)));
+    }
+
+    #[tokio::test]
+    async fn test_offline_mode_end_to_end() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18120,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let chat_payload = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Hello, test offline mode!"}
+            ],
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .header("X-SMG-Offline", "1")
+            .body(Body::from(serde_json::to_string(&chat_payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body_json.get("receipt_id").is_some());
+        let receipt_id = body_json["receipt_id"].as_str().unwrap();
+        assert!(!receipt_id.is_empty());
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let retrieve_payload = json!({"receipt_id": receipt_id});
+        let req1 = Request::builder()
+            .method("POST")
+            .uri("/query_maybe_retrieve")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_string(&retrieve_payload).unwrap(),
+            ))
+            .unwrap();
+
+        let resp1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        let body1 = axum::body::to_bytes(resp1.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json1: serde_json::Value = serde_json::from_slice(&body1).unwrap();
+        assert!(body_json1.get("choices").is_some());
+        assert_eq!(
+            body_json1["choices"][0]["message"]["content"],
+            "This is a mock chat response."
+        );
+        assert!(body_json1.get("usage").is_some());
+
+        let req2 = Request::builder()
+            .method("POST")
+            .uri("/query_maybe_retrieve")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_string(&retrieve_payload).unwrap(),
+            ))
+            .unwrap();
+
+        let resp2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        let body2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(body_json2["status"], "pending");
+
+        ctx.shutdown().await;
+    }
+}

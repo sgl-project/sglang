@@ -573,7 +573,10 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !is_stream {
-            // For non-streaming requests, preserve headers
+            if crate::routers::offline_hack::is_offline_mode(headers) {
+                return crate::routers::offline_hack::handle_offline_response(res, status, load_guard);
+            }
+
             let response_headers = header_utils::preserve_response_headers(res.headers());
 
             let response = match res.bytes().await {

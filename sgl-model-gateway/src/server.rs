@@ -597,7 +597,11 @@ pub fn build_app(
         .route("/engine_metrics", get(engine_metrics))
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
-        .route("/get_server_info", get(get_server_info));
+        .route("/get_server_info", get(get_server_info))
+        .route(
+            "/query_maybe_retrieve",
+            post(crate::routers::offline_hack::query_maybe_retrieve),
+        );
 
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
