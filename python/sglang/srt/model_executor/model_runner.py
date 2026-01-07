@@ -192,6 +192,9 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu_xmx_available = xpu_has_xmx_support()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _use_aiter:
+    from aiter import dtypes
 
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
@@ -1466,7 +1469,9 @@ class ModelRunner:
                 isinstance(kv_cache_quant_algo, str)
                 and kv_cache_quant_algo.upper() == "FP8"
             ):
-                if _is_hip:
+                if _use_aiter:
+                    self.kv_cache_dtype = dtypes.fp8
+                elif _is_hip:  # fallback for HIP without aiter
                     self.kv_cache_dtype = torch.float8_e4m3fnuz
                 else:
                     self.kv_cache_dtype = torch.float8_e4m3fn
@@ -1478,7 +1483,9 @@ class ModelRunner:
             else:
                 self.kv_cache_dtype = torch.float8_e5m2
         elif self.server_args.kv_cache_dtype == "fp8_e4m3":
-            if _is_hip:  # Using natively supported format
+            if _use_aiter:
+                self.kv_cache_dtype = dtypes.fp8
+            elif _is_hip:  # fallback for HIP without aiter
                 self.kv_cache_dtype = torch.float8_e4m3fnuz
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
