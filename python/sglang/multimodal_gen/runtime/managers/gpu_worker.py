@@ -3,11 +3,32 @@
 # SPDX-License-Identifier: Apache-2.0
 import multiprocessing as mp
 import os
+import sys
 import time
 from typing import List
 
 import torch
 from setproctitle import setproctitle
+
+# Shape profiling support for diffusion models
+_ENABLE_SHAPE_PROFILING = os.environ.get("SGLANG_PROFILE_SHAPES", "0") == "1"
+_SHAPE_PROFILE_RANK = int(os.environ.get("SGLANG_PROFILE_SHAPES_RANK", "0"))
+_SHAPE_PROFILE_FILE = os.environ.get("SGLANG_PROFILE_SHAPES_FILE", "shapes.jsonl")
+_SHAPE_PROFILE_SKIP_WARMUP = int(os.environ.get("SGLANG_PROFILE_SHAPES_SKIP_WARMUP", "0"))
+_SHAPE_PROFILE_LOG_N_PASSES = int(os.environ.get("SGLANG_PROFILE_SHAPES_LOG_N_PASSES", "0"))
+# Default to deduplication for diffusion (same ops run 50 times)
+_SHAPE_PROFILE_DEDUPE = os.environ.get("SGLANG_PROFILE_SHAPES_DEDUPE", "1") == "1"
+_shape_logger_module = None
+
+if _ENABLE_SHAPE_PROFILING:
+    try:
+        _profiler_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../../examples/profiler"))
+        if os.path.exists(_profiler_path):
+            sys.path.insert(0, _profiler_path)
+            from torch_shape_logger_rank import CompactRankAwareShapeLogger
+            _shape_logger_module = CompactRankAwareShapeLogger
+    except Exception as e:
+        print(f"[SHAPE_PROFILER] Failed to load: {e}")
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
@@ -67,6 +88,23 @@ class GPUWorker:
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
 
+        # Initialize shape profiler for diffusion (with deduplication by default)
+        self._shape_logger = None
+        self._shape_profiling_started = False
+        if _ENABLE_SHAPE_PROFILING and _shape_logger_module and self.rank == _SHAPE_PROFILE_RANK:
+            try:
+                self._shape_logger = _shape_logger_module(
+                    output_file=_SHAPE_PROFILE_FILE,
+                    verbose=False,
+                    log_first_n_forward_passes=_SHAPE_PROFILE_LOG_N_PASSES,
+                    skip_first_n_forward_passes=_SHAPE_PROFILE_SKIP_WARMUP,
+                    only_rank=_SHAPE_PROFILE_RANK,
+                    dedupe_ops=_SHAPE_PROFILE_DEDUPE,
+                )
+                logger.info(f"[GPU Worker {self.rank}] Shape profiler initialized (dedupe={_SHAPE_PROFILE_DEDUPE})")
+            except Exception as e:
+                logger.warning(f"[GPU Worker {self.rank}] Failed to init shape profiler: {e}")
+
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
         setproctitle(f"sgl_diffusion::scheduler_TP{self.local_rank}")
@@ -118,6 +156,21 @@ class GPUWorker:
         assert self.pipeline is not None
         req = batch[0]
         output_batch = None
+
+        # Activate shape profiler on first forward pass (lazy activation)
+        if self._shape_logger and not self._shape_profiling_started:
+            try:
+                self._shape_logger.__enter__()
+                self._shape_profiling_started = True
+                logger.info(f"[GPU Worker {self.rank}] Shape profiling activated")
+            except Exception as e:
+                logger.warning(f"[GPU Worker {self.rank}] Failed to activate profiler: {e}")
+                self._shape_logger = None
+
+        # Mark start of forward pass for profiling
+        if self._shape_logger and self._shape_profiling_started:
+            self._shape_logger.start_forward_pass()
+
         try:
             if self.rank == 0:
                 torch.cuda.reset_peak_memory_stats()
@@ -168,6 +221,9 @@ class GPUWorker:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
         finally:
+            # Mark end of forward pass for profiling
+            if self._shape_logger and self._shape_profiling_started:
+                self._shape_logger.end_forward_pass()
             return output_batch
 
     def get_can_stay_resident_components(
