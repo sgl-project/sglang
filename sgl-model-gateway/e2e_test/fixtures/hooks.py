@@ -384,35 +384,28 @@ def pytest_configure(config: pytest.Config) -> None:
 # ---------------------------------------------------------------------------
 
 
-def is_parallel_execution() -> bool:
+def is_parallel_execution(config: pytest.Config) -> bool:
     """Check if tests are running in parallel mode (pytest-parallel).
 
     Returns True if --tests-per-worker > 1, indicating concurrent thread execution.
     """
-    # pytest-parallel sets this attribute on the config
-    import sys
+    # pytest-parallel adds the 'tests_per_worker' option
+    tests_per_worker = getattr(config.option, "tests_per_worker", None)
+    if tests_per_worker is None:
+        return False
 
-    for arg in sys.argv:
-        if arg.startswith("--tests-per-worker"):
-            if "=" in arg:
-                value = arg.split("=")[1]
-            else:
-                # Value is in next arg
-                idx = sys.argv.index(arg)
-                if idx + 1 < len(sys.argv):
-                    value = sys.argv[idx + 1]
-                else:
-                    value = "1"
-            try:
-                return int(value) > 1 or value == "auto"
-            except ValueError:
-                return value == "auto"
-    return False
+    if tests_per_worker == "auto":
+        return True
+
+    try:
+        return int(tests_per_worker) > 1
+    except (ValueError, TypeError):
+        return False
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
     """Skip thread_unsafe tests when running in parallel mode."""
-    if is_parallel_execution():
+    if is_parallel_execution(item.config):
         marker = item.get_closest_marker("thread_unsafe")
         if marker:
             reason = marker.kwargs.get("reason", "Test is not thread-safe")
