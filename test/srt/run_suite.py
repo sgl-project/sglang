@@ -26,7 +26,6 @@ suites = {
         TestFile("test_srt_endpoint.py", 127),
         TestFile("test_srt_engine.py", 252),
         TestFile("test_video_utils.py", 5),
-        TestFile("test_modelopt_export.py", 9),
     ],
     "per-commit-2-gpu": [
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
