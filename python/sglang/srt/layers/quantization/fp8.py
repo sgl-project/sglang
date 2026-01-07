@@ -69,6 +69,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     log_info_on_rank0,
+    next_power_of_2,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -175,6 +176,7 @@ class Fp8Config(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
@@ -182,6 +184,8 @@ class Fp8Config(QuantizationConfig):
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return Fp8MoEMethod(self)
+        elif isinstance(layer, RadixAttention):
+            return Fp8KVCacheMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -230,6 +234,7 @@ class Fp8LinearMethod(LinearMethodBase):
         input_size: int,
         output_size: int,
         params_dtype: torch.dtype,
+        skip_block_quant_check: bool = False,
         **extra_weight_attrs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
@@ -241,25 +246,31 @@ class Fp8LinearMethod(LinearMethodBase):
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
             )
-            # Required by row parallel
-            if tp_size > 1 and input_size // input_size_per_partition == tp_size:
-                if input_size_per_partition % block_k != 0:
-                    raise ValueError(
-                        f"Weight input_size_per_partition = "
-                        f"{input_size_per_partition} is not divisible by "
-                        f"weight quantization block_k = {block_k}."
-                    )
-            # Required by column parallel or enabling merged weights
-            if (
-                tp_size > 1 and output_size // output_size_per_partition == tp_size
-            ) or len(output_partition_sizes) > 1:
-                for output_partition_size in output_partition_sizes:
-                    if output_partition_size % block_n != 0:
+
+            if skip_block_quant_check:
+                logger.warning_once(
+                    f"Skipping block quantization checks for weight partition."
+                )
+            else:
+                # Required by row parallel
+                if tp_size > 1 and input_size // input_size_per_partition == tp_size:
+                    if input_size_per_partition % block_k != 0:
                         raise ValueError(
-                            f"Weight output_partition_size = "
-                            f"{output_partition_size} is not divisible by "
-                            f"weight quantization block_n = {block_n}."
+                            f"Weight input_size_per_partition = "
+                            f"{input_size_per_partition} is not divisible by "
+                            f"weight quantization block_k = {block_k}."
                         )
+                # Required by column parallel or enabling merged weights
+                if (
+                    tp_size > 1 and output_size // output_size_per_partition == tp_size
+                ) or len(output_partition_sizes) > 1:
+                    for output_partition_size in output_partition_sizes:
+                        if output_partition_size % block_n != 0:
+                            raise ValueError(
+                                f"Weight output_partition_size = "
+                                f"{output_partition_size} is not divisible by "
+                                f"weight quantization block_n = {block_n}."
+                            )
 
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
@@ -656,6 +667,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
                 requires_grad=False,
             )
+            # w13_weight and w2_weight are always requanted together
+            w13_weight_scale.format_ue8m0 = False
+            w2_weight_scale.format_ue8m0 = False
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
@@ -803,6 +817,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         ),
                     )
                     and get_moe_runner_backend().is_deep_gemm()
+                    and not layer.w13_weight_scale_inv.format_ue8m0
                 ):
                     assert isinstance(
                         layer, DeepEPMoE
@@ -814,6 +829,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     requant_weight_ue8m0_inplace(
                         layer.w2_weight, layer.w2_weight_scale_inv, weight_block_size
                     )
+                    layer.w13_weight_scale_inv.format_ue8m0 = True
+                    layer.w2_weight_scale_inv.format_ue8m0 = True
             return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
@@ -927,6 +944,86 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
+
+            # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
+            if get_moe_runner_backend().is_flashinfer_trtllm():
+                from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_a
+
+                # Note: No need to swap W13 halves, they are already in the correct order: [Gate, Up]
+                num_experts, two_n, hidden = layer.w13_weight.shape
+
+                # 2) Reorder rows for fused gated activation (W13)
+                w13_interleaved = [
+                    reorder_rows_for_gated_act_gemm(layer.w13_weight[i])
+                    for i in range(num_experts)
+                ]
+                w13_interleaved = torch.stack(w13_interleaved).reshape(
+                    num_experts, two_n, hidden
+                )
+
+                # 3) Shuffle weights for transposed MMA output (both W13, W2)
+                epilogue_tile_m = 128
+                w13_shuffled = [
+                    shuffle_matrix_a(
+                        w13_interleaved[i].view(torch.uint8), epilogue_tile_m
+                    )
+                    for i in range(num_experts)
+                ]
+                w2_shuffled = [
+                    shuffle_matrix_a(
+                        layer.w2_weight[i].view(torch.uint8), epilogue_tile_m
+                    )
+                    for i in range(num_experts)
+                ]
+
+                layer.w13_weight = Parameter(
+                    torch.stack(w13_shuffled).view(torch.float8_e4m3fn),
+                    requires_grad=False,
+                )
+                layer.w2_weight = Parameter(
+                    torch.stack(w2_shuffled).view(torch.float8_e4m3fn),
+                    requires_grad=False,
+                )
+
+                # Precompute and register per-expert output scaling factors for FI MoE
+                # Note: w13_input_scale and w2_input_scale are scalar Parameters post-reduction
+                assert (
+                    hasattr(layer, "w13_input_scale")
+                    and layer.w13_input_scale is not None
+                )
+                assert (
+                    hasattr(layer, "w2_input_scale")
+                    and layer.w2_input_scale is not None
+                )
+                assert (
+                    hasattr(layer, "w13_weight_scale")
+                    and layer.w13_weight_scale is not None
+                )
+                assert (
+                    hasattr(layer, "w2_weight_scale")
+                    and layer.w2_weight_scale is not None
+                )
+
+                input_scale = layer.w13_input_scale.to(torch.float32)
+                activation_scale = layer.w2_input_scale.to(torch.float32)
+                w13_weight_scale = layer.w13_weight_scale.to(torch.float32)
+                w2_weight_scale = layer.w2_weight_scale.to(torch.float32)
+
+                output1_scales_scalar = (
+                    w13_weight_scale * input_scale * (1.0 / activation_scale)
+                )
+                output1_scales_gate_scalar = w13_weight_scale * input_scale
+                output2_scales_scalar = activation_scale * w2_weight_scale
+
+                layer.output1_scales_scalar = Parameter(
+                    output1_scales_scalar, requires_grad=False
+                )
+                layer.output1_scales_gate_scalar = Parameter(
+                    output1_scales_gate_scalar, requires_grad=False
+                )
+                layer.output2_scales_scalar = Parameter(
+                    output2_scales_scalar, requires_grad=False
+                )
             return
 
     def process_weights_hip_int4(self, layer: Module):
@@ -1230,7 +1327,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         activation = self.moe_runner_config.activation
         routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
 
-        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+        from flashinfer.fused_moe import (
+            trtllm_fp8_block_scale_moe,
+            trtllm_fp8_per_tensor_scale_moe,
+        )
 
         from sglang.srt.layers.moe.topk import TopKOutputChecker
         from sglang.srt.layers.moe.utils import RoutingMethodType
@@ -1241,9 +1341,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         assert (
             activation == "silu"
         ), "Only silu is supported for flashinfer blockscale fp8 moe"
-        a_q, a_sf = per_token_group_quant_fp8(x, self.quant_config.weight_block_size[1])
-        # NOTE: scales of hidden states have to be transposed!
-        a_sf_t = a_sf.t().contiguous()
+
+        if self.block_quant:
+            a_q, a_sf = per_token_group_quant_fp8(
+                x, self.quant_config.weight_block_size[1]
+            )
+            # NOTE: scales of hidden states have to be transposed!
+            a_sf_t = a_sf.t().contiguous()
+        else:
+            a_q, _ = scaled_fp8_quant(x, layer.w13_input_scale)
 
         correction_bias = (
             None
@@ -1251,43 +1357,81 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else topk_config.correction_bias.to(x.dtype)
         )
 
-        routing_method_type = getattr(layer, "routing_method_type")
+        routing_method_type = getattr(
+            layer, "routing_method_type", RoutingMethodType.DeepSeekV3
+        )
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
 
-            # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
-            # It ignored the `output`` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
-            # so we put the whole function under the ``use_symmetric_memory`` context manager.
-            # If the bug is fixed, we can only put the output tensor allocation under the context manager.
-            return trtllm_fp8_block_scale_moe(
-                routing_logits=(
-                    router_logits.to(torch.float32)
-                    if routing_method_type == RoutingMethodType.DeepSeekV3
-                    else router_logits
-                ),
-                routing_bias=correction_bias,
-                hidden_states=a_q,
-                hidden_states_scale=a_sf_t,
-                gemm1_weights=layer.w13_weight,
-                gemm1_weights_scale=layer.w13_weight_scale_inv,
-                gemm2_weights=layer.w2_weight,
-                gemm2_weights_scale=layer.w2_weight_scale_inv,
-                num_experts=layer.num_experts,
-                top_k=topk_config.top_k,
-                n_group=topk_config.num_expert_group,
-                topk_group=topk_config.topk_group,
-                intermediate_size=layer.w2_weight.shape[2],
-                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-                local_num_experts=layer.num_local_experts,
-                routed_scaling_factor=(
-                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
-                ),
-                tile_tokens_dim=None,
-                routing_method_type=routing_method_type,
-                use_shuffled_weight=False,
-            )
+            if self.block_quant:
+                # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
+                # It ignored the `output`` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
+                # so we put the whole function under the ``use_symmetric_memory`` context manager.
+                # If the bug is fixed, we can only put the output tensor allocation under the context manager.
+                return trtllm_fp8_block_scale_moe(
+                    routing_logits=(
+                        router_logits.to(torch.float32)
+                        if routing_method_type == RoutingMethodType.DeepSeekV3
+                        else router_logits
+                    ),
+                    routing_bias=correction_bias,
+                    hidden_states=a_q,
+                    hidden_states_scale=a_sf_t,
+                    gemm1_weights=layer.w13_weight,
+                    gemm1_weights_scale=layer.w13_weight_scale_inv,
+                    gemm2_weights=layer.w2_weight,
+                    gemm2_weights_scale=layer.w2_weight_scale_inv,
+                    num_experts=layer.num_experts,
+                    top_k=topk_config.top_k,
+                    n_group=topk_config.num_expert_group,
+                    topk_group=topk_config.topk_group,
+                    intermediate_size=layer.w2_weight.shape[2],
+                    local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                    local_num_experts=layer.num_local_experts,
+                    routed_scaling_factor=(
+                        routed_scaling_factor
+                        if routed_scaling_factor is not None
+                        else 1.0
+                    ),
+                    tile_tokens_dim=None,
+                    routing_method_type=routing_method_type,
+                    use_shuffled_weight=False,
+                    tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+                )
+            else:
+                routing_bias_cast = (
+                    None
+                    if correction_bias is None
+                    else correction_bias.to(torch.bfloat16)
+                )
+
+                return trtllm_fp8_per_tensor_scale_moe(
+                    routing_logits=router_logits.to(torch.bfloat16),
+                    routing_bias=routing_bias_cast,
+                    hidden_states=a_q,
+                    gemm1_weights=layer.w13_weight,
+                    output1_scales_scalar=layer.output1_scales_scalar,
+                    output1_scales_gate_scalar=layer.output1_scales_gate_scalar,
+                    gemm2_weights=layer.w2_weight,
+                    output2_scales_scalar=layer.output2_scales_scalar,
+                    num_experts=layer.num_experts,
+                    top_k=topk_config.top_k,
+                    n_group=topk_config.num_expert_group,
+                    topk_group=topk_config.topk_group,
+                    intermediate_size=layer.w2_weight.shape[2],
+                    local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                    local_num_experts=layer.num_local_experts,
+                    routed_scaling_factor=(
+                        routed_scaling_factor
+                        if routed_scaling_factor is not None
+                        else 1.0
+                    ),
+                    use_routing_scales_on_input=False,
+                    routing_method_type=routing_method_type,
+                    tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+                )
 
     def maybe_apply_hip_fused_experts(
         self,

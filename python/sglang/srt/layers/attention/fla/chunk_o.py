@@ -16,12 +16,6 @@ BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
 
-@triton.heuristics(
-    {
-        "USE_G": lambda args: args["g"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
 # @triton.autotune(
 #     configs=[
 #         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
@@ -172,6 +166,8 @@ def chunk_fwd_o(
         BT=BT,
         BK=128,
         BV=64,
+        USE_G=g is not None,
+        IS_VARLEN=cu_seqlens is not None,
         num_warps=4,
         num_stages=2,
     )
