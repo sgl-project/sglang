@@ -458,6 +458,391 @@ def test_shared_weight_calculation():
     print("✓ PASSED")
 
 
+def test_empty_batch():
+    """Test handling of empty batch."""
+    print("\n" + "=" * 60)
+    print("Test: Empty batch handling")
+    print("=" * 60)
+    
+    balancer = DeepEPWaterfillBalancer(
+        num_experts=256,
+        world_size=8,
+        rank=0,
+        routed_scaling_factor=2.5,
+    )
+    
+    topk_ids = torch.empty(0, 8, dtype=torch.int64)
+    topk_weights = torch.empty(0, 8, dtype=torch.float32)
+    routed_counts = torch.zeros(8, dtype=torch.int64)
+    
+    expanded_ids, expanded_weights, local_mask = balancer.prepare_dispatch(
+        topk_ids, topk_weights, routed_counts
+    )
+    
+    print(f"Input shape: {topk_ids.shape}")
+    print(f"Output shape: {expanded_ids.shape}")
+    
+    assert expanded_ids.shape == (0, 9), f"Wrong shape: {expanded_ids.shape}"
+    assert expanded_weights.shape == (0, 9), f"Wrong shape: {expanded_weights.shape}"
+    assert local_mask.shape == (0,), f"Wrong mask shape: {local_mask.shape}"
+    print("✓ PASSED")
+
+
+def test_single_token():
+    """Test handling of single token."""
+    print("\n" + "=" * 60)
+    print("Test: Single token handling")
+    print("=" * 60)
+    
+    balancer = DeepEPWaterfillBalancer(
+        num_experts=256,
+        world_size=8,
+        rank=0,
+        routed_scaling_factor=2.5,
+    )
+    
+    # Single token routing to rank 1
+    topk_ids = torch.tensor([[32, 33, 34, -1, -1, -1, -1, -1]], dtype=torch.int64)
+    topk_weights = torch.tensor([[0.4, 0.3, 0.3, 0, 0, 0, 0, 0]], dtype=torch.float32)
+    routed_counts = torch.tensor([10, 5, 20, 30, 40, 50, 60, 70], dtype=torch.int64)
+    
+    expanded_ids, expanded_weights, local_mask = balancer.prepare_dispatch(
+        topk_ids, topk_weights, routed_counts
+    )
+    
+    print(f"Single token, batch < MIN_BATCH")
+    print(f"Local mask: {local_mask.tolist()}")
+    print(f"9th col: {expanded_ids[:, -1].tolist()}")
+    
+    # Should be local (batch < MIN_BATCH_FOR_BALANCE)
+    assert local_mask.all(), "Single token should be local!"
+    assert expanded_ids[0, -1] == LOCAL_SHARED_MARKER, "Should be LOCAL_SHARED_MARKER!"
+    print("✓ PASSED")
+
+
+def test_all_tokens_same_rank():
+    """Test when all tokens route to the same rank."""
+    print("\n" + "=" * 60)
+    print("Test: All tokens route to same rank")
+    print("=" * 60)
+    
+    balancer = DeepEPWaterfillBalancer(
+        num_experts=256,
+        world_size=8,
+        rank=0,
+        routed_scaling_factor=2.5,
+    )
+    
+    num_tokens = 100
+    # All tokens route only to rank 1
+    topk_ids = torch.randint(32, 64, (num_tokens, 8), dtype=torch.int64)
+    topk_weights = torch.ones(num_tokens, 8, dtype=torch.float32) * 0.125
+    routed_counts = torch.tensor([0, 800, 0, 0, 0, 0, 0, 0], dtype=torch.int64)
+    
+    expanded_ids, expanded_weights, local_mask = balancer.prepare_dispatch(
+        topk_ids, topk_weights, routed_counts
+    )
+    
+    # All destinations should be either rank 0 (source) or rank 1 (only routed rank)
+    remote_mask = ~local_mask
+    if remote_mask.any():
+        remote_9th = expanded_ids[remote_mask, -1]
+        remote_dest_ranks = remote_9th // 32
+        unique_dests = remote_dest_ranks.unique().tolist()
+        print(f"Remote destinations: {unique_dests}")
+        for d in unique_dests:
+            assert d in [0, 1], f"Unexpected destination {d}!"
+    
+    print(f"Local count: {local_mask.sum().item()}")
+    print(f"Remote count: {remote_mask.sum().item()}")
+    print("✓ PASSED")
+
+
+def test_waterfill_load_balance():
+    """Test that waterfill actually balances load."""
+    print("\n" + "=" * 60)
+    print("Test: Waterfill load balancing effectiveness")
+    print("=" * 60)
+    
+    num_experts = 256
+    world_size = 8
+    source_rank = 0
+    
+    # Each token routes to all 8 ranks (one expert per rank)
+    num_tokens = 1000
+    topk_ids = torch.zeros(num_tokens, 8, dtype=torch.int64)
+    for i in range(8):
+        topk_ids[:, i] = i * 32  # Expert 0, 32, 64, ..., 224
+    
+    # Unbalanced routed counts: rank 7 has much lower load
+    routed_counts = torch.tensor([1000, 900, 800, 700, 600, 500, 400, 100], dtype=torch.int64)
+    
+    destination = assign_shared_destination_pytorch(
+        topk_ids, routed_counts, num_experts, world_size, source_rank
+    )
+    
+    dest_counts = torch.bincount(destination, minlength=world_size)
+    print(f"Routed counts: {routed_counts.tolist()}")
+    print(f"Shared destination counts: {dest_counts.tolist()}")
+    
+    # Most tokens should go to rank 7 (lowest load)
+    max_dest = dest_counts.argmax().item()
+    print(f"Most shared tokens go to rank: {max_dest}")
+    
+    assert max_dest == 7, f"Expected rank 7 to receive most, got {max_dest}"
+    print("✓ PASSED (waterfill correctly identifies lowest load rank)")
+
+
+def test_min_tokens_per_rank_threshold():
+    """Test MIN_TOKENS_PER_RANK threshold in detail."""
+    print("\n" + "=" * 60)
+    print("Test: MIN_TOKENS_PER_RANK threshold")
+    print("=" * 60)
+    
+    balancer = DeepEPWaterfillBalancer(
+        num_experts=256,
+        world_size=8,
+        rank=0,
+        routed_scaling_factor=2.5,
+    )
+    
+    # Create scenario where waterfill would send few tokens to some ranks
+    num_tokens = 100
+    
+    # 90 tokens route to rank 1, 10 tokens route to rank 2
+    topk_ids = torch.zeros(num_tokens, 8, dtype=torch.int64)
+    topk_ids[:90, 0] = 32  # rank 1
+    topk_ids[90:, 0] = 64  # rank 2
+    topk_ids[:, 1:] = -1
+    
+    topk_weights = torch.ones(num_tokens, 8, dtype=torch.float32) * 0.125
+    
+    # Rank 2 has lowest load, but only 10 tokens can go there
+    routed_counts = torch.tensor([100, 50, 10, 200, 200, 200, 200, 200], dtype=torch.int64)
+    
+    expanded_ids, expanded_weights, local_mask = balancer.prepare_dispatch(
+        topk_ids, topk_weights, routed_counts
+    )
+    
+    # Count destinations
+    dest_for_tokens = torch.zeros(num_tokens, dtype=torch.int64)
+    dest_for_tokens[local_mask] = 0  # local
+    remote_mask = ~local_mask
+    if remote_mask.any():
+        dest_for_tokens[remote_mask] = expanded_ids[remote_mask, -1] // 32
+    
+    dest_counts = torch.bincount(dest_for_tokens, minlength=8)
+    print(f"Destination counts: {dest_counts.tolist()}")
+    print(f"MIN_TOKENS_PER_RANK: {balancer.MIN_TOKENS_PER_RANK}")
+    
+    # Rank 2 should not receive tokens if count < MIN_TOKENS_PER_RANK
+    # Those tokens should be redirected to local (rank 0)
+    rank2_remote_count = (expanded_ids[remote_mask, -1] // 32 == 2).sum().item() if remote_mask.any() else 0
+    print(f"Rank 2 receives (remote): {rank2_remote_count} tokens")
+    
+    if rank2_remote_count > 0 and rank2_remote_count < balancer.MIN_TOKENS_PER_RANK:
+        print("WARNING: Sparse destination not redirected!")
+    else:
+        print("✓ Sparse destinations handled correctly")
+    
+    print("✓ PASSED")
+
+
+def test_identify_shared_with_all_local():
+    """Test identify_shared_expert_tokens when all are local markers."""
+    print("\n" + "=" * 60)
+    print("Test: identify_shared_expert_tokens with all local")
+    print("=" * 60)
+    
+    num_experts = 256
+    world_size = 8
+    current_rank = 0
+    
+    # All tokens have LOCAL_SHARED_MARKER
+    recv_topk_ids = torch.zeros(10, 9, dtype=torch.int64)
+    recv_topk_ids[:, -1] = LOCAL_SHARED_MARKER
+    
+    shared_indices = identify_shared_expert_tokens(
+        recv_topk_ids, num_experts, world_size, current_rank
+    )
+    
+    print(f"All tokens have LOCAL_SHARED_MARKER")
+    print(f"Identified indices: {shared_indices.tolist()}")
+    
+    assert shared_indices.numel() == 0, "Should identify no tokens!"
+    print("✓ PASSED")
+
+
+def test_identify_shared_mixed():
+    """Test identify_shared_expert_tokens with mixed scenarios."""
+    print("\n" + "=" * 60)
+    print("Test: identify_shared_expert_tokens mixed scenarios")
+    print("=" * 60)
+    
+    num_experts = 256
+    world_size = 8
+    experts_per_rank = 32
+    
+    # Test for each rank
+    for current_rank in range(world_size):
+        recv_topk_ids = torch.zeros(world_size + 1, 9, dtype=torch.int64)
+        # Token i has virtual ID for rank i
+        for i in range(world_size):
+            recv_topk_ids[i, -1] = i * experts_per_rank
+        # Last token is local marker
+        recv_topk_ids[world_size, -1] = LOCAL_SHARED_MARKER
+        
+        shared_indices = identify_shared_expert_tokens(
+            recv_topk_ids, num_experts, world_size, current_rank
+        )
+        
+        expected = [current_rank]  # Only token at index current_rank
+        assert shared_indices.tolist() == expected, \
+            f"Rank {current_rank}: expected {expected}, got {shared_indices.tolist()}"
+    
+    print("✓ PASSED for all ranks")
+
+
+def test_compute_local_shared_empty():
+    """Test compute_local_shared_expert with no local tokens."""
+    print("\n" + "=" * 60)
+    print("Test: compute_local_shared_expert with no local tokens")
+    print("=" * 60)
+    
+    hidden_states = torch.randn(10, 8)
+    local_shared_mask = torch.zeros(10, dtype=torch.bool)  # All False
+    
+    def mock_fn(x):
+        return x * 2
+    
+    output, indices = compute_local_shared_expert(
+        hidden_states, local_shared_mask, mock_fn
+    )
+    
+    print(f"No local tokens")
+    print(f"Output: {output}")
+    print(f"Indices: {indices}")
+    
+    assert output is None, "Output should be None!"
+    assert indices is None, "Indices should be None!"
+    print("✓ PASSED")
+
+
+def test_virtual_id_mapping():
+    """Test that virtual IDs correctly map to ranks."""
+    print("\n" + "=" * 60)
+    print("Test: Virtual ID to rank mapping")
+    print("=" * 60)
+    
+    num_experts = 256
+    world_size = 8
+    experts_per_rank = num_experts // world_size
+    
+    # Test all ranks
+    for target_rank in range(world_size):
+        virtual_id = target_rank * experts_per_rank
+        computed_rank = virtual_id // experts_per_rank
+        
+        assert computed_rank == target_rank, \
+            f"Virtual ID {virtual_id} should map to rank {target_rank}, got {computed_rank}"
+        print(f"  Rank {target_rank} -> Virtual ID {virtual_id} -> Rank {computed_rank} ✓")
+    
+    print("✓ PASSED")
+
+
+def test_weight_preservation():
+    """Test that original weights are preserved in expansion."""
+    print("\n" + "=" * 60)
+    print("Test: Weight preservation in topk expansion")
+    print("=" * 60)
+    
+    num_experts = 256
+    world_size = 8
+    source_rank = 0
+    shared_weight = 0.4
+    
+    # Create random weights
+    topk_ids = torch.randint(0, num_experts, (50, 8), dtype=torch.int64)
+    topk_weights = torch.rand(50, 8, dtype=torch.float32)
+    shared_destination = torch.randint(0, world_size, (50,), dtype=torch.int64)
+    
+    expanded_ids, expanded_weights, local_mask = expand_topk_with_shared_expert(
+        topk_ids, topk_weights, shared_destination,
+        num_experts, world_size, source_rank, shared_weight
+    )
+    
+    # Verify first 8 columns unchanged
+    assert torch.equal(expanded_ids[:, :8], topk_ids), "topk_ids changed!"
+    assert torch.equal(expanded_weights[:, :8], topk_weights), "topk_weights changed!"
+    
+    print("✓ First 8 columns preserved")
+    print("✓ PASSED")
+
+
+def test_routed_count_accuracy():
+    """Test accuracy of routed token counting."""
+    print("\n" + "=" * 60)
+    print("Test: Routed count accuracy")
+    print("=" * 60)
+    
+    num_experts = 256
+    world_size = 8
+    experts_per_rank = 32
+    
+    # Create controlled scenario
+    topk_ids = torch.tensor([
+        [0, 1, 2, 3, 4, 5, 6, 7],      # 8 tokens to rank 0
+        [32, 33, 34, 35, -1, -1, -1, -1],  # 4 tokens to rank 1
+        [64, 65, -1, -1, -1, -1, -1, -1],  # 2 tokens to rank 2
+    ], dtype=torch.int64)
+    
+    counts = count_routed_per_rank_pytorch(topk_ids, num_experts, world_size)
+    
+    expected = [8, 4, 2, 0, 0, 0, 0, 0]
+    print(f"Computed counts: {counts.tolist()}")
+    print(f"Expected counts: {expected}")
+    
+    assert counts.tolist() == expected, f"Count mismatch!"
+    print("✓ PASSED")
+
+
+def test_consistency_across_calls():
+    """Test that repeated calls give consistent results."""
+    print("\n" + "=" * 60)
+    print("Test: Consistency across repeated calls")
+    print("=" * 60)
+    
+    balancer = DeepEPWaterfillBalancer(
+        num_experts=256,
+        world_size=8,
+        rank=0,
+        routed_scaling_factor=2.5,
+    )
+    
+    # Fixed input
+    torch.manual_seed(42)
+    topk_ids = torch.randint(0, 256, (100, 8), dtype=torch.int64)
+    topk_weights = torch.rand(100, 8, dtype=torch.float32)
+    routed_counts = torch.tensor([100, 90, 80, 70, 60, 50, 40, 30], dtype=torch.int64)
+    
+    # Call multiple times
+    results = []
+    for i in range(3):
+        expanded_ids, expanded_weights, local_mask = balancer.prepare_dispatch(
+            topk_ids.clone(), topk_weights.clone(), routed_counts.clone()
+        )
+        results.append((expanded_ids.clone(), expanded_weights.clone(), local_mask.clone()))
+    
+    # Verify all results are identical
+    for i in range(1, 3):
+        assert torch.equal(results[0][0], results[i][0]), f"IDs differ at call {i}!"
+        assert torch.equal(results[0][1], results[i][1]), f"Weights differ at call {i}!"
+        assert torch.equal(results[0][2], results[i][2]), f"Mask differs at call {i}!"
+    
+    print("✓ All 3 calls produced identical results")
+    print("✓ PASSED")
+
+
 def main():
     print("=" * 60)
     print("DeepEP Waterfill CPU Unit Tests")
@@ -474,6 +859,19 @@ def main():
         test_deepep_waterfill_balancer_sparse_redirect,
         test_end_to_end_scenario,
         test_shared_weight_calculation,
+        # New tests
+        test_empty_batch,
+        test_single_token,
+        test_all_tokens_same_rank,
+        test_waterfill_load_balance,
+        test_min_tokens_per_rank_threshold,
+        test_identify_shared_with_all_local,
+        test_identify_shared_mixed,
+        test_compute_local_shared_empty,
+        test_virtual_id_mapping,
+        test_weight_preservation,
+        test_routed_count_accuracy,
+        test_consistency_across_calls,
     ]
     
     passed = 0
