@@ -71,7 +71,7 @@ class BaseTpWorker(ABC):
 
     @property
     def is_hybrid_swa(self) -> bool:
-        return self.model_runner.is_hybrid_swa is not None
+        return self.model_runner.is_hybrid_swa
 
     def get_tokens_per_layer_info(self):
         return (
