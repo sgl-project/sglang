@@ -9,10 +9,13 @@ test into unit tests so that's easily reproducible in CI.
 
 import unittest
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
     TestDeterministicBase,
 )
+
+register_cuda_ci(est_time=228, suite="stage-b-test-small-1-gpu")
 
 
 class TestFlashinferDeterministic(TestDeterministicBase):
