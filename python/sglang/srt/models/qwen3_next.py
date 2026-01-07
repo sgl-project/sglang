@@ -474,7 +474,6 @@ class Qwen3GatedDeltaNet(nn.Module):
     
 
     def op_prepare(self, state):
-        # FIXME
         hidden_states: torch.Tensor = state.pop("hidden_states_after_comm_pre_attn")
         forward_batch = state.forward_batch
 
@@ -506,10 +505,6 @@ class Qwen3GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
-            
-            # if(query.device.index == 0): 
-            #    print(f"query:{query[0,:]}")
-        # mixed_qkv = rearrange(mixed_qkv, "b l d -> b d l")
 
         # 2. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(
@@ -561,7 +556,6 @@ class Qwen3GatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         if core_attn_out.numel() == 0:
-            # if core_attn_out is None , return
             state.hidden_states_after_attn = hidden_state
             return
         
@@ -1126,7 +1120,7 @@ class Qwen3NextModel(nn.Module):
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
-                enable_tbo=True,  #  debuging
+                enable_tbo=True,
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,

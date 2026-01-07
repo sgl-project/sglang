@@ -51,7 +51,7 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
-        # FIXME: Qwen3-Next has different name in decoder layers.
+        # The decoder layers in Qwen3-Next have different names.
         elif layer_name in ["Qwen3HybridLinearDecoderLayer", "Qwen3HybridAttentionDecoderLayer"]:
             return OperationsStrategy.concat(
                 [
@@ -224,8 +224,6 @@ def _compute_moe_qwen3_decode(layer):
 # -------------------------------- Strategy for Qwen3-Next ---------------------------------------
 
 
-# TODO: unstable, current strategy is almost the same as Qwen3, keep redundant code here for
-# convenience to adjust strategy
 def _compute_moe_qwen3_next_layer_operations_strategy_tbo(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
