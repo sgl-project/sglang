@@ -256,7 +256,7 @@ def _setup_pd_backend(
         logger.info("Tearing down PD gateway")
         gateway.shutdown()
         # Release references to allow eviction
-        for worker in all_workers:
+        for worker in prefills + decodes:
             worker.release()
 
 

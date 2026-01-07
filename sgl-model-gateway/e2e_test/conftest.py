@@ -1,5 +1,17 @@
 """Pytest configuration for E2E tests.
 
+Parallel Execution
+------------------
+Tests can run in parallel using pytest-parallel with shared worker processes.
+Use --workers 1 --tests-per-worker N for N concurrent test threads:
+
+    pytest --workers 1 --tests-per-worker 4 e2e_test/router/
+
+This leverages the thread-safe ModelPool and GPUAllocator classes to enable
+true shared-worker parallelism where all threads share the same session-scoped
+model_pool fixture. Tests marked with @pytest.mark.thread_unsafe will be
+automatically skipped in parallel mode.
+
 Markers
 -------
 This module defines several pytest markers for configuring E2E tests:
@@ -51,6 +63,18 @@ This module defines several pytest markers for configuring E2E tests:
 
 @pytest.mark.slow
     Mark test as slow-running.
+
+@pytest.mark.thread_unsafe(reason=None)
+    Mark test as incompatible with parallel thread execution.
+    Tests with this marker are automatically skipped when running
+    with --tests-per-worker > 1.
+
+    Args:
+        reason: Optional explanation of why the test is thread-unsafe.
+
+    Examples:
+        @pytest.mark.thread_unsafe
+        @pytest.mark.thread_unsafe(reason="Modifies global state")
 
 Fixtures
 --------
@@ -170,6 +194,7 @@ from fixtures import (
     pytest_collection_finish,
     pytest_collection_modifyitems,
     pytest_configure,
+    pytest_runtest_setup,
     setup_backend,
 )
 
@@ -180,6 +205,7 @@ __all__ = [
     "pytest_collection_modifyitems",
     "pytest_collection_finish",
     "pytest_configure",
+    "pytest_runtest_setup",
     # Fixtures
     "model_pool",
     "model_client",
