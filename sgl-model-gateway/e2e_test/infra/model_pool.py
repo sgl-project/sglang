@@ -220,10 +220,17 @@ class ModelPool:
         if requirements is None:
             requirements = [(DEFAULT_MODEL, ConnectionMode.HTTP)]
 
-        # Deduplicate and validate
-        requirements = list(set(requirements))
+        # Deduplicate while preserving order (first occurrence wins)
+        seen: set[tuple[str, ConnectionMode]] = set()
+        unique_requirements = []
+        for req in requirements:
+            if req not in seen:
+                seen.add(req)
+                unique_requirements.append(req)
+
+        # Validate
         valid_requirements = []
-        for model_id, mode in requirements:
+        for model_id, mode in unique_requirements:
             if model_id not in MODEL_SPECS:
                 logger.warning("Unknown model %s, skipping", model_id)
                 continue
@@ -250,8 +257,8 @@ class ModelPool:
                 "tp": spec.get("tp", 1),
             }
 
-        # Allocate GPU slots
-        slots = self.allocator.allocate_slots(allocation_specs)
+        # Allocate GPU slots (preserve test order so earlier tests get models first)
+        slots = self.allocator.allocate_slots(allocation_specs, preserve_order=True)
 
         # Track which models got slots
         launched_keys = set()

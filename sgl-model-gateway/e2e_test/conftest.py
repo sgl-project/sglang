@@ -181,9 +181,9 @@ from infra import (
 # Test collection: scan for required backends
 # ---------------------------------------------------------------------------
 
-# Global storage for scanned requirements
+# Global storage for scanned requirements (ordered by test collection order)
 _scanned_backends: set[str] = set()  # {"grpc", "http", "openai", ...}
-_scanned_models: set[str] = set()  # Models needed by tests
+_scanned_models: list[str] = []  # Models needed by tests, in test order
 _needs_default_model: bool = False  # True if any e2e test lacks explicit model marker
 
 
@@ -215,16 +215,19 @@ def pytest_collection_modifyitems(
                         _scanned_backends.update(param_values)
 
                 elif param_name == PARAM_MODEL or PARAM_MODEL in param_name:
-                    # Extract model names from parametrize
+                    # Extract model names from parametrize (preserve order)
                     if isinstance(param_values, (list, tuple)):
-                        _scanned_models.update(param_values)
+                        for model in param_values:
+                            if model not in _scanned_models:
+                                _scanned_models.append(model)
                         has_model_marker = True
 
         # Check for @pytest.mark.model("name") markers
         model_marker = item.get_closest_marker(PARAM_MODEL)
         if model_marker and model_marker.args:
             model_name = model_marker.args[0]
-            _scanned_models.add(model_name)
+            if model_name not in _scanned_models:
+                _scanned_models.append(model_name)
             has_model_marker = True
 
         # Check if this is an e2e test without an explicit model marker
@@ -233,9 +236,9 @@ def pytest_collection_modifyitems(
             _needs_default_model = True
 
     logger.info(
-        "Scanned test requirements - backends: %s, models: %s, needs default: %s",
+        "Scanned test requirements - backends: %s, models (in test order): %s, needs default: %s",
         _scanned_backends or {"(none)"},
-        _scanned_models or {"(none)"},
+        _scanned_models or ["(none)"],
         _needs_default_model,
     )
 
@@ -245,32 +248,38 @@ def get_pool_requirements() -> list[tuple[str, ConnectionMode]]:
 
     Returns:
         List of (model_id, ConnectionMode) tuples to try to pre-launch.
-        Models that don't fit will be launched on-demand.
+        Models are ordered by first appearance in test collection order,
+        so models needed by earlier tests are launched first.
     """
-    models = set(_scanned_models)
+    # Preserve order from test collection (list, not set)
+    models = list(_scanned_models)
 
     # Add DEFAULT_MODEL if any e2e test lacks an explicit model marker,
     # or if no models were specified at all
-    if _needs_default_model or not models:
-        models.add(DEFAULT_MODEL)
+    if _needs_default_model and DEFAULT_MODEL not in models:
+        # Prepend default model since tests without explicit markers run first
+        models.insert(0, DEFAULT_MODEL)
+    elif not models:
+        models = [DEFAULT_MODEL]
 
     # Convert scanned string backends to ConnectionMode enums
     # Filter to local backends only (grpc, http) - cloud backends don't need workers
-    local_modes: set[ConnectionMode] = set()
+    local_modes: list[ConnectionMode] = []
     for backend in _scanned_backends:
         try:
             mode = ConnectionMode(backend)
-            if mode in LOCAL_MODES:
-                local_modes.add(mode)
+            if mode in LOCAL_MODES and mode not in local_modes:
+                local_modes.append(mode)
         except ValueError:
             # Not a ConnectionMode (e.g., "openai", "xai", "pd") - skip
             pass
 
     # Default to HTTP if no local backends specified
     if not local_modes:
-        local_modes = {ConnectionMode.HTTP}
+        local_modes = [ConnectionMode.HTTP]
 
     # Build requirements: each model needs each mode
+    # Order: model order takes priority (models used first are launched first)
     requirements: list[tuple[str, ConnectionMode]] = []
     for model in models:
         for mode in local_modes:
