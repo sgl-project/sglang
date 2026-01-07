@@ -43,8 +43,6 @@ pub(crate) use builder::HarmonyBuilder;
 pub(crate) use detector::HarmonyDetector;
 pub(crate) use parser::HarmonyParserAdapter;
 pub(crate) use processor::{HarmonyResponseProcessor, ResponsesIterationResult};
-pub(crate) use responses::{
-    serve_harmony_responses, serve_harmony_responses_stream, HarmonyResponsesContext,
-};
+pub(crate) use responses::{serve_harmony_responses, serve_harmony_responses_stream};
 pub(crate) use streaming::HarmonyStreamingProcessor;
 pub(crate) use types::HarmonyMessage;
