@@ -1,10 +1,12 @@
 import json
 import tempfile
+import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from sglang.bench_serving import run_benchmark
+from sglang.bench_serving import parse_custom_headers, run_benchmark
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
@@ -94,6 +96,60 @@ class TestBenchServingFunctionality(CustomTestCase):
         self.assertGreaterEqual(
             prefix_count, expected, f"Expected at least {expected} prefix pairs"
         )
+
+
+class TestBenchServingCustomHeaders(CustomTestCase):
+    def test_parse_custom_headers(self):
+        headers = parse_custom_headers(["MyHeader=MY_VALUE", "Another=val=ue"])
+        self.assertEqual(headers, {"MyHeader": "MY_VALUE", "Another": "val=ue"})
+
+        headers = parse_custom_headers(["InvalidNoEquals"])
+        self.assertEqual(headers, {})
+
+        headers = parse_custom_headers(["=NoKey"])
+        self.assertEqual(headers, {})
+
+    def test_custom_headers_sent_to_server(self):
+        # TODO: In the future, consider using router's mock server for more realistic testing.
+        received_headers = {}
+
+        class HeaderEchoHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                received_headers.update(self.headers)
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"headers": dict(self.headers)}).encode())
+
+            def log_message(self, format, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), HeaderEchoHandler)
+        port = server.server_address[1]
+        server_thread = threading.Thread(target=server.handle_request)
+        server_thread.start()
+
+        try:
+            args = get_benchmark_args(
+                base_url=f"http://127.0.0.1:{port}",
+                backend="sglang",
+                dataset_name="random",
+                num_prompts=1,
+                random_input_len=8,
+                random_output_len=8,
+                header=["X-Custom-Test=TestValue123", "X-Another=AnotherVal"],
+            )
+            args.warmup_requests = 0
+            args.disable_tqdm = True
+            run_benchmark(args)
+        except Exception:
+            pass
+        finally:
+            server_thread.join(timeout=5)
+            server.server_close()
+
+        self.assertEqual(received_headers.get("X-Custom-Test"), "TestValue123")
+        self.assertEqual(received_headers.get("X-Another"), "AnotherVal")
 
 
 if __name__ == "__main__":
