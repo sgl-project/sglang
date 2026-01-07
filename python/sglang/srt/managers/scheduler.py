@@ -827,7 +827,7 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+        if self.draft_worker is None or self.spec_algorithm.is_ngram() or self.spec_algorithm.is_llguidance():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
@@ -1441,7 +1441,7 @@ class Scheduler(
                 ),
                 routing_key=recv_req.routing_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
-                dllm_config=self.dllm_config,
+                dllm_config=self.dllm_config
             )
             req.tokenizer = self.tokenizer
 

@@ -52,8 +52,6 @@ class LlguidanceWorker:
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
 
-        self.grammar_backend: Optional[GuidanceBackend] = None
-
     def clear_cache_pool(self):
         pass
 
