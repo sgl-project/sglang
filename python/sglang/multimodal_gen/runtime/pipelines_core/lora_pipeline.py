@@ -48,6 +48,7 @@ class LoRAPipeline(ComposedPipelineBase):
     cur_adapter_name: dict[str, str]
     cur_adapter_path: dict[str, str]
     cur_adapter_strength: dict[str, float]  # Track current strength per module
+    cur_adapter_config: dict[str, tuple[list[str], list[float]]]
     # [dit_layer_name] = wrapped_lora_layer
     lora_layers: dict[str, BaseLayerWithLoRA]
     lora_layers_critic: dict[str, BaseLayerWithLoRA]
@@ -74,6 +75,7 @@ class LoRAPipeline(ComposedPipelineBase):
         self.cur_adapter_name = {}
         self.cur_adapter_path = {}
         self.cur_adapter_strength = {}
+        self.cur_adapter_config = {}  # Track full LoRA config: {module_name: (nickname_list, strength_list)}
         self.lora_layers = {}
         self.lora_layers_critic = {}
         self.lora_layers_transformer_2 = {}
@@ -297,50 +299,162 @@ class LoRAPipeline(ComposedPipelineBase):
                 converted_count_critic,
             )
 
+    def _normalize_lora_params(
+        self,
+        lora_nickname: str | list[str],
+        lora_path: str | None | list[str | None],
+        strength: float | list[float],
+        target: str | list[str],
+    ) -> tuple[list[str], list[str | None], list[float], list[str]]:
+        """
+        Normalize LoRA parameters to lists for multi-LoRA support.
+
+        Requirements:
+        - each nickname must have a corresponding lora_path (no implicit repeat)
+        - strength / target if scalar broadcast, else length must match nickname
+        """
+        # nickname
+        if isinstance(lora_nickname, str):
+            lora_nicknames = [lora_nickname]
+        else:
+            lora_nicknames = lora_nickname
+
+        # lora_path: require 1:1 mapping with nickname (no implicit repeat)
+        if isinstance(lora_path, list):
+            lora_paths = lora_path
+        else:
+            lora_paths = [lora_path]
+        if len(lora_paths) != len(lora_nicknames):
+            raise ValueError(
+                f"Length mismatch: lora_nickname has {len(lora_nicknames)} items, "
+                f"but lora_path has {len(lora_paths)} items. "
+                "Provide one path per nickname."
+            )
+
+        # strength and target: allow scalar broadcast, else length must match
+        if isinstance(strength, (int, float)):
+            strengths = [float(strength)] * len(lora_nicknames)
+        else:
+            strengths = [float(s) for s in strength]
+        if len(strengths) != len(lora_nicknames):
+            raise ValueError(
+                f"Length mismatch: lora_nickname has {len(lora_nicknames)} items, "
+                f"but strength has {len(strengths)} items"
+            )
+
+        if isinstance(target, str):
+            targets = [target] * len(lora_nicknames)
+        else:
+            targets = target
+        if len(targets) != len(lora_nicknames):
+            raise ValueError(
+                f"Length mismatch: lora_nickname has {len(lora_nicknames)} items, "
+                f"but target has {len(targets)} items"
+            )
+        return lora_nicknames, lora_paths, strengths, targets
+
+    def _check_lora_config_matches(
+        self,
+        module_name: str,
+        target_nicknames: list[str],
+        target_strengths: list[float],
+        adapter_updated: bool,
+    ) -> bool:
+        """
+        Check if current LoRA configuration matches the target configuration.
+
+        Args:
+            module_name: The name of the module to check.
+            target_nicknames: List of LoRA nicknames to apply.
+            target_strengths: List of LoRA strengths to apply.
+            adapter_updated: Whether any adapter was updated/loaded.
+
+        Returns:
+            True if the configuration matches exactly (including order and strength), False otherwise.
+        """
+        if not self.is_lora_merged.get(module_name, False):
+            return False
+        if adapter_updated:
+            return False  # Adapter was updated, need to reapply
+
+        stored_config = self.cur_adapter_config.get(module_name)
+        if stored_config is None:
+            return False
+
+        stored_nicknames, stored_strengths = stored_config
+        # Compare: nickname list and strength list must match exactly (including order)
+        return (
+            stored_nicknames == target_nicknames
+            and stored_strengths == target_strengths
+        )
+
     def _apply_lora_to_layers(
         self,
         lora_layers: dict[str, BaseLayerWithLoRA],
-        lora_nickname: str,
-        lora_path: str | None,
+        lora_nicknames: list[str],
+        lora_paths: list[str | None],
         rank: int,
-        strength: float = 1.0,
+        strengths: list[float],
+        clear_existing: bool = False,
     ) -> int:
         """
-        Apply LoRA weights to the given lora_layers.
+        Apply LoRA weights to the given lora_layers. Supports multiple LoRA adapters.
 
         Args:
             lora_layers: The dictionary of LoRA layers to apply weights to.
-            lora_nickname: The nickname of the LoRA adapter.
-            lora_path: The path to the LoRA adapter.
+            lora_nicknames: The list of nicknames of the LoRA adapters.
+            lora_paths: The list of paths to the LoRA adapters. Must match length of lora_nicknames.
             rank: The distributed rank (for logging).
-            strength: LoRA strength for merge, default 1.0.
+            strengths: The list of LoRA strengths for merge. Must match length of lora_nicknames.
+            clear_existing: If True, clear existing LoRA weights before adding new ones.
 
         Returns:
             The number of layers that had LoRA weights applied.
         """
+        if len(lora_paths) != len(lora_nicknames):
+            raise ValueError(
+                f"Length mismatch: lora_nicknames has {len(lora_nicknames)} items, "
+                f"but lora_paths has {len(lora_paths)} items"
+            )
+        if len(strengths) != len(lora_nicknames):
+            raise ValueError(
+                f"Length mismatch: lora_nicknames has {len(lora_nicknames)} items, "
+                f"but strengths has {len(strengths)} items"
+            )
+
         adapted_count = 0
         for name, layer in lora_layers.items():
-            lora_A_name = name + ".lora_A"
-            lora_B_name = name + ".lora_B"
-            if (
-                lora_A_name in self.lora_adapters[lora_nickname]
-                and lora_B_name in self.lora_adapters[lora_nickname]
-            ):
-                layer.set_lora_weights(
-                    self.lora_adapters[lora_nickname][lora_A_name],
-                    self.lora_adapters[lora_nickname][lora_B_name],
-                    lora_path=lora_path,
-                    strength=strength,
-                )
-                adapted_count += 1
-            else:
-                if rank == 0:
-                    logger.warning(
-                        "LoRA adapter %s does not contain the weights for layer '%s'. LoRA will not be applied to it.",
-                        lora_path,
-                        name,
+            # Apply all LoRA adapters in order
+            for idx, (nickname, path, lora_strength) in enumerate(zip(lora_nicknames, lora_paths, strengths)):
+                lora_A_name = name + ".lora_A"
+                lora_B_name = name + ".lora_B"
+                if (
+                    lora_A_name in self.lora_adapters[nickname]
+                    and lora_B_name in self.lora_adapters[nickname]
+                ):
+                    layer.set_lora_weights(
+                        self.lora_adapters[nickname][lora_A_name],
+                        self.lora_adapters[nickname][lora_B_name],
+                        lora_path=path,
+                        strength=lora_strength,
+                        clear_existing=(clear_existing and idx == 0),  # Only clear on first LoRA
                     )
-                layer.disable_lora = True
+                    adapted_count += 1
+                else:
+                    if rank == 0 and idx == 0:  # Only warn for first missing LoRA
+                        logger.warning(
+                            "LoRA adapter %s does not contain the weights for layer '%s'. LoRA will not be applied to it.",
+                            path,
+                            name,
+                        )
+                    # Only disable if no LoRA was applied at all
+                    if idx == len(lora_nicknames) - 1:
+                        has_any_lora = any(
+                            name + ".lora_A" in self.lora_adapters[n] and name + ".lora_B" in self.lora_adapters[n]
+                            for n in lora_nicknames
+                        )
+                        if not has_any_lora:
+                            layer.disable_lora = True
         return adapted_count
 
     def is_lora_effective(self, target: str = "all") -> bool:
@@ -438,46 +552,25 @@ class LoRAPipeline(ComposedPipelineBase):
 
     def set_lora(
         self,
-        lora_nickname: str,
-        lora_path: str | None = None,
-        target: str = "all",
-        strength: float = 1.0,
+        lora_nickname: str | list[str],
+        lora_path: str | None | list[str | None] = None,
+        target: str | list[str] = "all",
+        strength: float | list[float] = 1.0,
     ):  # type: ignore
         """
-        Load a LoRA adapter into the pipeline and apply it to the specified transformer(s).
-
-        Args:
-            lora_nickname: The "nick name" of the adapter when referenced in the pipeline.
-            lora_path: The path to the adapter, either a local path or a Hugging Face repo id.
-            target: Which transformer(s) to apply the LoRA to. One of:
-                - "all": Apply to all transformers (default, backward compatible)
-                - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
-                - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
-                - "critic": Apply only to the critic model (fake_score_transformer)
-            strength: LoRA strength for merge, default 1.0.
+        Load LoRA adapter(s) into the pipeline and apply them to the specified transformer(s).
+        Supports both single LoRA (backward compatible) and multiple LoRA adapters.
         """
-        if target not in self.VALID_TARGETS:
-            raise ValueError(
-                f"Invalid target: {target}. Valid targets: {self.VALID_TARGETS}"
-            )
+        # Normalize inputs to lists for multi-LoRA support
+        lora_nicknames, lora_paths, strengths, targets = self._normalize_lora_params(
+            lora_nickname, lora_path, strength, target
+        )
 
-        # Check if any target module has a different LoRA merged
-        target_modules, error = self._get_target_lora_layers(target)
-        if error:
-            logger.warning("set_lora: %s", error)
-        for module_name, _ in target_modules:
-            if (
-                self.is_lora_merged.get(module_name, False)
-                and self.cur_adapter_name.get(module_name) != lora_nickname
-            ):
-                raise ValueError(
-                    f"LoRA '{self.cur_adapter_name.get(module_name)}' is currently merged in {module_name}. "
-                    "Please call 'unmerge_lora_weights' before setting a new LoRA."
-                )
-
-        if lora_nickname not in self.lora_adapters and lora_path is None:
+        # Validate targets
+        invalid_targets = [t for t in targets if t not in self.VALID_TARGETS]
+        if invalid_targets:
             raise ValueError(
-                f"Adapter {lora_nickname} not found in the pipeline. Please provide lora_path to load it."
+                f"Invalid target(s): {invalid_targets}. Valid targets: {self.VALID_TARGETS}"
             )
 
         # Disable layerwise offload before convert_to_lora_layers to ensure weights are accessible
@@ -489,63 +582,85 @@ class LoRAPipeline(ComposedPipelineBase):
             ):
                 self.convert_to_lora_layers()
 
-        # Re-fetch target_modules after convert_to_lora_layers() to get populated dicts
-        target_modules, error = self._get_target_lora_layers(target)
-        if error:
-            logger.warning("set_lora: %s", error)
-
+        # Check adapter presence and load missing adapters
         adapter_updated = False
         rank = dist.get_rank()
 
-        should_load = False
-        if lora_path is not None:
-            if lora_nickname not in self.loaded_adapter_paths:
-                should_load = True
-            elif self.loaded_adapter_paths[lora_nickname] != lora_path:
-                should_load = True
+        for nickname, path in zip(lora_nicknames, lora_paths):
+            if nickname not in self.lora_adapters and path is None:
+                raise ValueError(
+                    f"Adapter {nickname} not found in the pipeline. Please provide lora_path to load it."
+                )
+            # Check if adapter needs to be loaded
+            should_load = False
+            if path is not None:
+                if nickname not in self.loaded_adapter_paths:
+                    should_load = True
+                elif self.loaded_adapter_paths[nickname] != path:
+                    should_load = True
+            if should_load:
+                adapter_updated = True
+                self.load_lora_adapter(path, nickname, rank)
 
-        if should_load:
-            adapter_updated = True
-            self.load_lora_adapter(lora_path, lora_nickname, rank)
-
-        # Check if we can skip (same adapter already applied to all target modules with same strength)
-        all_already_applied = all(
-            not adapter_updated
-            and self.cur_adapter_name.get(module_name) == lora_nickname
-            and self.is_lora_merged.get(module_name, False)
-            and self.cur_adapter_strength.get(module_name) == strength
-            for module_name, _ in target_modules
-        )
-        if all_already_applied:
-            return
+        # Group by target to apply separately
+        target_to_indices = {}
+        for idx, tgt in enumerate(targets):
+            if tgt not in target_to_indices:
+                target_to_indices[tgt] = []
+            target_to_indices[tgt].append(idx)
 
         # Disable layerwise offload if enabled: load all layers to GPU
         with self._temporarily_disable_offload(target_modules=target_modules):
-            # Apply LoRA to target modules (now all layers are on GPU)
             adapted_count = 0
-            for module_name, lora_layers_dict in target_modules:
-                count = self._apply_lora_to_layers(
-                    lora_layers_dict,
-                    lora_nickname,
-                    lora_path,
-                    rank,
-                    strength,
-                )
-                adapted_count += count
-                self.cur_adapter_name[module_name] = lora_nickname
-                self.cur_adapter_path[module_name] = (
-                    lora_path or self.loaded_adapter_paths.get(lora_nickname, "")
-                )
-                self.is_lora_merged[module_name] = True
-                self.cur_adapter_strength[module_name] = strength
+            for tgt, idx_list in target_to_indices.items():
+                target_modules, error = self._get_target_lora_layers(tgt)
+                if error:
+                    logger.warning("set_lora: %s", error)
+                if not target_modules:
+                    continue
 
-            logger.info(
-                "Rank %d: LoRA adapter %s applied to %d layers (target: %s, strength: %s)",
+                tgt_nicknames = [lora_nicknames[i] for i in idx_list]
+                tgt_paths = [lora_paths[i] for i in idx_list]
+                tgt_strengths = [strengths[i] for i in idx_list]
+
+                merged_name = ",".join(tgt_nicknames) if len(tgt_nicknames) > 1 else tgt_nicknames[0]
+
+                # Skip if LoRA configuration matches exactly (including order and strength)
+                # Since all modules for the same target apply the same config, checking one is sufficient
+                first_module_name, _ = target_modules[0]
+                if self._check_lora_config_matches(
+                    first_module_name, tgt_nicknames, tgt_strengths, adapter_updated
+                ):
+                    logger.info("LoRA configuration matches exactly, skipping")
+                    continue
+
+                # Apply LoRA to modules for this target
+                for module_name, lora_layers_dict in target_modules:
+                    count = self._apply_lora_to_layers(
+                        lora_layers_dict,
+                        tgt_nicknames,
+                        tgt_paths,
+                        rank,
+                        tgt_strengths,
+                        clear_existing=True,
+                    )
+                    adapted_count += count
+                    self.cur_adapter_name[module_name] = merged_name
+                    self.cur_adapter_path[module_name] = ",".join(
+                        str(p or self.loaded_adapter_paths.get(n, "")) for n, p in zip(tgt_nicknames, tgt_paths)
+                    )
+                    self.is_lora_merged[module_name] = True
+                    self.cur_adapter_strength[module_name] = tgt_strengths[0]  # For backward compatibility
+                    # Store full configuration for multi-LoRA support (preserves order and all strengths)
+                    self.cur_adapter_config[module_name] = (tgt_nicknames.copy(), tgt_strengths.copy())
+
+        logger.info(
+            "Rank %d: LoRA adapter(s) %s applied to %d layers (targets: %s, strengths: %s)",
                 rank,
-                lora_path,
+                ", ".join(lora_paths) if lora_paths else None,
                 adapted_count,
-                target,
-                strength,
+                ", ".join(targets) if len(set(targets)) > 1 else targets[0],
+                ", ".join(f"{s:.2f}" for s in strengths) if len(strengths) > 1 else f"{strengths[0]:.2f}",
             )
 
     def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
@@ -649,7 +764,8 @@ class LoRAPipeline(ComposedPipelineBase):
                         continue
                 self.is_lora_merged[module_name] = False
                 self.cur_adapter_strength.pop(module_name, None)
-                logger.info("LoRA weights unmerged for %s", module_name)
+                self.cur_adapter_config.pop(module_name, None)  # Clear full config on unmerge
+            logger.info("LoRA weights unmerged for %s", module_name)
 
     def get_lora_status(self) -> dict[str, Any]:
         """
