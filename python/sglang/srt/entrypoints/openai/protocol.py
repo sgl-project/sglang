@@ -279,6 +279,7 @@ class CompletionRequest(BaseModel):
     attention_capture_layer_ids: Optional[List[int]] = None  # Specific layers to capture (overrides attention_capture_layer_id)
     attention_sketch_mode: bool = False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
     attention_fingerprint_mode: Optional[bool] = None  # Override server fingerprint mode (None = use server default)
+    attention_mask_prefix: Optional[int] = None  # Mask attention to first N tokens (privacy: hide system prompt structure)
 
     # For attention steering (semantic routing loop)
     # Format: {"layer_id": {"token_pos": bias_value, ...}, ...}
@@ -525,6 +526,7 @@ class ChatCompletionRequest(BaseModel):
     attention_capture_layer_ids: Optional[List[int]] = None  # Specific layers to capture (overrides attention_capture_layer_id)
     attention_sketch_mode: bool = False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
     attention_fingerprint_mode: Optional[bool] = None  # Override server fingerprint mode (None = use server default)
+    attention_mask_prefix: Optional[int] = None  # Mask attention to first N tokens (privacy: hide system prompt structure)
 
     # For attention steering (semantic routing loop)
     # Format: {"layer_id": {"token_pos": bias_value, ...}, ...}

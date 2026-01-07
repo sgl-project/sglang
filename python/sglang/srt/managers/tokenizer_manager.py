@@ -932,6 +932,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 attention_capture_layer_ids=obj.attention_capture_layer_ids,
                 attention_sketch_mode=obj.attention_sketch_mode,
                 attention_fingerprint_mode=getattr(obj, 'attention_fingerprint_mode', None),
+                attention_mask_prefix=getattr(obj, 'attention_mask_prefix', None),
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,

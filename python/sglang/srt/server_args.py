@@ -621,6 +621,11 @@ class ServerArgs:
     # Bandwidth-efficient for very long outputs (86k+) - ~500 bytes per layer vs raw edges
     attention_sketch_mode: bool = False
 
+    # Privacy: mask attention to system prompt tokens
+    # Prevents leaking system prompt structure/length through attention patterns
+    attention_mask_system_prompt: bool = False  # Auto-detect and mask system prompt tokens
+    attention_mask_prefix: int = 0  # Manual: mask first N tokens (0 = disabled)
+
     # Attention steering bias caps (prevent OOM from unbounded bias payloads)
     attention_bias_max_layers: int = 8  # Max layers that can have biases
     attention_bias_max_entries_per_layer: int = 1024  # Max bias entries per layer
@@ -4513,6 +4518,20 @@ class ServerArgs:
             help="Enable sketch mode for attention capture. Returns per-layer summary sketches "
                  "(top_hubs, dist_hist, entropy) instead of raw edges. Bandwidth-efficient for "
                  "very long outputs (86k+). ~500 bytes per layer. (default: False)",
+        )
+        parser.add_argument(
+            "--attention-mask-system-prompt",
+            action="store_true",
+            default=ServerArgs.attention_mask_system_prompt,
+            help="Privacy: automatically mask attention to system prompt tokens. "
+                 "Prevents leaking system prompt structure/length through attention patterns. (default: False)",
+        )
+        parser.add_argument(
+            "--attention-mask-prefix",
+            type=int,
+            default=ServerArgs.attention_mask_prefix,
+            help="Privacy: manually mask attention to first N tokens. "
+                 "Set to number of system prompt tokens to hide. 0 disables. (default: 0)",
         )
         parser.add_argument(
             "--attention-bias-max-layers",

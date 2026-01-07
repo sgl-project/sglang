@@ -718,6 +718,7 @@ class Req:
         attention_capture_layer_ids: Optional[List[int]] = None,
         attention_sketch_mode: bool = False,
         attention_fingerprint_mode: Optional[bool] = None,
+        attention_mask_prefix: Optional[int] = None,
         return_moe_routing: bool = False,
         moe_routing_top_k: int = 2,
         moe_capture_layer_ids: Optional[List[int]] = None,
@@ -792,6 +793,7 @@ class Req:
         # Per-request capture control (None = use batch defaults from server_args)
         # These can be set via API or overridden by sidecar feedback
         self.attention_fingerprint_mode: Optional[bool] = attention_fingerprint_mode
+        self.attention_mask_prefix: Optional[int] = attention_mask_prefix  # Privacy: mask first N tokens
         self.attention_fingerprint_max_steps: Optional[int] = None
         self.attention_stride: Optional[int] = None  # Override stride for this request
         self.attention_max_tokens: Optional[int] = None  # Override max tokens for this request
@@ -1530,6 +1532,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     attention_tokens_max: int = 0     # Max tokens to capture (0 = unlimited)
     attention_fingerprint_mode: bool = False  # Fingerprint mode: 64 bytes vs 200KB per step
     attention_fingerprint_max_steps: int = 256  # Early exit: stop after N steps
+    attention_mask_prefix: int = 0  # Privacy: mask first N tokens (from server_args)
 
     @classmethod
     def init_new(

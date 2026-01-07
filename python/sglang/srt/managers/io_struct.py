@@ -214,6 +214,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     attention_sketch_mode: Union[List[bool], bool] = False
     # Override server fingerprint mode per-request (None = use server default, False = raw mode)
     attention_fingerprint_mode: Optional[Union[List[bool], bool]] = None
+    # Privacy: mask attention to first N tokens (hide system prompt structure)
+    attention_mask_prefix: Optional[Union[List[int], int]] = None
     # Attention biases for steering: Dict[layer_id -> Dict[token_pos -> bias]]
     attention_biases: Optional[Union[List[Dict[int, Dict[int, float]]], Dict[int, Dict[int, float]]]] = None
     # MoE routing capture: which experts were selected for each token
@@ -796,6 +798,8 @@ class TokenizedGenerateReqInput(BaseReq):
     attention_sketch_mode: bool = False
     # Override server fingerprint mode per-request (None = use server default, False = raw mode)
     attention_fingerprint_mode: Optional[bool] = None
+    # Privacy: mask attention to first N tokens (hide system prompt structure)
+    attention_mask_prefix: Optional[int] = None
     # Attention biases for steering: Dict[layer_id -> Dict[token_pos -> bias]]
     attention_biases: Optional[Dict[int, Dict[int, float]]] = None
     # MoE routing capture: which experts were selected for each token

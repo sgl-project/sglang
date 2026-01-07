@@ -44,6 +44,46 @@ SKETCH_DIST_BINS = 16   # Number of bins for distance histogram (log scale)
 SKETCH_DIST_MAX = 20    # Max log2 distance for binning (covers 1M+ tokens)
 
 
+def apply_attention_privacy_mask(
+    token_positions: List[int],
+    attention_scores: List[float],
+    mask_prefix: int,
+    topk_logits: Optional[List[float]] = None,
+) -> Tuple[List[int], List[float], Optional[List[float]]]:
+    """
+    Apply privacy mask to attention data.
+
+    Filters out attention to positions < mask_prefix (e.g., system prompt tokens).
+    This prevents leaking system prompt structure/length through attention patterns.
+
+    Args:
+        token_positions: List of attended token positions
+        attention_scores: Corresponding attention scores
+        mask_prefix: Number of prefix tokens to mask (positions < this are hidden)
+        topk_logits: Optional raw logits (masked in parallel)
+
+    Returns:
+        Tuple of (masked_positions, masked_scores, masked_logits)
+        Positions are offset by mask_prefix so masked region appears as position 0.
+    """
+    if mask_prefix <= 0:
+        return token_positions, attention_scores, topk_logits
+
+    masked_positions = []
+    masked_scores = []
+    masked_logits = [] if topk_logits is not None else None
+
+    for i, pos in enumerate(token_positions):
+        if pos >= mask_prefix:
+            # Offset position so system prompt region is hidden
+            masked_positions.append(pos - mask_prefix)
+            masked_scores.append(attention_scores[i] if i < len(attention_scores) else 0.0)
+            if masked_logits is not None and topk_logits is not None:
+                masked_logits.append(topk_logits[i] if i < len(topk_logits) else 0.0)
+
+    return masked_positions, masked_scores, masked_logits
+
+
 def compute_attention_sketch(
     token_positions: List[int],
     attention_scores: List[float],
@@ -669,6 +709,13 @@ class SchedulerOutputProcessorMixin:
                 req_top_k = getattr(req, "top_k_attention", 5)
                 current_pos = len(req.origin_input_ids) + len(req.output_ids) - 1
 
+                # Privacy mask for sketch mode
+                sketch_mask_prefix = getattr(req, "attention_mask_prefix", None)
+                if sketch_mask_prefix is None:
+                    sketch_mask_prefix = getattr(batch, "attention_mask_prefix", 0)
+                if sketch_mask_prefix is None:
+                    sketch_mask_prefix = 0
+
                 if logits_output.attention_multi_layer:
                     # Multi-layer: compute sketch for each layer
                     layer_sketches = {}
@@ -678,8 +725,18 @@ class SchedulerOutputProcessorMixin:
                         logit_list = logits[i].cpu().tolist()[:req_top_k] if logits is not None else None
                         lse_val = logsumexp[i].cpu().item() if logsumexp is not None else None
 
+                        # Apply privacy mask
+                        if sketch_mask_prefix > 0:
+                            pos_list, score_list, logit_list = apply_attention_privacy_mask(
+                                pos_list, score_list, sketch_mask_prefix, logit_list
+                            )
+                            # Adjust current_pos for distance calculations
+                            adjusted_current_pos = current_pos - sketch_mask_prefix
+                        else:
+                            adjusted_current_pos = current_pos
+
                         layer_sketches[layer_id] = compute_attention_sketch(
-                            pos_list, score_list, logit_list, lse_val, current_pos
+                            pos_list, score_list, logit_list, lse_val, adjusted_current_pos
                         )
 
                     attention_info = {
@@ -702,8 +759,17 @@ class SchedulerOutputProcessorMixin:
                         if logits_output.attention_logsumexp_candidates is not None else None
                     )
 
+                    # Apply privacy mask
+                    if sketch_mask_prefix > 0:
+                        pos_list, score_list, logit_list = apply_attention_privacy_mask(
+                            pos_list, score_list, sketch_mask_prefix, logit_list
+                        )
+                        adjusted_current_pos = current_pos - sketch_mask_prefix
+                    else:
+                        adjusted_current_pos = current_pos
+
                     sketch = compute_attention_sketch(
-                        pos_list, score_list, logit_list, lse_val, current_pos
+                        pos_list, score_list, logit_list, lse_val, adjusted_current_pos
                     )
                     attention_info = {
                         "schema_version": 1,
@@ -729,17 +795,35 @@ class SchedulerOutputProcessorMixin:
                 # Slice to this request's actual top_k (batch may use max across requests)
                 req_top_k = getattr(req, "top_k_attention", 5)
 
+                # Privacy mask: hide attention to system prompt tokens
+                # Priority: per-request > batch default > server default
+                mask_prefix = getattr(req, "attention_mask_prefix", None)
+                if mask_prefix is None:
+                    mask_prefix = getattr(batch, "attention_mask_prefix", 0)
+                if mask_prefix is None:
+                    mask_prefix = 0
+
                 # Check for multi-layer attention data
                 if logits_output.attention_multi_layer:
                     # Multi-layer capture: create entry with all layers
                     layers_data = {}
                     for layer_id, (positions, scores, logits, logsumexp) in logits_output.attention_multi_layer.items():
+                        pos_list = positions[i].cpu().tolist()[:req_top_k]
+                        score_list = scores[i].cpu().tolist()[:req_top_k]
+                        logit_list = logits[i].cpu().tolist()[:req_top_k] if logits is not None else None
+
+                        # Apply privacy mask
+                        if mask_prefix > 0:
+                            pos_list, score_list, logit_list = apply_attention_privacy_mask(
+                                pos_list, score_list, mask_prefix, logit_list
+                            )
+
                         layer_entry = {
-                            "token_positions": positions[i].cpu().tolist()[:req_top_k],
-                            "attention_scores": scores[i].cpu().tolist()[:req_top_k],
+                            "token_positions": pos_list,
+                            "attention_scores": score_list,
                         }
-                        if logits is not None:
-                            layer_entry["topk_logits"] = logits[i].cpu().tolist()[:req_top_k]
+                        if logit_list is not None:
+                            layer_entry["topk_logits"] = logit_list
                         if logsumexp is not None:
                             lse_val = logsumexp[i].cpu().item()
                             layer_entry["logsumexp_candidates"] = lse_val
@@ -761,16 +845,21 @@ class SchedulerOutputProcessorMixin:
                     }
                     # Copy last layer data to top level for backward compatibility
                     if logits_output.attention_token_positions is not None:
-                        attention_info["token_positions"] = (
-                            logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
-                        )
-                        attention_info["attention_scores"] = (
-                            logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
-                        )
-                    if logits_output.attention_topk_logits is not None:
-                        attention_info["topk_logits"] = (
+                        top_pos = logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
+                        top_scores = logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
+                        top_logits = (
                             logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
+                            if logits_output.attention_topk_logits is not None else None
                         )
+                        # Apply privacy mask to top-level data
+                        if mask_prefix > 0:
+                            top_pos, top_scores, top_logits = apply_attention_privacy_mask(
+                                top_pos, top_scores, mask_prefix, top_logits
+                            )
+                        attention_info["token_positions"] = top_pos
+                        attention_info["attention_scores"] = top_scores
+                        if top_logits is not None:
+                            attention_info["topk_logits"] = top_logits
                     if logits_output.attention_logsumexp_candidates is not None:
                         lse_val = logits_output.attention_logsumexp_candidates[i].cpu().item()
                         attention_info["logsumexp_candidates"] = lse_val
@@ -782,22 +871,29 @@ class SchedulerOutputProcessorMixin:
                             attention_info["topk_mass"] = topk_mass
                 else:
                     # Single-layer capture (backward compatible format)
+                    single_pos = logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
+                    single_scores = logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
+                    single_logits = (
+                        logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
+                        if logits_output.attention_topk_logits is not None else None
+                    )
+
+                    # Apply privacy mask
+                    if mask_prefix > 0:
+                        single_pos, single_scores, single_logits = apply_attention_privacy_mask(
+                            single_pos, single_scores, mask_prefix, single_logits
+                        )
+
                     attention_info = {
                         "schema_version": 1,
                         "mode": "raw",
-                        "token_positions": logits_output.attention_token_positions[i]
-                        .cpu()
-                        .tolist()[:req_top_k],
-                        "attention_scores": logits_output.attention_token_scores[i]
-                        .cpu()
-                        .tolist()[:req_top_k],
+                        "token_positions": single_pos,
+                        "attention_scores": single_scores,
                         "layer_id": getattr(logits_output, "attention_layer_id", -1),
                     }
                     # Add true probability info if available
-                    if logits_output.attention_topk_logits is not None:
-                        attention_info["topk_logits"] = (
-                            logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
-                        )
+                    if single_logits is not None:
+                        attention_info["topk_logits"] = single_logits
                     if logits_output.attention_logsumexp_candidates is not None:
                         lse_val = logits_output.attention_logsumexp_candidates[i].cpu().item()
                         attention_info["logsumexp_candidates"] = lse_val
