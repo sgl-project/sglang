@@ -297,7 +297,7 @@ class SchedulerOutputProcessorMixin:
                     thread_finish_flag=req.finished(),
                 )
         # Log DP-level prefill load-balancing metrics
-        if self.current_scheduler_metrics_enabled():
+        if self.current_scheduler_metrics_enabled:
             self.log_prefill_dp_balance_stats(batch)
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)

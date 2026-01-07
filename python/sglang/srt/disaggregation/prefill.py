@@ -526,7 +526,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
         # Log DP-level prefill load-balancing metrics
-        if self.current_scheduler_metrics_enabled():
+        if self.current_scheduler_metrics_enabled:
             self.log_prefill_dp_balance_stats(batch)
         self.maybe_send_health_check_signal()
 
