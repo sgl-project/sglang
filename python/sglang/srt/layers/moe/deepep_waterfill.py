@@ -15,15 +15,20 @@
 DeepEP-based Waterfill Load Balancing for Shared Expert.
 
 This module implements waterfill load balancing for shared expert computation
-using DeepEP communication. The key idea is to treat shared expert as the 9th
-expert and dispatch it through DeepEP along with routed experts.
+using DeepEP communication. The key idea is:
 
-Design principles:
-1. Each token's shared expert can be sent to:
+1. Each token's shared expert can ONLY be sent to:
    - One of the ranks it already routes to (no extra communication)
    - Or stay at source rank for local computation
-2. Waterfill algorithm selects the lowest-loaded rank from candidates
-3. Shared expert weight = 1.0 / routed_scaling_factor (for correct combine)
+
+2. Waterfill algorithm selects the lowest-loaded rank from these candidates
+
+3. Implementation strategy:
+   - For tokens staying local: compute shared expert locally, don't include in dispatch
+   - For tokens going remote: encode shared expert as a "virtual expert" on target rank
+   - Virtual expert ID = num_routed_experts + target_rank (e.g., 256..263 for 8 ranks)
+
+4. Shared expert weight = 1.0 / routed_scaling_factor (for correct combine)
 """
 
 import os
@@ -43,8 +48,8 @@ except ImportError:
 # Environment variables
 DEEPEP_WATERFILL_DEBUG = os.environ.get("SGLANG_DEEPEP_WATERFILL_DEBUG", "0") == "1"
 
-# Special expert ID for shared expert (assuming 256 routed experts)
-SHARED_EXPERT_ID = 256
+# Marker for tokens that should compute shared expert locally (not dispatch)
+LOCAL_SHARED_EXPERT_MARKER = -1
 
 
 # ============== Triton Kernels ==============
@@ -251,50 +256,60 @@ def expand_topk_for_shared_expert(
     topk_ids: Tensor,
     topk_weights: Tensor,
     shared_destination: Tensor,
-    shared_expert_id: int,
+    num_routed_experts: int,
     shared_weight: float,
     source_rank: int,
-) -> Tuple[Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor]:
     """
     Expand topk_ids and topk_weights to include shared expert.
+
+    For each token:
+    - If destination == source_rank: mark as LOCAL_SHARED_EXPERT_MARKER (-1)
+      (will be computed locally, not dispatched)
+    - If destination != source_rank: use virtual expert ID = num_routed_experts + dest_rank
+      (will be dispatched to dest_rank which will compute shared expert)
 
     Args:
         topk_ids: [num_tokens, topk] original expert IDs
         topk_weights: [num_tokens, topk] original expert weights
         shared_destination: [num_tokens] destination ranks for shared expert
-        shared_expert_id: Expert ID for shared expert (e.g., 256)
+        num_routed_experts: Number of routed experts (e.g., 256)
         shared_weight: Weight for shared expert (1.0 / routed_scaling_factor)
         source_rank: Current rank ID
 
     Returns:
         expanded_topk_ids: [num_tokens, topk+1]
         expanded_topk_weights: [num_tokens, topk+1]
+        local_shared_mask: [num_tokens] boolean mask for tokens with local shared expert
     """
     num_tokens = topk_ids.shape[0]
     device = topk_ids.device
 
+    # Determine which tokens compute shared expert locally vs remotely
+    local_shared_mask = shared_destination == source_rank
+
     # Create expanded tensors
     expanded_topk_ids = torch.cat(
-        [topk_ids, torch.full((num_tokens, 1), -1, dtype=topk_ids.dtype, device=device)],
+        [topk_ids, torch.full((num_tokens, 1), LOCAL_SHARED_EXPERT_MARKER, dtype=topk_ids.dtype, device=device)],
         dim=1,
     )
     expanded_topk_weights = torch.cat(
-        [topk_weights, torch.zeros((num_tokens, 1), dtype=topk_weights.dtype, device=device)],
+        [topk_weights, torch.full((num_tokens, 1), shared_weight, dtype=topk_weights.dtype, device=device)],
         dim=1,
     )
 
-    # Set shared expert ID and weight for tokens that will be dispatched
-    # Tokens staying at source_rank will have shared_expert_id, others will use -1
-    # Actually, all tokens need shared expert computed, so we set the ID
-    # The destination is encoded in the expert_id: shared_expert_id + destination_rank
-    # Or we can use a separate mechanism
+    # For tokens that send shared expert to remote rank:
+    # Set expert ID = num_routed_experts + destination_rank
+    # This creates "virtual experts" 256, 257, ..., 263 (for 8 ranks)
+    # Each virtual expert will be handled by its corresponding rank
+    remote_shared_mask = ~local_shared_mask
+    if remote_shared_mask.any():
+        virtual_expert_ids = num_routed_experts + shared_destination
+        expanded_topk_ids[remote_shared_mask, -1] = virtual_expert_ids[remote_shared_mask]
 
-    # For simplicity, use shared_expert_id for all tokens
-    # The destination is determined by which rank receives the token
-    expanded_topk_ids[:, -1] = shared_expert_id
-    expanded_topk_weights[:, -1] = shared_weight
+    # Tokens with local shared expert keep -1 (won't be dispatched for the 9th slot)
 
-    return expanded_topk_ids, expanded_topk_weights
+    return expanded_topk_ids, expanded_topk_weights, local_shared_mask
 
 
 # ============== Main API ==============
@@ -304,9 +319,16 @@ class DeepEPWaterfillBalancer:
     """
     Waterfill load balancer for DeepEP-based shared expert dispatch.
 
+    The balancer assigns each token's shared expert computation to either:
+    1. A rank it already routes to (no extra communication)
+    2. The source rank (local computation)
+
+    Virtual expert IDs for shared expert: num_routed_experts + rank_id
+    E.g., for 256 routed experts and 8 ranks: virtual IDs are 256, 257, ..., 263
+
     Usage:
         balancer = DeepEPWaterfillBalancer(num_experts=256, world_size=8, rank=0)
-        expanded_topk = balancer.prepare_dispatch(topk_ids, topk_weights, routed_counts)
+        expanded_topk, local_mask = balancer.prepare_dispatch(topk_ids, topk_weights, routed_counts)
     """
 
     MIN_BATCH_FOR_BALANCE = 64
@@ -326,8 +348,9 @@ class DeepEPWaterfillBalancer:
         self.shared_weight = 1.0 / routed_scaling_factor if routed_scaling_factor != 0 else 1.0
         self.use_triton = use_triton and HAS_TRITON
 
-        # Shared expert ID
-        self.shared_expert_id = SHARED_EXPERT_ID
+        # Virtual expert IDs for shared expert on each rank
+        # rank 0 -> num_experts + 0, rank 1 -> num_experts + 1, etc.
+        self.shared_expert_base_id = num_experts
 
     def count_local_routed(self, topk_ids: Tensor) -> Tensor:
         """Count routed tokens per rank from local topk_ids."""
@@ -427,104 +450,90 @@ class DeepEPWaterfillBalancer:
         Returns:
             expanded_topk_ids: [num_tokens, topk+1]
             expanded_topk_weights: [num_tokens, topk+1]
-            shared_destination: [num_tokens] destination ranks
+            local_shared_mask: [num_tokens] boolean mask for local shared expert tokens
         """
-        # Assign shared expert destination
+        # Assign shared expert destination using waterfill
         shared_destination = self.assign_shared_destination(topk_ids, routed_counts)
 
-        # Expand topk to include shared expert
-        expanded_topk_ids, expanded_topk_weights = expand_topk_for_shared_expert(
+        # Expand topk to include shared expert (with correct virtual expert IDs)
+        expanded_topk_ids, expanded_topk_weights, local_shared_mask = expand_topk_for_shared_expert(
             topk_ids,
             topk_weights,
             shared_destination,
-            self.shared_expert_id,
+            self.num_experts,  # num_routed_experts
             self.shared_weight,
             self.rank,
         )
 
         if DEEPEP_WATERFILL_DEBUG:
+            num_local = local_shared_mask.sum().item()
+            num_remote = (~local_shared_mask).sum().item()
             print(
                 f"[DeepEP Waterfill] rank={self.rank} "
                 f"num_tokens={topk_ids.shape[0]} "
+                f"local_shared={num_local} remote_shared={num_remote} "
                 f"routed_counts={routed_counts.tolist()} "
                 f"shared_weight={self.shared_weight:.4f}"
             )
 
-        return expanded_topk_ids, expanded_topk_weights, shared_destination
+        return expanded_topk_ids, expanded_topk_weights, local_shared_mask
 
 
-def split_shared_and_routed_tokens(
-    hidden_states: Tensor,
-    topk_ids: Tensor,
-    topk_weights: Tensor,
-    shared_expert_id: int,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+def identify_received_shared_tokens(
+    recv_topk_ids: Tensor,
+    num_routed_experts: int,
+    current_rank: int,
+) -> Tuple[Tensor, Tensor]:
     """
-    Split received tokens into shared expert tokens and routed expert tokens.
+    Identify received tokens that need shared expert computation on this rank.
 
-    After DeepEP dispatch, each rank receives tokens for its local experts.
-    We need to separate:
-    - Tokens for shared expert (expert_id == shared_expert_id)
-    - Tokens for routed experts (expert_id < shared_expert_id)
+    After DeepEP dispatch, this rank receives tokens from all source ranks.
+    We need to identify tokens that were assigned to compute shared expert here.
+
+    Virtual expert ID for this rank = num_routed_experts + current_rank
 
     Args:
-        hidden_states: [total_recv_tokens, hidden_size] received hidden states
-        topk_ids: [total_recv_tokens, topk+1] received expert IDs
-        topk_weights: [total_recv_tokens, topk+1] received expert weights
-        shared_expert_id: Expert ID for shared expert
+        recv_topk_ids: [total_recv_tokens, topk+1] received expert IDs
+        num_routed_experts: Number of routed experts (e.g., 256)
+        current_rank: Current rank ID
 
     Returns:
-        shared_hidden: Hidden states for shared expert
-        shared_weights: Weights for shared expert
-        routed_hidden: Hidden states for routed experts
-        routed_topk_ids: Expert IDs for routed experts
-        routed_topk_weights: Weights for routed experts
-        shared_indices: Original indices of shared expert tokens
+        shared_mask: [total_recv_tokens] boolean mask for tokens needing shared expert
+        shared_indices: [num_shared] indices of tokens needing shared expert
     """
-    # Find tokens that have shared expert
-    # In expanded topk, the last column is shared expert
-    shared_mask = topk_ids[:, -1] == shared_expert_id
+    # Virtual expert ID for shared expert on this rank
+    virtual_shared_id = num_routed_experts + current_rank
+
+    # Check if the last column (shared expert slot) matches our virtual ID
+    shared_mask = recv_topk_ids[:, -1] == virtual_shared_id
     shared_indices = shared_mask.nonzero(as_tuple=True)[0]
 
-    # Extract shared expert data
-    shared_hidden = hidden_states[shared_indices]
-    shared_weights = topk_weights[shared_indices, -1]
-
-    # For routed experts, use original topk (without last column)
-    routed_topk_ids = topk_ids[:, :-1]
-    routed_topk_weights = topk_weights[:, :-1]
-
-    return (
-        shared_hidden,
-        shared_weights,
-        hidden_states,  # All tokens go through routed path
-        routed_topk_ids,
-        routed_topk_weights,
-        shared_indices,
-    )
+    return shared_mask, shared_indices
 
 
-def merge_shared_and_routed_outputs(
-    shared_output: Tensor,
+def merge_shared_output_inplace(
     routed_output: Tensor,
+    shared_output: Tensor,
     shared_indices: Tensor,
     shared_weights: Tensor,
 ) -> Tensor:
     """
-    Merge shared expert output with routed expert output.
+    Merge shared expert output into routed expert output in-place.
 
     Args:
+        routed_output: [total_tokens, hidden_size] routed expert computation result (modified in-place)
         shared_output: [num_shared, hidden_size] shared expert computation result
-        routed_output: [total_tokens, hidden_size] routed expert computation result
-        shared_indices: [num_shared] indices of shared expert tokens
-        shared_weights: [num_shared] weights for shared expert
+        shared_indices: [num_shared] indices where to add shared output
+        shared_weights: [num_shared] weights for shared expert (already = 1.0 / routed_scaling_factor)
 
     Returns:
-        merged_output: [total_tokens, hidden_size] merged output
+        routed_output: [total_tokens, hidden_size] merged output
     """
-    # Add shared output to corresponding positions
-    # shared_weights is already 1.0 / routed_scaling_factor
-    if shared_output.shape[0] > 0:
+    if shared_output is not None and shared_output.shape[0] > 0:
+        # shared_weights is 1.0 / routed_scaling_factor
+        # After combine's routed_scaling_factor multiplication:
+        # shared contribution = shared_output * shared_weights * routed_scaling_factor
+        #                     = shared_output * (1/rsf) * rsf = shared_output (correct!)
         routed_output.index_add_(
             0,
             shared_indices,
@@ -532,4 +541,39 @@ def merge_shared_and_routed_outputs(
         )
 
     return routed_output
+
+
+def compute_local_shared_expert(
+    hidden_states: Tensor,
+    local_shared_mask: Tensor,
+    shared_expert_fn,
+    shared_weight: float,
+) -> Tuple[Optional[Tensor], Tensor]:
+    """
+    Compute shared expert for tokens that stay local.
+
+    Args:
+        hidden_states: [num_tokens, hidden_size] input hidden states
+        local_shared_mask: [num_tokens] boolean mask for tokens with local shared expert
+        shared_expert_fn: Function to compute shared expert (e.g., self.shared_experts)
+        shared_weight: Weight for shared expert (1.0 / routed_scaling_factor)
+
+    Returns:
+        local_shared_output: [num_tokens, hidden_size] or None if no local tokens
+                             Output is already weighted and shaped for direct addition
+        local_shared_indices: [num_local] indices of local shared expert tokens
+    """
+    local_indices = local_shared_mask.nonzero(as_tuple=True)[0]
+
+    if local_indices.shape[0] == 0:
+        return None, local_indices
+
+    # Compute shared expert for local tokens
+    local_hidden = hidden_states[local_indices]
+    local_output = shared_expert_fn(local_hidden)
+
+    # Weight the output (will be combined later without additional weighting)
+    local_output = local_output * shared_weight
+
+    return local_output, local_indices
 
