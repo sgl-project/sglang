@@ -25,6 +25,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.layer import get_moe_runner_backend
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -39,24 +40,32 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 
 def awq_dequantize_func():
-    '''
+    """
     Get the AWQ dequantize function for the current device
 
     Return:
         - The AWQ dequantize function for the current device.
         - None if the current device is not supported.
-    '''
+    """
     if _is_cuda:
         from sgl_kernel import awq_dequantize
+
         return awq_dequantize
     elif _is_hip:
-        from sglang.srt.layers.quantization.awq_triton import awq_dequantize_triton as awq_dequantize
+        from sglang.srt.layers.quantization.awq_triton import (
+            awq_dequantize_triton as awq_dequantize,
+        )
+
         return awq_dequantize
     elif _is_npu:
-        from sglang.srt.layers.quantization.awq_triton import awq_dequantize_decomposition as awq_dequantize
+        from sglang.srt.layers.quantization.awq_triton import (
+            awq_dequantize_decomposition as awq_dequantize,
+        )
+
         return awq_dequantize
     else:
         return None
+
 
 def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
     return (

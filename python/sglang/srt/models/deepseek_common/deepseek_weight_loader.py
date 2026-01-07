@@ -13,15 +13,16 @@
 # ==============================================================================
 
 import concurrent.futures
+import logging
+from typing import Iterable, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import tqdm
 from transformers import PretrainedConfig
-import logging
-from typing import Iterable, Tuple, Optional
 
-from sglang.srt.environ import envs
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -38,26 +39,26 @@ from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.models.deepseek_common.utils import (
-    awq_dequantize_func,
-    enable_nextn_moe_bf16_cast_to_fp8,
-)
 from sglang.srt.model_loader.utils import (
     maybe_executor_submit,
     should_async_load,
     should_deepgemm_weight_requant_ue8m0,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_common.utils import (
+    awq_dequantize_func,
+    enable_nextn_moe_bf16_cast_to_fp8,
+)
 from sglang.srt.utils import (
     bind_or_assign,
     cpu_has_amx_support,
-    log_info_on_rank0,
-    is_npu,
-    is_cuda,
-    is_cpu,
-    is_hip,
-    is_gfx95_supported,
     get_bool_env_var,
+    is_cpu,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    log_info_on_rank0,
 )
 
 _is_npu = is_npu()
@@ -77,6 +78,7 @@ logger = logging.getLogger(__name__)
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
+
 
 class DeepseekV2WeightLoaderMixin:
     """Mixin for loading weights in DeepSeek V2/V3 models.
@@ -430,7 +432,9 @@ class DeepseekV2WeightLoaderMixin:
                         self_attn.kv_b_proj.qzeros,
                     ).T
                 else:
-                    raise ValueError("AWQ dequantize function is not supported for the current device")
+                    raise ValueError(
+                        "AWQ dequantize function is not supported for the current device"
+                    )
             else:
                 w = self_attn.kv_b_proj.weight
 
@@ -673,4 +677,3 @@ class DeepseekV2WeightLoaderMixin:
         )
         w13_scale.format_ue8m0 = True
         w2_scale.format_ue8m0 = True
-
