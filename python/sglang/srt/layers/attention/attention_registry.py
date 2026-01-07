@@ -52,7 +52,9 @@ def create_flashinfer_backend(runner):
                 kv_indptr_buf=kv_indptr_buf,
                 kv_last_page_len_buf=kv_last_page_len_buf,
             )
-
+        # return FlashInferAttnBackend(
+        #     runner, init_new_workspace=runner.init_new_workspace
+        # )
     else:
         from sglang.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,

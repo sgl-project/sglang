@@ -32,6 +32,7 @@ from sglang.srt.speculative.spec_utils import (
     align_evict_mask_to_page_size,
     assign_req_to_token_pool_func,
     create_accept_length_filter,
+    create_extend_spec_info,
     create_extend_after_decode_spec_info,
     filter_finished_cache_loc_kernel,
     generate_simulated_accept_index,
@@ -644,8 +645,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
         pt = 0
         for i, extend_len in enumerate(batch.extend_lens):
-            input_ids = batch.input_ids[pt : pt + extend_len]
-            batch.input_ids[pt : pt + extend_len] = torch.cat(
+            input_ids = batch.input_ids[pt: pt + extend_len]
+            batch.input_ids[pt: pt + extend_len] = torch.cat(
                 (input_ids[1:], self.verified_id[i].reshape(1))
             )
             pt += extend_len
@@ -733,8 +734,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         batch.seq_lens_sum = sum(batch.seq_lens)
         batch.input_ids = self.verified_id
         self.verified_id = new_verified_id
-        
-        
+
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,

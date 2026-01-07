@@ -391,6 +391,7 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    requests_all_greedy: Optional[bool] = True
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
     requests_all_greedy: Optional[bool] = True

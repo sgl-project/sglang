@@ -64,6 +64,7 @@ suites = {
         TestFile("test_deterministic.py", 400),
         TestFile("test_eagle_infer_a.py", 750),
         TestFile("test_eagle_infer_b.py", 750),
+        TestFile("test_eagle_simple_infer.py", 700),
         TestFile("test_eagle_infer_beta.py", 90),
         TestFile("test_constrained_decoding.py", 150),
         TestFile("test_eval_fp8_accuracy.py", 303),

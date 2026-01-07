@@ -604,7 +604,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                        custom_mask_buf=self.cuda_graph_custom_mask,
+                        custom_mask_buf=custom_mask_buf,
                         mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
                     )
                 )
