@@ -415,6 +415,7 @@ async def async_request_openai_chat_completions(
                         retrieve_payload = {"receipt_id": receipt_id}
                         while True:
                             async with session.post(retrieve_url, json=retrieve_payload) as poll_resp:
+                                print(f"hi call /query_maybe_retrieve {retrieve_payload=} {poll_resp.status=}")
                                 if poll_resp.status == 200:
                                     poll_text = await poll_resp.text()
                                     try:
