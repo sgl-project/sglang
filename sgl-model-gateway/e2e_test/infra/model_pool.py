@@ -127,9 +127,11 @@ class ModelInstance:
 
         Call this before using the instance in a test to prevent eviction.
         Must be paired with a release() call when done.
+        Also updates last_used timestamp atomically with ref count.
         """
         with self._ref_lock:
             self._ref_count += 1
+            self.last_used = time.time()
             logger.debug(
                 "Acquired reference to %s (ref_count=%d)", self.key, self._ref_count
             )
@@ -670,8 +672,8 @@ class ModelPool:
 
         instance = self.instances[key]
 
-        # Update last_used timestamp
-        instance.last_used = time.time()
+        # Note: last_used is updated in acquire() which should be called by fixtures
+        # to prevent eviction during test execution
 
         # Verify worker is still alive and healthy
         if not instance.is_alive():
@@ -712,8 +714,9 @@ class ModelPool:
 
         # Sort by last_used descending (MRU eviction) - evict most recently used first
         # Store (dict_key, instance) tuples to preserve the actual key for eviction
+        # Note: Make a copy of items to avoid RuntimeError if dict is modified during iteration
         evictable: list[tuple[str, ModelInstance]] = []
-        for dict_key, inst in self.instances.items():
+        for dict_key, inst in list(self.instances.items()):
             # Skip instances with active references (tests using them)
             if inst.is_in_use:
                 logger.debug(
