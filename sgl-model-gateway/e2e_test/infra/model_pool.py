@@ -887,6 +887,8 @@ class ModelPool:
         workers: list[WorkerIdentity],
         startup_timeout: int = DEFAULT_STARTUP_TIMEOUT,
         allow_eviction: bool = True,
+        wait_for_gpus: bool = True,
+        gpu_wait_timeout: int = 300,
     ) -> list[ModelInstance]:
         """Launch workers of any type.
 
@@ -899,22 +901,55 @@ class ModelPool:
             workers: List of WorkerIdentity objects specifying workers to launch.
             startup_timeout: Timeout for workers to become healthy.
             allow_eviction: If True, evict MRU models to free GPUs.
+            wait_for_gpus: If True, wait for GPUs to become available when all
+                are in use by other tests (with eviction enabled).
+            gpu_wait_timeout: Max seconds to wait for GPUs (default 5 min).
 
         Returns:
             List of launched ModelInstance objects.
         """
-        with self._lock:
-            return self._launch_workers_unlocked(
-                workers, startup_timeout, allow_eviction
+        deadline = time.time() + gpu_wait_timeout
+        poll_interval = 2.0  # seconds
+
+        while True:
+            with self._lock:
+                result = self._launch_workers_unlocked(
+                    workers, startup_timeout, allow_eviction
+                )
+                if result is not None:
+                    return result
+
+                # _launch_workers_unlocked returns None when GPUs unavailable
+                # after eviction attempt (all workers in use by other tests)
+                if not wait_for_gpus or not allow_eviction:
+                    return []
+
+                if time.time() >= deadline:
+                    logger.warning(
+                        "Timeout waiting for GPUs after %ds, giving up",
+                        gpu_wait_timeout,
+                    )
+                    return []
+
+            # Release lock while waiting so other tests can release workers
+            logger.info(
+                "All GPUs in use by other tests, waiting %.1fs for availability...",
+                poll_interval,
             )
+            time.sleep(poll_interval)
 
     def _launch_workers_unlocked(
         self,
         workers: list[WorkerIdentity],
         startup_timeout: int = DEFAULT_STARTUP_TIMEOUT,
         allow_eviction: bool = True,
-    ) -> list[ModelInstance]:
-        """Internal launch logic. Caller must hold _lock."""
+    ) -> list[ModelInstance] | None:
+        """Internal launch logic. Caller must hold _lock.
+
+        Returns:
+            List of launched instances, empty list if no valid workers,
+            or None if GPUs unavailable (signals caller to wait and retry).
+        """
         if not workers:
             return []
 
@@ -951,6 +986,19 @@ class ModelPool:
                     len(available),
                 )
                 self._evict_for_gpus(total_gpus)
+
+                # Check again after eviction
+                available = self.allocator.available_gpus()
+                if len(available) < total_gpus:
+                    # Still not enough - all workers are in use by other tests
+                    # Return None to signal caller to wait and retry
+                    logger.info(
+                        "Still need %d GPUs, only %d available after eviction. "
+                        "All workers in use by other tests.",
+                        total_gpus,
+                        len(available),
+                    )
+                    return None
             else:
                 logger.warning(
                     "Need %d GPUs, only %d available. Skipping launch.",
