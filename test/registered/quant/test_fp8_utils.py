@@ -7,7 +7,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
 
 
 class TestInverseTransformScaleUe8m0(CustomTestCase):
