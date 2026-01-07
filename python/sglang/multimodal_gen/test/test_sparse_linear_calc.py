@@ -11,13 +11,7 @@ def original_calc_linear(q, k, v):
 def torch_calc_linear(q, k, v):
     kv = torch.matmul(k.transpose(-1, -2), v)
     k_sum = torch.sum(k, dim=-2, keepdim=True)
-
-    q_kv = torch.matmul(q, kv)
-    q_k_sum = torch.matmul(q, k_sum.transpose(-1, -2))
-
-    denominator = q_k_sum + 1e-5
-
-    return q_kv / denominator
+    return torch.matmul(q, kv) / (1e-5 + torch.matmul(q, k_sum.transpose(-1, -2)))
 
 
 for seed in [0, 42, 128, 1024]:
