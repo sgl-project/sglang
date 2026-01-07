@@ -970,6 +970,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             texts, is_cross_encoder_request
         )
 
+        mm_inputs = []
+        if self.mm_processor and obj.contains_mm_input():
+            mm_tasks = []
+            for i, req in enumerate(requests):
+                task = self.mm_data_processor.process(
+                    image_data=obj.image_data[i] if obj.image_data else None,
+                    audio_data=obj.audio_data[i] if obj.audio_data else None,
+                    input_text_or_ids=input_ids_list[i],
+                    request_obj=obj[i],
+                    max_req_input_len=self.max_req_input_len,
+                )
+                mm_tasks.append(task)
+
+            mm_results = await asyncio.gather(*mm_tasks)
+
+            for i, mm_input in enumerate(mm_results):
+                if mm_input and "input_ids" in mm_input:
+                    input_ids_list[i] = mm_input["input_ids"]
+                mm_inputs.append(mm_input)
+
         # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
@@ -977,9 +997,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             token_type_ids = (
                 token_type_ids_list[i] if token_type_ids_list is not None else None
             )
+            mm_input = mm_inputs[i] if mm_inputs else None
             tokenized_objs.append(
                 self._create_tokenized_object(
-                    req, req.text, input_ids_list[i], None, None, token_type_ids
+                    req, req.text, input_ids_list[i], None, mm_input, token_type_ids
                 )
             )
             trace_slice_end(RequestStage.TOKENIZE, req.rid)
