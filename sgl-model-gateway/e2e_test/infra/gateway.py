@@ -328,6 +328,30 @@ class Gateway:
     # Worker Management APIs
     # -------------------------------------------------------------------------
 
+    def _worker_from_api_response(self, w: dict) -> WorkerInfo:
+        """Convert API response dict to WorkerInfo.
+
+        Args:
+            w: Worker dict from API response.
+
+        Returns:
+            WorkerInfo object.
+        """
+        status = "healthy" if w.get("is_healthy", False) else "unhealthy"
+        return WorkerInfo(
+            id=w.get("id", ""),
+            url=w.get("url", ""),
+            model=w.get("model_id"),
+            status=status,
+            pending_requests=w.get("load", 0),
+            metadata={
+                "worker_type": w.get("worker_type"),
+                "connection_mode": w.get("connection_mode"),
+                "priority": w.get("priority"),
+                "cost": w.get("cost"),
+            },
+        )
+
     def list_workers(self, timeout: float = 5.0) -> list[WorkerInfo]:
         """List all workers connected to the gateway.
 
@@ -338,26 +362,9 @@ class Gateway:
             resp = httpx.get(f"{self.base_url}/workers", timeout=timeout)
             if resp.status_code == 200:
                 data = resp.json()
-                workers = []
-                for w in data.get("workers", []):
-                    # Map API fields to WorkerInfo
-                    status = "healthy" if w.get("is_healthy", False) else "unhealthy"
-                    workers.append(
-                        WorkerInfo(
-                            id=w.get("id", ""),
-                            url=w.get("url", ""),
-                            model=w.get("model_id"),
-                            status=status,
-                            pending_requests=w.get("load", 0),
-                            metadata={
-                                "worker_type": w.get("worker_type"),
-                                "connection_mode": w.get("connection_mode"),
-                                "priority": w.get("priority"),
-                                "cost": w.get("cost"),
-                            },
-                        )
-                    )
-                return workers
+                return [
+                    self._worker_from_api_response(w) for w in data.get("workers", [])
+                ]
             return []
         except (httpx.RequestError, httpx.TimeoutException):
             return []
@@ -374,21 +381,7 @@ class Gateway:
         try:
             resp = httpx.get(f"{self.base_url}/workers/{worker_id}", timeout=timeout)
             if resp.status_code == 200:
-                w = resp.json()
-                status = "healthy" if w.get("is_healthy", False) else "unhealthy"
-                return WorkerInfo(
-                    id=w.get("id", ""),
-                    url=w.get("url", ""),
-                    model=w.get("model_id"),
-                    status=status,
-                    pending_requests=w.get("load", 0),
-                    metadata={
-                        "worker_type": w.get("worker_type"),
-                        "connection_mode": w.get("connection_mode"),
-                        "priority": w.get("priority"),
-                        "cost": w.get("cost"),
-                    },
-                )
+                return self._worker_from_api_response(resp.json())
             return None
         except (httpx.RequestError, httpx.TimeoutException):
             return None
