@@ -2,6 +2,7 @@
 #include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
 #include <sgl_kernel/utils.h>    // For div_ceil, RuntimeCheck
+#include <sgl_kernel/vec.cuh>    // For aligned_vector
 
 #include <cuda_fp16.h>
 #include <dlpack/dlpack.h>
@@ -13,6 +14,10 @@
 namespace {
 
 namespace ffi = tvm::ffi;
+
+// Use aligned_vector<T, 4> for vectorized memory access
+template <typename T>
+using Vec4 = device::aligned_vector<T, 4>;
 
 enum NormType : int {
   LayerNorm = 0,
@@ -29,9 +34,8 @@ struct ItemPerThreadTag {
   static constexpr int value = V;
 };
 
-template <typename T4_, typename T_>
+template <typename T_>
 struct DTypeTag {
-  using T4 = T4_;
   using T = T_;
 };
 
@@ -83,22 +87,48 @@ __device__ __forceinline__ void blockReduceSum(T (&vals)[NumVals]) {
   __syncthreads();
 }
 
-// Vector-of-4 type for bfloat16
-struct alignas(8) bf16_4 {
-  cutlass::bfloat16_t x, y, z, w;
-};
+// compute sum of elements in a Vec4
+template <typename T>
+__device__ __forceinline__ float vec4_sum(const Vec4<T>& v) {
+  float sum = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    sum += static_cast<float>(v[j]);
+  }
+  return sum;
+}
 
-struct alignas(8) half4 {
-  __half x, y, z, w;
-};
+// compute sum of squares of elements in a Vec4
+template <typename T>
+__device__ __forceinline__ float vec4_sum_sq(const Vec4<T>& v) {
+  float sum = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    float val = static_cast<float>(v[j]);
+    sum += val * val;
+  }
+  return sum;
+}
+
+// compute sum of squared differences from mean
+template <typename T>
+__device__ __forceinline__ float vec4_variance_sum(const Vec4<T>& v, float mean) {
+  float sum = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    float diff = static_cast<float>(v[j]) - mean;
+    sum += diff * diff;
+  }
+  return sum;
+}
 
 // both scale and shift are scalar
-template <typename T4, typename T, int ITEM_PER_THREAD, NormType norm_type>
+template <typename T, int ITEM_PER_THREAD, NormType norm_type>
 __global__ void norm_twoPassAlgo_stored_locally_e4(
-    T4* output,
-    const T4* input,
-    const T4* gamma,
-    const T4* beta,
+    T* output,
+    const T* input,
+    const T* gamma,
+    const T* beta,
     const T* scale,
     const T* shift,
     const int m,
@@ -110,25 +140,22 @@ __global__ void norm_twoPassAlgo_stored_locally_e4(
   const int bdimx = blockDim.x;
   __shared__ float s_mean, s_variance;
   float local_sums[1] = {0.0f};
-  T4 local_val[ITEM_PER_THREAD];
+  Vec4<T> local_val[ITEM_PER_THREAD];
   const int n_4 = n / 4;
   int offset = m_idx * n_4;
-  input += offset;
-  output += offset;
 
-  const T4 zero = {T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
 #pragma unroll
   for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
     const int index = i * bdimx + tid;
-    local_val[i] = index < n_4 ? input[index] : zero;
-    if constexpr (norm_type == NormType::LayerNorm) {
-      local_sums[0] += static_cast<float>(local_val[i].x) + static_cast<float>(local_val[i].y) +
-                       static_cast<float>(local_val[i].z) + static_cast<float>(local_val[i].w);
+    if (index < n_4) {
+      local_val[i].load(input, offset + index);
     } else {
-      local_sums[0] += static_cast<float>(local_val[i].x) * static_cast<float>(local_val[i].x) +
-                       static_cast<float>(local_val[i].y) * static_cast<float>(local_val[i].y) +
-                       static_cast<float>(local_val[i].z) * static_cast<float>(local_val[i].z) +
-                       static_cast<float>(local_val[i].w) * static_cast<float>(local_val[i].w);
+      local_val[i].fill(T(0.0f));
+    }
+    if constexpr (norm_type == NormType::LayerNorm) {
+      local_sums[0] += vec4_sum(local_val[i]);
+    } else {
+      local_sums[0] += vec4_sum_sq(local_val[i]);
     }
   }
 
@@ -148,12 +175,7 @@ __global__ void norm_twoPassAlgo_stored_locally_e4(
     for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
       const int index = i * bdimx + tid;
       if (index < n_4) {
-        const float4 tmp = {
-            static_cast<float>(local_val[i].x) - s_mean,
-            static_cast<float>(local_val[i].y) - s_mean,
-            static_cast<float>(local_val[i].z) - s_mean,
-            static_cast<float>(local_val[i].w) - s_mean};
-        local_sums[0] += tmp.x * tmp.x + tmp.y * tmp.y + tmp.z * tmp.z + tmp.w * tmp.w;
+        local_sums[0] += vec4_variance_sum(local_val[i], s_mean);
       }
     }
     if (blockDim.x <= 32) {
@@ -168,74 +190,52 @@ __global__ void norm_twoPassAlgo_stored_locally_e4(
   }
   __syncthreads();
 
+  // Load scalar scale/shift once
+  const float scale_v = static_cast<float>(scale[0]);
+  const float shift_v = static_cast<float>(shift[0]);
+
 #pragma unroll
   for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
     const int index = i * bdimx + tid;
     if (index < n_4) {
-      if constexpr (norm_type == NormType::LayerNorm) {
-        const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
-        const T4 beta_val = affine ? beta[index] : T4{T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
-        const T scale_v = scale[0], shift_v = shift[0];
-        const T4 scale_val = {scale_v, scale_v, scale_v, scale_v};
-        const T4 shift_val = {shift_v, shift_v, shift_v, shift_v};
-        T4 tmp;
-        tmp.x =
-            T(((static_cast<float>(local_val[i].x) - s_mean) * s_variance * static_cast<float>(gamma_val.x) +
-               static_cast<float>(beta_val.x)) *
-                  (1.0f + static_cast<float>(scale_val.x)) +
-              static_cast<float>(shift_val.x));
-        tmp.y =
-            T(((static_cast<float>(local_val[i].y) - s_mean) * s_variance * static_cast<float>(gamma_val.y) +
-               static_cast<float>(beta_val.y)) *
-                  (1.0f + static_cast<float>(scale_val.y)) +
-              static_cast<float>(shift_val.y));
-        tmp.z =
-            T(((static_cast<float>(local_val[i].z) - s_mean) * s_variance * static_cast<float>(gamma_val.z) +
-               static_cast<float>(beta_val.z)) *
-                  (1.0f + static_cast<float>(scale_val.z)) +
-              static_cast<float>(shift_val.z));
-        tmp.w =
-            T(((static_cast<float>(local_val[i].w) - s_mean) * s_variance * static_cast<float>(gamma_val.w) +
-               static_cast<float>(beta_val.w)) *
-                  (1.0f + static_cast<float>(scale_val.w)) +
-              static_cast<float>(shift_val.w));
-        output[index] = tmp;
+      Vec4<T> gamma_val, beta_val;
+      if (affine) {
+        gamma_val.load(gamma, index);
+        beta_val.load(beta, index);
       } else {
-        const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
-        const T scale_v = scale[0], shift_v = shift[0];
-        const T4 scale_val = {scale_v, scale_v, scale_v, scale_v};
-        const T4 shift_val = {shift_v, shift_v, shift_v, shift_v};
-        T4 tmp;
-        tmp.x =
-            T((static_cast<float>(local_val[i].x) * s_variance * static_cast<float>(gamma_val.x)) *
-                  (1.0f + static_cast<float>(scale_val.x)) +
-              static_cast<float>(shift_val.x));
-        tmp.y =
-            T((static_cast<float>(local_val[i].y) * s_variance * static_cast<float>(gamma_val.y)) *
-                  (1.0f + static_cast<float>(scale_val.y)) +
-              static_cast<float>(shift_val.y));
-        tmp.z =
-            T((static_cast<float>(local_val[i].z) * s_variance * static_cast<float>(gamma_val.z)) *
-                  (1.0f + static_cast<float>(scale_val.z)) +
-              static_cast<float>(shift_val.z));
-        tmp.w =
-            T((static_cast<float>(local_val[i].w) * s_variance * static_cast<float>(gamma_val.w)) *
-                  (1.0f + static_cast<float>(scale_val.w)) +
-              static_cast<float>(shift_val.w));
-        output[index] = tmp;
+        gamma_val.fill(T(1.0f));
+        beta_val.fill(T(0.0f));
       }
+
+      Vec4<T> tmp;
+      if constexpr (norm_type == NormType::LayerNorm) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
+          float affine_out = normalized * static_cast<float>(gamma_val[j]) + static_cast<float>(beta_val[j]);
+          tmp[j] = T(affine_out * (1.0f + scale_v) + shift_v);
+        }
+      } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float normalized = static_cast<float>(local_val[i][j]) * s_variance;
+          float affine_out = normalized * static_cast<float>(gamma_val[j]);
+          tmp[j] = T(affine_out * (1.0f + scale_v) + shift_v);
+        }
+      }
+      tmp.store(output, offset + index);
     }
   }
 }
 
-template <typename T4, typename T, int ITEM_PER_THREAD, NormType norm_type>
+template <typename T, int ITEM_PER_THREAD, NormType norm_type>
 __global__ void norm_twoPassAlgo_stored_locally_e4_fused_scale_shift(
-    T4* output,
-    const T4* input,
-    const T4* gamma,
-    const T4* beta,
-    const T4* scale,
-    const T4* shift,
+    T* output,
+    const T* input,
+    const T* gamma,
+    const T* beta,
+    const T* scale,
+    const T* shift,
     const int m,
     const int n,
     bool affine,
@@ -247,27 +247,24 @@ __global__ void norm_twoPassAlgo_stored_locally_e4_fused_scale_shift(
   const int bdimx = blockDim.x;
   __shared__ float s_mean, s_variance;
   float local_sums[1] = {0.0f};
-  T4 local_val[ITEM_PER_THREAD];
+  Vec4<T> local_val[ITEM_PER_THREAD];
   const int n_4 = n / 4;
   int offset = m_idx * n_4;
-  input += offset;
-  output += offset;
-  if (!is_scale_c_1) scale += offset;
-  if (!is_shift_c_1) shift += offset;
+  int scale_offset = is_scale_c_1 ? 0 : offset;
+  int shift_offset = is_shift_c_1 ? 0 : offset;
 
-  const T4 zero = {T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
 #pragma unroll
   for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
     const int index = i * bdimx + tid;
-    local_val[i] = index < n_4 ? input[index] : zero;
-    if constexpr (norm_type == NormType::LayerNorm) {
-      local_sums[0] += static_cast<float>(local_val[i].x) + static_cast<float>(local_val[i].y) +
-                       static_cast<float>(local_val[i].z) + static_cast<float>(local_val[i].w);
+    if (index < n_4) {
+      local_val[i].load(input, offset + index);
     } else {
-      local_sums[0] += static_cast<float>(local_val[i].x) * static_cast<float>(local_val[i].x) +
-                       static_cast<float>(local_val[i].y) * static_cast<float>(local_val[i].y) +
-                       static_cast<float>(local_val[i].z) * static_cast<float>(local_val[i].z) +
-                       static_cast<float>(local_val[i].w) * static_cast<float>(local_val[i].w);
+      local_val[i].fill(T(0.0f));
+    }
+    if constexpr (norm_type == NormType::LayerNorm) {
+      local_sums[0] += vec4_sum(local_val[i]);
+    } else {
+      local_sums[0] += vec4_sum_sq(local_val[i]);
     }
   }
 
@@ -287,12 +284,7 @@ __global__ void norm_twoPassAlgo_stored_locally_e4_fused_scale_shift(
     for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
       const int index = i * bdimx + tid;
       if (index < n_4) {
-        const float4 tmp = {
-            static_cast<float>(local_val[i].x) - s_mean,
-            static_cast<float>(local_val[i].y) - s_mean,
-            static_cast<float>(local_val[i].z) - s_mean,
-            static_cast<float>(local_val[i].w) - s_mean};
-        local_sums[0] += tmp.x * tmp.x + tmp.y * tmp.y + tmp.z * tmp.z + tmp.w * tmp.w;
+        local_sums[0] += vec4_variance_sum(local_val[i], s_mean);
       }
     }
     if (blockDim.x <= 32) {
@@ -311,69 +303,47 @@ __global__ void norm_twoPassAlgo_stored_locally_e4_fused_scale_shift(
   for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
     const int index = i * bdimx + tid;
     if (index < n_4) {
-      if constexpr (norm_type == NormType::LayerNorm) {
-        const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
-        const T4 beta_val = affine ? beta[index] : T4{T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
-        const T4 scale_val = scale[index];
-        const T4 shift_val = shift[index];
-        T4 tmp;
-        tmp.x =
-            T(((static_cast<float>(local_val[i].x) - s_mean) * s_variance * static_cast<float>(gamma_val.x) +
-               static_cast<float>(beta_val.x)) *
-                  (1.0f + static_cast<float>(scale_val.x)) +
-              static_cast<float>(shift_val.x));
-        tmp.y =
-            T(((static_cast<float>(local_val[i].y) - s_mean) * s_variance * static_cast<float>(gamma_val.y) +
-               static_cast<float>(beta_val.y)) *
-                  (1.0f + static_cast<float>(scale_val.y)) +
-              static_cast<float>(shift_val.y));
-        tmp.z =
-            T(((static_cast<float>(local_val[i].z) - s_mean) * s_variance * static_cast<float>(gamma_val.z) +
-               static_cast<float>(beta_val.z)) *
-                  (1.0f + static_cast<float>(scale_val.z)) +
-              static_cast<float>(shift_val.z));
-        tmp.w =
-            T(((static_cast<float>(local_val[i].w) - s_mean) * s_variance * static_cast<float>(gamma_val.w) +
-               static_cast<float>(beta_val.w)) *
-                  (1.0f + static_cast<float>(scale_val.w)) +
-              static_cast<float>(shift_val.w));
-        output[index] = tmp;
+      Vec4<T> gamma_val, beta_val, scale_val, shift_val;
+      if (affine) {
+        gamma_val.load(gamma, index);
+        beta_val.load(beta, index);
       } else {
-        const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
-        const T4 scale_val = scale[index];
-        const T4 shift_val = shift[index];
-        T4 tmp;
-        tmp.x =
-            T((static_cast<float>(local_val[i].x) * s_variance * static_cast<float>(gamma_val.x)) *
-                  (1.0f + static_cast<float>(scale_val.x)) +
-              static_cast<float>(shift_val.x));
-        tmp.y =
-            T((static_cast<float>(local_val[i].y) * s_variance * static_cast<float>(gamma_val.y)) *
-                  (1.0f + static_cast<float>(scale_val.y)) +
-              static_cast<float>(shift_val.y));
-        tmp.z =
-            T((static_cast<float>(local_val[i].z) * s_variance * static_cast<float>(gamma_val.z)) *
-                  (1.0f + static_cast<float>(scale_val.z)) +
-              static_cast<float>(shift_val.z));
-        tmp.w =
-            T((static_cast<float>(local_val[i].w) * s_variance * static_cast<float>(gamma_val.w)) *
-                  (1.0f + static_cast<float>(scale_val.w)) +
-              static_cast<float>(shift_val.w));
-        output[index] = tmp;
+        gamma_val.fill(T(1.0f));
+        beta_val.fill(T(0.0f));
       }
+      scale_val.load(scale, scale_offset + index);
+      shift_val.load(shift, shift_offset + index);
+
+      Vec4<T> tmp;
+      if constexpr (norm_type == NormType::LayerNorm) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
+          float affine_out = normalized * static_cast<float>(gamma_val[j]) + static_cast<float>(beta_val[j]);
+          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
+        }
+      } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float normalized = static_cast<float>(local_val[i][j]) * s_variance;
+          float affine_out = normalized * static_cast<float>(gamma_val[j]);
+          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
+        }
+      }
+      tmp.store(output, offset + index);
     }
   }
 }
 
 // 4D scale/shift variant: scale/shift shape [B, F, 1, N]
-template <typename T4, typename T, int ITEM_PER_THREAD, NormType norm_type>
+template <typename T, int ITEM_PER_THREAD, NormType norm_type>
 __global__ void norm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d(
-    T4* output,
-    const T4* input,
-    const T4* gamma,
-    const T4* beta,
-    const T4* scale4d,
-    const T4* shift4d,
+    T* output,
+    const T* input,
+    const T* gamma,
+    const T* beta,
+    const T* scale4d,
+    const T* shift4d,
     const int m,
     const int n,
     const int B,
@@ -386,11 +356,9 @@ __global__ void norm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d(
   const int bdimx = blockDim.x;
   __shared__ float s_mean, s_variance;
   float local_sums[1] = {0.0f};
-  T4 local_val[ITEM_PER_THREAD];
+  Vec4<T> local_val[ITEM_PER_THREAD];
   const int n_4 = n / 4;
   int offset = m_idx * n_4;
-  input += offset;
-  output += offset;
 
   // Compute (b, f) indices for this row
   const int rows_per_b = F * frame_seqlen;
@@ -399,19 +367,18 @@ __global__ void norm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d(
   const int f = s_in_b / frame_seqlen;
   const int base4d = (b * F + f) * n_4;
 
-  const T4 zero = {T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
 #pragma unroll
   for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
     const int index = i * bdimx + tid;
-    local_val[i] = index < n_4 ? input[index] : zero;
-    if constexpr (norm_type == NormType::LayerNorm) {
-      local_sums[0] += static_cast<float>(local_val[i].x) + static_cast<float>(local_val[i].y) +
-                       static_cast<float>(local_val[i].z) + static_cast<float>(local_val[i].w);
+    if (index < n_4) {
+      local_val[i].load(input, offset + index);
     } else {
-      local_sums[0] += static_cast<float>(local_val[i].x) * static_cast<float>(local_val[i].x) +
-                       static_cast<float>(local_val[i].y) * static_cast<float>(local_val[i].y) +
-                       static_cast<float>(local_val[i].z) * static_cast<float>(local_val[i].z) +
-                       static_cast<float>(local_val[i].w) * static_cast<float>(local_val[i].w);
+      local_val[i].fill(T(0.0f));
+    }
+    if constexpr (norm_type == NormType::LayerNorm) {
+      local_sums[0] += vec4_sum(local_val[i]);
+    } else {
+      local_sums[0] += vec4_sum_sq(local_val[i]);
     }
   }
 
@@ -431,12 +398,7 @@ __global__ void norm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d(
     for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
       const int index = i * bdimx + tid;
       if (index < n_4) {
-        const float4 tmp = {
-            static_cast<float>(local_val[i].x) - s_mean,
-            static_cast<float>(local_val[i].y) - s_mean,
-            static_cast<float>(local_val[i].z) - s_mean,
-            static_cast<float>(local_val[i].w) - s_mean};
-        local_sums[0] += tmp.x * tmp.x + tmp.y * tmp.y + tmp.z * tmp.z + tmp.w * tmp.w;
+        local_sums[0] += vec4_variance_sum(local_val[i], s_mean);
       }
     }
     if (blockDim.x <= 32) {
@@ -455,56 +417,34 @@ __global__ void norm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d(
   for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
     const int index = i * bdimx + tid;
     if (index < n_4) {
-      if constexpr (norm_type == NormType::LayerNorm) {
-        const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
-        const T4 beta_val = affine ? beta[index] : T4{T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
-        const T4 scale_val = scale4d[base4d + index];
-        const T4 shift_val = shift4d[base4d + index];
-        T4 tmp;
-        tmp.x =
-            T(((static_cast<float>(local_val[i].x) - s_mean) * s_variance * static_cast<float>(gamma_val.x) +
-               static_cast<float>(beta_val.x)) *
-                  (1.0f + static_cast<float>(scale_val.x)) +
-              static_cast<float>(shift_val.x));
-        tmp.y =
-            T(((static_cast<float>(local_val[i].y) - s_mean) * s_variance * static_cast<float>(gamma_val.y) +
-               static_cast<float>(beta_val.y)) *
-                  (1.0f + static_cast<float>(scale_val.y)) +
-              static_cast<float>(shift_val.y));
-        tmp.z =
-            T(((static_cast<float>(local_val[i].z) - s_mean) * s_variance * static_cast<float>(gamma_val.z) +
-               static_cast<float>(beta_val.z)) *
-                  (1.0f + static_cast<float>(scale_val.z)) +
-              static_cast<float>(shift_val.z));
-        tmp.w =
-            T(((static_cast<float>(local_val[i].w) - s_mean) * s_variance * static_cast<float>(gamma_val.w) +
-               static_cast<float>(beta_val.w)) *
-                  (1.0f + static_cast<float>(scale_val.w)) +
-              static_cast<float>(shift_val.w));
-        output[index] = tmp;
+      Vec4<T> gamma_val, beta_val, scale_val, shift_val;
+      if (affine) {
+        gamma_val.load(gamma, index);
+        beta_val.load(beta, index);
       } else {
-        const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
-        const T4 scale_val = scale4d[base4d + index];
-        const T4 shift_val = shift4d[base4d + index];
-        T4 tmp;
-        tmp.x =
-            T((static_cast<float>(local_val[i].x) * s_variance * static_cast<float>(gamma_val.x)) *
-                  (1.0f + static_cast<float>(scale_val.x)) +
-              static_cast<float>(shift_val.x));
-        tmp.y =
-            T((static_cast<float>(local_val[i].y) * s_variance * static_cast<float>(gamma_val.y)) *
-                  (1.0f + static_cast<float>(scale_val.y)) +
-              static_cast<float>(shift_val.y));
-        tmp.z =
-            T((static_cast<float>(local_val[i].z) * s_variance * static_cast<float>(gamma_val.z)) *
-                  (1.0f + static_cast<float>(scale_val.z)) +
-              static_cast<float>(shift_val.z));
-        tmp.w =
-            T((static_cast<float>(local_val[i].w) * s_variance * static_cast<float>(gamma_val.w)) *
-                  (1.0f + static_cast<float>(scale_val.w)) +
-              static_cast<float>(shift_val.w));
-        output[index] = tmp;
+        gamma_val.fill(T(1.0f));
+        beta_val.fill(T(0.0f));
       }
+      scale_val.load(scale4d, base4d + index);
+      shift_val.load(shift4d, base4d + index);
+
+      Vec4<T> tmp;
+      if constexpr (norm_type == NormType::LayerNorm) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
+          float affine_out = normalized * static_cast<float>(gamma_val[j]) + static_cast<float>(beta_val[j]);
+          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
+        }
+      } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float normalized = static_cast<float>(local_val[i][j]) * s_variance;
+          float affine_out = normalized * static_cast<float>(gamma_val[j]);
+          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
+        }
+      }
+      tmp.store(output, offset + index);
     }
   }
 }
@@ -576,12 +516,12 @@ static void norm_fused_scale_shift_launch(
     };
 
     const auto& dtype = x.dtype();
-    if (dtype.code == kDLFloat && dtype.bits == 32) {
-      dispatch_dtype(DTypeTag<float4, float>{});
-    } else if (dtype.code == kDLFloat && dtype.bits == 16) {
-      dispatch_dtype(DTypeTag<half4, half>{});
-    } else if (dtype.code == kDLBfloat && dtype.bits == 16) {
-      dispatch_dtype(DTypeTag<bf16_4, cutlass::bfloat16_t>{});
+    if (is_type<float>(dtype)) {
+      dispatch_dtype(DTypeTag<float>{});
+    } else if (is_type<half>(dtype)) {
+      dispatch_dtype(DTypeTag<half>{});
+    } else if (is_type<nv_bfloat16>(dtype)) {
+      dispatch_dtype(DTypeTag<cutlass::bfloat16_t>{});
     } else {
       RuntimeCheck(false, "Unsupported dtype. Use float32, float16, or bfloat16.");
     }
@@ -590,16 +530,15 @@ static void norm_fused_scale_shift_launch(
   // If both scale and shift are scalar, launch the below kernel.
   if (scalar_both) {
     auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
-      using T4 = typename decltype(dtype_tag)::T4;
       using T = typename decltype(dtype_tag)::T;
       using IPT = decltype(ipt_tag);
       using NT = decltype(norm_tag);
       LaunchKernel(grid, block, x.device())(
-          norm_twoPassAlgo_stored_locally_e4<T4, T, IPT::value, NT::value>,
-          (T4*)out.data_ptr(),
-          (const T4*)x.data_ptr(),
-          (const T4*)gamma_ptr,
-          (const T4*)beta_ptr,
+          norm_twoPassAlgo_stored_locally_e4<T, IPT::value, NT::value>,
+          (T*)out.data_ptr(),
+          (const T*)x.data_ptr(),
+          (const T*)gamma_ptr,
+          (const T*)beta_ptr,
           (const T*)scale.data_ptr(),
           (const T*)shift.data_ptr(),
           (int)M,
@@ -614,18 +553,17 @@ static void norm_fused_scale_shift_launch(
 
   if (use_2d) {
     auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
-      using T4 = typename decltype(dtype_tag)::T4;
       using T = typename decltype(dtype_tag)::T;
       using IPT = decltype(ipt_tag);
       using NT = decltype(norm_tag);
       LaunchKernel(grid, block, x.device())(
-          norm_twoPassAlgo_stored_locally_e4_fused_scale_shift<T4, T, IPT::value, NT::value>,
-          (T4*)out.data_ptr(),
-          (const T4*)x.data_ptr(),
-          (const T4*)gamma_ptr,
-          (const T4*)beta_ptr,
-          (const T4*)scale.data_ptr(),
-          (const T4*)shift.data_ptr(),
+          norm_twoPassAlgo_stored_locally_e4_fused_scale_shift<T, IPT::value, NT::value>,
+          (T*)out.data_ptr(),
+          (const T*)x.data_ptr(),
+          (const T*)gamma_ptr,
+          (const T*)beta_ptr,
+          (const T*)scale.data_ptr(),
+          (const T*)shift.data_ptr(),
           (int)M,
           (int)N,
           affine,
@@ -646,18 +584,17 @@ static void norm_fused_scale_shift_launch(
   const int frame_seqlen = (int)(M / (B * F));
 
   auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
-    using T4 = typename decltype(dtype_tag)::T4;
     using T = typename decltype(dtype_tag)::T;
     using IPT = decltype(ipt_tag);
     using NT = decltype(norm_tag);
     LaunchKernel(grid, block, x.device())(
-        norm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d<T4, T, IPT::value, NT::value>,
-        (T4*)out.data_ptr(),
-        (const T4*)x.data_ptr(),
-        (const T4*)gamma_ptr,
-        (const T4*)beta_ptr,
-        (const T4*)scale.data_ptr(),
-        (const T4*)shift.data_ptr(),
+        norm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d<T, IPT::value, NT::value>,
+        (T*)out.data_ptr(),
+        (const T*)x.data_ptr(),
+        (const T*)gamma_ptr,
+        (const T*)beta_ptr,
+        (const T*)scale.data_ptr(),
+        (const T*)shift.data_ptr(),
         (int)M,
         (int)N,
         (int)B,
@@ -765,18 +702,18 @@ void fused_rmsnorm_scale_shift(
 // 1: 2D gate [M, N]
 // 2: Bx1xN gate [B, 1, N]
 // 3: BxFx1xN gate [B, F, 1, N]
-template <typename T4, typename T, int ITEM_PER_THREAD, NormType norm_type, bool scalar_both>
+template <typename T, int ITEM_PER_THREAD, NormType norm_type, bool scalar_both>
 __global__ void norm_e4_fused_res_gate_scale_shift_2d(
-    T4* __restrict__ output,
-    T4* __restrict__ residual_out,
-    const T4* __restrict__ x,
-    const T4* __restrict__ residual,
-    const T4* __restrict__ gamma,
-    const T4* __restrict__ beta,
-    const T4* __restrict__ scale,
-    const T4* __restrict__ shift,
-    const T4* __restrict__ gate_mn,  // used when gate_mode == 1
-    const T4* __restrict__ gate_b1,  // used when gate_mode == 2 (flattened [B,1,N] -> [B,N])
+    T* __restrict__ output,
+    T* __restrict__ residual_out,
+    const T* __restrict__ x,
+    const T* __restrict__ residual,
+    const T* __restrict__ gamma,
+    const T* __restrict__ beta,
+    const T* __restrict__ scale,
+    const T* __restrict__ shift,
+    const T* __restrict__ gate_mn,  // used when gate_mode == 1
+    const T* __restrict__ gate_b1,  // used when gate_mode == 2 (flattened [B,1,N] -> [B,N])
     const int m,
     const int n,
     const int gate_mode,
@@ -791,11 +728,9 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
   const int bdimx = blockDim.x;
   __shared__ float s_mean, s_variance;
   float local_sums[1] = {0.0f};
-  T4 local_val[ITEM_PER_THREAD];
+  Vec4<T> local_val[ITEM_PER_THREAD];
   const int n_4 = n / 4;
   const int offset = m_idx * n_4;
-
-  const T4 zero = {T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
 
   const int b = (gate_mode == 2) ? (m_idx / rows_per_b) : 0;
   const int gate_b_base = (gate_mode == 2) ? (b * n_4) : 0;
@@ -804,36 +739,36 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
   for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
     const int index = i * bdimx + tid;
     if (index < n_4) {
-      const T4 x_v = x[offset + index];
-      const T4 r_v = residual[offset + index];
-      T4 g_v;
+      Vec4<T> x_v, r_v, g_v;
+      x_v.load(x, offset + index);
+      r_v.load(residual, offset + index);
+
       if (gate_mode == 0) {
-        g_v = {T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
+        g_v.fill(T(1.0f));
       } else if (gate_mode == 1) {
-        g_v = gate_mn[is_gate_c_1 ? index : (offset + index)];
+        g_v.load(gate_mn, is_gate_c_1 ? index : (offset + index));
       } else {  // gate_mode == 2
-        g_v = gate_b1[gate_b_base + index];
+        g_v.load(gate_b1, gate_b_base + index);
       }
-      T4 sum_v;
-      sum_v.x = T(static_cast<float>(r_v.x) + static_cast<float>(x_v.x) * static_cast<float>(g_v.x));
-      sum_v.y = T(static_cast<float>(r_v.y) + static_cast<float>(x_v.y) * static_cast<float>(g_v.y));
-      sum_v.z = T(static_cast<float>(r_v.z) + static_cast<float>(x_v.z) * static_cast<float>(g_v.z));
-      sum_v.w = T(static_cast<float>(r_v.w) + static_cast<float>(x_v.w) * static_cast<float>(g_v.w));
+
+      Vec4<T> sum_v;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        sum_v[j] = T(static_cast<float>(r_v[j]) + static_cast<float>(x_v[j]) * static_cast<float>(g_v[j]));
+      }
       local_val[i] = sum_v;
+
       if (residual_out != nullptr) {
-        residual_out[offset + index] = sum_v;
+        sum_v.store(residual_out, offset + index);
       }
+
       if constexpr (norm_type == NormType::LayerNorm) {
-        local_sums[0] += static_cast<float>(sum_v.x) + static_cast<float>(sum_v.y) + static_cast<float>(sum_v.z) +
-                         static_cast<float>(sum_v.w);
+        local_sums[0] += vec4_sum(sum_v);
       } else {
-        local_sums[0] += static_cast<float>(sum_v.x) * static_cast<float>(sum_v.x) +
-                         static_cast<float>(sum_v.y) * static_cast<float>(sum_v.y) +
-                         static_cast<float>(sum_v.z) * static_cast<float>(sum_v.z) +
-                         static_cast<float>(sum_v.w) * static_cast<float>(sum_v.w);
+        local_sums[0] += vec4_sum_sq(sum_v);
       }
     } else {
-      local_val[i] = zero;
+      local_val[i].fill(T(0.0f));
     }
   }
 
@@ -853,12 +788,7 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
     for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
       const int index = i * bdimx + tid;
       if (index < n_4) {
-        const float4 tmp = {
-            static_cast<float>(local_val[i].x) - s_mean,
-            static_cast<float>(local_val[i].y) - s_mean,
-            static_cast<float>(local_val[i].z) - s_mean,
-            static_cast<float>(local_val[i].w) - s_mean};
-        local_sums[0] += tmp.x * tmp.x + tmp.y * tmp.y + tmp.z * tmp.z + tmp.w * tmp.w;
+        local_sums[0] += vec4_variance_sum(local_val[i], s_mean);
       }
     }
     if (blockDim.x <= 32) {
@@ -873,93 +803,69 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
   }
   __syncthreads();
 
+  // Pre-load scalar scale/shift if needed
+  float scalar_scale_v = 0.0f, scalar_shift_v = 0.0f;
+  if constexpr (scalar_both) {
+    scalar_scale_v = static_cast<float>(scale[0]);
+    scalar_shift_v = static_cast<float>(shift[0]);
+  }
+
 #pragma unroll
   for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
     const int index = i * bdimx + tid;
     if (index < n_4) {
-      if constexpr (norm_type == NormType::LayerNorm) {
-        const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
-        const T4 beta_val = affine ? beta[index] : T4{T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
-        T4 scale_val, shift_val;
-        if constexpr (scalar_both) {
-          T scale_v = ((const T*)scale)[0];
-          T shift_v = ((const T*)shift)[0];
-          scale_val = {scale_v, scale_v, scale_v, scale_v};
-          shift_val = {shift_v, shift_v, shift_v, shift_v};
-        } else {
-          scale_val = scale[is_scale_c_1 ? index : (offset + index)];
-          shift_val = shift[is_shift_c_1 ? index : (offset + index)];
-        }
-        T4 tmp;
-        tmp.x =
-            T(((static_cast<float>(local_val[i].x) - s_mean) * s_variance * static_cast<float>(gamma_val.x) +
-               static_cast<float>(beta_val.x)) *
-                  (1.0f + static_cast<float>(scale_val.x)) +
-              static_cast<float>(shift_val.x));
-        tmp.y =
-            T(((static_cast<float>(local_val[i].y) - s_mean) * s_variance * static_cast<float>(gamma_val.y) +
-               static_cast<float>(beta_val.y)) *
-                  (1.0f + static_cast<float>(scale_val.y)) +
-              static_cast<float>(shift_val.y));
-        tmp.z =
-            T(((static_cast<float>(local_val[i].z) - s_mean) * s_variance * static_cast<float>(gamma_val.z) +
-               static_cast<float>(beta_val.z)) *
-                  (1.0f + static_cast<float>(scale_val.z)) +
-              static_cast<float>(shift_val.z));
-        tmp.w =
-            T(((static_cast<float>(local_val[i].w) - s_mean) * s_variance * static_cast<float>(gamma_val.w) +
-               static_cast<float>(beta_val.w)) *
-                  (1.0f + static_cast<float>(scale_val.w)) +
-              static_cast<float>(shift_val.w));
-        output[offset + index] = tmp;
+      Vec4<T> gamma_val, beta_val, scale_val, shift_val;
+
+      if (affine) {
+        gamma_val.load(gamma, index);
+        beta_val.load(beta, index);
       } else {
-        const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
-        T4 scale_val, shift_val;
-        if constexpr (scalar_both) {
-          T scale_v = ((const T*)scale)[0];
-          T shift_v = ((const T*)shift)[0];
-          scale_val = {scale_v, scale_v, scale_v, scale_v};
-          shift_val = {shift_v, shift_v, shift_v, shift_v};
-        } else {
-          scale_val = scale[is_scale_c_1 ? index : (offset + index)];
-          shift_val = shift[is_shift_c_1 ? index : (offset + index)];
-        }
-        T4 tmp;
-        tmp.x =
-            T((static_cast<float>(local_val[i].x) * s_variance * static_cast<float>(gamma_val.x)) *
-                  (1.0f + static_cast<float>(scale_val.x)) +
-              static_cast<float>(shift_val.x));
-        tmp.y =
-            T((static_cast<float>(local_val[i].y) * s_variance * static_cast<float>(gamma_val.y)) *
-                  (1.0f + static_cast<float>(scale_val.y)) +
-              static_cast<float>(shift_val.y));
-        tmp.z =
-            T((static_cast<float>(local_val[i].z) * s_variance * static_cast<float>(gamma_val.z)) *
-                  (1.0f + static_cast<float>(scale_val.z)) +
-              static_cast<float>(shift_val.z));
-        tmp.w =
-            T((static_cast<float>(local_val[i].w) * s_variance * static_cast<float>(gamma_val.w)) *
-                  (1.0f + static_cast<float>(scale_val.w)) +
-              static_cast<float>(shift_val.w));
-        output[offset + index] = tmp;
+        gamma_val.fill(T(1.0f));
+        beta_val.fill(T(0.0f));
       }
+
+      if constexpr (scalar_both) {
+        scale_val.fill(T(scalar_scale_v));
+        shift_val.fill(T(scalar_shift_v));
+      } else {
+        scale_val.load(scale, is_scale_c_1 ? index : (offset + index));
+        shift_val.load(shift, is_shift_c_1 ? index : (offset + index));
+      }
+
+      Vec4<T> tmp;
+      if constexpr (norm_type == NormType::LayerNorm) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
+          float affine_out = normalized * static_cast<float>(gamma_val[j]) + static_cast<float>(beta_val[j]);
+          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
+        }
+      } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float normalized = static_cast<float>(local_val[i][j]) * s_variance;
+          float affine_out = normalized * static_cast<float>(gamma_val[j]);
+          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
+        }
+      }
+      tmp.store(output, offset + index);
     }
   }
 }
 
-template <typename T4, typename T, int ITEM_PER_THREAD, NormType norm_type>
+template <typename T, int ITEM_PER_THREAD, NormType norm_type>
 __global__ void norm_e4_fused_res_gate_scale_shift_4d(
-    T4* __restrict__ output,
-    T4* __restrict__ residual_out,
-    const T4* __restrict__ x,
-    const T4* __restrict__ residual,
-    const T4* __restrict__ gamma,
-    const T4* __restrict__ beta,
-    const T4* __restrict__ scale4d,
-    const T4* __restrict__ shift4d,
-    const T4* __restrict__ gate_mn,  // unused for 4d
-    const T4* __restrict__ gate_b1,  // unused for 4d
-    const T4* __restrict__ gate4d,   // used when gate_mode == 3
+    T* __restrict__ output,
+    T* __restrict__ residual_out,
+    const T* __restrict__ x,
+    const T* __restrict__ residual,
+    const T* __restrict__ gamma,
+    const T* __restrict__ beta,
+    const T* __restrict__ scale4d,
+    const T* __restrict__ shift4d,
+    const T* __restrict__ gate_mn,  // unused for 4d
+    const T* __restrict__ gate_b1,  // unused for 4d
+    const T* __restrict__ gate4d,   // used when gate_mode == 3
     const int m,
     const int n,
     const int gate_mode,  // 0 or 3 expected here
@@ -973,7 +879,7 @@ __global__ void norm_e4_fused_res_gate_scale_shift_4d(
   const int bdimx = blockDim.x;
   __shared__ float s_mean, s_variance;
   float local_sums[1] = {0.0f};
-  T4 local_val[ITEM_PER_THREAD];
+  Vec4<T> local_val[ITEM_PER_THREAD];
   const int n_4 = n / 4;
   const int offset = m_idx * n_4;
 
@@ -984,40 +890,38 @@ __global__ void norm_e4_fused_res_gate_scale_shift_4d(
   const int f = s_in_b / frame_seqlen;
   const int base4d = (b * F + f) * n_4;
 
-  const T4 zero = {T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
-
 #pragma unroll
   for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
     const int index = i * bdimx + tid;
     if (index < n_4) {
-      const T4 x_v = x[offset + index];
-      const T4 r_v = residual[offset + index];
-      T4 g_v;
+      Vec4<T> x_v, r_v, g_v;
+      x_v.load(x, offset + index);
+      r_v.load(residual, offset + index);
+
       if (gate_mode == 0) {
-        g_v = {T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
+        g_v.fill(T(1.0f));
       } else {  // gate_mode == 3
-        g_v = gate4d[base4d + index];
+        g_v.load(gate4d, base4d + index);
       }
-      T4 sum_v;
-      sum_v.x = T(static_cast<float>(r_v.x) + static_cast<float>(x_v.x) * static_cast<float>(g_v.x));
-      sum_v.y = T(static_cast<float>(r_v.y) + static_cast<float>(x_v.y) * static_cast<float>(g_v.y));
-      sum_v.z = T(static_cast<float>(r_v.z) + static_cast<float>(x_v.z) * static_cast<float>(g_v.z));
-      sum_v.w = T(static_cast<float>(r_v.w) + static_cast<float>(x_v.w) * static_cast<float>(g_v.w));
+
+      Vec4<T> sum_v;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        sum_v[j] = T(static_cast<float>(r_v[j]) + static_cast<float>(x_v[j]) * static_cast<float>(g_v[j]));
+      }
       local_val[i] = sum_v;
+
       if (residual_out != nullptr) {
-        residual_out[offset + index] = sum_v;
+        sum_v.store(residual_out, offset + index);
       }
+
       if constexpr (norm_type == NormType::LayerNorm) {
-        local_sums[0] += static_cast<float>(sum_v.x) + static_cast<float>(sum_v.y) + static_cast<float>(sum_v.z) +
-                         static_cast<float>(sum_v.w);
+        local_sums[0] += vec4_sum(sum_v);
       } else {
-        local_sums[0] += static_cast<float>(sum_v.x) * static_cast<float>(sum_v.x) +
-                         static_cast<float>(sum_v.y) * static_cast<float>(sum_v.y) +
-                         static_cast<float>(sum_v.z) * static_cast<float>(sum_v.z) +
-                         static_cast<float>(sum_v.w) * static_cast<float>(sum_v.w);
+        local_sums[0] += vec4_sum_sq(sum_v);
       }
     } else {
-      local_val[i] = zero;
+      local_val[i].fill(T(0.0f));
     }
   }
 
@@ -1037,12 +941,7 @@ __global__ void norm_e4_fused_res_gate_scale_shift_4d(
     for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
       const int index = i * bdimx + tid;
       if (index < n_4) {
-        const float4 tmp = {
-            static_cast<float>(local_val[i].x) - s_mean,
-            static_cast<float>(local_val[i].y) - s_mean,
-            static_cast<float>(local_val[i].z) - s_mean,
-            static_cast<float>(local_val[i].w) - s_mean};
-        local_sums[0] += tmp.x * tmp.x + tmp.y * tmp.y + tmp.z * tmp.z + tmp.w * tmp.w;
+        local_sums[0] += vec4_variance_sum(local_val[i], s_mean);
       }
     }
     if (blockDim.x <= 32) {
@@ -1061,56 +960,35 @@ __global__ void norm_e4_fused_res_gate_scale_shift_4d(
   for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
     const int index = i * bdimx + tid;
     if (index < n_4) {
-      if constexpr (norm_type == NormType::LayerNorm) {
-        const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
-        const T4 beta_val = affine ? beta[index] : T4{T(0.0f), T(0.0f), T(0.0f), T(0.0f)};
-        const T4 scale_val = scale4d[base4d + index];
-        const T4 shift_val = shift4d[base4d + index];
-        T4 tmp;
-        tmp.x =
-            T(((static_cast<float>(local_val[i].x) - s_mean) * s_variance * static_cast<float>(gamma_val.x) +
-               static_cast<float>(beta_val.x)) *
-                  (1.0f + static_cast<float>(scale_val.x)) +
-              static_cast<float>(shift_val.x));
-        tmp.y =
-            T(((static_cast<float>(local_val[i].y) - s_mean) * s_variance * static_cast<float>(gamma_val.y) +
-               static_cast<float>(beta_val.y)) *
-                  (1.0f + static_cast<float>(scale_val.y)) +
-              static_cast<float>(shift_val.y));
-        tmp.z =
-            T(((static_cast<float>(local_val[i].z) - s_mean) * s_variance * static_cast<float>(gamma_val.z) +
-               static_cast<float>(beta_val.z)) *
-                  (1.0f + static_cast<float>(scale_val.z)) +
-              static_cast<float>(shift_val.z));
-        tmp.w =
-            T(((static_cast<float>(local_val[i].w) - s_mean) * s_variance * static_cast<float>(gamma_val.w) +
-               static_cast<float>(beta_val.w)) *
-                  (1.0f + static_cast<float>(scale_val.w)) +
-              static_cast<float>(shift_val.w));
-        output[offset + index] = tmp;
+      Vec4<T> gamma_val, beta_val, scale_val, shift_val;
+
+      if (affine) {
+        gamma_val.load(gamma, index);
+        beta_val.load(beta, index);
       } else {
-        const T4 gamma_val = affine ? gamma[index] : T4{T(1.0f), T(1.0f), T(1.0f), T(1.0f)};
-        const T4 scale_val = scale4d[base4d + index];
-        const T4 shift_val = shift4d[base4d + index];
-        T4 tmp;
-        tmp.x =
-            T((static_cast<float>(local_val[i].x) * s_variance * static_cast<float>(gamma_val.x)) *
-                  (1.0f + static_cast<float>(scale_val.x)) +
-              static_cast<float>(shift_val.x));
-        tmp.y =
-            T((static_cast<float>(local_val[i].y) * s_variance * static_cast<float>(gamma_val.y)) *
-                  (1.0f + static_cast<float>(scale_val.y)) +
-              static_cast<float>(shift_val.y));
-        tmp.z =
-            T((static_cast<float>(local_val[i].z) * s_variance * static_cast<float>(gamma_val.z)) *
-                  (1.0f + static_cast<float>(scale_val.z)) +
-              static_cast<float>(shift_val.z));
-        tmp.w =
-            T((static_cast<float>(local_val[i].w) * s_variance * static_cast<float>(gamma_val.w)) *
-                  (1.0f + static_cast<float>(scale_val.w)) +
-              static_cast<float>(shift_val.w));
-        output[offset + index] = tmp;
+        gamma_val.fill(T(1.0f));
+        beta_val.fill(T(0.0f));
       }
+      scale_val.load(scale4d, base4d + index);
+      shift_val.load(shift4d, base4d + index);
+
+      Vec4<T> tmp;
+      if constexpr (norm_type == NormType::LayerNorm) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
+          float affine_out = normalized * static_cast<float>(gamma_val[j]) + static_cast<float>(beta_val[j]);
+          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
+        }
+      } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float normalized = static_cast<float>(local_val[i][j]) * s_variance;
+          float affine_out = normalized * static_cast<float>(gamma_val[j]);
+          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
+        }
+      }
+      tmp.store(output, offset + index);
     }
   }
 }
@@ -1220,12 +1098,12 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
     };
 
     const auto& dtype = x.dtype();
-    if (dtype.code == kDLFloat && dtype.bits == 32) {
-      dispatch_dtype(DTypeTag<float4, float>{});
-    } else if (dtype.code == kDLFloat && dtype.bits == 16) {
-      dispatch_dtype(DTypeTag<half4, half>{});
-    } else if (dtype.code == kDLBfloat && dtype.bits == 16) {
-      dispatch_dtype(DTypeTag<bf16_4, cutlass::bfloat16_t>{});
+    if (is_type<float>(dtype)) {
+      dispatch_dtype(DTypeTag<float>{});
+    } else if (is_type<half>(dtype)) {
+      dispatch_dtype(DTypeTag<half>{});
+    } else if (is_type<nv_bfloat16>(dtype)) {
+      dispatch_dtype(DTypeTag<cutlass::bfloat16_t>{});
     } else {
       RuntimeCheck(false, "Unsupported dtype. Use float32, float16, or bfloat16.");
     }
@@ -1233,8 +1111,6 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
 
   if (use_2d || scalar_both) {
     const int rows_per_b = (gate_mode == 2) ? (int)(M / gate_opt.value().size(0)) : 0;
-    const auto& scale2d = scale;
-    const auto& shift2d = shift;
     if (scalar_both) {
       RuntimeCheck(
           gate_mode != 3,
@@ -1242,23 +1118,22 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
     }
 
     auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
-      using T4 = typename decltype(dtype_tag)::T4;
       using T = typename decltype(dtype_tag)::T;
       using IPT = decltype(ipt_tag);
       using NT = decltype(norm_tag);
       if (scalar_both) {
         LaunchKernel(grid, block, x.device())(
-            norm_e4_fused_res_gate_scale_shift_2d<T4, T, IPT::value, NT::value, true>,
-            (T4*)y.data_ptr(),
-            (T4*)residual_out.data_ptr(),
-            (const T4*)x.data_ptr(),
-            (const T4*)residual.data_ptr(),
-            (const T4*)gamma_ptr,
-            (const T4*)beta_ptr,
-            (const T4*)scale2d.data_ptr(),
-            (const T4*)shift2d.data_ptr(),
-            (gate_mode == 1) ? (const T4*)gate_opt.value().data_ptr() : nullptr,
-            (gate_mode == 2) ? (const T4*)gate_opt.value().data_ptr() : nullptr,
+            norm_e4_fused_res_gate_scale_shift_2d<T, IPT::value, NT::value, true>,
+            (T*)y.data_ptr(),
+            (T*)residual_out.data_ptr(),
+            (const T*)x.data_ptr(),
+            (const T*)residual.data_ptr(),
+            (const T*)gamma_ptr,
+            (const T*)beta_ptr,
+            (const T*)scale.data_ptr(),
+            (const T*)shift.data_ptr(),
+            (gate_mode == 1) ? (const T*)gate_opt.value().data_ptr() : nullptr,
+            (gate_mode == 2) ? (const T*)gate_opt.value().data_ptr() : nullptr,
             (int)M,
             (int)N,
             gate_mode,
@@ -1270,17 +1145,17 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
             eps);
       } else {
         LaunchKernel(grid, block, x.device())(
-            norm_e4_fused_res_gate_scale_shift_2d<T4, T, IPT::value, NT::value, false>,
-            (T4*)y.data_ptr(),
-            (T4*)residual_out.data_ptr(),
-            (const T4*)x.data_ptr(),
-            (const T4*)residual.data_ptr(),
-            (const T4*)gamma_ptr,
-            (const T4*)beta_ptr,
-            (const T4*)scale2d.data_ptr(),
-            (const T4*)shift2d.data_ptr(),
-            (gate_mode == 1) ? (const T4*)gate_opt.value().data_ptr() : nullptr,
-            (gate_mode == 2) ? (const T4*)gate_opt.value().data_ptr() : nullptr,
+            norm_e4_fused_res_gate_scale_shift_2d<T, IPT::value, NT::value, false>,
+            (T*)y.data_ptr(),
+            (T*)residual_out.data_ptr(),
+            (const T*)x.data_ptr(),
+            (const T*)residual.data_ptr(),
+            (const T*)gamma_ptr,
+            (const T*)beta_ptr,
+            (const T*)scale.data_ptr(),
+            (const T*)shift.data_ptr(),
+            (gate_mode == 1) ? (const T*)gate_opt.value().data_ptr() : nullptr,
+            (gate_mode == 2) ? (const T*)gate_opt.value().data_ptr() : nullptr,
             (int)M,
             (int)N,
             gate_mode,
@@ -1304,23 +1179,22 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
   RuntimeCheck(gate_mode == 0 || gate_mode == 3, "When scale/shift are 4D, gate must be none or 4D [B,F,1,N]");
 
   auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
-    using T4 = typename decltype(dtype_tag)::T4;
     using T = typename decltype(dtype_tag)::T;
     using IPT = decltype(ipt_tag);
     using NT = decltype(norm_tag);
     LaunchKernel(grid, block, x.device())(
-        norm_e4_fused_res_gate_scale_shift_4d<T4, T, IPT::value, NT::value>,
-        (T4*)y.data_ptr(),
-        (T4*)residual_out.data_ptr(),
-        (const T4*)x.data_ptr(),
-        (const T4*)residual.data_ptr(),
-        (const T4*)gamma_ptr,
-        (const T4*)beta_ptr,
-        (const T4*)scale.data_ptr(),
-        (const T4*)shift.data_ptr(),
+        norm_e4_fused_res_gate_scale_shift_4d<T, IPT::value, NT::value>,
+        (T*)y.data_ptr(),
+        (T*)residual_out.data_ptr(),
+        (const T*)x.data_ptr(),
+        (const T*)residual.data_ptr(),
+        (const T*)gamma_ptr,
+        (const T*)beta_ptr,
+        (const T*)scale.data_ptr(),
+        (const T*)shift.data_ptr(),
         nullptr,
         nullptr,
-        (gate_mode == 3) ? (const T4*)gate_opt.value().data_ptr() : nullptr,
+        (gate_mode == 3) ? (const T*)gate_opt.value().data_ptr() : nullptr,
         (int)M,
         (int)N,
         gate_mode,
