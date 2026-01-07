@@ -231,6 +231,41 @@ def parse_junit_xml_for_executed_cases(xml_path: str) -> list[str]:
     return executed_cases
 
 
+def parse_junit_xml_for_case_results(xml_path: str) -> dict[str, str]:
+    """
+    Parse JUnit XML to extract case IDs and their pass/fail status.
+
+    Returns:
+        Dictionary mapping case_id to status ("pass", "fail", or "error").
+    """
+    if not Path(xml_path).exists():
+        return {}
+
+    case_results = {}
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    for testcase in root.iter("testcase"):
+        # Check if test was skipped
+        if testcase.find("skipped") is not None:
+            continue
+
+        name = testcase.get("name", "")
+        # Extract case ID from test name like "test_diffusion_server[qwen_image_t2i]"
+        if "[" in name and "]" in name:
+            case_id = name[name.index("[") + 1 : name.index("]")]
+
+            # Determine status based on child elements
+            if testcase.find("failure") is not None:
+                case_results[case_id] = "fail"
+            elif testcase.find("error") is not None:
+                case_results[case_id] = "error"
+            else:
+                case_results[case_id] = "pass"
+
+    return case_results
+
+
 def write_execution_report(
     suite: str,
     partition_id: int,
@@ -238,6 +273,7 @@ def write_execution_report(
     executed_cases: list[str],
     is_standalone: bool = False,
     standalone_file: str | None = None,
+    case_results: dict[str, str] | None = None,
 ) -> str:
     """
     Write execution report to JSON file.
@@ -252,6 +288,7 @@ def write_execution_report(
         "is_standalone": is_standalone,
         "standalone_file": standalone_file,
         "executed_cases": executed_cases,
+        "case_results": case_results or {},
     }
 
     report_filename = f"execution_report_{suite}_{partition_id}.json"
@@ -264,20 +301,25 @@ def write_execution_report(
     return str(report_path)
 
 
-def run_pytest(files, filter_expr=None, junit_xml_path=None) -> tuple[int, list[str]]:
+def run_pytest(
+    files, filter_expr=None, junit_xml_path=None
+) -> tuple[int, list[str], dict[str, str]]:
     """
     Run pytest with retry logic for flaky tests.
 
     Returns:
-        Tuple of (exit_code, executed_cases) where executed_cases is a list of
-        case IDs that were executed across all retry attempts.
+        Tuple of (exit_code, executed_cases, case_results) where:
+        - executed_cases is a list of case IDs that were executed
+        - case_results is a dict mapping case_id to status ("pass", "fail", "error")
     """
     if not files:
         print("No files to run.")
-        return (0, [])
+        return (0, [], {})
 
     # Accumulate executed cases across all retry attempts
     all_executed_cases: set[str] = set()
+    # Track case results (later runs overwrite earlier status for retried cases)
+    all_case_results: dict[str, str] = {}
 
     base_cmd = [sys.executable, "-m", "pytest", "-s", "-v"]
 
@@ -324,13 +366,16 @@ def run_pytest(files, filter_expr=None, junit_xml_path=None) -> tuple[int, list[
         process.wait()
         returncode = process.returncode
 
-        # Accumulate executed cases from this run before checking return code
+        # Accumulate executed cases and results from this run before checking return code
         if junit_xml_path:
             cases_this_run = parse_junit_xml_for_executed_cases(junit_xml_path)
             all_executed_cases.update(cases_this_run)
+            # Get case results (later runs overwrite earlier status for retried cases)
+            results_this_run = parse_junit_xml_for_case_results(junit_xml_path)
+            all_case_results.update(results_this_run)
 
         if returncode == 0:
-            return (0, list(all_executed_cases))
+            return (0, list(all_executed_cases), all_case_results)
 
         # Exit code 5 means no tests were collected/selected - treat as success
         # when using filters, since some partitions may have all tests filtered out
@@ -339,7 +384,7 @@ def run_pytest(files, filter_expr=None, junit_xml_path=None) -> tuple[int, list[
                 "No tests collected (exit code 5). This is expected when filters "
                 "deselect all tests in a partition. Treating as success."
             )
-            return (0, list(all_executed_cases))
+            return (0, list(all_executed_cases), all_case_results)
 
         # check if the failure is due to an assertion in test_server_utils.py
         full_output = output_bytes.decode("utf-8", errors="replace")
@@ -358,10 +403,10 @@ def run_pytest(files, filter_expr=None, junit_xml_path=None) -> tuple[int, list[
         )
 
         if not (is_perf_assertion or is_flaky_ci_assertion or is_oom_error):
-            return (returncode, list(all_executed_cases))
+            return (returncode, list(all_executed_cases), all_case_results)
 
     logger.info("Max retry exceeded")
-    return (returncode, list(all_executed_cases))
+    return (returncode, list(all_executed_cases), all_case_results)
 
 
 def main():
@@ -456,7 +501,7 @@ def main():
         print()
 
         junit_xml_path = str(target_dir / "junit_results.xml")
-        exit_code, executed_cases = run_pytest(
+        exit_code, executed_cases, case_results = run_pytest(
             suite_files, filter_expr=filter_expr, junit_xml_path=junit_xml_path
         )
 
@@ -467,6 +512,7 @@ def main():
             total_partitions=args.total_partitions,
             executed_cases=executed_cases,
             is_standalone=False,
+            case_results=case_results,
         )
 
     else:
@@ -500,12 +546,17 @@ def main():
 
         # Run without case ID filter (standalone tests are not parametrized)
         junit_xml_path = str(target_dir / "junit_results.xml")
-        exit_code, _ = run_pytest(
+        exit_code, _, _ = run_pytest(
             [standalone_file], filter_expr=args.filter, junit_xml_path=junit_xml_path
         )
 
         # Generate execution report for standalone
         standalone_filename = standalone_files[standalone_idx]
+        # Determine standalone status based on exit code
+        standalone_key = f"standalone:{standalone_filename}"
+        standalone_status = "pass" if exit_code == 0 else "fail"
+        standalone_case_results = {standalone_key: standalone_status}
+
         write_execution_report(
             suite=args.suite,
             partition_id=args.partition_id,
@@ -513,6 +564,7 @@ def main():
             executed_cases=[],  # Standalone doesn't have parametrized cases
             is_standalone=True,
             standalone_file=standalone_filename,
+            case_results=standalone_case_results,
         )
 
     sys.exit(exit_code)

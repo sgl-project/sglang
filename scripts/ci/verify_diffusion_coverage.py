@@ -86,6 +86,26 @@ def collect_executed_cases(reports: list[dict]) -> dict[str, set[str]]:
     return executed
 
 
+def collect_case_results(reports: list[dict]) -> dict[str, dict[str, str]]:
+    """
+    Collect case results (pass/fail/error status) from execution reports.
+
+    Returns:
+        Dictionary mapping suite name to {case_id: status} dictionary.
+    """
+    results = {}
+    for report in reports:
+        suite = report["suite"]
+        if suite not in results:
+            results[suite] = {}
+
+        # Get case_results from report (empty dict for legacy reports)
+        case_results = report.get("case_results", {})
+        results[suite].update(case_results)
+
+    return results
+
+
 def verify_coverage(
     expected: dict[str, set[str]],
     executed: dict[str, set[str]],
@@ -104,6 +124,64 @@ def verify_coverage(
             missing[suite] = suite_missing
 
     return len(missing) == 0, missing
+
+
+def print_results_summary(
+    case_results: dict[str, dict[str, str]],
+) -> tuple[int, int, int]:
+    """
+    Print test results summary and return counts.
+
+    Returns:
+        Tuple of (passed_count, failed_count, error_count)
+    """
+    # Check if we have any results data
+    total_results = sum(len(results) for results in case_results.values())
+    if total_results == 0:
+        print("\nTest Results: No results data available (legacy reports)")
+        return (0, 0, 0)
+
+    # Count by status
+    passed_count = 0
+    failed_count = 0
+    error_count = 0
+    failed_cases: dict[str, list[str]] = {}
+
+    for suite, results in case_results.items():
+        for case_id, status in results.items():
+            if status == "pass":
+                passed_count += 1
+            elif status == "fail":
+                failed_count += 1
+                if suite not in failed_cases:
+                    failed_cases[suite] = []
+                failed_cases[suite].append(case_id)
+            elif status == "error":
+                error_count += 1
+                if suite not in failed_cases:
+                    failed_cases[suite] = []
+                failed_cases[suite].append(f"{case_id} (error)")
+
+    # Print summary
+    total = passed_count + failed_count + error_count
+    print("\n" + "=" * 60)
+    print("Test Results Summary")
+    print("=" * 60)
+    print(f"  Total executed: {total}")
+    print(f"  ✅ Passed: {passed_count}")
+    print(f"  ❌ Failed: {failed_count}")
+    if error_count > 0:
+        print(f"  ⚠️  Errors: {error_count}")
+
+    # Print failed cases if any
+    if failed_cases:
+        print("\nFailed cases:")
+        for suite, cases in sorted(failed_cases.items()):
+            print(f"  {suite}:")
+            for case_id in sorted(cases):
+                print(f"    - {case_id}")
+
+    return (passed_count, failed_count, error_count)
 
 
 def main():
@@ -149,6 +227,9 @@ def main():
     for suite, cases in executed.items():
         print(f"  {suite}: {len(cases)} cases")
 
+    # Collect case results
+    case_results = collect_case_results(reports)
+
     # Verify coverage
     is_complete, missing = verify_coverage(expected, executed)
 
@@ -156,7 +237,6 @@ def main():
         print("\n" + "=" * 60)
         print("✅ COVERAGE: 100% - All test cases executed")
         print("=" * 60)
-        sys.exit(0)
     else:
         print("\n" + "=" * 60)
         print("❌ COVERAGE FAILURE: Missing test cases detected")
@@ -165,7 +245,20 @@ def main():
             print(f"\n{suite.upper()} suite - Missing {len(cases)} case(s):")
             for case_id in sorted(cases):
                 print(f"  - {case_id}")
+
+    # Print test results summary
+    passed_count, failed_count, error_count = print_results_summary(case_results)
+
+    # Exit with appropriate code
+    if not is_complete:
         sys.exit(1)
+    elif failed_count > 0 or error_count > 0:
+        print("\n" + "=" * 60)
+        print("⚠️  WARNING: Some tests failed but coverage is complete")
+        print("=" * 60)
+        sys.exit(0)  # Coverage is complete, failures are visible in results
+    else:
+        sys.exit(0)
 
 
 if __name__ == "__main__":
