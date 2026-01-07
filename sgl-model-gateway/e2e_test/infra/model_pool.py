@@ -293,6 +293,7 @@ class ModelPool:
         self.allocator = allocator or GPUAllocator()
         self.instances: dict[str, ModelInstance] = {}  # key = "model_id:mode"
         self._startup_timeout = DEFAULT_STARTUP_TIMEOUT
+        self._lock = threading.RLock()  # Protects instances dict
 
     def startup(
         self,
@@ -309,11 +310,22 @@ class ModelPool:
         Each WorkerIdentity uniquely identifies a worker by (model_id, mode,
         worker_type, index).
 
+        Thread-safe: Protected by internal lock.
+
         Args:
             requirements: List of WorkerIdentity specifying what to start.
                          If None, starts default model in HTTP mode.
             startup_timeout: Timeout in seconds for all models to become healthy.
         """
+        with self._lock:
+            self._startup_unlocked(requirements, startup_timeout)
+
+    def _startup_unlocked(
+        self,
+        requirements: list[WorkerIdentity] | None = None,
+        startup_timeout: int = DEFAULT_STARTUP_TIMEOUT,
+    ) -> None:
+        """Internal startup logic. Caller must hold _lock."""
         self._startup_timeout = startup_timeout
 
         if requirements is None:
@@ -621,17 +633,34 @@ class ModelPool:
         If the model is not running, it will be launched on-demand with MRU
         eviction if GPU resources are constrained.
 
+        Thread-safe: Protected by internal lock. The returned instance has its
+        reference count incremented (via acquire()) to prevent eviction.
+        Caller MUST call release() on the instance when done.
+
         Args:
             model_id: The model ID (e.g., "llama-8b")
             mode: The mode (ConnectionMode.HTTP or ConnectionMode.GRPC, or string)
             worker_type: The worker type (REGULAR, PREFILL, DECODE). Defaults to REGULAR.
 
         Returns:
-            ModelInstance for the requested model/mode/worker_type.
+            ModelInstance for the requested model/mode/worker_type (already acquired).
 
         Raises:
             RuntimeError: If worker process died or failed health check.
         """
+        with self._lock:
+            instance = self._get_unlocked(model_id, mode, worker_type)
+            # Acquire while holding lock to prevent race with eviction
+            instance.acquire()
+            return instance
+
+    def _get_unlocked(
+        self,
+        model_id: str,
+        mode: ConnectionMode | str,
+        worker_type: WorkerType | str = WorkerType.REGULAR,
+    ) -> ModelInstance:
+        """Internal get logic. Caller must hold _lock."""
         # Accept both enum and string for convenience
         if isinstance(mode, str):
             mode = ConnectionMode(mode)
@@ -831,18 +860,27 @@ class ModelPool:
     ) -> list[ModelInstance]:
         """Get all workers of a specific type for a model.
 
+        Thread-safe: Protected by internal lock. All returned instances have their
+        reference count incremented (via acquire()) to prevent eviction.
+        Caller MUST call release() on each instance when done.
+
         Args:
             model_id: The model ID.
             worker_type: The worker type to filter by.
 
         Returns:
-            List of matching ModelInstance objects.
+            List of matching ModelInstance objects (already acquired).
         """
-        return [
-            inst
-            for inst in self.instances.values()
-            if inst.model_id == model_id and inst.worker_type == worker_type
-        ]
+        with self._lock:
+            workers = [
+                inst
+                for inst in self.instances.values()
+                if inst.model_id == model_id and inst.worker_type == worker_type
+            ]
+            # Acquire all while holding lock to prevent race with eviction
+            for worker in workers:
+                worker.acquire()
+            return workers
 
     def launch_workers(
         self,
@@ -855,6 +893,8 @@ class ModelPool:
         This is the unified method for launching workers. It handles all worker
         types (regular, prefill, decode) uniformly.
 
+        Thread-safe: Protected by internal lock.
+
         Args:
             workers: List of WorkerIdentity objects specifying workers to launch.
             startup_timeout: Timeout for workers to become healthy.
@@ -863,6 +903,18 @@ class ModelPool:
         Returns:
             List of launched ModelInstance objects.
         """
+        with self._lock:
+            return self._launch_workers_unlocked(
+                workers, startup_timeout, allow_eviction
+            )
+
+    def _launch_workers_unlocked(
+        self,
+        workers: list[WorkerIdentity],
+        startup_timeout: int = DEFAULT_STARTUP_TIMEOUT,
+        allow_eviction: bool = True,
+    ) -> list[ModelInstance]:
+        """Internal launch logic. Caller must hold _lock."""
         if not workers:
             return []
 
@@ -976,11 +1028,15 @@ class ModelPool:
         return self.get(model_id, mode).base_url
 
     def shutdown(self) -> None:
-        """Tear down all models."""
-        logger.info("Shutting down model pool (%d instances)", len(self.instances))
-        for instance in self.instances.values():
-            instance.terminate()
-        self.instances.clear()
+        """Tear down all models.
+
+        Thread-safe: Protected by internal lock.
+        """
+        with self._lock:
+            logger.info("Shutting down model pool (%d instances)", len(self.instances))
+            for instance in self.instances.values():
+                instance.terminate()
+            self.instances.clear()
 
     def __enter__(self) -> "ModelPool":
         return self

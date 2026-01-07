@@ -158,6 +158,7 @@ def _setup_pd_backend(
         )
 
     # Try to use pre-launched PD workers, or launch additional ones if needed
+    # get_workers_by_type auto-acquires all returned workers
     existing_prefills = model_pool.get_workers_by_type(model_id, WorkerType.PREFILL)
     existing_decodes = model_pool.get_workers_by_type(model_id, WorkerType.DECODE)
 
@@ -168,6 +169,11 @@ def _setup_pd_backend(
     if missing_prefill == 0 and missing_decode == 0:
         prefills = existing_prefills[:num_prefill]
         decodes = existing_decodes[:num_decode]
+        # Release excess workers we won't use
+        for w in existing_prefills[num_prefill:]:
+            w.release()
+        for w in existing_decodes[num_decode:]:
+            w.release()
         logger.info(
             "Using pre-launched PD workers: %d prefill, %d decode",
             len(prefills),
@@ -206,16 +212,16 @@ def _setup_pd_backend(
         new_instances = model_pool.launch_workers(
             workers_to_launch, startup_timeout=300
         )
+        # Acquire newly launched instances (launch_workers doesn't auto-acquire)
+        for inst in new_instances:
+            inst.acquire()
 
         new_prefills = [w for w in new_instances if w.worker_type == WorkerType.PREFILL]
         new_decodes = [w for w in new_instances if w.worker_type == WorkerType.DECODE]
         prefills = existing_prefills + new_prefills
         decodes = existing_decodes + new_decodes
 
-    # Acquire references to prevent eviction during test
-    all_workers = prefills + decodes
-    for worker in all_workers:
-        worker.acquire()
+    # All workers in prefills and decodes are now acquired
 
     model_path = prefills[0].model_path if prefills else None
 
@@ -272,11 +278,20 @@ def _setup_local_backend(
 
     try:
         if num_workers > 1:
-            existing = model_pool.get_workers_by_type(model_id, WorkerType.REGULAR)
-            existing_for_mode = [w for w in existing if w.mode == connection_mode]
+            # get_workers_by_type auto-acquires all returned workers
+            all_existing = model_pool.get_workers_by_type(model_id, WorkerType.REGULAR)
+            existing_for_mode = [w for w in all_existing if w.mode == connection_mode]
+
+            # Release workers we won't use (wrong mode)
+            for w in all_existing:
+                if w not in existing_for_mode:
+                    w.release()
 
             if len(existing_for_mode) >= num_workers:
                 instances = existing_for_mode[:num_workers]
+                # Release excess workers we won't use
+                for w in existing_for_mode[num_workers:]:
+                    w.release()
             else:
                 missing = num_workers - len(existing_for_mode)
                 workers_to_launch = [
@@ -291,6 +306,9 @@ def _setup_local_backend(
                 new_instances = model_pool.launch_workers(
                     workers_to_launch, startup_timeout=300
                 )
+                # Acquire newly launched instances
+                for inst in new_instances:
+                    inst.acquire()
                 instances = existing_for_mode + new_instances
 
             if not instances:
@@ -298,14 +316,11 @@ def _setup_local_backend(
             worker_urls = [inst.worker_url for inst in instances]
             model_path = instances[0].model_path
         else:
+            # get() auto-acquires the returned instance
             instance = model_pool.get(model_id, connection_mode)
             instances = [instance]
             worker_urls = [instance.worker_url]
             model_path = instance.model_path
-
-        # Acquire references to prevent eviction during test
-        for inst in instances:
-            inst.acquire()
     except RuntimeError as e:
         pytest.fail(str(e))
 
@@ -393,14 +408,12 @@ def backend_router(request: pytest.FixtureRequest, model_pool: "ModelPool"):
     connection_mode = ConnectionMode(backend_name)
 
     try:
+        # get() auto-acquires the returned instance
         instance = model_pool.get(model_id, connection_mode)
     except KeyError:
         pytest.skip(f"Model {model_id}:{backend_name} not available in pool")
     except RuntimeError as e:
         pytest.fail(str(e))
-
-    # Acquire reference to prevent eviction during test
-    instance.acquire()
 
     gateway = Gateway()
     gateway.start(

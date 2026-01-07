@@ -164,12 +164,10 @@ def model_client(request: pytest.FixtureRequest, model_pool: "ModelPool"):
     model_id = marker.args[0]
 
     try:
+        # get() auto-acquires the returned instance
         instance = model_pool.get(model_id)
     except KeyError:
         pytest.skip(f"Model {model_id} not available in model pool")
-
-    # Acquire reference to prevent eviction during test
-    instance.acquire()
 
     client = openai.OpenAI(
         base_url=f"{instance.base_url}/v1",
@@ -203,12 +201,10 @@ def model_base_url(request: pytest.FixtureRequest, model_pool: "ModelPool") -> s
     model_id = marker.args[0]
 
     try:
+        # get() auto-acquires the returned instance
         instance = model_pool.get(model_id)
     except KeyError:
         pytest.skip(f"Model {model_id} not available in model pool")
-
-    # Acquire reference to prevent eviction during test
-    instance.acquire()
 
     yield instance.base_url
 
