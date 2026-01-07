@@ -132,51 +132,10 @@ def _setup_pd_backend(
 
     logger.info("Setting up PD backend for model %s", model_id)
 
-    # Check PD requirements
-    try:
-        import sgl_kernel  # noqa: F401
-
-        logger.info("sgl_kernel imported successfully")
-    except ImportError:
-        logger.info("Skipping PD test: sgl_kernel not available")
-        pytest.skip("sgl_kernel not available, required for PD disaggregation")
-
-    try:
-        import torch
-
-        logger.info("torch imported successfully")
-    except ImportError:
-        logger.info("Skipping PD test: torch not available")
-        pytest.skip("torch not available")
-
-    cuda_available = torch.cuda.is_available()
-    logger.info("CUDA available: %s", cuda_available)
-    if not cuda_available:
-        logger.info("Skipping PD test: CUDA not available")
-        pytest.skip("CUDA not available")
-
     # Get PD configuration from workers marker
     num_prefill = workers_config.get("prefill") or 1
     num_decode = workers_config.get("decode") or 1
-
-    # Check GPU requirements
-    required_gpus = num_prefill + num_decode
-    gpu_count = torch.cuda.device_count()
-    logger.info(
-        "GPU check: need %d GPUs (%d prefill + %d decode), have %d",
-        required_gpus,
-        num_prefill,
-        num_decode,
-        gpu_count,
-    )
-    if gpu_count < required_gpus:
-        logger.info("Skipping PD test: not enough GPUs")
-        pytest.skip(
-            f"PD tests require {required_gpus} GPUs "
-            f"({num_prefill} prefill + {num_decode} decode), found {gpu_count}"
-        )
-
-    logger.info("All PD requirements met, proceeding with worker setup")
+    logger.info("PD config: %d prefill, %d decode workers", num_prefill, num_decode)
 
     # Try to use pre-launched PD workers, or launch additional ones if needed
     # get_workers_by_type auto-acquires all returned workers
