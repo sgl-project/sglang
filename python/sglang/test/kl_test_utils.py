@@ -303,12 +303,16 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
 
     new_input_ids = []
     output_logprobs = []
+    second_turn_outputs = []
+    second_turn_inputs = []
     for i, result in enumerate(results):
         if result["meta_info"]["cached_tokens"] <= len(first_turn_input_ids[i]) + 1:
             print(f"Decode cache miss for prompt {i}, skipping")
             continue
         new_input_ids.append(second_turn_input_ids[i] + result["output_ids"])
         output_logprobs.append(_extract_output_logprobs(result))
+        second_turn_outputs.append(result["output_ids"])
+        second_turn_inputs.append(second_turn_input_ids[i])
 
     assert len(new_input_ids) > 0.5 * len(
         second_turn_input_ids
@@ -316,6 +320,19 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
 
     print("Flush Cache and run prefill to get input logprobs ...")
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)
+
+    # Debug: Print text comparison for first sample
+    # print("\n" + "="*80)
+    # print("TEXT COMPARISON (sample 0):")
+    # print("-"*80)
+    # input_text = tokenizer.decode(new_input_ids[0])
+    # output_text = tokenizer.decode(second_turn_outputs[0])
+    # print(f"Input (prompt + first output + comma):\n{input_text}\n")
+    # print(f"Output (generated using decode cache):\n{output_text}")
+    # print("="*80 + "\n")
+
+    # print(f"Input logprobs (prompt + first output + comma):\n{input_logprobs}\n")
+    # print(f"Output logprobs (generated using decode cache):\n{output_logprobs}")
 
     compare_kl_divergence(
         input_logprobs,

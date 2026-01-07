@@ -18,6 +18,9 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 from typing import List
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_world_size,
+)
 
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.environ import envs
@@ -134,7 +137,9 @@ class MambaPool:
         def at_layer_idx(self, layer: int):
             kwargs = {}
             for k, v in vars(self).items():
-                if k == "conv" or k == "intermediate_conv_window":
+                if k == "intermediate_accepted_steps":
+                    kwargs[k] = v
+                elif k == "conv" or k == "intermediate_conv_window":
                     kwargs[k] = [conv[layer] for conv in v]
                 else:
                     kwargs[k] = v[layer]
@@ -148,7 +153,11 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: torch.Tensor
+        intermediate_k: torch.Tensor
+        intermediate_v: torch.Tensor
+        intermediate_g: torch.Tensor
+        intermediate_beta: torch.Tensor
+        intermediate_accepted_steps: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
 
     def __init__(
@@ -161,10 +170,14 @@ class MambaPool:
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
+        self.tp_size = get_tensor_model_parallel_world_size()
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
         conv_dtype = cache_params.dtype.conv
         ssm_dtype = cache_params.dtype.temporal
+        head_dim = cache_params.shape.head_dim
+        num_heads = cache_params.shape.num_heads // self.tp_size
+        num_k_heads = cache_params.shape.num_k_heads // self.tp_size
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -199,16 +212,54 @@ class MambaPool:
             if speculative_num_draft_tokens is not None:
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
+                intermediate_k = torch.zeros(
                     size=(
                         num_mamba_layers,
-                        spec_state_size + 1,
+                        size + 1,
                         speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
+                        num_k_heads,
+                        head_dim
                     ),
-                    dtype=ssm_dtype,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                intermediate_v = torch.zeros(
+                    size=(
+                        num_mamba_layers,
+                        size + 1,
+                        speculative_num_draft_tokens,
+                        num_heads,
+                        head_dim
+                    ),
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                intermediate_g = torch.zeros(
+                    size=(
+                        num_mamba_layers,
+                        size + 1,
+                        speculative_num_draft_tokens,
+                        num_heads
+                    ),
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                intermediate_beta = torch.zeros(
+                    size=(
+                        num_mamba_layers,
+                        size + 1,
+                        speculative_num_draft_tokens,
+                        num_heads
+                    ),
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                intermediate_accepted_steps = torch.full(
+                    size=(
+                        size + 1,
+                    ),
+                    fill_value=-1,
+                    dtype=torch.int32,
                     device="cuda",
                 )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
@@ -217,7 +268,7 @@ class MambaPool:
                     torch.zeros(
                         size=(
                             num_mamba_layers,
-                            spec_state_size + 1,
+                            size + 1,
                             speculative_num_draft_tokens,
                             conv_shape[0],
                             conv_shape[1],
@@ -230,7 +281,11 @@ class MambaPool:
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
-                    intermediate_ssm=intermediate_ssm_state_cache,
+                    intermediate_k=intermediate_k,
+                    intermediate_v=intermediate_v,
+                    intermediate_g=intermediate_g,
+                    intermediate_beta=intermediate_beta,
+                    intermediate_accepted_steps=intermediate_accepted_steps,
                     intermediate_conv_window=intermediate_conv_window_cache,
                 )
                 logger.info(
@@ -238,7 +293,11 @@ class MambaPool:
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
+                    f"intermediate_k size: {get_tensor_size_bytes(intermediate_k) / GB:.2f}GB "
+                    f"intermediate_v size: {get_tensor_size_bytes(intermediate_v) / GB:.2f}GB "
+                    f"intermediate_g size: {get_tensor_size_bytes(intermediate_g) / GB:.2f}GB "
+                    f"intermediate_beta size: {get_tensor_size_bytes(intermediate_beta) / GB:.2f}GB "
+                    f"intermediate_accepted_steps size: {get_tensor_size_bytes(intermediate_accepted_steps) / GB:.2f}GB "
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
                 )
             else:
@@ -275,6 +334,7 @@ class MambaPool:
         for i in range(len(self.mamba_cache.conv)):
             self.mamba_cache.conv[i][:, select_index] = 0
         self.mamba_cache.temporal[:, select_index] = 0
+        self.mamba_cache.intermediate_accepted_steps[select_index] = -1
 
         return select_index
 
@@ -294,6 +354,26 @@ class MambaPool:
         self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
             :, src_index
         ]
+        # if isinstance(self.mamba_cache, MambaPool.SpeculativeState):
+        #     self.mamba_cache.intermediate_k[:, dst_index] = self.mamba_cache.intermediate_k[
+        #         :, src_index
+        #     ]
+        #     self.mamba_cache.intermediate_v[:, dst_index] = self.mamba_cache.intermediate_v[
+        #         :, src_index
+        #     ]
+        #     self.mamba_cache.intermediate_g[:, dst_index] = self.mamba_cache.intermediate_g[
+        #         :, src_index
+        #     ]
+        #     self.mamba_cache.intermediate_beta[:, dst_index] = self.mamba_cache.intermediate_beta[
+        #         :, src_index
+        #     ]
+        #     self.mamba_cache.intermediate_accepted_steps[dst_index] = self.mamba_cache.intermediate_accepted_steps[
+        #         src_index
+        #     ]
+        #     for i in range(len(self.mamba_cache.intermediate_conv_window)):
+        #         self.mamba_cache.intermediate_conv_window[i][:, dst_index] = self.mamba_cache.intermediate_conv_window[i][
+        #             :, src_index
+        #         ]
         return
 
     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
