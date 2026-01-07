@@ -183,9 +183,13 @@ from infra import (
 # Test collection: scan for required workers
 # ---------------------------------------------------------------------------
 
-# Global storage for scanned requirements (ordered by test collection order)
-# Each entry is a WorkerIdentity with model_id, mode, and worker_type
-_scanned_requirements: list[WorkerIdentity] = []
+# Track max worker counts: (model_id, mode, worker_type) -> max_count
+# This unified approach handles regular, prefill, and decode workers the same way
+_worker_counts: dict[tuple[str, ConnectionMode, WorkerType], int] = {}
+
+# Track first-seen order to preserve test collection order
+_first_seen_order: list[tuple[str, ConnectionMode, WorkerType]] = []
+
 _needs_default_model: bool = False  # True if any e2e test lacks explicit model marker
 
 
@@ -197,10 +201,23 @@ def pytest_collection_modifyitems(
     """Scan collected tests to determine required workers.
 
     This runs after test collection but before tests execute.
-    It extracts WorkerIdentity requirements from markers in test collection order,
-    so models needed by earlier tests are launched first.
+    It extracts worker requirements from markers in test collection order,
+    tracking the max count needed for each (model, mode, worker_type) combination.
+
+    All worker types (regular, prefill, decode) are handled uniformly.
     """
-    global _scanned_requirements, _needs_default_model
+    global _worker_counts, _first_seen_order, _needs_default_model
+
+    def track_worker(
+        model_id: str, mode: ConnectionMode, worker_type: WorkerType, count: int
+    ) -> None:
+        """Track a worker requirement, updating max count if needed."""
+        key = (model_id, mode, worker_type)
+        if key not in _worker_counts:
+            _first_seen_order.append(key)
+            _worker_counts[key] = count
+        else:
+            _worker_counts[key] = max(_worker_counts[key], count)
 
     for item in items:
         # Extract model from marker or use default
@@ -228,14 +245,15 @@ def pytest_collection_modifyitems(
                     if isinstance(param_values, (list, tuple)):
                         backends.extend(param_values)
 
-        # Check for PD workers marker (@pytest.mark.workers(prefill=N, decode=N))
+        # Check for workers marker (@pytest.mark.workers(...))
         workers_marker = item.get_closest_marker("workers")
-        is_pd_test = False
+        prefill_count = 0
+        decode_count = 0
+        regular_count = 1  # Default to 1 regular worker
         if workers_marker:
-            prefill = workers_marker.kwargs.get("prefill")
-            decode = workers_marker.kwargs.get("decode")
-            if prefill or decode:
-                is_pd_test = True
+            prefill_count = workers_marker.kwargs.get("prefill") or 0
+            decode_count = workers_marker.kwargs.get("decode") or 0
+            regular_count = workers_marker.kwargs.get("count") or 1
 
         # Track if this test needs default model
         is_e2e = item.get_closest_marker("e2e") is not None
@@ -243,14 +261,17 @@ def pytest_collection_modifyitems(
             _needs_default_model = True
             model_id = DEFAULT_MODEL
 
-        # Add WorkerIdentity requirements in order
+        # Track worker requirements
         if model_id and backends:
             for backend in backends:
                 # "pd" backend means PD workers
                 if backend == "pd":
-                    is_pd_test = True
-                    # PD workers default to HTTP mode
-                    mode = ConnectionMode.HTTP
+                    mode = ConnectionMode.HTTP  # PD uses HTTP mode
+                    # Default to 1 prefill + 1 decode if not specified
+                    p_count = prefill_count if prefill_count > 0 else 1
+                    d_count = decode_count if decode_count > 0 else 1
+                    track_worker(model_id, mode, WorkerType.PREFILL, p_count)
+                    track_worker(model_id, mode, WorkerType.DECODE, d_count)
                 else:
                     try:
                         mode = ConnectionMode(backend)
@@ -258,36 +279,39 @@ def pytest_collection_modifyitems(
                         # Cloud backend (openai, xai, etc.) - skip
                         continue
 
-                if is_pd_test or backend == "pd":
-                    # PD tests need prefill and decode workers
-                    for wt in (WorkerType.PREFILL, WorkerType.DECODE):
-                        identity = WorkerIdentity(model_id, mode, wt)
-                        if identity not in _scanned_requirements:
-                            _scanned_requirements.append(identity)
-                else:
-                    # Regular worker
-                    identity = WorkerIdentity(model_id, mode, WorkerType.REGULAR)
-                    if identity not in _scanned_requirements:
-                        _scanned_requirements.append(identity)
+                    # Check if this backend also has PD workers
+                    if prefill_count > 0 or decode_count > 0:
+                        track_worker(model_id, mode, WorkerType.PREFILL, prefill_count)
+                        track_worker(model_id, mode, WorkerType.DECODE, decode_count)
+                    else:
+                        # Regular worker
+                        track_worker(model_id, mode, WorkerType.REGULAR, regular_count)
 
         elif model_id and is_e2e:
             # E2E test without explicit backend - will use HTTP by default
-            identity = WorkerIdentity(model_id, ConnectionMode.HTTP, WorkerType.REGULAR)
-            if identity not in _scanned_requirements:
-                _scanned_requirements.append(identity)
+            track_worker(model_id, ConnectionMode.HTTP, WorkerType.REGULAR, 1)
 
-    logger.info(
-        "Scanned test requirements (in test order): %s, needs default: %s",
-        [str(r) for r in _scanned_requirements] or ["(none)"],
-        _needs_default_model,
-    )
+    # Log results
+    if _worker_counts:
+        summary = []
+        for key in _first_seen_order:
+            model_id, mode, worker_type = key
+            count = _worker_counts[key]
+            if worker_type == WorkerType.REGULAR:
+                summary.append(f"{model_id}:{mode.value}x{count}")
+            else:
+                summary.append(f"{model_id}:{mode.value}:{worker_type.value}x{count}")
+        logger.info("Scanned worker requirements (in test order): %s", summary)
+    else:
+        logger.info("Scanned worker requirements: (none)")
 
 
 def get_pool_requirements() -> list[WorkerIdentity]:
     """Build pool requirements from scanned test markers.
 
     Returns:
-        List of WorkerIdentity objects to try to pre-launch.
+        List of WorkerIdentity objects to pre-launch.
+        Each WorkerIdentity has (model_id, mode, worker_type, index).
         Requirements are ordered by first appearance in test collection order,
         so workers needed by earlier tests are launched first.
 
@@ -301,32 +325,120 @@ def get_pool_requirements() -> list[WorkerIdentity]:
     models_with_pd_first: set[str] = set()
     first_worker_type_per_model: dict[str, WorkerType] = {}
 
-    for identity in _scanned_requirements:
-        if identity.model_id not in first_worker_type_per_model:
-            first_worker_type_per_model[identity.model_id] = identity.worker_type
-            if identity.is_prefill or identity.is_decode:
-                models_with_pd_first.add(identity.model_id)
+    for model_id, mode, worker_type in _first_seen_order:
+        if model_id not in first_worker_type_per_model:
+            first_worker_type_per_model[model_id] = worker_type
+            if worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
+                models_with_pd_first.add(model_id)
                 logger.info(
                     "Model %s has PD test first - skipping regular worker pre-launch",
-                    identity.model_id,
+                    model_id,
                 )
 
-    # Filter requirements:
-    # - Skip regular workers for models that have PD first
-    # - Keep PD workers (they'll be launched on-demand, but track order)
+    # Generate individual WorkerIdentity objects in first-seen order
     requirements: list[WorkerIdentity] = []
-    for identity in _scanned_requirements:
-        if identity.model_id in models_with_pd_first and identity.is_regular:
-            continue  # Skip regular workers - PD test runs first
+    for model_id, mode, worker_type in _first_seen_order:
+        # Skip regular workers for models that have PD first
+        if model_id in models_with_pd_first and worker_type == WorkerType.REGULAR:
+            continue
 
-        if identity not in requirements:
-            requirements.append(identity)
+        count = _worker_counts.get((model_id, mode, worker_type), 1)
+        for i in range(count):
+            requirements.append(WorkerIdentity(model_id, mode, worker_type, i))
 
     # Add default if no requirements
     if not requirements:
         requirements.append(WorkerIdentity(DEFAULT_MODEL, ConnectionMode.HTTP))
 
     return requirements
+
+
+def validate_gpu_requirements() -> tuple[int, int]:
+    """Check if there are enough GPUs for the required workers.
+
+    Returns:
+        Tuple of (required_gpus, available_gpus).
+
+    Raises:
+        pytest.UsageError: If tests require more GPUs than available.
+    """
+    from infra import MODEL_SPECS
+
+    # Count total GPUs needed
+    required_gpus = 0
+    for (model_id, mode, worker_type), count in _worker_counts.items():
+        if model_id not in MODEL_SPECS:
+            continue
+        spec = MODEL_SPECS[model_id]
+        tp = spec.get("tp", 1)
+        required_gpus += tp * count
+
+    # Count available GPUs
+    available_gpus = 0
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            available_gpus = torch.cuda.device_count()
+    except ImportError:
+        pass
+
+    return required_gpus, available_gpus
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Validate GPU requirements after test collection.
+
+    This runs after all tests are collected but before any tests execute.
+    Fails fast if tests require more GPUs than available.
+    """
+    if not _worker_counts:
+        return
+
+    # Skip validation if model pool is disabled
+    if os.environ.get(ENV_SKIP_MODEL_POOL, "").lower() in ("1", "true", "yes"):
+        return
+
+    required_gpus, available_gpus = validate_gpu_requirements()
+
+    if required_gpus > available_gpus:
+        # Build detailed breakdown
+        from infra import MODEL_SPECS
+
+        breakdown = []
+        for key in _first_seen_order:
+            model_id, mode, worker_type = key
+            if model_id not in MODEL_SPECS:
+                continue
+            count = _worker_counts[key]
+            tp = MODEL_SPECS[model_id].get("tp", 1)
+            gpus = tp * count
+            if worker_type == WorkerType.REGULAR:
+                breakdown.append(f"{model_id}:{mode.value} x{count} = {gpus} GPU(s)")
+            else:
+                breakdown.append(
+                    f"{model_id}:{mode.value}:{worker_type.value} x{count} = {gpus} GPU(s)"
+                )
+
+        raise pytest.UsageError(
+            f"\n{'='*60}\n"
+            f"GPU REQUIREMENTS EXCEEDED\n"
+            f"{'='*60}\n"
+            f"Required: {required_gpus} GPUs\n"
+            f"Available: {available_gpus} GPUs\n"
+            f"\nBreakdown:\n  " + "\n  ".join(breakdown) + "\n"
+            f"\nOptions:\n"
+            f"  1. Run fewer tests with: pytest -k 'test_name'\n"
+            f"  2. Use fewer workers: @pytest.mark.workers(prefill=1, decode=1)\n"
+            f"  3. Skip GPU tests: SKIP_MODEL_POOL=1 pytest\n"
+            f"{'='*60}"
+        )
+
+    logger.info(
+        "GPU validation passed: %d required, %d available",
+        required_gpus,
+        available_gpus,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -383,13 +495,15 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
     routers (~1-2s) pointing to these workers.
 
     Startup behavior:
-    - Scans test markers to determine required (model, mode) combinations
-    - Launches workers sequentially, but they boot up concurrently
+    - Scans test markers to determine required workers (model, mode, type, count)
+    - Launches workers in test collection order
     - Waits for all workers to become healthy before returning
 
     Test requirements are auto-detected from:
-    - @pytest.mark.parametrize("setup_backend", ["grpc", "http"])
+    - @pytest.mark.parametrize("setup_backend", ["grpc", "http", "pd"])
     - @pytest.mark.model("model-name")
+    - @pytest.mark.workers(count=N) for regular workers
+    - @pytest.mark.workers(prefill=N, decode=N) for PD workers
 
     Environment variable overrides:
     - E2E_MODELS: Comma-separated model IDs (e.g., "llama-8b,qwen-7b")
@@ -440,7 +554,7 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
 
         # Create WorkerIdentity objects (regular workers only from env vars)
         requirements = [
-            WorkerIdentity(m, b, WorkerType.REGULAR)
+            WorkerIdentity(m, b, WorkerType.REGULAR, 0)
             for m in models
             for b in backend_modes
         ]
@@ -463,7 +577,10 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
     _model_pool = ModelPool(allocator)
 
     startup_timeout = int(os.environ.get(ENV_STARTUP_TIMEOUT, "300"))
-    _model_pool.startup(requirements=requirements, startup_timeout=startup_timeout)
+    _model_pool.startup(
+        requirements=requirements,
+        startup_timeout=startup_timeout,
+    )
 
     # Log final GPU allocation summary
     logger.info(_model_pool.allocator.summary())
@@ -679,15 +796,16 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
                 f"({num_prefill} prefill + {num_decode} decode), found {gpu_count}"
             )
 
-        # Try to use pre-launched PD workers, or launch new ones if needed
+        # Try to use pre-launched PD workers, or launch additional ones if needed
         existing_prefills = model_pool.get_workers_by_type(model_id, WorkerType.PREFILL)
         existing_decodes = model_pool.get_workers_by_type(model_id, WorkerType.DECODE)
 
-        if (
-            len(existing_prefills) >= num_prefill
-            and len(existing_decodes) >= num_decode
-        ):
-            # Use pre-launched workers
+        # Calculate how many more we need (if any)
+        missing_prefill = max(0, num_prefill - len(existing_prefills))
+        missing_decode = max(0, num_decode - len(existing_decodes))
+
+        if missing_prefill == 0 and missing_decode == 0:
+            # Use pre-launched workers (we have enough)
             prefills = existing_prefills[:num_prefill]
             decodes = existing_decodes[:num_decode]
             logger.info(
@@ -696,13 +814,48 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
                 len(decodes),
             )
         else:
-            # Launch new PD workers (custom config or not pre-launched)
-            prefills, decodes = model_pool.launch_pd_workers(
-                model_id=model_id,
-                num_prefill=num_prefill,
-                num_decode=num_decode,
-                startup_timeout=300,
+            # Build WorkerIdentity list for missing workers
+            workers_to_launch: list[WorkerIdentity] = []
+            for i in range(missing_prefill):
+                workers_to_launch.append(
+                    WorkerIdentity(
+                        model_id,
+                        ConnectionMode.HTTP,
+                        WorkerType.PREFILL,
+                        len(existing_prefills) + i,
+                    )
+                )
+            for i in range(missing_decode):
+                workers_to_launch.append(
+                    WorkerIdentity(
+                        model_id,
+                        ConnectionMode.HTTP,
+                        WorkerType.DECODE,
+                        len(existing_decodes) + i,
+                    )
+                )
+
+            logger.info(
+                "Have %d/%d prefill, %d/%d decode. Launching %d more workers",
+                len(existing_prefills),
+                num_prefill,
+                len(existing_decodes),
+                num_decode,
+                len(workers_to_launch),
             )
+            new_instances = model_pool.launch_workers(
+                workers_to_launch, startup_timeout=300
+            )
+
+            # Combine existing + newly launched
+            new_prefills = [
+                w for w in new_instances if w.worker_type == WorkerType.PREFILL
+            ]
+            new_decodes = [
+                w for w in new_instances if w.worker_type == WorkerType.DECODE
+            ]
+            prefills = existing_prefills + new_prefills
+            decodes = existing_decodes + new_decodes
 
         model_path = prefills[0].model_path if prefills else None
 
@@ -753,17 +906,31 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
 
         try:
             if num_workers > 1:
-                # Launch multiple workers on separate GPUs
-                instances = model_pool.launch_regular_workers(
-                    model_id=model_id,
-                    num_workers=num_workers,
-                    mode=connection_mode,
-                    startup_timeout=300,
-                )
-                if not instances:
-                    pytest.fail(
-                        f"Failed to launch {num_workers} workers for {model_id}"
+                # Check existing workers
+                existing = model_pool.get_workers_by_type(model_id, WorkerType.REGULAR)
+                existing_for_mode = [w for w in existing if w.mode == connection_mode]
+
+                if len(existing_for_mode) >= num_workers:
+                    instances = existing_for_mode[:num_workers]
+                else:
+                    # Launch missing workers
+                    missing = num_workers - len(existing_for_mode)
+                    workers_to_launch = [
+                        WorkerIdentity(
+                            model_id,
+                            connection_mode,
+                            WorkerType.REGULAR,
+                            len(existing_for_mode) + i,
+                        )
+                        for i in range(missing)
+                    ]
+                    new_instances = model_pool.launch_workers(
+                        workers_to_launch, startup_timeout=300
                     )
+                    instances = existing_for_mode + new_instances
+
+                if not instances:
+                    pytest.fail(f"Failed to get {num_workers} workers for {model_id}")
                 worker_urls = [inst.worker_url for inst in instances]
                 model_path = instances[0].model_path
             else:
