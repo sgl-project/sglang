@@ -1888,12 +1888,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         if get_dcp_world_size() > 1:
             if forward_batch.forward_mode.is_decode():
                 # if forward_batch.forward_mode is decode, gather q
-                q_pe = q_pe.contiguous()
-                q_nope_out = q_nope_out.contiguous()
-                # gathered_q_pe = get_dcp_group().all_gather(q_pe, dim=-2)
-                # gathered_q_nope_out = get_dcp_group().all_gather(q_nope_out, dim=-2)
-                # q_pe = gathered_q_pe
-                # q_nope_out = gathered_q_nope_out
                 with use_symmetric_memory(get_dcp_group()):
                     combined = torch.cat([q_pe, q_nope_out], dim=-1)
                 gathered = get_dcp_group().all_gather(combined, dim=-2)
