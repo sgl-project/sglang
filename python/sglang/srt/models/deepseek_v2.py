@@ -780,6 +780,26 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
+        # Initialize DeepEP Waterfill balancer if enabled
+        self._enable_deepep_waterfill = (
+            get_global_server_args().enable_deepep_waterfill
+            and get_moe_a2a_backend().is_deepep()
+            and self.num_fused_shared_experts == 0
+            and config.n_shared_experts is not None
+            and config.n_shared_experts > 0
+        )
+        self.deepep_waterfill_balancer = None
+        if self._enable_deepep_waterfill:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+            from sglang.srt.layers.moe.deepep_waterfill import DeepEPWaterfillBalancer
+
+            self.deepep_waterfill_balancer = DeepEPWaterfillBalancer(
+                num_experts=config.n_routed_experts,
+                world_size=self.moe_ep_size,
+                rank=get_tensor_model_parallel_rank(),
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+
     def get_moe_weights(self):
         return [
             x.data
@@ -818,7 +838,10 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                 )
         else:
-            return self.forward_deepep(hidden_states, forward_batch)
+            if self._enable_deepep_waterfill:
+                return self.forward_deepep_waterfill(hidden_states, forward_batch)
+            else:
+                return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(
         self,
@@ -1161,6 +1184,171 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             return None
+
+    def forward_deepep_waterfill(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """
+        Forward pass with DeepEP-based waterfill load balancing for shared expert.
+
+        This method treats shared expert as a virtual 9th expert and dispatches it
+        through DeepEP along with routed experts based on load balancing.
+
+        Flow:
+        1. Compute router logits and get topk for routed experts
+        2. Count local routed tokens per rank
+        3. AllReduce to get global routed counts
+        4. Use waterfill to assign shared expert destination for each token
+        5. Expand topk_ids/weights to include shared expert (topk=9)
+        6. DeepEP dispatch with expanded topk
+        7. On receiver: split shared/routed tokens, compute separately, merge
+        8. DeepEP combine to return results
+        """
+        from sglang.srt.layers.moe.deepep_waterfill import SHARED_EXPERT_ID
+        from sglang.srt.layers.moe.topk import TopKOutput
+
+        num_tokens = hidden_states.shape[0]
+        device = hidden_states.device
+
+        if num_tokens == 0:
+            # Empty batch - use standard path
+            topk_output = self.topk.empty_topk_output(device)
+            return self.experts(hidden_states=hidden_states, topk_output=topk_output)
+
+        # Step 1: Compute router logits and get topk for routed experts
+        router_logits = self.gate(hidden_states, forward_batch=forward_batch)
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=forward_batch.num_token_non_padded,
+            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                layer_id=self.layer_id,
+            ),
+        )
+        topk_ids = topk_output.topk_ids  # [num_tokens, 8]
+        topk_weights = topk_output.topk_weights  # [num_tokens, 8]
+
+        # Step 2: Count local routed tokens per rank
+        local_routed_counts = self.deepep_waterfill_balancer.count_local_routed(topk_ids)
+
+        # Step 3: AllReduce to get global routed counts
+        global_routed_counts = local_routed_counts.clone()
+        torch.distributed.all_reduce(
+            global_routed_counts, op=torch.distributed.ReduceOp.SUM
+        )
+
+        # Step 4 & 5: Waterfill assignment and expand topk
+        expanded_topk_ids, expanded_topk_weights, shared_destination = (
+            self.deepep_waterfill_balancer.prepare_dispatch(
+                topk_ids, topk_weights, global_routed_counts
+            )
+        )
+
+        # Create expanded TopKOutput for dispatch
+        expanded_topk_output = TopKOutput(
+            topk_weights=expanded_topk_weights,
+            topk_ids=expanded_topk_ids,
+            token_expert_indices=None,
+        )
+
+        # Step 6: DeepEP dispatch with expanded topk
+        dispatcher = self.experts.dispatcher
+        dispatcher.dispatch_a(
+            hidden_states=hidden_states,
+            topk_output=expanded_topk_output,
+        )
+        dispatch_output = dispatcher.dispatch_b()
+
+        # Step 7: Process received tokens
+        recv_hidden = dispatch_output.hidden_states
+        recv_hidden_scale = dispatch_output.hidden_states_scale
+        recv_topk_ids = dispatch_output.topk_ids
+        recv_topk_weights = dispatch_output.topk_weights
+
+        # Identify shared expert tokens (last column = SHARED_EXPERT_ID)
+        shared_mask = recv_topk_ids[:, -1] == SHARED_EXPERT_ID
+        shared_indices = shared_mask.nonzero(as_tuple=True)[0]
+
+        # Compute shared expert for tokens that have it
+        if shared_indices.shape[0] > 0:
+            shared_hidden = recv_hidden[shared_indices]
+            shared_weights = recv_topk_weights[shared_indices, -1]
+            shared_output = self.shared_experts(shared_hidden)
+        else:
+            shared_output = None
+            shared_weights = None
+
+        # Compute routed experts using standard MoE path
+        # Use original topk (without shared expert column) for MoE computation
+        routed_topk_ids = recv_topk_ids[:, :-1]
+        routed_topk_weights = recv_topk_weights[:, :-1]
+
+        # Create dispatch output for routed experts
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DeepEPLLDispatchOutput,
+            DeepEPNormalDispatchOutput,
+        )
+
+        if isinstance(dispatch_output, DeepEPNormalDispatchOutput):
+            routed_dispatch_output = DeepEPNormalDispatchOutput(
+                hidden_states=recv_hidden,
+                hidden_states_scale=recv_hidden_scale,
+                topk_ids=routed_topk_ids,
+                topk_weights=routed_topk_weights,
+                num_recv_tokens_per_expert=dispatch_output.num_recv_tokens_per_expert,
+            )
+        else:
+            # DeepEPLLDispatchOutput
+            routed_dispatch_output = DeepEPLLDispatchOutput(
+                hidden_states=recv_hidden,
+                hidden_states_scale=recv_hidden_scale,
+                topk_ids=routed_topk_ids,
+                topk_weights=routed_topk_weights,
+                masked_m=dispatch_output.masked_m,
+                expected_m=dispatch_output.expected_m,
+            )
+
+        # Run MoE computation for routed experts
+        combine_input = self.experts.run_moe_core(dispatch_output=routed_dispatch_output)
+        routed_output = combine_input.hidden_states
+
+        # Merge shared expert output with routed output
+        # shared_weights already contains 1.0 / routed_scaling_factor
+        if shared_output is not None and shared_indices.shape[0] > 0:
+            routed_output.index_add_(
+                0,
+                shared_indices,
+                shared_output * shared_weights.unsqueeze(-1),
+            )
+
+        # Step 8: DeepEP combine
+        # Use expanded topk for combine (includes shared expert)
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DeepEPLLCombineInput,
+            DeepEPNormalCombineInput,
+        )
+
+        if isinstance(dispatch_output, DeepEPNormalDispatchOutput):
+            final_combine_input = DeepEPNormalCombineInput(
+                hidden_states=routed_output,
+                topk_ids=recv_topk_ids,
+                topk_weights=recv_topk_weights,
+            )
+        else:
+            final_combine_input = DeepEPLLCombineInput(
+                hidden_states=routed_output,
+                topk_ids=recv_topk_ids,
+                topk_weights=recv_topk_weights,
+            )
+        final_hidden_states = dispatcher.combine(final_combine_input)
+
+        # Apply routed scaling factor if not fused
+        if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+            final_hidden_states *= self.routed_scaling_factor
+
+        return final_hidden_states
 
     def op_gate(self, state):
         if is_non_idle_and_non_empty(

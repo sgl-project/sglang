@@ -464,6 +464,7 @@ class ServerArgs:
     moe_dense_tp_size: Optional[int] = None
     elastic_ep_backend: Literal[None, "mooncake"] = None
     mooncake_ib_device: Optional[str] = None
+    enable_deepep_waterfill: bool = False
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -1910,6 +1911,17 @@ class ServerArgs:
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+            if self.enable_deepep_waterfill:
+                logger.info(
+                    "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
+                )
+
+        # Validate enable_deepep_waterfill requires deepep backend
+        if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
+            raise ValueError(
+                "enable_deepep_waterfill requires moe_a2a_backend='deepep'. "
+                f"Current moe_a2a_backend='{self.moe_a2a_backend}'."
             )
 
         if self.moe_a2a_backend == "mooncake":
@@ -3703,6 +3715,14 @@ class ServerArgs:
             help="The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices "
             "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
+        )
+        parser.add_argument(
+            "--enable-deepep-waterfill",
+            action="store_true",
+            default=ServerArgs.enable_deepep_waterfill,
+            help="Enable waterfill load balancing for shared expert using DeepEP dispatch. "
+            "This treats shared expert as the 9th expert and dispatches it through DeepEP "
+            "based on routed expert load for better load balancing.",
         )
 
         # Mamba Cache
