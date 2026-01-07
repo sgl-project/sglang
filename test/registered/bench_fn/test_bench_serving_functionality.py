@@ -122,7 +122,7 @@ class TestBenchServingCustomHeaders(CustomTestCase):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 if self.path == "/v1/models":
-                    self.wfile.write(json.dumps({"data": [{"id": "test-model"}]}).encode())
+                    self.wfile.write(json.dumps({"data": [{"id": "gpt2"}]}).encode())
                 elif self.path == "/generate":
                     self.wfile.write(json.dumps({"text": "ok", "meta_info": {"completion_tokens": 1}}).encode())
                 else:
@@ -144,6 +144,7 @@ class TestBenchServingCustomHeaders(CustomTestCase):
                 base_url=f"http://127.0.0.1:{port}",
                 backend="sglang",
                 dataset_name="random",
+                tokenizer="gpt2",
                 num_prompts=1,
                 random_input_len=8,
                 random_output_len=8,
