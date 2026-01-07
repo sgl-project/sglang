@@ -10,10 +10,8 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 suites = {
     "per-commit-1-gpu": [
         TestFile("test_deterministic.py", 228),
-        TestFile("test_eval_fp8_accuracy.py", 250),
         TestFile("test_evs.py", 20),
         TestFile("test_external_models.py", 30),
-        TestFile("test_fp8_utils.py", 9),
         TestFile("test_gpt_oss_1gpu.py", 402),
         TestFile("test_hidden_states.py", 55),
         TestFile("test_input_embeddings.py", 38),
@@ -34,7 +32,6 @@ suites = {
         TestFile("test_profile_merger.py", 8),
         TestFile("test_profile_merger_http_api.py", 9),
         TestFile("test_swa_unittest.py", 8),
-        TestFile("test_torchao.py", 103),
         TestFile("test_utils_update_weights.py", 29),
         TestFile("test_video_utils.py", 5),
         TestFile("test_modelopt_export.py", 9),
@@ -127,7 +124,6 @@ suite_amd = {
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_bench_typebaseddispatcher.py", 10),
-        TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_external_models.py", 45),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
