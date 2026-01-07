@@ -67,8 +67,6 @@ elif _is_hip:
     from sglang.srt.layers.quantization.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )
-
-    warnings.warn(f"HIP does not support fused_marlin_moe currently.")
 elif _is_xpu:
     from sgl_kernel import awq_dequantize
 
