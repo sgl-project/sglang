@@ -101,6 +101,9 @@ class DFlashVerifyInput(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
+    # Custom attention "allow mask" for TARGET_VERIFY in backends that require it (e.g. triton).
+    # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
+    custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     def __post_init__(self):
@@ -149,6 +152,24 @@ class DFlashVerifyInput(SpecInput):
             bs,
         )
 
+        # Build a standard causal attention *allow* mask over [prefix + verify_block] for each request.
+        # Layout matches other speculative inputs: flatten per request, row-major over
+        # [q_len=draft_token_num, kv_len=prefix_len + draft_token_num].
+        if self.draft_token_num <= 0:
+            raise ValueError(f"DFLASH draft_token_num must be positive, got {self.draft_token_num}.")
+        mask_chunks: List[torch.Tensor] = []
+        q_len = int(self.draft_token_num)
+        q_idx = torch.arange(q_len, device=batch.device, dtype=torch.int32).unsqueeze(1)
+        for prefix_len in batch.seq_lens_cpu.tolist():
+            prefix_len_i = int(prefix_len)
+            kv_len = prefix_len_i + q_len
+            k_idx = torch.arange(kv_len, device=batch.device, dtype=torch.int32).unsqueeze(0)
+            # Allow attending to the full prefix and to tokens up to (and including) the
+            # current query position within the verify block (standard causal masking).
+            allow = k_idx <= (prefix_len_i + q_idx)
+            mask_chunks.append(allow.flatten())
+        self.custom_mask = torch.cat(mask_chunks, dim=0) if mask_chunks else torch.empty((0,), dtype=torch.bool, device=batch.device)
+
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
@@ -185,9 +206,7 @@ class DFlashVerifyInput(SpecInput):
             kv_indices,
             req_to_token.size(1),
         )
-        # DFlash verify is a standard causal block prefill. Let the attention backend
-        # apply its built-in causal masking; no custom mask is required here.
-        return kv_indices, cum_kv_seq_len, qo_indptr, None
+        return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
     def verify(
         self,

@@ -1,7 +1,22 @@
+"""Manual GSM8K benchmark for DFLASH (vs target-only baseline).
+
+Notes / known limitations (as of this initial integration):
+  - Prompting style matters a lot for acceptance length. The upstream DFlash HF demo/bench
+    uses a Qwen chat-template prompt; use `SGLANG_DFLASH_PROMPT_STYLE=dflash_chat` and
+    typically `SGLANG_DFLASH_STOP=` (empty) to get closer acceptance numbers.
+  - DFLASH may *diverge* from target-only greedy decoding on some prompts. This is because
+    DFLASH verifies a whole block with `ForwardMode.TARGET_VERIFY` (prefill-style kernels),
+    while the baseline uses the normal decode path. Some attention backends can produce
+    different argmax tokens across these modes (numerical differences), which makes direct
+    "accuracy" comparisons misleading.
+    Use `SGLANG_DFLASH_ASSERT_MATCH=1` to detect any token-level divergence.
+"""
+
 import ast
 import json
 import os
 import re
+import shlex
 import statistics
 import time
 import unittest
@@ -9,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import torch
+from transformers import AutoTokenizer
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -49,18 +65,21 @@ def _get_answer_value(answer_str: str) -> int:
 
 
 def _send_generate(base_url: str, prompt: str, *, max_new_tokens: int) -> dict:
+    stop = os.getenv("SGLANG_DFLASH_STOP", "Question,Assistant:,<|separator|>")
+    stop_list = [s for s in stop.split(",") if s] if stop else []
+    sampling_params = {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 1,
+        "max_new_tokens": max_new_tokens,
+    }
+    if stop_list:
+        sampling_params["stop"] = stop_list
     resp = requests.post(
         base_url + "/generate",
         json={
             "text": prompt,
-            "sampling_params": {
-                "temperature": 0.0,
-                "top_p": 1.0,
-                "top_k": 1,
-                "max_new_tokens": max_new_tokens,
-                # Avoid extra decoding after an answer.
-                "stop": ["Question", "Assistant:", "<|separator|>"],
-            },
+            "sampling_params": sampling_params,
         },
         timeout=600,
     )
@@ -125,6 +144,8 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
         num_questions = int(os.getenv("SGLANG_DFLASH_NUM_QUESTIONS", "100"))
         num_shots = int(os.getenv("SGLANG_DFLASH_NUM_SHOTS", "1"))
         disable_radix_cache = os.getenv("SGLANG_DFLASH_DISABLE_RADIX_CACHE", "1") != "0"
+        prompt_style = os.getenv("SGLANG_DFLASH_PROMPT_STYLE", "fewshot_qa")
+        assert_match = os.getenv("SGLANG_DFLASH_ASSERT_MATCH", "0") != "0"
 
         # Read GSM8K data (download if absent).
         data_path = os.getenv("SGLANG_DFLASH_GSM8K_PATH", "test.jsonl")
@@ -133,17 +154,41 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
             data_path = download_and_cache_file(url)
         lines = list(read_jsonl(data_path))
 
-        few_shot = _get_few_shot_examples(lines, num_shots)
+        tokenizer = None
+        if prompt_style == "dflash_chat":
+            tokenizer = AutoTokenizer.from_pretrained(target_model)
+
+        few_shot = _get_few_shot_examples(lines, num_shots) if prompt_style == "fewshot_qa" else ""
         prompts: list[str] = []
         labels: list[int] = []
         for i in range(len(lines[:num_questions])):
-            prompts.append(few_shot + _get_one_example(lines, i, False))
+            if prompt_style == "fewshot_qa":
+                prompts.append(few_shot + _get_one_example(lines, i, False))
+            elif prompt_style == "dflash_chat":
+                assert tokenizer is not None
+                user_content = (
+                    lines[i]["question"]
+                    + "\nPlease reason step by step, and put your final answer within \\boxed{}."
+                )
+                prompts.append(
+                    tokenizer.apply_chat_template(
+                        [{"role": "user", "content": user_content}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                )
+            else:
+                raise ValueError(f"Unsupported SGLANG_DFLASH_PROMPT_STYLE: {prompt_style}")
             labels.append(_get_answer_value(lines[i]["answer"]))
         self.assertTrue(all(l != INVALID for l in labels), "Invalid labels in GSM8K data")
 
         common_server_args = ["--attention-backend", attention_backend]
         if disable_radix_cache:
             common_server_args.append("--disable-radix-cache")
+        extra_server_args = os.getenv("SGLANG_DFLASH_EXTRA_SERVER_ARGS", "").strip()
+        if extra_server_args:
+            common_server_args.extend(shlex.split(extra_server_args))
 
         baseline_port = find_available_port(20000)
         dflash_port = find_available_port(baseline_port + 1)
@@ -214,10 +259,23 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
         baseline_total_tokens, baseline_preds = _collect_common_metrics(baseline_outputs)
         dflash_total_tokens, dflash_preds = _collect_common_metrics(dflash_outputs)
 
+        if assert_match:
+            for i, (baseline_out, dflash_out) in enumerate(
+                zip(baseline_outputs, dflash_outputs, strict=True)
+            ):
+                if baseline_out.get("output_ids") != dflash_out.get("output_ids"):
+                    raise AssertionError(
+                        "Baseline and DFLASH outputs diverged at index "
+                        f"{i}.\nbaseline={baseline_out.get('output_ids')}\ndflash={dflash_out.get('output_ids')}"
+                    )
+
         baseline_throughput = baseline_total_tokens / max(baseline_latency, 1e-6)
         dflash_throughput = dflash_total_tokens / max(dflash_latency, 1e-6)
         speedup = dflash_throughput / max(baseline_throughput, 1e-6)
 
+        # WARNING: Until baseline-vs-DFLASH greedy outputs are guaranteed identical, these
+        # "accuracy" numbers are not strictly comparable. Prefer asserting matches via
+        # `SGLANG_DFLASH_ASSERT_MATCH=1` when debugging correctness.
         baseline_acc = sum(
             int(p == l) for p, l in zip(baseline_preds, labels, strict=True)
         ) / len(labels)
@@ -250,6 +308,7 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
                 "parallel": parallel,
                 "num_questions": num_questions,
                 "num_shots": num_shots,
+                "prompt_style": prompt_style,
                 "disable_radix_cache": disable_radix_cache,
             },
             "baseline": {
