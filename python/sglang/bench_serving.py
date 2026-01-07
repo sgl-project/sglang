@@ -1626,6 +1626,7 @@ def sample_image_requests(
     image_resolution: str,
     backend: str,
     random_image_count: bool = False,
+    skip_special_tokens: bool = False,
 ) -> List[DatasetRow]:
     """Generate requests with images.
 
@@ -1692,6 +1693,12 @@ def sample_image_requests(
     total_image_bytes = 0
 
     special_tokens = None
+    if (
+        skip_special_tokens
+        and hasattr(processor.tokenizer, "all_special_ids")
+        and processor.tokenizer.all_special_ids is not None
+    ):
+        special_tokens = set(processor.tokenizer.all_special_ids)
 
     # Extract special token strings and convert to token_id
     special_token_strings = []
@@ -1725,6 +1732,9 @@ def sample_image_requests(
     else:
         merged_special_tokens = None
     for i in range(num_requests):
+        # Get the number of images for this request
+        request_image_count = int(image_counts[i])
+
         # Generate text prompt
         text_prompt = gen_mm_prompt(
             processor.tokenizer,
