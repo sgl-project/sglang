@@ -25,7 +25,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     ScaleResidual,
     ScaleResidualLayerNormScaleShift,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -132,10 +132,10 @@ class WanSelfAttention(nn.Module):
         self.parallel_attention = parallel_attention
 
         # layers
-        self.to_q = ReplicatedLinear(dim, dim)
-        self.to_k = ReplicatedLinear(dim, dim)
-        self.to_v = ReplicatedLinear(dim, dim)
-        self.to_out = ReplicatedLinear(dim, dim)
+        self.to_q = ColumnParallelLinear(dim, dim, gather_output=True)
+        self.to_k = ColumnParallelLinear(dim, dim, gather_output=True)
+        self.to_v = ColumnParallelLinear(dim, dim, gather_output=True)
+        self.to_out = ColumnParallelLinear(dim, dim, gather_output=True)
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
@@ -218,8 +218,8 @@ class WanI2VCrossAttention(WanSelfAttention):
             supported_attention_backends=supported_attention_backends,
         )
 
-        self.add_k_proj = ReplicatedLinear(dim, dim)
-        self.add_v_proj = ReplicatedLinear(dim, dim)
+        self.add_k_proj = ColumnParallelLinear(dim, dim, gather_output=True)
+        self.add_v_proj = ColumnParallelLinear(dim, dim, gather_output=True)
         self.norm_added_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_added_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
@@ -272,11 +272,11 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True)
+        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
 
-        self.to_out = ReplicatedLinear(dim, dim, bias=True)
+        self.to_out = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
         if attention_type == "sla":
             self.attn1 = MinimalA2AAttnOp(
                 SparseLinearAttention(
@@ -454,12 +454,14 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True)
-        self.to_gate_compress = ReplicatedLinear(dim, dim, bias=True)
+        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_gate_compress = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=True
+        )
 
-        self.to_out = ReplicatedLinear(dim, dim, bias=True)
+        self.to_out = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
         self.attn1 = UlyssesAttention_VSA(
             num_heads=num_heads,
             head_size=dim // num_heads,
