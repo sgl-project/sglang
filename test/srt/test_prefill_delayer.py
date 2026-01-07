@@ -90,7 +90,7 @@ def _run_throughput_test(
             **other_benchmark_args,
         )
         res = run_benchmark(args)
-        _print_prefill_delayer_metrics(base_url)
+        _print_prefill_delayer_metrics(base_url, expect_metrics=prefill_delayer)
     finally:
         kill_process_tree(process.pid)
 
@@ -166,7 +166,7 @@ def _launch_server(*, model, base_url, prefill_delayer: bool, other_args):
         )
 
 
-def _print_prefill_delayer_metrics(base_url: str):
+def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool):
     metrics_response = requests.get(f"{base_url}/metrics")
     assert metrics_response.status_code == 200
     metrics_text = metrics_response.text
@@ -176,9 +176,10 @@ def _print_prefill_delayer_metrics(base_url: str):
     print("=== PrefillDelayer Metrics ===")
     for line in prefill_delayer_metrics:
         print(line)
-    assert "sglang:prefill_delayer_wait_forward_passes" in metrics_text
-    assert "sglang:prefill_delayer_wait_seconds" in metrics_text
-    assert "sglang:prefill_delayer_timeouts_total" in metrics_text
+    if expect_metrics:
+        assert "sglang:prefill_delayer_wait_forward_passes" in metrics_text
+        assert "sglang:prefill_delayer_wait_seconds" in metrics_text
+        assert "sglang:prefill_delayer_timeouts_total" in metrics_text
 
 
 if __name__ == "__main__":
