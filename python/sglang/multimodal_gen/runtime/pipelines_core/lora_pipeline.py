@@ -344,17 +344,6 @@ class LoRAPipeline(ComposedPipelineBase):
         Returns:
             The number of layers that had LoRA weights applied.
         """
-        if len(lora_paths) != len(lora_nicknames):
-            raise ValueError(
-                f"Length mismatch: lora_nicknames has {len(lora_nicknames)} items, "
-                f"but lora_paths has {len(lora_paths)} items"
-            )
-        if len(strengths) != len(lora_nicknames):
-            raise ValueError(
-                f"Length mismatch: lora_nicknames has {len(lora_nicknames)} items, "
-                f"but strengths has {len(strengths)} items"
-            )
-        
         adapted_count = 0
         for name, layer in lora_layers.items():
             # Apply all LoRA adapters in order
@@ -582,7 +571,7 @@ class LoRAPipeline(ComposedPipelineBase):
         logger.info(
             "Rank %d: LoRA adapter(s) %s applied to %d layers (targets: %s, strengths: %s)",
             rank,
-            ", ".join(lora_paths) if lora_paths else None,
+            ", ".join(map(str, lora_paths)) if lora_paths else None,
             adapted_count,
             ", ".join(targets) if len(set(targets)) > 1 else targets[0],
             ", ".join(f"{s:.2f}" for s in strengths) if len(strengths) > 1 else f"{strengths[0]:.2f}",

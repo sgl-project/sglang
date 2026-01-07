@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
+    format_lora_message,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
@@ -343,15 +344,7 @@ class DiffGenerator:
             target=target,
             strength=strength,
         )
-        # Format success message for single or multiple LoRAs
-        if isinstance(lora_nickname, list):
-            nickname_str = ", ".join(lora_nickname)
-            target_str = ", ".join(target) if isinstance(target, list) else target
-            strength_str = ", ".join(f"{s:.2f}" for s in strength) if isinstance(strength, list) else f"{strength:.2f}"
-        else:
-            nickname_str = lora_nickname
-            target_str = target if isinstance(target, str) else ", ".join(target)
-            strength_str = f"{strength:.2f}" if isinstance(strength, (int, float)) else ", ".join(f"{s:.2f}" for s in strength)
+        nickname_str, target_str, strength_str = format_lora_message(lora_nickname, target, strength)
         
         self._send_lora_request(
             req,
