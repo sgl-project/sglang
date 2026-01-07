@@ -69,23 +69,12 @@ impl TokenGuardBody {
 impl Drop for TokenGuardBody {
     fn drop(&mut self) {
         if let Some(bucket) = self.token_bucket.take() {
-            let tokens = self.tokens;
             debug!(
                 "TokenGuardBody: stream ended, returning {} tokens to bucket",
-                tokens
+                self.tokens
             );
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    bucket.return_tokens(tokens).await;
-                });
-            } else {
-                // Runtime not available (e.g., during shutdown)
-                // Tokens will be lost, but this is acceptable during shutdown
-                warn!(
-                    "TokenGuardBody: Cannot return {} tokens - no Tokio runtime available",
-                    tokens
-                );
-            }
+            // Use lock-free sync return - no runtime needed, guaranteed token return
+            bucket.return_tokens_sync(self.tokens);
         }
     }
 }
@@ -159,7 +148,7 @@ pub async fn auth_middleware(
 /// Alphanumeric characters for request ID generation (as bytes for O(1) indexing)
 const REQUEST_ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-/// Generate OpenAI-compatible request ID based on endpoint
+/// Generate OpenAI-compatible request ID based on endpoint.
 fn generate_request_id(path: &str) -> String {
     let prefix = if path.contains("/chat/completions") {
         "chatcmpl-"

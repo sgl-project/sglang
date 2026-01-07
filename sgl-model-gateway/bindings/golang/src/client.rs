@@ -160,7 +160,7 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
     };
 
     // Tokenize
-    let token_ids = match tokenizer.encode(&processed_messages.text) {
+    let token_ids = match tokenizer.encode(&processed_messages.text, false) {
         Ok(encoding) => encoding.token_ids().to_vec(),
         Err(e) => {
             set_error_message(error_out, &format!("Failed to tokenize: {}", e));
