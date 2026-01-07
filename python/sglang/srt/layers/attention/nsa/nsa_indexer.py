@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 from einops import rearrange
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
 global _use_multi_stream
 
-# Enable next_n=2 optimization for speculative decoding in deep_gemm.fp8_paged_mqa_logits
-# This processes pairs of tokens together instead of one at a time, reducing kernel overhead.
-# Set to "0" to disable and fall back to next_n=1 behavior.
-NSA_ENABLE_NEXT_N_2 = os.environ.get("SGLANG_NSA_ENABLE_NEXT_N_2", "1") == "1"
+# deep_gemm.fp8_paged_mqa_logits kv_cache layout
+_PAGED_MQA_BLOCK_KV = 64
+_PAGED_MQA_NUM_HEADS_KV = 1
+_PAGED_MQA_HEAD_DIM_WITH_SF = 132  # 128 + 4 (scale factor)
 
 if is_cuda():
     try:
@@ -289,6 +289,45 @@ class Indexer(MultiPlatformOp):
 
         return key
 
+    def _can_use_next_n_2(
+        self,
+        is_speculative: bool,
+        total_tokens: int,
+        forward_batch: ForwardBatch,
+        block_tables: torch.Tensor,
+    ) -> Tuple[bool, int, int]:
+        """Returns (use_next_n_2, batch_size, tokens_per_req)."""
+        if not envs.SGLANG_NSA_ENABLE_NEXT_N_2.get():
+            return False, 0, 1
+
+        if not is_speculative or total_tokens < 2:
+            return False, 0, 1
+
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        if isinstance(extend_lens, torch.Tensor):
+            extend_lens = extend_lens.tolist()
+
+        if not extend_lens:
+            return False, 0, 1
+
+        if len(set(extend_lens)) != 1:
+            return False, 0, 1
+
+        tokens_per_req = int(extend_lens[0])
+        batch_size = len(extend_lens)
+
+        if (
+            batch_size > 0
+            and tokens_per_req >= 2
+            and tokens_per_req % 2 == 0
+            and total_tokens == batch_size * tokens_per_req
+        ):
+            block_rows = block_tables.shape[0]
+            if block_rows in (batch_size, total_tokens):
+                return True, batch_size, tokens_per_req
+
+        return False, 0, 1
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -324,39 +363,18 @@ class Indexer(MultiPlatformOp):
 
         # Prepare kv_cache shape
         assert len(kv_cache_fp8.shape) == 2
-        block_kv = 64
-        num_heads_kv = 1
-        head_dim_with_sf = 132
         kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            kv_cache_fp8.shape[0],
+            _PAGED_MQA_BLOCK_KV,
+            _PAGED_MQA_NUM_HEADS_KV,
+            _PAGED_MQA_HEAD_DIM_WITH_SF,
         )
 
         # Check if we can use next_n=2 for speculative decoding
-        # deep_gemm.fp8_paged_mqa_logits only supports next_n in {1, 2}
         total_tokens = q_fp8.shape[0]
-        use_next_n_2 = False
-        batch_size = 0
-        tokens_per_req = 1
-
-        if NSA_ENABLE_NEXT_N_2 and is_speculative and total_tokens >= 2:
-            extend_lens = forward_batch.extend_seq_lens_cpu
-            if isinstance(extend_lens, torch.Tensor):
-                extend_lens = extend_lens.tolist()
-
-            if extend_lens:
-                if len(set(extend_lens)) == 1:
-                    tokens_per_req = int(extend_lens[0])
-                    batch_size = len(extend_lens)
-                    # Use next_n=2 if each request has >= 2 tokens and even number of tokens
-                    if (
-                        batch_size > 0
-                        and tokens_per_req >= 2
-                        and tokens_per_req % 2 == 0
-                        and total_tokens == batch_size * tokens_per_req
-                    ):
-                        block_rows = block_tables.shape[0]
-                        if block_rows in (batch_size, total_tokens):
-                            use_next_n_2 = True
+        use_next_n_2, batch_size, tokens_per_req = self._can_use_next_n_2(
+            is_speculative, total_tokens, forward_batch, block_tables
+        )
 
         if use_next_n_2:
             return self._get_topk_paged_next_n_2(
