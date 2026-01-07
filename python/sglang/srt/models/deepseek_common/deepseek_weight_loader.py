@@ -81,15 +81,7 @@ NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 
 class DeepseekV2WeightLoaderMixin:
-    """Mixin for loading weights in DeepSeek V2/V3 models.
-
-    Handles checkpoint loading with support for:
-    - Tensor/pipeline parallelism
-    - Multiple quantization formats (FP8, INT8, AWQ, etc.)
-    - MoE expert weight loading
-    - NextN speculative decoding weights
-    - Shared expert fusion optimization
-    """
+    """Mixin for loading weights in DeepSeek V2/V3 models."""
 
     model: nn.Module
     config: PretrainedConfig
