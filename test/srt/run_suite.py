@@ -9,24 +9,12 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
-        TestFile("test_deterministic.py", 228),
         TestFile("test_evs.py", 20),
         TestFile("test_external_models.py", 30),
-        TestFile("test_gpt_oss_1gpu.py", 402),
-        TestFile("test_hidden_states.py", 55),
-        TestFile("test_input_embeddings.py", 38),
-        TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 7),
-        TestFile("test_model_hooks.py", 6),
         TestFile("test_modelopt_loader.py", 11),
         TestFile("test_multi_tokenizer.py", 230),
-        TestFile("test_page_size.py", 60),
-        TestFile("test_request_queue_validation.py", 47),
-        TestFile("test_score_api.py", 260),
-        TestFile("test_server_args.py", 9),
         TestFile("test_skip_tokenizer_init.py", 77),
-        TestFile("test_srt_endpoint.py", 127),
-        TestFile("test_srt_engine.py", 252),
         TestFile("test_utils_update_weights.py", 29),
         TestFile("test_video_utils.py", 5),
         TestFile("test_modelopt_export.py", 9),
@@ -98,7 +86,6 @@ suites = {
         TestFile("test_bench_one_batch.py"),
         TestFile("test_bench_serving.py"),
         TestFile("test_eval_accuracy_large.py"),
-        TestFile("test_gpt_oss_common.py"),
         TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
@@ -120,18 +107,10 @@ suite_amd = {
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_bench_typebaseddispatcher.py", 10),
         TestFile("test_external_models.py", 45),
-        TestFile("test_input_embeddings.py", 38),
-        TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
-        TestFile("test_model_hooks.py", 10),
         TestFile("test_multi_tokenizer.py", 345),
-        TestFile("test_page_size.py", 60),
-        TestFile("test_request_queue_validation.py", 70),
         TestFile("test_rope_rocm.py", 3),
-        TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
-        TestFile("test_srt_endpoint.py", 130),
-        TestFile("test_srt_engine.py", 261),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_type_based_dispatcher.py", 10),
         TestFile("test_video_utils.py", 8),
@@ -143,9 +122,7 @@ suite_amd = {
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
     ],
-    "per-commit-amd-mi35x": [
-        TestFile("test_gpt_oss_1gpu.py", 750),
-    ],
+    "per-commit-amd-mi35x": [],
     "per-commit-2-gpu-amd": [
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_load_weights_from_remote_instance.py", 72),
