@@ -4,17 +4,16 @@ Usage:
     python3 -m pytest test/registered/hicache/test_hicache_storage_3fs_backend.py -v
 """
 
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
-
 import json
 import os
 import unittest
 
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
 
 
 class HiCacheStorage3FSBackendBaseMixin(HiCacheStorageBaseMixin):

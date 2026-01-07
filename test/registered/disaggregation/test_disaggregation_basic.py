@@ -1,7 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=400, suite="stage-b-test-large-2-gpu")
-
 import json
 import os
 import unittest
@@ -11,6 +7,7 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -22,6 +19,8 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
+
+register_cuda_ci(est_time=400, suite="stage-b-test-large-2-gpu")
 
 
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):

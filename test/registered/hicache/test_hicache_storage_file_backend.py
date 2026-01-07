@@ -4,10 +4,6 @@ Usage:
     python3 -m pytest test/registered/hicache/test_hicache_storage_file_backend.py -v
 """
 
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
-
 import json
 import os
 import random
@@ -22,6 +18,7 @@ import requests
 
 from sglang.bench_serving import get_tokenizer
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -32,6 +29,8 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
 
 
 class HiCacheStorageBaseMixin:
