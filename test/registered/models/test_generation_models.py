@@ -106,6 +106,10 @@ ALL_MODELS = [
         trust_remote_code=True,
         skip_long_prompt=True,
     ),
+    ModelCase(
+        "LiquidAI/LFM2.5-1.2B-Instruct",
+        trust_remote_code=True,
+    ),
 ]
 
 TORCH_DTYPES = [torch.float16]
