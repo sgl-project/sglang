@@ -786,6 +786,8 @@ class ChatCompletionResponseChoice(BaseModel):
     hidden_states: Optional[object] = None
     # Top-k attention tokens per generated token for interpretability
     attention_tokens: Optional[List[Dict]] = None
+    # Logit lens: intermediate layer predictions (experimental)
+    logit_lens: Optional[Dict] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -794,6 +796,8 @@ class ChatCompletionResponseChoice(BaseModel):
             data.pop("hidden_states", None)
         if self.attention_tokens is None:
             data.pop("attention_tokens", None)
+        if self.logit_lens is None:
+            data.pop("logit_lens", None)
         return data
 
 
@@ -815,6 +819,8 @@ class DeltaMessage(BaseModel):
     hidden_states: Optional[object] = None
     # Top-k attention tokens per generated token for interpretability
     attention_tokens: Optional[List[Dict]] = None
+    # Logit lens: intermediate layer predictions (experimental)
+    logit_lens: Optional[Dict] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -823,6 +829,8 @@ class DeltaMessage(BaseModel):
             data.pop("hidden_states", None)
         if self.attention_tokens is None:
             data.pop("attention_tokens", None)
+        if self.logit_lens is None:
+            data.pop("logit_lens", None)
         return data
 
 

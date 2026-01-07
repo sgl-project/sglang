@@ -90,6 +90,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.logit_lens import LogitLensExtractor, create_logit_lens_extractor
 from sglang.srt.layers.moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     get_global_experts_capturer,
@@ -961,6 +962,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.tp_size,
                 self.tp_rank,
                 self.pp_rank,
+            )
+
+        # Initialize logit lens extractor for interpretability (experimental)
+        self.logit_lens_extractor: Optional[LogitLensExtractor] = None
+        if hasattr(self.model, 'lm_head'):
+            # Get final layer norm if available (for proper projection)
+            norm_module = None
+            if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
+                norm_module = self.model.model.norm
+            elif hasattr(self.model, 'norm'):
+                norm_module = self.model.norm
+
+            self.logit_lens_extractor = create_logit_lens_extractor(
+                model=self.model,
+                config=self.model_config.hf_config,
+                norm_module=norm_module,
+            )
+            logger.debug(
+                f"Initialized logit lens extractor for {self.model_config.num_hidden_layers} layers"
             )
 
         # Pre-expand RoPE cache before CUDA Graph capture
@@ -2270,6 +2290,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
+        # Register logit lens hooks if requested (experimental interpretability feature)
+        logit_lens_active = False
+        if (
+            forward_batch.capture_logit_lens
+            and self.logit_lens_extractor is not None
+            and hasattr(self.model, 'lm_head')
+        ):
+            self.logit_lens_extractor.register_hooks(forward_batch.logit_lens_layer_ids)
+            logit_lens_active = True
+
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
@@ -2315,6 +2345,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.pp_group.is_last_rank
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
+
+        # Compute logit lens output if hooks were active
+        if logit_lens_active and isinstance(ret, LogitsProcessorOutput):
+            try:
+                lens_output = self.logit_lens_extractor.compute_lens(
+                    lm_head=self.model.lm_head,
+                    top_k=forward_batch.logit_lens_top_k,
+                    final_logits=ret.next_token_logits,
+                )
+                ret.logit_lens_output = lens_output
+            finally:
+                # Always clean up hooks and captured states
+                self.logit_lens_extractor.remove_hooks()
+                self.logit_lens_extractor.clear()
 
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 

@@ -59,6 +59,7 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.logit_lens.types import LogitLensOutput
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -460,6 +461,13 @@ class ForwardBatch:
     moe_routing_max_steps: int = 0  # Max decode steps to capture (0 = unlimited)
     moe_routing_current_step: int = 0  # Current decode step counter
 
+    # For logit lens (interpretability) - project intermediate layers to vocab
+    capture_logit_lens: bool = False
+    logit_lens_top_k: int = 5  # Number of top token candidates per layer
+    logit_lens_layer_ids: Optional[List[int]] = None  # Which layers to probe (None = auto-select ~4)
+    # Captured logit lens output (populated after forward pass)
+    logit_lens_output: Optional["LogitLensOutput"] = None
+
     @classmethod
     def init_new(
         cls,
@@ -783,6 +791,22 @@ class ForwardBatch:
                     ret.moe_capture_layer_ids = None
             else:
                 ret.moe_capture_layer_ids = None
+
+        # Init logit lens capture (experimental interpretability feature)
+        if batch.capture_logit_lens:
+            ret.capture_logit_lens = True
+            ret.logit_lens_top_k = batch.logit_lens_top_k
+            # Validate layer IDs if provided
+            num_layers = model_runner.model_config.num_hidden_layers
+            if batch.logit_lens_layer_ids is not None:
+                valid_layer_ids = [
+                    lid if lid >= 0 else num_layers + lid
+                    for lid in batch.logit_lens_layer_ids
+                ]
+                valid_layer_ids = [lid for lid in valid_layer_ids if 0 <= lid < num_layers]
+                ret.logit_lens_layer_ids = valid_layer_ids if valid_layer_ids else None
+            else:
+                ret.logit_lens_layer_ids = None  # Auto-select layers
 
         return ret
 

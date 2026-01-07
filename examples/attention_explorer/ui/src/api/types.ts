@@ -16,7 +16,7 @@ export type ManifoldZone =
   | 'unknown';
 
 export type Program = 'prod' | 'debug' | 'discovery';
-export type View = 'chat' | 'inspect' | 'manifold' | 'router' | 'compare';
+export type View = 'chat' | 'inspect' | 'manifold' | 'router' | 'compare' | 'lens';
 
 export const SCHEMA_VERSION = 1;
 
@@ -126,6 +126,38 @@ export interface MoERoutingEntry {
   entropy_mean?: number;
   hubness_mean?: number;
   expert_churn?: number;
+}
+
+// ============================================================================
+// LOGIT LENS DATA (Experimental)
+// ============================================================================
+
+export interface LogitLensLayerResult {
+  layer_id: number;
+  top_token_ids: number[];
+  top_tokens: string[];
+  top_probs: number[];
+  entropy: number;
+  kl_from_final?: number;
+}
+
+export interface LogitLensEntry {
+  probed_layers: number[];
+  total_layers: number;
+  layers: Record<string, LogitLensLayerResult>;
+  final?: {
+    top_token_ids: number[];
+    top_tokens: string[];
+    top_probs: number[];
+  };
+  decode_step: number;
+  token_text?: string;
+}
+
+export interface LogitLensSession {
+  entries: LogitLensEntry[];
+  model: string;
+  total_layers: number;
 }
 
 // ============================================================================

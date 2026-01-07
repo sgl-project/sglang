@@ -999,6 +999,8 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
 class BatchTokenIDOutput(
     BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin
 ):
+    """Output batch for token ID mode processing."""
+
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
@@ -1052,6 +1054,9 @@ class BatchTokenIDOutput(
 
     # MoE routing info for interpretability (which experts were selected per token)
     output_moe_routing: Optional[List[List[Dict]]] = None
+
+    # Logit lens info for interpretability (intermediate layer predictions)
+    output_logit_lens: Optional[List[Dict]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
@@ -1145,6 +1150,9 @@ class BatchStrOutput(
 
     # MoE routing info for interpretability (which experts were selected per token)
     output_moe_routing: Optional[List[List[Dict]]] = None
+
+    # Logit lens info for interpretability (intermediate layer predictions)
+    output_logit_lens: Optional[List[Dict]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None

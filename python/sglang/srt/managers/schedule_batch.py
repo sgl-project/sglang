@@ -2573,6 +2573,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if moe_capture_layer_ids is None:
                     moe_capture_layer_ids = getattr(req, "moe_capture_layer_ids", None)
 
+        # Check if any request wants logit lens capture (experimental interpretability)
+        capture_logit_lens = False
+        logit_lens_top_k = 5
+        logit_lens_layer_ids: Optional[List[int]] = None
+
+        for req in self.reqs:
+            if getattr(req, "return_logit_lens", False):
+                capture_logit_lens = True
+                # Use the max top_k from any request
+                req_top_k = getattr(req, "logit_lens_top_k", 5)
+                if req_top_k > logit_lens_top_k:
+                    logit_lens_top_k = req_top_k
+                # Use layer IDs from first request that specifies them
+                if logit_lens_layer_ids is None:
+                    logit_lens_layer_ids = getattr(req, "logit_lens_layer_ids", None)
+
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
@@ -2636,6 +2652,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             capture_moe_routing=capture_moe_routing,
             moe_routing_top_k=moe_routing_top_k,
             moe_capture_layer_ids=moe_capture_layer_ids,
+            capture_logit_lens=capture_logit_lens,
+            logit_lens_top_k=logit_lens_top_k,
+            logit_lens_layer_ids=logit_lens_layer_ids,
         )
 
     def copy(self):
@@ -2788,3 +2807,9 @@ class ModelWorkerBatch:
     capture_moe_routing: bool = False
     moe_routing_top_k: int = 2  # How many top experts to capture
     moe_capture_layer_ids: Optional[List[int]] = None  # Which layers to capture (None = all)
+
+    # For logit lens (interpretability) - project intermediate layers to vocab
+    # Shows how token predictions evolve through model layers
+    capture_logit_lens: bool = False
+    logit_lens_top_k: int = 5  # Number of top token candidates per layer
+    logit_lens_layer_ids: Optional[List[int]] = None  # Which layers to probe (None = auto-select ~4)

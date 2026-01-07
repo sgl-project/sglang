@@ -10,6 +10,7 @@ const VIEWS: { id: View; label: string; icon: string }[] = [
   { id: 'manifold', label: 'Manifold', icon: '🌐' },
   { id: 'router', label: 'Router', icon: '⚡' },
   { id: 'compare', label: 'Compare', icon: '⚖️' },
+  { id: 'lens', label: 'Lens', icon: '🔬' },
 ];
 
 const PROGRAMS: { id: Program; label: string; description: string }[] = [
