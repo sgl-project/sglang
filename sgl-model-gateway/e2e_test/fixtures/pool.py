@@ -6,6 +6,7 @@ Workers are expensive to start (~30-60s each), so they're kept running across te
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import threading
@@ -23,6 +24,21 @@ logger = logging.getLogger(__name__)
 # Global model pool instance with thread-safe initialization
 _model_pool: "ModelPool | None" = None
 _model_pool_lock = threading.Lock()
+_shutdown_registered = False
+
+
+def _shutdown_model_pool() -> None:
+    """Shutdown the global model pool at process exit.
+
+    This is registered with atexit to ensure cleanup happens after all tests
+    complete, which is important for pytest-parallel where multiple threads
+    share the session-scoped fixture.
+    """
+    global _model_pool
+    if _model_pool is not None:
+        logger.info("Shutting down model pool at process exit")
+        _model_pool.shutdown()
+        _model_pool = None
 
 
 @pytest.fixture(scope="session")
@@ -114,11 +130,15 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
                 for m in models
                 for b in backend_modes
             ]
-            logger.info("Using env var requirements: %s", [str(r) for r in requirements])
+            logger.info(
+                "Using env var requirements: %s", [str(r) for r in requirements]
+            )
         else:
             # Use scanned requirements from test markers
             requirements = get_pool_requirements()
-            logger.info("Using scanned requirements: %s", [str(r) for r in requirements])
+            logger.info(
+                "Using scanned requirements: %s", [str(r) for r in requirements]
+            )
 
         # Filter to valid models
         requirements = [r for r in requirements if r.model_id in MODEL_SPECS]
@@ -141,8 +161,13 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
         # Log final GPU allocation summary
         logger.info(_model_pool.allocator.summary())
 
-        # Register cleanup
-        request.addfinalizer(_model_pool.shutdown)
+        # Register cleanup with atexit instead of request.addfinalizer
+        # This is critical for pytest-parallel where multiple threads share
+        # the session-scoped fixture - addfinalizer can fire too early
+        global _shutdown_registered
+        if not _shutdown_registered:
+            atexit.register(_shutdown_model_pool)
+            _shutdown_registered = True
 
         return _model_pool
 
