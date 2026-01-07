@@ -1347,21 +1347,33 @@ class DeepseekV2MoE(nn.Module):
         combine_input = self.experts.run_moe_core(dispatch_output=routed_dispatch_output)
         routed_output = combine_input.hidden_states
 
+        # Determine if we're in Normal mode or Low Latency mode
+        # - Normal mode: run_moe_core already applied topk_weights, combine does NOT apply weights
+        # - Low Latency mode: run_moe_core did NOT apply weights, combine WILL apply weights
+        is_normal_mode = isinstance(dispatch_output, DeepEPNormalDispatchOutput)
+
         # Compute shared expert for remote tokens and add to output
-        # Remote shared uses weight = 1/rsf because it's added BEFORE combine,
-        # and the final rsf multiplication will cancel it out:
-        # remote_shared * (1/rsf) * rsf = remote_shared
         if remote_shared_indices.numel() > 0:
             remote_shared_hidden = recv_hidden[remote_shared_indices]
             remote_shared_expert_output = self._forward_shared_experts(remote_shared_hidden)
-            # Get shared expert weights (9th column) = 1/rsf
-            remote_shared_weights = recv_topk_weights[remote_shared_indices, -1].unsqueeze(-1)
-            # Add weighted shared expert output to routed output
-            routed_output.index_add_(
-                0,
-                remote_shared_indices,
-                remote_shared_expert_output * remote_shared_weights,
-            )
+
+            if is_normal_mode:
+                # Normal mode: combine does NOT apply weights, so we must apply weight here
+                # Weight = 1/rsf so that after final rsf multiplication: output * rsf = original
+                remote_shared_weights = recv_topk_weights[remote_shared_indices, -1].unsqueeze(-1)
+                routed_output.index_add_(
+                    0,
+                    remote_shared_indices,
+                    remote_shared_expert_output * remote_shared_weights,
+                )
+            else:
+                # Low Latency mode: combine WILL apply weights from topk_weights
+                # Just add raw output, combine will multiply by weight (1/rsf)
+                routed_output.index_add_(
+                    0,
+                    remote_shared_indices,
+                    remote_shared_expert_output,
+                )
 
         # Step 8: DeepEP combine with original topk=9
         if isinstance(dispatch_output, DeepEPNormalDispatchOutput):
