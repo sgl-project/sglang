@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
@@ -53,6 +54,27 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+# Minimal shape profiling support (controlled by environment variables)
+_ENABLE_SHAPE_PROFILING = os.environ.get("SGLANG_PROFILE_SHAPES", "0") == "1"
+_SHAPE_PROFILE_RANK = int(os.environ.get("SGLANG_PROFILE_SHAPES_RANK", "0"))
+_SHAPE_PROFILE_FILE = os.environ.get("SGLANG_PROFILE_SHAPES_FILE", "shapes.jsonl")
+_SHAPE_PROFILE_SKIP_WARMUP = int(os.environ.get("SGLANG_PROFILE_SHAPES_SKIP_WARMUP", "0"))
+_SHAPE_PROFILE_LOG_N_PASSES = int(os.environ.get("SGLANG_PROFILE_SHAPES_LOG_N_PASSES", "0"))
+_shape_logger_module = None
+
+if _ENABLE_SHAPE_PROFILING:
+    try:
+        import sys
+        _profiler_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../examples/profiler"))
+        if os.path.exists(_profiler_path):
+            sys.path.insert(0, _profiler_path)
+            from torch_shape_logger_rank import CompactRankAwareShapeLogger
+            _shape_logger_module = CompactRankAwareShapeLogger
+            logger.info(f"Shape profiling enabled: rank={_SHAPE_PROFILE_RANK}, file={_SHAPE_PROFILE_FILE}")
+    except Exception as e:
+        logger.warning(f"Failed to load shape profiling: {e}")
+        _ENABLE_SHAPE_PROFILING = False
 
 
 class BaseTpWorker(ABC):
@@ -264,6 +286,22 @@ class TpModelWorker(BaseTpWorker):
                 )
         self.device = self.model_runner.device
 
+        # Initialize shape profiler if enabled
+        self._shape_logger = None
+        self._shape_profiling_started = False
+        if _ENABLE_SHAPE_PROFILING and _shape_logger_module and self.tp_rank == _SHAPE_PROFILE_RANK:
+            try:
+                self._shape_logger = _shape_logger_module(
+                    output_file=_SHAPE_PROFILE_FILE,
+                    verbose=False,
+                    log_first_n_forward_passes=_SHAPE_PROFILE_LOG_N_PASSES,
+                    skip_first_n_forward_passes=_SHAPE_PROFILE_SKIP_WARMUP,
+                    only_rank=_SHAPE_PROFILE_RANK,
+                )
+                logger.info(f"[TP Rank {self.tp_rank}] Shape profiler initialized")
+            except Exception as e:
+                logger.warning(f"[TP Rank {self.tp_rank}] Failed to init shape profiler: {e}")
+
         # Init nccl groups
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
@@ -431,6 +469,20 @@ class TpModelWorker(BaseTpWorker):
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
 
+        # Activate shape profiler on first forward pass (lazy activation)
+        if self._shape_logger and not self._shape_profiling_started:
+            try:
+                self._shape_logger.__enter__()
+                self._shape_profiling_started = True
+                logger.info(f"[TP Rank {self.tp_rank}] Shape profiling activated")
+            except Exception as e:
+                logger.warning(f"[TP Rank {self.tp_rank}] Failed to activate profiler: {e}")
+                self._shape_logger = None
+
+        # Mark start of forward pass for profiling
+        if self._shape_logger and self._shape_profiling_started:
+            self._shape_logger.start_forward_pass()
+
         # Get forward batch from model worker batch
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
@@ -442,7 +494,10 @@ class TpModelWorker(BaseTpWorker):
             assert forward_batch is not None
 
         if self.is_dllm():
-            return self._forward_batch_generation_dllm(forward_batch)
+            result = self._forward_batch_generation_dllm(forward_batch)
+            if self._shape_logger and self._shape_profiling_started:
+                self._shape_logger.end_forward_pass()
+            return result
 
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(
@@ -459,6 +514,8 @@ class TpModelWorker(BaseTpWorker):
 
             if is_verify:
                 # Skip sampling and return logits for target forward
+                if self._shape_logger and self._shape_profiling_started:
+                    self._shape_logger.end_forward_pass()
                 return batch_result
 
             if (
@@ -474,6 +531,8 @@ class TpModelWorker(BaseTpWorker):
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
+                if self._shape_logger and self._shape_profiling_started:
+                    self._shape_logger.end_forward_pass()
                 return batch_result
 
             if not model_worker_batch.is_prefill_only:
@@ -498,6 +557,8 @@ class TpModelWorker(BaseTpWorker):
                         logits_output, model_worker_batch
                     )
 
+            if self._shape_logger and self._shape_profiling_started:
+                self._shape_logger.end_forward_pass()
             return batch_result
         else:
             out = self.model_runner.forward(
@@ -506,6 +567,8 @@ class TpModelWorker(BaseTpWorker):
                 skip_attn_backend_init=skip_attn_backend_init,
             )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            if self._shape_logger and self._shape_profiling_started:
+                self._shape_logger.end_forward_pass()
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
