@@ -1401,6 +1401,7 @@ class TritonAttnBackend(AttentionBackend):
                 top_k=forward_batch.attention_top_k,
                 chunk_size=forward_batch.attention_chunk_size,
                 window=forward_batch.attention_window,
+                head_ids=forward_batch.attention_capture_head_ids,
             )
 
             # Compute fingerprint if fingerprint mode is enabled (production path)
