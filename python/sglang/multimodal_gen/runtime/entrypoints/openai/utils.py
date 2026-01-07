@@ -24,10 +24,10 @@ logger = init_logger(__name__)
 
 @dataclasses.dataclass
 class SetLoraReq:
-    lora_nickname: str
-    lora_path: Optional[str] = None
-    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
-    strength: float = 1.0  # LoRA strength for merge, default 1.0
+    lora_nickname: Union[str, List[str]]
+    lora_path: Optional[Union[str, List[Optional[str]]]] = None
+    target: Union[str, List[str]] = "all"  # "all", "transformer", "transformer_2", "critic"
+    strength: Union[float, List[float]] = 1.0  # LoRA strength for merge, default 1.0
 
 
 @dataclasses.dataclass
