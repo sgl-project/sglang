@@ -30,7 +30,7 @@ export default defineConfig({
   projects: [
     {
       name: 'unit',
-      testMatch: /app\.spec\.ts/,
+      testMatch: /(app|types|stores)\.spec\.ts/,
       use: { ...devices['Desktop Chrome'] },
     },
     {

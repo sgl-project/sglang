@@ -391,5 +391,212 @@ class TestTopkAttention(CustomTestCase):
             self.assertEqual(item["layer_id"], 42)
 
 
+class TestHeadSelectionFiltering(CustomTestCase):
+    """Test head_ids filtering for per-request attention head selection."""
+
+    def _set_all_seeds(self, seed):
+        """Set all random seeds for reproducibility."""
+        random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    def setUp(self):
+        self._set_all_seeds(42)
+
+    def test_head_ids_filters_correctly(self):
+        """Test that head_ids parameter filters attention to specified heads."""
+        from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
+            compute_topk_attention_chunked,
+        )
+
+        device = get_device()
+        batch_size = 1
+        num_heads = 8
+        num_kv_heads = 8
+        head_dim = 64
+        seq_len = 64
+        top_k = 5
+
+        # Create query and keys
+        q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device=device)
+        k_buffer = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.float16, device=device)
+        kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+        kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
+        sm_scale = 1.0 / (head_dim ** 0.5)
+
+        # Run without head filtering
+        scores_all, indices_all, _, _ = compute_topk_attention_chunked(
+            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            head_ids=None,
+        )
+
+        # Run with subset of heads
+        head_ids = [0, 1, 2]  # Only use first 3 heads
+        scores_filtered, indices_filtered, _, _ = compute_topk_attention_chunked(
+            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            head_ids=head_ids,
+        )
+
+        # Results should be different (unless by random chance)
+        # The filtered version should produce valid results
+        self.assertEqual(scores_filtered.shape, (batch_size, top_k))
+        self.assertEqual(indices_filtered.shape, (batch_size, top_k))
+
+        # Scores should sum to ~1 (softmax normalized)
+        score_sum = scores_filtered[0].sum().item()
+        self.assertAlmostEqual(score_sum, 1.0, places=3)
+
+        # Indices should be within valid range
+        self.assertTrue(torch.all(indices_filtered >= 0))
+        self.assertTrue(torch.all(indices_filtered < seq_len))
+
+    def test_head_ids_empty_fallback(self):
+        """Test that empty head_ids falls back to all heads."""
+        from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
+            compute_topk_attention_chunked,
+        )
+
+        device = get_device()
+        batch_size = 1
+        num_heads = 4
+        head_dim = 32
+        seq_len = 32
+        top_k = 3
+
+        q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device=device)
+        k_buffer = torch.randn(seq_len, num_heads, head_dim, dtype=torch.float16, device=device)
+        kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+        kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
+        sm_scale = 1.0 / (head_dim ** 0.5)
+
+        # Empty head_ids should behave like None (all heads)
+        scores_empty, indices_empty, _, _ = compute_topk_attention_chunked(
+            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            head_ids=[],
+        )
+
+        scores_none, indices_none, _, _ = compute_topk_attention_chunked(
+            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            head_ids=None,
+        )
+
+        # Results should be the same
+        torch.testing.assert_close(scores_empty, scores_none)
+        torch.testing.assert_close(indices_empty, indices_none)
+
+    def test_head_ids_invalid_filtered_out(self):
+        """Test that invalid head IDs are filtered out gracefully."""
+        from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
+            compute_topk_attention_chunked,
+        )
+
+        device = get_device()
+        batch_size = 1
+        num_heads = 4
+        head_dim = 32
+        seq_len = 32
+        top_k = 3
+
+        q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device=device)
+        k_buffer = torch.randn(seq_len, num_heads, head_dim, dtype=torch.float16, device=device)
+        kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+        kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
+        sm_scale = 1.0 / (head_dim ** 0.5)
+
+        # Include some invalid head IDs (negative and out of range)
+        head_ids = [-1, 0, 2, 100]  # Only 0 and 2 are valid for num_heads=4
+
+        # Should not crash and should produce valid results
+        scores, indices, _, _ = compute_topk_attention_chunked(
+            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            head_ids=head_ids,
+        )
+
+        self.assertEqual(scores.shape, (batch_size, top_k))
+        self.assertEqual(indices.shape, (batch_size, top_k))
+
+        # Results should be valid
+        score_sum = scores[0].sum().item()
+        self.assertAlmostEqual(score_sum, 1.0, places=3)
+
+    def test_head_ids_single_head(self):
+        """Test filtering to a single head."""
+        from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
+            compute_topk_attention_chunked,
+        )
+
+        device = get_device()
+        batch_size = 1
+        num_heads = 8
+        head_dim = 64
+        seq_len = 64
+        top_k = 5
+
+        q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device=device)
+        k_buffer = torch.randn(seq_len, num_heads, head_dim, dtype=torch.float16, device=device)
+        kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+        kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
+        sm_scale = 1.0 / (head_dim ** 0.5)
+
+        # Use only head 0
+        scores, indices, logits, lse = compute_topk_attention_chunked(
+            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            head_ids=[0],
+        )
+
+        self.assertEqual(scores.shape, (batch_size, top_k))
+        self.assertEqual(indices.shape, (batch_size, top_k))
+
+        # Verify scores are valid
+        score_sum = scores[0].sum().item()
+        self.assertAlmostEqual(score_sum, 1.0, places=3)
+
+        # All indices should be unique and valid
+        unique_indices = torch.unique(indices[0]).tolist()
+        self.assertEqual(len(unique_indices), top_k)
+
+    def test_head_ids_with_large_sequence(self):
+        """Test head filtering with larger sequences that use chunked path."""
+        from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
+            compute_topk_attention_chunked,
+        )
+
+        device = get_device()
+        batch_size = 1
+        num_heads = 16
+        num_kv_heads = 4  # GQA
+        head_dim = 64
+        seq_len = 10000  # Large enough to trigger chunked path
+        top_k = 10
+
+        q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device=device)
+        k_buffer = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.float16, device=device)
+        kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+        kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
+        sm_scale = 1.0 / (head_dim ** 0.5)
+
+        # Filter to subset of heads
+        head_ids = [0, 4, 8, 12]
+
+        scores, indices, logits, lse = compute_topk_attention_chunked(
+            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            chunk_size=2048,
+            head_ids=head_ids,
+        )
+
+        # Verify results
+        self.assertEqual(scores.shape, (batch_size, top_k))
+        self.assertEqual(indices.shape, (batch_size, top_k))
+        self.assertTrue(torch.all(indices >= 0))
+        self.assertTrue(torch.all(indices < seq_len))
+
+        # Scores should sum to ~1
+        score_sum = scores[0].sum().item()
+        self.assertAlmostEqual(score_sum, 1.0, places=2)
+
+
 if __name__ == "__main__":
     unittest.main()
