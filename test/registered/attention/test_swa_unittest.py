@@ -3,14 +3,14 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
-register_cuda_ci(est_time=8, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu")
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(est_time=8, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu")
 
 
 class TestSWA(unittest.TestCase):

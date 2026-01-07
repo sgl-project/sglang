@@ -4,9 +4,6 @@ import unittest
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -14,6 +11,9 @@ from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
 
 
 class TestMamba(unittest.TestCase):
