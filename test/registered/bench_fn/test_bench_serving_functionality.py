@@ -117,19 +117,28 @@ class TestBenchServingCustomHeaders(CustomTestCase):
 
         class HeaderEchoHandler(BaseHTTPRequestHandler):
             def _handle(self):
-                received_requests.put((self.command, self.path, dict(self.headers)))
+                received_requests.put(
+                    {
+                        "method": self.command,
+                        "path": self.path,
+                        "headers": dict(self.headers),
+                    }
+                )
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 if self.path == "/v1/models":
                     self.wfile.write(json.dumps({"data": [{"id": "gpt2"}]}).encode())
                 elif self.path == "/generate":
-                    self.wfile.write(json.dumps({"text": "ok", "meta_info": {"completion_tokens": 1}}).encode())
+                    self.wfile.write(
+                        json.dumps(
+                            {"text": "ok", "meta_info": {"completion_tokens": 1}}
+                        ).encode()
+                    )
                 else:
                     self.wfile.write(json.dumps({}).encode())
 
             do_GET = do_POST = _handle
-
 
         server = HTTPServer(("127.0.0.1", 0), HeaderEchoHandler)
         port = server.server_address[1]
@@ -160,9 +169,13 @@ class TestBenchServingCustomHeaders(CustomTestCase):
         while not received_requests.empty():
             all_reqs.append(received_requests.get_nowait())
 
-        generate_reqs = [(m, p, h) for m, p, h in all_reqs if p == "/generate"]
-        self.assertGreater(len(generate_reqs), 0, f"No /generate request. All: {[(m, p) for m, p, _ in all_reqs]}")
-        _, _, headers = generate_reqs[0]
+        generate_reqs = [r for r in all_reqs if r["path"] == "/generate"]
+        self.assertGreater(
+            len(generate_reqs),
+            0,
+            f"No /generate request. All: {[r['path'] for r in all_reqs]}",
+        )
+        headers = generate_reqs[0]["headers"]
         self.assertEqual(headers.get("X-Custom-Test"), "TestValue123")
         self.assertEqual(headers.get("X-Another"), "AnotherVal")
 
