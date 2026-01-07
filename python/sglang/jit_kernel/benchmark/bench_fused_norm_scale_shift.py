@@ -1,283 +1,201 @@
-# Benchmarks SGLang fused layernorm/rmsnorm scale shift kernels versus PyTorch naive implementations
+# Benchmarks SGLang fused layernorm/rmsnorm scale shift kernels
 # Tests three kernel variants:
 # 1. fused_norm_scale_shift - with affine parameters (gamma/beta)
 # 2. fused_norm_scale_shift_no_affine - without affine parameters
 # 3. fused_scale_residual_norm_scale_shift - with residual and gate
-import argparse
+import itertools
 import os
-from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Tuple
 
 import torch
+import triton
+import triton.testing
 
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     _NormScaleShift,
     _ScaleResidualNormScaleShift,
 )
 
-# CI environment detection
 IS_CI = (
     os.getenv("CI", "false").lower() == "true"
     or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 )
 
+DTYPE = torch.bfloat16
+DEVICE = "cuda"
+EPS = 1e-5
 
-def bench_fused_norm_scale_shift(
-    B: int,
-    L: int,
-    C: int,
-    norm_type: str,
-    num_warmup: int,
-    num_run: int,
-) -> Tuple[float, float]:
-    device = "cuda"
-    dtype = torch.bfloat16
-    eps = 1e-5
+if IS_CI:
+    B_RANGE = [1]
+    L_RANGE = [128]
+    C_RANGE = [1024]
+else:
+    B_RANGE = [1]
+    L_RANGE = [128, 1024, 4096]
+    C_RANGE = [1024, 3072, 4096]
 
-    x = torch.randn(B, L, C, dtype=dtype, device=device)
-    weight = torch.randn(C, dtype=dtype, device=device)
-    bias = torch.randn(C, dtype=dtype, device=device)
-    scale = torch.randn(B, L, C, dtype=dtype, device=device)
-    shift = torch.randn(B, L, C, dtype=dtype, device=device)
-    layer = _NormScaleShift(C, norm_type, eps=eps, elementwise_affine=True, dtype=dtype)
+NORM_TYPE_RANGE = ["layer", "rms"]
+
+
+def create_norm_scale_shift_layer(C: int, norm_type: str):
+    """Create layer with affine parameters."""
+    layer = _NormScaleShift(C, norm_type, eps=EPS, elementwise_affine=True, dtype=DTYPE)
+    weight = torch.randn(C, dtype=DTYPE, device=DEVICE)
+    bias = torch.randn(C, dtype=DTYPE, device=DEVICE)
     with torch.no_grad():
         layer.norm.weight.copy_(weight)
         if norm_type == "layer":
             layer.norm.bias.copy_(bias)
-
-    # warmup
-    for _ in range(num_warmup):
-        layer.forward_native(x, shift, scale)
-    torch.cuda.synchronize()
-
-    # run naive
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(num_run):
-        layer.forward_native(x, shift, scale)
-    end_event.record()
-    end_event.synchronize()
-    torch.cuda.synchronize()
-    naive_time = start_event.elapsed_time(end_event) / num_run * 1000  # us
-
-    # warmup
-    for _ in range(num_warmup):
-        layer.forward_cuda(x, shift, scale)
-    torch.cuda.synchronize()
-
-    # run sglang
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(num_run):
-        layer.forward_cuda(x, shift, scale)
-    end_event.record()
-    end_event.synchronize()
-    torch.cuda.synchronize()
-    sglang_time = start_event.elapsed_time(end_event) / num_run * 1000  # us
-
-    return naive_time, sglang_time
+    return layer
 
 
-def bench_fused_norm_scale_shift_no_affine(
-    B: int,
-    L: int,
-    C: int,
-    norm_type: str,
-    num_warmup: int,
-    num_run: int,
-) -> Tuple[float, float]:
-    device = "cuda"
-    dtype = torch.bfloat16
-    eps = 1e-5
-
-    x = torch.randn(B, L, C, dtype=dtype, device=device)
-    scale = torch.randn(B, L, C, dtype=dtype, device=device)
-    shift = torch.randn(B, L, C, dtype=dtype, device=device)
-
+def create_norm_scale_shift_no_affine_layer(C: int, norm_type: str):
+    """Create layer without affine parameters."""
     layer = _NormScaleShift(
-        C, norm_type, eps=eps, elementwise_affine=False, dtype=dtype
+        C, norm_type, eps=EPS, elementwise_affine=False, dtype=DTYPE
     )
-
-    # warmup
-    for _ in range(num_warmup):
-        layer.forward_native(x, shift, scale)
-    torch.cuda.synchronize()
-
-    # run naive
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(num_run):
-        layer.forward_native(x, shift, scale)
-    end_event.record()
-    end_event.synchronize()
-    torch.cuda.synchronize()
-    naive_time = start_event.elapsed_time(end_event) / num_run * 1000  # us
-
-    # warmup
-    for _ in range(num_warmup):
-        layer.forward_cuda(x, shift, scale)
-    torch.cuda.synchronize()
-
-    # run sglang
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(num_run):
-        layer.forward_cuda(x, shift, scale)
-    end_event.record()
-    end_event.synchronize()
-    torch.cuda.synchronize()
-    sglang_time = start_event.elapsed_time(end_event) / num_run * 1000  # us
-
-    return naive_time, sglang_time
+    return layer
 
 
-def bench_fused_scale_residual_norm_scale_shift(
-    B: int,
-    L: int,
-    C: int,
-    norm_type: str,
-    num_warmup: int,
-    num_run: int,
-) -> Tuple[float, float]:
-    device = "cuda"
-    dtype = torch.bfloat16
-    eps = 1e-5
-
-    residual = torch.randn(B, L, C, dtype=dtype, device=device)
-    x = torch.randn(B, L, C, dtype=dtype, device=device)
-    weight = torch.randn(C, dtype=dtype, device=device)
-    bias = torch.randn(C, dtype=dtype, device=device)
-    scale = torch.randn(B, L, C, dtype=dtype, device=device)
-    shift = torch.randn(B, L, C, dtype=dtype, device=device)
-    gate = torch.randn(B, 1, C, dtype=dtype, device=device)
+def create_scale_residual_norm_scale_shift_layer(C: int, norm_type: str):
+    """Create layer with residual, gate, and affine parameters."""
     layer = _ScaleResidualNormScaleShift(
-        C, norm_type, eps=eps, elementwise_affine=True, dtype=dtype
+        C, norm_type, eps=EPS, elementwise_affine=True, dtype=DTYPE
     )
+    weight = torch.randn(C, dtype=DTYPE, device=DEVICE)
+    bias = torch.randn(C, dtype=DTYPE, device=DEVICE)
     with torch.no_grad():
         layer.norm.weight.copy_(weight)
         if norm_type == "layer":
             layer.norm.bias.copy_(bias)
-    # warmup
-    for _ in range(num_warmup):
-        layer.forward_native(residual, x, gate, shift, scale)
-    torch.cuda.synchronize()
-
-    # run naive
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(num_run):
-        layer.forward_native(residual, x, gate, shift, scale)
-    end_event.record()
-    end_event.synchronize()
-    torch.cuda.synchronize()
-    naive_time = start_event.elapsed_time(end_event) / num_run * 1000  # us
-
-    # warmup
-    for _ in range(num_warmup):
-        layer.forward_cuda(residual, x, gate, shift, scale)
-    torch.cuda.synchronize()
-
-    # run sglang
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(num_run):
-        layer.forward_cuda(residual, x, gate, shift, scale)
-    end_event.record()
-    end_event.synchronize()
-    torch.cuda.synchronize()
-    sglang_time = start_event.elapsed_time(end_event) / num_run * 1000  # us
-
-    return naive_time, sglang_time
+    return layer
 
 
-benchmark_kernels = {
-    "fused_norm_scale_shift": bench_fused_norm_scale_shift,
-    "fused_norm_scale_shift_no_affine": bench_fused_norm_scale_shift_no_affine,
-    "fused_scale_residual_norm_scale_shift": bench_fused_scale_residual_norm_scale_shift,
-}
+# ============================================================================
+# Benchmark 1: fused_norm_scale_shift (with affine)
+# ============================================================================
+LINE_VALS = ["native", "cuda"]
+LINE_NAMES = ["SGLang Native", "SGLang Fused"]
+STYLES = [("red", "-"), ("blue", "--")]
+
+configs_norm_scale_shift = list(
+    itertools.product(B_RANGE, L_RANGE, C_RANGE, NORM_TYPE_RANGE)
+)
 
 
-@dataclass
-class ShapeArg:
-    B: int
-    L: int
-    C: int
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["B", "L", "C", "norm_type"],
+        x_vals=configs_norm_scale_shift,
+        line_arg="provider",
+        line_vals=LINE_VALS,
+        line_names=LINE_NAMES,
+        styles=STYLES,
+        ylabel="us",
+        plot_name="fused_norm_scale_shift",
+        args={},
+    )
+)
+def bench_fused_norm_scale_shift(
+    B: int, L: int, C: int, norm_type: str, provider: str
+) -> Tuple[float, float, float]:
+    x = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
+    scale = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
+    shift = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
+    layer = create_norm_scale_shift_layer(C, norm_type)
 
-
-def benchmark_one_shape(
-    kernel_name: str,
-    shape_args: List[ShapeArg],
-    norm_type_args: List[str],
-    num_warmup: int,
-    num_run: int,
-):
-    print(f"\n{'='*80}")
-    print(f"Kernel: {kernel_name}")
-    print(f"{'='*80}")
-
-    kernel_func = benchmark_kernels[kernel_name]
-
-    for norm_type in norm_type_args:
-        for shape in shape_args:
-            naive_time, sglang_time = kernel_func(
-                shape.B,
-                shape.L,
-                shape.C,
-                norm_type,
-                num_warmup,
-                num_run,
-            )
-            speedup = naive_time / sglang_time if sglang_time > 0 else 0.0
-            print(
-                f"B={shape.B:1d}, L={shape.L:4d}, C={shape.C:4d} norm={norm_type} | "
-                f"Naive: {naive_time:8.2f} us | "
-                f"SGLang: {sglang_time:8.2f} us | "
-                f"Speedup: {speedup:5.2f}x"
-            )
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--num-warmup", type=int, default=3)
-    parser.add_argument("--num-run", type=int, default=10)
-
-    # CI environment uses simplified parameters
-    if IS_CI:
-        shape_args = [
-            # Only test one simple shape in CI
-            ShapeArg(B=1, L=128, C=1024),
-        ]
+    if provider == "native":
+        fn = lambda: layer.forward_native(x, shift, scale)
     else:
-        shape_args = [
-            # Small shapes
-            ShapeArg(B=1, L=128, C=1024),
-            ShapeArg(B=1, L=128, C=3072),
-            ShapeArg(B=1, L=128, C=4096),
-            # Medium shapes
-            ShapeArg(B=1, L=1024, C=1024),
-            ShapeArg(B=1, L=1024, C=3072),
-            ShapeArg(B=1, L=1024, C=4096),
-            # Large shapes
-            ShapeArg(B=1, L=4096, C=1024),
-            ShapeArg(B=1, L=4096, C=3072),
-            ShapeArg(B=1, L=4096, C=4096),
-        ]
+        fn = lambda: layer.forward_cuda(x, shift, scale)
 
-    norm_type_args = ["layer", "rms"]
+    quantiles = [0.5, 0.2, 0.8]
+    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    return 1000 * ms, 1000 * max_ms, 1000 * min_ms  # convert to us
 
-    args = parser.parse_args()
 
-    for kernel_name in benchmark_kernels.keys():
-        benchmark_one_shape(
-            kernel_name, shape_args, norm_type_args, args.num_warmup, args.num_run
-        )
+# ============================================================================
+# Benchmark 2: fused_norm_scale_shift_no_affine (without affine)
+# ============================================================================
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["B", "L", "C", "norm_type"],
+        x_vals=configs_norm_scale_shift,
+        line_arg="provider",
+        line_vals=LINE_VALS,
+        line_names=LINE_NAMES,
+        styles=STYLES,
+        ylabel="us",
+        plot_name="fused_norm_scale_shift_no_affine",
+        args={},
+    )
+)
+def bench_fused_norm_scale_shift_no_affine(
+    B: int, L: int, C: int, norm_type: str, provider: str
+) -> Tuple[float, float, float]:
+    x = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
+    scale = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
+    shift = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
+    layer = create_norm_scale_shift_no_affine_layer(C, norm_type)
+
+    if provider == "native":
+        fn = lambda: layer.forward_native(x, shift, scale)
+    else:
+        fn = lambda: layer.forward_cuda(x, shift, scale)
+
+    quantiles = [0.5, 0.2, 0.8]
+    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    return 1000 * ms, 1000 * max_ms, 1000 * min_ms  # convert to us
+
+
+# ============================================================================
+# Benchmark 3: fused_scale_residual_norm_scale_shift (with residual and gate)
+# ============================================================================
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["B", "L", "C", "norm_type"],
+        x_vals=configs_norm_scale_shift,
+        line_arg="provider",
+        line_vals=LINE_VALS,
+        line_names=LINE_NAMES,
+        styles=STYLES,
+        ylabel="us",
+        plot_name="fused_scale_residual_norm_scale_shift",
+        args={},
+    )
+)
+def bench_fused_scale_residual_norm_scale_shift(
+    B: int, L: int, C: int, norm_type: str, provider: str
+) -> Tuple[float, float, float]:
+    residual = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
+    x = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
+    scale = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
+    shift = torch.randn(B, L, C, dtype=DTYPE, device=DEVICE)
+    gate = torch.randn(B, 1, C, dtype=DTYPE, device=DEVICE)
+    layer = create_scale_residual_norm_scale_shift_layer(C, norm_type)
+
+    if provider == "native":
+        fn = lambda: layer.forward_native(residual, x, gate, shift, scale)
+    else:
+        fn = lambda: layer.forward_cuda(residual, x, gate, shift, scale)
+
+    quantiles = [0.5, 0.2, 0.8]
+    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    return 1000 * ms, 1000 * max_ms, 1000 * min_ms  # convert to us
 
 
 if __name__ == "__main__":
-    main()
+    print(f"\n{'='*80}")
+    print("Benchmark: fused_norm_scale_shift (with affine)")
+    print(f"{'='*80}\n")
+    bench_fused_norm_scale_shift.run(print_data=True)
+
+    print(f"\n{'='*80}")
+    print("Benchmark: fused_norm_scale_shift_no_affine (without affine)")
+    print(f"{'='*80}\n")
+    bench_fused_norm_scale_shift_no_affine.run(print_data=True)
+
+    print(f"\n{'='*80}")
+    print("Benchmark: fused_scale_residual_norm_scale_shift (with residual and gate)")
+    print(f"{'='*80}\n")
+    bench_fused_scale_residual_norm_scale_shift.run(print_data=True)
