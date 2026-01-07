@@ -55,6 +55,13 @@ logger = logging.getLogger(__name__)
 # Profiling for V1 vs V2 comparison (set SGLANG_PROFILE_SPEC_SYNC=1 to enable)
 _PROFILE_SYNC = os.environ.get("SGLANG_PROFILE_SPEC_SYNC", "0") == "1"
 _v1_sync_stats = {"tolist_ns": 0, "count": 0}
+_v1_step_stats = {
+    "draft_ns": 0,
+    "verify_ns": 0,
+    "draft_extend_ns": 0,
+    "total_ns": 0,
+    "count": 0,
+}
 
 
 @dataclass
@@ -399,10 +406,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if _PROFILE_SYNC:
             _v1_sync_stats["tolist_ns"] += time.perf_counter_ns() - _t0
             _v1_sync_stats["count"] += 1
-            if _v1_sync_stats["count"] % 50 == 0:
+            if _v1_sync_stats["count"] % 20 == 0:
                 avg = _v1_sync_stats["tolist_ns"] / _v1_sync_stats["count"] / 1e6
                 print(
-                    f"[V1 SYNC STATS] n={_v1_sync_stats['count']} tolist={avg:.3f}ms/step"
+                    f"[V1 SYNC STATS] n={_v1_sync_stats['count']} tolist={avg:.3f}ms/step",
+                    flush=True,
                 )
         has_finished = False
 

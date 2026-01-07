@@ -34,11 +34,14 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
+    _PROFILE_SYNC,
+    _step_stats,
     assign_extend_cache_locs,
     build_compact_kv_src_tgt_cache_loc,
     compact_data_tensors_func,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
+    record_step_time,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -124,15 +127,11 @@ class EagleDraftWorker(BaseDraftWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-
-        # Init draft worker
-        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
-            ctx = draft_tp_context(get_attention_tp_group())
-        else:
-            ctx = empty_context()
         with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            empty_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -165,9 +164,11 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -639,6 +640,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
         ):
+            # Wait for Plan Stream from previous request before starting new prefill.
+            # The previous request's Plan Stream may still be accessing shared data
+            # structures (req_to_token, kv_indices) when we start a new request.
+            if self.plan_stream is not None:
+                torch.cuda.current_stream().wait_stream(self.plan_stream)
+
             # Target prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             batch_output = self.target_worker.forward_batch_generation(
@@ -647,9 +654,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
                         model_worker_batch,
@@ -659,6 +667,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
+            if _PROFILE_SYNC:
+                _t_step_start = time.perf_counter_ns()
+
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
@@ -667,21 +678,55 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+
+            if _PROFILE_SYNC:
+                _t_draft_start = time.perf_counter_ns()
+            with (
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
+            if _PROFILE_SYNC:
+                record_step_time("draft_ns", time.perf_counter_ns() - _t_draft_start)
+
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
+
+            if _PROFILE_SYNC:
+                _t_verify_start = time.perf_counter_ns()
             batch_output = self.verify(model_worker_batch)
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            if _PROFILE_SYNC:
+                record_step_time("verify_ns", time.perf_counter_ns() - _t_verify_start)
+
+            if _PROFILE_SYNC:
+                _t_draft_ext_start = time.perf_counter_ns()
+            with (
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )
+            if _PROFILE_SYNC:
+                record_step_time(
+                    "draft_extend_ns", time.perf_counter_ns() - _t_draft_ext_start
+                )
+                record_step_time("total_ns", time.perf_counter_ns() - _t_step_start)
+                _step_stats["count"] += 1
+                if _step_stats["count"] % 20 == 0:
+                    n = _step_stats["count"]
+                    draft = _step_stats["draft_ns"] / n / 1e6
+                    verify = _step_stats["verify_ns"] / n / 1e6
+                    draft_ext = _step_stats["draft_extend_ns"] / n / 1e6
+                    total = _step_stats["total_ns"] / n / 1e6
+                    print(
+                        f"[V2 STEP] n={n} draft={draft:.2f}ms verify={verify:.2f}ms "
+                        f"draft_ext={draft_ext:.2f}ms total={total:.2f}ms",
+                        flush=True,
+                    )
+
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
@@ -789,7 +834,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if is_tree_mode:
                 # Tree mode requires CUDA/HIP for Triton kernels
                 if not (_is_cuda or _is_hip):
-                    raise RuntimeError("Tree mode speculative decoding (topk > 1) requires CUDA or HIP.")
+                    raise RuntimeError(
+                        "Tree mode speculative decoding (topk > 1) requires CUDA or HIP."
+                    )
 
                 # Compact accepted KV cache to the front of the per-request
                 # speculative region so subsequent decode reads contiguous KV.
