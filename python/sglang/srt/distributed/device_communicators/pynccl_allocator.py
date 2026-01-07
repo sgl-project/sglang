@@ -3,7 +3,6 @@ import tempfile
 from contextlib import nullcontext
 
 import torch
-import torch.utils.cpp_extension
 from packaging import version
 from torch.cuda.memory import CUDAPluggableAllocator
 
@@ -90,6 +89,8 @@ def restore_symmetric_memory_context(saved_context):
 def get_nccl_mem_pool():
     global _allocator, _mem_pool, _cur_device
     if _mem_pool is None:
+        import torch.utils.cpp_extension
+
         out_dir = tempfile.gettempdir()
         nccl_allocator_libname = "nccl_allocator"
         torch.utils.cpp_extension.load_inline(

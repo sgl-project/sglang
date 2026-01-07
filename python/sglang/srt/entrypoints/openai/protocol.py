@@ -339,10 +339,14 @@ class ChatCompletionMessageContentTextPart(BaseModel):
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
 
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -516,6 +520,10 @@ class ChatCompletionRequest(BaseModel):
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
 
+    # SGLang multimodal tiling controls (extensions)
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
@@ -656,6 +664,7 @@ class ChatCompletionRequest(BaseModel):
             "skip_special_tokens": self.skip_special_tokens,
             "logit_bias": self.logit_bias,
             "custom_params": self.custom_params,
+            "sampling_seed": self.seed,
         }
 
         if self.response_format and self.response_format.type == "json_schema":

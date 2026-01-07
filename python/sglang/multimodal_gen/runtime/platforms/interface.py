@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import enum
 import random
-from typing import TYPE_CHECKING, NamedTuple
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -23,6 +24,7 @@ logger = init_logger(__name__)
 
 
 class AttentionBackendEnum(enum.Enum):
+    FA2 = enum.auto()
     FA = enum.auto()
     SLIDING_TILE_ATTN = enum.auto()
     TORCH_SDPA = enum.auto()
@@ -89,27 +91,78 @@ class Platform:
 
     supported_quantization: list[str] = []
 
+    @lru_cache(maxsize=1)
     def is_cuda(self) -> bool:
-        return self._enum == PlatformEnum.CUDA
+        return self.is_cuda_static()
 
+    @lru_cache(maxsize=1)
     def is_rocm(self) -> bool:
-        return self._enum == PlatformEnum.ROCM
+        return self.is_rocm_static()
 
+    @lru_cache(maxsize=1)
     def is_tpu(self) -> bool:
         return self._enum == PlatformEnum.TPU
 
+    @lru_cache(maxsize=1)
     def is_cpu(self) -> bool:
         return self._enum == PlatformEnum.CPU
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def is_blackwell(cls):
+        if not cls.is_cuda_static():
+            return False
+        return torch.cuda.get_device_capability()[0] == 10
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def is_sm120(cls):
+        if not cls.is_cuda_static():
+            return False
+        return torch.cuda.get_device_capability()[0] == 12
+
+    @classmethod
+    def is_cuda_static(cls) -> bool:
+        return getattr(cls, "_enum", None) == PlatformEnum.CUDA
+
+    @classmethod
+    def is_rocm_static(cls) -> bool:
+        return getattr(cls, "_enum", None) == PlatformEnum.ROCM
+
+    @lru_cache(maxsize=1)
+    def is_hpu(self) -> bool:
+        return hasattr(torch, "hpu") and torch.hpu.is_available()
+
+    @lru_cache(maxsize=1)
+    def is_xpu(self) -> bool:
+        return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+    @lru_cache(maxsize=1)
+    def is_npu(self) -> bool:
+        return hasattr(torch, "npu") and torch.npu.is_available()
 
     def is_out_of_tree(self) -> bool:
         return self._enum == PlatformEnum.OOT
 
+    @lru_cache(maxsize=1)
     def is_cuda_alike(self) -> bool:
         """Stateless version of :func:`torch.cuda.is_available`."""
         return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
 
+    @lru_cache(maxsize=1)
     def is_mps(self) -> bool:
         return self._enum == PlatformEnum.MPS
+
+    @lru_cache(maxsize=1)
+    def is_musa(self):
+        try:
+            return hasattr(torch, "musa") and torch.musa.is_available()
+        except ModuleNotFoundError:
+            return False
+
+    @lru_cache(maxsize=1)
+    def is_hip(self) -> bool:
+        return self.is_rocm()
 
     @classmethod
     def get_attn_backend_cls_str(
@@ -163,9 +216,34 @@ class Platform:
         raise NotImplementedError
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """Get the total memory of a device in bytes."""
         raise NotImplementedError
+
+    @lru_cache(maxsize=1)
+    def get_device(self, local_rank: int) -> torch.device:
+        if self.is_cuda() or self.is_rocm():
+            return torch.device("cuda", local_rank)
+        elif self.is_musa():
+            return torch.device("musa", local_rank)
+        elif self.is_mps():
+            return torch.device("mps")
+        else:
+            return torch.device("cpu")
+
+    @lru_cache(maxsize=1)
+    def get_torch_distributed_backend_str(self) -> str:
+        if self.is_cuda_alike():
+            return "nccl"
+        elif self.is_musa():
+            return "mccl"
+        elif self.is_mps():
+            return "gloo"
+        else:
+            raise NotImplementedError(
+                "No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available"
+            )
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
@@ -227,6 +305,19 @@ class Platform:
     ) -> float:
         """
         Return the memory usage in bytes.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    def get_available_gpu_memory(
+        cls,
+        device_id: int = 0,
+        distributed: bool = False,
+        empty_cache: bool = True,
+        cpu_group: Any = None,
+    ) -> float:
+        """
+        Return the available memory in GiB.
         """
         raise NotImplementedError
 

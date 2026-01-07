@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     prepare_request,
 )
-from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.srt.managers.io_struct import VertexGenerateReqInput
 
@@ -27,13 +27,13 @@ VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from sglang.multimodal_gen.runtime.scheduler_client import (
+        async_scheduler_client,
         run_zeromq_broker,
-        scheduler_client,
     )
 
     # 1. Initialize the singleton client that connects to the backend Scheduler
     server_args = app.state.server_args
-    scheduler_client.initialize(server_args)
+    async_scheduler_client.initialize(server_args)
 
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
     # On shutdown
     print("FastAPI app is shutting down...")
     broker_task.cancel()
-    scheduler_client.close()
+    async_scheduler_client.close()
 
 
 # Health router
@@ -55,9 +55,15 @@ async def health():
     return {"status": "ok"}
 
 
-@health_router.get("/models")
+@health_router.get("/models", deprecated=True)
 async def get_models(request: Request):
-    """Get information about the model served by this server."""
+    """
+    Get information about the model served by this server.
+
+    .. deprecated::
+        Use /v1/models instead for OpenAI-compatible model discovery.
+        This endpoint will be removed in a future version.
+    """
     from sglang.multimodal_gen.registry import get_model_info
 
     server_args: ServerArgs = request.app.state.server_args
@@ -69,7 +75,6 @@ async def get_models(request: Request):
         "task_type": server_args.pipeline_config.task_type.name,
         "dit_precision": server_args.pipeline_config.dit_precision,
         "vae_precision": server_args.pipeline_config.vae_precision,
-        "workload_type": server_args.workload_type.value,
     }
 
     if model_info:
@@ -106,7 +111,7 @@ def encode_video_to_base64(file_path: str):
 async def forward_to_scheduler(req_obj, sp):
     """Forwards request to scheduler and processes the result."""
     try:
-        response = await scheduler_client.forward(req_obj)
+        response = await async_scheduler_client.forward(req_obj)
         if response.output is None:
             raise RuntimeError("Model generation returned no output.")
 
