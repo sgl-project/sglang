@@ -75,7 +75,8 @@ class LoRAPipeline(ComposedPipelineBase):
         self.cur_adapter_name = {}
         self.cur_adapter_path = {}
         self.cur_adapter_strength = {}
-        self.cur_adapter_config = {}  # Track full LoRA config: {module_name: (nickname_list, strength_list)}
+        # Track full LoRA config: {module_name: (nickname_list, strength_list)}
+        self.cur_adapter_config = {}
         self.lora_layers = {}
         self.lora_layers_critic = {}
         self.lora_layers_transformer_2 = {}
@@ -425,7 +426,9 @@ class LoRAPipeline(ComposedPipelineBase):
         adapted_count = 0
         for name, layer in lora_layers.items():
             # Apply all LoRA adapters in order
-            for idx, (nickname, path, lora_strength) in enumerate(zip(lora_nicknames, lora_paths, strengths)):
+            for idx, (nickname, path, lora_strength) in enumerate(
+                zip(lora_nicknames, lora_paths, strengths)
+            ):
                 lora_A_name = name + ".lora_A"
                 lora_B_name = name + ".lora_B"
                 if (
@@ -437,7 +440,9 @@ class LoRAPipeline(ComposedPipelineBase):
                         self.lora_adapters[nickname][lora_B_name],
                         lora_path=path,
                         strength=lora_strength,
-                        clear_existing=(clear_existing and idx == 0),  # Only clear on first LoRA
+                        clear_existing=(
+                            clear_existing and idx == 0
+                        ),  # Only clear on first LoRA
                     )
                     adapted_count += 1
                 else:
@@ -450,7 +455,8 @@ class LoRAPipeline(ComposedPipelineBase):
                     # Only disable if no LoRA was applied at all
                     if idx == len(lora_nicknames) - 1:
                         has_any_lora = any(
-                            name + ".lora_A" in self.lora_adapters[n] and name + ".lora_B" in self.lora_adapters[n]
+                            name + ".lora_A" in self.lora_adapters[n]
+                            and name + ".lora_B" in self.lora_adapters[n]
                             for n in lora_nicknames
                         )
                         if not has_any_lora:
@@ -623,7 +629,9 @@ class LoRAPipeline(ComposedPipelineBase):
                 tgt_paths = [lora_paths[i] for i in idx_list]
                 tgt_strengths = [strengths[i] for i in idx_list]
 
-                merged_name = ",".join(tgt_nicknames) if len(tgt_nicknames) > 1 else tgt_nicknames[0]
+                merged_name = (
+                ",".join(tgt_nicknames) if len(tgt_nicknames) > 1 else tgt_nicknames[0]
+            )
 
                 # Skip if LoRA configuration matches exactly (including order and strength)
                 # Since all modules for the same target apply the same config, checking one is sufficient
@@ -647,12 +655,16 @@ class LoRAPipeline(ComposedPipelineBase):
                     adapted_count += count
                     self.cur_adapter_name[module_name] = merged_name
                     self.cur_adapter_path[module_name] = ",".join(
-                        str(p or self.loaded_adapter_paths.get(n, "")) for n, p in zip(tgt_nicknames, tgt_paths)
+                        str(p or self.loaded_adapter_paths.get(n, ""))
+                    for n, p in zip(tgt_nicknames, tgt_paths)
                     )
                     self.is_lora_merged[module_name] = True
-                    self.cur_adapter_strength[module_name] = tgt_strengths[0]  # For backward compatibility
+                    self.cur_adapter_strength[module_name] = tgt_strengths[0]
                     # Store full configuration for multi-LoRA support (preserves order and all strengths)
-                    self.cur_adapter_config[module_name] = (tgt_nicknames.copy(), tgt_strengths.copy())
+                    self.cur_adapter_config[module_name] = (
+                    tgt_nicknames.copy(),
+                    tgt_strengths.copy(),
+                )
 
         logger.info(
             "Rank %d: LoRA adapter(s) %s applied to %d layers (targets: %s, strengths: %s)",
@@ -660,8 +672,12 @@ class LoRAPipeline(ComposedPipelineBase):
                 ", ".join(map(str, lora_paths)) if lora_paths else None,
                 adapted_count,
                 ", ".join(targets) if len(set(targets)) > 1 else targets[0],
-                ", ".join(f"{s:.2f}" for s in strengths) if len(strengths) > 1 else f"{strengths[0]:.2f}",
-            )
+                (
+                ", ".join(f"{s:.2f}" for s in strengths)
+                if len(strengths) > 1
+                else f"{strengths[0]:.2f}"
+            ),
+        )
 
     def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
         """
@@ -764,7 +780,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         continue
                 self.is_lora_merged[module_name] = False
                 self.cur_adapter_strength.pop(module_name, None)
-                self.cur_adapter_config.pop(module_name, None)  # Clear full config on unmerge
+                self.cur_adapter_config.pop(module_name, None)
             logger.info("LoRA weights unmerged for %s", module_name)
 
     def get_lora_status(self) -> dict[str, Any]:
