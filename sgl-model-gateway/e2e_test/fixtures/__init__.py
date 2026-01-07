@@ -14,9 +14,11 @@ Legacy modules (to be removed during e2e_response_api migration):
 # Pytest hooks (imported by conftest.py via pytest_plugins)
 from .hooks import (
     get_pool_requirements,
+    is_parallel_execution,
     pytest_collection_finish,
     pytest_collection_modifyitems,
     pytest_configure,
+    pytest_runtest_setup,
     validate_gpu_requirements,
 )
 
@@ -32,8 +34,10 @@ __all__ = [
     "pytest_collection_modifyitems",
     "pytest_collection_finish",
     "pytest_configure",
+    "pytest_runtest_setup",
     "get_pool_requirements",
     "validate_gpu_requirements",
+    "is_parallel_execution",
     # Pool fixtures
     "model_pool",
     "model_client",

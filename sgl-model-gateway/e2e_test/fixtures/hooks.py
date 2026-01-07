@@ -269,21 +269,38 @@ def get_pool_requirements() -> list["WorkerIdentity"]:
 # ---------------------------------------------------------------------------
 
 
+def _count_gpus_without_cuda() -> int:
+    """Count available GPUs without initializing CUDA.
+
+    Uses nvidia-smi to avoid CUDA initialization, which is critical for
+    pytest-parallel compatibility. CUDA cannot be re-initialized after a fork.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return len([line for line in result.stdout.strip().split("\n") if line])
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        pass
+    return 0
+
+
 def validate_gpu_requirements() -> tuple[int, int]:
     """Check if there are enough GPUs for any single test.
+
+    Uses nvidia-smi instead of torch.cuda to avoid CUDA initialization,
+    which would break pytest-parallel (CUDA cannot be re-initialized after fork).
 
     Returns:
         Tuple of (max_required_gpus, available_gpus).
     """
-    available_gpus = 0
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            available_gpus = torch.cuda.device_count()
-    except ImportError:
-        pass
-
+    available_gpus = _count_gpus_without_cuda()
     return _max_test_gpu_requirement, available_gpus
 
 
@@ -356,3 +373,40 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "slow: mark test as slow-running",
     )
+    config.addinivalue_line(
+        "markers",
+        "thread_unsafe: mark test as incompatible with parallel thread execution",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parallel execution support
+# ---------------------------------------------------------------------------
+
+
+def is_parallel_execution(config: pytest.Config) -> bool:
+    """Check if tests are running in parallel mode (pytest-parallel).
+
+    Returns True if --tests-per-worker > 1, indicating concurrent thread execution.
+    """
+    # pytest-parallel adds the 'tests_per_worker' option
+    tests_per_worker = getattr(config.option, "tests_per_worker", None)
+    if tests_per_worker is None:
+        return False
+
+    if tests_per_worker == "auto":
+        return True
+
+    try:
+        return int(tests_per_worker) > 1
+    except (ValueError, TypeError):
+        return False
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Skip thread_unsafe tests when running in parallel mode."""
+    if is_parallel_execution(item.config):
+        marker = item.get_closest_marker("thread_unsafe")
+        if marker:
+            reason = marker.kwargs.get("reason", "Test is not thread-safe")
+            pytest.skip(f"Skipping in parallel mode: {reason}")
