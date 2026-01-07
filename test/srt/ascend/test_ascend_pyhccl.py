@@ -184,36 +184,61 @@ def reduce_scatter_worker_fn():
     torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-8)
 
 
+@worker_fn_wrapper
+def sub_comm_worker_fn():
+    pyhccl_comm = PyHcclCommunicator(
+        get_world_group().cpu_group, device=get_world_group().device
+    )
+
+    device = f"npu:{pyhccl_comm.rank}"
+    tensor = torch.ones(16, 1024, 1024, dtype=torch.float32, device=device)
+    rank_list = [0, 1]
+    sub_comm = pyhccl_comm.create_subcomm(rank_list)
+
+    tensor = pyhccl_comm.all_reduce(in_tensor=tensor, comm=sub_comm)
+    torch.npu.synchronize()
+    if torch.distributed.get_rank() in rank_list:
+        assert torch.all(tensor == len(rank_list)).cpu().item()
+    else:
+        assert torch.all(tensor == 1).cpu().item()
+
+
 class TestAscendPyhccl(CustomTestCase):
     @pytest.mark.skipif(
-        torch.npu.device_count() < 2, reason="Need at least 2 GPUs to run the test."
+        torch.npu.device_count() < 2, reason="Need at least 2 NPUs to run the test."
     )
     def test_pyhccl(self):
         distributed_run(worker_fn, 2)
 
     @pytest.mark.skipif(
-        torch.npu.device_count() < 4, reason="Need at least 4 GPUs to run the test."
+        torch.npu.device_count() < 4, reason="Need at least 4 NPUs to run the test."
     )
     def test_pyhccl_multiple_allreduce(self):
         distributed_run(multiple_allreduce_worker_fn, 4)
 
     @pytest.mark.skipif(
-        torch.npu.device_count() < 4, reason="Need at least 4 GPUs to run the test."
+        torch.npu.device_count() < 4, reason="Need at least 4 NPUs to run the test."
     )
     def test_pyhccl_broadcast(self):
         distributed_run(broadcast_worker_fn, 4)
 
     @pytest.mark.skipif(
-        torch.npu.device_count() < 2, reason="Need at least 2 GPUs to run the test."
+        torch.npu.device_count() < 2, reason="Need at least 2 NPUs to run the test."
     )
     def test_pyhccl_all_gather(self):
         distributed_run(all_gather_worker_fn, 2)
 
     @pytest.mark.skipif(
-        torch.npu.device_count() < 2, reason="Need at least 2 GPUs to run the test."
+        torch.npu.device_count() < 2, reason="Need at least 2 NPUs to run the test."
     )
     def test_pyhccl_reduce_scatter(self):
         distributed_run(reduce_scatter_worker_fn, 2)
+
+    @pytest.mark.skipif(
+        torch.npu.device_count() < 2, reason="Need at least 2 NPUs to run the test."
+    )
+    def test_pyhccl_sub_comm(self):
+        distributed_run(sub_comm_worker_fn, 2)
 
 
 if __name__ == "__main__":

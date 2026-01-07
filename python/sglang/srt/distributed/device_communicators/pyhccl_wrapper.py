@@ -72,6 +72,28 @@ def current_stream() -> torch.npu.Stream:
     return _CURRENT_STREAM
 
 
+class HcclCommConfig(ctypes.Structure):
+    _fields_ = [
+        ("size", ctypes.c_size_t),
+        ("magic_word", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint64),
+        ("hccl_buffer_size", ctypes.c_uint32),
+        ("hccl_deterministic", ctypes.c_uint32),
+        ("hccl_comm_name", ctypes.c_char * 128),
+        ("hccl_udi", ctypes.c_char * 128),
+        ("hccl_op_expansion_mode", ctypes.c_uint32),
+        ("hccl_rdma_traffic_class", ctypes.c_uint32),
+        ("hccl_rdma_service_level", ctypes.c_uint32),
+        ("hcll_world_rank_id", ctypes.c_uint32),
+        ("hccl_job_id", ctypes.c_uint64),
+        ("comm_engine", ctypes.c_int32),
+        ("thread_num", ctypes.c_uint32),
+        ("notify_num_per_thread", ctypes.c_uint32),
+        ("acl_graph_zero_copy_enable", ctypes.c_uint8),
+    ]
+
+
 class hcclDataTypeEnum:
     hcclInt8 = 0
     hcclInt16 = 1
@@ -233,6 +255,23 @@ class HCCLLibrary:
                 aclrtStream_t,
             ],
         ),
+        # HcclResult HcclCreateSubCommConfig(
+        #   HcclComm *comm, uin32_t rankNum, uint32_t *rankIds, uint64_t subCommId,
+        #   uint32_t subCommRankId, HcclCommConfig *config, HcclComm *subComm
+        # )
+        Function(
+            "HcclCreateSubCommConfig",
+            hcclResult_t,
+            [
+                ctypes.POINTER(hcclComm_t),
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_uint64,
+                ctypes.c_uint32,
+                ctypes.POINTER(HcclCommConfig),
+                ctypes.POINTER(hcclComm_t),
+            ],
+        ),
         # HcclResult HcclCommDestroy(HcclComm comm);
         Function("HcclCommDestroy", hcclResult_t, [hcclComm_t]),
     ]
@@ -370,6 +409,23 @@ class HCCLLibrary:
 
     def hcclBarrier(self, comm: hcclComm_t, stream: aclrtStream_t) -> None:
         self.HCCL_CHECK(self._funcs["HcclBarrier"](comm, stream))
+
+    def hcclCreateSubcommConfig(
+        self, comm, ranks_size, c_rank_ids, subcomm_id, subcomm_rank, comm_config
+    ):
+        subcomm = hcclComm_t()
+        self.HCCL_CHECK(
+            self._funcs["HcclCreateSubCommConfig"](
+                ctypes.byref(comm),
+                ranks_size,
+                c_rank_ids,
+                subcomm_id,
+                subcomm_rank,
+                ctypes.byref(comm_config),
+                ctypes.byref(subcomm),
+            )
+        )
+        return subcomm
 
     def hcclCommDestroy(self, comm: hcclComm_t) -> None:
         self.HCCL_CHECK(self._funcs["HcclCommDestroy"](comm))

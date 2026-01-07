@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm-ascend/blob/v0.11.0-dev/vllm_ascend/distributed/device_communicators/pyhccl.py
 
+import ctypes
 import logging
 from typing import Optional, Union
 
@@ -8,6 +9,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
 from sglang.srt.distributed.device_communicators.pyhccl_wrapper import (
+    HcclCommConfig,
     HCCLLibrary,
     aclrtStream_t,
     buffer_type,
@@ -55,6 +57,7 @@ class PyHcclCommunicator:
             self.world_size = group.world_size
 
         self.group = group
+        self.subcomm_id = 1
 
         # if world_size == 1, no need to create communicator
         if self.world_size == 1:
@@ -119,7 +122,11 @@ class PyHcclCommunicator:
             del data
 
     def all_reduce(
-        self, in_tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None
+        self,
+        in_tensor: torch.Tensor,
+        op: ReduceOp = ReduceOp.SUM,
+        comm=None,
+        stream=None,
     ) -> torch.Tensor:
         if self.disabled:
             return None
@@ -132,7 +139,8 @@ class PyHcclCommunicator:
         )
 
         out_tensor = torch.empty_like(in_tensor)
-
+        if comm is None:
+            comm = self.comm
         if stream is None:
             stream = current_stream()
         self.hccl.hcclAllReduce(
@@ -141,18 +149,20 @@ class PyHcclCommunicator:
             in_tensor.numel(),
             hcclDataTypeEnum.from_torch(in_tensor.dtype),
             hcclRedOpTypeEnum.from_torch(op),
-            self.comm,
+            comm,
             aclrtStream_t(stream.npu_stream),
         )
         return out_tensor
 
-    def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
+    def broadcast(self, tensor: torch.Tensor, src: int, comm=None, stream=None):
         if self.disabled:
             return
         assert tensor.device == self.device, (
             f"this hccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
+        if comm is None:
+            comm = self.comm
         if stream is None:
             stream = current_stream()
         buffer = buffer_type(tensor.data_ptr())
@@ -161,12 +171,12 @@ class PyHcclCommunicator:
             tensor.numel(),
             hcclDataTypeEnum.from_torch(tensor.dtype),
             src,
-            self.comm,
+            comm,
             aclrtStream_t(stream.npu_stream),
         )
 
     def all_gather(
-        self, out_tensor: torch.Tensor, in_tensor: torch.Tensor, stream=None
+        self, out_tensor: torch.Tensor, in_tensor: torch.Tensor, comm=None, stream=None
     ):
         if self.disabled:
             return
@@ -180,6 +190,8 @@ class PyHcclCommunicator:
             f"but the input tensor is on {out_tensor.device}"
         )
 
+        if comm is None:
+            comm = self.comm
         if stream is None:
             stream = current_stream()
 
@@ -188,7 +200,7 @@ class PyHcclCommunicator:
             buffer_type(out_tensor.data_ptr()),
             in_tensor.numel(),
             hcclDataTypeEnum.from_torch(in_tensor.dtype),
-            self.comm,
+            comm,
             aclrtStream_t(stream.npu_stream),
         )
 
@@ -197,6 +209,7 @@ class PyHcclCommunicator:
         in_tensor: torch.Tensor,
         out_tensor: torch.Tensor,
         op: ReduceOp = ReduceOp.SUM,
+        comm=None,
         stream=None,
     ):
         if self.disabled:
@@ -211,6 +224,8 @@ class PyHcclCommunicator:
             f"but the input tensor is on {out_tensor.device}"
         )
 
+        if comm is None:
+            comm = self.comm
         if stream is None:
             stream = current_stream()
 
@@ -220,17 +235,57 @@ class PyHcclCommunicator:
             out_tensor.numel(),
             hcclDataTypeEnum.from_torch(in_tensor.dtype),
             hcclRedOpTypeEnum.from_torch(op),
-            self.comm,
+            comm,
             aclrtStream_t(stream.npu_stream),
         )
 
-    def barrier(self, stream=None):
+    def create_subcomm(self, ranks: list[int]):
+        comm_config = HcclCommConfig(
+            size=312,
+            magic_word=0xF0F0F0F0,
+            version=6,
+            reserved=0,
+            hccl_buffer_size=0xFFFFFFFF,
+            hccl_deterministic=0xFFFFFFFF,
+            hccl_comm_name=b"\0",
+            hccl_udi=b"\0",
+            hccl_op_expansize_mode=0,
+            hccl_rdma_traffic_class=0xFFFFFFFF,
+            hccl_rdma_service_level=0xFFFFFFFF,
+            hccl_world_rank_id=0,
+            hccl_job_id=0,
+            comm_engine=-1,
+            thread_num=0xFFFFFFFF,
+            notify_num_per_thread=0xFFFFFFFF,
+            acl_graph_zero_copy_enable=0,
+        )
+        uint32_array = ctypes.c_uint32 * len(ranks)
+        c_rank_ids = uint32_array(*ranks)
+        subcomm_rank = ranks.index(self.rank)
+        ranks_size = len(ranks)
+        subcomm_id = self.subcomm_id
+
+        subcomm = self.hccl.hcclCreateSubcommConfig(
+            self.comm, ranks_size, c_rank_ids, subcomm_id, subcomm_rank, comm_config
+        )
+        self.subcomm_id += 1
+        return subcomm
+
+    def destroy_comm(self, comm=None):
+        if comm:
+            self.hccl.hcclCommDestroy(comm)
+        else:
+            self.hccl.hcclCommDestroy(self.comm)
+
+    def barrier(self, comm=None, stream=None):
         if self.disabled:
             return
+        if comm is None:
+            comm = self.comm
         if stream is None:
             stream = current_stream()
 
         self.hccl.hcclBarrier(
-            self.comm,
+            comm,
             aclrtStream_t(stream.npu_stream),
         )
