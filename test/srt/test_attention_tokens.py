@@ -210,5 +210,100 @@ class TestAttentionTokens(CustomTestCase):
         )
 
 
+class TestAttentionPrivacyMask(unittest.TestCase):
+    """Unit tests for attention privacy mask function."""
+
+    def test_mask_filters_prefix_positions(self):
+        """Test that positions < mask_prefix are filtered out."""
+        from sglang.srt.managers.scheduler_output_processor_mixin import (
+            apply_attention_privacy_mask,
+        )
+
+        positions = [0, 5, 10, 15, 20]
+        scores = [0.1, 0.2, 0.3, 0.25, 0.15]
+        mask_prefix = 10
+
+        masked_pos, masked_scores, _ = apply_attention_privacy_mask(
+            positions, scores, mask_prefix
+        )
+
+        # Only positions >= 10 should remain
+        self.assertEqual(masked_pos, [0, 5, 10])  # 10-10=0, 15-10=5, 20-10=10
+        self.assertEqual(masked_scores, [0.3, 0.25, 0.15])
+
+    def test_mask_offsets_positions(self):
+        """Test that positions are offset by mask_prefix."""
+        from sglang.srt.managers.scheduler_output_processor_mixin import (
+            apply_attention_privacy_mask,
+        )
+
+        positions = [50, 100, 150]
+        scores = [0.5, 0.3, 0.2]
+        mask_prefix = 50
+
+        masked_pos, masked_scores, _ = apply_attention_privacy_mask(
+            positions, scores, mask_prefix
+        )
+
+        # Positions should be offset: 50->0, 100->50, 150->100
+        self.assertEqual(masked_pos, [0, 50, 100])
+        self.assertEqual(masked_scores, [0.5, 0.3, 0.2])
+
+    def test_mask_zero_prefix_passthrough(self):
+        """Test that mask_prefix=0 passes through unchanged."""
+        from sglang.srt.managers.scheduler_output_processor_mixin import (
+            apply_attention_privacy_mask,
+        )
+
+        positions = [0, 5, 10]
+        scores = [0.5, 0.3, 0.2]
+        mask_prefix = 0
+
+        masked_pos, masked_scores, _ = apply_attention_privacy_mask(
+            positions, scores, mask_prefix
+        )
+
+        self.assertEqual(masked_pos, positions)
+        self.assertEqual(masked_scores, scores)
+
+    def test_mask_handles_logits(self):
+        """Test that logits are masked in parallel with positions."""
+        from sglang.srt.managers.scheduler_output_processor_mixin import (
+            apply_attention_privacy_mask,
+        )
+
+        positions = [5, 15, 25]
+        scores = [0.3, 0.4, 0.3]
+        logits = [1.0, 2.0, 3.0]
+        mask_prefix = 10
+
+        masked_pos, masked_scores, masked_logits = apply_attention_privacy_mask(
+            positions, scores, mask_prefix, logits
+        )
+
+        # Only position 15 and 25 should remain
+        self.assertEqual(masked_pos, [5, 15])  # 15-10=5, 25-10=15
+        self.assertEqual(masked_scores, [0.4, 0.3])
+        self.assertEqual(masked_logits, [2.0, 3.0])
+
+    def test_mask_all_filtered(self):
+        """Test behavior when all positions are masked."""
+        from sglang.srt.managers.scheduler_output_processor_mixin import (
+            apply_attention_privacy_mask,
+        )
+
+        positions = [0, 5, 9]
+        scores = [0.5, 0.3, 0.2]
+        mask_prefix = 10
+
+        masked_pos, masked_scores, _ = apply_attention_privacy_mask(
+            positions, scores, mask_prefix
+        )
+
+        # All positions < 10, so all filtered
+        self.assertEqual(masked_pos, [])
+        self.assertEqual(masked_scores, [])
+
+
 if __name__ == "__main__":
     unittest.main()
