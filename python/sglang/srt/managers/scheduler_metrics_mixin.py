@@ -137,7 +137,7 @@ class SchedulerMetricsMixin:
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
 
-        # assert self.temp_prefill_info is None # TODO re-enable
+        assert self.temp_prefill_info is None
         self.temp_prefill_info = dict(
             adder_log_input_tokens=adder.log_input_tokens,
             adder_log_hit_tokens=adder.log_hit_tokens,

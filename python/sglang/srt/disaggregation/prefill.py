@@ -273,6 +273,9 @@ class PrefillBootstrapQueue:
                 failed_reqs.append(req)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                if self.scheduler.enable_hicache_storage:
+                    # to release prefetch events associated with the request
+                    self.scheduler.tree_cache.release_aborted_request(req.rid)
                 continue
 
             # KV.WaitingForInput - init here

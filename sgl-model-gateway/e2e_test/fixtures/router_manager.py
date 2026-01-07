@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import requests
+from infra import wait_for_health
 
 from .ports import find_free_port
 
@@ -126,21 +127,8 @@ class RouterManager:
         proc = subprocess.Popen(cmd)
         self._children.append(proc)
         url = f"http://127.0.0.1:{port}"
-        self._wait_health(url)
+        wait_for_health(url, timeout=30.0, check_interval=0.2)
         return ProcHandle(process=proc, url=url)
-
-    def _wait_health(self, base_url: str, timeout: float = 30.0):
-        start = time.time()
-        with requests.Session() as s:
-            while time.time() - start < timeout:
-                try:
-                    r = s.get(f"{base_url}/health", timeout=2)
-                    if r.status_code == 200:
-                        return
-                except requests.RequestException:
-                    pass
-                time.sleep(0.2)
-        raise TimeoutError(f"Router at {base_url} did not become healthy")
 
     def add_worker(self, base_url: str, worker_url: str, timeout: float = 30.0) -> None:
         r = requests.post(f"{base_url}/workers", json={"url": worker_url})

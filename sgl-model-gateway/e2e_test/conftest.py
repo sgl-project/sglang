@@ -4,26 +4,23 @@ Markers
 -------
 This module defines several pytest markers for configuring E2E tests:
 
-@pytest.mark.model(name, scope="session")
+@pytest.mark.model(name)
     Specify which model to use for the test.
 
     Args:
         name: Model ID from MODEL_SPECS (e.g., "llama-8b", "qwen-7b")
-        scope: "session" (default) or "class"
-            - session: Pre-launched at test session start. Stays running.
-            - class: Launched on-demand when test class starts.
 
     GPU Resource Management:
         When GPUs are limited (e.g., 4 GPUs, 6 models), the model pool uses
-        LRU (Least Recently Used) eviction:
-        1. Session models are pre-launched until GPUs are full
-        2. Overflow models are queued for on-demand launch
-        3. When a queued model is needed, LRU model is evicted
-        4. Evicted models go back to queue and can be re-launched later
+        MRU (Most Recently Used) eviction:
+        1. Models are pre-launched until GPUs are full
+        2. When a test needs a model that isn't running, MRU model is evicted
+           (models just used are likely done, models not yet used are waiting)
+        3. The needed model is then launched on-demand
 
     Examples:
-        @pytest.mark.model("llama-8b")  # session scope, pre-launched
-        @pytest.mark.model("qwen-72b", scope="class")  # on-demand only
+        @pytest.mark.model("llama-8b")
+        @pytest.mark.model("qwen-72b")
 
 @pytest.mark.workers(count=1, prefill=None, decode=None)
     Configure worker topology for the test.
@@ -80,15 +77,6 @@ Test with specific model and multiple backends:
         def test_generate(self, setup_backend):
             ...
 
-Large model loaded on-demand (class scope):
-
-    @pytest.mark.e2e
-    @pytest.mark.model("llama-70b", scope="class")
-    @pytest.mark.parametrize("setup_backend", ["http"], indirect=True)
-    class TestLargeModel:
-        def test_inference(self, setup_backend):
-            ...
-
 PD disaggregation mode:
 
     @pytest.mark.e2e
@@ -107,7 +95,7 @@ import subprocess
 import sys
 from importlib.util import find_spec
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -152,9 +140,9 @@ def pytest_runtest_logstart(nodeid: str, location: tuple) -> None:
     """Print clear test header at start of each test."""
     # Extract test name from nodeid (e.g., "test_mmlu.py::TestMMLU::test_mmlu_basic[grpc]")
     test_name = nodeid.split("::")[-1] if "::" in nodeid else nodeid
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * LOG_SEPARATOR_WIDTH}")
     print(f"TEST: {test_name}")
-    print(f"{'='*60}")
+    print(f"{'=' * LOG_SEPARATOR_WIDTH}")
 
 
 # Path setup for imports
@@ -184,19 +172,30 @@ from infra import (
     ENV_SKIP_MODEL_POOL,
     ENV_STARTUP_TIMEOUT,
     LOCAL_MODES,
+    LOG_SEPARATOR_WIDTH,
     PARAM_MODEL,
     PARAM_SETUP_BACKEND,
     ConnectionMode,
+    WorkerIdentity,
+    WorkerType,
 )
 
 # ---------------------------------------------------------------------------
-# Test collection: scan for required backends
+# Test collection: scan for required workers
 # ---------------------------------------------------------------------------
 
-# Global storage for scanned requirements
-_scanned_backends: set[str] = set()  # {"grpc", "http", "openai", ...}
-_session_models: set[str] = set()  # Models to pre-launch at session start
-_class_models: set[str] = set()  # Models to launch on-demand per class
+# Track max worker counts: (model_id, mode, worker_type) -> max_count
+# This unified approach handles regular, prefill, and decode workers the same way
+_worker_counts: dict[tuple[str, ConnectionMode, WorkerType], int] = {}
+
+# Track first-seen order to preserve test collection order
+_first_seen_order: list[tuple[str, ConnectionMode, WorkerType]] = []
+
+# Track max GPU requirement for any single test (for validation)
+_max_test_gpu_requirement: int = 0
+_max_test_name: str = ""
+
+_needs_default_model: bool = False  # True if any e2e test lacks explicit model marker
 
 
 def pytest_collection_modifyitems(
@@ -204,102 +203,258 @@ def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],
 ) -> None:
-    """Scan collected tests to determine required backends and models.
+    """Scan collected tests to determine required workers.
 
     This runs after test collection but before tests execute.
-    It extracts backend requirements from @pytest.mark.parametrize markers.
+    It extracts worker requirements from markers in test collection order,
+    tracking the max count needed for each (model, mode, worker_type) combination.
 
-    Models are categorized by scope:
-    - session: Pre-launched at session start (default)
-    - class: Launched on-demand when test class starts
+    Also tracks the max GPU requirement for any single test for validation.
     """
-    global _scanned_backends, _session_models, _class_models
+    global _worker_counts, _first_seen_order, _needs_default_model
+    global _max_test_gpu_requirement, _max_test_name
+
+    from infra import MODEL_SPECS
+
+    def track_worker(
+        model_id: str, mode: ConnectionMode, worker_type: WorkerType, count: int
+    ) -> None:
+        """Track a worker requirement, updating max count if needed."""
+        key = (model_id, mode, worker_type)
+        if key not in _worker_counts:
+            _first_seen_order.append(key)
+            _worker_counts[key] = count
+        else:
+            _worker_counts[key] = max(_worker_counts[key], count)
+
+    def calculate_test_gpus(
+        model_id: str, prefill: int, decode: int, regular: int
+    ) -> int:
+        """Calculate GPU requirement for a single test."""
+        if model_id not in MODEL_SPECS:
+            return 0
+        tp = MODEL_SPECS[model_id].get("tp", 1)
+        return tp * (prefill + decode + regular)
 
     for item in items:
-        # Scan parametrize markers for setup_backend
+        # Extract model from marker or use default
+        model_marker = item.get_closest_marker(PARAM_MODEL)
+        model_id = model_marker.args[0] if model_marker and model_marker.args else None
+
+        # Check parametrize for model
+        if model_id is None:
+            for marker in item.iter_markers("parametrize"):
+                if marker.args and len(marker.args) >= 2:
+                    param_name = marker.args[0]
+                    if param_name == PARAM_MODEL or PARAM_MODEL in param_name:
+                        param_values = marker.args[1]
+                        if isinstance(param_values, (list, tuple)) and param_values:
+                            model_id = param_values[0]  # First model in parametrize
+                        break
+
+        # Extract backends from parametrize
+        backends: list[str] = []
         for marker in item.iter_markers("parametrize"):
             if marker.args and len(marker.args) >= 2:
                 param_name = marker.args[0]
                 param_values = marker.args[1]
-
                 if param_name == PARAM_SETUP_BACKEND:
-                    # Extract backend names from parametrize values
                     if isinstance(param_values, (list, tuple)):
-                        _scanned_backends.update(param_values)
+                        backends.extend(param_values)
 
-                elif param_name == PARAM_MODEL or PARAM_MODEL in param_name:
-                    # Extract model names from parametrize - default to session scope
-                    if isinstance(param_values, (list, tuple)):
-                        _session_models.update(param_values)
+        # Check for workers marker (@pytest.mark.workers(...))
+        workers_marker = item.get_closest_marker("workers")
+        prefill_count = 0
+        decode_count = 0
+        regular_count = 1  # Default to 1 regular worker
+        if workers_marker:
+            prefill_count = workers_marker.kwargs.get("prefill") or 0
+            decode_count = workers_marker.kwargs.get("decode") or 0
+            regular_count = workers_marker.kwargs.get("count") or 1
 
-        # Check for @pytest.mark.model("name", scope="...") markers
-        model_marker = item.get_closest_marker(PARAM_MODEL)
-        if model_marker and model_marker.args:
-            model_name = model_marker.args[0]
-            scope = model_marker.kwargs.get("scope", "session")
+        # Track if this test needs default model
+        is_e2e = item.get_closest_marker("e2e") is not None
+        if model_id is None and is_e2e:
+            _needs_default_model = True
+            model_id = DEFAULT_MODEL
 
-            if scope == "class":
-                _class_models.add(model_name)
+        # Track worker requirements and calculate this test's GPU requirement
+        test_gpus = 0
+        if model_id and backends:
+            for backend in backends:
+                # "pd" backend means PD workers
+                if backend == "pd":
+                    mode = ConnectionMode.HTTP  # PD uses HTTP mode
+                    # Default to 1 prefill + 1 decode if not specified
+                    p_count = prefill_count if prefill_count > 0 else 1
+                    d_count = decode_count if decode_count > 0 else 1
+                    track_worker(model_id, mode, WorkerType.PREFILL, p_count)
+                    track_worker(model_id, mode, WorkerType.DECODE, d_count)
+                    test_gpus = max(
+                        test_gpus, calculate_test_gpus(model_id, p_count, d_count, 0)
+                    )
+                else:
+                    try:
+                        mode = ConnectionMode(backend)
+                    except ValueError:
+                        # Cloud backend (openai, xai, etc.) - skip
+                        continue
+
+                    # Check if this backend also has PD workers
+                    if prefill_count > 0 or decode_count > 0:
+                        track_worker(model_id, mode, WorkerType.PREFILL, prefill_count)
+                        track_worker(model_id, mode, WorkerType.DECODE, decode_count)
+                        test_gpus = max(
+                            test_gpus,
+                            calculate_test_gpus(
+                                model_id, prefill_count, decode_count, 0
+                            ),
+                        )
+                    else:
+                        # Regular worker
+                        track_worker(model_id, mode, WorkerType.REGULAR, regular_count)
+                        test_gpus = max(
+                            test_gpus,
+                            calculate_test_gpus(model_id, 0, 0, regular_count),
+                        )
+
+        elif model_id and is_e2e:
+            # E2E test without explicit backend - will use HTTP by default
+            track_worker(model_id, ConnectionMode.HTTP, WorkerType.REGULAR, 1)
+            test_gpus = calculate_test_gpus(model_id, 0, 0, 1)
+
+        # Track max GPU requirement across all tests
+        if test_gpus > _max_test_gpu_requirement:
+            _max_test_gpu_requirement = test_gpus
+            _max_test_name = item.nodeid
+
+    # Log results
+    if _worker_counts:
+        summary = []
+        for key in _first_seen_order:
+            model_id, mode, worker_type = key
+            count = _worker_counts[key]
+            if worker_type == WorkerType.REGULAR:
+                summary.append(f"{model_id}:{mode.value}x{count}")
             else:
-                _session_models.add(model_name)
-
-    # Remove class models from session models (class scope takes precedence if mixed)
-    # Actually, keep both - a model can be used by both session and class scoped tests
-    # The model_pool will handle this by keeping session models running
-
-    logger.info(
-        "Scanned test requirements - backends: %s, session models: %s, class models: %s",
-        _scanned_backends or {"(none)"},
-        _session_models or {"(none)"},
-        _class_models or {"(none)"},
-    )
+                summary.append(f"{model_id}:{mode.value}:{worker_type.value}x{count}")
+        logger.info("Scanned worker requirements (in test order): %s", summary)
+        logger.info(
+            "Max GPU requirement for single test: %d (%s)",
+            _max_test_gpu_requirement,
+            _max_test_name,
+        )
+    else:
+        logger.info("Scanned worker requirements: (none)")
 
 
-def get_pool_requirements() -> list[tuple[str, ConnectionMode]]:
+def get_pool_requirements() -> list[WorkerIdentity]:
     """Build pool requirements from scanned test markers.
 
-    Only returns session-scoped models for pre-launching.
-    Class-scoped models are launched on-demand by model_pool.get().
-
     Returns:
-        List of (model_id, ConnectionMode) tuples to pre-launch.
+        List of WorkerIdentity objects to pre-launch.
+        Each WorkerIdentity has (model_id, mode, worker_type, index).
+        Requirements are ordered by first appearance in test collection order,
+        so workers needed by earlier tests are launched first.
+
+    Note:
+        If a model's first test needs PD workers (prefill/decode), we skip
+        pre-launching regular workers for that model (they'd be evicted
+        immediately when PD workers are launched).
     """
-    # Only pre-launch session-scoped models
-    # Default model if none specified
-    models = _session_models or {DEFAULT_MODEL}
+    # Track which models have PD workers as their first requirement
+    # These models shouldn't have regular workers pre-launched
+    models_with_pd_first: set[str] = set()
+    first_worker_type_per_model: dict[str, WorkerType] = {}
 
-    # Convert scanned string backends to ConnectionMode enums
-    # Filter to local backends only (grpc, http) - cloud backends don't need workers
-    local_modes: set[ConnectionMode] = set()
-    for backend in _scanned_backends:
-        try:
-            mode = ConnectionMode(backend)
-            if mode in LOCAL_MODES:
-                local_modes.add(mode)
-        except ValueError:
-            # Not a ConnectionMode (e.g., "openai", "xai") - skip
-            pass
+    for model_id, mode, worker_type in _first_seen_order:
+        if model_id not in first_worker_type_per_model:
+            first_worker_type_per_model[model_id] = worker_type
+            if worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
+                models_with_pd_first.add(model_id)
+                logger.info(
+                    "Model %s has PD test first - skipping regular worker pre-launch",
+                    model_id,
+                )
 
-    # Default to HTTP if no local backends specified
-    if not local_modes:
-        local_modes = {ConnectionMode.HTTP}
+    # Generate individual WorkerIdentity objects in first-seen order
+    requirements: list[WorkerIdentity] = []
+    for model_id, mode, worker_type in _first_seen_order:
+        # Skip regular workers for models that have PD first
+        if model_id in models_with_pd_first and worker_type == WorkerType.REGULAR:
+            continue
 
-    # Build requirements: each model needs each mode
-    requirements: list[tuple[str, ConnectionMode]] = []
-    for model in models:
-        for mode in local_modes:
-            requirements.append((model, mode))
+        count = _worker_counts.get((model_id, mode, worker_type), 1)
+        for i in range(count):
+            requirements.append(WorkerIdentity(model_id, mode, worker_type, i))
+
+    # Add default if no requirements
+    if not requirements:
+        requirements.append(WorkerIdentity(DEFAULT_MODEL, ConnectionMode.HTTP))
 
     return requirements
 
 
-def get_class_scoped_models() -> set[str]:
-    """Get models that are class-scoped (launched on-demand).
+def validate_gpu_requirements() -> tuple[int, int]:
+    """Check if there are enough GPUs for any single test.
 
     Returns:
-        Set of model IDs that should be launched on-demand.
+        Tuple of (max_required_gpus, available_gpus).
+
+    Note:
+        We check the max requirement for any single test, not the sum.
+        Workers can be evicted between tests, so we only need enough GPUs
+        for the most demanding test.
     """
-    return _class_models.copy()
+    # Count available GPUs
+    available_gpus = 0
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            available_gpus = torch.cuda.device_count()
+    except ImportError:
+        pass
+
+    return _max_test_gpu_requirement, available_gpus
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Validate GPU requirements after test collection.
+
+    This runs after all tests are collected but before any tests execute.
+    Fails fast if any single test requires more GPUs than available.
+    """
+    if not _worker_counts:
+        return
+
+    # Skip validation if model pool is disabled
+    if os.environ.get(ENV_SKIP_MODEL_POOL, "").lower() in ("1", "true", "yes"):
+        return
+
+    max_required, available_gpus = validate_gpu_requirements()
+
+    if max_required > available_gpus:
+        sep = "=" * LOG_SEPARATOR_WIDTH
+        raise pytest.UsageError(
+            f"\n{sep}\n"
+            f"GPU REQUIREMENTS EXCEEDED\n"
+            f"{sep}\n"
+            f"Test '{_max_test_name}' requires {max_required} GPUs\n"
+            f"Available: {available_gpus} GPUs\n"
+            f"\nOptions:\n"
+            f"  1. Run tests that fit: pytest -k 'not {_max_test_name.split('::')[0]}'\n"
+            f"  2. Reduce workers: @pytest.mark.workers(prefill=1, decode=1)\n"
+            f"  3. Skip GPU tests: SKIP_MODEL_POOL=1 pytest\n"
+            f"{sep}"
+        )
+
+    logger.info(
+        "GPU validation passed: max %d required (by %s), %d available",
+        max_required,
+        _max_test_name,
+        available_gpus,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -311,8 +466,7 @@ def pytest_configure(config: pytest.Config) -> None:
     """Register custom markers."""
     config.addinivalue_line(
         "markers",
-        "model(name, scope='session'): mark test to use a specific model "
-        "(scope: 'session' for pre-launched, 'class' for on-demand)",
+        "model(name): mark test to use a specific model from MODEL_SPECS",
     )
     config.addinivalue_line(
         "markers",
@@ -357,13 +511,15 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
     routers (~1-2s) pointing to these workers.
 
     Startup behavior:
-    - Scans test markers to determine required (model, mode) combinations
-    - Launches workers sequentially, but they boot up concurrently
+    - Scans test markers to determine required workers (model, mode, type, count)
+    - Launches workers in test collection order
     - Waits for all workers to become healthy before returning
 
     Test requirements are auto-detected from:
-    - @pytest.mark.parametrize("setup_backend", ["grpc", "http"])
+    - @pytest.mark.parametrize("setup_backend", ["grpc", "http", "pd"])
     - @pytest.mark.model("model-name")
+    - @pytest.mark.workers(count=N) for regular workers
+    - @pytest.mark.workers(prefill=N, decode=N) for PD workers
 
     Environment variable overrides:
     - E2E_MODELS: Comma-separated model IDs (e.g., "llama-8b,qwen-7b")
@@ -412,15 +568,20 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
         if not backend_modes:
             backend_modes = {ConnectionMode.HTTP}
 
-        requirements = [(m, b) for m in models for b in backend_modes]
-        logger.info("Using env var requirements: %s", requirements)
+        # Create WorkerIdentity objects (regular workers only from env vars)
+        requirements = [
+            WorkerIdentity(m, b, WorkerType.REGULAR, 0)
+            for m in models
+            for b in backend_modes
+        ]
+        logger.info("Using env var requirements: %s", [str(r) for r in requirements])
     else:
         # Use scanned requirements from test markers
         requirements = get_pool_requirements()
-        logger.info("Using scanned requirements: %s", requirements)
+        logger.info("Using scanned requirements: %s", [str(r) for r in requirements])
 
     # Filter to valid models
-    requirements = [(m, b) for m, b in requirements if m in MODEL_SPECS]
+    requirements = [r for r in requirements if r.model_id in MODEL_SPECS]
 
     if not requirements:
         logger.warning("No valid requirements, model pool will be empty")
@@ -431,29 +592,11 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
     allocator = GPUAllocator()
     _model_pool = ModelPool(allocator)
 
-    # Register class-scoped models for on-demand launching
-    class_models = get_class_scoped_models()
-    if class_models:
-        _model_pool.register_class_scoped_models(class_models)
-
     startup_timeout = int(os.environ.get(ENV_STARTUP_TIMEOUT, "300"))
-    _model_pool.startup(requirements=requirements, startup_timeout=startup_timeout)
-
-    # Pre-launch PD workers if 'pd' backend is detected
-    if "pd" in _scanned_backends:
-        logger.info("PD backend detected, pre-launching PD workers")
-        # Use default model for PD workers
-        pd_model = next(iter(_session_models), DEFAULT_MODEL)
-        if pd_model in MODEL_SPECS:
-            try:
-                _model_pool.launch_pd_workers(
-                    model_id=pd_model,
-                    num_prefill=1,
-                    num_decode=1,
-                    startup_timeout=startup_timeout,
-                )
-            except Exception as e:
-                logger.warning("Failed to pre-launch PD workers: %s", e)
+    _model_pool.startup(
+        requirements=requirements,
+        startup_timeout=startup_timeout,
+    )
 
     # Log final GPU allocation summary
     logger.info(_model_pool.allocator.summary())
@@ -519,8 +662,8 @@ def _get_marker_value(
     request: pytest.FixtureRequest,
     marker_name: str,
     arg_index: int = 0,
-    default: any = None,
-) -> any:
+    default: Any = None,
+) -> Any:
     """Get a value from a pytest marker.
 
     Args:
@@ -543,8 +686,8 @@ def _get_marker_value(
 def _get_marker_kwargs(
     request: pytest.FixtureRequest,
     marker_name: str,
-    defaults: dict[str, any] | None = None,
-) -> dict[str, any]:
+    defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Get keyword arguments from a pytest marker.
 
     Args:
@@ -624,12 +767,6 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
     if model_id is None:
         model_id = os.environ.get(ENV_MODEL, DEFAULT_MODEL)
 
-    # Get model scope from marker (session or class)
-    model_marker = request.node.get_closest_marker("model")
-    model_scope = "session"
-    if model_marker:
-        model_scope = model_marker.kwargs.get("scope", "session")
-
     # Get worker configuration from marker
     workers_config = _get_marker_kwargs(
         request, "workers", defaults={"count": 1, "prefill": None, "decode": None}
@@ -675,15 +812,16 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
                 f"({num_prefill} prefill + {num_decode} decode), found {gpu_count}"
             )
 
-        # Try to use pre-launched PD workers, or launch new ones if needed
+        # Try to use pre-launched PD workers, or launch additional ones if needed
         existing_prefills = model_pool.get_workers_by_type(model_id, WorkerType.PREFILL)
         existing_decodes = model_pool.get_workers_by_type(model_id, WorkerType.DECODE)
 
-        if (
-            len(existing_prefills) >= num_prefill
-            and len(existing_decodes) >= num_decode
-        ):
-            # Use pre-launched workers
+        # Calculate how many more we need (if any)
+        missing_prefill = max(0, num_prefill - len(existing_prefills))
+        missing_decode = max(0, num_decode - len(existing_decodes))
+
+        if missing_prefill == 0 and missing_decode == 0:
+            # Use pre-launched workers (we have enough)
             prefills = existing_prefills[:num_prefill]
             decodes = existing_decodes[:num_decode]
             logger.info(
@@ -692,13 +830,48 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
                 len(decodes),
             )
         else:
-            # Launch new PD workers (custom config or not pre-launched)
-            prefills, decodes = model_pool.launch_pd_workers(
-                model_id=model_id,
-                num_prefill=num_prefill,
-                num_decode=num_decode,
-                startup_timeout=300,
+            # Build WorkerIdentity list for missing workers
+            workers_to_launch: list[WorkerIdentity] = []
+            for i in range(missing_prefill):
+                workers_to_launch.append(
+                    WorkerIdentity(
+                        model_id,
+                        ConnectionMode.HTTP,
+                        WorkerType.PREFILL,
+                        len(existing_prefills) + i,
+                    )
+                )
+            for i in range(missing_decode):
+                workers_to_launch.append(
+                    WorkerIdentity(
+                        model_id,
+                        ConnectionMode.HTTP,
+                        WorkerType.DECODE,
+                        len(existing_decodes) + i,
+                    )
+                )
+
+            logger.info(
+                "Have %d/%d prefill, %d/%d decode. Launching %d more workers",
+                len(existing_prefills),
+                num_prefill,
+                len(existing_decodes),
+                num_decode,
+                len(workers_to_launch),
             )
+            new_instances = model_pool.launch_workers(
+                workers_to_launch, startup_timeout=300
+            )
+
+            # Combine existing + newly launched
+            new_prefills = [
+                w for w in new_instances if w.worker_type == WorkerType.PREFILL
+            ]
+            new_decodes = [
+                w for w in new_instances if w.worker_type == WorkerType.DECODE
+            ]
+            prefills = existing_prefills + new_prefills
+            decodes = existing_decodes + new_decodes
 
         model_path = prefills[0].model_path if prefills else None
 
@@ -748,23 +921,47 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
         num_workers = workers_config.get("count") or 1
 
         try:
-            instance = model_pool.get(model_id, connection_mode, scope=model_scope)
-        except KeyError:
-            pytest.skip(f"Model {model_id}:{backend_name} not available in pool")
+            if num_workers > 1:
+                # Check existing workers
+                existing = model_pool.get_workers_by_type(model_id, WorkerType.REGULAR)
+                existing_for_mode = [w for w in existing if w.mode == connection_mode]
+
+                if len(existing_for_mode) >= num_workers:
+                    instances = existing_for_mode[:num_workers]
+                else:
+                    # Launch missing workers
+                    missing = num_workers - len(existing_for_mode)
+                    workers_to_launch = [
+                        WorkerIdentity(
+                            model_id,
+                            connection_mode,
+                            WorkerType.REGULAR,
+                            len(existing_for_mode) + i,
+                        )
+                        for i in range(missing)
+                    ]
+                    new_instances = model_pool.launch_workers(
+                        workers_to_launch, startup_timeout=300
+                    )
+                    instances = existing_for_mode + new_instances
+
+                if not instances:
+                    pytest.fail(f"Failed to get {num_workers} workers for {model_id}")
+                worker_urls = [inst.worker_url for inst in instances]
+                model_path = instances[0].model_path
+            else:
+                # Single worker - use existing get() method
+                instance = model_pool.get(model_id, connection_mode)
+                worker_urls = [instance.worker_url]
+                model_path = instance.model_path
         except RuntimeError as e:
             pytest.fail(str(e))
-
-        # Build worker URLs list
-        # For num_workers > 1, we need multiple workers from the pool
-        # For now, we reuse the same worker URL (router will load balance)
-        # TODO: Support launching multiple distinct workers for true LB testing
-        worker_urls = [instance.worker_url] * num_workers
 
         # Launch gateway with configuration
         gateway = Gateway()
         gateway.start(
             worker_urls=worker_urls,
-            model_path=instance.model_path,
+            model_path=model_path,
             policy=gateway_config["policy"],
             timeout=gateway_config["timeout"],
             extra_args=gateway_config["extra_args"],
@@ -785,7 +982,7 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
         )
 
         try:
-            yield backend_name, instance.model_path, client, gateway
+            yield backend_name, model_path, client, gateway
         finally:
             logger.info("Tearing down gateway for %s backend", backend_name)
             gateway.shutdown()
