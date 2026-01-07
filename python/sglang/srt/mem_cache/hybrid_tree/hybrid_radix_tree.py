@@ -93,7 +93,7 @@ class HybridRadixTree(BasePrefixCache):
 
     def register_component(self, component: CacheComponent):
         """Register a cache component and set up its allocator.
-        
+
         If a component with the same name is already registered, skip registration.
         """
         # Skip if already registered
@@ -193,12 +193,8 @@ class HybridRadixTree(BasePrefixCache):
         self._update_lru_for_match(best_match_node)
 
         # Allow components to perform post-match operations
-        req = kwargs.get("req", None)
-        cow_mamba = kwargs.get("cow_mamba", False)
-
-        if req is not None and (cow_mamba or "cow_mamba" not in kwargs):
-            for comp in self.components.values():
-                comp.on_match_complete(best_match_node, req)
+        for comp in self.components.values():
+            comp.on_match_complete(best_match_node, **kwargs)
 
         # Build result indices
         if best_match_len > 0:
@@ -216,7 +212,7 @@ class HybridRadixTree(BasePrefixCache):
             )
 
         logger.info(
-            f"Match prefix result for req {req.rid if req else 'None'}: match prefix: {len(result_indices.tolist())}"
+            f"Match prefix result，matched prefix: {len(result_indices.tolist())}"
         )
         return MatchResult(
             device_indices=result_indices,

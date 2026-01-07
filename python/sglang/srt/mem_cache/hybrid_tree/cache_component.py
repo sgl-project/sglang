@@ -68,21 +68,21 @@ class CacheComponent(ABC):
 
     def check_prefix_match_constraints(self, node: TreeNode, context: dict, child: Optional[TreeNode] = None) -> bool:
         """Check if node satisfies component constraints given current context.
-        
+
         Args:
             node: Current node to check
             child: Next child node (None for final check)
             context: Match context accumulated during traversal
-        
+
         Returns:
             bool: True = should accept node as best_match, False = reject
         """
         data = self.get_component_data(node)
         return data is not None and not data.is_tombstone()
 
-    def on_match_complete(self, matched_node: TreeNode, req):
+    def on_match_complete(self, matched_node: TreeNode, **kwargs):
         """Called after match_prefix completes (before returning result).
-        
+
         Use for post-match operations like:
         - Mamba: COW (copy-on-write) of matched state
         - Resource preparation for upcoming cache operation
@@ -372,10 +372,19 @@ class MambaComponent(CacheComponent):
             return [node]
         return []
 
-    def on_match_complete(self, matched_node: TreeNode, req):
-        """Copy mamba state from tree to request space (COW)."""
+    def on_match_complete(self, matched_node: TreeNode, **kwargs):
+        """Copy mamba state from tree to request space (COW).
+
+        Args:
+            matched_node: The matched node
+            req: Request object
+            **kwargs: Can contain 'cow_mamba' (default: True if not specified)
+        """
+        cow_mamba: bool = kwargs.get("cow_mamba", False)
+        req = kwargs.get("req", None)
+
         node_data = self.get_component_data(matched_node)
-        if node_data is None or node_data.is_tombstone():
+        if node_data is None or node_data.is_tombstone() or not cow_mamba or req is None:
             return
 
         mamba_pool = self.tree.req_to_token_pool.mamba_pool
@@ -547,20 +556,20 @@ class SWAComponent(CacheComponent):
             node = node.parent
 
         return nodes
-    
+
     def update_prefix_match_context(self, node: TreeNode, context: dict, init: bool = False) -> bool:
         """Update SWA match context during traversal.
-        
+
         Tracks distance since last tombstone.
         """
         if init:
             # For path connected to root without tombstone
             context['swa_match_len_since_tombstone'] = float('inf')
             return True
-        
+
         data = self.get_component_data(node)
         match_len = context.get('swa_match_len_since_tombstone', float('inf'))
-        
+
         # Update distance based on whether node is tombstone
         if data and data.is_tombstone():
             # Reached tombstone: reset distance
@@ -568,20 +577,20 @@ class SWAComponent(CacheComponent):
         elif data and not data.is_tombstone():
             # Not tombstone: accumulate distance
             context['swa_match_len_since_tombstone'] = match_len + len(data.value)
-        
+
         return True
 
     def check_prefix_match_constraints(self, node: TreeNode, context: dict, child: Optional[TreeNode] = None) -> bool:
         """Check if node satisfies SWA constraints given current context.
 
         Logic:
-            - During traversal (child != None): 
+            - During traversal (child != None):
               Accept if child is tombstone AND accumulated distance >= sliding_window_size
-            - Final check (child == None): 
+            - Final check (child == None):
               Accept if accumulated distance >= sliding_window_size
         """
         match_len = context.get('swa_match_len_since_tombstone', float('inf'))
-        
+
         if child is None:
             return match_len >= self.sliding_window_size
         else:
