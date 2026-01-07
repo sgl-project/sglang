@@ -4,6 +4,7 @@ import { ChatView } from './components/views/ChatView';
 import { InspectView } from './components/views/InspectView';
 import { ManifoldView } from './components/views/ManifoldView';
 import { RouterView } from './components/views/RouterView';
+import { ComparisonView } from './components/comparison';
 import { InsightPanel } from './components/lens/InsightPanel';
 import { TokenLensDrawer } from './components/lens/TokenLensDrawer';
 import { useUIStore } from './stores/useUIStore';
@@ -21,6 +22,8 @@ export default function App() {
         return <ManifoldView />;
       case 'router':
         return <RouterView />;
+      case 'compare':
+        return <ComparisonView />;
       default:
         return <ChatView />;
     }
