@@ -2509,7 +2509,6 @@ class ServerArgs:
             "--model",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
-            required=True,
         )
         parser.add_argument(
             "--tokenizer-path",
