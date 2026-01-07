@@ -135,7 +135,9 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter,
     _use_aiter_gfx95,
 )
-from sglang.srt.models.deepseek_common.deepseek_weight_loader import DeepseekV2WeightLoaderMixin
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    DeepseekV2WeightLoaderMixin,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -2867,7 +2869,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     @property
     def end_layer(self):
         return self.model.end_layer
-        
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         self.do_load_weights(weights, is_nextn)
 
