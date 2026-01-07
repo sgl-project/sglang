@@ -64,7 +64,17 @@ class TestDeepseekV32DP(CustomTestCase):
             self.assertGreater(metrics["accuracy"], 0.935)
 
     def test_bs_1_speed(self):
-        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        # Additional warmup for single-request long-sequence generation
+        # GSM8K's parallel batch warmup may not be sufficient for bs=1 long-sequence scenarios
+        args = BenchArgs(
+            port=int(self.base_url.split(":")[-1]), max_new_tokens=2048
+        )
+        num_warmup_iterations = 3
+        for i in range(num_warmup_iterations):
+            print(f"Warmup iteration {i+1}/{num_warmup_iterations}...")
+            send_one_prompt(args)
+
+        # Actual test
         acc_length, speed = send_one_prompt(args)
 
         print(f"{speed=:.2f}")
