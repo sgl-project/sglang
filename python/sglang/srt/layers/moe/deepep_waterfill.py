@@ -20,11 +20,11 @@ as the 9th routed expert and dispatched through DeepEP.
 Key Design:
 1. Each token's shared expert can ONLY be sent to:
    - A rank it already routes to (no extra communication)
-   - Or source rank (local computation)
+   - Or source rank (local computation, marked with LOCAL_SHARED_MARKER)
 
 2. Virtual expert ID = target_rank * experts_per_rank
    - This ensures DeepEP routes to the correct rank
-   - No need to increase num_experts
+   - LOCAL_SHARED_MARKER (-1) means compute locally, don't dispatch
 
 3. On receiver side:
    - Identify tokens whose 9th expert is for this rank
@@ -32,6 +32,10 @@ Key Design:
    - Merge outputs before combine
 
 4. Shared expert weight = 1.0 / routed_scaling_factor
+
+5. Small batch optimization:
+   - If batch size < MIN_BATCH_FOR_BALANCE, all shared experts compute locally
+   - Avoids fragmented computation across ranks
 """
 
 import os
@@ -40,15 +44,10 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-try:
-    import triton
-    import triton.language as tl
-
-    HAS_TRITON = True
-except ImportError:
-    HAS_TRITON = False
-
 DEEPEP_WATERFILL_DEBUG = os.environ.get("SGLANG_DEEPEP_WATERFILL_DEBUG", "0") == "1"
+
+# Marker for local shared expert computation (won't be dispatched)
+LOCAL_SHARED_MARKER = -1
 
 
 # ============== PyTorch Implementation ==============
@@ -67,7 +66,7 @@ def count_routed_per_rank_pytorch(
     rank_ids = torch.where(
         valid_mask,
         torch.clamp(topk_ids // experts_per_rank, 0, world_size - 1),
-        torch.full_like(topk_ids, world_size),
+        torch.full_like(topk_ids, world_size),  # Invalid -> out of range
     )
 
     flat_ranks = rank_ids.flatten()
@@ -90,6 +89,9 @@ def assign_shared_destination_pytorch(
     1. For each token, find all ranks it routes to
     2. Add source_rank as a candidate (local computation option)
     3. Select the rank with lowest routed count
+    
+    Returns:
+        destination: [num_tokens] destination rank for each token's shared expert
     """
     num_tokens = topk_ids.shape[0]
     topk = topk_ids.shape[1]
@@ -100,6 +102,7 @@ def assign_shared_destination_pytorch(
         return torch.empty(0, dtype=torch.int64, device=device)
 
     # Build candidate mask: [num_tokens, world_size]
+    # Each token can send shared expert to ranks it already routes to + source rank
     candidate_mask = torch.zeros(num_tokens, world_size, dtype=torch.bool, device=device)
     candidate_mask[:, source_rank] = True  # Source rank is always a candidate
 
@@ -117,7 +120,7 @@ def assign_shared_destination_pytorch(
         ranks = rank_ids[:, k]
         candidate_mask[token_indices[valid], ranks[valid]] = True
 
-    # Select rank with minimum count among candidates
+    # Select rank with minimum count among candidates (waterfill)
     INF = routed_counts.max() + 1
     candidate_counts = torch.where(candidate_mask, routed_counts.unsqueeze(0), INF)
     destination = candidate_counts.argmin(dim=1)
@@ -131,27 +134,44 @@ def expand_topk_with_shared_expert(
     shared_destination: Tensor,
     num_experts: int,
     world_size: int,
+    source_rank: int,
     shared_weight: float,
-) -> Tuple[Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor]:
     """
     Expand topk_ids/weights from [N, 8] to [N, 9] with shared expert info.
 
-    The 9th column contains a virtual expert ID that routes to the target rank:
+    The 9th column contains:
+    - LOCAL_SHARED_MARKER (-1): if destination == source_rank (compute locally)
+    - virtual_expert_id: if destination != source_rank (dispatch to target rank)
+    
     virtual_expert_id = target_rank * experts_per_rank
-
-    This ensures DeepEP dispatches the token to the correct rank without
-    needing to increase num_experts in the MoE runner.
+    This ensures DeepEP dispatches the token to the correct rank.
+    
+    Returns:
+        expanded_topk_ids: [N, 9]
+        expanded_topk_weights: [N, 9]
+        local_shared_mask: [N] boolean mask for tokens with local shared expert
     """
     num_tokens = topk_ids.shape[0]
     device = topk_ids.device
     experts_per_rank = num_experts // world_size
 
-    # Virtual expert ID = target_rank * experts_per_rank
-    # This ID will be in the range [0, num_experts) and routes to target_rank
-    virtual_expert_ids = (shared_destination * experts_per_rank).unsqueeze(1)
+    # Identify local vs remote shared expert
+    local_shared_mask = shared_destination == source_rank
+    
+    # Virtual expert ID for remote dispatch
+    # For local: will be set to LOCAL_SHARED_MARKER (-1)
+    virtual_expert_ids = shared_destination * experts_per_rank
+    
+    # Set local shared expert to marker (won't be dispatched)
+    virtual_expert_ids = torch.where(
+        local_shared_mask,
+        torch.full_like(virtual_expert_ids, LOCAL_SHARED_MARKER),
+        virtual_expert_ids,
+    )
 
     expanded_topk_ids = torch.cat(
-        [topk_ids, virtual_expert_ids.to(topk_ids.dtype)], dim=1
+        [topk_ids, virtual_expert_ids.unsqueeze(1).to(topk_ids.dtype)], dim=1
     )
 
     shared_weights_col = torch.full(
@@ -159,7 +179,7 @@ def expand_topk_with_shared_expert(
     )
     expanded_topk_weights = torch.cat([topk_weights, shared_weights_col], dim=1)
 
-    return expanded_topk_ids, expanded_topk_weights
+    return expanded_topk_ids, expanded_topk_weights, local_shared_mask
 
 
 # ============== Main API ==============
@@ -175,8 +195,11 @@ class DeepEPWaterfillBalancer:
     2. Source rank (local computation)
 
     The shared expert is encoded as a virtual 9th expert in topk_ids.
+    Local computation is marked with LOCAL_SHARED_MARKER (-1).
     """
 
+    # Minimum batch size to enable waterfill balancing
+    # Below this threshold, all shared experts are computed locally
     MIN_BATCH_FOR_BALANCE = 64
 
     def __init__(
@@ -214,38 +237,71 @@ class DeepEPWaterfillBalancer:
         topk_ids: Tensor,
         topk_weights: Tensor,
         routed_counts: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Prepare expanded topk for dispatch with shared expert as 9th expert.
 
-        Returns:
-            expanded_topk_ids: [N, 9] with virtual expert ID in 9th column
-            expanded_topk_weights: [N, 9] with shared_weight in 9th column
-        """
-        shared_destination = self.assign_shared_destination(topk_ids, routed_counts)
+        If batch size < MIN_BATCH_FOR_BALANCE, all shared experts are computed
+        locally to avoid fragmented computation.
 
-        expanded_topk_ids, expanded_topk_weights = expand_topk_with_shared_expert(
+        Returns:
+            expanded_topk_ids: [N, 9] with virtual expert ID or LOCAL_SHARED_MARKER
+            expanded_topk_weights: [N, 9] with shared_weight in 9th column
+            local_shared_mask: [N] boolean mask for tokens with local shared expert
+        """
+        num_tokens = topk_ids.shape[0]
+        device = topk_ids.device
+        
+        if num_tokens == 0:
+            # Empty batch
+            expanded_topk_ids = torch.empty(0, topk_ids.shape[1] + 1, dtype=topk_ids.dtype, device=device)
+            expanded_topk_weights = torch.empty(0, topk_weights.shape[1] + 1, dtype=topk_weights.dtype, device=device)
+            local_shared_mask = torch.empty(0, dtype=torch.bool, device=device)
+            return expanded_topk_ids, expanded_topk_weights, local_shared_mask
+
+        # Small batch optimization: all shared experts compute locally
+        if num_tokens < self.MIN_BATCH_FOR_BALANCE:
+            # All destinations are source rank (local)
+            shared_destination = torch.full(
+                (num_tokens,), self.rank, dtype=torch.int64, device=device
+            )
+            if DEEPEP_WATERFILL_DEBUG:
+                print(
+                    f"[DeepEP Waterfill] rank={self.rank} "
+                    f"tokens={num_tokens} < MIN_BATCH={self.MIN_BATCH_FOR_BALANCE}, "
+                    f"all shared experts computed locally"
+                )
+        else:
+            # Waterfill assignment
+            shared_destination = self.assign_shared_destination(topk_ids, routed_counts)
+
+        # Expand topk to include shared expert
+        expanded_topk_ids, expanded_topk_weights, local_shared_mask = expand_topk_with_shared_expert(
             topk_ids,
             topk_weights,
             shared_destination,
             self.num_experts,
             self.world_size,
+            self.rank,
             self.shared_weight,
         )
 
-        if DEEPEP_WATERFILL_DEBUG:
+        if DEEPEP_WATERFILL_DEBUG and num_tokens >= self.MIN_BATCH_FOR_BALANCE:
             # Count how many tokens go to each rank for shared expert
+            num_local = local_shared_mask.sum().item()
+            num_remote = num_tokens - num_local
             dest_counts = torch.bincount(
                 shared_destination, minlength=self.world_size
             ).tolist()
             print(
                 f"[DeepEP Waterfill] rank={self.rank} "
-                f"tokens={topk_ids.shape[0]} "
+                f"tokens={num_tokens} "
+                f"local_shared={num_local} remote_shared={num_remote} "
                 f"routed_counts={routed_counts.tolist()} "
                 f"shared_dest_counts={dest_counts}"
             )
 
-        return expanded_topk_ids, expanded_topk_weights
+        return expanded_topk_ids, expanded_topk_weights, local_shared_mask
 
 
 def identify_shared_expert_tokens(
@@ -258,18 +314,56 @@ def identify_shared_expert_tokens(
     Identify which received tokens need shared expert computation on this rank.
 
     A token needs shared expert here if its 9th column (virtual expert ID)
-    maps to current_rank.
+    maps to current_rank. Tokens with LOCAL_SHARED_MARKER (-1) are skipped
+    (they were computed locally on source rank).
 
     Returns:
         shared_indices: indices of tokens needing shared expert computation
     """
     experts_per_rank = num_experts // world_size
 
-    # 9th column contains virtual expert ID = target_rank * experts_per_rank
+    # 9th column contains virtual expert ID or LOCAL_SHARED_MARKER
     virtual_expert_ids = recv_topk_ids[:, -1]
+    
+    # Skip LOCAL_SHARED_MARKER tokens (they stay on source rank)
+    valid_mask = virtual_expert_ids >= 0
+    
+    # Check if virtual ID maps to current rank
     target_ranks = virtual_expert_ids // experts_per_rank
-
-    shared_mask = target_ranks == current_rank
+    shared_mask = valid_mask & (target_ranks == current_rank)
+    
     shared_indices = shared_mask.nonzero(as_tuple=True)[0]
 
     return shared_indices
+
+
+def compute_local_shared_expert(
+    hidden_states: Tensor,
+    local_shared_mask: Tensor,
+    shared_expert_fn,
+    shared_weight: float,
+) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+    """
+    Compute shared expert locally for tokens marked as local.
+    
+    Args:
+        hidden_states: [N, H] input hidden states
+        local_shared_mask: [N] boolean mask for local shared expert tokens
+        shared_expert_fn: function to compute shared expert
+        shared_weight: weight for shared expert output
+        
+    Returns:
+        local_shared_output: [num_local, H] weighted output (or None if no local tokens)
+        local_indices: [num_local] indices of local tokens (or None)
+    """
+    if not local_shared_mask.any():
+        return None, None
+    
+    local_indices = local_shared_mask.nonzero(as_tuple=True)[0]
+    local_hidden = hidden_states[local_indices]
+    local_output = shared_expert_fn(local_hidden)
+    
+    # Apply shared weight
+    local_output_weighted = local_output * shared_weight
+    
+    return local_output_weighted, local_indices

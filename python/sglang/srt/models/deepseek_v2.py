@@ -1199,22 +1199,29 @@ class DeepseekV2MoE(nn.Module):
         Key Design:
         - Each token's shared expert is assigned to a rank it already routes to
           (or source rank), selected by waterfill algorithm
+        - LOCAL_SHARED_MARKER (-1): compute locally on source rank (not dispatched)
         - Virtual expert ID = target_rank * experts_per_rank (routes to target_rank)
         - Receiver identifies shared expert tokens and computes them separately
         - Shared expert weight = 1/routed_scaling_factor for correct final scaling
+        - Small batch optimization: if tokens < MIN_BATCH, all shared experts local
 
         Flow:
         1. Compute router logits and get topk (8 routed experts)
         2. AllReduce to get global routed counts per rank
         3. Waterfill assigns shared expert destination for each token
-        4. Expand topk to 9 columns (with virtual expert ID for shared)
-        5. DeepEP dispatch with topk=9
-        6. Receiver: identify shared tokens, compute routed (8 cols) + shared separately
-        7. Merge outputs and DeepEP combine
-        8. Apply final scaling
+        4. Expand topk to 9 columns (LOCAL_SHARED_MARKER or virtual ID)
+        5. Start local shared expert on alt_stream (parallel with dispatch)
+        6. DeepEP dispatch with topk=9
+        7. Receiver: identify remote shared tokens, compute routed + shared separately
+        8. Merge outputs and DeepEP combine
+        9. Add local shared expert output
+        10. Apply final scaling
         """
         from sglang.srt.distributed import get_moe_expert_parallel_rank
-        from sglang.srt.layers.moe.deepep_waterfill import identify_shared_expert_tokens
+        from sglang.srt.layers.moe.deepep_waterfill import (
+            compute_local_shared_expert,
+            identify_shared_expert_tokens,
+        )
         from sglang.srt.layers.moe.topk import TopKOutput
 
         num_tokens = hidden_states.shape[0]
@@ -1246,11 +1253,37 @@ class DeepseekV2MoE(nn.Module):
         )
 
         # Step 3 & 4: Waterfill assignment and expand topk to 9 columns
-        expanded_topk_ids, expanded_topk_weights = (
+        expanded_topk_ids, expanded_topk_weights, local_shared_mask = (
             self.deepep_waterfill_balancer.prepare_dispatch(
                 topk_ids, topk_weights, global_routed_counts
             )
         )
+
+        # Step 5: Start local shared expert computation on alt_stream (parallel)
+        local_shared_output = None
+        local_shared_indices = None
+        local_shared_event = None
+        
+        if local_shared_mask.any() and self.alt_stream is not None:
+            self.alt_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.alt_stream):
+                local_shared_output, local_shared_indices = compute_local_shared_expert(
+                    hidden_states,
+                    local_shared_mask,
+                    self._forward_shared_experts,
+                    self.deepep_waterfill_balancer.shared_weight,
+                )
+                if local_shared_output is not None:
+                    local_shared_output.record_stream(self.alt_stream)
+                local_shared_event = self.alt_stream.record_event()
+        elif local_shared_mask.any():
+            # No alt_stream, compute synchronously
+            local_shared_output, local_shared_indices = compute_local_shared_expert(
+                hidden_states,
+                local_shared_mask,
+                self._forward_shared_experts,
+                self.deepep_waterfill_balancer.shared_weight,
+            )
 
         # Create expanded TopKOutput for dispatch
         expanded_topk_output = TopKOutput(
@@ -1259,7 +1292,7 @@ class DeepseekV2MoE(nn.Module):
             token_expert_indices=None,
         )
 
-        # Step 5: DeepEP dispatch with topk=9
+        # Step 6: DeepEP dispatch with topk=9
         dispatcher = self.experts.dispatcher
         dispatcher.dispatch_a(
             hidden_states=hidden_states,
@@ -1267,13 +1300,14 @@ class DeepseekV2MoE(nn.Module):
         )
         dispatch_output = dispatcher.dispatch_b()
 
-        # Step 6: Process received tokens
+        # Step 7: Process received tokens
         recv_hidden = dispatch_output.hidden_states
         recv_topk_ids = dispatch_output.topk_ids  # [M, 9]
         recv_topk_weights = dispatch_output.topk_weights  # [M, 9]
 
-        # Identify tokens that need shared expert computation on this rank
-        shared_indices = identify_shared_expert_tokens(
+        # Identify tokens that need shared expert computation on this rank (remote)
+        # These are tokens sent from OTHER ranks with virtual ID mapping to this rank
+        remote_shared_indices = identify_shared_expert_tokens(
             recv_topk_ids,
             self.deepep_waterfill_balancer.num_experts,
             self.deepep_waterfill_balancer.world_size,
@@ -1313,20 +1347,20 @@ class DeepseekV2MoE(nn.Module):
         combine_input = self.experts.run_moe_core(dispatch_output=routed_dispatch_output)
         routed_output = combine_input.hidden_states
 
-        # Compute shared expert for identified tokens and add to output
-        if shared_indices.numel() > 0:
-            shared_hidden = recv_hidden[shared_indices]
-            shared_expert_output = self.shared_experts(shared_hidden)
+        # Compute shared expert for remote tokens and add to output
+        if remote_shared_indices.numel() > 0:
+            remote_shared_hidden = recv_hidden[remote_shared_indices]
+            remote_shared_expert_output = self._forward_shared_experts(remote_shared_hidden)
             # Get shared expert weights (9th column)
-            shared_weights = recv_topk_weights[shared_indices, -1].unsqueeze(-1)
+            remote_shared_weights = recv_topk_weights[remote_shared_indices, -1].unsqueeze(-1)
             # Add weighted shared expert output to routed output
             routed_output.index_add_(
                 0,
-                shared_indices,
-                shared_expert_output * shared_weights,
+                remote_shared_indices,
+                remote_shared_expert_output * remote_shared_weights,
             )
 
-        # Step 7: DeepEP combine with original topk=9
+        # Step 8: DeepEP combine with original topk=9
         if isinstance(dispatch_output, DeepEPNormalDispatchOutput):
             final_combine_input = DeepEPNormalCombineInput(
                 hidden_states=routed_output,
@@ -1341,7 +1375,19 @@ class DeepseekV2MoE(nn.Module):
             )
         combined_hidden_states = dispatcher.combine(final_combine_input)
 
-        # Step 8: Apply routed scaling factor
+        # Step 9: Wait for local shared expert and add to result
+        if local_shared_event is not None:
+            torch.cuda.current_stream().wait_event(local_shared_event)
+        
+        if local_shared_output is not None and local_shared_indices is not None:
+            # Add local shared expert output at original token positions
+            combined_hidden_states.index_add_(
+                0,
+                local_shared_indices,
+                local_shared_output,
+            )
+
+        # Step 10: Apply routed scaling factor
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             combined_hidden_states *= self.routed_scaling_factor
 
