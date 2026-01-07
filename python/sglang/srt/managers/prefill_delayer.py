@@ -1,6 +1,6 @@
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -18,12 +18,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _DelayInfo:
-    delayed_count: int
-    start_time: float
-
-    @classmethod
-    def create_now(cls) -> "_DelayInfo":
-        return cls(delayed_count=0, start_time=time.perf_counter())
+    delayed_count: int = 0
+    start_time: float = field(default_factory=time.perf_counter)
 
 
 class PrefillDelayer:
@@ -68,7 +64,7 @@ class PrefillDelayer:
 
         if global_mixed_prefillable:
             if self._curr_delay_info is None:
-                self._curr_delay_info = _DelayInfo.create_now()
+                self._curr_delay_info = _DelayInfo()
             self._curr_delay_info.delayed_count += 1
             if self._curr_delay_info.delayed_count < self.max_delay_passes:
                 return False
