@@ -97,6 +97,9 @@ def forward_mha_prepare_npu(
 
     q[..., m.qk_nope_head_dim :] = q_pe
 
+    if m.w_kc.dtype == torch.uint8:
+        kv_a = kv_a.squeeze(1).squeeze(1)
+
     kv = m.kv_b_proj(kv_a)[0]
     kv = kv.view(-1, m.num_local_heads, m.qk_nope_head_dim + m.v_head_dim)
     k_nope = kv[..., : m.qk_nope_head_dim]
@@ -188,7 +191,10 @@ def forward_mla_prepare_npu(
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
 
-        q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
+        if m.w_kc.dtype == torch.uint8:
+            q_nope_out = torch.ops.npu.fp8_w8a16_batch_matmul(q_nope.transpose(0, 1).contiguous(), m.w_kc, m.w_scale_k, "bf16")
+        else:
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
@@ -247,14 +253,18 @@ def forward_mla_core_npu(
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
-    attn_bmm_output = torch.empty(
-        (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-        dtype=attn_output.dtype,
-        device=attn_output.device,
-    )
+    if m.w_vc.dtype == torch.uint8:
+        attn_bmm_output = torch.ops.npu.fp8_w8a16_batch_matmul(attn_output.transpose(0, 1).contiguous(), m.w_vc, m.w_scale_v, "bf16")
+        attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+    else:
+        attn_bmm_output = torch.empty(
+            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
+            dtype=attn_output.dtype,
+            device=attn_output.device,
+        )
 
-    attn_output = attn_output.contiguous()
-    torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+        attn_output = attn_output.contiguous()
+        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     output, _ = m.o_proj(attn_bmm_output)

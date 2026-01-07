@@ -3538,6 +3538,12 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 weight_block_size,
                                 torch.bfloat16,
                             )
+                    elif (
+                        _is_npu
+                        and weight_block_size[0] == 128
+                        and weight_block_size[1] == 128
+                    ):
+                        block_scale = weight_scale
                     else:
                         w, scale = block_quant_to_tensor_quant(
                             weight, weight_scale, weight_block_size
@@ -3586,8 +3592,23 @@ class DeepseekV2ForCausalLM(nn.Module):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
                 )
-
-            if not use_deep_gemm_bmm:
+            if _is_npu:
+                num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
+                num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
+                ws_kc, ws_vc = block_scale.unflatten(
+                    0, (-1, (num_tiles_k + num_tiles_n))
+                ).split([num_tiles_k, num_tiles_n], dim=1)
+                self_attn.w_scale_k = bind_or_assign(
+                    self_attn.w_scale_k, ws_kc.contiguous()
+                )
+                self_attn.w_scale_v = bind_or_assign(
+                    self_attn.w_scale_v, ws_vc.transpose(1, 2).contiguous()
+                )
+                self_attn.w_kc = bind_or_assign(
+                    self_attn.w_kc, w_kc.view(torch.uint8).contiguous()
+                )
+                self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.view(torch.uint8).transpose(1, 2).contiguous())
+            elif not use_deep_gemm_bmm:
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )

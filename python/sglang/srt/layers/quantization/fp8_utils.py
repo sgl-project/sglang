@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_npu,
     is_sm90_supported,
     offloader,
 )
@@ -52,6 +53,7 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_npu = is_npu()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -73,6 +75,10 @@ if _is_cuda:
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
+
+if _is_npu: 
+    import torch_npu
+    import sgl_kernel_npu
 
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
@@ -258,6 +264,8 @@ def _dispatch_auto_backend() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
+    elif _is_npu:
+        return soft_fp8_blockfp8_matmul_npu
     else:
         return triton_w8a8_block_fp8_linear
 
@@ -1165,3 +1173,25 @@ def validate_fp8_block_shape(
                     f"{output_partition_size} is not divisible by "
                     f"weight quantization block_n = {block_n}."
                 )
+
+
+def soft_fp8_blockfp8_matmul_npu(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    output = torch.ops.npu.fp8_w8a16_matmul(input, weight, weight_scale, "bf16")
+    return output
+
+
+def soft_fp8_blockfp8_gmm_npu(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_list: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.ops.npu.fp8_w8a16_grouped_matmul(input, weight, weight_scale, group_list, "bf16")
+    return output
