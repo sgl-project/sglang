@@ -93,6 +93,16 @@ class WanT2V480PConfig(PipelineConfig):
 
 
 @dataclass
+class TurboWanT2V480PConfig(WanT2V480PConfig):
+    """Base configuration for Wan T2V 1.3B pipeline architecture."""
+
+    flow_shift: float | None = 8.0
+    dmd_denoising_steps: list[int] | None = field(
+        default_factory=lambda: [988, 932, 852, 608]
+    )
+
+
+@dataclass
 class WanT2V720PConfig(WanT2V480PConfig):
     """Base configuration for Wan T2V 14B 720P pipeline architecture."""
 
@@ -106,6 +116,7 @@ class WanT2V720PConfig(WanT2V480PConfig):
 class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
     """Base configuration for Wan I2V 14B 480P pipeline architecture."""
 
+    max_area: int = 480 * 832
     # WanConfig-specific parameters with defaults
     task_type: ModelTaskType = ModelTaskType.I2V
     # Precision for each component
@@ -130,6 +141,7 @@ class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
 class WanI2V720PConfig(WanI2V480PConfig):
     """Base configuration for Wan I2V 14B 720P pipeline architecture."""
 
+    max_area: int = 720 * 1280
     # WanConfig-specific parameters with defaults
 
     # Denoising stage

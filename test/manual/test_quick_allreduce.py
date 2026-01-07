@@ -9,7 +9,7 @@ import ray
 import torch
 import torch.distributed as dist
 
-from sglang.srt import _custom_ops as ops
+import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.distributed import init_distributed_environment
 from sglang.srt.distributed.communication_op import (  # noqa
     tensor_model_parallel_all_reduce,
