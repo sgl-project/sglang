@@ -100,8 +100,8 @@ class TestBenchServingFunctionality(CustomTestCase):
 
 class TestBenchServingCustomHeaders(CustomTestCase):
     def test_parse_custom_headers(self):
-        headers = parse_custom_headers(["MyHeader=MY_VALUE", "Another=val=ue"])
-        self.assertEqual(headers, {"MyHeader": "MY_VALUE", "Another": "val=ue"})
+        headers = parse_custom_headers(["MyHeader=MY_VALUE", "Another=value=hello"])
+        self.assertEqual(headers, {"MyHeader": "MY_VALUE", "Another": "value=hello"})
 
         headers = parse_custom_headers(["InvalidNoEquals"])
         self.assertEqual(headers, {})
