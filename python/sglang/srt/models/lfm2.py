@@ -7,6 +7,8 @@ This is a hybrid architecture with both attention and short conv layers.
 
 The model uses a gated 1D causal convolution (kernel=3) instead of attention
 in some layers, providing linear memory complexity for those layers.
+
+Uses optimized causal_conv1d kernels from the mamba package for fast inference.
 """
 
 import logging
@@ -17,6 +19,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.lfm2 import Lfm2Config
+from sglang.srt.layers.attention.mamba.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -206,11 +212,12 @@ class Lfm2Attention(nn.Module):
 
 class Lfm2ShortConv(nn.Module):
     """
-    Gated short convolution layer using SGLang's MambaPool for state management.
+    Gated short convolution layer using optimized causal_conv1d kernels.
 
     Architecture: in_proj -> split(B, C, x) -> Bx -> conv1d -> C*conv_out -> out_proj
     - Uses double gating: B (before conv) and C (after conv)
     - Fixed-size cache: stores last (kernel_size - 1) tokens
+    - Uses causal_conv1d_fn for prefill and causal_conv1d_update for decode
     """
 
     def __init__(
@@ -224,19 +231,19 @@ class Lfm2ShortConv(nn.Module):
         self.layer_idx = layer_idx
         self.conv_kernel = int(config.conv_L_cache)
         self.L_cache = self.conv_kernel - 1
-        self.bias = bool(config.conv_bias)
+        self.use_bias = bool(config.conv_bias)
         self.hidden_size = config.hidden_size
 
-        self.in_proj = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias=self.bias)
-        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=self.bias)
-        self.conv = nn.Conv1d(
-            config.hidden_size,
-            config.hidden_size,
-            kernel_size=self.conv_kernel,
-            groups=config.hidden_size,
-            bias=self.bias,
-            padding=self.L_cache,
-        )
+        self.in_proj = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias=self.use_bias)
+        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=self.use_bias)
+
+        # Conv weights stored in format matching causal_conv1d: (hidden_size, kernel_size)
+        # Weight loading will handle conversion from HF's (hidden_size, 1, kernel_size)
+        self.conv_weight = nn.Parameter(torch.empty(config.hidden_size, self.conv_kernel))
+        if self.use_bias:
+            self.conv_bias = nn.Parameter(torch.empty(config.hidden_size))
+        else:
+            self.register_parameter("conv_bias", None)
 
     def forward(
         self,
@@ -250,124 +257,50 @@ class Lfm2ShortConv(nn.Module):
         conv_state = layer_cache.conv[0]
         req_pool_indices = forward_batch.req_pool_indices
 
-        if forward_batch.forward_mode.is_decode():
-            return self._forward_decode(hidden_states, conv_state, req_pool_indices)
-
-        seq_lens = getattr(forward_batch, "extend_seq_lens", None)
-        if seq_lens is not None and len(seq_lens) > 1:
-            return self._forward_prefill_multi(
-                hidden_states, conv_state, req_pool_indices, seq_lens
-            )
-        return self._forward_prefill_single(hidden_states, conv_state, req_pool_indices)
-
-    def _forward_prefill_single(
-        self,
-        hidden_states: torch.Tensor,
-        conv_state: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        T = hidden_states.shape[0]
-
-        proj = self.in_proj(hidden_states)
-        proj_t = proj.transpose(0, 1).unsqueeze(0)
-        B_gate, C_gate, x = proj_t.chunk(3, dim=1)
-        Bx = B_gate * x
-        conv_out = self.conv(Bx)[..., :T]
-        y = C_gate * conv_out
-        y = self.out_proj(y.squeeze(0).transpose(0, 1))
-
-        # Store final conv state
-        if T >= self.L_cache:
-            final_state = Bx[0, :, -self.L_cache :]
-        else:
-            final_state = F.pad(Bx[0], (self.L_cache - T, 0), value=0.0)
-
-        if req_pool_indices.numel() > 0:
-            conv_state.index_copy_(
-                0,
-                req_pool_indices[:1].long(),
-                final_state.unsqueeze(0).to(conv_state.dtype),
-            )
-
-        return y
-
-    def _forward_prefill_multi(
-        self,
-        hidden_states: torch.Tensor,
-        conv_state: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ) -> torch.Tensor:
-        outputs = []
-        start_idx = 0
-        seq_lens_list = (
-            seq_lens.tolist() if isinstance(seq_lens, torch.Tensor) else list(seq_lens)
-        )
-        req_pool_indices_long = req_pool_indices.long()
-
-        for i, seq_len in enumerate(seq_lens_list):
-            seq_len = int(seq_len)
-            end_idx = start_idx + seq_len
-            seq_hidden = hidden_states[start_idx:end_idx]
-            T = seq_hidden.shape[0]
-
-            proj = self.in_proj(seq_hidden)
-            proj_t = proj.transpose(0, 1).unsqueeze(0)
-            B_gate, C_gate, x = proj_t.chunk(3, dim=1)
-            Bx = B_gate * x
-            conv_out = self.conv(Bx)[..., :T]
-            y = C_gate * conv_out
-            y = self.out_proj(y.squeeze(0).transpose(0, 1))
-            outputs.append(y)
-
-            if T >= self.L_cache:
-                final_state = Bx[0, :, -self.L_cache :]
-            else:
-                final_state = F.pad(Bx[0], (self.L_cache - T, 0), value=0.0)
-
-            conv_state.index_copy_(
-                0,
-                req_pool_indices_long[i : i + 1],
-                final_state.unsqueeze(0).to(conv_state.dtype),
-            )
-            start_idx = end_idx
-
-        return torch.cat(outputs, dim=0)
-
-    def _forward_decode(
-        self,
-        hidden_states: torch.Tensor,
-        conv_state: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        req_pool_indices_long = req_pool_indices.long()
-
+        # Project and split into gates: B (pre-conv), C (post-conv), x (input)
         proj = self.in_proj(hidden_states)
         B_gate, C_gate, x = proj.chunk(3, dim=-1)
         Bx = B_gate * x
 
-        conv_weights = self.conv.weight[:, 0, :]
-        current_states = conv_state[req_pool_indices_long]
+        if forward_batch.forward_mode.is_decode():
+            # Decode: single token per request, use optimized update kernel
+            conv_out = causal_conv1d_update(
+                Bx,
+                conv_state,
+                self.conv_weight,
+                self.conv_bias,
+                activation=None,
+                conv_state_indices=req_pool_indices.to(torch.int32),
+            )
+        else:
+            # Prefill: multiple tokens, use varlen kernel
+            T = hidden_states.shape[0]
+            Bx_t = Bx.transpose(0, 1).contiguous()
 
-        # Update state: roll left, insert new value at end
-        new_states = torch.cat(
-            [current_states[:, :, 1:], Bx.unsqueeze(-1)], dim=-1
-        )
-        conv_state.index_copy_(
-            0, req_pool_indices_long, new_states.to(conv_state.dtype)
-        )
+            # Build query_start_loc: [0, cumsum(seq_lens)...]
+            extend_start_loc = forward_batch.extend_start_loc
+            if extend_start_loc is not None and len(extend_start_loc) > 1:
+                query_start_loc = torch.cat([
+                    extend_start_loc,
+                    torch.tensor([T], dtype=torch.int32, device=hidden_states.device)
+                ])
+                cache_indices = req_pool_indices.to(torch.int32)
+            else:
+                query_start_loc = torch.tensor([0, T], dtype=torch.int32, device=hidden_states.device)
+                cache_indices = req_pool_indices[:1].to(torch.int32)
 
-        # Apply conv: use last kernel_size values
-        conv_input = torch.cat(
-            [current_states[:, :, -(self.conv_kernel - 1) :], Bx.unsqueeze(-1)], dim=-1
-        )
-        conv_out = (conv_input * conv_weights.unsqueeze(0)).sum(dim=-1)
+            conv_out = causal_conv1d_fn(
+                Bx_t,
+                self.conv_weight,
+                self.conv_bias,
+                query_start_loc=query_start_loc,
+                cache_indices=cache_indices,
+                has_initial_state=None,
+                conv_states=conv_state,
+                activation=None,
+            ).transpose(0, 1)
 
-        if self.bias and self.conv.bias is not None:
-            conv_out = conv_out + self.conv.bias
-
-        y = C_gate * conv_out
-        return self.out_proj(y.to(hidden_states.dtype))
+        return self.out_proj(C_gate * conv_out)
 
 
 class Lfm2DecoderLayer(nn.Module):
@@ -567,6 +500,17 @@ class Lfm2ForCausalLM(nn.Module):
 
             if "embed_tokens.weight" in name:
                 embed_tokens_weight = loaded_weight
+
+            # Handle conv.weight -> conv_weight conversion for ShortConv layers
+            # HF shape: (hidden_size, 1, kernel_size) -> squeeze to (hidden_size, kernel_size)
+            if ".conv.weight" in name:
+                name = name.replace(".conv.weight", ".conv_weight")
+                # Squeeze out the middle dimension: (D, 1, K) -> (D, K)
+                loaded_weight = loaded_weight.squeeze(1)
+
+            # Handle conv.bias -> conv_bias conversion
+            if ".conv.bias" in name:
+                name = name.replace(".conv.bias", ".conv_bias")
 
             # Handle QKV stacking
             for param_name, weight_name, shard_id in stacked_params_mapping:
