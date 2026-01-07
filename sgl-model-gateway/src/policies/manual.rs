@@ -16,17 +16,15 @@
 use std::{sync::Arc, time::Instant};
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use http::header::HeaderName;
 use rand::Rng;
 use tracing::info;
 
 use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::{core::Worker, observability::metrics::Metrics};
-
-/// Header for routing key based sticky sessions
-static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
+use crate::{
+    core::Worker, observability::metrics::Metrics, routers::header_utils::extract_routing_key,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionBranch {
@@ -191,12 +189,7 @@ impl ManualPolicy {
             return (None, ExecutionBranch::NoHealthyWorkers);
         }
 
-        // Extract routing key from header
-        let routing_id = info
-            .headers
-            .and_then(|h| h.get(&HEADER_ROUTING_KEY))
-            .and_then(|v| v.to_str().ok())
-            .filter(|s| !s.is_empty());
+        let routing_id = extract_routing_key(info.headers);
 
         if let Some(routing_id) = routing_id {
             let (idx, branch) = self.select_by_routing_id(workers, routing_id, &healthy_indices);

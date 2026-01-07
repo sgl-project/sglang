@@ -697,21 +697,33 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
         num_workers = workers_config.get("count") or 1
 
         try:
-            instance = model_pool.get(model_id, connection_mode)
+            if num_workers > 1:
+                # Launch multiple workers on separate GPUs
+                instances = model_pool.launch_regular_workers(
+                    model_id=model_id,
+                    num_workers=num_workers,
+                    mode=connection_mode,
+                    startup_timeout=300,
+                )
+                if not instances:
+                    pytest.fail(
+                        f"Failed to launch {num_workers} workers for {model_id}"
+                    )
+                worker_urls = [inst.worker_url for inst in instances]
+                model_path = instances[0].model_path
+            else:
+                # Single worker - use existing get() method
+                instance = model_pool.get(model_id, connection_mode)
+                worker_urls = [instance.worker_url]
+                model_path = instance.model_path
         except RuntimeError as e:
             pytest.fail(str(e))
-
-        # Build worker URLs list
-        # For num_workers > 1, we need multiple workers from the pool
-        # For now, we reuse the same worker URL (router will load balance)
-        # TODO: Support launching multiple distinct workers for true LB testing
-        worker_urls = [instance.worker_url] * num_workers
 
         # Launch gateway with configuration
         gateway = Gateway()
         gateway.start(
             worker_urls=worker_urls,
-            model_path=instance.model_path,
+            model_path=model_path,
             policy=gateway_config["policy"],
             timeout=gateway_config["timeout"],
             extra_args=gateway_config["extra_args"],
@@ -732,7 +744,7 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
         )
 
         try:
-            yield backend_name, instance.model_path, client, gateway
+            yield backend_name, model_path, client, gateway
         finally:
             logger.info("Tearing down gateway for %s backend", backend_name)
             gateway.shutdown()
