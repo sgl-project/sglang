@@ -116,13 +116,13 @@ python3 -m sglang.launch_server \
 The structure of the config file is described in further details in [Configuration File Spec](#Configuration-File-Specification).
 
 
-#### 3. Using Command-line JSON String 
+#### 3. Using Command-line JSON String
 
 For debugging or quick testing, you may pass a **JSON-style string** directly via `--hicache-storage-backend-extra-config`.
 
 This requires explicitly specifying the plugin type via an environment variable, and this method can be applicable to **only a few** plugins (e.g., POSIX, GDS, GDS_MT)
 
-The below example shows how to use command-line string to use the POSIX plugin where URING is enabled for async POSIX storage. 
+The below example shows how to use command-line string to use the POSIX plugin where URING is enabled for async POSIX storage.
 
 ```bash
 export SGLANG_HICACHE_NIXL_BACKEND_PLUGIN_TYPE=POSIX

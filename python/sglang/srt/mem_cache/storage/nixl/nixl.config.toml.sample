@@ -1,7 +1,7 @@
 ################################################################################
 # IMPORTANT
 # 1. to enable a plugin, add "active = true" in the corresponding section
-# 2. the configs inside plugin.posix (i.e., use_aio, use_uring, use_posix_aio) 
+# 2. the configs inside plugin.posix (i.e., use_aio, use_uring, use_posix_aio)
 #    are mutually exclusive
 ################################################################################
 
@@ -10,7 +10,7 @@
 # POSIX FILE SYSTEM BACKEND
 ########################################
 [plugin.posix]
-# Configuration for the POSIX file-based backend. 
+# Configuration for the POSIX file-based backend.
 #
 # The supported backends include:
 # 1. AIO (`use_aio = "true"`)

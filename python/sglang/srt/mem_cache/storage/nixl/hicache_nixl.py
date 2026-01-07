@@ -8,7 +8,12 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 
-from .nixl_utils import NixlBackendSelection, NixlFileManager, NixlRegistration, NixlBackendConfig
+from .nixl_utils import (
+    NixlBackendConfig,
+    NixlBackendSelection,
+    NixlFileManager,
+    NixlRegistration,
+)
 
 try:
     from nixl._api import nixl_agent, nixl_agent_config
