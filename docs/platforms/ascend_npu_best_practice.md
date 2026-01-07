@@ -280,16 +280,16 @@ do
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export HCCL_BUFFSIZE=650
-        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=4
         export TASK_QUEUE_ENABLE=0
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --trust-remote-code --dist-init-addr DIP1:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 16 \
+        --port 8001 --trust-remote-code --dist-init-addr DIP1:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 8 \
         --mem-fraction-static 0.75 --max-running-requests 32 --attention-backend ascend --device npu --quantization modelslim \
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head --moe-dense-tp 1 \
-        --cuda-graph-bs 4 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
+        --cuda-graph-bs 2 4 6 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
         --tokenizer-worker-num 4 --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16 \
         --load-balance-method decode_round_robin
@@ -1769,7 +1769,7 @@ LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
 echo "${LOCAL_HOST2}"
 
-export HCCL_BUFFSIZE=1600
+export HCCL_BUFFSIZE=2100
 export HCCL_SOCKET_IFNAME=xxx
 export GLOO_SOCKET_IFNAME=xxx
 export HCCL_OP_EXPANSION_MODE="AIV"
@@ -1867,8 +1867,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
 
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-
 MODEL_PATH=xxx
 
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
@@ -1895,16 +1893,16 @@ do
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
-        python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode \
+        python -m sglang.launch_server --model-path ${MODEL_PATH} \
         --host 127.0.0.1 --port 7439 --trust-remote-code \
         --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 --mem-fraction-static 0.8 --max-running-requests 768 \
         --attention-backend ascend --device npu --quantization modelslim --enable-dp-attention \
-        --moe-a2a-backend ascend_fuseep --cuda-graph-bs 6 8 10 12 18 24 \
+        --moe-a2a-backend deepep --deepep-mode auto --cuda-graph-bs 6 8 10 12 18 24 \
         --dist-init-addr 141.61.105.131:5000 --chunked-prefill-size 32768 --max-prefill-tokens 458880 \
         --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
         --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-        --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
-        --prefill-round-robin-balance --enable-dp-lm-head --dtype bfloat16 --tokenizer-worker-num 4
+        --watchdog-timeout 9000 --context-length 8192 \
+        --enable-dp-lm-head --dtype bfloat16
         NODE_RANK=$i
         break
     fi
@@ -2230,11 +2228,10 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --attention-backend ascend --device npu   \
     --max-running-requests 32 \
     --disable-radix-cache \
-    --base-gpu-id 4 \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --chunked-prefill-size -1 --max-prefill-tokens 65536  \
-    --tp-size 8 --mem-fraction-static 0.72 --cuda-graph-bs 1 4 6 12 18 24 30 32 --dtype bfloat1
+    --tp-size 8 --mem-fraction-static 0.72 --cuda-graph-bs 1 4 6 12 18 24 30 32 --dtype bfloat16
 
 ```
 
@@ -2443,10 +2440,10 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --attention-backend ascend --device npu  --quantization modelslim  \
     --max-running-requests 78 \
     --disable-radix-cache --speculative-draft-model-quantization unquant \
-    --chunked-prefill-size -1 --max-prefill-tokens 65536  \
+    --chunked-prefill-size -1 --max-prefill-tokens 49152  \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-    --tp-size 4  --mem-fraction-static 0.72 --cuda-graph-bs 16 32 64 68 72 78 --dtype bfloat16
+    --tp-size 4  --mem-fraction-static 0.7 --cuda-graph-bs 16 32 64 68 72 78 --dtype bfloat16
 ```
 
 #### Benchmark
@@ -3046,7 +3043,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 --max-running-requests 80 --context-length 8192 --dtype bfloat16 \
 --chunked-prefill-size 28672 --max-prefill-tokens 458880  \
 --disable-radix-cache --moe-a2a-backend deepep  --deepep-mode auto --enable-dp-attention --enable-dp-lm-head \
---tp 16 --dp-size 4 --mem-fraction-static 0.7 --cuda-graph-bs  16 20
+--tp 16 --dp-size 4 --mem-fraction-static 0.7 --cuda-graph-bs  16 20 24
 ```
 
 #### Benchmark
@@ -3136,6 +3133,7 @@ python -m sglang.launch_server \
         --host 127.0.0.1 \
         --port 6699 \
         --tp-size 4 \
+        --device npu \
         --attention-backend ascend \
         --mem-fraction-static 0.685 \
         --max-running-requests 80 \

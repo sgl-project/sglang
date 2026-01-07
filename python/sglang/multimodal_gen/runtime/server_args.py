@@ -17,6 +17,7 @@ from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -923,9 +924,18 @@ class ServerArgs:
 
     def check_server_args(self) -> None:
         """Validate inference arguments for consistency"""
+        # layerwise offload
         if current_platform.is_mps():
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
+
+        if not envs.SGLANG_CACHE_DIT_ENABLED:
+            # TODO: need a better way to tell this
+            if "wan" in self.pipeline_config.__class__.__name__.lower():
+                logger.info(
+                    "Automatically enable dit_layerwise_offload for Wan for best performance"
+                )
+                self.dit_layerwise_offload = True
 
         if self.dit_layerwise_offload:
             if self.use_fsdp_inference:
@@ -938,7 +948,7 @@ class ServerArgs:
                     "dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload."
                 )
                 self.dit_cpu_offload = False
-            if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
+            if envs.SGLANG_CACHE_DIT_ENABLED:
                 raise ValueError(
                     "dit_layerwise_offload cannot be enabled together with cache-dit. "
                     "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "

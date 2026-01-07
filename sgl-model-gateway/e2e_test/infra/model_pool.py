@@ -293,6 +293,7 @@ class ModelPool:
         worker_type: WorkerType = WorkerType.REGULAR,
         bootstrap_port: int | None = None,
         ib_device: str | None = None,
+        instance_key: str | None = None,
     ) -> ModelInstance:
         """Launch a model instance.
 
@@ -303,6 +304,7 @@ class ModelPool:
             worker_type: Worker type (REGULAR, PREFILL, or DECODE).
             bootstrap_port: Bootstrap port for prefill workers in PD mode.
             ib_device: InfiniBand device for PD disaggregation.
+            instance_key: Custom instance key, or None to auto-generate.
 
         Returns:
             The launched ModelInstance.
@@ -353,11 +355,15 @@ class ModelPool:
                 cmd.extend(["--disaggregation-ib-device", ib_device])
         elif worker_type == WorkerType.DECODE:
             cmd.extend(["--disaggregation-mode", "decode"])
+            # Base GPU ID 0 since CUDA_VISIBLE_DEVICES remaps the GPU
+            cmd.extend(["--base-gpu-id", "0"])
             if ib_device:
                 cmd.extend(["--disaggregation-ib-device", ib_device])
 
-        # Build key based on worker type
-        if worker_type == WorkerType.REGULAR:
+        # Build key based on worker type (or use custom key)
+        if instance_key:
+            key = instance_key
+        elif worker_type == WorkerType.REGULAR:
             key = f"{model_id}:{mode.value}"
         else:
             key = f"{model_id}:{mode.value}:{worker_type.value}"
@@ -560,7 +566,11 @@ class ModelPool:
         return instance
 
     def _evict_for_gpus(
-        self, required_gpus: int, exclude_model_id: str | None = None
+        self,
+        required_gpus: int,
+        exclude_model_id: str | None = None,
+        exclude_mode: ConnectionMode | None = None,
+        exclude_worker_types: set[WorkerType] | None = None,
     ) -> None:
         """Evict models until we have enough GPUs available.
 
@@ -570,29 +580,45 @@ class ModelPool:
 
         Args:
             required_gpus: Number of GPUs needed.
-            exclude_model_id: Model ID to exclude from eviction (test may need
-                multiple modes of the same model).
+            exclude_model_id: Model ID to exclude from eviction.
+            exclude_mode: Connection mode to exclude from eviction (optional).
+            exclude_worker_types: Worker types to exclude from eviction.
+                If None, falls back to excluding by model_id only (backward compatible).
         """
         available = self.allocator.available_gpus()
         if len(available) >= required_gpus:
             return  # Already have enough
 
         # Sort by last_used descending (MRU eviction) - evict most recently used first
-        # Exclude instances of the same model_id (test may need multiple modes)
-        evictable = [
-            inst
-            for inst in self.instances.values()
-            if exclude_model_id is None or inst.model_id != exclude_model_id
-        ]
-        evictable.sort(key=lambda x: x.last_used, reverse=True)
+        # Store (dict_key, instance) tuples to preserve the actual key for eviction
+        evictable: list[tuple[str, ModelInstance]] = []
+        for dict_key, inst in self.instances.items():
+            if exclude_worker_types is not None:
+                # Precise matching with worker types
+                # Must match model_id AND worker_type, mode is optional
+                if (
+                    exclude_model_id is not None
+                    and inst.model_id == exclude_model_id
+                    and inst.worker_type in exclude_worker_types
+                ):
+                    # If mode is specified, also require mode match
+                    if exclude_mode is None or inst.mode == exclude_mode:
+                        continue
+            else:
+                # Backward compatible: exclude by model_id only
+                if exclude_model_id is not None and inst.model_id == exclude_model_id:
+                    continue
+            evictable.append((dict_key, inst))
+
+        evictable.sort(key=lambda x: x[1].last_used, reverse=True)
 
         freed_gpus = len(available)
-        for inst in evictable:
+        for dict_key, inst in evictable:
             if freed_gpus >= required_gpus:
                 break
 
-            logger.info("Evicting model %s (MRU) to free GPUs", inst.key)
-            self._evict_instance(inst.key)
+            logger.info("Evicting model %s (MRU) to free GPUs", dict_key)
+            self._evict_instance(dict_key)
             if inst.gpu_slot:
                 freed_gpus += len(inst.gpu_slot.gpu_ids)
 
@@ -608,7 +634,13 @@ class ModelPool:
         spec = get_model_spec(model_id)
         required_gpus = spec.get("tp", 1)
 
-        self._evict_for_gpus(required_gpus, exclude_model_id=model_id)
+        # Exclude REGULAR workers of same model from eviction (keep them)
+        # but allow evicting PD workers (PREFILL/DECODE) to free GPUs
+        self._evict_for_gpus(
+            required_gpus,
+            exclude_model_id=model_id,
+            exclude_worker_types={WorkerType.REGULAR},
+        )
 
         available = self.allocator.available_gpus()
         if len(available) < required_gpus:
@@ -682,6 +714,102 @@ class ModelPool:
             if inst.model_id == model_id and inst.worker_type == worker_type
         ]
 
+    def launch_regular_workers(
+        self,
+        model_id: str,
+        num_workers: int,
+        mode: ConnectionMode = ConnectionMode.HTTP,
+        startup_timeout: int = DEFAULT_STARTUP_TIMEOUT,
+        allow_eviction: bool = True,
+    ) -> list[ModelInstance]:
+        """Launch multiple regular workers for load balancing.
+
+        Args:
+            model_id: Model identifier from MODEL_SPECS.
+            num_workers: Number of workers to launch.
+            mode: Connection mode (HTTP or GRPC).
+            startup_timeout: Timeout for workers to become healthy.
+            allow_eviction: If True, evict MRU models to free GPUs.
+
+        Returns:
+            List of ModelInstance objects.
+        """
+        self._startup_timeout = startup_timeout
+
+        if model_id not in MODEL_SPECS:
+            raise ValueError(f"Unknown model: {model_id}")
+
+        spec = get_model_spec(model_id)
+        tp = spec.get("tp", 1)
+        required_gpus = num_workers * tp
+
+        # Check if we have enough GPUs
+        available = self.allocator.available_gpus()
+        if len(available) < required_gpus:
+            if allow_eviction:
+                logger.info(
+                    "Need %d GPUs for %d workers, only %d available. Evicting MRU models...",
+                    required_gpus,
+                    num_workers,
+                    len(available),
+                )
+                # Exclude REGULAR workers of same model/mode from eviction
+                self._evict_for_gpus(
+                    required_gpus,
+                    exclude_model_id=model_id,
+                    exclude_mode=mode,
+                    exclude_worker_types={WorkerType.REGULAR},
+                )
+            else:
+                logger.info(
+                    "Need %d GPUs for %d workers, only %d available. "
+                    "Skipping (eviction not allowed).",
+                    required_gpus,
+                    num_workers,
+                    len(available),
+                )
+                return []
+
+        # Build allocation specs for all workers
+        allocation_specs = {}
+        for i in range(num_workers):
+            key = f"{model_id}:{mode.value}:{i}"
+            allocation_specs[key] = {
+                "model": spec["model"],
+                "memory_gb": spec.get("memory_gb", 16),
+                "tp": tp,
+            }
+
+        # Allocate GPU slots
+        slots = self.allocator.allocate_slots(allocation_specs)
+        slot_map = {slot.assigned_model: slot for slot in slots}
+
+        if not slots:
+            raise RuntimeError(
+                f"Failed to allocate GPU slots for {num_workers} workers after eviction. "
+                f"Need {required_gpus} GPUs."
+            )
+
+        instances: list[ModelInstance] = []
+
+        # Launch workers
+        for i in range(num_workers):
+            key = f"{model_id}:{mode.value}:{i}"
+            gpu_slot = slot_map.get(key)
+            instance = self._launch_model(
+                model_id=model_id,
+                mode=mode,
+                gpu_slot=gpu_slot,
+                worker_type=WorkerType.REGULAR,
+                instance_key=key,
+            )
+            instances.append(instance)
+
+        # Wait for all to be healthy
+        self._wait_all_healthy()
+
+        return instances
+
     def launch_pd_workers(
         self,
         model_id: str,
@@ -728,7 +856,13 @@ class ModelPool:
                     required_gpus,
                     len(available),
                 )
-                self._evict_for_gpus(required_gpus, exclude_model_id=model_id)
+                # Exclude PD workers of same model/mode, but evict REGULAR workers
+                self._evict_for_gpus(
+                    required_gpus,
+                    exclude_model_id=model_id,
+                    exclude_mode=mode,
+                    exclude_worker_types={WorkerType.PREFILL, WorkerType.DECODE},
+                )
             else:
                 logger.info(
                     "Need %d GPUs for PD workers, only %d available. "
@@ -781,6 +915,7 @@ class ModelPool:
                 worker_type=WorkerType.PREFILL,
                 bootstrap_port=bootstrap_port,
                 ib_device=ib_device,
+                instance_key=key,
             )
             prefill_instances.append(instance)
 
@@ -794,6 +929,7 @@ class ModelPool:
                 gpu_slot=gpu_slot,
                 worker_type=WorkerType.DECODE,
                 ib_device=ib_device,
+                instance_key=key,
             )
             decode_instances.append(instance)
 
