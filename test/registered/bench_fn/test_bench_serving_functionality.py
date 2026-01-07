@@ -130,8 +130,6 @@ class TestBenchServingCustomHeaders(CustomTestCase):
 
             do_GET = do_POST = _handle
 
-            def log_message(self, format, *args):
-                pass
 
         server = HTTPServer(("127.0.0.1", 0), HeaderEchoHandler)
         port = server.server_address[1]
