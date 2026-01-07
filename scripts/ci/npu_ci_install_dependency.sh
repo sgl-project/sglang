@@ -7,6 +7,7 @@ DEVICE_TYPE=$1
 
 # Install the required dependencies in CI.
 apt update -y && apt install -y \
+    unzip \
     build-essential \
     cmake \
     wget \
@@ -49,7 +50,7 @@ wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./
 
 
 ### Install sgl-kernel-npu
-SGL_KERNEL_NPU_TAG="2025.12.29"
+SGL_KERNEL_NPU_TAG="2026.01.07"
 mkdir sgl-kernel-npu
 (cd sgl-kernel-npu && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_8.3.rc2_910b.zip \
 && unzip sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_8.3.rc2_910b.zip \
