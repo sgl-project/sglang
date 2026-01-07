@@ -429,6 +429,8 @@ class ForwardBatch:
     attention_token_info: Optional["AttentionTokenInfo"] = None
     # Layer IDs to capture attention from (empty = use attention_capture_layer_ids from init)
     attention_capture_layer_ids: Optional[List[int]] = None
+    # Head IDs to average over when computing top-k (None = all heads)
+    attention_capture_head_ids: Optional[List[int]] = None
     # Fingerprint mode: compute in-kernel histogram instead of raw indices
     # Production mode - 64 bytes vs ~200KB per step
     attention_fingerprint_mode: bool = False
@@ -710,6 +712,9 @@ class ForwardBatch:
                     layer_ids = [num_layers - 1]
 
             ret.attention_capture_layer_ids = layer_ids
+
+            # Get head selection filter if specified
+            ret.attention_capture_head_ids = batch.attention_capture_head_ids
 
         # Init attention biases for steering (semantic routing loop)
         if batch.attention_biases is not None:

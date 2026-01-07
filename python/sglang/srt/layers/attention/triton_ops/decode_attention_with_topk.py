@@ -141,6 +141,7 @@ def compute_topk_attention_chunked(
     chunk_size: int = 1024,
     window: int = 0,
     exact_logsumexp: bool = True,  # Compute exact logsumexp over ALL tokens
+    head_ids: Optional[List[int]] = None,  # Only average over these heads (None = all)
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute top-k attention positions using chunked approach.
@@ -303,6 +304,7 @@ def compute_topk_attention_chunked(
         q, k_buffer, kv_indptr, kv_indices,
         sm_scale, topk_chunk_idx, chunk_size, top_k,
         exact_logsumexp=exact_logsumexp,
+        head_ids=head_ids,
     )
 
 
@@ -406,6 +408,7 @@ def _rescan_top_chunks(
     chunk_size: int,
     top_k: int,
     exact_logsumexp: bool = True,  # New parameter to control exact vs approximate
+    head_ids: Optional[List[int]] = None,  # Only average over these heads (None = all)
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Rescan the top chunks to find exact token positions.
@@ -492,8 +495,16 @@ def _rescan_top_chunks(
             # Attention scores: [num_heads, chunk_len]
             scores = torch.einsum("hd,shd->hs", query.float(), keys.float()) * sm_scale
 
-            # Average across heads
-            scores_avg = scores.mean(dim=0)  # [chunk_len]
+            # Average across heads (filter by head_ids if specified)
+            if head_ids is not None and len(head_ids) > 0:
+                # Only average over specified heads
+                valid_head_ids = [h for h in head_ids if 0 <= h < scores.shape[0]]
+                if len(valid_head_ids) > 0:
+                    scores_avg = scores[valid_head_ids].mean(dim=0)  # [chunk_len]
+                else:
+                    scores_avg = scores.mean(dim=0)  # Fallback to all heads
+            else:
+                scores_avg = scores.mean(dim=0)  # [chunk_len]
 
             all_scores.append(scores_avg)
             all_positions.append(positions)

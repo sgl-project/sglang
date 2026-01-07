@@ -126,6 +126,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             attention_fingerprint_mode=request.attention_fingerprint_mode,
             attention_mask_prefix=request.attention_mask_prefix,
             include_prompt_attention=request.include_prompt_attention,
+            attention_capture_head_ids=request.attention_capture_head_ids,
             attention_biases=self._convert_attention_biases(request.attention_biases),
             return_moe_routing=request.return_moe_routing,
             moe_routing_top_k=request.moe_routing_top_k,

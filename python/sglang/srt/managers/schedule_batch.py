@@ -720,6 +720,7 @@ class Req:
         attention_fingerprint_mode: Optional[bool] = None,
         attention_mask_prefix: Optional[int] = None,
         include_prompt_attention: bool = True,
+        attention_capture_head_ids: Optional[List[int]] = None,
         return_moe_routing: bool = False,
         moe_routing_top_k: int = 2,
         moe_capture_layer_ids: Optional[List[int]] = None,
@@ -796,6 +797,7 @@ class Req:
         self.attention_fingerprint_mode: Optional[bool] = attention_fingerprint_mode
         self.attention_mask_prefix: Optional[int] = attention_mask_prefix  # Privacy: mask first N tokens
         self.include_prompt_attention: bool = include_prompt_attention  # Capture first decode step regardless of stride
+        self.attention_capture_head_ids: Optional[List[int]] = attention_capture_head_ids  # Only average over these heads
         self.attention_fingerprint_max_steps: Optional[int] = None
         self.attention_stride: Optional[int] = None  # Override stride for this request
         self.attention_max_tokens: Optional[int] = None  # Override max tokens for this request
@@ -2437,6 +2439,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         capture_attention_tokens = False
         attention_top_k = 5
         capture_layers: Optional[List[int]] = None  # Normalized layer selection
+        capture_head_ids: Optional[List[int]] = None  # Head selection filter
 
         # Default stride/max from batch settings
         default_stride = self.attention_tokens_stride
@@ -2526,6 +2529,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Normalize to List[int] | None internally (layer_ids takes precedence)
             if capture_layers is None:
                 capture_layers = self._resolve_capture_layers(req)
+
+            # Get head filter from first request that specifies one
+            if capture_head_ids is None:
+                req_head_ids = getattr(req, "attention_capture_head_ids", None)
+                if req_head_ids is not None:
+                    capture_head_ids = list(req_head_ids)
 
         # Collect attention biases from semantic_memory (for steering)
         # Format: Dict[layer_id -> List[Dict[token_pos -> bias]]]
@@ -2622,6 +2631,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             capture_attention_tokens=capture_attention_tokens,
             attention_top_k=attention_top_k,
             attention_capture_layer_id=capture_layers,  # Pass normalized List[int] | None
+            attention_capture_head_ids=capture_head_ids,  # Head selection filter
             attention_biases=attention_biases,  # Steering biases from semantic_memory
             capture_moe_routing=capture_moe_routing,
             moe_routing_top_k=moe_routing_top_k,
@@ -2766,6 +2776,7 @@ class ModelWorkerBatch:
     capture_attention_tokens: bool = False
     attention_top_k: int = 5
     attention_capture_layer_id: Optional[Union[int, List[int]]] = None  # Per-request layer override (single int or list)
+    attention_capture_head_ids: Optional[List[int]] = None  # Only average over these heads (None = all)
 
     # For attention steering (semantic routing loop)
     # Dict[layer_id -> List[Dict[token_pos -> bias_value]]] (one dict per request in batch)

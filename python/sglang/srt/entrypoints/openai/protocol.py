@@ -281,6 +281,7 @@ class CompletionRequest(BaseModel):
     attention_fingerprint_mode: Optional[bool] = None  # Override server fingerprint mode (None = use server default)
     attention_mask_prefix: Optional[int] = None  # Mask attention to first N tokens (privacy: hide system prompt structure)
     include_prompt_attention: bool = True  # Capture first decode step (prompt attention) regardless of stride
+    attention_capture_head_ids: Optional[List[int]] = None  # Only average over these heads (None = all heads)
 
     # For attention steering (semantic routing loop)
     # Format: {"layer_id": {"token_pos": bias_value, ...}, ...}
@@ -292,6 +293,12 @@ class CompletionRequest(BaseModel):
     return_moe_routing: bool = False
     moe_routing_top_k: int = 2  # How many top experts to capture per token
     moe_capture_layer_ids: Optional[List[int]] = None  # Which layers to capture (None = all MoE layers)
+
+    # For logit lens (interpretability) - project intermediate layers to vocab
+    # Shows how token predictions evolve through the model
+    return_logit_lens: bool = False  # Enable logit lens capture (experimental)
+    logit_lens_top_k: int = 5  # Number of top token candidates per layer
+    logit_lens_layer_ids: Optional[List[int]] = None  # Which layers to probe (None = auto-select ~4 layers)
 
     @field_validator("max_tokens")
     @classmethod
@@ -529,6 +536,7 @@ class ChatCompletionRequest(BaseModel):
     attention_fingerprint_mode: Optional[bool] = None  # Override server fingerprint mode (None = use server default)
     attention_mask_prefix: Optional[int] = None  # Mask attention to first N tokens (privacy: hide system prompt structure)
     include_prompt_attention: bool = True  # Capture first decode step (prompt attention) regardless of stride
+    attention_capture_head_ids: Optional[List[int]] = None  # Only average over these heads (None = all heads)
 
     # For attention steering (semantic routing loop)
     # Format: {"layer_id": {"token_pos": bias_value, ...}, ...}
@@ -540,6 +548,12 @@ class ChatCompletionRequest(BaseModel):
     return_moe_routing: bool = False
     moe_routing_top_k: int = 2  # How many top experts to capture per token
     moe_capture_layer_ids: Optional[List[int]] = None  # Which layers to capture (None = all MoE layers)
+
+    # For logit lens (interpretability) - project intermediate layers to vocab
+    # Shows how token predictions evolve through the model
+    return_logit_lens: bool = False  # Enable logit lens capture (experimental)
+    logit_lens_top_k: int = 5  # Number of top token candidates per layer
+    logit_lens_layer_ids: Optional[List[int]] = None  # Which layers to probe (None = auto-select ~4 layers)
 
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",

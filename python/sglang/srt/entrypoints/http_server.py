@@ -1390,8 +1390,13 @@ async def attention_capabilities():
                 "mask_system_prompt": server_args.attention_mask_system_prompt,
                 "mask_prefix": server_args.attention_mask_prefix,
             },
-            "head_selection": False,  # Not yet implemented
+            "head_selection": True,  # Filter which heads to average (attention_capture_head_ids param)
             "attention_steering": True,  # attention_biases parameter
+            "logit_lens": {
+                "enabled": False,  # Experimental - API defined but not yet fully implemented
+                "description": "Project intermediate layer outputs to vocabulary space",
+                "status": "planned",  # Will show token prediction evolution through layers
+            },
         },
         "guardrails": {
             "api_key_required": server_args.attention_capture_api_key is not None,
