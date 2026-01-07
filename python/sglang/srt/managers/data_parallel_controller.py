@@ -99,6 +99,8 @@ class DPBudget:
         """Update the budget queue."""
         # Update budget queue together for load updating from the same round.
         for load in load_update.loads:
+            if load is None:
+                continue
             if abs(load.ts_tic - self.ts_tic) > self.tic_window:
                 logger.debug(f"Proceed to next round: {self.ts_tic=} {load.ts_tic=}")
                 self.pending_loads.clear()
