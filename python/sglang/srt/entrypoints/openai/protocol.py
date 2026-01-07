@@ -280,6 +280,7 @@ class CompletionRequest(BaseModel):
     attention_sketch_mode: bool = False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
     attention_fingerprint_mode: Optional[bool] = None  # Override server fingerprint mode (None = use server default)
     attention_mask_prefix: Optional[int] = None  # Mask attention to first N tokens (privacy: hide system prompt structure)
+    include_prompt_attention: bool = True  # Capture first decode step (prompt attention) regardless of stride
 
     # For attention steering (semantic routing loop)
     # Format: {"layer_id": {"token_pos": bias_value, ...}, ...}
@@ -527,6 +528,7 @@ class ChatCompletionRequest(BaseModel):
     attention_sketch_mode: bool = False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
     attention_fingerprint_mode: Optional[bool] = None  # Override server fingerprint mode (None = use server default)
     attention_mask_prefix: Optional[int] = None  # Mask attention to first N tokens (privacy: hide system prompt structure)
+    include_prompt_attention: bool = True  # Capture first decode step (prompt attention) regardless of stride
 
     # For attention steering (semantic routing loop)
     # Format: {"layer_id": {"token_pos": bias_value, ...}, ...}

@@ -719,6 +719,7 @@ class Req:
         attention_sketch_mode: bool = False,
         attention_fingerprint_mode: Optional[bool] = None,
         attention_mask_prefix: Optional[int] = None,
+        include_prompt_attention: bool = True,
         return_moe_routing: bool = False,
         moe_routing_top_k: int = 2,
         moe_capture_layer_ids: Optional[List[int]] = None,
@@ -794,6 +795,7 @@ class Req:
         # These can be set via API or overridden by sidecar feedback
         self.attention_fingerprint_mode: Optional[bool] = attention_fingerprint_mode
         self.attention_mask_prefix: Optional[int] = attention_mask_prefix  # Privacy: mask first N tokens
+        self.include_prompt_attention: bool = include_prompt_attention  # Capture first decode step regardless of stride
         self.attention_fingerprint_max_steps: Optional[int] = None
         self.attention_stride: Optional[int] = None  # Override stride for this request
         self.attention_max_tokens: Optional[int] = None  # Override max tokens for this request
@@ -2495,7 +2497,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             next_step = req.attention_tokens_decode_step + 1
 
             # Apply stride: only capture every Nth step
-            if stride > 1 and (next_step % stride != 0):
+            # Exception: always capture step 1 if include_prompt_attention is True
+            # (step 1 shows what in the prompt the model attends to for first token)
+            is_prompt_step = next_step == 1 and req.include_prompt_attention
+            if stride > 1 and (next_step % stride != 0) and not is_prompt_step:
                 continue
 
             # Apply max: stop if we've hit the cap

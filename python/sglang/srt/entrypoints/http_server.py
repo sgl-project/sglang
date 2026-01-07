@@ -1338,6 +1338,75 @@ async def retrieve_model(model: str):
     )
 
 
+@app.get("/v1/attention/capabilities", response_class=ORJSONResponse)
+async def attention_capabilities():
+    """
+    Returns attention capture capabilities and configuration.
+
+    Useful for clients to discover available modes, limits, and features
+    before making requests with attention capture enabled.
+    """
+    server_args = _global_state.tokenizer_manager.server_args
+    model_config = _global_state.tokenizer_manager.model_config
+
+    return {
+        "enabled": server_args.return_attention_tokens,
+        "modes": {
+            "raw": {
+                "available": True,
+                "description": "Full top-k attention positions and scores per token",
+                "bytes_per_token": "~200-500 (depends on layers)",
+            },
+            "sketch": {
+                "available": True,
+                "enabled_by_default": server_args.attention_sketch_mode,
+                "description": "Per-layer sketches with histograms and entropy",
+                "bytes_per_token": "~500 per layer",
+            },
+            "fingerprint": {
+                "available": True,
+                "enabled_by_default": server_args.attention_fingerprint_mode,
+                "description": "64-byte GPU-aggregated fingerprint for clustering",
+                "bytes_per_token": 64,
+            },
+        },
+        "limits": {
+            "max_top_k": 64,  # Reasonable upper bound
+            "default_top_k": server_args.attention_tokens_top_k,
+            "max_tokens": server_args.attention_tokens_max,
+            "stride": server_args.attention_tokens_stride,
+            "chunk_size": server_args.attention_chunk_size,
+            "fingerprint_max_steps": server_args.attention_fingerprint_max_steps,
+        },
+        "layers": {
+            "total": model_config.num_hidden_layers,
+            "capture_mode": server_args.attention_capture_layers,
+            "capture_layer_id": server_args.attention_capture_layer_id,
+        },
+        "features": {
+            "include_prompt_attention": True,
+            "privacy_mask": {
+                "enabled": server_args.attention_mask_prefix > 0 or server_args.attention_mask_system_prompt,
+                "mask_system_prompt": server_args.attention_mask_system_prompt,
+                "mask_prefix": server_args.attention_mask_prefix,
+            },
+            "head_selection": False,  # Not yet implemented
+            "attention_steering": True,  # attention_biases parameter
+        },
+        "guardrails": {
+            "api_key_required": server_args.attention_capture_api_key is not None,
+            "allowed_origins": server_args.attention_capture_allowed_origins.split(",") if server_args.attention_capture_allowed_origins else None,
+            "max_concurrent": server_args.attention_capture_max_concurrent,
+            "disabled_in_production": server_args.attention_capture_disable_in_production,
+        },
+        "model": {
+            "name": _global_state.tokenizer_manager.served_model_name,
+            "context_length": model_config.context_len,
+            "num_heads": getattr(model_config, 'num_attention_heads', None),
+        },
+    }
+
+
 @app.post("/v1/score", dependencies=[Depends(validate_json_request)])
 async def v1_score_request(request: ScoringRequest, raw_request: Request):
     """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""

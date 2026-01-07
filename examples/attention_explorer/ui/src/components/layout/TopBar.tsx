@@ -1,5 +1,6 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { useUIStore } from '../../stores/useUIStore';
+import { useTraceStore } from '../../stores/useTraceStore';
 import { View, Program } from '../../api/types';
 import { OverheadHUD } from './OverheadHUD';
 
@@ -24,8 +25,35 @@ export function TopBar() {
   const setView = useUIStore((state) => state.setView);
   const setProgram = useUIStore((state) => state.setProgram);
 
+  const currentTrace = useTraceStore((state) => state.currentTrace);
+  const exportTraceAsJSONL = useTraceStore((state) => state.exportTraceAsJSONL);
+  const importTraceFromJSONL = useTraceStore((state) => state.importTraceFromJSONL);
+
   const [programChanging, setProgramChanging] = useState(false);
   const [viewChanging, setViewChanging] = useState<View | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleImportClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const content = await file.text();
+      importTraceFromJSONL(content);
+    } catch (error) {
+      console.error('Failed to import trace:', error);
+      alert('Failed to import trace. Please check the file format.');
+    }
+
+    // Reset input so same file can be imported again
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
 
   // Show feedback when program changes
   const handleProgramChange = (newProgram: Program) => {
@@ -73,6 +101,47 @@ export function TopBar() {
       </div>
 
       <div className="right">
+        {/* Export/Import buttons */}
+        <div style={{ display: 'flex', gap: '4px', marginRight: '8px' }}>
+          <button
+            onClick={exportTraceAsJSONL}
+            disabled={!currentTrace}
+            title="Export trace as JSONL"
+            style={{
+              padding: '4px 8px',
+              fontSize: '11px',
+              background: currentTrace ? 'rgba(122, 162, 255, 0.2)' : 'rgba(100, 100, 100, 0.2)',
+              border: '1px solid rgba(255, 255, 255, 0.1)',
+              borderRadius: '4px',
+              color: currentTrace ? '#7aa2ff' : '#666',
+              cursor: currentTrace ? 'pointer' : 'not-allowed',
+            }}
+          >
+            Export
+          </button>
+          <button
+            onClick={handleImportClick}
+            title="Import trace from JSONL"
+            style={{
+              padding: '4px 8px',
+              fontSize: '11px',
+              background: 'rgba(85, 214, 166, 0.2)',
+              border: '1px solid rgba(255, 255, 255, 0.1)',
+              borderRadius: '4px',
+              color: '#55d6a6',
+              cursor: 'pointer',
+            }}
+          >
+            Import
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".jsonl,.ndjson"
+            onChange={handleFileChange}
+            style={{ display: 'none' }}
+          />
+        </div>
         <OverheadHUD />
         <div className={`pill ${isConnected ? 'connected-pill' : 'disconnected-pill'}`}>
           <span className={`dot ${isConnected ? 'connected' : ''}`} style={{

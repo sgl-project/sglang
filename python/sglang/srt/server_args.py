@@ -639,6 +639,13 @@ class ServerArgs:
     moe_routing_stride: int = 1  # Capture every Nth token (1 = all, 8 = every 8th)
     moe_routing_max_bytes: int = 0  # Hard limit on routing buffer size in bytes (0 = unlimited)
 
+    # Multi-tenant guardrails for attention capture
+    # Restricts who can use attention capture in shared/production environments
+    attention_capture_api_key: Optional[str] = None  # If set, only requests with this key can use attention capture
+    attention_capture_allowed_origins: Optional[str] = None  # Comma-separated origins allowed for attention capture (CORS)
+    attention_capture_max_concurrent: int = 0  # Max concurrent requests with attention capture (0 = unlimited)
+    attention_capture_disable_in_production: bool = False  # Auto-disable if server_args indicate production mode
+
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
@@ -4579,6 +4586,35 @@ class ServerArgs:
             type=int,
             default=ServerArgs.moe_routing_max_bytes,
             help="Maximum bytes for MoE routing data per request. 0 = unlimited. (default: 0)",
+        )
+
+        # Multi-tenant guardrails for attention capture
+        parser.add_argument(
+            "--attention-capture-api-key",
+            type=str,
+            default=ServerArgs.attention_capture_api_key,
+            help="If set, only requests with this API key in X-Attention-Key header can use attention capture. "
+                 "Useful for restricting attention capture in shared environments.",
+        )
+        parser.add_argument(
+            "--attention-capture-allowed-origins",
+            type=str,
+            default=ServerArgs.attention_capture_allowed_origins,
+            help="Comma-separated list of origins allowed to use attention capture. "
+                 "Example: 'http://localhost:3000,https://dashboard.example.com'",
+        )
+        parser.add_argument(
+            "--attention-capture-max-concurrent",
+            type=int,
+            default=ServerArgs.attention_capture_max_concurrent,
+            help="Maximum concurrent requests with attention capture enabled. 0 = unlimited. (default: 0)",
+        )
+        parser.add_argument(
+            "--attention-capture-disable-in-production",
+            action="store_true",
+            default=ServerArgs.attention_capture_disable_in_production,
+            help="Auto-disable attention capture when running in production mode "
+                 "(detected via SGLANG_PRODUCTION env var or explicit flag).",
         )
 
         # PD disaggregation

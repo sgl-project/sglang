@@ -40,6 +40,10 @@ interface TraceState {
   loadTrace: (traceId: string) => void;
   deleteTrace: (traceId: string) => void;
 
+  // Export/Import
+  exportTraceAsJSONL: () => void;
+  importTraceFromJSONL: (jsonlContent: string) => void;
+
   // Getters (computed from current trace)
   getTokenAt: (index: number) => TokenEntry | null;
   getStepAt: (index: number) => DecodeStep | null;
@@ -286,6 +290,140 @@ export const useTraceStore = create<TraceState>((set, get) => ({
     set((state) => ({
       savedTraces: state.savedTraces.filter((t) => t.id !== traceId),
     }));
+  },
+
+  exportTraceAsJSONL: () => {
+    const trace = get().currentTrace;
+    if (!trace) return;
+
+    // Build JSONL content with one JSON object per line
+    // Using record_type to avoid conflicts with existing 'type' fields in data
+    const lines: string[] = [];
+
+    // Header with metadata
+    lines.push(JSON.stringify({
+      record_type: 'header',
+      version: '1.0',
+      trace_id: trace.id,
+      model: trace.model,
+      created_at: trace.createdAt,
+      updated_at: trace.updatedAt,
+    }));
+
+    // Messages
+    for (const msg of trace.messages) {
+      lines.push(JSON.stringify({
+        record_type: 'message',
+        ...msg,
+      }));
+    }
+
+    // Tokens
+    for (const token of trace.tokens) {
+      lines.push(JSON.stringify({
+        record_type: 'token',
+        ...token,
+      }));
+    }
+
+    // Decode steps (attention + MoE data)
+    for (const step of trace.steps) {
+      lines.push(JSON.stringify({
+        record_type: 'step',
+        ...step,
+      }));
+    }
+
+    // Segments
+    for (const segment of trace.segments) {
+      lines.push(JSON.stringify({
+        record_type: 'segment',
+        ...segment,
+      }));
+    }
+
+    // Metrics
+    if (trace.metrics) {
+      lines.push(JSON.stringify({
+        record_type: 'metrics',
+        ...trace.metrics,
+      }));
+    }
+
+    // Download as file
+    const content = lines.join('\n');
+    const blob = new Blob([content], { type: 'application/x-ndjson' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `trace-${trace.id}-${new Date().toISOString().slice(0, 10)}.jsonl`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
+
+  importTraceFromJSONL: (jsonlContent) => {
+    try {
+      const lines = jsonlContent.trim().split('\n').filter(l => l.trim());
+
+      let header: any = null;
+      const messages: Message[] = [];
+      const tokens: TokenEntry[] = [];
+      const steps: DecodeStep[] = [];
+      const segments: Segment[] = [];
+      let metrics: any = null;
+
+      for (const line of lines) {
+        const obj = JSON.parse(line);
+        const { record_type, ...data } = obj;
+
+        switch (record_type) {
+          case 'header':
+            header = data;
+            break;
+          case 'message':
+            messages.push(data as Message);
+            break;
+          case 'token':
+            tokens.push(data as TokenEntry);
+            break;
+          case 'step':
+            steps.push(data as DecodeStep);
+            break;
+          case 'segment':
+            segments.push(data as Segment);
+            break;
+          case 'metrics':
+            metrics = data;
+            break;
+        }
+      }
+
+      if (!header) {
+        throw new Error('Invalid JSONL: missing header');
+      }
+
+      // Reconstruct trace
+      const trace: TraceSession = {
+        id: header.trace_id || `imported-${Date.now()}`,
+        model: header.model || 'Unknown',
+        createdAt: header.created_at || Date.now(),
+        updatedAt: header.updated_at || Date.now(),
+        messages,
+        tokens,
+        segments,
+        steps,
+        metrics,
+        isStreaming: false,
+        streamingTokenIndex: -1,
+      };
+
+      set({ currentTrace: trace });
+    } catch (error) {
+      console.error('Failed to import trace:', error);
+      throw error;
+    }
   },
 
   // Getters
