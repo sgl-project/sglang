@@ -540,8 +540,12 @@ class Req:
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
-        # The length of KV that have been removed in local attention chunked prefill
+        # The length of KV that have been removed in swa chunk cache
         self.evicted_seqlen_local = 0
+
+        # The index of the extend / decode batch
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
@@ -1470,6 +1474,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
 
+            req.extend_batch_idx += 1
+
             # update req-level memory management fields
             req.kv_committed_len = seq_len
             req.kv_allocated_len = seq_len
@@ -1568,6 +1574,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mm_item.feature = pixel_values.reconstruct_on_target_device(
                         torch.cuda.current_device()
                     )
+                    # The reference by CudaIpcTensorTransportProxy was cut off,
+                    # proactively delete to avoid slow gc.
+                    del pixel_values
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
@@ -1898,6 +1907,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Update req-level memory management fields
         for req in self.reqs:
+            req.decode_batch_idx += 1
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
