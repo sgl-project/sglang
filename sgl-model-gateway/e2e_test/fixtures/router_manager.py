@@ -1,3 +1,9 @@
+"""Legacy router manager for integration tests.
+
+DEPRECATED: This module will be removed during e2e_response_api migration.
+Use infra.Gateway instead for all router management.
+"""
+
 import subprocess
 import time
 from dataclasses import dataclass
