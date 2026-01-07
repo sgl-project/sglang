@@ -308,7 +308,6 @@ class ServerArgs:
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
-    hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
@@ -1067,7 +1066,7 @@ class ServerArgs:
             if is_deepseek_nsa(hf_config):  # DeepSeek 3.2
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
-                    logger.info("Use nsa attention backend for DeepSeek NSA.")
+                    logger.info("Use nsa attention backend for DeepSeek with DSA.")
 
                 if not is_npu():  # CUDA GPU
                     if self.enable_nsa_prefill_context_parallel:
@@ -1101,12 +1100,12 @@ class ServerArgs:
                         # Pure TP and partial DP Attention mode is active for NSA, logging a warning
                         if self.dp_size < self.tp_size:
                             logger.warning(
-                                f"NSA with TP mode is active, dp_size={self.dp_size}, tp_size={self.tp_size}, "
+                                f"DSA with TP mode is active, dp_size={self.dp_size}, tp_size={self.tp_size}, "
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
                     self.page_size = 64
-                    logger.warning("Setting page size to 64 for DeepSeek NSA.")
+                    logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     # For Hopper, we support both bf16 and fp8 kv cache; for Blackwell, we support fp8 only currently
                     import torch
@@ -1115,34 +1114,29 @@ class ServerArgs:
                     if self.kv_cache_dtype == "auto":
                         self.kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
                         logger.warning(
-                            f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek NSA."
+                            f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
                         )
                     if self.kv_cache_dtype == "bf16":
                         self.kv_cache_dtype = "bfloat16"
                     assert self.kv_cache_dtype in [
                         "bfloat16",
                         "fp8_e4m3",
-                    ], "DeepSeek NSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+                    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
                     if self.kv_cache_dtype == "fp8_e4m3":
                         # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
                         self.nsa_prefill_backend = "flashmla_auto"
                         self.nsa_decode_backend = "flashmla_kv"
                         logger.warning(
-                            "Setting NSA backend to flashmla_auto for prefill and flashmla_kv for decode for FP8 KV Cache."
+                            "Setting DSA backend to flashmla_auto for prefill and flashmla_kv for decode for FP8 KV Cache."
                         )
                     else:
-                        # set prefill/decode backends for Blackwell. The default settings are for Hopper.
+                        # set prefill/decode backends to flashmla_sparse for Blackwell.
+                        # The default settings (P=flashmla_sparse, D=fa3) are for Hopper.
                         if major >= 10:
                             self.nsa_prefill_backend = "flashmla_sparse"
                             self.nsa_decode_backend = "flashmla_sparse"
 
-                    # Logging env vars for NSA
-                    from sglang.srt.layers.attention.nsa.utils import (
-                        print_nsa_bool_env_vars,
-                    )
-
-                    print_nsa_bool_env_vars()
                 if self.enable_nsa_prefill_context_parallel:
                     assert (
                         self.disaggregation_mode != "decode"
@@ -1477,8 +1471,10 @@ class ServerArgs:
                         self.mamba_track_interval % self.page_size == 0
                     ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
                     assert (
-                        FLA_CHUNK_SIZE % self.page_size == 0
-                    ), f"Page size for hybrid GDN model must be divisible by {FLA_CHUNK_SIZE}, got {self.page_size}"
+                        max(FLA_CHUNK_SIZE, self.page_size)
+                        % min(FLA_CHUNK_SIZE, self.page_size)
+                        == 0
+                    ), f"max(FLA_CHUNK_SIZE, self.page_size) % min(FLA_CHUNK_SIZE, self.page_size) should be 0, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
 
             elif not self.disable_radix_cache:
                 logger.warning(
@@ -2849,15 +2845,8 @@ class ServerArgs:
         )
         parser.add_argument(
             "--hybrid-kvcache-ratio",
-            nargs="?",
-            const=0.5,
-            type=float,
-            default=ServerArgs.hybrid_kvcache_ratio,
-            help=(
-                "Mix ratio in [0,1] between uniform and hybrid kv buffers "
-                "(0.0 = pure uniform: swa_size / full_size = 1)"
-                "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
-            ),
+            action=DeprecatedAction,
+            help="Note: --hybrid-kvcache-ratio is deprecated now. Please use --swa-full-tokens-ratio instead.",
         )
         parser.add_argument(
             "--swa-full-tokens-ratio",
