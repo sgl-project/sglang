@@ -341,19 +341,20 @@ def compute_local_shared_expert(
     hidden_states: Tensor,
     local_shared_mask: Tensor,
     shared_expert_fn,
-    shared_weight: float,
 ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
     """
     Compute shared expert locally for tokens marked as local.
+    
+    Local shared expert output is NOT weighted by 1/rsf because it will be
+    added AFTER the routed_scaling_factor multiplication.
     
     Args:
         hidden_states: [N, H] input hidden states
         local_shared_mask: [N] boolean mask for local shared expert tokens
         shared_expert_fn: function to compute shared expert
-        shared_weight: weight for shared expert output
         
     Returns:
-        local_shared_output: [num_local, H] weighted output (or None if no local tokens)
+        local_shared_output: [num_local, H] output (or None if no local tokens)
         local_indices: [num_local] indices of local tokens (or None)
     """
     if not local_shared_mask.any():
@@ -363,7 +364,5 @@ def compute_local_shared_expert(
     local_hidden = hidden_states[local_indices]
     local_output = shared_expert_fn(local_hidden)
     
-    # Apply shared weight
-    local_output_weighted = local_output * shared_weight
-    
-    return local_output_weighted, local_indices
+    # NO weight applied here - local shared is added after rsf multiplication
+    return local_output, local_indices

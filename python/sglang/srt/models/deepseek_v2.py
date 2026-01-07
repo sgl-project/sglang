@@ -1267,22 +1267,22 @@ class DeepseekV2MoE(nn.Module):
         if local_shared_mask.any() and self.alt_stream is not None:
             self.alt_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.alt_stream):
+                # Local shared expert: no weight applied here, will be added after rsf
                 local_shared_output, local_shared_indices = compute_local_shared_expert(
                     hidden_states,
                     local_shared_mask,
                     self._forward_shared_experts,
-                    self.deepep_waterfill_balancer.shared_weight,
                 )
                 if local_shared_output is not None:
                     local_shared_output.record_stream(self.alt_stream)
                 local_shared_event = self.alt_stream.record_event()
         elif local_shared_mask.any():
             # No alt_stream, compute synchronously
+            # Local shared expert: no weight applied here, will be added after rsf
             local_shared_output, local_shared_indices = compute_local_shared_expert(
                 hidden_states,
                 local_shared_mask,
                 self._forward_shared_experts,
-                self.deepep_waterfill_balancer.shared_weight,
             )
 
         # Create expanded TopKOutput for dispatch
@@ -1348,10 +1348,13 @@ class DeepseekV2MoE(nn.Module):
         routed_output = combine_input.hidden_states
 
         # Compute shared expert for remote tokens and add to output
+        # Remote shared uses weight = 1/rsf because it's added BEFORE combine,
+        # and the final rsf multiplication will cancel it out:
+        # remote_shared * (1/rsf) * rsf = remote_shared
         if remote_shared_indices.numel() > 0:
             remote_shared_hidden = recv_hidden[remote_shared_indices]
             remote_shared_expert_output = self._forward_shared_experts(remote_shared_hidden)
-            # Get shared expert weights (9th column)
+            # Get shared expert weights (9th column) = 1/rsf
             remote_shared_weights = recv_topk_weights[remote_shared_indices, -1].unsqueeze(-1)
             # Add weighted shared expert output to routed output
             routed_output.index_add_(
@@ -1375,21 +1378,23 @@ class DeepseekV2MoE(nn.Module):
             )
         combined_hidden_states = dispatcher.combine(final_combine_input)
 
-        # Step 9: Wait for local shared expert and add to result
+        # Step 9: Apply routed scaling factor FIRST (only affects routed experts)
+        # This must happen BEFORE adding shared expert output
+        if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+            combined_hidden_states *= self.routed_scaling_factor
+
+        # Step 10: Wait for local shared expert and add to result (NOT scaled by rsf)
         if local_shared_event is not None:
             torch.cuda.current_stream().wait_event(local_shared_event)
         
         if local_shared_output is not None and local_shared_indices is not None:
             # Add local shared expert output at original token positions
+            # Note: local_shared_output is NOT multiplied by rsf
             combined_hidden_states.index_add_(
                 0,
                 local_shared_indices,
                 local_shared_output,
             )
-
-        # Step 10: Apply routed scaling factor
-        if not self.experts.should_fuse_routed_scaling_factor_in_topk:
-            combined_hidden_states *= self.routed_scaling_factor
 
         return combined_hidden_states
 
