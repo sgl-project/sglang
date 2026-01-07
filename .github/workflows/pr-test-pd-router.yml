@@ -20,6 +20,10 @@ concurrency:
   group: test-disaggregation-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
 permissions:
   contents: read
   pull-requests: write
@@ -27,11 +31,15 @@ permissions:
 
 jobs:
   test-disaggregation:
-    if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci') && contains(github.event.pull_request.labels.*.name, 'router-benchmark')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci' && contains(github.event.pull_request.labels.*.name, 'router-benchmark')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'router-benchmark' && contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    # TEMPORARILY DISABLED: 8-gpu-h200-oracle node is broken
+    # TODO: Re-enable when node is fixed
+    if: false
+    # Original condition:
+    # if: |
+    #   github.event_name != 'pull_request' ||
+    #   (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci') && contains(github.event.pull_request.labels.*.name, 'router-benchmark')) ||
+    #   (github.event.action == 'labeled' && github.event.label.name == 'run-ci' && contains(github.event.pull_request.labels.*.name, 'router-benchmark')) ||
+    #   (github.event.action == 'labeled' && github.event.label.name == 'router-benchmark' && contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: [8-gpu-h200-oracle]
     timeout-minutes: 45
 
@@ -50,18 +58,19 @@ jobs:
       run: |
         bash scripts/ci/ci_install_rust.sh
 
-    - name: Cache Rust dependencies
-      uses: actions/cache@v4
+    - name: Configure sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
       with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          sgl-model-gateway/target/
-        key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-model-gateway/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
+        version: "v0.12.0"
+
+    - name: Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: sgl-model-gateway
+        shared-key: "rust-cache"
+        cache-all-crates: true
+        cache-on-failure: true
+        save-if: true
 
     - name: Cache pip dependencies
       uses: actions/cache@v4
@@ -144,8 +153,8 @@ jobs:
         python3 -m pip --no-cache-dir install --upgrade pip
         python3 -m pip --no-cache-dir install torch==2.9.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu128
         python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
-        python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.7.post2
-        python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.2
+        python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.8
+        python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.3
 
     - name: Build and install sgl-model-gateway
       run: |
