@@ -21,7 +21,6 @@ import sys
 import time
 from collections import deque
 from concurrent import futures
-from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -1878,14 +1877,21 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        with (
-            PrefillDelayerSinglePassExecutor(self.prefill_delayer)
-            if self.prefill_delayer
-            else nullcontext()
-        ) as prefill_delayer_single_pass:
-            return self._get_new_batch_prefill_raw(
-                prefill_delayer_single_pass=prefill_delayer_single_pass
+        prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor.maybe_create(
+            self.prefill_delayer
+        )
+
+        ret = self._get_new_batch_prefill_raw(
+            prefill_delayer_single_pass=prefill_delayer_single_pass
+        )
+
+        if self.prefill_delayer:
+            # Typical scenarios: (1) non-prefillable (2) chunked prefill
+            prefill_delayer_single_pass.maybe_negotiate_should_allow_prefill(
+                local_prefillable=ret is not None
             )
+
+        return ret
 
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
