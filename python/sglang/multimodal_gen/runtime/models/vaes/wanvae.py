@@ -428,6 +428,88 @@ class WanUpsample(nn.Upsample):
         return super().forward(x.float()).type_as(x)
 
 
+def resample_forward(self, x):
+    b, c, t, h, w = x.size()
+    first_frame = is_first_frame.get()
+    if first_frame:
+        assert t == 1
+    _feat_cache = feat_cache.get()
+    _feat_idx = feat_idx.get()
+    if self.mode == "upsample3d":
+        if _feat_cache is not None:
+            idx = _feat_idx
+            if _feat_cache[idx] is None:
+                _feat_cache[idx] = "Rep"
+                _feat_idx += 1
+            else:
+                cache_x = x[:, :, -CACHE_T:, :, :].clone()
+                if (
+                    cache_x.shape[2] < 2
+                    and _feat_cache[idx] is not None
+                    and _feat_cache[idx] != "Rep"
+                ):
+                    # cache last frame of last two chunk
+                    cache_x = torch.cat(
+                        [
+                            _feat_cache[idx][:, :, -1, :, :]
+                            .unsqueeze(2)
+                            .to(cache_x.device),
+                            cache_x,
+                        ],
+                        dim=2,
+                    )
+                if (
+                    cache_x.shape[2] < 2
+                    and _feat_cache[idx] is not None
+                    and _feat_cache[idx] == "Rep"
+                ):
+                    cache_x = torch.cat(
+                        [torch.zeros_like(cache_x).to(cache_x.device), cache_x],
+                        dim=2,
+                    )
+                if _feat_cache[idx] == "Rep":
+                    x = self.time_conv(x)
+                else:
+                    x = self.time_conv(x, _feat_cache[idx])
+                _feat_cache[idx] = cache_x
+                _feat_idx += 1
+
+                x = x.reshape(b, 2, c, t, h, w)
+                x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
+                x = x.reshape(b, c, t * 2, h, w)
+            feat_cache.set(_feat_cache)
+            feat_idx.set(_feat_idx)
+        elif not first_frame and hasattr(self, "time_conv"):
+            x = self.time_conv(x)
+            x = x.reshape(b, 2, c, t, h, w)
+            x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
+            x = x.reshape(b, c, t * 2, h, w)
+    t = x.shape[2]
+    x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+    x = self.resample(x)
+    x = x.view(b, t, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
+
+    _feat_cache = feat_cache.get()
+    _feat_idx = feat_idx.get()
+    if self.mode == "downsample3d":
+        if _feat_cache is not None:
+            idx = _feat_idx
+            if _feat_cache[idx] is None:
+                _feat_cache[idx] = x.clone()
+                _feat_idx += 1
+            else:
+                cache_x = x[:, :, -1:, :, :].clone()
+                x = self.time_conv(
+                    torch.cat([_feat_cache[idx][:, :, -1:, :, :], x], 2)
+                )
+                _feat_cache[idx] = cache_x
+                _feat_idx += 1
+            feat_cache.set(_feat_cache)
+            feat_idx.set(_feat_idx)
+        elif not first_frame and hasattr(self, "time_conv"):
+            x = self.time_conv(x)
+    return x
+
 class WanResample(nn.Module):
     r"""
     A custom resampling module for 2D and 3D data.
@@ -450,146 +532,93 @@ class WanResample(nn.Module):
         # default to dim //2
         if upsample_out_dim is None:
             upsample_out_dim = dim // 2
-        
-        world_size = get_sp_world_size()
 
         # layers
-        if world_size > 1:
-            if mode == "upsample2d":
-                self.resample = nn.Sequential(
-                    WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
-                    WanDistConv2d(dim, upsample_out_dim, 3, padding=1),
-                )
-            elif mode == "upsample3d":
-                self.resample = nn.Sequential(
-                    WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
-                    WanDistConv2d(dim, upsample_out_dim, 3, padding=1),
-                )
-                self.time_conv = WanCausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
+        if mode == "upsample2d":
+            self.resample = nn.Sequential(
+                WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
+                nn.Conv2d(dim, upsample_out_dim, 3, padding=1),
+            )
+        elif mode == "upsample3d":
+            self.resample = nn.Sequential(
+                WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
+                nn.Conv2d(dim, upsample_out_dim, 3, padding=1),
+            )
+            self.time_conv = WanCausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
 
-            elif mode == "downsample2d":
-                self.resample = nn.Sequential(
-                    nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
-                )
-            elif mode == "downsample3d":
-                self.resample = nn.Sequential(
-                    nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
-                )
-                self.time_conv = WanCausalConv3d(
-                    dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0)
-                )
+        elif mode == "downsample2d":
+            self.resample = nn.Sequential(
+                nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
+            )
+        elif mode == "downsample3d":
+            self.resample = nn.Sequential(
+                nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
+            )
+            self.time_conv = WanCausalConv3d(
+                dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0)
+            )
 
-            else:
-                self.resample = nn.Identity()
         else:
-            if mode == "upsample2d":
-                self.resample = nn.Sequential(
-                    WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
-                    nn.Conv2d(dim, upsample_out_dim, 3, padding=1),
-                )
-            elif mode == "upsample3d":
-                self.resample = nn.Sequential(
-                    WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
-                    nn.Conv2d(dim, upsample_out_dim, 3, padding=1),
-                )
-                self.time_conv = WanCausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
-
-            elif mode == "downsample2d":
-                self.resample = nn.Sequential(
-                    nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
-                )
-            elif mode == "downsample3d":
-                self.resample = nn.Sequential(
-                    nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
-                )
-                self.time_conv = WanCausalConv3d(
-                    dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0)
-                )
-
-            else:
-                self.resample = nn.Identity()
+            self.resample = nn.Identity()
 
     def forward(self, x):
-        b, c, t, h, w = x.size()
-        first_frame = is_first_frame.get()
-        if first_frame:
-            assert t == 1
-        _feat_cache = feat_cache.get()
-        _feat_idx = feat_idx.get()
-        if self.mode == "upsample3d":
-            if _feat_cache is not None:
-                idx = _feat_idx
-                if _feat_cache[idx] is None:
-                    _feat_cache[idx] = "Rep"
-                    _feat_idx += 1
-                else:
-                    cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                    if (
-                        cache_x.shape[2] < 2
-                        and _feat_cache[idx] is not None
-                        and _feat_cache[idx] != "Rep"
-                    ):
-                        # cache last frame of last two chunk
-                        cache_x = torch.cat(
-                            [
-                                _feat_cache[idx][:, :, -1, :, :]
-                                .unsqueeze(2)
-                                .to(cache_x.device),
-                                cache_x,
-                            ],
-                            dim=2,
-                        )
-                    if (
-                        cache_x.shape[2] < 2
-                        and _feat_cache[idx] is not None
-                        and _feat_cache[idx] == "Rep"
-                    ):
-                        cache_x = torch.cat(
-                            [torch.zeros_like(cache_x).to(cache_x.device), cache_x],
-                            dim=2,
-                        )
-                    if _feat_cache[idx] == "Rep":
-                        x = self.time_conv(x)
-                    else:
-                        x = self.time_conv(x, _feat_cache[idx])
-                    _feat_cache[idx] = cache_x
-                    _feat_idx += 1
+        return resample_forward(self, x)
+ 
 
-                    x = x.reshape(b, 2, c, t, h, w)
-                    x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
-                    x = x.reshape(b, c, t * 2, h, w)
-                feat_cache.set(_feat_cache)
-                feat_idx.set(_feat_idx)
-            elif not first_frame and hasattr(self, "time_conv"):
-                x = self.time_conv(x)
-                x = x.reshape(b, 2, c, t, h, w)
-                x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
-                x = x.reshape(b, c, t * 2, h, w)
-        t = x.shape[2]
-        x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
-        x = self.resample(x)
-        x = x.view(b, t, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
+class WanDistResample(nn.Module):
+    r"""
+    A custom resampling module for 2D and 3D data used for parallel decoding.
 
-        _feat_cache = feat_cache.get()
-        _feat_idx = feat_idx.get()
-        if self.mode == "downsample3d":
-            if _feat_cache is not None:
-                idx = _feat_idx
-                if _feat_cache[idx] is None:
-                    _feat_cache[idx] = x.clone()
-                    _feat_idx += 1
-                else:
-                    cache_x = x[:, :, -1:, :, :].clone()
-                    x = self.time_conv(
-                        torch.cat([_feat_cache[idx][:, :, -1:, :, :], x], 2)
-                    )
-                    _feat_cache[idx] = cache_x
-                    _feat_idx += 1
-                feat_cache.set(_feat_cache)
-                feat_idx.set(_feat_idx)
-            elif not first_frame and hasattr(self, "time_conv"):
-                x = self.time_conv(x)
-        return x
+    Args:
+        dim (int): The number of input/output channels.
+        mode (str): The resampling mode. Must be one of:
+            - 'none': No resampling (identity operation).
+            - 'upsample2d': 2D upsampling with nearest-exact interpolation and convolution.
+            - 'upsample3d': 3D upsampling with nearest-exact interpolation, convolution, and causal 3D convolution.
+            - 'downsample2d': 2D downsampling with zero-padding and convolution.
+            - 'downsample3d': 3D downsampling with zero-padding, convolution, and causal 3D convolution.
+    """
+
+    def __init__(self, dim: int, mode: str, upsample_out_dim: int = None) -> None:
+        super().__init__()
+        self.dim = dim
+        self.mode = mode
+
+        # default to dim //2
+        if upsample_out_dim is None:
+            upsample_out_dim = dim // 2
+        
+        # layers
+        # We only support parallel decoding for upsample2d and upsample3d now.
+        if mode == "upsample2d":
+            self.resample = nn.Sequential(
+                WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
+                WanDistConv2d(dim, upsample_out_dim, 3, padding=1),
+            )
+        elif mode == "upsample3d":
+            self.resample = nn.Sequential(
+                WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
+                WanDistConv2d(dim, upsample_out_dim, 3, padding=1),
+            )
+            self.time_conv = WanCausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
+
+        elif mode == "downsample2d":
+            self.resample = nn.Sequential(
+                nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
+            )
+        elif mode == "downsample3d":
+            self.resample = nn.Sequential(
+                nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
+            )
+            self.time_conv = WanCausalConv3d(
+                dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0)
+            )
+
+        else:
+            self.resample = nn.Identity()
+
+    def forward(self, x):
+        return resample_forward(self, x)
 
 
 def _residual_block_forward(self, x):
@@ -968,7 +997,7 @@ class WanDistResidualDownBlock(nn.Module):
         # Add the final downsample block
         if down_flag:
             mode = "downsample3d" if temperal_downsample else "downsample2d"
-            self.downsampler = WanResample(out_dim, mode=mode)
+            self.downsampler = WanDistResample(out_dim, mode=mode)
         else:
             self.downsampler = None
 
@@ -1260,7 +1289,7 @@ class WanDistResidualUpBlock(nn.Module):
         # Add upsampling layer if needed
         if up_flag:
             upsample_mode = "upsample3d" if temperal_upsample else "upsample2d"
-            self.upsampler = WanResample(
+            self.upsampler = WanDistResample(
                 out_dim, mode=upsample_mode, upsample_out_dim=out_dim
             )
         else:
@@ -1381,7 +1410,7 @@ class WanDistUpBlock(nn.Module):
         # Add upsampling layer if needed
         self.upsamplers = None
         if upsample_mode is not None:
-            self.upsamplers = nn.ModuleList([WanResample(out_dim, mode=upsample_mode)])
+            self.upsamplers = nn.ModuleList([WanDistResample(out_dim, mode=upsample_mode)])
 
         self.gradient_checkpointing = False
 
