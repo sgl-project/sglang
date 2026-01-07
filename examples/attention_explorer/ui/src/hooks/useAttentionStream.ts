@@ -3,7 +3,7 @@ import { useSessionStore } from '../stores/useSessionStore';
 import { useUIStore } from '../stores/useUIStore';
 import { useTraceStore } from '../stores/useTraceStore';
 import { AttentionStreamClient } from '../api/client';
-import { extractFingerprint, isFingerprintMode } from '../api/types';
+import { extractFingerprint } from '../api/types';
 
 export interface UseAttentionStreamOptions {
   baseUrl?: string;
@@ -22,6 +22,7 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
   const addMessage = useSessionStore((state) => state.addMessage);
   const appendToken = useSessionStore((state) => state.appendToken);
   const appendAttention = useSessionStore((state) => state.appendAttention);
+  const appendMoE = useSessionStore((state) => state.appendMoE);
   const setFingerprint = useSessionStore((state) => state.setFingerprint);
   const startStreaming = useSessionStore((state) => state.startStreaming);
   const finishStreaming = useSessionStore((state) => state.finishStreaming);
@@ -81,10 +82,13 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
       onAttention: (entry) => {
         appendAttention(entry);
 
-        if (isFingerprintMode(entry)) {
-          const fp = extractFingerprint(entry);
-          if (fp) setFingerprint(fp);
-        }
+        // Extract fingerprint from any mode (raw, sketch, or fingerprint)
+        // This enables Manifold/Router views with raw attention data
+        const fp = extractFingerprint(entry);
+        if (fp) setFingerprint(fp);
+      },
+      onMoE: (entry) => {
+        appendMoE(entry);
       },
       onFinish: () => {
         finishStreaming();
@@ -102,7 +106,7 @@ export function useAttentionStream(options: UseAttentionStreamOptions = {}) {
     return () => {
       client.abort();
     };
-  }, [baseUrl, model, program, appendToken, appendAttention, setFingerprint, finishStreaming]);
+  }, [baseUrl, model, program, appendToken, appendAttention, appendMoE, setFingerprint, finishStreaming]);
 
   useEffect(() => {
     clientRef.current?.setProgram(program);

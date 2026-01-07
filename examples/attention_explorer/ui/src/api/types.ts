@@ -301,7 +301,135 @@ export function extractFingerprint(entry: AttentionEntry): Fingerprint | null {
     };
   }
 
+  // Compute fingerprint from raw attention data (client-side)
+  if (isRawMode(entry)) {
+    return computeFingerprintFromRaw(entry);
+  }
+
   return null;
+}
+
+/**
+ * Compute fingerprint metrics from raw attention positions and scores.
+ * This enables Manifold/Router views without server fingerprint mode.
+ *
+ * Distance bands (relative to current position):
+ * - Local: 0-32 tokens (syntax/immediate context)
+ * - Mid: 33-256 tokens (semantic/paragraph level)
+ * - Long: 257+ tokens (document-level/cross-context)
+ */
+function computeFingerprintFromRaw(entry: AttentionEntryRaw): Fingerprint {
+  const positions = entry.token_positions || [];
+  const scores = entry.attention_scores || [];
+
+  // Also check multi-layer data
+  const allPositions: number[] = [];
+  const allScores: number[] = [];
+
+  if (entry.layers) {
+    for (const layer of Object.values(entry.layers)) {
+      allPositions.push(...(layer.token_positions || []));
+      allScores.push(...(layer.attention_scores || []));
+    }
+  } else {
+    allPositions.push(...positions);
+    allScores.push(...scores);
+  }
+
+  if (allPositions.length === 0) {
+    return {
+      histogram: new Array(16).fill(0),
+      local_mass: 0,
+      mid_mass: 0,
+      long_mass: 0,
+      entropy: 0,
+    };
+  }
+
+  // Compute current position (assume last attended position + 1, or max position)
+  const maxPos = Math.max(...allPositions);
+  const currentPos = maxPos + 1;
+
+  // Compute distance histogram (16 bins, log-scale)
+  const histogram = new Array(16).fill(0);
+  let localMass = 0;
+  let midMass = 0;
+  let longMass = 0;
+  let totalMass = 0;
+
+  for (let i = 0; i < allPositions.length; i++) {
+    const pos = allPositions[i];
+    const score = allScores[i] || 0;
+    const distance = currentPos - pos;
+
+    // Distance bands
+    if (distance <= 32) {
+      localMass += score;
+    } else if (distance <= 256) {
+      midMass += score;
+    } else {
+      longMass += score;
+    }
+    totalMass += score;
+
+    // Log-scale histogram bin
+    const bin = Math.min(15, Math.floor(Math.log2(Math.max(1, distance))));
+    histogram[bin] += score;
+  }
+
+  // Normalize
+  if (totalMass > 0) {
+    localMass /= totalMass;
+    midMass /= totalMass;
+    longMass /= totalMass;
+    for (let i = 0; i < histogram.length; i++) {
+      histogram[i] /= totalMass;
+    }
+  }
+
+  // Compute entropy from score distribution
+  let entropy = 0;
+  for (const score of allScores) {
+    if (score > 0) {
+      const p = score / totalMass;
+      entropy -= p * Math.log2(p);
+    }
+  }
+
+  // Compute consensus (how much top-k agrees across layers)
+  let consensus = 0;
+  if (entry.layers && Object.keys(entry.layers).length > 1) {
+    const layerTopK = Object.values(entry.layers).map(l =>
+      new Set((l.token_positions || []).slice(0, 5))
+    );
+    if (layerTopK.length >= 2) {
+      let overlaps = 0;
+      let comparisons = 0;
+      for (let i = 0; i < layerTopK.length; i++) {
+        for (let j = i + 1; j < layerTopK.length; j++) {
+          const intersection = [...layerTopK[i]].filter(x => layerTopK[j].has(x));
+          overlaps += intersection.length / 5;
+          comparisons++;
+        }
+      }
+      consensus = comparisons > 0 ? overlaps / comparisons : 0;
+    }
+  }
+
+  // Compute hubness (concentration of attention on few positions)
+  const sortedScores = [...allScores].sort((a, b) => b - a);
+  const top3Mass = sortedScores.slice(0, 3).reduce((a, b) => a + b, 0);
+  const hubness = totalMass > 0 ? top3Mass / totalMass : 0;
+
+  return {
+    histogram,
+    local_mass: localMass,
+    mid_mass: midMass,
+    long_mass: longMass,
+    entropy,
+    consensus,
+    hubness,
+  };
 }
 
 export function classifyManifold(fp: Fingerprint): ManifoldZone {

@@ -129,9 +129,29 @@ export const useSessionStore = create<SessionState>((set, get) => {
     }),
 
   appendMoE: (entry) =>
-    set((state) => ({
-      currentMoE: [...state.currentMoE, entry],
-    })),
+    set((state) => {
+      // Get step from entry - server sends decode_step starting at 1
+      const step = entry.decode_step ?? state.currentMoE.length + 1;
+      const tokenIndex = Math.max(0, step - 1);
+
+      const newMoE = [...state.currentMoE];
+      newMoE[tokenIndex] = entry;
+
+      // Update the message with new MoE data
+      const messages = [...state.messages];
+      const lastMsg = messages[messages.length - 1];
+
+      if (lastMsg?.role === 'assistant') {
+        const moeArray: MoERoutingEntry[] = [...(lastMsg.moe || [])];
+        moeArray[tokenIndex] = entry;
+        messages[messages.length - 1] = {
+          ...lastMsg,
+          moe: moeArray,
+        };
+      }
+
+      return { messages, currentMoE: newMoE };
+    }),
 
   setFingerprint: (fp) => set({ fingerprint: fp }),
 
