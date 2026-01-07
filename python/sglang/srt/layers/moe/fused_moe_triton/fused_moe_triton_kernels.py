@@ -35,6 +35,9 @@ try:
 except:
     _support_tensor_descriptor = False
 
+
+from sgl_kernel import moe_wna16_gemm
+
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -626,7 +629,7 @@ def should_moe_wna16_use_cuda(
     num_valid_tokens: int, group_size: int, num_experts: int, bit: int
 ):
     return (
-        current_platform.is_cuda()
+        _is_cuda
         and bit == 4
         and group_size in [32, 64, 128]
         and num_valid_tokens / num_experts <= 6
@@ -785,6 +788,9 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
+    M = A.size(0)
+    num_tokens = M * top_k
+
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
@@ -827,7 +833,7 @@ def invoke_fused_moe_kernel(
 
         if use_moe_wna16_cuda:
             bit = 4 if use_int4_w4a16 else 8
-            ops.moe_wna16_gemm(
+            moe_wna16_gemm(
                 A,
                 C,
                 B,

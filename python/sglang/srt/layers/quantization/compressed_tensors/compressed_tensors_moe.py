@@ -115,8 +115,11 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
+                if get_bool_env_var("SGLANG_DISABLE_WNA16_MOE_MARLIN", "false"):
+                    logger.info_once("Using CompressedTensorsWNA16MoEMethod")
+                    return CompressedTensorsWNA16MoEMethod(quant_config)
                 logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
-                return CompressedTensorsWNA16MoEMethod(quant_config)
+                return CompressedTensorsWNA16MarlinMoEMethod(quant_config)
             else:
                 if (
                     quant_config._is_dynamic_token_w4(weight_quant, input_quant)
