@@ -190,6 +190,10 @@ _worker_counts: dict[tuple[str, ConnectionMode, WorkerType], int] = {}
 # Track first-seen order to preserve test collection order
 _first_seen_order: list[tuple[str, ConnectionMode, WorkerType]] = []
 
+# Track max GPU requirement for any single test (for validation)
+_max_test_gpu_requirement: int = 0
+_max_test_name: str = ""
+
 _needs_default_model: bool = False  # True if any e2e test lacks explicit model marker
 
 
@@ -204,9 +208,12 @@ def pytest_collection_modifyitems(
     It extracts worker requirements from markers in test collection order,
     tracking the max count needed for each (model, mode, worker_type) combination.
 
-    All worker types (regular, prefill, decode) are handled uniformly.
+    Also tracks the max GPU requirement for any single test for validation.
     """
     global _worker_counts, _first_seen_order, _needs_default_model
+    global _max_test_gpu_requirement, _max_test_name
+
+    from infra import MODEL_SPECS
 
     def track_worker(
         model_id: str, mode: ConnectionMode, worker_type: WorkerType, count: int
@@ -218,6 +225,15 @@ def pytest_collection_modifyitems(
             _worker_counts[key] = count
         else:
             _worker_counts[key] = max(_worker_counts[key], count)
+
+    def calculate_test_gpus(
+        model_id: str, prefill: int, decode: int, regular: int
+    ) -> int:
+        """Calculate GPU requirement for a single test."""
+        if model_id not in MODEL_SPECS:
+            return 0
+        tp = MODEL_SPECS[model_id].get("tp", 1)
+        return tp * (prefill + decode + regular)
 
     for item in items:
         # Extract model from marker or use default
@@ -261,7 +277,8 @@ def pytest_collection_modifyitems(
             _needs_default_model = True
             model_id = DEFAULT_MODEL
 
-        # Track worker requirements
+        # Track worker requirements and calculate this test's GPU requirement
+        test_gpus = 0
         if model_id and backends:
             for backend in backends:
                 # "pd" backend means PD workers
@@ -272,6 +289,9 @@ def pytest_collection_modifyitems(
                     d_count = decode_count if decode_count > 0 else 1
                     track_worker(model_id, mode, WorkerType.PREFILL, p_count)
                     track_worker(model_id, mode, WorkerType.DECODE, d_count)
+                    test_gpus = max(
+                        test_gpus, calculate_test_gpus(model_id, p_count, d_count, 0)
+                    )
                 else:
                     try:
                         mode = ConnectionMode(backend)
@@ -283,13 +303,29 @@ def pytest_collection_modifyitems(
                     if prefill_count > 0 or decode_count > 0:
                         track_worker(model_id, mode, WorkerType.PREFILL, prefill_count)
                         track_worker(model_id, mode, WorkerType.DECODE, decode_count)
+                        test_gpus = max(
+                            test_gpus,
+                            calculate_test_gpus(
+                                model_id, prefill_count, decode_count, 0
+                            ),
+                        )
                     else:
                         # Regular worker
                         track_worker(model_id, mode, WorkerType.REGULAR, regular_count)
+                        test_gpus = max(
+                            test_gpus,
+                            calculate_test_gpus(model_id, 0, 0, regular_count),
+                        )
 
         elif model_id and is_e2e:
             # E2E test without explicit backend - will use HTTP by default
             track_worker(model_id, ConnectionMode.HTTP, WorkerType.REGULAR, 1)
+            test_gpus = calculate_test_gpus(model_id, 0, 0, 1)
+
+        # Track max GPU requirement across all tests
+        if test_gpus > _max_test_gpu_requirement:
+            _max_test_gpu_requirement = test_gpus
+            _max_test_name = item.nodeid
 
     # Log results
     if _worker_counts:
@@ -302,6 +338,11 @@ def pytest_collection_modifyitems(
             else:
                 summary.append(f"{model_id}:{mode.value}:{worker_type.value}x{count}")
         logger.info("Scanned worker requirements (in test order): %s", summary)
+        logger.info(
+            "Max GPU requirement for single test: %d (%s)",
+            _max_test_gpu_requirement,
+            _max_test_name,
+        )
     else:
         logger.info("Scanned worker requirements: (none)")
 
@@ -354,25 +395,16 @@ def get_pool_requirements() -> list[WorkerIdentity]:
 
 
 def validate_gpu_requirements() -> tuple[int, int]:
-    """Check if there are enough GPUs for the required workers.
+    """Check if there are enough GPUs for any single test.
 
     Returns:
-        Tuple of (required_gpus, available_gpus).
+        Tuple of (max_required_gpus, available_gpus).
 
-    Raises:
-        pytest.UsageError: If tests require more GPUs than available.
+    Note:
+        We check the max requirement for any single test, not the sum.
+        Workers can be evicted between tests, so we only need enough GPUs
+        for the most demanding test.
     """
-    from infra import MODEL_SPECS
-
-    # Count total GPUs needed
-    required_gpus = 0
-    for (model_id, mode, worker_type), count in _worker_counts.items():
-        if model_id not in MODEL_SPECS:
-            continue
-        spec = MODEL_SPECS[model_id]
-        tp = spec.get("tp", 1)
-        required_gpus += tp * count
-
     # Count available GPUs
     available_gpus = 0
     try:
@@ -383,14 +415,14 @@ def validate_gpu_requirements() -> tuple[int, int]:
     except ImportError:
         pass
 
-    return required_gpus, available_gpus
+    return _max_test_gpu_requirement, available_gpus
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
     """Validate GPU requirements after test collection.
 
     This runs after all tests are collected but before any tests execute.
-    Fails fast if tests require more GPUs than available.
+    Fails fast if any single test requires more GPUs than available.
     """
     if not _worker_counts:
         return
@@ -399,44 +431,26 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     if os.environ.get(ENV_SKIP_MODEL_POOL, "").lower() in ("1", "true", "yes"):
         return
 
-    required_gpus, available_gpus = validate_gpu_requirements()
+    max_required, available_gpus = validate_gpu_requirements()
 
-    if required_gpus > available_gpus:
-        # Build detailed breakdown
-        from infra import MODEL_SPECS
-
-        breakdown = []
-        for key in _first_seen_order:
-            model_id, mode, worker_type = key
-            if model_id not in MODEL_SPECS:
-                continue
-            count = _worker_counts[key]
-            tp = MODEL_SPECS[model_id].get("tp", 1)
-            gpus = tp * count
-            if worker_type == WorkerType.REGULAR:
-                breakdown.append(f"{model_id}:{mode.value} x{count} = {gpus} GPU(s)")
-            else:
-                breakdown.append(
-                    f"{model_id}:{mode.value}:{worker_type.value} x{count} = {gpus} GPU(s)"
-                )
-
+    if max_required > available_gpus:
         raise pytest.UsageError(
             f"\n{'='*60}\n"
             f"GPU REQUIREMENTS EXCEEDED\n"
             f"{'='*60}\n"
-            f"Required: {required_gpus} GPUs\n"
+            f"Test '{_max_test_name}' requires {max_required} GPUs\n"
             f"Available: {available_gpus} GPUs\n"
-            f"\nBreakdown:\n  " + "\n  ".join(breakdown) + "\n"
             f"\nOptions:\n"
-            f"  1. Run fewer tests with: pytest -k 'test_name'\n"
-            f"  2. Use fewer workers: @pytest.mark.workers(prefill=1, decode=1)\n"
+            f"  1. Run tests that fit: pytest -k 'not {_max_test_name.split('::')[0]}'\n"
+            f"  2. Reduce workers: @pytest.mark.workers(prefill=1, decode=1)\n"
             f"  3. Skip GPU tests: SKIP_MODEL_POOL=1 pytest\n"
             f"{'='*60}"
         )
 
     logger.info(
-        "GPU validation passed: %d required, %d available",
-        required_gpus,
+        "GPU validation passed: max %d required (by %s), %d available",
+        max_required,
+        _max_test_name,
         available_gpus,
     )
 
