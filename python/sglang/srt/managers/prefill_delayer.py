@@ -1,10 +1,14 @@
 import logging
-from typing import Optional
+import time
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var
+
+if TYPE_CHECKING:
+    from sglang.srt.metrics.collector import SchedulerMetricsCollector
 
 _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
@@ -12,7 +16,14 @@ logger = logging.getLogger(__name__)
 
 
 class PrefillDelayer:
-    def __init__(self, dp_size, attn_tp_size, tp_worker, server_args):
+    def __init__(
+        self,
+        dp_size,
+        attn_tp_size,
+        tp_worker,
+        server_args,
+        metrics_collector: Optional["SchedulerMetricsCollector"] = None,
+    ):
         self.global_info = torch.empty(
             (dp_size, attn_tp_size, 1),
             dtype=torch.int64,
@@ -22,6 +33,8 @@ class PrefillDelayer:
 
         self.curr_delayed_count = 0
         self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
+        self._wait_start_time: Optional[float] = None
+        self._metrics_collector = metrics_collector
 
         assert (
             server_args.enable_dp_attention
@@ -43,17 +56,31 @@ class PrefillDelayer:
         )
 
         if global_mixed_prefillable:
+            if self._wait_start_time is None:
+                self._wait_start_time = time.perf_counter()
             self.curr_delayed_count += 1
             if self.curr_delayed_count < self.max_delay_passes:
                 return False
 
-        if _DEBUG_LOG and global_mixed_prefillable:
+        is_timeout = global_mixed_prefillable
+        if _DEBUG_LOG and is_timeout:
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill (prefillable: {global_prefillable.sum()})"
             )
 
-        self.curr_delayed_count = 0
+        self._record_metrics_and_reset(is_timeout=is_timeout)
         return True
+
+    def _record_metrics_and_reset(self, is_timeout: bool) -> None:
+        if self.curr_delayed_count > 0 and self._metrics_collector is not None:
+            wait_seconds = time.perf_counter() - self._wait_start_time
+            self._metrics_collector.observe_prefill_delayer_wait(
+                forward_passes=self.curr_delayed_count,
+                wait_seconds=wait_seconds,
+                is_timeout=is_timeout,
+            )
+        self.curr_delayed_count = 0
+        self._wait_start_time = None
 
     def _gather_info(self, local_prefillable: bool):
         local_info = torch.tensor(
