@@ -432,7 +432,8 @@ class TestBenchServing(CustomTestCase):
                 "fp8",
                 "--pp-size",
                 "2",
-            ],
+            ]
+            + (["--mem-fraction-static", "0.7"] if is_in_amd_ci() else []),
             need_warmup=False,
             seed=42,
         )
@@ -442,7 +443,10 @@ class TestBenchServing(CustomTestCase):
                 f"### test_pp_long_context_latency_prefill\n"
                 f"input_throughput: {res['input_throughput']:.2f} ms\n"
             )
-            self.assertGreater(res["input_throughput"], 4000)
+            if is_in_amd_ci():
+                self.assertGreater(res["input_throughput"], 3000)
+            else:
+                self.assertGreater(res["input_throughput"], 4000)
 
     def test_score_api_latency_throughput(self):
         """Test score API latency and throughput performance"""
