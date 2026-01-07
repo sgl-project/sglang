@@ -442,7 +442,7 @@ def make_report(eval_result: EvalResult) -> str:
     )
 
 
-def make_report_from_example_htmls(htmls: List[str]):
+def make_report_from_example_htmls(htmls: list[str]):
     """
     Create a standalone HTML report from a list of example htmls
     """
