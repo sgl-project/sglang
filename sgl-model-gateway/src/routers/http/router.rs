@@ -557,6 +557,10 @@ impl Router {
             }
         }
 
+        if !is_stream && crate::routers::offline_hack::is_offline_mode(headers) {
+            return crate::routers::offline_hack::spawn_offline_request(request_builder, load_guard);
+        }
+
         let res = match request_builder.send().await {
             Ok(res) => res,
             Err(e) => {
@@ -573,10 +577,6 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !is_stream {
-            if crate::routers::offline_hack::is_offline_mode(headers) {
-                return crate::routers::offline_hack::handle_offline_response(res, status, load_guard);
-            }
-
             let response_headers = header_utils::preserve_response_headers(res.headers());
 
             let response = match res.bytes().await {

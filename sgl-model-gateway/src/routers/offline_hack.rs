@@ -7,9 +7,9 @@ use axum::{
 use bytes::Bytes;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
-use reqwest::Response as ReqwestResponse;
+use reqwest::RequestBuilder;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::core::WorkerLoadGuard;
 
@@ -63,28 +63,52 @@ pub fn is_offline_mode(headers: Option<&HeaderMap>) -> bool {
         .unwrap_or(false)
 }
 
-pub fn generate_receipt_id() -> String {
+fn generate_receipt_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-pub fn receipt_response(receipt_id: &str) -> Response {
+fn receipt_response(receipt_id: &str) -> Response {
     Json(serde_json::json!({"receipt_id": receipt_id})).into_response()
 }
 
-pub fn handle_offline_response(
-    res: ReqwestResponse,
-    status: StatusCode,
+pub fn spawn_offline_request(
+    request_builder: RequestBuilder,
     load_guard: Option<WorkerLoadGuard>,
 ) -> Response {
     let receipt_id = generate_receipt_id();
     let receipt_id_clone = receipt_id.clone();
+    info!(receipt_id = %receipt_id, "Offline mode: spawning background request");
+
     tokio::spawn(async move {
-        let result = match res.bytes().await {
+        let res = match request_builder.send().await {
+            Ok(res) => res,
+            Err(e) => {
+                error!(receipt_id = %receipt_id_clone, error = %e, "Offline mode: request failed");
+                let error_body = serde_json::json!({
+                    "error": {
+                        "message": format!("Request failed: {}", e),
+                        "type": "offline_request_error"
+                    }
+                });
+                STORE.store(
+                    receipt_id_clone,
+                    Bytes::from(error_body.to_string()),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+                drop(load_guard);
+                return;
+            }
+        };
+
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+        match res.bytes().await {
             Ok(body) => {
                 STORE.store(receipt_id_clone, body, status);
-                Ok(())
             }
             Err(e) => {
+                error!(receipt_id = %receipt_id_clone, error = %e, "Offline mode: failed to read body");
                 let error_body = serde_json::json!({
                     "error": {
                         "message": format!("Failed to get response body: {}", e),
@@ -96,12 +120,11 @@ pub fn handle_offline_response(
                     Bytes::from(error_body.to_string()),
                     StatusCode::INTERNAL_SERVER_ERROR,
                 );
-                Err(e)
             }
-        };
+        }
         drop(load_guard);
-        result
     });
+
     receipt_response(&receipt_id)
 }
 

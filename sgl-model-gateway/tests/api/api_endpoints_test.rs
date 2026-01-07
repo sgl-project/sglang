@@ -2020,11 +2020,13 @@ mod offline_mode_tests {
 
     #[tokio::test]
     async fn test_offline_mode_end_to_end() {
+        let worker_delay_ms = 3000u64;
+
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18120,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
+            response_delay_ms: worker_delay_ms,
             fail_rate: 0.0,
         }])
         .await;
@@ -2047,8 +2049,17 @@ mod offline_mode_tests {
             .body(Body::from(serde_json::to_string(&chat_payload).unwrap()))
             .unwrap();
 
+        let start = std::time::Instant::now();
         let resp = app.clone().oneshot(req).await.unwrap();
+        let elapsed = start.elapsed();
+
         assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            elapsed.as_millis() < 500,
+            "Offline mode should return immediately, but took {}ms (worker delay is {}ms)",
+            elapsed.as_millis(),
+            worker_delay_ms
+        );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -2058,9 +2069,28 @@ mod offline_mode_tests {
         let receipt_id = body_json["receipt_id"].as_str().unwrap();
         assert!(!receipt_id.is_empty());
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
         let retrieve_payload = json!({"receipt_id": receipt_id});
+        let req_pending = Request::builder()
+            .method("POST")
+            .uri("/query_maybe_retrieve")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_string(&retrieve_payload).unwrap(),
+            ))
+            .unwrap();
+
+        let resp_pending = app.clone().oneshot(req_pending).await.unwrap();
+        let body_pending = axum::body::to_bytes(resp_pending.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json_pending: serde_json::Value = serde_json::from_slice(&body_pending).unwrap();
+        assert_eq!(
+            json_pending["status"], "pending",
+            "Result should be pending while worker is still processing"
+        );
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(worker_delay_ms + 500)).await;
+
         let req1 = Request::builder()
             .method("POST")
             .uri("/query_maybe_retrieve")
