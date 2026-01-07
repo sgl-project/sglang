@@ -1,157 +1,100 @@
-"""Cloud backend configurations for E2E tests.
+"""Cloud runtime configurations for E2E tests.
 
-This module handles cloud API backends (OpenAI, xAI) that don't need local GPU workers.
-For local backends (gRPC, HTTP), use ModelPool from infra/ to launch workers,
-then launch the router separately pointing to those workers.
+This module handles cloud API runtimes (OpenAI, xAI) that don't need local GPU workers.
+For local runtimes (gRPC, HTTP), use ModelPool from infra/ to launch workers,
+then launch the gateway separately pointing to those workers.
+
+Cloud runtimes vs History backends:
+- Cloud runtimes: Where models run (openai, xai)
+- History backends: Gateway plugin for conversation storage (memory, oracle)
+These are orthogonal - any cloud runtime can use any history backend.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-import subprocess
-from dataclasses import dataclass
 from typing import Any
 
-from infra import get_open_port, kill_process_tree, wait_for_health
+from infra import Gateway
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class RouterInstance:
-    """A running router instance (for cloud backends)."""
-
-    base_url: str
-    router_process: subprocess.Popen
-    backend: str
-
-    def shutdown(self) -> None:
-        """Shutdown the router."""
-        if self.router_process.poll() is None:
-            kill_process_tree(self.router_process.pid)
-
-
-def launch_cloud_router(
-    backend: str,  # "openai" or "xai"
-    *,
-    history_backend: str = "memory",
-    router_args: list[str] | None = None,
-    timeout: float = 60,
-    show_output: bool | None = None,
-) -> RouterInstance:
-    """Launch router with cloud API backend (OpenAI/xAI).
-
-    Args:
-        backend: "openai" or "xai"
-        history_backend: "memory" or "oracle"
-        router_args: Additional router arguments
-        timeout: Startup timeout in seconds
-        show_output: Show subprocess output
-
-    Returns:
-        RouterInstance with running router
-    """
-    if show_output is None:
-        show_output = os.environ.get("SHOW_ROUTER_LOGS", "0") == "1"
-
-    router_port = get_open_port()
-    prometheus_port = get_open_port()
-    base_url = f"http://127.0.0.1:{router_port}"
-
-    # Get API key and worker URL
-    if backend == "openai":
-        worker_url = "https://api.openai.com"
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY environment variable required")
-    elif backend == "xai":
-        worker_url = "https://api.x.ai"
-        api_key = os.environ.get("XAI_API_KEY")
-        if not api_key:
-            raise ValueError("XAI_API_KEY environment variable required")
-    else:
-        raise ValueError(f"Unsupported cloud backend: {backend}")
-
-    logger.info("Launching %s router on port %d", backend, router_port)
-
-    cmd = [
-        "python3",
-        "-m",
-        "sglang_router.launch_router",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(router_port),
-        "--prometheus-port",
-        str(prometheus_port),
-        "--backend",
-        "openai",
-        "--worker-urls",
-        worker_url,
-        "--history-backend",
-        history_backend,
-        "--log-level",
-        "warn",
-    ]
-
-    if router_args:
-        cmd.extend(router_args)
-
-    env = os.environ.copy()
-    if backend == "openai":
-        env["OPENAI_API_KEY"] = api_key
-    else:
-        env["XAI_API_KEY"] = api_key
-
-    router_proc = subprocess.Popen(
-        cmd,
-        env=env,
-        stdout=None if show_output else subprocess.PIPE,
-        stderr=None if show_output else subprocess.PIPE,
-        start_new_session=True,
-    )
-
-    try:
-        wait_for_health(base_url, timeout=timeout)
-    except TimeoutError:
-        kill_process_tree(router_proc.pid)
-        raise
-
-    logger.info("%s router ready at %s", backend, base_url)
-
-    return RouterInstance(
-        base_url=base_url,
-        router_process=router_proc,
-        backend=backend,
-    )
-
-
-# Cloud backend configurations
-CLOUD_BACKENDS: dict[str, dict[str, Any]] = {
+# Cloud runtime configurations (where models run)
+CLOUD_RUNTIMES: dict[str, dict[str, Any]] = {
     "openai": {
-        "description": "OpenAI API backend",
+        "description": "OpenAI API",
         "model": "gpt-4o-mini",
         "api_key_env": "OPENAI_API_KEY",
-        "history_backend": "memory",
     },
     "xai": {
-        "description": "xAI API backend",
+        "description": "xAI API",
         "model": "grok-2-latest",
         "api_key_env": "XAI_API_KEY",
-        "history_backend": "memory",
     },
+}
+
+# Keep CLOUD_BACKENDS as alias for backward compatibility during migration
+# TODO: Remove after e2e_response_api migration
+CLOUD_BACKENDS: dict[str, dict[str, Any]] = {
+    **CLOUD_RUNTIMES,
+    # Legacy entry for tests that parameterize on history backend
     "oracle_store": {
         "description": "OpenAI API with Oracle history backend",
         "model": "gpt-4o-mini",
         "api_key_env": "OPENAI_API_KEY",
         "history_backend": "oracle",
+        "_runtime": "openai",  # Actual runtime to use
     },
 }
 
 
+def get_cloud_runtime_config(runtime: str) -> dict[str, Any]:
+    """Get configuration for a cloud runtime."""
+    if runtime not in CLOUD_RUNTIMES:
+        raise KeyError(
+            f"Unknown cloud runtime: {runtime}. Available: {list(CLOUD_RUNTIMES.keys())}"
+        )
+    return CLOUD_RUNTIMES[runtime]
+
+
+def launch_cloud_gateway(
+    runtime: str,  # "openai" or "xai"
+    *,
+    history_backend: str = "memory",
+    extra_args: list[str] | None = None,
+    timeout: float = 60,
+    show_output: bool | None = None,
+) -> Gateway:
+    """Launch gateway with cloud API runtime.
+
+    Args:
+        runtime: Cloud runtime ("openai" or "xai")
+        history_backend: History storage backend ("memory" or "oracle")
+        extra_args: Additional router arguments
+        timeout: Startup timeout in seconds
+        show_output: Show subprocess output
+
+    Returns:
+        Gateway instance with running router
+    """
+    if runtime not in CLOUD_RUNTIMES:
+        raise ValueError(f"Unknown cloud runtime: {runtime}")
+
+    gateway = Gateway()
+    gateway.start(
+        cloud_backend=runtime,
+        history_backend=history_backend,
+        timeout=timeout,
+        show_output=show_output,
+        extra_args=extra_args,
+    )
+    return gateway
+
+
+# Backward compatibility aliases - TODO: Remove after migration
 def get_cloud_backend_config(backend: str) -> dict[str, Any]:
-    """Get configuration for a cloud backend."""
+    """Deprecated: Use get_cloud_runtime_config instead."""
     if backend not in CLOUD_BACKENDS:
         raise KeyError(
             f"Unknown cloud backend: {backend}. Available: {list(CLOUD_BACKENDS.keys())}"
@@ -159,28 +102,23 @@ def get_cloud_backend_config(backend: str) -> dict[str, Any]:
     return CLOUD_BACKENDS[backend]
 
 
-def launch_cloud_backend(backend: str, **kwargs: Any) -> RouterInstance:
-    """Launch a cloud backend router.
-
-    Args:
-        backend: Backend name from CLOUD_BACKENDS
-        **kwargs: Override launcher kwargs
-
-    Returns:
-        RouterInstance with running router
-    """
+def launch_cloud_backend(backend: str, **kwargs: Any) -> Gateway:
+    """Deprecated: Use launch_cloud_gateway instead."""
     cfg = get_cloud_backend_config(backend)
 
-    # Determine actual backend type (openai or xai)
-    if backend == "oracle_store":
-        actual_backend = "openai"
-    else:
-        actual_backend = backend
+    # Handle legacy oracle_store entry
+    runtime = cfg.get("_runtime", backend)
+    history_backend = kwargs.pop(
+        "history_backend", cfg.get("history_backend", "memory")
+    )
 
-    history_backend = kwargs.pop("history_backend", cfg["history_backend"])
-
-    return launch_cloud_router(
-        actual_backend,
+    return launch_cloud_gateway(
+        runtime,
         history_backend=history_backend,
+        extra_args=kwargs.pop("router_args", None),
         **kwargs,
     )
+
+
+# Keep old function name as alias
+launch_cloud_router = launch_cloud_gateway
