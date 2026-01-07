@@ -472,6 +472,9 @@ class ServerArgs:
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
 
+    # async eplb weight d2d transfer
+    enable_eplb_async_d2d: bool = False
+
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
@@ -3635,6 +3638,11 @@ class ServerArgs:
             "--enable-eplb",
             action="store_true",
             help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--enable-eplb-async-d2d",
+            action="store_true",
+            help="Enable EPLB async weight D2D transfer",
         )
         parser.add_argument(
             "--eplb-algorithm",
