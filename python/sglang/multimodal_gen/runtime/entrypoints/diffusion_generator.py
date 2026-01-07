@@ -344,8 +344,10 @@ class DiffGenerator:
             target=target,
             strength=strength,
         )
-        nickname_str, target_str, strength_str = format_lora_message(lora_nickname, target, strength)
-        
+        nickname_str, target_str, strength_str = format_lora_message(
+            lora_nickname, target, strength
+        )
+
         self._send_lora_request(
             req,
             f"Successfully set LoRA adapter(s): {nickname_str} (target: {target_str}, strength: {strength_str})",
