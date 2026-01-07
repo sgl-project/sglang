@@ -201,6 +201,10 @@ class DeepEPWaterfillBalancer:
     # Minimum batch size to enable waterfill balancing
     # Below this threshold, all shared experts are computed locally
     MIN_BATCH_FOR_BALANCE = 64
+    
+    # Minimum tokens to send to a remote rank for shared expert
+    # If a rank would receive fewer tokens than this, compute locally instead
+    MIN_TOKENS_PER_RANK = 16
 
     def __init__(
         self,
@@ -241,8 +245,9 @@ class DeepEPWaterfillBalancer:
         """
         Prepare expanded topk for dispatch with shared expert as 9th expert.
 
-        If batch size < MIN_BATCH_FOR_BALANCE, all shared experts are computed
-        locally to avoid fragmented computation.
+        Optimizations:
+        1. If batch size < MIN_BATCH_FOR_BALANCE, all shared experts compute locally
+        2. If a remote rank would receive < MIN_TOKENS_PER_RANK, compute locally instead
 
         Returns:
             expanded_topk_ids: [N, 9] with virtual expert ID or LOCAL_SHARED_MARKER
@@ -261,7 +266,6 @@ class DeepEPWaterfillBalancer:
 
         # Small batch optimization: all shared experts compute locally
         if num_tokens < self.MIN_BATCH_FOR_BALANCE:
-            # All destinations are source rank (local)
             shared_destination = torch.full(
                 (num_tokens,), self.rank, dtype=torch.int64, device=device
             )
@@ -274,6 +278,29 @@ class DeepEPWaterfillBalancer:
         else:
             # Waterfill assignment
             shared_destination = self.assign_shared_destination(topk_ids, routed_counts)
+            
+            # Check per-rank token counts and redirect sparse destinations to local
+            # If a remote rank would receive too few tokens, compute locally instead
+            dest_counts = torch.bincount(shared_destination, minlength=self.world_size)
+            
+            # Find ranks (excluding source rank) that would receive too few tokens
+            sparse_ranks_mask = (dest_counts < self.MIN_TOKENS_PER_RANK)
+            sparse_ranks_mask[self.rank] = False  # Don't modify source rank assignments
+            
+            if sparse_ranks_mask.any():
+                # Redirect tokens destined for sparse ranks to local computation
+                sparse_ranks = sparse_ranks_mask.nonzero(as_tuple=True)[0]
+                for sparse_rank in sparse_ranks:
+                    redirect_mask = shared_destination == sparse_rank
+                    shared_destination[redirect_mask] = self.rank
+                
+                if DEEPEP_WATERFILL_DEBUG:
+                    new_dest_counts = torch.bincount(shared_destination, minlength=self.world_size)
+                    print(
+                        f"[DeepEP Waterfill] rank={self.rank} "
+                        f"redirected sparse ranks {sparse_ranks.tolist()} to local, "
+                        f"dest_counts: {dest_counts.tolist()} -> {new_dest_counts.tolist()}"
+                    )
 
         # Expand topk to include shared expert
         expanded_topk_ids, expanded_topk_weights, local_shared_mask = expand_topk_with_shared_expert(
