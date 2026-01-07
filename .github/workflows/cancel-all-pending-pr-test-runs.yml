@@ -7,7 +7,7 @@ on:
         description: 'Space-separated list of workflow filenames to cancel'
         required: true
         type: string
-        default: 'pr-test.yml pr-test-xeon.yml'
+        default: 'pr-test.yml'
 
 permissions:
   actions: write   # Needed to cancel runs
