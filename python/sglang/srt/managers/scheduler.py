@@ -674,9 +674,9 @@ class Scheduler(
                     params=params, sliding_window_size=self.sliding_window_size
                 )
             elif self.is_hybrid_ssm:
-                from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+                from sglang.srt.mem_cache.hybrid_tree.hybrid_radix_tree import HybridRadixTree
 
-                self.tree_cache = MambaRadixCache(params)
+                self.tree_cache = HybridRadixTree(params)
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
                     LMCRadixCache,

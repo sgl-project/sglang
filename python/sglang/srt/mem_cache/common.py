@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from sglang.srt.mem_cache.hybrid_tree.hybrid_radix_tree import HybridRadixTree
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
@@ -306,12 +307,12 @@ def alloc_req_slots(
         mamba_available_size = req_to_token_pool.mamba_pool.available_size()
         factor = (
             MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            if isinstance(tree_cache, MambaRadixCache)
+            if isinstance(tree_cache, (MambaRadixCache, HybridRadixTree))
             else MAMBA_STATE_PER_REQ_NO_CACHE
         )
         mamba_state_needed = num_reqs * factor
         if mamba_available_size < mamba_state_needed:
-            if tree_cache is not None and isinstance(tree_cache, MambaRadixCache):
+            if tree_cache is not None and isinstance(tree_cache, (MambaRadixCache, HybridRadixTree)):
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
                 tree_cache.evict_mamba(mamba_num)
         req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)

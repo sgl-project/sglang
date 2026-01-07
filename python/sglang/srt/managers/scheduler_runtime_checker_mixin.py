@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from sglang.srt.mem_cache.hybrid_tree.hybrid_radix_tree import HybridRadixTree
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
 from sglang.srt.utils.request_logger import disable_request_logging
@@ -29,7 +30,7 @@ class SchedulerRuntimeCheckerMixin:
         return num_used, token_usage, available_size, evictable_size
 
     def _get_mamba_token_info(self: Scheduler):
-        is_radix_tree = isinstance(self.tree_cache, MambaRadixCache)
+        is_radix_tree = isinstance(self.tree_cache, (MambaRadixCache, HybridRadixTree))
         full_available_size = self.token_to_kv_pool_allocator.available_size()
         full_evictable_size = (
             self.tree_cache.full_evictable_size() if is_radix_tree else 0
@@ -234,7 +235,7 @@ class SchedulerRuntimeCheckerMixin:
     def check_memory(self: Scheduler):
         if self.is_hybrid_swa:
             memory_leak, token_msg = self._check_hybrid_memory()
-        elif self.is_hybrid_ssm and isinstance(self.tree_cache, MambaRadixCache):
+        elif self.is_hybrid_ssm and isinstance(self.tree_cache, (MambaRadixCache, HybridRadixTree)):
             memory_leak, token_msg = self._check_mamba_memory()
         else:
             memory_leak, token_msg = self._check_radix_cache_memory()
@@ -308,7 +309,7 @@ class SchedulerRuntimeCheckerMixin:
 
     def check_tree_cache(self: Scheduler):
         if (self.is_hybrid_swa and isinstance(self.tree_cache, SWARadixCache)) or (
-            self.is_hybrid_ssm and isinstance(self.tree_cache, MambaRadixCache)
+            self.is_hybrid_ssm and isinstance(self.tree_cache, (MambaRadixCache, HybridRadixTree))
         ):
             self.tree_cache.sanity_check()
 
@@ -342,7 +343,7 @@ def create_scheduler_watchdog(
         if scheduler.is_hybrid_swa:
             _, info_msg = scheduler._check_hybrid_memory()
         elif scheduler.is_hybrid_ssm and isinstance(
-            scheduler.tree_cache, MambaRadixCache
+            scheduler.tree_cache, (MambaRadixCache, HybridRadixTree)
         ):
             _, info_msg = scheduler._check_mamba_memory()
         else:
