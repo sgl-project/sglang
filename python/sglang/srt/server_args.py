@@ -1135,7 +1135,11 @@ class ServerArgs:
                         # The default settings (P=flashmla_sparse, D=fa3) are for Hopper.
                         if major >= 10:
                             self.nsa_prefill_backend = "flashmla_sparse"
-                            self.nsa_decode_backend = "flashmla_sparse"
+                            self.nsa_decode_backend = (
+                                "flashinfer"
+                                if self.kv_cache_dtype == "bfloat16"
+                                else "flashmla_sparse"
+                            )
 
                 if self.enable_nsa_prefill_context_parallel:
                     assert (
