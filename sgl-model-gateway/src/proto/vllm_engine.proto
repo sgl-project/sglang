@@ -141,9 +141,6 @@ message GenerateComplete {
   // OutputLogProbs output_logprobs = 6;
   // InputLogProbs input_logprobs = 7;
 
-  // Routed experts information
-  google.protobuf.Struct routed_experts = 8;
-
   // Index for ordering when n>1 (for parallel request multiplexing)
   uint32 index = 9;
 }
