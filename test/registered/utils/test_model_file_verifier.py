@@ -229,12 +229,14 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
         generate_checksums(source=self.test_dir, output_path=checksums_file)
 
+        corrupted_file = None
         if corrupt_weights:
             safetensors_files = [
                 f for f in os.listdir(self.test_dir) if f.endswith(".safetensors")
             ]
             self.assertTrue(len(safetensors_files) > 0, "No safetensors files found")
-            _flip_bit_in_file(os.path.join(self.test_dir, safetensors_files[0]))
+            corrupted_file = safetensors_files[0]
+            _flip_bit_in_file(os.path.join(self.test_dir, corrupted_file))
 
         stdout_io, stderr_io = StringIO(), StringIO()
         try:
@@ -247,10 +249,8 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
             )
         except PopenLaunchServerError as e:
             self.assertTrue(corrupt_weights, f"Unexpected server failure: {e.output[-500:]}")
-            self.assertTrue(
-                "IntegrityError" in e.output or "mismatch" in e.output.lower(),
-                f"Expected integrity error, got: {e.output[-500:]}",
-            )
+            self.assertIn(corrupted_file, e.output, f"Expected {corrupted_file} in error")
+            self.assertIn("mismatch", e.output.lower(), f"Expected mismatch error: {e.output[-500:]}")
             return
 
         self.assertFalse(corrupt_weights, "Expected server to fail with corrupted weights")
