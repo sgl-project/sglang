@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -9,7 +10,12 @@ from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    FusedRMSNormAdd,
+    FusedRMSNormAddRMSNorm,
+    RMSNorm,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -240,10 +246,26 @@ class ZImageTransformerBlock(nn.Module):
         self.feed_forward = FeedForward(dim=dim, hidden_dim=int(dim / 3 * 8))
 
         self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
-
         self.attention_norm2 = RMSNorm(dim, eps=norm_eps)
+        self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
+
+        # Initialize fused kernels (no parameters, just operations)
+        try:
+            self.fused_attn_norm2_ffn_norm1 = FusedRMSNormAddRMSNorm(
+                hidden_size=dim, eps=norm_eps
+            )
+            self.fused_ffn_norm2_add = FusedRMSNormAdd(
+                hidden_size=dim, eps=norm_eps
+            )
+            self.use_fused_kernels = True
+            print(f"ZImageTransformerBlock layer {layer_id}: Using fused RMSNorm kernels")
+        except Exception as e:
+            print(
+                f"ZImageTransformerBlock layer {layer_id}: Failed to initialize fused kernels, "
+                f"falling back to original implementation. Error: {e}"
+            )
+            self.use_fused_kernels = False
 
         if modulation:
             self.adaLN_modulation = nn.Sequential(
@@ -284,14 +306,31 @@ class ZImageTransformerBlock(nn.Module):
                 self.attention_norm1(x),
                 freqs_cis=freqs_cis,
             )
-            x = x + self.attention_norm2(attn_out)
 
-            # FFN block
-            x = x + self.ffn_norm2(
-                self.feed_forward(
-                    self.ffn_norm1(x),
+            if self.use_fused_kernels:
+                # Fused: x = x + attention_norm2(attn_out); ffn_norm1(x)
+                # Pass weights directly to avoid parameter registration
+                x, ffn_input = self.fused_attn_norm2_ffn_norm1(
+                    x, attn_out,
+                    weight1=self.attention_norm2.weight,
+                    weight2=self.ffn_norm1.weight
                 )
-            )
+                # FFN block
+                ffn_out = self.feed_forward(ffn_input)
+                # Fused: x = x + ffn_norm2(ffn_out)
+                x = self.fused_ffn_norm2_add(
+                    x, ffn_out,
+                    weight=self.ffn_norm2.weight
+                )
+            else:
+                # Original implementation
+                x = x + self.attention_norm2(attn_out)
+                # FFN block
+                x = x + self.ffn_norm2(
+                    self.feed_forward(
+                        self.ffn_norm1(x),
+                    )
+                )
 
         return x
 
