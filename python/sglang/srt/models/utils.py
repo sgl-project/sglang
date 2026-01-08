@@ -233,7 +233,7 @@ def apply_qk_norm(
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-        and can_use_fused_inplace_qknorm(head_dim)
+        and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
             q=q.view(batch_size, -1, head_dim),
