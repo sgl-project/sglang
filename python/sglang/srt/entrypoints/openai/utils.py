@@ -5,6 +5,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
     LogProbs,
+    StreamOptions
 )
 
 logger = logging.getLogger(__name__)
@@ -70,3 +71,16 @@ def process_hidden_states_from_ret(
     if hidden_states is not None:
         hidden_states = hidden_states[-1] if len(hidden_states) > 1 else []
     return hidden_states
+
+
+def should_include_usage(
+    stream_options: StreamOptions | None, enable_force_include_usage: bool
+) -> tuple[bool, bool]:
+    if stream_options:
+        include_usage = stream_options.include_usage or enable_force_include_usage
+        continuous_usage_stats = include_usage and bool(
+            stream_options.continuous_usage_stats
+        )
+    else:
+        include_usage, continuous_usage_stats = enable_force_include_usage, False
+    return include_usage, continuous_usage_stats

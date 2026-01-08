@@ -38,6 +38,7 @@ from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
+    should_include_usage,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -549,6 +550,10 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
 
         try:
+            include_usage, continuous_usage_stats = should_include_usage(
+                request.stream_options,
+                self.tokenizer_manager.server_args.enable_force_include_usage)
+
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
@@ -617,10 +622,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
 
                         # Add usage stats if continuous_usage_stats is enabled
-                        if (
-                            request.stream_options
-                            and request.stream_options.continuous_usage_stats
-                        ):
+                        if continuous_usage_stats:
                             chunk.usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
@@ -672,10 +674,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
 
                         # Add usage stats if continuous_usage_stats is enabled
-                        if (
-                            request.stream_options
-                            and request.stream_options.continuous_usage_stats
-                        ):
+                        if continuous_usage_stats:
                             chunk.usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
@@ -740,7 +739,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
             # Additional usage chunk
-            if request.stream_options and request.stream_options.include_usage:
+            if include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
                     completion_tokens,
@@ -1140,6 +1139,10 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
 
+        include_usage, continuous_usage_stats = should_include_usage(
+            request.stream_options,
+            self.tokenizer_manager.server_args.enable_force_include_usage)
+
         # Yield normal text
         if normal_text:
             choice_data = ChatCompletionResponseStreamChoice(
@@ -1155,7 +1158,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             # Add usage stats if continuous_usage_stats is enabled
-            if request.stream_options and request.stream_options.continuous_usage_stats:
+            if continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
@@ -1205,7 +1208,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             # Add usage stats if continuous_usage_stats is enabled
-            if request.stream_options and request.stream_options.continuous_usage_stats:
+            if continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(

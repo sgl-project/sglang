@@ -20,6 +20,7 @@ from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
+    should_include_usage,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
@@ -204,6 +205,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
         hidden_states = {}
 
         try:
+            include_usage, continuous_usage_stats = should_include_usage(
+                request.stream_options,
+                self.tokenizer_manager.server_args.enable_force_include_usage)
+
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
@@ -275,10 +280,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 )
 
                 # Add usage stats if continuous_usage_stats is enabled
-                if (
-                    request.stream_options
-                    and request.stream_options.continuous_usage_stats
-                ):
+                if continuous_usage_stats:
                     chunk.usage = UsageProcessor.calculate_token_usage(
                         prompt_tokens=prompt_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
@@ -311,7 +313,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
             # Handle final usage chunk
-            if request.stream_options and request.stream_options.include_usage:
+            if include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
                     completion_tokens,
