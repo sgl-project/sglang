@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
+# Cannot use Pydantic to avoid dependency
 @dataclass
 class FileInfo:
     sha256: str
