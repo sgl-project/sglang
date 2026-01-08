@@ -121,7 +121,7 @@ def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
         raise IntegrityError(f"Failed to list files from HF repo {repo_id}: {e}")
 
     checksums = {
-        Path(f.get("name", "")).name: _get_checksum_from_hf_file(fs, f)
+        Path(f.get("name", "")).name: c
         for f in files
         if (c := _get_checksum_from_hf_file(fs, f)) is not None
     }
