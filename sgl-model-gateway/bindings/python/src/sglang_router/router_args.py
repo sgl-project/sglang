@@ -35,6 +35,8 @@ class RouterArgs:
     balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
+    enable_reactive_eviction: bool = True
+    reactive_eviction_threshold: float = 1.2
     max_idle_secs: int = 4 * 3600
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
@@ -267,6 +269,18 @@ class RouterArgs:
             type=float,
             default=RouterArgs.cache_threshold,
             help="Cache threshold (0.0-1.0) for cache-aware routing",
+        )
+        routing_group.add_argument(
+            f"--{prefix}enable-reactive-eviction",
+            action="store_true",
+            default=True,
+            help="Trigger cache eviction immediately when max-tree-size is exceeded",
+        )
+        routing_group.add_argument(
+            f"--{prefix}reactive-eviction-threshold",
+            type=float,
+            default=1.2,
+            help="Multiplier for max-tree-size to trigger reactive cache eviction (high-water mark)",
         )
         routing_group.add_argument(
             f"--{prefix}balance-abs-threshold",

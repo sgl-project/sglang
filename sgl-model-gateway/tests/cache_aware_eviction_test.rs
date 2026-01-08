@@ -6,47 +6,92 @@ use smg::{
 };
 
 #[tokio::test]
-async fn test_cache_aware_tree_growth_exceeds_limit() {
-    // 1. Setup config with a small max size and a very long eviction interval.
-    // This simulates a burst happening between two periodic eviction cycles.
+async fn test_reactive_eviction_limits_growth() {
+    // 1. Setup config: Max size 100, Reactive threshold 1.2 (High-water = 120)
     let max_tree_size = 100;
     let config = CacheAwareConfig {
-        cache_threshold: 0.5,
-        balance_abs_threshold: 1000,
-        balance_rel_threshold: 10.0,
-        eviction_interval_secs: 3600, // 1 hour interval (effectively no periodic eviction)
         max_tree_size,
+        enable_reactive_eviction: true,
+        reactive_eviction_threshold: 1.2,
+        eviction_interval_secs: 3600, // Disable background task to isolate reactive logic
+        ..Default::default()
     };
 
     let policy = CacheAwarePolicy::with_config(config);
-
-    // 2. Initialize with a worker.
-    // Fix for previous error: BasicWorkerBuilder uses .model(ModelCard::new(...))
+    let model_id = "test-model";
     let worker_url = "http://localhost:8001";
+
     let worker = Arc::new(
         BasicWorkerBuilder::new(worker_url)
-            .model(ModelCard::new("test-model"))
+            .model(ModelCard::new(model_id))
             .worker_type(WorkerType::Regular)
             .build(),
     );
     let workers: Vec<Arc<dyn Worker>> = vec![worker];
     policy.init_workers(&workers);
 
-    // 3. Send a burst of large, unique requests.
-    // Each request is 1000 characters, which is 10x the max_tree_size.
+    // 2. TRIGGER: Insert 1000 characters (10x the limit)
     let large_text = "a".repeat(1000);
     let info = SelectWorkerInfo {
         request_text: Some(&large_text),
         ..Default::default()
     };
 
-    // 4. ROUTING TRIGGER: This call inserts 1000 chars into the tree.
-    // Logic: In the current implementation, this returns successfully immediately.
-    // It DOES NOT check if the tree has grown beyond the 100-char limit.
+    // This call now triggers synchronous eviction internally
     policy.select_worker(&workers, &info);
 
-    // 5. Verification
-    // Manual intervention is required currently to enforce the limit.
-    // The fact that the system is now 900% over-budget confirms the stability risk.
-    policy.evict_cache(max_tree_size);
+    // 3. VERIFICATION
+    let current_size = policy.get_worker_cache_size(model_id, worker_url);
+
+    // The size should have been trimmed back to max_tree_size (100)
+    // because 1000 exceeded the high-water mark of 120.
+    assert!(
+        current_size <= 100,
+        "Tree size {} exceeded limit 100 despite reactive eviction",
+        current_size
+    );
+
+    println!(
+        "Success: Reactive eviction trimmed tree from 1000 down to {}",
+        current_size
+    );
+}
+
+#[tokio::test]
+async fn test_disabled_reactive_eviction_allows_growth() {
+    // Verify that the feature can be turned off (proving the test logic is sound)
+    let max_tree_size = 100;
+    let config = CacheAwareConfig {
+        max_tree_size,
+        enable_reactive_eviction: false, // Disabled
+        eviction_interval_secs: 3600,
+        ..Default::default()
+    };
+
+    let policy = CacheAwarePolicy::with_config(config);
+    let model_id = "test-model";
+    let worker_url = "http://localhost:8001";
+    let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
+        BasicWorkerBuilder::new(worker_url)
+            .model(ModelCard::new(model_id))
+            .build(),
+    )];
+    policy.init_workers(&workers);
+
+    policy.select_worker(
+        &workers,
+        &SelectWorkerInfo {
+            request_text: Some(&"a".repeat(1000)),
+            ..Default::default()
+        },
+    );
+
+    let current_size = policy.get_worker_cache_size(model_id, worker_url);
+
+    // Without reactive eviction, it should still be ~1000
+    assert!(current_size >= 1000);
+    println!(
+        "Confirmed: Growth is unbounded when reactive eviction is disabled (Size: {})",
+        current_size
+    );
 }

@@ -113,6 +113,8 @@ impl RouterConfigBuilder {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        enable_reactive_eviction: bool,
+        reactive_eviction_threshold: f32,
     ) -> Self {
         self.config.policy = PolicyConfig::CacheAware {
             cache_threshold,
@@ -120,6 +122,8 @@ impl RouterConfigBuilder {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            enable_reactive_eviction,
+            reactive_eviction_threshold,
         };
         self
     }

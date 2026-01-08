@@ -87,6 +87,14 @@ impl CacheAwarePolicy {
     pub fn new() -> Self {
         Self::with_config(CacheAwareConfig::default())
     }
+    /// Get the current character count in the tree for a specific worker and model.
+    /// Useful for testing and monitoring.
+    pub fn get_worker_cache_size(&self, model_id: &str, worker_url: &str) -> usize {
+        self.trees
+            .get(model_id)
+            .and_then(|tree| tree.tenant_char_count.get(worker_url).map(|v| *v.value()))
+            .unwrap_or(0)
+    }
 
     pub fn with_config(config: CacheAwareConfig) -> Self {
         let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
@@ -195,6 +203,30 @@ impl CacheAwarePolicy {
             );
         }
     }
+    /// Helper to trigger eviction if a worker's cache exceeds the high-water mark.
+    fn check_reactive_eviction(&self, tree: &Tree, worker_url: &str) {
+        if !self.config.enable_reactive_eviction {
+            return;
+        }
+
+        let current_size = tree
+            .tenant_char_count
+            .get(worker_url)
+            .map(|v| *v.value())
+            .unwrap_or(0);
+
+        let high_water_mark =
+            (self.config.max_tree_size as f32 * self.config.reactive_eviction_threshold) as usize;
+
+        if current_size > high_water_mark {
+            debug!(
+                "Reactive eviction triggered for worker {} (size: {} > high-water: {})",
+                worker_url, current_size, high_water_mark
+            );
+            // Evict back down to the configured max size
+            tree.evict_tenant_by_size(self.config.max_tree_size);
+        }
+    }
 
     fn select_worker_min_load(
         &self,
@@ -229,7 +261,9 @@ impl CacheAwarePolicy {
 
             if let Some(tree) = tree {
                 // Now we can work with the tree without holding the HashMap lock
+                let url = workers[min_load_idx].url();
                 tree.insert(text, workers[min_load_idx].url());
+                self.check_reactive_eviction(&tree, url);
             } else {
                 debug!(
                     "Warning: No tree found for model '{}', skipping cache update",
@@ -314,8 +348,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             if let Some(idx) = selected_idx {
+                let url = workers[idx].url();
                 // Update the tree with this request (use worker URL directly, no allocation)
                 tree.insert(text, workers[idx].url());
+                self.check_reactive_eviction(&tree, url);
 
                 // Increment processed counter
                 workers[idx].increment_processed();
