@@ -182,6 +182,7 @@ class TestModelFileVerifierE2E(unittest.TestCase):
                     "verify",
                     "--model-path",
                     test_dir,
+                    "--model-checksum",
                 ],
                 capture_output=True,
                 text=True,
@@ -198,12 +199,58 @@ class TestModelFileVerifierE2E(unittest.TestCase):
                     "verify",
                     "--model-path",
                     test_dir,
+                    "--model-checksum",
                 ],
                 capture_output=True,
                 text=True,
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("mismatch", result.stderr.lower())
+
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_cli_verify_with_explicit_checksum_file(self):
+        import subprocess
+        import sys
+
+        test_dir = tempfile.mkdtemp()
+        try:
+            create_test_file(test_dir, "model.safetensors", b"test content " * 100)
+            create_test_file(test_dir, "config.json", b'{"test": true}')
+
+            checksums_path = os.path.join(test_dir, "my_checksums.json")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "sglang.srt.utils.model_file_verifier",
+                    "generate",
+                    "--model-path",
+                    test_dir,
+                    "--output",
+                    checksums_path,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"Generate failed: {result.stderr}")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "sglang.srt.utils.model_file_verifier",
+                    "verify",
+                    "--model-path",
+                    test_dir,
+                    "--model-checksum",
+                    checksums_path,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"Verify failed: {result.stderr}")
 
         finally:
             shutil.rmtree(test_dir, ignore_errors=True)

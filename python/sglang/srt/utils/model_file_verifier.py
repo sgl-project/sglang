@@ -239,8 +239,12 @@ def main():
         "--model-path", required=True, help="Path to model directory"
     )
     verify_parser.add_argument(
-        "--checksums",
-        help="Checksums source: JSON file path or HuggingFace repo ID (default: <model-path>/checksums.json)",
+        "--model-checksum",
+        nargs="?",
+        const="",
+        default=None,
+        help="Checksums source: JSON file path or HuggingFace repo ID. "
+        "If specified without value, uses <model-path>/checksums.json",
     )
     verify_parser.add_argument(
         "--workers", type=int, default=4, help="Number of parallel workers"
@@ -249,9 +253,15 @@ def main():
     args = parser.parse_args()
 
     try:
+        checksums_source = getattr(args, "model_checksum", None)
+        if checksums_source == "":
+            checksums_source = os.path.join(
+                args.model_path, ModelFileVerifier.CHECKSUM_FILENAME
+            )
+
         verifier = ModelFileVerifier(
             model_path=args.model_path,
-            checksums_source=getattr(args, "checksums", None),
+            checksums_source=checksums_source,
             max_workers=args.workers,
         )
 

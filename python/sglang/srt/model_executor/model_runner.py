@@ -831,7 +831,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
             model_loader_extra_config=self.server_args.model_loader_extra_config,
-            model_checksum=self.server_args.model_checksum,
             tp_rank=self.tp_rank,
             remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
