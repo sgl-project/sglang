@@ -373,12 +373,12 @@ def _setup_cloud_backend(
         gateway_config: Gateway configuration from marker.
     """
     import openai
-    from backends import CLOUD_RUNTIMES, launch_cloud_gateway
+    from infra import THIRD_PARTY_MODELS, launch_cloud_gateway
 
-    if backend_name not in CLOUD_RUNTIMES:
+    if backend_name not in THIRD_PARTY_MODELS:
         pytest.fail(f"Unknown cloud runtime: {backend_name}")
 
-    cfg = CLOUD_RUNTIMES[backend_name]
+    cfg = THIRD_PARTY_MODELS[backend_name]
     api_key_env = cfg.get("api_key_env")
 
     if api_key_env and not os.environ.get(api_key_env):
