@@ -34,3 +34,5 @@ class CacheInitParams:
 
     pp_rank: int = 0
     pp_size: int = 1
+
+    chunked_prefill_size: Optional[int] = None

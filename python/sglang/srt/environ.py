@@ -325,6 +325,10 @@ class Envs:
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
 
+    # NSA Backend
+    SGLANG_NSA_FUSE_TOPK = EnvBool(True)
+    SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
@@ -417,6 +421,12 @@ class Envs:
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+
+    # Tokenizer
+    SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
+
+    # TokenizerManager
+    SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
     # fmt: on
 

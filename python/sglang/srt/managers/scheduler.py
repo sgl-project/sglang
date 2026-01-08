@@ -16,12 +16,12 @@
 import faulthandler
 import logging
 import os
-import pickle
 import signal
 import sys
 import time
 from collections import deque
 from concurrent import futures
+from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -117,7 +117,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
-from sglang.srt.managers.prefill_delayer import PrefillDelayer
+from sglang.srt.managers.prefill_delayer import (
+    PrefillDelayer,
+    PrefillDelayerSinglePassExecutor,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
@@ -645,6 +648,7 @@ class Scheduler(
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            chunked_prefill_size=server_args.chunked_prefill_size,
         )
 
         if (
@@ -828,6 +832,9 @@ class Scheduler(
                 attn_tp_size=self.attn_tp_size,
                 tp_worker=self.tp_worker,
                 server_args=self.server_args,
+                metrics_collector=(
+                    self.metrics_collector if self.enable_metrics else None
+                ),
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
@@ -1211,41 +1218,6 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
-    def _parse_multipart_message(self, parts):
-        # Check message type
-        msg_type = bytes(parts[0])
-
-        if msg_type == b"NORM":
-            # Normal message
-            recv_req = pickle.loads(parts[1])
-
-        elif msg_type == b"FEAT":
-            # Message with optimized feature tensors
-            recv_req = pickle.loads(parts[1])
-            feature_infos = pickle.loads(parts[2])
-
-            # Reconstruct tensors
-            for i, feature_info in enumerate(feature_infos):
-                buffer_idx = 3 + i
-                buffer = (
-                    parts[buffer_idx].buffer
-                    if hasattr(parts[buffer_idx], "buffer")
-                    else parts[buffer_idx]
-                )
-
-                dtype = feature_info["dtype"]
-                shape = feature_info["shape"]
-                tensor = torch.frombuffer(buffer, dtype=dtype).reshape(shape)
-
-                idx = feature_info["idx"]
-                if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
-                    mm_items = recv_req.mm_inputs.get("mm_items", [])
-                    if idx < len(mm_items):
-                        mm_items[idx].feature = tensor
-        else:
-            logger.warning(f"Unknown message type: {msg_type}")
-        return recv_req
-
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1266,15 +1238,10 @@ class Scheduler(
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        parts = self.recv_from_tokenizer.recv_multipart(
-                            flags=zmq.NOBLOCK, copy=False
-                        )
-                        if not parts:
-                            break
-                        recv_req = self._parse_multipart_message(parts)
-                        recv_reqs.append(recv_req)
-                    except zmq.ZMQError as e:
+                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    except zmq.ZMQError:
                         break
+                    recv_reqs.append(recv_req)
 
                 while True:
                     try:
@@ -1937,6 +1904,18 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+        with (
+            PrefillDelayerSinglePassExecutor(self.prefill_delayer)
+            if self.prefill_delayer
+            else nullcontext()
+        ) as prefill_delayer_single_pass:
+            return self._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=prefill_delayer_single_pass
+            )
+
+    def _get_new_batch_prefill_raw(
+        self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
+    ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1945,20 +1924,9 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        # The `should_allow_prefill` needs to be called on all ranks since contains communication
-        delayer_allow_prefill = (
-            self.prefill_delayer.should_allow_prefill(
-                # TODO: consider offline generation cases when there are a lot of waiting requests
-                local_prefillable=len(self.waiting_queue)
-                > 0,
-            )
-            if self.prefill_delayer
-            else True
-        )
-        if (not delayer_allow_prefill) or (
-            (self.running_batch.batch_is_full or len(self.waiting_queue) == 0)
-            and self.chunked_req is None
-        ):
+        if (
+            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.chunked_req is None:
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -2007,6 +1975,7 @@ class Scheduler(
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
         )
 
         if self.chunked_req is not None:
@@ -2574,6 +2543,7 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
+        ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
