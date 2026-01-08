@@ -13,7 +13,6 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::context::ResponsesContext;
 use crate::{
     data_connector::{self, ConversationId, ResponseId},
     mcp::{self, McpManager},
@@ -25,7 +24,7 @@ use crate::{
             ResponseOutputItem, ResponsesRequest,
         },
     },
-    routers::error,
+    routers::{error, grpc::common::responses::ResponsesContext},
 };
 
 // ============================================================================
@@ -115,10 +114,18 @@ pub(super) fn prepare_chat_tools_and_choice(
     };
 }
 
+/// Tool call extracted from a ChatCompletionResponse
+#[derive(Debug, Clone)]
+pub(super) struct ExtractedToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
 /// Extract all tool calls from chat response (for parallel tool call support)
 pub(super) fn extract_all_tool_calls_from_chat(
     response: &crate::protocols::chat::ChatCompletionResponse,
-) -> Vec<(String, String, String)> {
+) -> Vec<ExtractedToolCall> {
     // Check if response has choices with tool calls
     let Some(choice) = response.choices.first() else {
         return Vec::new();
@@ -129,16 +136,14 @@ pub(super) fn extract_all_tool_calls_from_chat(
     if let Some(tool_calls) = &message.tool_calls {
         tool_calls
             .iter()
-            .map(|tool_call| {
-                (
-                    tool_call.id.clone(),
-                    tool_call.function.name.clone(),
-                    tool_call
-                        .function
-                        .arguments
-                        .clone()
-                        .unwrap_or_else(|| "{}".to_string()),
-                )
+            .map(|tool_call| ExtractedToolCall {
+                call_id: tool_call.id.clone(),
+                name: tool_call.function.name.clone(),
+                arguments: tool_call
+                    .function
+                    .arguments
+                    .clone()
+                    .unwrap_or_else(|| "{}".to_string()),
             })
             .collect()
     } else {
@@ -175,8 +180,9 @@ pub(super) fn generate_mcp_id(prefix: &str) -> String {
 pub(super) fn build_mcp_list_tools_item(
     mcp: &Arc<McpManager>,
     server_label: &str,
+    server_keys: &[String],
 ) -> ResponseOutputItem {
-    let tools = mcp.list_tools();
+    let tools = mcp.list_tools_for_servers(server_keys);
     let tools_info: Vec<McpToolInfo> = tools
         .iter()
         .map(|t| McpToolInfo {
