@@ -43,36 +43,32 @@ jobs:
             gh run list \
               --repo "$REPO" \
               --workflow "$workflow_file" \
-              --json databaseId,status,event,pullRequests \
+              --json databaseId,status,event,url \
               --limit 1000 \
               | jq -c '.[]
                   | select((.status=="queued" or .status=="waiting" or .status=="in_progress") and .event=="pull_request")' \
-              | while read -r run; do
+            | while read -r run; do
+                run_id=$(echo "$run" | jq -r '.databaseId')
+                run_url=$(echo "$run" | jq -r '.url // empty')
 
-                  run_id=$(echo "$run" | jq -r '.databaseId')
-                  pr_number=$(echo "$run" | jq -r '.pullRequests[0].number')
+                pr_number=$(gh api "repos/$REPO/actions/runs/$run_id" \
+                  --jq '.pull_requests[0].number // empty' 2>/dev/null || true)
 
-                  # Safety check
-                  if [ "$pr_number" = "null" ] || [ -z "$pr_number" ]; then
-                    echo "⚠️ Run $run_id has no associated PR, skipping"
-                    continue
-                  fi
+                if [ -z "$pr_number" ]; then
+                  echo "⚠️ Run $run_id has no associated PR, skipping ($run_url)"
+                  continue
+                fi
 
-                  echo "Run $run_id is associated with PR #$pr_number"
+                labels=$(gh pr view "$pr_number" --repo "$REPO" --json labels \
+                  | jq -r '.labels[].name' || true)
 
-                  # Fetch PR labels
-                  labels=$(gh pr view "$pr_number" \
-                    --repo "$REPO" \
-                    --json labels \
-                    | jq -r '.labels[].name' || true)
+                if echo "$labels" | grep -Fxq "high priority"; then
+                  echo "🛑 PR #$pr_number has label 'high priority' → skip cancel"
+                  continue
+                fi
 
-                  if echo "$labels" | grep -Fxq "high priority"; then
-                    echo "🛑 PR #$pr_number has label 'high priority' → skip cancel"
-                    continue
-                  fi
-
-                  echo "🚫 Cancelling run $run_id (PR #$pr_number has no high-priority label)"
-                  gh run cancel "$run_id" --repo "$REPO" \
-                    || echo "⚠️ Could not cancel run $run_id (already completed or no permission?)"
-                done
+                echo "🚫 Cancelling run $run_id (PR #$pr_number) $run_url"
+                gh run cancel "$run_id" --repo "$REPO" \
+                  || echo "⚠️ Could not cancel run $run_id"
+            done
           done
