@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
 from contextlib import nullcontext
 from io import StringIO
 
@@ -111,11 +112,55 @@ class TestModelFileVerifier(_FakeModelTestCase):
             )
 
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        checksums = generate_checksums(
+        result = generate_checksums(
             source=self.test_dir, output_path=checksums_file, max_workers=4
         )
 
-        self.assertGreaterEqual(len(checksums), 10)
+        self.assertGreaterEqual(len(result.files), 10)
+
+    def test_generated_json_snapshot(self):
+        checksums_file = os.path.join(self.test_dir, "checksums.json")
+        generate_checksums(source=self.test_dir, output_path=checksums_file)
+
+        with open(checksums_file) as f:
+            data = json.load(f)
+
+        expected = {
+            "files": {
+                "config.json": {
+                    "sha256": "81dddc8c379baae137d99d24c5fa081d3a5ce52b6a221ddc22fe364711f8beaf",
+                    "size": 23,
+                },
+                "model.safetensors": {
+                    "sha256": "eb0c73a48a89fefb6b68dd41af830d75610c885135eac99139373b04705d05f3",
+                    "size": 2500,
+                },
+                "tokenizer.json": {
+                    "sha256": "4e3043229142b64d998563bc543ce034e0a2251af5d404995e3afcb8ce8850df",
+                    "size": 18,
+                },
+            }
+        }
+        self.assertEqual(data, expected)
+
+    def test_legacy_checksums_format_deprecated(self):
+        legacy_data = {
+            "checksums": {
+                "model.safetensors": "eb0c73a48a89fefb6b68dd41af830d75610c885135eac99139373b04705d05f3",
+                "config.json": "81dddc8c379baae137d99d24c5fa081d3a5ce52b6a221ddc22fe364711f8beaf",
+                "tokenizer.json": "4e3043229142b64d998563bc543ce034e0a2251af5d404995e3afcb8ce8850df",
+            }
+        }
+        legacy_file = os.path.join(self.test_dir, "legacy_checksums.json")
+        with open(legacy_file, "w") as f:
+            json.dump(legacy_data, f)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            verify(model_path=self.test_dir, checksums_source=legacy_file)
+            self.assertEqual(len(w), 1)
+            self.assertTrue(issubclass(w[0].category, DeprecationWarning))
+            self.assertIn("deprecated", str(w[0].message).lower())
 
 
 # ======== CLI Tests ========
@@ -144,8 +189,8 @@ class TestModelFileVerifierCLI(_FakeModelTestCase):
 
         with open(checksums_file) as f:
             data = json.load(f)
-        self.assertIn("checksums", data)
-        self.assertEqual(len(data["checksums"]), 3)
+        self.assertIn("files", data)
+        self.assertEqual(len(data["files"]), 3)
 
     def test_cli_verify_success(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
@@ -204,12 +249,12 @@ class TestModelFileVerifierHF(_RealModelTestCase):
 
     def test_generate_checksums_from_hf(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        checksums = generate_checksums(source=MODEL_NAME, output_path=checksums_file)
+        result = generate_checksums(source=MODEL_NAME, output_path=checksums_file)
 
         self.assertTrue(os.path.exists(checksums_file))
-        self.assertGreater(len(checksums), 0)
-        for filename, sha256 in checksums.items():
-            self.assertEqual(len(sha256), 64)
+        self.assertGreater(len(result.files), 0)
+        for filename, file_info in result.files.items():
+            self.assertEqual(len(file_info.sha256), 64)
 
     def test_verify_with_hf_checksums_source(self):
         verify(model_path=self.test_dir, checksums_source=MODEL_NAME)
