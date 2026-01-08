@@ -2006,14 +2006,11 @@ class Scheduler(
                     | set([req.lora_id])
                 )
                 if not self.tp_worker.can_run_lora_batch(new_lora_set):
-                    # If this is a LoRA request that would exceed the LoRA slot limit,
-                    # skip it and continue to try scheduling non-LoRA requests.
-                    # Non-LoRA requests (lora_id=None) share a single reserved slot
-                    # and should never cause this check to fail.
-                    if req.lora_id is not None:
-                        # Skip this LoRA request - it would trigger adapter eviction/loading
-                        # which is slow. We'll try to schedule it in a future iteration.
-                        continue
+                    # Batch would exceed the LoRA slot limit.
+                    # Skip this request and try scheduling it in a future iteration.
+                    # Note: When eviction is needed, the eviction policy prefers to
+                    # evict LoRA adapters over base model (None) - see mem_pool.py.
+                    continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
