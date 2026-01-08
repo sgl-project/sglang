@@ -22,11 +22,12 @@ use crate::{
 /// Ensure MCP connection succeeds if MCP tools are declared
 ///
 /// Checks if request declares MCP tools, and if so, validates that
-/// the MCP client can be created and connected.
+/// the MCP clients can be created and connected.
+/// Returns Ok((has_mcp_tools, server_keys)) on success.
 pub(crate) async fn ensure_mcp_connection(
     mcp_manager: &Arc<McpManager>,
     tools: Option<&[ResponseTool]>,
-) -> Result<bool, Response> {
+) -> Result<(bool, Vec<String>), Response> {
     let has_mcp_tools = tools
         .map(|t| {
             t.iter()
@@ -36,23 +37,25 @@ pub(crate) async fn ensure_mcp_connection(
 
     if has_mcp_tools {
         if let Some(tools) = tools {
-            if ensure_request_mcp_client(mcp_manager, tools)
-                .await
-                .is_none()
-            {
-                error!(
-                    function = "ensure_mcp_connection",
-                    "Failed to connect to MCP server"
-                );
-                return Err(error::failed_dependency(
-                    "connect_mcp_server_failed",
-                    "Failed to connect to MCP server. Check server_url and authorization.",
-                ));
+            match ensure_request_mcp_client(mcp_manager, tools).await {
+                Some((_manager, server_keys)) => {
+                    return Ok((true, server_keys));
+                }
+                None => {
+                    error!(
+                        function = "ensure_mcp_connection",
+                        "Failed to connect to MCP servers"
+                    );
+                    return Err(error::failed_dependency(
+                        "connect_mcp_server_failed",
+                        "Failed to connect to MCP servers. Check server_url and authorization.",
+                    ));
+                }
             }
         }
     }
 
-    Ok(has_mcp_tools)
+    Ok((false, Vec::new()))
 }
 
 /// Validate that workers are available for the requested model
