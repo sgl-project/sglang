@@ -3,6 +3,8 @@
 import argparse
 import asyncio
 import copy
+import doctest
+import inspect
 import json
 import logging
 import os
@@ -19,7 +21,7 @@ from datetime import datetime
 from functools import partial, wraps
 from io import BytesIO
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
@@ -59,6 +61,8 @@ DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instru
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
+# Hybrid Mamba models
+DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 # VL test models
 DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
@@ -750,6 +754,7 @@ def get_similarities(vec1, vec2):
 
 def get_benchmark_args(
     base_url="",
+    backend="sglang",
     dataset_name="",
     dataset_path="",
     tokenizer="",
@@ -767,9 +772,16 @@ def get_benchmark_args(
     lora_name=None,
     lora_request_distribution="uniform",
     lora_zipf_alpha=1.5,
+    gsp_num_groups=4,
+    gsp_prompts_per_group=4,
+    gsp_system_prompt_len=128,
+    gsp_question_len=32,
+    gsp_output_len=32,
+    gsp_num_turns=1,
+    header=None,
 ):
     return SimpleNamespace(
-        backend="sglang",
+        backend=backend,
         base_url=base_url,
         host=None,
         port=None,
@@ -801,6 +813,13 @@ def get_benchmark_args(
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
+        gsp_num_groups=gsp_num_groups,
+        gsp_prompts_per_group=gsp_prompts_per_group,
+        gsp_system_prompt_len=gsp_system_prompt_len,
+        gsp_question_len=gsp_question_len,
+        gsp_output_len=gsp_output_len,
+        gsp_num_turns=gsp_num_turns,
+        header=header,
     )
 
 
@@ -1952,6 +1971,18 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
         return wrapper
 
     return decorator
+
+
+def run_doctests(obj: Callable[..., Any] | ModuleType):
+    mod = inspect.getmodule(obj)
+    globals = dict(mod.__dict__)
+    finder = doctest.DocTestFinder()
+    runner = doctest.DocTestRunner(verbose=True)
+    tests = finder.find(obj, obj.__name__, globs=globals)
+    assert len(tests) >= 1, f"No tests found for {obj.__name__}"
+    for test in tests:
+        result = runner.run(test)
+        assert result.failed == 0, f"Test {test.name} failed"
 
 
 def dump_metric(metric_name: str, value: Any, labels: Optional[dict] = None):

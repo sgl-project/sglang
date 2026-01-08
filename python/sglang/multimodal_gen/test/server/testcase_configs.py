@@ -374,6 +374,14 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         MULTI_IMAGE_TI2I_sampling_params,
     ),
     DiffusionTestCase(
+        "qwen_image_edit_2511_ti2i",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Edit-2511",
+            modality="image",
+        ),
+        TI2I_sampling_params,
+    ),
+    DiffusionTestCase(
         "qwen_image_layered_i2i",
         DiffusionServerArgs(
             model_path="Qwen/Qwen-Image-Layered",
@@ -567,6 +575,16 @@ TWO_GPU_CASES_B = [
             # test ring attn
             ulysses_degree=1,
             ring_degree=2,
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "zimage_image_t2i_2_gpus",
+        DiffusionServerArgs(
+            model_path="Tongyi-MAI/Z-Image-Turbo",
+            modality="image",
+            num_gpus=2,
+            ulysses_degree=2,
         ),
         T2I_sampling_params,
     ),
