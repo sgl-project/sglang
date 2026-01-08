@@ -35,9 +35,7 @@ class TestChatCompletion:
 
     @pytest.mark.parametrize("logprobs", [None, 5])
     @pytest.mark.parametrize("parallel_sample_num", [1, 2])
-    def test_chat_completion_stream(
-        self, setup_backend, logprobs, parallel_sample_num
-    ):
+    def test_chat_completion_stream(self, setup_backend, logprobs, parallel_sample_num):
         """Test streaming chat completion with logprobs and parallel sampling."""
         _, model, client, gateway = setup_backend
         self._run_chat_completion_stream(client, model, logprobs, parallel_sample_num)
@@ -284,7 +282,6 @@ The SmartHome Mini is a compact smart home assistant available in black or white
 @pytest.mark.gateway(
     extra_args=["--reasoning-parser=gpt-oss", "--history-backend", "memory"]
 )
-@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestChatCompletionGptOss(TestChatCompletion):
     """Tests for chat completions API with GPT-OSS model.
 
@@ -300,9 +297,7 @@ class TestChatCompletionGptOss(TestChatCompletion):
 
     @pytest.mark.parametrize("logprobs", [None])  # No logprobs for OSS
     @pytest.mark.parametrize("parallel_sample_num", [1, 2])
-    def test_chat_completion_stream(
-        self, setup_backend, logprobs, parallel_sample_num
-    ):
+    def test_chat_completion_stream(self, setup_backend, logprobs, parallel_sample_num):
         """Test streaming chat completion with parallel sampling (no logprobs)."""
         super().test_chat_completion_stream(
             setup_backend, logprobs, parallel_sample_num
