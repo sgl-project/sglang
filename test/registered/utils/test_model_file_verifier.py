@@ -214,6 +214,7 @@ class TestModelFileVerifierHF(_RealModelTestCase):
 class TestModelFileVerifierWithRealModel(_RealModelTestCase):
 
     def _run_server_test(self, *, corrupt_weights: bool):
+        from contextlib import nullcontext
         from io import StringIO
 
         import requests
@@ -239,7 +240,8 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
             _flip_bit_in_file(os.path.join(self.test_dir, corrupted_file))
 
         stdout_io, stderr_io = StringIO(), StringIO()
-        try:
+        ctx = self.assertRaises(PopenLaunchServerError) if corrupt_weights else nullcontext()
+        with ctx:
             process = popen_launch_server(
                 model=self.test_dir,
                 base_url=DEFAULT_URL_FOR_TEST,
@@ -247,22 +249,20 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
                 other_args=["--model-checksum", checksums_file],
                 return_stdout_stderr=(stdout_io, stderr_io),
             )
-        except PopenLaunchServerError as e:
-            self.assertTrue(corrupt_weights, f"Unexpected server failure: {e.output[-500:]}")
-            self.assertIn(corrupted_file, e.output, f"Expected {corrupted_file} in error")
-            self.assertIn("mismatch", e.output.lower(), f"Expected mismatch error: {e.output[-500:]}")
-            return
 
-        self.assertFalse(corrupt_weights, "Expected server to fail with corrupted weights")
-        try:
-            response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/generate",
-                json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
-            )
-            self.assertEqual(response.status_code, 200)
-            self.assertIn("text", response.json())
-        finally:
-            kill_process_tree(process.pid)
+        if corrupt_weights:
+            self.assertIn(corrupted_file, ctx.exception.output)
+            self.assertIn("mismatch", ctx.exception.output.lower())
+        else:
+            try:
+                response = requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/generate",
+                    json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("text", response.json())
+            finally:
+                kill_process_tree(process.pid)
 
     def test_server_launch_with_checksum_intact(self):
         self._run_server_test(corrupt_weights=False)
