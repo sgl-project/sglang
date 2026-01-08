@@ -3,7 +3,7 @@ use std::{
     collections::{BinaryHeap, HashMap, VecDeque},
     hash::{BuildHasherDefault, Hasher},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock,
     },
 };
@@ -247,6 +247,8 @@ pub struct Tree {
     root: NodeRef,
     /// Per-tenant character count for size tracking. Using TenantId for consistency.
     pub tenant_char_count: DashMap<TenantId, usize>,
+    /// Global character count for all tenants in this tree.
+    pub total_char_count: AtomicUsize,
 }
 
 // For the heap
@@ -356,6 +358,7 @@ impl Tree {
                 last_tenant: parking_lot::RwLock::new(None),
             }),
             tenant_char_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
+            total_char_count: AtomicUsize::new(0),
         }
     }
 
@@ -369,10 +372,6 @@ impl Tree {
         // Ensure tenant exists at root (don't update timestamp - root is never evicted)
         self.root
             .tenant_last_access_time
-            .entry(Arc::clone(&tenant_id))
-            .or_insert(0);
-
-        self.tenant_char_count
             .entry(Arc::clone(&tenant_id))
             .or_insert(0);
 
@@ -412,8 +411,16 @@ impl Tree {
                     // Attach tenant to the new leaf node with timestamp
                     self.tenant_char_count
                         .entry(Arc::clone(&tenant_id))
-                        .and_modify(|count| *count += remaining_char_count)
-                        .or_insert(remaining_char_count);
+                        .and_modify(|count| {
+                            *count += remaining_char_count;
+                            self.total_char_count
+                                .fetch_add(remaining_char_count, Ordering::Relaxed);
+                        })
+                        .or_insert_with(|| {
+                            self.total_char_count
+                                .fetch_add(remaining_char_count, Ordering::Relaxed);
+                            remaining_char_count
+                        });
                     new_node
                         .tenant_last_access_time
                         .insert(Arc::clone(&tenant_id), epoch);
@@ -469,8 +476,16 @@ impl Tree {
                         {
                             self.tenant_char_count
                                 .entry(Arc::clone(&tenant_id))
-                                .and_modify(|count| *count += matched_text_count)
-                                .or_insert(matched_text_count);
+                                .and_modify(|count| {
+                                    *count += matched_text_count;
+                                    self.total_char_count
+                                        .fetch_add(matched_text_count, Ordering::Relaxed);
+                                })
+                                .or_insert_with(|| {
+                                    self.total_char_count
+                                        .fetch_add(matched_text_count, Ordering::Relaxed);
+                                    matched_text_count
+                                });
                             new_node
                                 .tenant_last_access_time
                                 .insert(Arc::clone(&tenant_id), 0);
@@ -491,8 +506,16 @@ impl Tree {
                         {
                             self.tenant_char_count
                                 .entry(Arc::clone(&tenant_id))
-                                .and_modify(|count| *count += matched_node_text_count)
-                                .or_insert(matched_node_text_count);
+                                .and_modify(|count| {
+                                    *count += matched_node_text_count;
+                                    self.total_char_count
+                                        .fetch_add(matched_node_text_count, Ordering::Relaxed);
+                                })
+                                .or_insert_with(|| {
+                                    self.total_char_count
+                                        .fetch_add(matched_node_text_count, Ordering::Relaxed);
+                                    matched_node_text_count
+                                });
                             matched_node
                                 .tenant_last_access_time
                                 .insert(Arc::clone(&tenant_id), 0);
@@ -715,6 +738,104 @@ impl Tree {
             .collect()
     }
 
+    /// Evicts the oldest nodes globally until the total tree size is under max_size.
+    pub fn evict_aggregate_by_size(&self, max_size: usize) {
+        let mut total_size = self.total_char_count.load(Ordering::Relaxed);
+        if total_size <= max_size {
+            return;
+        }
+
+        // Calculate used size and collect leaves
+        let mut stack = vec![Arc::clone(&self.root)];
+        let mut pq = BinaryHeap::new();
+
+        while let Some(curr) = stack.pop() {
+            for child in curr.children.iter() {
+                stack.push(Arc::clone(child.value()));
+            }
+
+            // Add leaves from all tenants to priority queue
+            for tenant in Tree::leaf_of(&curr) {
+                if let Some(timestamp) = curr.tenant_last_access_time.get(tenant.as_ref()) {
+                    pq.push(Reverse(EvictionEntry {
+                        timestamp: *timestamp,
+                        tenant: Arc::clone(&tenant),
+                        node: Arc::clone(&curr),
+                    }));
+                }
+            }
+        }
+
+        // Process global eviction
+        while total_size > max_size {
+            let Reverse(entry) = match pq.pop() {
+                Some(e) => e,
+                None => break,
+            };
+
+            let EvictionEntry { tenant, node, .. } = entry;
+
+            // Verify this node is still a leaf for this tenant
+            let is_still_leaf = node.tenant_last_access_time.contains_key(tenant.as_ref())
+                && !node.children.iter().any(|child| {
+                    child
+                        .value()
+                        .tenant_last_access_time
+                        .contains_key(tenant.as_ref())
+                });
+            if !is_still_leaf {
+                continue;
+            }
+
+            let node_len = node.text.read().unwrap().char_count();
+
+            // Decrement per-tenant and global total
+            self.tenant_char_count
+                .entry(Arc::clone(&tenant))
+                .and_modify(|count| {
+                    *count = count.saturating_sub(node_len);
+                });
+            self.total_char_count.fetch_sub(node_len, Ordering::Relaxed);
+
+            // Remove tenant from node
+            node.tenant_last_access_time.remove(tenant.as_ref());
+
+            let parent_opt = node.parent.read().unwrap().clone();
+
+            // Remove empty nodes
+            if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
+                if let Some(ref parent) = parent_opt {
+                    if let Some(fc) = node.text.read().unwrap().first_char() {
+                        parent.children.remove(&fc);
+                    }
+                }
+            }
+
+            // If parent becomes a leaf for this tenant, add to PQ
+            if let Some(ref parent) = parent_opt {
+                if parent.tenant_last_access_time.contains_key(tenant.as_ref()) {
+                    let has_child_with_tenant = parent.children.iter().any(|child| {
+                        child
+                            .value()
+                            .tenant_last_access_time
+                            .contains_key(tenant.as_ref())
+                    });
+                    if !has_child_with_tenant {
+                        if let Some(timestamp) = parent.tenant_last_access_time.get(tenant.as_ref())
+                        {
+                            pq.push(Reverse(EvictionEntry {
+                                timestamp: *timestamp,
+                                tenant: Arc::clone(&tenant),
+                                node: Arc::clone(parent),
+                            }));
+                        }
+                    }
+                }
+            }
+            total_size = self.total_char_count.load(Ordering::Relaxed);
+        }
+    }
+
     pub fn evict_tenant_by_size(&self, max_size: usize) {
         // Calculate used size and collect leaves
         let mut stack = vec![Arc::clone(&self.root)];
@@ -772,6 +893,7 @@ impl Tree {
                 .and_modify(|count| {
                     *count = count.saturating_sub(node_len);
                 });
+            self.total_char_count.fetch_sub(node_len, Ordering::Relaxed);
 
             // Remove tenant from node
             node.tenant_last_access_time.remove(tenant.as_ref());
@@ -823,6 +945,12 @@ impl Tree {
     pub fn remove_tenant(&self, tenant: &str) {
         // Intern tenant ID once for efficient lookups
         let tenant_id = intern_tenant(tenant);
+
+        // Subtract this tenant's total count from the global total
+        if let Some(count) = self.tenant_char_count.get(tenant_id.as_ref()) {
+            self.total_char_count
+                .fetch_sub(*count.value(), Ordering::Relaxed);
+        }
 
         // 1. Find all the leaves for the tenant
         // A leaf is a node that has this tenant but no children have it
@@ -2306,5 +2434,29 @@ mod tests {
             assert_eq!(matched, *text, "Failed for: {:?}", text);
             assert_eq!(matched_tenant, *tenant);
         }
+    }
+
+    #[test]
+    fn test_evict_aggregate_by_size() {
+        let tree = Tree::new();
+        let max_size = 10;
+
+        // Insert text for multiple tenants. Total = 15 chars.
+        tree.insert("hello", "tenant1"); // 5
+        thread::sleep(Duration::from_millis(10));
+        tree.insert("world", "tenant2"); // 5
+        thread::sleep(Duration::from_millis(10));
+        tree.insert("rust!", "tenant3"); // 5
+
+        assert_eq!(tree.total_char_count.load(Ordering::Relaxed), 15);
+
+        // Evict globally. Should remove "hello" (oldest).
+        tree.evict_aggregate_by_size(max_size);
+
+        assert_eq!(tree.total_char_count.load(Ordering::Relaxed), 10);
+        let sizes = tree.get_used_size_per_tenant();
+        assert!(!sizes.contains_key("tenant1"));
+        assert_eq!(sizes.get("tenant2").unwrap(), &5);
+        assert_eq!(sizes.get("tenant3").unwrap(), &5);
     }
 }

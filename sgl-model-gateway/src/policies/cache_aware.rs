@@ -204,27 +204,26 @@ impl CacheAwarePolicy {
         }
     }
     /// Helper to trigger eviction if a worker's cache exceeds the high-water mark.
-    fn check_reactive_eviction(&self, tree: &Tree, worker_url: &str) {
+    fn check_reactive_eviction(&self, tree: &Tree, _worker_url: &str) {
         if !self.config.enable_reactive_eviction {
             return;
         }
 
-        let current_size = tree
-            .tenant_char_count
-            .get(worker_url)
-            .map(|v| *v.value())
-            .unwrap_or(0);
+        // USE GLOBAL COUNT: Check total size across ALL workers
+        let current_total_size = tree
+            .total_char_count
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         let high_water_mark =
             (self.config.max_tree_size as f32 * self.config.reactive_eviction_threshold) as usize;
 
-        if current_size > high_water_mark {
+        if current_total_size > high_water_mark {
             debug!(
-                "Reactive eviction triggered for worker {} (size: {} > high-water: {})",
-                worker_url, current_size, high_water_mark
+                "Reactive aggregate eviction triggered (Total size: {} > high-water: {})",
+                current_total_size, high_water_mark
             );
-            // Evict back down to the configured max size
-            tree.evict_tenant_by_size(self.config.max_tree_size);
+            // Trim the whole tree back to the configured budget
+            tree.evict_aggregate_by_size(self.config.max_tree_size);
         }
     }
 
