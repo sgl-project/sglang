@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Set
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.observability.metrics_collector import StorageMetrics
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
@@ -305,7 +306,9 @@ class HiCacheStorage(ABC):
         pass
 
     def get_stats(self):
-        return None
+        storage_metrics = StorageMetrics()
+        storage_metrics.prefetch_occupancy_ratio = self.prefetch_occupancy_ratio
+        return storage_metrics
 
 
 class HiCacheFile(HiCacheStorage):
