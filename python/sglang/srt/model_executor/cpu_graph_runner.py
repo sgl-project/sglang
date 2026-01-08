@@ -93,14 +93,15 @@ def set_torch_compile_config():
 
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
-    # cpu torch compile speeds up decoding by reducing python overhead
+    # torch compile speeds up decoding by reducing python overhead on CPU
     server_args = model_runner.server_args
-    capture_bs = server_args.cpu_graph_bs
-    if capture_bs is None:
-        capture_bs = (
-            list(range(1, 17)) + list(range(18, 31, 2)) + list(range(32, 81, 4))
-        )
-    capture_bs = [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
+    # Note that we reuse server_args.cuda_graph_bs here.
+    # Users can customize the batch sizes supported by cpu_graph, such as:
+    # --cuda-graph-bs 1 2 4 8 16
+    capture_bs = server_args.cuda_graph_bs
+    assert (
+        max(capture_bs) <= server_args.torch_compile_max_bs
+    ), f"{capture_bs=}, {server_args.torch_compile_max_bs=}"
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"

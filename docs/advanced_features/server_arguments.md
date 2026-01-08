@@ -356,7 +356,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-radix-cache` | Disable RadixAttention for prefix caching. | `False` | bool flag (set to enable) |
 | `--cuda-graph-max-bs` | Set the maximum batch size for cuda graph. It will extend the cuda graph capture batch size to this value. | `None` | Type: int |
 | `--cuda-graph-bs` | Set the list of batch sizes for cuda graph. | `None` | List[int] |
-| `--cpu-graph-bs` | Set the list of batch sizes for cpu graph. | `None` | List[int] |
 | `--disable-cuda-graph` | Disable cuda graph. | `False` | bool flag (set to enable) |
 | `--disable-cuda-graph-padding` | Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed. | `False` | bool flag (set to enable) |
 | `--enable-profile-cuda-graph` | Enable profiling of cuda graph capture. | `False` | bool flag (set to enable) |

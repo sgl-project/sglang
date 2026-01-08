@@ -48,7 +48,7 @@ class TestCPUGraph(CustomTestCase):
             "--enable-torch-compile",
             "--torch-compile-max-bs",
             "2",
-            "--cpu-graph-bs",
+            "--cuda-graph-bs",
             "2",
         ],
         min_throughput=40,

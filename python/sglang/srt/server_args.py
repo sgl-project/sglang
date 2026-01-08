@@ -526,7 +526,6 @@ class ServerArgs:
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
-    cpu_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
@@ -928,10 +927,20 @@ class ServerArgs:
                 self.cuda_graph_max_bs = 160
 
         # Set cuda graph batch sizes
-        if self.cuda_graph_bs is None:
-            self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
+        if self.device != "cpu":
+            if self.cuda_graph_bs is None:
+                self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
+            else:
+                self.cuda_graph_max_bs = max(self.cuda_graph_bs)
         else:
-            self.cuda_graph_max_bs = max(self.cuda_graph_bs)
+            # set torch_compile_max_bs for cpu device
+            # as cpu graph is based on torch.compile
+            assert self.cuda_graph_max_bs is not None
+            self.torch_compile_max_bs = self.cuda_graph_max_bs
+            if self.cuda_graph_bs is None:
+                self.cuda_graph_bs = self._generate_cpu_graph_batch_sizes()
+            else:
+                self.torch_compile_max_bs = max(self.cuda_graph_bs)
 
         if self.piecewise_cuda_graph_max_tokens is None:
             # Capture piecewise cuda graph tokens up to the chunked prefill size. Two benefits:
@@ -1021,6 +1030,20 @@ class ServerArgs:
             )
 
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
+
+        return capture_bs
+
+    def _generate_cpu_graph_batch_sizes(self):
+        """
+        Generate the list of batch sizes for CPU graph capture based on torch_compile_max_bs.
+        """
+        if self.disable_cuda_graph_padding:
+            capture_bs = list(range(1, self.torch_compile_max_bs + 1))
+        else:
+            capture_bs = (
+                list(range(1, 17)) + list(range(18, 31, 2)) + list(range(32, 81, 4))
+            )
+        capture_bs = [bs for bs in capture_bs if bs <= self.torch_compile_max_bs]
 
         return capture_bs
 
@@ -3975,12 +3998,6 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Set the list of batch sizes for cuda graph.",
-        )
-        parser.add_argument(
-            "--cpu-graph-bs",
-            type=int,
-            nargs="+",
-            help="Set the list of batch sizes for cpu graph.",
         )
         parser.add_argument(
             "--disable-cuda-graph",
