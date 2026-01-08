@@ -159,7 +159,7 @@ class ZImageAttention(nn.Module):
             if (
                 q.is_cuda
                 and (self.norm_q.variance_epsilon == self.norm_k.variance_epsilon)
-                and can_use_fused_inplace_qknorm(self.head_dim)
+                and can_use_fused_inplace_qknorm(self.head_dim, q.dtype)
             ):
                 q, k = apply_qk_norm(
                     q=q,
