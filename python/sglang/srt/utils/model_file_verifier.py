@@ -15,7 +15,7 @@ import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 IGNORE_PATTERNS = [
     "checksums.json",
@@ -151,7 +151,7 @@ def _compute_checksums(
 ) -> Dict[str, str]:
     from tqdm import tqdm
 
-    def compute_one(filename: str) -> Tuple[str, str]:
+    def compute_one(filename: str) -> Tuple[str, Optional[str]]:
         full_path = model_path / filename
         if not full_path.exists():
             return filename, None
