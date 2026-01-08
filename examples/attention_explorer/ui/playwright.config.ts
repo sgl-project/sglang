@@ -34,6 +34,11 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'] },
     },
     {
+      name: 'ui-features',
+      testMatch: /ui-features\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
       name: 'integration',
       testMatch: /full-integration\.spec\.ts/,
       use: { ...devices['Desktop Chrome'] },
