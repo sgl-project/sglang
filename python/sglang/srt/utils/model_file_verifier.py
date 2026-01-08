@@ -23,15 +23,10 @@ from typing import Dict, List, Optional, Tuple
 # ======== Data Format ========
 
 
-# Cannot use Pydantic to avoid dependency
 @dataclass
 class FileInfo:
     sha256: str
     size: int
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "FileInfo":
-        return cls(**data)
 
 
 @dataclass
@@ -47,16 +42,11 @@ class Manifest:
                 DeprecationWarning,
                 stacklevel=3,
             )
-            return cls(
-                files={
-                    k: FileInfo(sha256=v, size=0) for k, v in data["checksums"].items()
-                }
-            )
-
-        return cls(files={k: FileInfo.from_dict(v) for k, v in data["files"].items()})
+            return cls(files={k: FileInfo(sha256=v, size=0) for k, v in data["checksums"].items()})
+        return cls(files={k: FileInfo(**v) for k, v in data["files"].items()})
 
     def to_dict(self) -> dict:
-        return {"files": {k: asdict(v) for k, v in self.files.items()}}
+        return asdict(self)
 
 
 # ======== Constants ========
