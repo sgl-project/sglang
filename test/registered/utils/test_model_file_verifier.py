@@ -46,7 +46,7 @@ class TestModelFileVerifier(unittest.TestCase):
 
         with open(checksums_file) as f:
             saved = json.load(f)
-        self.assertEqual(saved, checksums)
+        self.assertEqual(saved["checksums"], checksums)
 
     def test_verify_intact_files(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")

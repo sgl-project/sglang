@@ -12,7 +12,7 @@ As a module:
 import argparse
 import hashlib
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -77,7 +77,8 @@ def generate_checksums(
 
     checksums = _compute_checksums(model_path, files, max_workers)
 
-    Path(output_path).write_text(json.dumps(checksums, indent=2, sort_keys=True))
+    output = {"checksums": checksums}
+    Path(output_path).write_text(json.dumps(output, indent=2, sort_keys=True))
 
     print(
         f"[ModelFileVerifier] Generated checksums for {len(checksums)} files -> {output_path}"
@@ -105,7 +106,8 @@ def _discover_files(model_path: Path) -> List[str]:
 
 def _load_checksums(source: str) -> Dict[str, str]:
     if Path(source).is_file():
-        return json.loads(Path(source).read_text())
+        data = json.loads(Path(source).read_text())
+        return data["checksums"]
     return _load_checksums_from_hf(source)
 
 
@@ -155,28 +157,21 @@ def _compute_checksums(
 ) -> Dict[str, str]:
     from tqdm import tqdm
 
-    results = {}
-
     def compute_one(filename: str) -> Tuple[str, str]:
         full_path = model_path / filename
         sha256 = compute_sha256(full_path)
         return filename, sha256
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(compute_one, f): f for f in filenames}
-        for future in tqdm(
-            as_completed(futures), total=len(filenames), desc="Computing checksums"
-        ):
-            filename = futures[future]
-            try:
-                name, checksum = future.result()
-                results[name] = checksum
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                raise IntegrityError(f"Failed to compute checksum for {filename}: {e}")
+        results = list(
+            tqdm(
+                executor.map(compute_one, filenames),
+                total=len(filenames),
+                desc="Computing checksums",
+            )
+        )
 
-    return results
+    return dict(results)
 
 
 def compute_sha256(file_path: Path) -> str:
@@ -195,6 +190,14 @@ class IntegrityError(Exception):
 
 
 # ======== CLI ========
+
+
+def _cli_generate(args):
+    generate_checksums(args.model_path, args.output, args.workers)
+
+
+def _cli_verify(args):
+    verify(args.model_path, args.model_checksum, args.workers)
 
 
 def main():
@@ -235,14 +238,6 @@ def main():
 
     args = parser.parse_args()
     args.func(args)
-
-
-def _cli_generate(args):
-    generate_checksums(args.model_path, args.output, args.workers)
-
-
-def _cli_verify(args):
-    verify(args.model_path, args.model_checksum, args.workers)
 
 
 if __name__ == "__main__":
