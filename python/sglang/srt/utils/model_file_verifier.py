@@ -212,7 +212,7 @@ def _cli_verify(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Model File Verifier - Verify model file integrity using SHA256 checksums"
+        description="Model File Verifier - Verify model file integrity using checksums"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
