@@ -12,6 +12,7 @@ on:
 permissions:
   actions: write   # Needed to cancel runs
   contents: read   # Needed to read repo info
+  pull-requests: read  # needed for gh pr view (labels)
 
 jobs:
   cancel-pending-pr-test:
@@ -20,15 +21,19 @@ jobs:
       - name: Install GitHub CLI
         run: sudo apt-get install -y gh jq
 
-      - name: Cancel all pending/waiting PR-associated runs for specified workflows
+      - name: Cancel unfinished PR-associated runs (skip high-priority PRs)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          WORKFLOWS: ${{ github.event.inputs.workflows }}
+        shell: bash
         run: |
-          # Read the space-separated string from the input into a bash array
-          WORKFLOW_FILES=(${{ github.event.inputs.workflows }})
+          set -euo pipefail
 
-          echo "Targeting ${#WORKFLOW_FILES[@]} workflow(s): ${{ github.event.inputs.workflows }}"
+          # Read the space-separated string from the input into a bash array
+          read -r -a WORKFLOW_FILES <<< "${WORKFLOWS}"
+
+          echo "Targeting ${#WORKFLOW_FILES[@]} workflow(s): ${WORKFLOWS}"
 
           for workflow_file in "${WORKFLOW_FILES[@]}"; do
             echo "--- Checking workflow: $workflow_file ---"
@@ -36,13 +41,36 @@ jobs:
             gh run list \
               --repo "$REPO" \
               --workflow "$workflow_file" \
-              --json databaseId,status,event \
+              --json databaseId,status,event,pullRequests \
               --limit 1000 \
-              | jq -r '.[] | select((.status=="queued" or .status=="waiting" or .status=="in_progress") and .event=="pull_request") | .databaseId' \
-              | while read run_id; do
-                  echo "Attempting to cancel run ID: $run_id for workflow: $workflow_file"
+              | jq -c '.[]
+                  | select((.status=="queued" or .status=="waiting" or .status=="in_progress") and .event=="pull_request")' \
+              | while read -r run; do
 
-                  # The "|| echo ..." part prevents the script from crashing if cancellation fails
-                  gh run cancel "$run_id" --repo "$REPO" || echo "⚠️ Could not cancel run $run_id (it may have already completed). Continuing..."
+                  run_id=$(echo "$run" | jq -r '.databaseId')
+                  pr_number=$(echo "$run" | jq -r '.pullRequests[0].number')
+
+                  # Safety check
+                  if [ "$pr_number" = "null" ] || [ -z "$pr_number" ]; then
+                    echo "⚠️ Run $run_id has no associated PR, skipping"
+                    continue
+                  fi
+
+                  echo "Run $run_id is associated with PR #$pr_number"
+
+                  # Fetch PR labels
+                  labels=$(gh pr view "$pr_number" \
+                    --repo "$REPO" \
+                    --json labels \
+                    | jq -r '.labels[].name' || true)
+
+                  if echo "$labels" | grep -q "^high-priority$"; then
+                    echo "🛑 PR #$pr_number has label 'high-priority' → skip cancel"
+                    continue
+                  fi
+
+                  echo "🚫 Cancelling run $run_id (PR #$pr_number has no high-priority label)"
+                  gh run cancel "$run_id" --repo "$REPO" \
+                    || echo "⚠️ Could not cancel run $run_id (already completed or no permission?)"
                 done
           done
