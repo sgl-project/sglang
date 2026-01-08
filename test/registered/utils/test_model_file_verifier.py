@@ -221,7 +221,7 @@ class TestModelFileVerifierHF(_RealModelTestCase):
 
 class TestModelFileVerifierWithRealModel(_RealModelTestCase):
 
-    def _run_server_test(self, *, corrupt_weights: bool, use_hf_checksum: bool = False):
+    def _run_server_test(self, *, corrupt_weights: bool, use_hf_checksum: bool):
         if use_hf_checksum:
             checksum_arg = MODEL_NAME
         else:
@@ -268,10 +268,10 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
                 kill_process_tree(process.pid)
 
     def test_server_launch_with_checksum_intact(self):
-        self._run_server_test(corrupt_weights=False)
+        self._run_server_test(corrupt_weights=False, use_hf_checksum=False)
 
     def test_server_launch_fails_with_corrupted_weights(self):
-        self._run_server_test(corrupt_weights=True)
+        self._run_server_test(corrupt_weights=True, use_hf_checksum=False)
 
     def test_server_launch_with_hf_checksum_intact(self):
         self._run_server_test(corrupt_weights=False, use_hf_checksum=True)
