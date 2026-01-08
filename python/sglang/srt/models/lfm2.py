@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 # We don't use it, we keep it for reference. If we run sglang.srt.layers.layernorm.RMSNorm 
-# kernel for some reason the difference in logporbs slighlty increases, but to an acceptable degree
+# kernel the difference in logporbs slighlty increases, but to an acceptable degree
 # class Lfm2RMSNorm(nn.Module):
 #     """LFM2-specific RMSNorm: weight * x (not (1 + weight) * x like Gemma)."""
 

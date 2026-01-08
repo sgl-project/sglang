@@ -20,7 +20,8 @@ from transformers import Lfm2Config as HFLfm2Config
 from transformers import CONFIG_MAPPING
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+import torch
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape, Mamba2StateDType
 
 logger = logging.get_logger(__name__)
 
@@ -85,7 +86,16 @@ class Lfm2Config(HFLfm2Config):
             conv_kernel=conv_kernel,
         )
 
-        return Mamba2CacheParams(shape=shape, layers=conv_layer_ids)
+        # Get conv dtype from torch default (set by model runner before this is called)
+        # Fall back to bfloat16 if default is float32
+        default_dtype = torch.get_default_dtype()
+        conv_dtype = default_dtype if default_dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+
+        return Mamba2CacheParams(
+            shape=shape,
+            layers=conv_layer_ids,
+            dtype=Mamba2StateDType(conv=conv_dtype, temporal=torch.float32),
+        )
 
 
 # Override HuggingFace's Lfm2Config with our extended version

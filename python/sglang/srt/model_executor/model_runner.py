@@ -545,7 +545,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
         # Init memory pool and attention backends
-        self.init_memory_pool(min_per_gpu_memory)
+        # Set default dtype so mamba2_cache_params picks up the correct dtype for conv state
+        with set_default_torch_dtype(self.model_config.dtype):
+            self.init_memory_pool(min_per_gpu_memory)
 
         # Init max running requests
         self.max_running_requests = min(
