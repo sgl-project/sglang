@@ -562,6 +562,17 @@ def popen_with_error_check(command: list[str], allow_exit: bool = False):
     return process
 
 
+class PopenLaunchServerError(Exception):
+    def __init__(self, message: str, stdout: str = None, stderr: str = None):
+        super().__init__(message)
+        self.stdout = stdout or ""
+        self.stderr = stderr or ""
+
+    @property
+    def output(self) -> str:
+        return self.stdout + self.stderr
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -669,15 +680,26 @@ def popen_launch_server(
     else:
         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
+    def _get_captured_output():
+        if return_stdout_stderr:
+            return (
+                return_stdout_stderr[0].getvalue(),
+                return_stdout_stderr[1].getvalue(),
+            )
+        return None, None
+
     start_time = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout:
             return_code = process.poll()
             if return_code is not None:
                 # Server failed to start (non-zero exit code) or crashed
-                raise Exception(
+                stdout, stderr = _get_captured_output()
+                raise PopenLaunchServerError(
                     f"Server process exited with code {return_code}. "
-                    "Check server logs for errors."
+                    "Check server logs for errors.",
+                    stdout=stdout,
+                    stderr=stderr,
                 )
 
             try:
@@ -697,14 +719,22 @@ def popen_launch_server(
 
             return_code = process.poll()
             if return_code is not None:
-                raise Exception(
-                    f"Server unexpectedly exits ({return_code=}). Usually there will be error logs describing the cause far above this line."
+                stdout, stderr = _get_captured_output()
+                raise PopenLaunchServerError(
+                    f"Server unexpectedly exits ({return_code=}). Usually there will be error logs describing the cause far above this line.",
+                    stdout=stdout,
+                    stderr=stderr,
                 )
 
             time.sleep(10)
 
     kill_process_tree(process.pid)
-    raise TimeoutError("Server failed to start within the timeout period.")
+    stdout, stderr = _get_captured_output()
+    raise PopenLaunchServerError(
+        "Server failed to start within the timeout period.",
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
 def popen_launch_pd_server(
