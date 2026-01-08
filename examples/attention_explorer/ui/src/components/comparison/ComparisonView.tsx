@@ -1,10 +1,19 @@
+import { useState, useRef } from 'react';
 import { useComparisonStore } from '../../stores/useComparisonStore';
+import { useQuantCompareStore } from '../../stores/useQuantCompareStore';
 import { SessionSelector } from './SessionSelector';
 import { MetricsDiffCard } from './MetricsDiffCard';
 import { FingerprintDiffChart } from './FingerprintDiffChart';
 import { ZoneBadgeComparison } from './ZoneBadgeComparison';
+import { QuantComparePanel } from './QuantComparePanel';
+
+type CompareTab = 'session' | 'quant';
 
 export function ComparisonView() {
+  const [activeTab, setActiveTab] = useState<CompareTab>('quant');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Session comparison state
   const leftTraceId = useComparisonStore((state) => state.leftTraceId);
   const rightTraceId = useComparisonStore((state) => state.rightTraceId);
   const comparison = useComparisonStore((state) => state.comparison);
@@ -13,23 +22,137 @@ export function ComparisonView() {
   const swapSessions = useComparisonStore((state) => state.swapSessions);
   const clearComparison = useComparisonStore((state) => state.clearComparison);
 
+  // Quant comparison state
+  const quantComparison = useQuantCompareStore((state) => state.comparison);
+  const quantError = useQuantCompareStore((state) => state.error);
+  const loadFromFile = useQuantCompareStore((state) => state.loadFromFile);
+
   const hasSelection = leftTraceId && rightTraceId;
+
+  const handleLoadResults = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      await loadFromFile(file);
+    }
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
 
   return (
     <div className="card comparison-view">
       <div className="card-header">
         <div className="card-title">
-          <span>Compare Sessions</span>
-          <span className="subtitle">Side-by-side attention pattern analysis</span>
+          <span>Compare</span>
+          <span className="subtitle">
+            {activeTab === 'session'
+              ? 'Side-by-side attention pattern analysis'
+              : 'BF16 vs Quantized attention comparison'}
+          </span>
         </div>
         <div className="badges">
-          {comparison && (
+          {activeTab === 'session' && comparison && (
             <span className="badge strong">
               {Math.round(comparison.overallSimilarity * 100)}% Similar
             </span>
           )}
+          {activeTab === 'quant' && quantComparison && (
+            <span className="badge strong">
+              {Math.round(quantComparison.overall_mean_jaccard * 100)}% Jaccard
+            </span>
+          )}
         </div>
       </div>
+
+      {/* Tab Bar */}
+      <div
+        style={{
+          display: 'flex',
+          gap: '4px',
+          padding: '0 16px',
+          borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
+          background: 'rgba(0, 0, 0, 0.2)',
+        }}
+      >
+        <button
+          onClick={() => setActiveTab('quant')}
+          style={{
+            padding: '10px 16px',
+            background: 'transparent',
+            border: 'none',
+            borderBottom: activeTab === 'quant' ? '2px solid #7aa2ff' : '2px solid transparent',
+            color: activeTab === 'quant' ? '#7aa2ff' : '#888',
+            fontSize: '13px',
+            fontWeight: 500,
+            cursor: 'pointer',
+            transition: 'all 0.15s ease',
+          }}
+        >
+          Quantization
+        </button>
+        <button
+          onClick={() => setActiveTab('session')}
+          style={{
+            padding: '10px 16px',
+            background: 'transparent',
+            border: 'none',
+            borderBottom: activeTab === 'session' ? '2px solid #7aa2ff' : '2px solid transparent',
+            color: activeTab === 'session' ? '#7aa2ff' : '#888',
+            fontSize: '13px',
+            fontWeight: 500,
+            cursor: 'pointer',
+            transition: 'all 0.15s ease',
+          }}
+        >
+          Sessions
+        </button>
+        {activeTab === 'quant' && (
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center' }}>
+            <button
+              onClick={handleLoadResults}
+              style={{
+                padding: '6px 12px',
+                background: 'rgba(122, 162, 255, 0.15)',
+                border: '1px solid rgba(122, 162, 255, 0.3)',
+                borderRadius: '4px',
+                color: '#7aa2ff',
+                fontSize: '11px',
+                cursor: 'pointer',
+                marginRight: '8px',
+              }}
+            >
+              Load JSON
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json"
+              onChange={handleFileChange}
+              style={{ display: 'none' }}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* Quant Tab Content */}
+      {activeTab === 'quant' && (
+        <div className="card-content" style={{ padding: '16px' }}>
+          {quantError && (
+            <div className="comparison-error">
+              <span className="error-icon">!</span>
+              {quantError}
+            </div>
+          )}
+          <QuantComparePanel comparison={quantComparison} onLoadResults={handleLoadResults} />
+        </div>
+      )}
+
+      {/* Session Tab Content */}
+      {activeTab === 'session' && (
 
       <div className="card-content comparison-layout">
         {/* Session Selection Row */}
@@ -218,6 +341,7 @@ export function ComparisonView() {
           </div>
         )}
       </div>
+      )}
     </div>
   );
 }

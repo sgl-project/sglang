@@ -1049,3 +1049,65 @@ export interface SessionSummary {
   avgEntropy: number;
   label?: string;  // Optional user-friendly label
 }
+
+// ============================================================================
+// QUANTIZATION COMPARISON TYPES (SINQ / INT4 vs BF16)
+// ============================================================================
+
+/**
+ * Status thresholds for Jaccard similarity:
+ * - PASS: >= 0.8 (excellent preservation)
+ * - WARN: >= 0.5 (acceptable, some divergence)
+ * - FAIL: < 0.5 (significant attention pattern loss)
+ */
+export type QuantCompareStatus = 'PASS' | 'WARN' | 'FAIL';
+
+/**
+ * Result of comparing attention patterns for a single prompt.
+ */
+export interface QuantComparePromptResult {
+  prompt: string;
+  bf16Response?: string;
+  int4Response?: string;
+  mean_jaccard: number;
+  min_jaccard: number;
+  max_jaccard: number;
+  std_jaccard?: number;
+  tokens_compared?: number;
+  divergent_count?: number;
+  divergent_tokens?: number[];  // Token indices where Jaccard < 0.5
+  per_token_jaccard?: number[];
+  status: QuantCompareStatus;
+}
+
+/**
+ * Full quantization comparison result.
+ * Compares attention patterns between BF16 baseline and quantized model.
+ */
+export interface QuantizationComparison {
+  model: string;
+  quantization: string;  // e.g., "SINQ INT4", "AWQ INT4", "GPTQ INT4"
+  overall_mean_jaccard: number;
+  overall_pass_rate: number;  // Fraction of prompts that passed
+  results: QuantComparePromptResult[];
+  timestamp: number;
+  quality_tier: 'EXCELLENT' | 'ACCEPTABLE' | 'POOR';
+}
+
+/**
+ * Get status from Jaccard score
+ */
+export function getQuantCompareStatus(jaccard: number): QuantCompareStatus {
+  if (jaccard >= 0.8) return 'PASS';
+  if (jaccard >= 0.5) return 'WARN';
+  return 'FAIL';
+}
+
+/**
+ * Get quality tier from overall Jaccard
+ */
+export function getQuantQualityTier(overallJaccard: number): 'EXCELLENT' | 'ACCEPTABLE' | 'POOR' {
+  if (overallJaccard >= 0.8) return 'EXCELLENT';
+  if (overallJaccard >= 0.6) return 'ACCEPTABLE';
+  return 'POOR';
+}
