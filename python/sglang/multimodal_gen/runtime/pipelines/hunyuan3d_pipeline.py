@@ -354,6 +354,19 @@ class PaintStage(PipelineStage):
         return OutputBatch(output=[return_path], timings=batch.timings)
 
 
+class ShapeOnlyOutputStage(PipelineStage):
+    def __init__(self, config: Hunyuan3DPipelineConfig) -> None:
+        super().__init__()
+        self.config = config
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        obj_path = batch.extra["shape_obj_path"]
+        return_path = batch.extra["shape_return_path"]
+        if return_path.endswith(".glb"):
+            return_path = obj_path
+        return OutputBatch(output=[return_path], timings=batch.timings)
+
+
 class Hunyuan3DPipeline(ComposedPipelineBase):
     pipeline_name = "Hunyuan3DPipeline"
     _required_config_modules = [
@@ -386,26 +399,27 @@ class Hunyuan3DPipeline(ComposedPipelineBase):
         _ensure_hunyuan3d_paths(config.hunyuan3d_repo_path)
         repo_root = os.path.abspath(config.hunyuan3d_repo_path)
 
-        from textureGenPipeline import Hunyuan3DPaintConfig, Hunyuan3DPaintPipeline
+        if config.paint_enable:
+            from textureGenPipeline import Hunyuan3DPaintConfig, Hunyuan3DPaintPipeline
 
-        paint_model_path = config.paint_model_path or self.model_path
+            paint_model_path = config.paint_model_path or self.model_path
 
-        paint_config = Hunyuan3DPaintConfig(
-            max_num_view=config.paint_max_num_view,
-            resolution=config.paint_resolution,
-        )
-        device_str = str(torch.device(current_platform.device_type))
-        paint_config.device = device_str
-        paint_config.multiview_pretrained_path = paint_model_path
-        paint_config.multiview_cfg_path = os.path.join(
-            repo_root, "hy3dpaint", "cfgs", "hunyuan-paint-pbr.yaml"
-        )
-        paint_config.realesrgan_ckpt_path = os.path.join(
-            repo_root, "hy3dpaint", "ckpt", "RealESRGAN_x4plus.pth"
-        )
+            paint_config = Hunyuan3DPaintConfig(
+                max_num_view=config.paint_max_num_view,
+                resolution=config.paint_resolution,
+            )
+            device_str = str(torch.device(current_platform.device_type))
+            paint_config.device = device_str
+            paint_config.multiview_pretrained_path = paint_model_path
+            paint_config.multiview_cfg_path = os.path.join(
+                repo_root, "hy3dpaint", "cfgs", "hunyuan-paint-pbr.yaml"
+            )
+            paint_config.realesrgan_ckpt_path = os.path.join(
+                repo_root, "hy3dpaint", "ckpt", "RealESRGAN_x4plus.pth"
+            )
 
-        paint_pipeline = Hunyuan3DPaintPipeline(paint_config)
-        self.add_module("paint_pipeline", paint_pipeline)
+            paint_pipeline = Hunyuan3DPaintPipeline(paint_config)
+            self.add_module("paint_pipeline", paint_pipeline)
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         config = server_args.pipeline_config
@@ -450,12 +464,18 @@ class Hunyuan3DPipeline(ComposedPipelineBase):
             ),
         )
         self.add_stage(stage_name="shape_save_stage", stage=ShapeSaveStage(config))
-        self.add_stage(
-            stage_name="paint_stage",
-            stage=PaintStage(
-                paint_pipeline=self.get_module("paint_pipeline"), config=config
-            ),
-        )
+        if config.paint_enable:
+            self.add_stage(
+                stage_name="paint_stage",
+                stage=PaintStage(
+                    paint_pipeline=self.get_module("paint_pipeline"), config=config
+                ),
+            )
+        else:
+            self.add_stage(
+                stage_name="paint_stage",
+                stage=ShapeOnlyOutputStage(config=config),
+            )
 
 
 EntryClass = Hunyuan3DPipeline
