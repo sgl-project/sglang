@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 import re
-
 from collections import defaultdict
 from collections.abc import Hashable
 from typing import Any
@@ -348,7 +347,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 was_offloaded, manager_info = (
                     self._temporarily_load_layer_for_conversion(module_name, name)
                 )
-                
+
                 layer.set_lora_weights(
                     self.lora_adapters[lora_nickname][lora_A_name],
                     self.lora_adapters[lora_nickname][lora_B_name],
@@ -356,7 +355,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     strength=strength,
                 )
                 adapted_count += 1
-                
+
                 self._restore_layer_offload_state(was_offloaded, manager_info)
             else:
                 if rank == 0:
