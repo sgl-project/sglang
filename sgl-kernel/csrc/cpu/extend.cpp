@@ -47,11 +47,6 @@ void extend_attention_kernel_impl(
     int max_len_extend,
     int buffer_size_per_thread,
     bool is_prefix_skipped) {
-  using Vec = at::vec::Vectorized<float>;
-
-  // Ensure BLOCK_M <= BLOCK_N to prevent potential buffer overflows during causal masking
-  static_assert(BLOCK_M <= BLOCK_N);
-
   // strides
   const int o_strideM = num_heads * head_size_v;
   const int o_strideH = head_size_v;
@@ -261,6 +256,7 @@ void extend_attention_kernel_impl(
 
 template <int BLOCK_M, int BLOCK_N>
 inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int head_size_v) {
+  static_assert(BLOCK_M <= BLOCK_N, "Make sure BLOCK_M <= BLOCK_N to prevent buffer overflows during causal masking");
   const int size_per_thread =
       /* s_i     */ BLOCK_M * BLOCK_N * sizeof(float) +
       /* v_prime */ BLOCK_M * head_size_v * sizeof(float) +
