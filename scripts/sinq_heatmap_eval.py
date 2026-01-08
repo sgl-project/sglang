@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """
-SINQ Comprehensive Quantization Evaluation
+SINQ Comprehensive Quantization Evaluation (Schema v1)
 
-Tests all SINQ quantization configurations and generates a heatmap
-showing Jaccard similarity (attention pattern preservation) across:
+Tests all SINQ quantization configurations and generates:
+- Heatmaps showing Jaccard similarity across configurations
+- Schema v1 comparison reports with full metrics:
+  * Jaccard similarity (set overlap)
+  * Weighted Jaccard (score-weighted overlap)
+  * Rank correlation (Spearman/Kendall)
+  * Mass retained (baseline attention preserved)
+  * KL divergence (distribution shift)
+
+Configurations tested:
 - nbits: 2, 3, 4, 5, 6, 8
 - tiling_mode: 1D, 2D
 - group_size: 64, 128
@@ -12,6 +20,7 @@ showing Jaccard similarity (attention pattern preservation) across:
 Usage:
     python sinq_heatmap_eval.py --model Qwen/Qwen3-1.7B
     python sinq_heatmap_eval.py --model Qwen/Qwen3-1.7B --quick  # Fewer prompts
+    python sinq_heatmap_eval.py --model Qwen/Qwen3-1.7B --schema-v1  # Full schema output
 """
 
 import argparse
@@ -20,6 +29,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +38,7 @@ import traceback
 
 import torch
 import numpy as np
+from scipy import stats
 
 # Visualization
 import matplotlib
@@ -84,8 +95,34 @@ QUICK_PROMPTS = [
 
 
 # ============================================================================
-# EVALUATION
+# METRICS COMPUTATION
 # ============================================================================
+
+@dataclass
+class StepMetrics:
+    """Metrics for a single generation step."""
+    jaccard: float
+    weighted_jaccard: float
+    spearman: float
+    kendall: float
+    mass_retained: float
+    kl_divergence: float
+
+
+@dataclass
+class PromptMetrics:
+    """Aggregated metrics for a single prompt."""
+    prompt_id: str
+    prompt_text: str
+    jaccard: float
+    weighted_jaccard: float
+    spearman: float
+    kendall: float
+    mass_retained: float
+    kl_divergence: float
+    output_match: bool
+    per_step_jaccard: List[float] = field(default_factory=list)
+
 
 @dataclass
 class ConfigResult:
@@ -95,11 +132,20 @@ class ConfigResult:
     std_jaccard: float
     min_jaccard: float
     max_jaccard: float
-    compression_ratio: float
-    bf16_memory_mb: float
-    quant_memory_mb: float
+    # New metrics
+    mean_weighted_jaccard: float = 0.0
+    mean_spearman: float = 0.0
+    mean_kendall: float = 0.0
+    mean_mass_retained: float = 0.0
+    mean_kl_divergence: float = 0.0
+    output_match_rate: float = 0.0
+    # Existing fields
+    compression_ratio: float = 0.0
+    bf16_memory_mb: float = 0.0
+    quant_memory_mb: float = 0.0
     error: Optional[str] = None
     per_prompt_jaccard: List[float] = field(default_factory=list)
+    per_prompt_metrics: List[PromptMetrics] = field(default_factory=list)
     duration_seconds: float = 0
 
 
@@ -114,11 +160,168 @@ def compute_jaccard_similarity(set1: set, set2: set) -> float:
     return intersection / union if union > 0 else 0.0
 
 
-def get_top_tokens(logits: torch.Tensor, k: int = 10) -> set:
-    """Get top-k token indices from logits."""
+def compute_weighted_jaccard(
+    positions1: List[int],
+    scores1: List[float],
+    positions2: List[int],
+    scores2: List[float],
+) -> float:
+    """
+    Compute weighted Jaccard using scores as weights.
+
+    For shared positions: weight = min(score1, score2)
+    For union: weight = max of available scores
+    """
+    if not positions1 and not positions2:
+        return 1.0
+
+    pos_to_score1 = dict(zip(positions1, scores1))
+    pos_to_score2 = dict(zip(positions2, scores2))
+
+    all_positions = set(positions1) | set(positions2)
+    if not all_positions:
+        return 1.0
+
+    intersection_weight = 0.0
+    union_weight = 0.0
+
+    for pos in all_positions:
+        s1 = pos_to_score1.get(pos, 0.0)
+        s2 = pos_to_score2.get(pos, 0.0)
+
+        if pos in pos_to_score1 and pos in pos_to_score2:
+            intersection_weight += min(s1, s2)
+        union_weight += max(s1, s2)
+
+    return intersection_weight / union_weight if union_weight > 0 else 0.0
+
+
+def compute_rank_correlation(
+    positions1: List[int],
+    positions2: List[int],
+) -> Tuple[float, float]:
+    """
+    Compute Spearman and Kendall rank correlation for overlapping positions.
+
+    Returns (spearman_rho, kendall_tau)
+    """
+    common = set(positions1) & set(positions2)
+    if len(common) < 2:
+        return 0.0, 0.0
+
+    # Get ranks in each list for common positions
+    rank1 = {pos: i for i, pos in enumerate(positions1)}
+    rank2 = {pos: i for i, pos in enumerate(positions2)}
+
+    common_list = list(common)
+    ranks1 = [rank1[pos] for pos in common_list]
+    ranks2 = [rank2[pos] for pos in common_list]
+
+    try:
+        spearman, _ = stats.spearmanr(ranks1, ranks2)
+        kendall, _ = stats.kendalltau(ranks1, ranks2)
+        return (
+            float(spearman) if not np.isnan(spearman) else 0.0,
+            float(kendall) if not np.isnan(kendall) else 0.0,
+        )
+    except Exception:
+        return 0.0, 0.0
+
+
+def compute_mass_retained(
+    baseline_positions: List[int],
+    baseline_scores: List[float],
+    candidate_positions: List[int],
+) -> float:
+    """
+    Compute fraction of baseline attention mass preserved in candidate top-k.
+    """
+    if not baseline_positions or not baseline_scores:
+        return 1.0
+
+    candidate_set = set(candidate_positions)
+    total_mass = sum(baseline_scores)
+    retained_mass = sum(
+        score for pos, score in zip(baseline_positions, baseline_scores)
+        if pos in candidate_set
+    )
+
+    return retained_mass / total_mass if total_mass > 0 else 0.0
+
+
+def compute_kl_divergence(
+    baseline_scores: List[float],
+    candidate_scores: List[float],
+    epsilon: float = 1e-10,
+) -> float:
+    """
+    Compute KL divergence between truncated distributions.
+    """
+    if not baseline_scores or not candidate_scores:
+        return 0.0
+
+    # Normalize
+    p = np.array(baseline_scores) + epsilon
+    q = np.array(candidate_scores) + epsilon
+    p = p / p.sum()
+    q = q / q.sum()
+
+    # Pad to same length
+    max_len = max(len(p), len(q))
+    p = np.pad(p, (0, max_len - len(p)), constant_values=epsilon)
+    q = np.pad(q, (0, max_len - len(q)), constant_values=epsilon)
+
+    # Renormalize
+    p = p / p.sum()
+    q = q / q.sum()
+
+    return float(stats.entropy(p, q))
+
+
+def compute_step_metrics(
+    baseline_positions: List[int],
+    baseline_scores: List[float],
+    candidate_positions: List[int],
+    candidate_scores: List[float],
+) -> StepMetrics:
+    """Compute all metrics for a single generation step."""
+    jaccard = compute_jaccard_similarity(
+        set(baseline_positions), set(candidate_positions)
+    )
+    weighted_jaccard = compute_weighted_jaccard(
+        baseline_positions, baseline_scores,
+        candidate_positions, candidate_scores,
+    )
+    spearman, kendall = compute_rank_correlation(baseline_positions, candidate_positions)
+    mass_retained = compute_mass_retained(
+        baseline_positions, baseline_scores, candidate_positions
+    )
+    kl_div = compute_kl_divergence(baseline_scores, candidate_scores)
+
+    return StepMetrics(
+        jaccard=jaccard,
+        weighted_jaccard=weighted_jaccard,
+        spearman=spearman,
+        kendall=kendall,
+        mass_retained=mass_retained,
+        kl_divergence=kl_div,
+    )
+
+
+def get_top_tokens_with_scores(logits: torch.Tensor, k: int = 10) -> Tuple[List[int], List[float]]:
+    """Get top-k token indices and their probability scores from logits."""
     probs = torch.softmax(logits, dim=-1)
-    top_indices = torch.topk(probs, k).indices
-    return set(top_indices.cpu().numpy().tolist())
+    top_probs, top_indices = torch.topk(probs, k)
+    return (
+        top_indices.cpu().numpy().tolist(),
+        top_probs.cpu().numpy().tolist(),
+    )
+
+
+def get_top_tokens(logits: torch.Tensor, k: int = 10) -> set:
+    """Get top-k token indices from logits (legacy compatibility)."""
+    positions, _ = get_top_tokens_with_scores(logits, k)
+    return set(positions)
 
 
 def get_memory_mb() -> float:
@@ -171,8 +374,14 @@ class SINQEvaluator:
         self.bf16_memory = get_memory_mb()
         print(f"BF16 model memory: {self.bf16_memory:.1f} MB")
 
-    def get_bf16_outputs(self, prompts: List[str], max_tokens: int = 64) -> Dict[str, Tuple[str, List[set]]]:
-        """Generate outputs and collect top-k tokens from BF16 model."""
+    def get_bf16_outputs(
+        self, prompts: List[str], max_tokens: int = 64, top_k: int = 10
+    ) -> Dict[str, Tuple[str, List[Tuple[List[int], List[float]]]]]:
+        """
+        Generate outputs and collect top-k tokens with scores from BF16 model.
+
+        Returns dict mapping prompt -> (response, list of (positions, scores) per step)
+        """
         results = {}
 
         for prompt in prompts:
@@ -196,10 +405,11 @@ class SINQEvaluator:
                 skip_special_tokens=True
             )
 
-            # Collect top-k tokens for each generated position
+            # Collect top-k tokens WITH SCORES for each generated position
             topk_per_step = []
             for score in outputs.scores:
-                topk_per_step.append(get_top_tokens(score[0], k=10))
+                positions, scores = get_top_tokens_with_scores(score[0], k=top_k)
+                topk_per_step.append((positions, scores))
 
             results[prompt] = (response, topk_per_step)
 
@@ -209,10 +419,11 @@ class SINQEvaluator:
         self,
         config: QuantConfig,
         prompts: List[str],
-        bf16_outputs: Dict[str, Tuple[str, List[set]]],
+        bf16_outputs: Dict[str, Tuple[str, List[Tuple[List[int], List[float]]]]],
         max_tokens: int = 64,
+        top_k: int = 10,
     ) -> ConfigResult:
-        """Evaluate a single quantization configuration."""
+        """Evaluate a single quantization configuration with full metrics."""
         print(f"\n{'-'*60}")
         print(f"Testing: {config.name}")
         print(f"  nbits={config.nbits}, group_size={config.group_size}, "
@@ -260,11 +471,11 @@ class SINQEvaluator:
             compression_ratio = self.bf16_memory / quant_memory if quant_memory > 0 else 0
             print(f"  Quantized memory: {quant_memory:.1f} MB (compression: {compression_ratio:.2f}x)")
 
-            # Evaluate on prompts
-            jaccard_scores = []
+            # Evaluate on prompts - collect ALL metrics
+            prompt_metrics_list = []
 
-            for prompt in prompts:
-                bf16_response, bf16_topk = bf16_outputs[prompt]
+            for idx, prompt in enumerate(prompts):
+                bf16_response, bf16_topk_steps = bf16_outputs[prompt]
 
                 # Generate with quantized model
                 inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
@@ -280,24 +491,70 @@ class SINQEvaluator:
                         pad_token_id=self.tokenizer.pad_token_id,
                     )
 
-                # Collect top-k tokens
-                quant_topk = []
+                # Decode quantized response
+                quant_response = self.tokenizer.decode(
+                    outputs.sequences[0][input_len:],
+                    skip_special_tokens=True
+                )
+
+                # Collect top-k tokens WITH SCORES
+                quant_topk_steps = []
                 for score in outputs.scores:
-                    quant_topk.append(get_top_tokens(score[0], k=10))
+                    positions, scores = get_top_tokens_with_scores(score[0], k=top_k)
+                    quant_topk_steps.append((positions, scores))
 
-                # Compute per-step Jaccard
-                min_len = min(len(bf16_topk), len(quant_topk))
+                # Compute per-step metrics
+                min_len = min(len(bf16_topk_steps), len(quant_topk_steps))
+                step_metrics = []
+
                 if min_len > 0:
-                    step_jaccards = [
-                        compute_jaccard_similarity(bf16_topk[i], quant_topk[i])
-                        for i in range(min_len)
-                    ]
-                    prompt_jaccard = np.mean(step_jaccards)
-                else:
-                    prompt_jaccard = 0.0
+                    for i in range(min_len):
+                        bf16_positions, bf16_scores = bf16_topk_steps[i]
+                        quant_positions, quant_scores = quant_topk_steps[i]
 
-                jaccard_scores.append(prompt_jaccard)
-                print(f"  Prompt '{prompt[:30]}...': Jaccard={prompt_jaccard:.3f}")
+                        step_m = compute_step_metrics(
+                            bf16_positions, bf16_scores,
+                            quant_positions, quant_scores,
+                        )
+                        step_metrics.append(step_m)
+
+                # Aggregate step metrics
+                if step_metrics:
+                    jaccards = [m.jaccard for m in step_metrics]
+                    weighted_jaccards = [m.weighted_jaccard for m in step_metrics]
+                    spearmans = [m.spearman for m in step_metrics]
+                    kendalls = [m.kendall for m in step_metrics]
+                    mass_retaineds = [m.mass_retained for m in step_metrics]
+                    kl_divs = [m.kl_divergence for m in step_metrics]
+
+                    pm = PromptMetrics(
+                        prompt_id=f"prompt_{idx:03d}",
+                        prompt_text=prompt[:100],
+                        jaccard=float(np.mean(jaccards)),
+                        weighted_jaccard=float(np.mean(weighted_jaccards)),
+                        spearman=float(np.mean(spearmans)),
+                        kendall=float(np.mean(kendalls)),
+                        mass_retained=float(np.mean(mass_retaineds)),
+                        kl_divergence=float(np.mean(kl_divs)),
+                        output_match=(bf16_response.strip() == quant_response.strip()),
+                        per_step_jaccard=jaccards,
+                    )
+                else:
+                    pm = PromptMetrics(
+                        prompt_id=f"prompt_{idx:03d}",
+                        prompt_text=prompt[:100],
+                        jaccard=0.0,
+                        weighted_jaccard=0.0,
+                        spearman=0.0,
+                        kendall=0.0,
+                        mass_retained=0.0,
+                        kl_divergence=0.0,
+                        output_match=False,
+                    )
+
+                prompt_metrics_list.append(pm)
+                print(f"  Prompt '{prompt[:30]}...': J={pm.jaccard:.3f} wJ={pm.weighted_jaccard:.3f} "
+                      f"ρ={pm.spearman:.3f} mass={pm.mass_retained:.3f}")
 
             # Cleanup
             del model_to_quant
@@ -305,16 +562,32 @@ class SINQEvaluator:
 
             duration = time.time() - start_time
 
+            # Aggregate across all prompts
+            all_jaccards = [pm.jaccard for pm in prompt_metrics_list]
+            all_weighted = [pm.weighted_jaccard for pm in prompt_metrics_list]
+            all_spearman = [pm.spearman for pm in prompt_metrics_list]
+            all_kendall = [pm.kendall for pm in prompt_metrics_list]
+            all_mass = [pm.mass_retained for pm in prompt_metrics_list]
+            all_kl = [pm.kl_divergence for pm in prompt_metrics_list]
+            all_matches = [pm.output_match for pm in prompt_metrics_list]
+
             return ConfigResult(
                 config=config,
-                mean_jaccard=float(np.mean(jaccard_scores)),
-                std_jaccard=float(np.std(jaccard_scores)),
-                min_jaccard=float(np.min(jaccard_scores)),
-                max_jaccard=float(np.max(jaccard_scores)),
+                mean_jaccard=float(np.mean(all_jaccards)),
+                std_jaccard=float(np.std(all_jaccards)),
+                min_jaccard=float(np.min(all_jaccards)),
+                max_jaccard=float(np.max(all_jaccards)),
+                mean_weighted_jaccard=float(np.mean(all_weighted)),
+                mean_spearman=float(np.mean(all_spearman)),
+                mean_kendall=float(np.mean(all_kendall)),
+                mean_mass_retained=float(np.mean(all_mass)),
+                mean_kl_divergence=float(np.mean(all_kl)),
+                output_match_rate=sum(all_matches) / len(all_matches) if all_matches else 0.0,
                 compression_ratio=compression_ratio,
                 bf16_memory_mb=self.bf16_memory,
                 quant_memory_mb=quant_memory,
-                per_prompt_jaccard=jaccard_scores,
+                per_prompt_jaccard=all_jaccards,
+                per_prompt_metrics=prompt_metrics_list,
                 duration_seconds=duration,
             )
 
@@ -540,6 +813,7 @@ def main():
     parser.add_argument("--nbits", type=int, nargs="+", help="Specific nbits to test")
     parser.add_argument("--methods", nargs="+", choices=["sinq", "asinq"], help="Specific methods")
     parser.add_argument("--max-tokens", type=int, default=64, help="Max tokens to generate")
+    parser.add_argument("--schema-v1", action="store_true", help="Export in Quantization Comparison Schema v1 format")
 
     args = parser.parse_args()
 
@@ -612,26 +886,56 @@ def main():
     # Print summary
     print_summary(results, total_time)
 
+    # Export Schema v1 if requested
+    if args.schema_v1:
+        export_all_schema_v1(results, args.model, prompts, output_dir)
+
     return 0
 
 
 def save_results(results: List[ConfigResult], output_dir: Path):
-    """Save results to JSON."""
+    """Save results to JSON with all metrics."""
     data = {
         "timestamp": datetime.now().isoformat(),
         "results": [
             {
                 "config": asdict(r.config),
+                # Jaccard metrics
                 "mean_jaccard": r.mean_jaccard,
                 "std_jaccard": r.std_jaccard,
                 "min_jaccard": r.min_jaccard,
                 "max_jaccard": r.max_jaccard,
+                # Additional metrics
+                "mean_weighted_jaccard": r.mean_weighted_jaccard,
+                "mean_spearman": r.mean_spearman,
+                "mean_kendall": r.mean_kendall,
+                "mean_mass_retained": r.mean_mass_retained,
+                "mean_kl_divergence": r.mean_kl_divergence,
+                "output_match_rate": r.output_match_rate,
+                # Compression
                 "compression_ratio": r.compression_ratio,
                 "bf16_memory_mb": r.bf16_memory_mb,
                 "quant_memory_mb": r.quant_memory_mb,
+                # Status
                 "error": r.error,
-                "per_prompt_jaccard": r.per_prompt_jaccard,
                 "duration_seconds": r.duration_seconds,
+                # Per-prompt data
+                "per_prompt_jaccard": r.per_prompt_jaccard,
+                "per_prompt_metrics": [
+                    {
+                        "prompt_id": pm.prompt_id,
+                        "prompt_text": pm.prompt_text,
+                        "jaccard": pm.jaccard,
+                        "weighted_jaccard": pm.weighted_jaccard,
+                        "spearman": pm.spearman,
+                        "kendall": pm.kendall,
+                        "mass_retained": pm.mass_retained,
+                        "kl_divergence": pm.kl_divergence,
+                        "output_match": pm.output_match,
+                        "per_step_jaccard": pm.per_step_jaccard,
+                    }
+                    for pm in r.per_prompt_metrics
+                ],
             }
             for r in results
         ]
@@ -643,10 +947,10 @@ def save_results(results: List[ConfigResult], output_dir: Path):
 
 
 def print_summary(results: List[ConfigResult], total_time: float):
-    """Print evaluation summary."""
-    print("\n" + "="*70)
+    """Print evaluation summary with all metrics."""
+    print("\n" + "="*90)
     print("EVALUATION SUMMARY")
-    print("="*70)
+    print("="*90)
 
     valid = [r for r in results if r.error is None]
     errors = [r for r in results if r.error is not None]
@@ -665,36 +969,237 @@ def print_summary(results: List[ConfigResult], total_time: float):
         # Sort by Jaccard
         sorted_by_quality = sorted(valid, key=lambda x: -x.mean_jaccard)
 
-        print("\n" + "-"*70)
+        print("\n" + "-"*90)
         print("TOP 10 BY QUALITY (Jaccard Similarity)")
-        print("-"*70)
-        print(f"{'Config':<35} {'Jaccard':>10} {'Compression':>12} {'Memory MB':>10}")
-        print("-"*70)
+        print("-"*90)
+        header = f"{'Config':<30} {'Jaccard':>8} {'wJacc':>7} {'Spear':>7} {'Mass':>6} {'KL':>7} {'Match':>6} {'Compr':>7}"
+        print(header)
+        print("-"*90)
         for r in sorted_by_quality[:10]:
-            print(f"{r.config.name:<35} {r.mean_jaccard:>10.3f} {r.compression_ratio:>12.2f}x {r.quant_memory_mb:>10.0f}")
+            print(f"{r.config.name:<30} {r.mean_jaccard:>8.3f} {r.mean_weighted_jaccard:>7.3f} "
+                  f"{r.mean_spearman:>7.3f} {r.mean_mass_retained:>6.3f} {r.mean_kl_divergence:>7.3f} "
+                  f"{r.output_match_rate:>6.1%} {r.compression_ratio:>6.2f}x")
 
         # Sort by compression
         sorted_by_compression = sorted(valid, key=lambda x: -x.compression_ratio)
 
-        print("\n" + "-"*70)
+        print("\n" + "-"*90)
         print("TOP 10 BY COMPRESSION")
-        print("-"*70)
-        print(f"{'Config':<35} {'Compression':>12} {'Jaccard':>10} {'Memory MB':>10}")
-        print("-"*70)
+        print("-"*90)
+        print(header)
+        print("-"*90)
         for r in sorted_by_compression[:10]:
-            print(f"{r.config.name:<35} {r.compression_ratio:>12.2f}x {r.mean_jaccard:>10.3f} {r.quant_memory_mb:>10.0f}")
+            print(f"{r.config.name:<30} {r.mean_jaccard:>8.3f} {r.mean_weighted_jaccard:>7.3f} "
+                  f"{r.mean_spearman:>7.3f} {r.mean_mass_retained:>6.3f} {r.mean_kl_divergence:>7.3f} "
+                  f"{r.output_match_rate:>6.1%} {r.compression_ratio:>6.2f}x")
+
+        # Quality tier distribution
+        excellent = [r for r in valid if r.mean_jaccard >= 0.8]
+        good = [r for r in valid if 0.6 <= r.mean_jaccard < 0.8]
+        acceptable = [r for r in valid if 0.4 <= r.mean_jaccard < 0.6]
+        degraded = [r for r in valid if 0.2 <= r.mean_jaccard < 0.4]
+        failed = [r for r in valid if r.mean_jaccard < 0.2]
+
+        print("\n" + "-"*90)
+        print("QUALITY TIER DISTRIBUTION")
+        print("-"*90)
+        print(f"  Excellent (≥80%): {len(excellent):>3} configs")
+        print(f"  Good (≥60%):      {len(good):>3} configs")
+        print(f"  Acceptable (≥40%): {len(acceptable):>3} configs")
+        print(f"  Degraded (≥20%):  {len(degraded):>3} configs")
+        print(f"  Failed (<20%):    {len(failed):>3} configs")
 
         # Best trade-off (highest Jaccard with compression > 2x)
         good_compression = [r for r in valid if r.compression_ratio >= 2.0]
         if good_compression:
             best_tradeoff = max(good_compression, key=lambda x: x.mean_jaccard)
-            print(f"\n{'='*70}")
+            print(f"\n{'='*90}")
             print(f"RECOMMENDED CONFIG (Best quality with >2x compression):")
-            print(f"  {best_tradeoff.config.name}")
-            print(f"  Jaccard: {best_tradeoff.mean_jaccard:.3f}")
-            print(f"  Compression: {best_tradeoff.compression_ratio:.2f}x")
-            print(f"  Memory: {best_tradeoff.quant_memory_mb:.0f} MB")
-            print(f"{'='*70}")
+            print(f"  Config:          {best_tradeoff.config.name}")
+            print(f"  Jaccard:         {best_tradeoff.mean_jaccard:.3f}")
+            print(f"  Weighted Jaccard: {best_tradeoff.mean_weighted_jaccard:.3f}")
+            print(f"  Spearman rho:    {best_tradeoff.mean_spearman:.3f}")
+            print(f"  Mass Retained:   {best_tradeoff.mean_mass_retained:.3f}")
+            print(f"  KL Divergence:   {best_tradeoff.mean_kl_divergence:.3f}")
+            print(f"  Output Match:    {best_tradeoff.output_match_rate:.1%}")
+            print(f"  Compression:     {best_tradeoff.compression_ratio:.2f}x")
+            print(f"  Memory:          {best_tradeoff.quant_memory_mb:.0f} MB")
+            print(f"{'='*90}")
+
+
+def classify_quality_tier(mean_jaccard: float) -> str:
+    """Classify quality tier based on Jaccard similarity."""
+    if mean_jaccard >= 0.8:
+        return "excellent"
+    if mean_jaccard >= 0.6:
+        return "good"
+    if mean_jaccard >= 0.4:
+        return "acceptable"
+    if mean_jaccard >= 0.2:
+        return "degraded"
+    return "failed"
+
+
+def export_schema_v1(
+    result: ConfigResult,
+    model_name: str,
+    prompts: List[str],
+    output_dir: Path,
+):
+    """
+    Export a single configuration result in Quantization Comparison Schema v1 format.
+
+    Each config gets its own comparison report against the BF16 baseline.
+    """
+    comparison_id = str(uuid.uuid4())
+    timestamp = datetime.now().isoformat()
+
+    # Compute summary statistics
+    jaccards = result.per_prompt_jaccard if result.per_prompt_jaccard else [result.mean_jaccard]
+    jaccards_sorted = sorted(jaccards)
+
+    def percentile(arr, p):
+        idx = int(len(arr) * p)
+        idx = min(idx, len(arr) - 1)
+        return arr[idx]
+
+    # Build per-prompt results
+    per_prompt_results = []
+    for pm in result.per_prompt_metrics:
+        per_prompt_results.append({
+            "prompt_id": pm.prompt_id,
+            "prompt_text": pm.prompt_text,
+            "prompt_pack": "custom",
+            "jaccard": pm.jaccard,
+            "weighted_jaccard": pm.weighted_jaccard,
+            "rank_correlation": {
+                "spearman": pm.spearman,
+                "kendall": pm.kendall,
+            },
+            "mass_retained": pm.mass_retained,
+            "kl_divergence": pm.kl_divergence,
+            "output_match": pm.output_match,
+            "per_step_jaccard": pm.per_step_jaccard,
+        })
+
+    report = {
+        "schema_version": "1.0.0",
+        "comparison_id": comparison_id,
+        "timestamp": timestamp,
+        "baseline": {
+            "model_id": model_name,
+            "dtype": "bf16",
+            "memory_mb": result.bf16_memory_mb,
+        },
+        "candidate": {
+            "model_id": model_name,
+            "dtype": f"int{result.config.nbits}" if result.config.nbits <= 8 else "fp8",
+            "quantization": {
+                "method": result.config.method,
+                "nbits": result.config.nbits,
+                "group_size": result.config.group_size,
+                "tiling_mode": result.config.tiling_mode,
+            },
+            "memory_mb": result.quant_memory_mb,
+        },
+        "evaluation": {
+            "prompts": {
+                "source": "inline",
+                "count": len(prompts),
+            },
+            "decoding": {
+                "max_tokens": 64,
+                "temperature": 0.0,
+            },
+            "attention_capture": {
+                "top_k": 10,
+                "aggregation": "mean",
+            },
+        },
+        "results": {
+            "summary": {
+                "jaccard": {
+                    "mean": result.mean_jaccard,
+                    "std": result.std_jaccard,
+                    "min": result.min_jaccard,
+                    "max": result.max_jaccard,
+                    "median": percentile(jaccards_sorted, 0.5),
+                    "p5": percentile(jaccards_sorted, 0.05),
+                    "p95": percentile(jaccards_sorted, 0.95),
+                },
+                "weighted_jaccard": {
+                    "mean": result.mean_weighted_jaccard,
+                },
+                "rank_correlation": {
+                    "spearman_mean": result.mean_spearman,
+                    "kendall_mean": result.mean_kendall,
+                },
+                "mass_retained": {
+                    "mean": result.mean_mass_retained,
+                },
+                "kl_divergence": {
+                    "mean": result.mean_kl_divergence,
+                },
+                "output_agreement": {
+                    "exact_match_rate": result.output_match_rate,
+                },
+                "compression_ratio": result.compression_ratio,
+                "quality_tier": classify_quality_tier(result.mean_jaccard),
+            },
+            "per_prompt": per_prompt_results,
+        },
+        "metadata": {
+            "purpose": "SINQ quantization evaluation",
+            "tags": ["sinq", result.config.method, f"{result.config.nbits}bit"],
+        },
+    }
+
+    # Save to file
+    safe_name = result.config.name.replace("/", "_")
+    filename = output_dir / f"schema_v1_{safe_name}.json"
+    with open(filename, "w") as f:
+        json.dump(report, f, indent=2)
+
+    return filename
+
+
+def export_all_schema_v1(
+    results: List[ConfigResult],
+    model_name: str,
+    prompts: List[str],
+    output_dir: Path,
+):
+    """Export all results in Schema v1 format."""
+    print("\n" + "="*60)
+    print("Exporting Schema v1 reports...")
+    print("="*60)
+
+    schema_dir = output_dir / "schema_v1"
+    schema_dir.mkdir(exist_ok=True)
+
+    exported = []
+    for r in results:
+        if r.error is None:
+            filename = export_schema_v1(r, model_name, prompts, schema_dir)
+            exported.append(filename)
+            print(f"  Exported: {filename.name}")
+
+    # Create index file
+    index = {
+        "schema_version": "1.0.0",
+        "generated": datetime.now().isoformat(),
+        "model": model_name,
+        "total_configs": len(results),
+        "successful_configs": len(exported),
+        "reports": [str(f.name) for f in exported],
+    }
+
+    index_file = schema_dir / "index.json"
+    with open(index_file, "w") as f:
+        json.dump(index, f, indent=2)
+
+    print(f"\nExported {len(exported)} Schema v1 reports to {schema_dir}/")
+    return exported
 
 
 if __name__ == "__main__":
