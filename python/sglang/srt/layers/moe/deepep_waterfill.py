@@ -101,24 +101,29 @@ def assign_shared_destination_pytorch(
     if num_tokens == 0:
         return torch.empty(0, dtype=torch.int64, device=device)
 
-    # Build candidate mask: [num_tokens, world_size]
-    # Each token can send shared expert to ranks it already routes to + source rank
-    candidate_mask = torch.zeros(num_tokens, world_size, dtype=torch.bool, device=device)
-    candidate_mask[:, source_rank] = True  # Source rank is always a candidate
-
-    # Add routed ranks as candidates
+    # Compute rank_ids: [num_tokens, topk]
+    # For invalid expert IDs (< 0), use world_size as placeholder (will be filtered)
     valid_mask = topk_ids >= 0
     rank_ids = torch.where(
         valid_mask,
         torch.clamp(topk_ids // experts_per_rank, 0, world_size - 1),
-        torch.zeros_like(topk_ids),
+        torch.full_like(topk_ids, world_size),  # Invalid -> out of range
     )
 
-    for k in range(topk):
-        token_indices = torch.arange(num_tokens, device=device)
-        valid = valid_mask[:, k]
-        ranks = rank_ids[:, k]
-        candidate_mask[token_indices[valid], ranks[valid]] = True
+    # OPTIMIZED: Build candidate mask using scatter (vectorized, no loop)
+    # Flatten rank_ids and create row indices
+    # Shape: [num_tokens * topk]
+    flat_rank_ids = rank_ids.flatten()
+    row_indices = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, topk).flatten()
+    
+    # Create candidate_mask using scatter
+    # Note: use world_size+1 columns to handle invalid entries, then slice
+    candidate_mask = torch.zeros(num_tokens, world_size + 1, dtype=torch.bool, device=device)
+    candidate_mask[row_indices, flat_rank_ids] = True
+    candidate_mask = candidate_mask[:, :world_size]  # Remove invalid column
+    
+    # Source rank is always a candidate
+    candidate_mask[:, source_rank] = True
 
     # Select rank with minimum count among candidates (waterfill)
     INF = routed_counts.max() + 1
@@ -153,31 +158,31 @@ def expand_topk_with_shared_expert(
         local_shared_mask: [N] boolean mask for tokens with local shared expert
     """
     num_tokens = topk_ids.shape[0]
+    topk = topk_ids.shape[1]
     device = topk_ids.device
     experts_per_rank = num_experts // world_size
 
     # Identify local vs remote shared expert
     local_shared_mask = shared_destination == source_rank
     
-    # Virtual expert ID for remote dispatch
-    # For local: will be set to LOCAL_SHARED_MARKER (-1)
-    virtual_expert_ids = shared_destination * experts_per_rank
+    # OPTIMIZED: Pre-allocate output tensors to avoid cat overhead
+    expanded_topk_ids = torch.empty(
+        num_tokens, topk + 1, dtype=topk_ids.dtype, device=device
+    )
+    expanded_topk_ids[:, :topk] = topk_ids
     
-    # Set local shared expert to marker (won't be dispatched)
-    virtual_expert_ids = torch.where(
-        local_shared_mask,
-        torch.full_like(virtual_expert_ids, LOCAL_SHARED_MARKER),
-        virtual_expert_ids,
+    # Compute virtual expert IDs: dest * experts_per_rank for remote, -1 for local
+    # Use in-place operations where possible
+    virtual_expert_ids = shared_destination * experts_per_rank
+    virtual_expert_ids[local_shared_mask] = LOCAL_SHARED_MARKER
+    expanded_topk_ids[:, topk] = virtual_expert_ids.to(topk_ids.dtype)
+    
+    # OPTIMIZED: Pre-allocate weights tensor
+    expanded_topk_weights = torch.empty(
+        num_tokens, topk + 1, dtype=topk_weights.dtype, device=device
     )
-
-    expanded_topk_ids = torch.cat(
-        [topk_ids, virtual_expert_ids.unsqueeze(1).to(topk_ids.dtype)], dim=1
-    )
-
-    shared_weights_col = torch.full(
-        (num_tokens, 1), shared_weight, dtype=topk_weights.dtype, device=device
-    )
-    expanded_topk_weights = torch.cat([topk_weights, shared_weights_col], dim=1)
+    expanded_topk_weights[:, :topk] = topk_weights
+    expanded_topk_weights[:, topk] = shared_weight
 
     return expanded_topk_ids, expanded_topk_weights, local_shared_mask
 
@@ -289,13 +294,14 @@ class DeepEPWaterfillBalancer:
             sparse_ranks_mask[self.rank] = False  # Don't modify source rank assignments
             
             if sparse_ranks_mask.any():
-                # Redirect tokens destined for sparse ranks to local computation
-                sparse_ranks = sparse_ranks_mask.nonzero(as_tuple=True)[0]
-                for sparse_rank in sparse_ranks:
-                    redirect_mask = shared_destination == sparse_rank
-                    shared_destination[redirect_mask] = self.rank
+                # OPTIMIZED: Vectorized redirect of sparse ranks to local
+                # Create a lookup: sparse_ranks -> source_rank, others -> keep original
+                redirect_lookup = torch.arange(self.world_size, device=device)
+                redirect_lookup[sparse_ranks_mask] = self.rank
+                shared_destination = redirect_lookup[shared_destination]
                 
                 if DEEPEP_WATERFILL_DEBUG:
+                    sparse_ranks = sparse_ranks_mask.nonzero(as_tuple=True)[0]
                     new_dest_counts = torch.bincount(shared_destination, minlength=self.world_size)
                     print(
                         f"[DeepEP Waterfill] rank={self.rank} "
