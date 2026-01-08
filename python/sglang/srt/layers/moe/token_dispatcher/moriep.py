@@ -16,7 +16,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils import get_int_env_var, get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.single_batch_overlap import CombineOverlapArgs
@@ -35,6 +35,12 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
 )
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter import QuantType, get_hip_quant
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +194,8 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.quant_config = {}
-
+        #[kk TODO] need to support mxfp4 type
+        self.quant_func = get_hip_quant(QuantType.per_1x128)
 
     def dispatch_a(
         self,
@@ -209,13 +216,26 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         topk_weights,
         topk_ids,
     ):
+        #enable_fp8 = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
+
+        scale = None
+
+        if enable_fp8:
+            # FP8 quant
+            if num_token > 0:
+                # NOTE: aiter is able to handle token=0 case in UT. But for some reason it failed at e2e case. Root cause TBD.
+                hidden_states, scale = self.quant_func(hidden_states, quant_dtype=fp8_dtype)
+            else:
+                hidden_states = torch.empty(hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device)
+                scale = torch.empty((0, self.hidden_size // 128), dtype=torch.float32, device=hidden_states.device)
+
         (
             packed_recv_hidden,
             recv_topk_weights,
             recv_scales,
             recv_topk_ids,
             packed_recv_count
-        ) = self._dispatch_core(hidden_states, topk_weights, topk_ids, None)
+        ) = self._dispatch_core(hidden_states, topk_weights, topk_ids, scale)
 
         return MoriEPNormalDispatchOutput(
             packed_recv_hidden,
