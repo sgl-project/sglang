@@ -42,7 +42,7 @@ class Manifest:
                 DeprecationWarning,
                 stacklevel=3,
             )
-            return cls(files={k: FileInfo(sha256=v, size=0) for k, v in data["checksums"].items()})
+            return cls(files={k: FileInfo(sha256=v, size=-1) for k, v in data["checksums"].items()})
         return cls(files={k: FileInfo(**v) for k, v in data["files"].items()})
 
     def to_dict(self) -> dict:
@@ -70,25 +70,24 @@ IGNORE_PATTERNS = [
 def verify(*, model_path: str, checksums_source: str, max_workers: int = 4) -> None:
     model_path = Path(model_path).resolve()
     expected = _load_checksums(checksums_source)
-    actual_infos = _compute_file_infos_from_folder(
+    actual = _compute_manifest_from_folder(
         model_path=model_path,
         filenames=list(expected.files.keys()),
         max_workers=max_workers,
     )
-    expected_dict = {k: v.sha256 for k, v in expected.files.items()}
-    actual_dict = {k: v.sha256 for k, v in actual_infos.items()}
-    _compare_checksums(expected=expected_dict, actual=actual_dict)
+    _compare_manifests(expected=expected, actual=actual)
     print(f"[ModelFileVerifier] All {len(expected.files)} files verified successfully.")
 
 
-def _compare_checksums(*, expected: Dict[str, str], actual: Dict[str, str]) -> None:
+def _compare_manifests(*, expected: Manifest, actual: Manifest) -> None:
     errors = []
-    for filename, expected_hash in expected.items():
-        if filename not in actual:
-            errors.append(f"{filename}: missing")
-        elif actual[filename] != expected_hash:
+    for filename, exp in expected.files.items():
+        if filename not in actual.files:
+            errors.append(f"{filename}: missing (expected size={exp.size})")
+        elif actual.files[filename].sha256 != exp.sha256:
+            act = actual.files[filename]
             errors.append(
-                f"{filename}: mismatch (expected={expected_hash[:16]}..., actual={actual[filename][:16]}...)"
+                f"{filename}: mismatch (expected={exp.sha256[:16]}... size={exp.size}, actual={act.sha256[:16]}... size={act.size})"
             )
 
     if errors:
@@ -166,7 +165,7 @@ def _get_filename_and_info_from_hf_file(
     if any(fnmatch.fnmatch(filename, pat) for pat in IGNORE_PATTERNS):
         return None
 
-    size = file_info.get("size", 0)
+    size = file_info.get("size", -1)
     lfs_info = file_info.get("lfs")
     if lfs_info and "sha256" in lfs_info:
         return filename, FileInfo(sha256=lfs_info["sha256"], size=size)
