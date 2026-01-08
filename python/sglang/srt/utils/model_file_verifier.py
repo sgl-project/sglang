@@ -21,6 +21,12 @@ IGNORE_PATTERNS = [
     "checksums.json",
     ".DS_Store",
     "*.lock",
+    ".gitattributes",
+    "LICENSE",
+    "LICENSE.*",
+    "README.md",
+    "README.*",
+    "NOTICE",
 ]
 
 
@@ -128,6 +134,8 @@ def _load_checksums(source: str) -> Dict[str, str]:
 
 
 def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
+    import fnmatch
+
     try:
         from huggingface_hub import HfFileSystem
     except ImportError:
@@ -148,6 +156,8 @@ def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
         if file_info.get("type") != "file":
             continue
         filename = Path(file_info.get("name", "")).name
+        if any(fnmatch.fnmatch(filename, pat) for pat in IGNORE_PATTERNS):
+            continue
         full_path = file_info.get("name", "")
         lfs_info = file_info.get("lfs")
         if lfs_info and "sha256" in lfs_info:
