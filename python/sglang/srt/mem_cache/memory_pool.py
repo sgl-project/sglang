@@ -433,10 +433,18 @@ class HybridReqToTokenPool(ReqToTokenPool):
             assert len(select_index) == len(
                 mamba_ping_pong_track_buffer_list
             ), f"Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
-        self.req_index_to_mamba_index_mapping[select_index] = torch.tensor(
+
+        select_index_tensor = torch.tensor(
+            select_index, dtype=torch.int64, device=self.device
+        )
+        mamba_index_tensor = torch.tensor(
             mamba_index, dtype=torch.int32, device=self.device
         )
+        self.req_index_to_mamba_index_mapping.scatter_(
+            0, select_index_tensor, mamba_index_tensor
+        )
         if self.enable_mamba_extra_buffer:
+
             self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
                 torch.tensor(
                     mamba_ping_pong_track_buffer_list,
