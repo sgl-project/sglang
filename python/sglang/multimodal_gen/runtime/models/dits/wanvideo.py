@@ -314,6 +314,7 @@ class WanTransformerBlock(nn.Module):
             logger.error("QK Norm type not supported")
             raise Exception
         assert cross_attn_norm is True
+        self.qk_norm = qk_norm
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
             norm_type="layer",
@@ -395,14 +396,17 @@ class WanTransformerBlock(nn.Module):
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
-
+        tp_rmsnorm = (
+            self.qk_norm == "rms_norm_across_heads"
+            and get_tensor_model_parallel_world_size() > 1
+        )
         if self.norm_q is not None:
-            if get_tensor_model_parallel_world_size() > 1:
+            if tp_rmsnorm:
                 query = tensor_parallel_rms_norm(query, self.norm_q)
             else:
                 query = self.norm_q(query)
         if self.norm_k is not None:
-            if get_tensor_model_parallel_world_size() > 1:
+            if tp_rmsnorm:
                 key = tensor_parallel_rms_norm(key, self.norm_k)
             else:
                 key = self.norm_k(key)
