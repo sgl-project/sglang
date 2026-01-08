@@ -9,7 +9,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-# FP8 quantization kernel tests
 register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
 
 

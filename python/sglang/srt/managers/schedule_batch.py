@@ -258,6 +258,12 @@ class MultimodalDataItem:
 
         from sglang.srt.managers.mm_utils import hash_feature
 
+        if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+            import uuid
+
+            self.hash = uuid.uuid4().int
+            self.pad_value = self.hash % (1 << 30)
+            return
         if self.hash is None:
             from sglang.srt.server_args import get_global_server_args
 
@@ -546,8 +552,12 @@ class Req:
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
-        # The length of KV that have been removed in local attention chunked prefill
+        # The length of KV that have been removed in swa chunk cache
         self.evicted_seqlen_local = 0
+
+        # The index of the extend / decode batch
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
@@ -787,20 +797,11 @@ class Req:
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
-
-        # NOTE: This function is called exactly once after the request is finished.
-        global_server_args = get_global_server_args()
-        topk = global_server_args.speculative_eagle_topk
-
-        enable_kv_committed_len = topk is None or topk == 1
-        if enable_kv_committed_len:
-            assert (
-                not self.kv_committed_freed
-            ), f"Committed KV cache already freed ({self.kv_committed_len=})"
-            self.kv_committed_freed = True
-            return self.kv_committed_len
-        else:
-            return len(self.origin_input_ids) + max(len(self.output_ids) - 1, 0)
+        assert (
+            not self.kv_committed_freed
+        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        self.kv_committed_freed = True
+        return self.kv_committed_len
 
     def pop_overallocated_kv_cache(self) -> Tuple[int, int]:
         """Return the range of over-allocated KV cache and mark them as freed."""
@@ -1476,6 +1477,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
 
+            req.extend_batch_idx += 1
+
             # update req-level memory management fields
             req.kv_committed_len = seq_len
             req.kv_allocated_len = seq_len
@@ -1574,6 +1577,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mm_item.feature = pixel_values.reconstruct_on_target_device(
                         torch.cuda.current_device()
                     )
+                    # The reference by CudaIpcTensorTransportProxy was cut off,
+                    # proactively delete to avoid slow gc.
+                    del pixel_values
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
@@ -1618,7 +1624,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_indices_cpu: List[int],
         mamba_track_seqlens_cpu: List[int],
     ):
-        mask = (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE > 0
+        MAMBA_CACHE_V2_CHUNK_SIZE = max(
+            FLA_CHUNK_SIZE, self.token_to_kv_pool_allocator.page_size
+        )
+        mask = req.extend_input_len >= MAMBA_CACHE_V2_CHUNK_SIZE
         mamba_track_mask_cpu.append(mask)
         mamba_track_indices_cpu.append(
             req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
@@ -1637,7 +1646,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # mamba radix cache to track which seqlen this mamba state should store at.
             mamba_track_seqlen_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+                + (req.extend_input_len // MAMBA_CACHE_V2_CHUNK_SIZE)
+                * MAMBA_CACHE_V2_CHUNK_SIZE
             )
             req.mamba_next_track_idx = (
                 self.req_to_token_pool.get_mamba_ping_pong_other_idx(
@@ -1649,7 +1659,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
                     req.mamba_branching_seqlen - len(req.prefix_indices)
-                ) % FLA_CHUNK_SIZE == 0
+                ) % MAMBA_CACHE_V2_CHUNK_SIZE == 0
                 if (
                     req.mamba_branching_seqlen > len(req.prefix_indices)
                     and req.mamba_branching_seqlen < mamba_track_seqlen
@@ -1904,6 +1914,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Update req-level memory management fields
         for req in self.reqs:
+            req.decode_batch_idx += 1
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
