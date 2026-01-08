@@ -10,6 +10,10 @@ from sglang.srt.utils.model_file_verifier import (
     compute_sha256,
 )
 
+
+register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
+
+
 # ======== Test Utilities ========
 
 
