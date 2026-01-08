@@ -84,16 +84,10 @@ def generate_checksums(
 def _discover_files(model_path: Path) -> List[str]:
     import fnmatch
 
-    files = []
-    for entry in model_path.iterdir():
-        if entry.name.startswith("."):
-            continue
-        if not entry.is_file():
-            continue
-        if any(fnmatch.fnmatch(entry.name, pat) for pat in IGNORE_PATTERNS):
-            continue
-        files.append(entry.name)
-    return sorted(files)
+    return sorted(
+        e.name for e in model_path.iterdir()
+        if e.is_file() and not e.name.startswith(".") and not any(fnmatch.fnmatch(e.name, p) for p in IGNORE_PATTERNS)
+    )
 
 
 # ======== Load Checksums ========
