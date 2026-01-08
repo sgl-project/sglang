@@ -43,7 +43,7 @@ jobs:
             gh run list \
               --repo "$REPO" \
               --workflow "$workflow_file" \
-              --json databaseId,status,event,url,headSha,headBranch \
+              --json databaseId,status,event,url \
               --limit 1000 \
             | jq -c '.[]
                 | select(.event=="pull_request" and (.status=="queued" or .status=="waiting" or .status=="in_progress"))' \
@@ -51,29 +51,39 @@ jobs:
                 run_id=$(echo "$run" | jq -r '.databaseId')
                 run_url=$(echo "$run" | jq -r '.url // empty')
 
-                # Fetch run details to get true head owner + head branch (works for fork PR too)
-                run_json=$(gh api -H "Accept: application/vnd.github+json" \
+                echo "Checking run $run_id ($run_url)"
+
+                # Fetch full run details to get head repository and branch info
+                run_details=$(gh api -H "Accept: application/vnd.github+json" \
                   "repos/$REPO/actions/runs/$run_id" 2>/dev/null || true)
 
-                head_owner=$(echo "$run_json" | jq -r '.head_repository.owner.login // empty')
-                head_branch=$(echo "$run_json" | jq -r '.head_branch // empty')
+                if [ -z "$run_details" ]; then
+                  echo "⚠️ Could not fetch details for run $run_id, skipping"
+                  continue
+                fi
+
+                # Get head owner and branch (works for both fork and non-fork PRs)
+                head_owner=$(echo "$run_details" | jq -r '.head_repository.owner.login // empty')
+                head_branch=$(echo "$run_details" | jq -r '.head_branch // empty')
 
                 if [ -z "$head_owner" ] || [ -z "$head_branch" ]; then
                   echo "⚠️ Run $run_id missing head info (owner='$head_owner', branch='$head_branch'), skipping ($run_url)"
                   continue
                 fi
 
-                # Find PR by head=OWNER:BRANCH in the base repo
+                echo "  Head: ${head_owner}:${head_branch}"
+
+                # Find PR by searching with head=owner:branch
                 pr_number=$(gh api -H "Accept: application/vnd.github+json" \
-                  "repos/$REPO/pulls" -f state=open -f head="${head_owner}:${head_branch}" \
+                  "repos/$REPO/pulls?state=open&head=${head_owner}:${head_branch}" \
                   --jq '.[0].number // empty' 2>/dev/null || true)
 
                 if [ -z "$pr_number" ]; then
-                  echo "⚠️ Run $run_id PR not found via head='${head_owner}:${head_branch}', skipping ($run_url)"
+                  echo "⚠️ No open PR found for ${head_owner}:${head_branch}, skipping run $run_id"
                   continue
                 fi
 
-                echo "Run $run_id is associated with PR #$pr_number (head='${head_owner}:${head_branch}')"
+                echo "  Associated with PR #$pr_number"
 
                 # Debug when missing
                 if [ -z "$pr_number" ]; then
@@ -83,11 +93,12 @@ jobs:
 
                 echo "Run $run_id is associated with PR #$pr_number (headBranch='$head_branch')"
 
+                # Check for high priority label
                 labels=$(gh pr view "$pr_number" --repo "$REPO" --json labels \
-                  | jq -r '.labels[].name' || true)
+                  | jq -r '.labels[].name' 2>/dev/null || true)
 
                 if echo "$labels" | grep -Fxq "high priority"; then
-                  echo "🛑 PR #$pr_number has label 'high priority' → skip cancel"
+                  echo "  🛑 PR #$pr_number has 'high priority' label → skipping cancel"
                   continue
                 fi
 
