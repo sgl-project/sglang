@@ -1,0 +1,51 @@
+name: Sync Fork via Pull Request
+
+on:
+  schedule:
+    - cron: '0 */1 * * *'   # runs daily at 03:00 UTC
+  workflow_dispatch:      # allows manual run
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Download your fork’s code
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2. Add the original repository as "upstream"
+      - name: Add upstream repository
+        run: |
+          git remote add upstream https://github.com/sgl-project/sglang.git
+
+      # 3. Get latest changes from upstream
+      - name: Fetch upstream changes
+        run: |
+          git fetch upstream
+
+      # 4. Create a new branch for syncing
+      - name: Create sync branch
+        run: |
+          git checkout -B upstream-sync upstream/main
+
+      # 5. Push that branch to your fork
+      - name: Push sync branch
+        run: |
+          git push origin upstream-sync --force
+
+      # 6. Open a Pull Request automatically
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: upstream-sync
+          title: "Sync with upstream repository"
+          body: |
+            This PR was automatically created.
+            It syncs the latest changes from the original repository.
