@@ -461,7 +461,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
         next_draft_input = batch_result.next_draft_input
-        ret_topk_p_list = [next_draft_input.topk_p] + ret_topk_index_list
+        ret_topk_p_list = [next_draft_input.topk_p] + ret_topk_p_list
         ret_topk_index_list = [next_draft_input.topk_index] + ret_topk_index_list
         (
             next_draft_input.topk_p,
@@ -473,7 +473,7 @@ class EagleDraftWorker(BaseDraftWorker):
             None,  # if use spec overlap reflow, we do not need to save hidden_states for target mode
         )
 
-    def draft_forward_2(self, forward_batch: ForwardBatch):
+    def draft_forward_v2(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
         out_cache_loc = forward_batch.out_cache_loc
