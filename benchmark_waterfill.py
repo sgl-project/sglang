@@ -19,7 +19,7 @@ from deepep_waterfill import (
 )
 
 if HAS_TRITON:
-    from deepep_waterfill import assign_shared_destination_triton
+    from deepep_waterfill import assign_shared_destination_triton, waterfill_expand_topk_fused
 
 
 def benchmark_function(fn, *args, warmup=5, repeat=100, **kwargs):
@@ -147,26 +147,39 @@ def main():
     # Test Triton kernel if available and on GPU
     if HAS_TRITON and device == "cuda":
         print("\n" + "=" * 70)
-        print("Triton Kernel Performance (GPU)")
+        print("Triton Fused Kernel Performance (GPU)")
         print("=" * 70)
-        print(f"\n{'Batch':<10} {'PyTorch':<15} {'Triton':<15} {'Speedup':<10}")
+        
+        # Compare: PyTorch (assign + expand) vs Triton Fused
+        def pytorch_full(topk_ids, topk_weights, routed_counts):
+            shared_dest = assign_shared_destination_pytorch(topk_ids, routed_counts, num_experts, world_size, 0)
+            return expand_topk_with_shared_expert(topk_ids, topk_weights, shared_dest, num_experts, world_size, 0, 0.4)
+        
+        print(f"\n{'Batch':<10} {'PyTorch':<15} {'Triton Fused':<15} {'Speedup':<10}")
         print("-" * 50)
         
         for batch_size in batch_sizes:
             topk_ids = torch.randint(0, num_experts, (batch_size, topk), dtype=torch.int64, device=device)
+            topk_weights = torch.rand(batch_size, topk, dtype=torch.float32, device=device)
             routed_counts = torch.randint(1000, 5000, (world_size,), dtype=torch.int64, device=device)
             
-            t_pytorch = benchmark_function(
-                assign_shared_destination_pytorch, topk_ids, routed_counts, num_experts, world_size, 0
-            )
-            t_triton = benchmark_function(
-                assign_shared_destination_triton, topk_ids, routed_counts, num_experts, world_size, 0
+            t_pytorch = benchmark_function(pytorch_full, topk_ids, topk_weights, routed_counts)
+            t_fused = benchmark_function(
+                waterfill_expand_topk_fused, topk_ids, topk_weights, routed_counts,
+                num_experts, world_size, 0, 0.4
             )
             
-            speedup = t_pytorch / t_triton
-            print(f"{batch_size:<10} {t_pytorch:<15.4f} {t_triton:<15.4f} {speedup:<10.2f}x")
+            speedup = t_pytorch / t_fused
+            print(f"{batch_size:<10} {t_pytorch:<15.4f} {t_fused:<15.4f} {speedup:<10.2f}x")
+            
+        # Memory traffic comparison
+        print("\n" + "-" * 50)
+        print("Memory Analysis:")
+        print("  PyTorch: 3 kernel launches, intermediate tensors for candidate_mask, rank_ids")
+        print("  Triton:  1 fused kernel, no intermediate tensors")
+        
     elif HAS_TRITON:
-        print(f"\n[INFO] Triton available but running on CPU. Use GPU to test Triton kernel.")
+        print(f"\n[INFO] Triton available but running on CPU. Use GPU to test fused kernel.")
     else:
         print(f"\n[INFO] Triton not available. Install triton for GPU-optimized kernels.")
 

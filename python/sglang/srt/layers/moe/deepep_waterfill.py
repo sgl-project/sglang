@@ -64,55 +64,192 @@ except ImportError:
 if HAS_TRITON:
 
     @triton.jit
-    def _assign_shared_destination_kernel(
-        topk_ids_ptr,       # [num_tokens, topk]
-        routed_counts_ptr,  # [world_size]
-        destination_ptr,    # [num_tokens] output
+    def _waterfill_expand_topk_fused_kernel(
+        # Inputs
+        topk_ids_ptr,           # [num_tokens, topk]
+        topk_weights_ptr,       # [num_tokens, topk]
+        routed_counts_ptr,      # [world_size]
+        # Outputs
+        expanded_ids_ptr,       # [num_tokens, topk+1]
+        expanded_weights_ptr,   # [num_tokens, topk+1]
+        local_mask_ptr,         # [num_tokens]
+        # Scalars
         num_tokens,
-        topk,
+        topk: tl.constexpr,
         experts_per_rank,
         world_size,
         source_rank,
+        shared_weight,
+        local_marker,           # LOCAL_SHARED_MARKER = -1
         BLOCK_SIZE: tl.constexpr,
     ):
         """
-        Triton kernel for assigning shared expert destination using waterfill.
-        Each program instance handles one token.
+        Fused Triton kernel for waterfill assignment + topk expansion.
+        
+        For each token:
+        1. Find all ranks it routes to (from topk_ids)
+        2. Select the rank with minimum routed_count (waterfill)
+        3. Expand topk_ids/weights to include shared expert
+        4. Set local_mask for tokens computed locally
+        
+        This kernel fuses assign_shared_destination + expand_topk_with_shared_expert
+        into a single kernel pass, reducing memory traffic and kernel launch overhead.
         """
         pid = tl.program_id(0)
         token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = token_idx < num_tokens
         
-        # Initialize best_rank and best_count for each token
-        best_count = tl.full([BLOCK_SIZE], 2**30, dtype=tl.int64)  # INF
-        best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
-        
-        # Check source rank first
+        # ===== Step 1: Waterfill - find best destination rank =====
+        # Initialize with source rank (always a candidate)
         source_count = tl.load(routed_counts_ptr + source_rank)
-        update_mask = mask
-        best_count = tl.where(update_mask, source_count, best_count)
+        best_count = tl.where(mask, source_count, 2**30)
+        best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int32)
         
-        # Check each routed expert
+        # Check each routed expert and update if better
         for k in range(topk):
-            # Load expert ID for this token
-            expert_id = tl.load(topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1)
+            # Load expert ID
+            expert_id = tl.load(
+                topk_ids_ptr + token_idx * topk + k, 
+                mask=mask, 
+                other=-1
+            )
             valid = expert_id >= 0
             
-            # Compute target rank
+            # Compute target rank from expert ID
             target_rank = expert_id // experts_per_rank
-            target_rank = tl.minimum(target_rank, world_size - 1)
-            target_rank = tl.maximum(target_rank, 0)
+            target_rank = tl.minimum(tl.maximum(target_rank, 0), world_size - 1)
             
-            # Load routed count for target rank
-            target_count = tl.load(routed_counts_ptr + target_rank, mask=mask & valid, other=2**30)
+            # Load routed count for this rank
+            target_count = tl.load(
+                routed_counts_ptr + target_rank, 
+                mask=mask & valid, 
+                other=2**30
+            )
             
-            # Update if this rank has lower count
+            # Update if this rank has lower count (waterfill)
             better = (target_count < best_count) & valid & mask
             best_count = tl.where(better, target_count, best_count)
             best_rank = tl.where(better, target_rank, best_rank)
         
-        # Store result
-        tl.store(destination_ptr + token_idx, best_rank, mask=mask)
+        # ===== Step 2: Compute virtual expert ID and local mask =====
+        is_local = (best_rank == source_rank)
+        
+        # Virtual expert ID: dest * experts_per_rank, or local_marker if local
+        virtual_id = tl.where(
+            is_local,
+            local_marker,
+            best_rank * experts_per_rank
+        )
+        
+        # ===== Step 3: Copy original topk_ids and topk_weights =====
+        # Copy topk_ids columns
+        for k in range(topk):
+            val = tl.load(topk_ids_ptr + token_idx * topk + k, mask=mask, other=0)
+            tl.store(expanded_ids_ptr + token_idx * (topk + 1) + k, val, mask=mask)
+        
+        # Copy topk_weights columns
+        for k in range(topk):
+            val = tl.load(topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0)
+            tl.store(expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask)
+        
+        # ===== Step 4: Write 9th column (shared expert) =====
+        tl.store(
+            expanded_ids_ptr + token_idx * (topk + 1) + topk, 
+            virtual_id, 
+            mask=mask
+        )
+        tl.store(
+            expanded_weights_ptr + token_idx * (topk + 1) + topk,
+            shared_weight,
+            mask=mask
+        )
+        
+        # ===== Step 5: Write local mask =====
+        tl.store(local_mask_ptr + token_idx, is_local, mask=mask)
+
+
+    def waterfill_expand_topk_fused(
+        topk_ids: Tensor,
+        topk_weights: Tensor,
+        routed_counts: Tensor,
+        num_experts: int,
+        world_size: int,
+        source_rank: int,
+        shared_weight: float,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Fused waterfill assignment + topk expansion using Triton.
+        
+        This is a single kernel that does:
+        1. Waterfill: For each token, find the least loaded rank among its routed ranks
+        2. Expand topk from [N, 8] to [N, 9] with shared expert info
+        
+        Returns:
+            expanded_topk_ids: [N, 9]
+            expanded_topk_weights: [N, 9]  
+            local_shared_mask: [N] boolean
+        """
+        num_tokens = topk_ids.shape[0]
+        topk = topk_ids.shape[1]
+        experts_per_rank = num_experts // world_size
+        device = topk_ids.device
+        
+        if num_tokens == 0:
+            return (
+                torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=device),
+                torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=device),
+                torch.empty(0, dtype=torch.bool, device=device),
+            )
+        
+        # Pre-allocate outputs
+        expanded_topk_ids = torch.empty(num_tokens, topk + 1, dtype=topk_ids.dtype, device=device)
+        expanded_topk_weights = torch.empty(num_tokens, topk + 1, dtype=topk_weights.dtype, device=device)
+        local_shared_mask = torch.empty(num_tokens, dtype=torch.bool, device=device)
+        
+        # Launch fused kernel
+        BLOCK_SIZE = 256
+        grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+        
+        _waterfill_expand_topk_fused_kernel[grid](
+            topk_ids,
+            topk_weights,
+            routed_counts,
+            expanded_topk_ids,
+            expanded_topk_weights,
+            local_shared_mask,
+            num_tokens,
+            topk,
+            experts_per_rank,
+            world_size,
+            source_rank,
+            shared_weight,
+            LOCAL_SHARED_MARKER,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        
+        return expanded_topk_ids, expanded_topk_weights, local_shared_mask
+
+
+    @triton.jit
+    def _count_destinations_kernel(
+        destination_ptr,    # [num_tokens] - destination rank for each token
+        counts_ptr,         # [world_size] - output counts (atomic add)
+        num_tokens,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Count tokens per destination rank using atomic operations."""
+        pid = tl.program_id(0)
+        token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = token_idx < num_tokens
+        
+        dest = tl.load(destination_ptr + token_idx, mask=mask, other=0)
+        
+        # Use atomic add to count
+        # Note: This creates contention but is simpler than reduction
+        for i in range(BLOCK_SIZE):
+            if tl.arange(0, BLOCK_SIZE)[i] < num_tokens - pid * BLOCK_SIZE:
+                d = tl.load(destination_ptr + pid * BLOCK_SIZE + i)
+                tl.atomic_add(counts_ptr + d, 1)
 
 
     def assign_shared_destination_triton(
@@ -122,7 +259,7 @@ if HAS_TRITON:
         world_size: int,
         source_rank: int,
     ) -> Tensor:
-        """Triton-optimized shared destination assignment."""
+        """Triton-optimized shared destination assignment (standalone version)."""
         num_tokens = topk_ids.shape[0]
         topk = topk_ids.shape[1]
         experts_per_rank = num_experts // world_size
@@ -131,24 +268,27 @@ if HAS_TRITON:
         if num_tokens == 0:
             return torch.empty(0, dtype=torch.int64, device=device)
         
-        destination = torch.empty(num_tokens, dtype=torch.int64, device=device)
-        
-        BLOCK_SIZE = 128
-        grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-        
-        _assign_shared_destination_kernel[grid](
+        # Use the fused kernel but only extract destination
+        # This is less efficient than standalone, but kept for API compatibility
+        expanded_ids, _, local_mask = waterfill_expand_topk_fused(
             topk_ids,
+            torch.zeros(num_tokens, topk, dtype=torch.float32, device=device),  # dummy weights
             routed_counts,
-            destination,
-            num_tokens,
-            topk,
-            experts_per_rank,
+            num_experts,
             world_size,
             source_rank,
-            BLOCK_SIZE=BLOCK_SIZE,
+            0.0,  # dummy weight
         )
         
-        return destination
+        # Extract destination from 9th column
+        virtual_ids = expanded_ids[:, -1]
+        destination = torch.where(
+            local_mask,
+            torch.full_like(virtual_ids, source_rank),
+            virtual_ids // experts_per_rank,
+        )
+        
+        return destination.to(torch.int64)
 
 
 # ============== PyTorch Implementation ==============
@@ -361,9 +501,12 @@ class DeepEPWaterfillBalancer:
         """
         Prepare expanded topk for dispatch with shared expert as 9th expert.
 
+        Uses fused Triton kernel on GPU for maximum performance.
+
         Optimizations:
-        1. If batch size < MIN_BATCH_FOR_BALANCE, all shared experts compute locally
-        2. If a remote rank would receive < MIN_TOKENS_PER_RANK, compute locally instead
+        1. Fused kernel: waterfill + expand in single GPU pass
+        2. If batch size < MIN_BATCH_FOR_BALANCE, all shared experts compute locally
+        3. If a remote rank would receive < MIN_TOKENS_PER_RANK, compute locally instead
 
         Returns:
             expanded_topk_ids: [N, 9] with virtual expert ID or LOCAL_SHARED_MARKER
@@ -371,99 +514,122 @@ class DeepEPWaterfillBalancer:
             local_shared_mask: [N] boolean mask for tokens with local shared expert
         """
         num_tokens = topk_ids.shape[0]
+        topk = topk_ids.shape[1]
         device = topk_ids.device
         
         if num_tokens == 0:
             # Empty batch
-            expanded_topk_ids = torch.empty(0, topk_ids.shape[1] + 1, dtype=topk_ids.dtype, device=device)
-            expanded_topk_weights = torch.empty(0, topk_weights.shape[1] + 1, dtype=topk_weights.dtype, device=device)
-            local_shared_mask = torch.empty(0, dtype=torch.bool, device=device)
-            return expanded_topk_ids, expanded_topk_weights, local_shared_mask
+            return (
+                torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=device),
+                torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=device),
+                torch.empty(0, dtype=torch.bool, device=device),
+            )
 
         # Small batch optimization: all shared experts compute locally
         if num_tokens < self.MIN_BATCH_FOR_BALANCE:
-            shared_destination = torch.full(
-                (num_tokens,), self.rank, dtype=torch.int64, device=device
-            )
             if DEEPEP_WATERFILL_DEBUG:
                 print(
                     f"[DeepEP Waterfill] rank={self.rank} "
                     f"tokens={num_tokens} < MIN_BATCH={self.MIN_BATCH_FOR_BALANCE}, "
                     f"all shared experts computed locally"
                 )
+            # Fast path: all local, no waterfill needed
+            expanded_topk_ids = torch.empty(num_tokens, topk + 1, dtype=topk_ids.dtype, device=device)
+            expanded_topk_ids[:, :topk] = topk_ids
+            expanded_topk_ids[:, topk] = LOCAL_SHARED_MARKER
+            
+            expanded_topk_weights = torch.empty(num_tokens, topk + 1, dtype=topk_weights.dtype, device=device)
+            expanded_topk_weights[:, :topk] = topk_weights
+            expanded_topk_weights[:, topk] = self.shared_weight
+            
+            local_shared_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+            return expanded_topk_ids, expanded_topk_weights, local_shared_mask
+
+        # ===== Use Fused Triton Kernel on GPU =====
+        if HAS_TRITON and topk_ids.is_cuda:
+            expanded_topk_ids, expanded_topk_weights, local_shared_mask = waterfill_expand_topk_fused(
+                topk_ids,
+                topk_weights,
+                routed_counts,
+                self.num_experts,
+                self.world_size,
+                self.rank,
+                self.shared_weight,
+            )
         else:
-            # Waterfill assignment
-            shared_destination = self.assign_shared_destination(topk_ids, routed_counts)
-            
-            # Check per-rank token counts and redirect sparse destinations to local
-            # If a remote rank would receive too few tokens, compute locally instead
-            dest_counts = torch.bincount(shared_destination, minlength=self.world_size)
-            
-            # Find ranks (excluding source rank) that would receive too few tokens
-            sparse_ranks_mask = (dest_counts < self.MIN_TOKENS_PER_RANK)
-            sparse_ranks_mask[self.rank] = False  # Don't modify source rank assignments
-            
-            if sparse_ranks_mask.any():
-                # OPTIMIZED: Vectorized redirect of sparse ranks to local
-                # Create a lookup: sparse_ranks -> source_rank, others -> keep original
-                redirect_lookup = torch.arange(self.world_size, device=device)
-                redirect_lookup[sparse_ranks_mask] = self.rank
-                shared_destination = redirect_lookup[shared_destination]
-                
-                if DEEPEP_WATERFILL_DEBUG:
-                    sparse_ranks = sparse_ranks_mask.nonzero(as_tuple=True)[0]
-                    new_dest_counts = torch.bincount(shared_destination, minlength=self.world_size)
-                    print(
-                        f"[DeepEP Waterfill] rank={self.rank} "
-                        f"redirected sparse ranks {sparse_ranks.tolist()} to local, "
-                        f"dest_counts: {dest_counts.tolist()} -> {new_dest_counts.tolist()}"
-                    )
+            # Fallback to PyTorch implementation
+            shared_destination = assign_shared_destination_pytorch(
+                topk_ids, routed_counts, self.num_experts, self.world_size, self.rank
+            )
+            expanded_topk_ids, expanded_topk_weights, local_shared_mask = expand_topk_with_shared_expert(
+                topk_ids, topk_weights, shared_destination,
+                self.num_experts, self.world_size, self.rank, self.shared_weight,
+            )
 
-        # Check if local shared count is too small for efficient tile utilization
-        # If so, redirect local tokens to the best remote rank
-        local_count = (shared_destination == self.rank).sum().item()
-        if 0 < local_count < self.MIN_TOKENS_PER_RANK and num_tokens >= self.MIN_BATCH_FOR_BALANCE:
-            # Find the rank with most shared tokens (excluding source rank)
-            dest_counts = torch.bincount(shared_destination, minlength=self.world_size)
-            dest_counts[self.rank] = -1  # Exclude source rank
-            best_remote_rank = dest_counts.argmax().item()
-            
-            if dest_counts[best_remote_rank] > 0:
-                # Redirect local tokens to best remote rank
-                local_mask = shared_destination == self.rank
-                shared_destination[local_mask] = best_remote_rank
-                
-                if DEEPEP_WATERFILL_DEBUG:
-                    print(
-                        f"[DeepEP Waterfill] rank={self.rank} "
-                        f"local_count={local_count} < MIN={self.MIN_TOKENS_PER_RANK}, "
-                        f"redirecting to rank {best_remote_rank}"
-                    )
-
-        # Expand topk to include shared expert
-        expanded_topk_ids, expanded_topk_weights, local_shared_mask = expand_topk_with_shared_expert(
-            topk_ids,
-            topk_weights,
-            shared_destination,
-            self.num_experts,
-            self.world_size,
-            self.rank,
-            self.shared_weight,
+        # ===== Post-processing: Handle sparse destinations (vectorized) =====
+        # This is done on GPU with minimal CPU sync
+        
+        # Extract destinations from virtual IDs
+        virtual_ids = expanded_topk_ids[:, -1]
+        
+        # Compute destination for each token
+        dest_from_virtual = torch.where(
+            local_shared_mask,
+            torch.full_like(virtual_ids, self.rank),
+            virtual_ids // self.experts_per_rank,
         )
+        
+        # Count tokens per destination rank
+        dest_counts = torch.bincount(dest_from_virtual.to(torch.int64), minlength=self.world_size)
+        
+        # Find sparse remote ranks (those receiving < MIN_TOKENS_PER_RANK)
+        sparse_ranks_mask = dest_counts < self.MIN_TOKENS_PER_RANK
+        sparse_ranks_mask[self.rank] = False  # Don't touch local
+        
+        # VECTORIZED: Redirect all sparse remote tokens to local in one shot
+        # Check which tokens go to sparse ranks
+        token_goes_to_sparse = sparse_ranks_mask[dest_from_virtual.long()] & ~local_shared_mask
+        
+        if token_goes_to_sparse.any():
+            expanded_topk_ids[token_goes_to_sparse, -1] = LOCAL_SHARED_MARKER
+            local_shared_mask = local_shared_mask | token_goes_to_sparse
+            
+            if DEEPEP_WATERFILL_DEBUG:
+                print(
+                    f"[DeepEP Waterfill] rank={self.rank} "
+                    f"redirected {token_goes_to_sparse.sum().item()} sparse tokens to local"
+                )
 
-        if DEEPEP_WATERFILL_DEBUG and num_tokens >= self.MIN_BATCH_FOR_BALANCE:
-            # Count how many tokens go to each rank for shared expert
+        # VECTORIZED: Handle case where local count is too small
+        # Move all local to best remote rank
+        local_count = local_shared_mask.sum()
+        has_sparse_local = (local_count > 0) & (local_count < self.MIN_TOKENS_PER_RANK)
+        
+        if has_sparse_local:
+            # Find best remote rank (one with most tokens)
+            remote_dest_counts = dest_counts.clone()
+            remote_dest_counts[self.rank] = -1  # Exclude local
+            best_remote_rank = remote_dest_counts.argmax()
+            
+            if remote_dest_counts[best_remote_rank] > 0:
+                # Redirect all local to best remote
+                expanded_topk_ids[local_shared_mask, -1] = best_remote_rank * self.experts_per_rank
+                local_shared_mask = torch.zeros_like(local_shared_mask)
+                
+                if DEEPEP_WATERFILL_DEBUG:
+                    print(
+                        f"[DeepEP Waterfill] rank={self.rank} "
+                        f"local_count={local_count.item()} < MIN={self.MIN_TOKENS_PER_RANK}, "
+                        f"redirecting to rank {best_remote_rank.item()}"
+                    )
+
+        if DEEPEP_WATERFILL_DEBUG:
             num_local = local_shared_mask.sum().item()
             num_remote = num_tokens - num_local
-            dest_counts = torch.bincount(
-                shared_destination, minlength=self.world_size
-            ).tolist()
             print(
                 f"[DeepEP Waterfill] rank={self.rank} "
                 f"tokens={num_tokens} "
-                f"local_shared={num_local} remote_shared={num_remote} "
-                f"routed_counts={routed_counts.tolist()} "
-                f"shared_dest_counts={dest_counts}"
+                f"local_shared={num_local} remote_shared={num_remote}"
             )
 
         return expanded_topk_ids, expanded_topk_weights, local_shared_mask
