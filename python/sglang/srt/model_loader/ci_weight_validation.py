@@ -33,7 +33,8 @@ logger = logging.getLogger(__name__)
 # Validation marker version - increment when validation logic changes
 # v2: Added trust_remote_code module validation (modeling_*.py must exist in snapshot)
 # v3: Added remote file existence checks for hf_quant_config.json
-VALIDATION_MARKER_VERSION = "3"
+# v4: Added marker recheck mechanism with required_files tracking
+VALIDATION_MARKER_VERSION = "4"
 
 
 def _remote_file_exists(
@@ -135,9 +136,18 @@ def _recheck_marker_against_snapshot(
     """
     required_files = marker.get("required_files", [])
     if not required_files:
-        # Old marker format or no required files - accept it
-        logger.debug("Marker has no required_files, accepting")
-        return True
+        # Old marker format without required_files - delete it and force re-validation
+        logger.warning(
+            "Marker has no required_files (old format). "
+            "Deleting old marker and forcing re-validation."
+        )
+        try:
+            if os.path.exists(marker_path):
+                os.remove(marker_path)
+                logger.debug("Deleted old-format marker: %s", marker_path)
+        except Exception as e:
+            logger.warning("Failed to delete old marker %s: %s", marker_path, e)
+        return False
 
     missing_files = []
     for filename in required_files:
