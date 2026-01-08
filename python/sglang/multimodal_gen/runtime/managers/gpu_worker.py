@@ -116,7 +116,6 @@ class GPUWorker:
         Execute a forward pass.
         """
         assert self.pipeline is not None
-        # TODO: dealing with first req for now
         req = batch[0]
         output_batch = None
         try:
@@ -125,7 +124,18 @@ class GPUWorker:
 
             start_time = time.monotonic()
 
-            output_batch = self.pipeline.forward(req, self.server_args)
+            result = self.pipeline.forward(req, self.server_args)
+
+            if isinstance(result, Req):
+                output_batch = OutputBatch(
+                    output=result.output,
+                    timings=result.timings,
+                    trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
+                    trajectory_latents=getattr(result, "trajectory_latents", None),
+                    trajectory_decoded=getattr(result, "trajectory_decoded", None),
+                )
+            else:
+                output_batch = result
 
             if self.rank == 0:
                 peak_memory_bytes = torch.cuda.max_memory_allocated()
@@ -155,10 +165,6 @@ class GPUWorker:
                 f"Error executing request {req.request_id}: {e}", exc_info=True
             )
             if output_batch is None:
-                from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-                    OutputBatch,
-                )
-
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
         finally:
@@ -245,6 +251,19 @@ class GPUWorker:
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.unmerge_lora_weights(target)
         return OutputBatch()
+
+    def list_loras(self) -> OutputBatch:
+        """
+        List loaded LoRA adapters and current application status per module.
+        """
+        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+            LoRAPipeline,
+        )
+
+        if not isinstance(self.pipeline, LoRAPipeline):
+            return OutputBatch(error="Lora is not enabled")
+        status = self.pipeline.get_lora_status()
+        return OutputBatch(output=status)
 
 
 def run_scheduler_process(
