@@ -6,7 +6,7 @@ Standalone usage:
     python -m sglang.srt.utils.model_file_verifier verify --model-path /path/to/model --model-checksum checksums.json
 
 As a module:
-    from sglang.srt.utils.model_file_verifier import ModelFileVerifier, verify, generate_checksums
+    from sglang.srt.utils.model_file_verifier import verify, generate_checksums
 """
 
 import argparse
@@ -97,24 +97,6 @@ def generate_checksums(
     return checksums
 
 
-# ======== Class Wrapper ========
-
-
-class ModelFileVerifier:
-    def __init__(self, model_path: str, checksums_source: str = None, max_workers: int = 4):
-        self.model_path = model_path
-        self.checksums_source = checksums_source
-        self.max_workers = max_workers
-
-    def verify(self) -> None:
-        if not self.checksums_source:
-            raise IntegrityError("checksums_source is required for verification")
-        verify(self.model_path, self.checksums_source, self.max_workers)
-
-    def generate_checksums(self, output_path: str) -> Dict[str, str]:
-        return generate_checksums(self.model_path, output_path, self.max_workers)
-
-
 # ======== Helper Functions ========
 
 
@@ -186,6 +168,8 @@ def _discover_files(model_path: str) -> List[str]:
 def _compute_checksums(
     model_path: str, filenames: List[str], max_workers: int
 ) -> Dict[str, str]:
+    from tqdm import tqdm
+
     results = {}
 
     def compute_one(filename: str) -> Tuple[str, str]:
@@ -195,12 +179,13 @@ def _compute_checksums(
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(compute_one, f): f for f in filenames}
-        for future in as_completed(futures):
+        for future in tqdm(
+            as_completed(futures), total=len(filenames), desc="Computing checksums"
+        ):
             filename = futures[future]
             try:
                 name, checksum = future.result()
                 results[name] = checksum
-                print(f"  [{len(results)}/{len(filenames)}] {name}: {checksum[:16]}...")
             except FileNotFoundError:
                 pass
             except Exception as e:
@@ -218,6 +203,14 @@ def compute_sha256(file_path: str) -> str:
 
 
 # ======== CLI ========
+
+
+def _cli_generate(args):
+    generate_checksums(args.model_path, args.output, args.workers)
+
+
+def _cli_verify(args):
+    verify(args.model_path, args.model_checksum, args.workers)
 
 
 def main():
@@ -238,6 +231,7 @@ def main():
     gen_parser.add_argument(
         "--workers", type=int, default=4, help="Number of parallel workers"
     )
+    gen_parser.set_defaults(func=_cli_generate)
 
     verify_parser = subparsers.add_parser(
         "verify", help="Verify model files against checksums"
@@ -253,21 +247,10 @@ def main():
     verify_parser.add_argument(
         "--workers", type=int, default=4, help="Number of parallel workers"
     )
+    verify_parser.set_defaults(func=_cli_verify)
 
     args = parser.parse_args()
-
-    try:
-        if args.command == "generate":
-            generate_checksums(args.model_path, args.output, args.workers)
-        elif args.command == "verify":
-            verify(args.model_path, args.model_checksum, args.workers)
-
-    except IntegrityError as e:
-        print(f"[ERROR] {e}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"[ERROR] Unexpected error: {e}", file=sys.stderr)
-        sys.exit(1)
+    args.func(args)
 
 
 if __name__ == "__main__":
