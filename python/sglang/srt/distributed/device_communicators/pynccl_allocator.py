@@ -86,14 +86,11 @@ def restore_symmetric_memory_context(saved_context):
         saved_context.__enter__()
 
 
-    global _allocator, _mem_pool, _cur_device
-    if _mem_pool is None:
-
-
 def init_pynccl_allocator():
     global _allocator, _cur_device
     if _allocator is None:
         import torch.utils.cpp_extension
+
         out_dir = tempfile.gettempdir()
         nccl_allocator_libname = "nccl_allocator"
         torch.utils.cpp_extension.load_inline(
