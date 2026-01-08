@@ -158,17 +158,16 @@ class HiRadixCache(RadixCache):
                     with open(path, "rb" if ext == ".toml" else "r") as f:
                         if ext == ".json":
                             extra_config = json.load(f)
-
                         elif ext == ".toml":
                             import tomllib
                             extra_config = tomllib.load(f)
-
                         elif ext in (".yaml", ".yml"):
                             import yaml
                             extra_config = yaml.safe_load(f)
-
                         else:
-                            raise ValueError(f"Unsupported config file {path} (config format: {ext})")
+                            raise ValueError(
+                                f"Unsupported config file {path} (config format: {ext})"
+                            )
                 else:
                     # read config from JSON string
                     extra_config = json.loads(storage_backend_extra_config)
