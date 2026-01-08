@@ -37,21 +37,6 @@ from infra.model_specs import (  # noqa: F401; Default model paths
 )
 
 # =============================================================================
-# Constants
-# =============================================================================
-
-# Server startup timeout (seconds)
-DEFAULT_TIMEOUT = 600
-DEFAULT_STARTUP_TIMEOUT = 300
-
-# Default test port range
-DEFAULT_PORT_BASE = 20000
-
-# File paths for test output
-STDOUT_FILENAME = "/tmp/sglang_test_stdout.txt"
-STDERR_FILENAME = "/tmp/sglang_test_stderr.txt"
-
-# =============================================================================
 # Tokenizer Utilities
 # =============================================================================
 
@@ -194,28 +179,5 @@ def is_ci_environment() -> bool:
 
 
 def get_test_timeout() -> int:
-    """Get test timeout from environment or default."""
-    return int(os.environ.get("E2E_TEST_TIMEOUT", str(DEFAULT_TIMEOUT)))
-
-
-def skip_if_no_gpu():
-    """Skip test if no GPU is available."""
-    import pytest
-
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            pytest.skip("No GPU available")
-    except ImportError:
-        # Try nvidia-ml-py
-        try:
-            import pynvml
-
-            pynvml.nvmlInit()
-            count = pynvml.nvmlDeviceGetCount()
-            pynvml.nvmlShutdown()
-            if count == 0:
-                pytest.skip("No GPU available")
-        except Exception:
-            pytest.skip("Cannot detect GPU (torch and pynvml not available)")
+    """Get test timeout from environment or default (600 seconds)."""
+    return int(os.environ.get("E2E_TEST_TIMEOUT", "600"))
