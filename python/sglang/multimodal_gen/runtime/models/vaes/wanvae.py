@@ -1462,7 +1462,9 @@ class WanDecoder3d(nn.Module):
         # dimensions
         dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
 
-        world_size = get_sp_world_size()
+        world_size = 1
+        if torch.distributed.is_initialized():
+            world_size = get_sp_world_size()
 
         if use_parallel_decode and world_size > 1:
             # init block
@@ -1566,10 +1568,12 @@ class WanDecoder3d(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, x):
-        rank = get_sp_parallel_rank()
-        world_size = get_sp_world_size()
+        world_size = 1
+        if torch.distributed.is_initialized():
+            world_size = get_sp_world_size()
 
         if self.use_parallel_decode and world_size > 1:
+            rank = get_sp_parallel_rank()
             x = torch.chunk(x, world_size, dim=-2)[rank]
 
         ## conv1
@@ -1634,7 +1638,7 @@ class WanDecoder3d(nn.Module):
         if self.use_parallel_decode and world_size > 1:
             tensor_list = [torch.empty_like(x) for _ in range(world_size)]
             dist.all_gather(tensor_list, x)
-            torch.concat(tensor_list, dim=-2)
+            x = torch.concat(tensor_list, dim=-2)
 
         return x
 
