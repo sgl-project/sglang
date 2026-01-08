@@ -100,8 +100,8 @@ if _use_aiter or _use_hip_int4:
     from aiter.ops.shuffle import shuffle_weight
 
 if _is_npu:
-    import torch_npu  # noqa: F401
     import sgl_kernel_npu  # noqa: F401
+    import torch_npu  # noqa: F401
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
