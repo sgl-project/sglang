@@ -11,6 +11,7 @@ const VIEWS: { id: View; label: string; icon: string }[] = [
   { id: 'router', label: 'Router', icon: '⚡' },
   { id: 'compare', label: 'Compare', icon: '⚖️' },
   { id: 'lens', label: 'Lens', icon: '🔬' },
+  { id: 'pareto', label: 'Pareto', icon: '📊' },
 ];
 
 const PROGRAMS: { id: Program; label: string; description: string }[] = [
