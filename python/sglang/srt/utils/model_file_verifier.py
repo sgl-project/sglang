@@ -21,6 +21,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
+# ======== Data Format ========
+
+
 # Cannot use Pydantic to avoid dependency
 @dataclass
 class FileInfo:
@@ -29,16 +32,7 @@ class FileInfo:
 
     @classmethod
     def from_dict(cls, data: dict) -> "FileInfo":
-        if not isinstance(data, dict):
-            raise IntegrityError(f"FileInfo expects dict, got {type(data).__name__}")
-        if "sha256" not in data:
-            raise IntegrityError("FileInfo missing required field 'sha256'")
-        if not isinstance(data["sha256"], str):
-            raise IntegrityError(f"FileInfo.sha256 expects str, got {type(data['sha256']).__name__}")
-        size = data.get("size", 0)
-        if not isinstance(size, int):
-            raise IntegrityError(f"FileInfo.size expects int, got {type(size).__name__}")
-        return cls(sha256=data["sha256"], size=size)
+        return cls(sha256=data["sha256"], size=data.get("size", 0))
 
 
 @dataclass
@@ -47,14 +41,7 @@ class ChecksumFile:
 
     @classmethod
     def from_dict(cls, data: dict) -> "ChecksumFile":
-        if not isinstance(data, dict):
-            raise IntegrityError(f"ChecksumFile expects dict, got {type(data).__name__}")
-        if "files" not in data:
-            raise IntegrityError("ChecksumFile missing required field 'files'")
-        if not isinstance(data["files"], dict):
-            raise IntegrityError(f"ChecksumFile.files expects dict, got {type(data['files']).__name__}")
-        files = {k: FileInfo.from_dict(v) for k, v in data["files"].items()}
-        return cls(files=files)
+        return cls(files={k: FileInfo.from_dict(v) for k, v in data["files"].items()})
 
     def to_dict(self) -> dict:
         return {"files": {k: asdict(v) for k, v in self.files.items()}}
@@ -67,13 +54,10 @@ class LegacyChecksumFile:
 
     @classmethod
     def from_dict(cls, data: dict) -> "LegacyChecksumFile":
-        if not isinstance(data, dict):
-            raise IntegrityError(f"LegacyChecksumFile expects dict, got {type(data).__name__}")
-        if "checksums" not in data:
-            raise IntegrityError("LegacyChecksumFile missing required field 'checksums'")
-        if not isinstance(data["checksums"], dict):
-            raise IntegrityError(f"LegacyChecksumFile.checksums expects dict, got {type(data['checksums']).__name__}")
         return cls(checksums=data["checksums"])
+
+
+# ======== Constants ========
 
 
 IGNORE_PATTERNS = [
