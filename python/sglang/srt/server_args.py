@@ -1585,10 +1585,7 @@ class ServerArgs:
                 elif (
                     is_sm100_supported()
                     and is_no_spec_infer_or_topk_one(self)
-                    and (
-                        self.speculative_algorithm is None
-                        or self.speculative_eagle_topk is not None
-                    )
+                    or self.speculative_eagle_topk == 1
                 ):
                     self.attention_backend = "trtllm_mha"
                 elif is_hip():
