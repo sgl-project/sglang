@@ -1396,8 +1396,10 @@ class ServerArgs:
                         self.mamba_track_interval % self.page_size == 0
                     ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
                     assert (
-                        FLA_CHUNK_SIZE % self.page_size == 0
-                    ), f"Page size for hybrid GDN model must be divisible by {FLA_CHUNK_SIZE}, got {self.page_size}"
+                        max(FLA_CHUNK_SIZE, self.page_size)
+                        % min(FLA_CHUNK_SIZE, self.page_size)
+                        == 0
+                    ), f"max(FLA_CHUNK_SIZE, self.page_size) % min(FLA_CHUNK_SIZE, self.page_size) should be 0, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
 
             elif not self.disable_radix_cache:
                 logger.warning(
