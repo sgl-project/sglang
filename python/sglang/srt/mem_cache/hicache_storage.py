@@ -8,6 +8,7 @@ from typing import Any, List, Optional
 import torch
 
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.metrics.collector import StorageMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +177,9 @@ class HiCacheStorage(ABC):
         pass
 
     def get_stats(self):
-        return None
+        storage_metrics = StorageMetrics()
+        storage_metrics.prefetch_occupancy_ratio = self.prefetch_occupancy_ratio
+        return storage_metrics
 
 
 class HiCacheFile(HiCacheStorage):

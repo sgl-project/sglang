@@ -1025,7 +1025,7 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
-    prefetch_occupied_ratios: List[float] = field(default_factory=list)
+    prefetch_occupancy_ratio: List[float] = field(default_factory=list)
 
 
 class StorageMetricsCollector:
@@ -1094,8 +1094,8 @@ class StorageMetricsCollector:
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
         )
-        self.gauge_prefetch_occupied_ratio = Gauge(
-            name="sglang:prefetch_occupied_ratio",
+        self.gauge_prefetch_occupancy_ratio = Gauge(
+            name="sglang:prefetch_occupancy_ratio",
             documentation="Current prefetch occupied ratio (0-1, >1 means rate limited).",
             labelnames=labels.keys(),
         )
@@ -1131,7 +1131,8 @@ class StorageMetricsCollector:
             self._log_histogram(self.histogram_backup_bandwidth, v)
 
         self._log_gauge(
-            self.gauge_prefetch_occupied_ratio, storage_metrics.prefetch_occupied_ratios
+            self.gauge_prefetch_occupancy_ratio,
+            storage_metrics.prefetch_occupancy_ratio,
         )
 
 
