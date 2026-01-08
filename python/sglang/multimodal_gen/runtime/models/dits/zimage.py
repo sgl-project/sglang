@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 
 logger = init_logger(__name__)
 
@@ -118,9 +119,14 @@ class ZImageAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
 
-        self.to_q = ReplicatedLinear(dim, dim, bias=False)
-        self.to_k = ReplicatedLinear(dim, self.head_dim * num_kv_heads, bias=False)
-        self.to_v = ReplicatedLinear(dim, self.head_dim * num_kv_heads, bias=False)
+        # assert num_heads % get_tp_world_size() == 0, f"num_heads {num_heads} must be divisible by tp world size {get_tp_world_size()}"
+        # assert num_kv_heads % get_tp_world_size() == 0, f"num_kv_heads {num_kv_heads} must be divisible by tp world size {get_tp_world_size()}"
+        # self.local_num_heads = num_heads // get_tp_world_size()
+        # self.local_num_kv_heads = num_kv_heads // get_tp_world_size()
+
+        self.to_q = ColumnParallelLinear(dim, dim, bias=False, gather_output=True)
+        self.to_k = ColumnParallelLinear(dim, self.head_dim * num_kv_heads, bias=False, gather_output=True)
+        self.to_v = ColumnParallelLinear(dim, self.head_dim * num_kv_heads, bias=False, gather_output=True)
 
         if self.qk_norm:
             self.norm_q = RMSNorm(self.head_dim, eps=eps)
@@ -130,13 +136,14 @@ class ZImageAttention(nn.Module):
             self.norm_k = None
 
         self.to_out = nn.ModuleList(
-            [RowParallelLinear(dim, dim, bias=False, input_is_parallel=True)]
+            # [RowParallelLinear(dim, dim, bias=False, input_is_parallel=True)]
+            [ColumnParallelLinear(dim, dim, bias=False, gather_output=True)]
         )
 
         self.attn = USPAttention(
-            num_heads=num_heads,
+            num_heads=self.num_heads,
             head_size=self.head_dim,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=self.num_kv_heads,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
@@ -150,7 +157,6 @@ class ZImageAttention(nn.Module):
         q, _ = self.to_q(hidden_states)
         k, _ = self.to_k(hidden_states)
         v, _ = self.to_v(hidden_states)
-
         q = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
         k = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
         v = v.view(*v.shape[:-1], self.num_kv_heads, self.head_dim)
