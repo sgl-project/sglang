@@ -302,7 +302,7 @@ class MoriEPDispatcher(BaseDispatcher):
         num_local_experts: int = None,
         hidden_size: int = None,
         params_dtype: torch.dtype = None,
-        deepep_mode: DeepEPMode = DeepEPMode.AUTO,
+        deepep_mode: DeepEPMode = DeepEPMode.NORMAL,
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
