@@ -553,7 +553,9 @@ Consider updating perf_baselines.json with the snippets below:
                 "strength": [1.0, 1.0],
             },
         )
-        assert resp.status_code == 200, f"set_lora with multiple adapters failed: {resp.text}"
+        assert (
+            resp.status_code == 200
+        ), f"set_lora with multiple adapters failed: {resp.text}"
         assert generate_fn(case.id, client) is not None
 
         # Test 2: Different strengths
@@ -566,7 +568,9 @@ Consider updating perf_baselines.json with the snippets below:
                 "strength": [0.8, 0.5],
             },
         )
-        assert resp.status_code == 200, f"set_lora with different strengths failed: {resp.text}"
+        assert (
+            resp.status_code == 200
+        ), f"set_lora with different strengths failed: {resp.text}"
         assert generate_fn(case.id, client) is not None
 
         # Test 3: Different targets
@@ -580,12 +584,16 @@ Consider updating perf_baselines.json with the snippets below:
                 "strength": [0.8, 0.5],
             },
         )
-        assert resp.status_code == 200, f"set_lora with cached adapters failed: {resp.text}"
+        assert (
+            resp.status_code == 200
+        ), f"set_lora with cached adapters failed: {resp.text}"
         assert generate_fn(case.id, client) is not None
 
         # Test 4: Switch back to single LoRA
         resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
-        assert resp.status_code == 200, f"set_lora back to single adapter failed: {resp.text}"
+        assert (
+            resp.status_code == 200
+        ), f"set_lora back to single adapter failed: {resp.text}"
         assert generate_fn(case.id, client) is not None
 
         logger.info("[Multi-LoRA] All multi-LoRA tests passed for %s", case.id)
