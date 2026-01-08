@@ -51,14 +51,15 @@ jobs:
                 run_id=$(echo "$run" | jq -r '.databaseId')
                 run_url=$(echo "$run" | jq -r '.url // empty')
 
-                echo "Checking run $run_id ($run_url)"
+                echo ""
+                echo "Run: $run_url"
 
                 # Fetch full run details to get head repository and branch info
                 run_details=$(gh api -H "Accept: application/vnd.github+json" \
                   "repos/$REPO/actions/runs/$run_id" 2>/dev/null || true)
 
                 if [ -z "$run_details" ]; then
-                  echo "⚠️ Could not fetch details for run $run_id, skipping"
+                  echo "  ⚠️  Could not fetch run details, skipping"
                   continue
                 fi
 
@@ -67,11 +68,11 @@ jobs:
                 head_branch=$(echo "$run_details" | jq -r '.head_branch // empty')
 
                 if [ -z "$head_owner" ] || [ -z "$head_branch" ]; then
-                  echo "⚠️ Run $run_id missing head info (owner='$head_owner', branch='$head_branch'), skipping ($run_url)"
+                  echo "  ⚠️  Missing head info, skipping"
                   continue
                 fi
 
-                echo "  Head: ${head_owner}:${head_branch}"
+                echo "  Branch: ${head_owner}:${head_branch}"
 
                 # Find PR by searching with head=owner:branch
                 pr_number=$(gh api -H "Accept: application/vnd.github+json" \
@@ -79,28 +80,23 @@ jobs:
                   --jq '.[0].number // empty' 2>/dev/null || true)
 
                 if [ -z "$pr_number" ]; then
-                  echo "⚠️ No open PR found for ${head_owner}:${head_branch}, skipping run $run_id"
+                  echo "  ⚠️  No open PR found, skipping"
                   continue
                 fi
 
-                echo "  Associated with PR #$pr_number"
-
-                # Debug when missing
-                if [ -z "$pr_number" ]; then
-                  echo "⚠️ Run $run_id PR not found (headBranch='$head_branch', headSha='$head_sha') ($run_url)"
-                  continue
-                fi
+                pr_url="https://github.com/$REPO/pull/$pr_number"
+                echo "  PR: $pr_url"
 
                 # Check for high priority label
                 labels=$(gh pr view "$pr_number" --repo "$REPO" --json labels \
                   | jq -r '.labels[].name' 2>/dev/null || true)
 
                 if echo "$labels" | grep -Fxq "high priority"; then
-                  echo "  🛑 PR #$pr_number has 'high priority' label → skipping cancel"
+                  echo "  🛑 Skipping (high priority label)"
                   continue
                 fi
 
-                echo "🚫 Cancelling run $run_id (PR #$pr_number) $run_url"
-                # gh run cancel "$run_id" --repo "$REPO" || echo "⚠️ Could not cancel run $run_id"
+                echo "  🚫 Cancelling..."
+                # gh run cancel "$run_id" --repo "$REPO" || echo "  ⚠️  Cancellation failed"
             done
           done
