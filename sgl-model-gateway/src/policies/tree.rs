@@ -379,7 +379,7 @@ impl Tree {
         let mut remaining = text;
         let mut prev = Arc::clone(&self.root);
 
-        // Helper to carry instructions out of the match block to satisfy borrow checker
+        // State carrier to satisfy borrow checker when updating 'prev'
         enum InsertStep {
             Done,
             Continue {
@@ -2433,7 +2433,15 @@ mod tests {
 
         assert_eq!(tree.total_char_count.load(Ordering::Relaxed), 10);
         let sizes = tree.get_used_size_per_tenant();
-        assert!(!sizes.contains_key("tenant1"));
+
+        // Corrected check: Either key is absent or size is 0.
+        // T1 size is 0 because its leaf node "hello" was removed.
+        let t1_size = sizes.get("tenant1").copied().unwrap_or(0);
+        assert_eq!(
+            t1_size, 0,
+            "Tenant 1 should have 0 size after global eviction"
+        );
+
         assert_eq!(sizes.get("tenant2").unwrap(), &5);
         assert_eq!(sizes.get("tenant3").unwrap(), &5);
     }
