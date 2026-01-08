@@ -115,8 +115,11 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
         )
         return
 
+    # Get storage backend from marker (default: memory)
+    storage_backend = get_marker_value(request, "storage", default="memory")
+
     # Cloud backends: launch cloud router
-    yield from _setup_cloud_backend(backend_name)
+    yield from _setup_cloud_backend(backend_name, storage_backend, gateway_config)
 
 
 def _setup_pd_backend(
@@ -357,34 +360,52 @@ def _setup_local_backend(
             inst.release()
 
 
-def _setup_cloud_backend(backend_name: str):
-    """Setup cloud backend (openai, xai, etc.)."""
+def _setup_cloud_backend(
+    backend_name: str,
+    storage_backend: str = "memory",
+    gateway_config: dict | None = None,
+):
+    """Setup cloud backend (openai, xai, etc.).
+
+    Args:
+        backend_name: Cloud backend name (openai, xai).
+        storage_backend: History storage backend (memory, oracle).
+        gateway_config: Gateway configuration from marker.
+    """
     import openai
-    from backends import CLOUD_BACKENDS, launch_cloud_backend
+    from backends import CLOUD_RUNTIMES, launch_cloud_gateway
 
-    if backend_name not in CLOUD_BACKENDS:
-        pytest.fail(f"Unknown backend: {backend_name}")
+    if backend_name not in CLOUD_RUNTIMES:
+        pytest.fail(f"Unknown cloud runtime: {backend_name}")
 
-    cfg = CLOUD_BACKENDS[backend_name]
+    cfg = CLOUD_RUNTIMES[backend_name]
     api_key_env = cfg.get("api_key_env")
 
     if api_key_env and not os.environ.get(api_key_env):
         pytest.skip(f"{api_key_env} not set, skipping {backend_name} tests")
 
-    logger.info("Launching cloud backend: %s", backend_name)
-    router = launch_cloud_backend(backend_name)
+    extra_args = gateway_config.get("extra_args") if gateway_config else None
+
+    logger.info(
+        "Launching cloud backend: %s with storage=%s", backend_name, storage_backend
+    )
+    gateway = launch_cloud_gateway(
+        backend_name,
+        history_backend=storage_backend,
+        extra_args=extra_args,
+    )
 
     api_key = os.environ.get(api_key_env) if api_key_env else "not-used"
     client = openai.OpenAI(
-        base_url=f"{router.base_url}/v1",
+        base_url=f"{gateway.base_url}/v1",
         api_key=api_key,
     )
 
     try:
-        yield backend_name, cfg["model"], client, router
+        yield backend_name, cfg["model"], client, gateway
     finally:
         logger.info("Tearing down cloud backend: %s", backend_name)
-        router.shutdown()
+        gateway.shutdown()
 
 
 @pytest.fixture

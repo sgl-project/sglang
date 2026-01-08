@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 CLOUD_RUNTIMES: dict[str, dict[str, Any]] = {
     "openai": {
         "description": "OpenAI API",
-        "model": "gpt-4o-mini",
+        "model": "gpt-5-nano",
         "api_key_env": "OPENAI_API_KEY",
     },
     "xai": {
@@ -34,19 +34,8 @@ CLOUD_RUNTIMES: dict[str, dict[str, Any]] = {
     },
 }
 
-# Keep CLOUD_BACKENDS as alias for backward compatibility during migration
-# TODO: Remove after e2e_response_api migration
-CLOUD_BACKENDS: dict[str, dict[str, Any]] = {
-    **CLOUD_RUNTIMES,
-    # Legacy entry for tests that parameterize on history backend
-    "oracle_store": {
-        "description": "OpenAI API with Oracle history backend",
-        "model": "gpt-4o-mini",
-        "api_key_env": "OPENAI_API_KEY",
-        "history_backend": "oracle",
-        "_runtime": "openai",  # Actual runtime to use
-    },
-}
+# Backward compatibility alias
+CLOUD_BACKENDS = CLOUD_RUNTIMES
 
 
 def get_cloud_runtime_config(runtime: str) -> dict[str, Any]:
@@ -92,33 +81,7 @@ def launch_cloud_gateway(
     return gateway
 
 
-# Backward compatibility aliases - TODO: Remove after migration
-def get_cloud_backend_config(backend: str) -> dict[str, Any]:
-    """Deprecated: Use get_cloud_runtime_config instead."""
-    if backend not in CLOUD_BACKENDS:
-        raise KeyError(
-            f"Unknown cloud backend: {backend}. Available: {list(CLOUD_BACKENDS.keys())}"
-        )
-    return CLOUD_BACKENDS[backend]
-
-
-def launch_cloud_backend(backend: str, **kwargs: Any) -> Gateway:
-    """Deprecated: Use launch_cloud_gateway instead."""
-    cfg = get_cloud_backend_config(backend)
-
-    # Handle legacy oracle_store entry
-    runtime = cfg.get("_runtime", backend)
-    history_backend = kwargs.pop(
-        "history_backend", cfg.get("history_backend", "memory")
-    )
-
-    return launch_cloud_gateway(
-        runtime,
-        history_backend=history_backend,
-        extra_args=kwargs.pop("router_args", None),
-        **kwargs,
-    )
-
-
-# Keep old function name as alias
+# Backward compatibility aliases
+get_cloud_backend_config = get_cloud_runtime_config
+launch_cloud_backend = launch_cloud_gateway
 launch_cloud_router = launch_cloud_gateway
