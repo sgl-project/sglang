@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
@@ -23,7 +24,6 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 
 logger = init_logger(__name__)
 
@@ -120,14 +120,22 @@ class ZImageAttention(nn.Module):
         self.qk_norm = qk_norm
 
         tp_size = get_tp_world_size()
-        assert num_heads % tp_size == 0, f"num_heads {num_heads} must be divisible by tp world size {tp_size}"
-        assert num_kv_heads % tp_size == 0, f"num_kv_heads {num_kv_heads} must be divisible by tp world size {tp_size}"
+        assert (
+            num_heads % tp_size == 0
+        ), f"num_heads {num_heads} must be divisible by tp world size {tp_size}"
+        assert (
+            num_kv_heads % tp_size == 0
+        ), f"num_kv_heads {num_kv_heads} must be divisible by tp world size {tp_size}"
         self.local_num_heads = num_heads // tp_size
         self.local_num_kv_heads = num_kv_heads // tp_size
 
         self.to_q = ColumnParallelLinear(dim, dim, bias=False, gather_output=False)
-        self.to_k = ColumnParallelLinear(dim, self.head_dim * num_kv_heads, bias=False, gather_output=False)
-        self.to_v = ColumnParallelLinear(dim, self.head_dim * num_kv_heads, bias=False, gather_output=False)
+        self.to_k = ColumnParallelLinear(
+            dim, self.head_dim * num_kv_heads, bias=False, gather_output=False
+        )
+        self.to_v = ColumnParallelLinear(
+            dim, self.head_dim * num_kv_heads, bias=False, gather_output=False
+        )
 
         if self.qk_norm:
             self.norm_q = RMSNorm(self.head_dim, eps=eps)
