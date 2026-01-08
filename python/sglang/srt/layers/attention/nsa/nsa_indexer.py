@@ -60,6 +60,13 @@ class BaseIndexerMetadata(ABC):
         """
 
     @abstractmethod
+    def get_page_table_1(self) -> torch.Tensor:
+        """
+        Return: (batch_size, num_blocks) int32, page table.
+                The page size of the table is 1.
+        """
+
+    @abstractmethod
     def get_seqlens_expanded(self) -> torch.Tensor:
         """
         Return: (sum_extend_seq_len,) int32 tensor
@@ -101,7 +108,11 @@ class BaseIndexerMetadata(ABC):
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
-    from sgl_kernel import hadamard_transform
+    # from sgl_kernel import hadamard_transform
+    if is_hip():
+        from fast_hadamard_transform import hadamard_transform
+    else:
+        from sgl_kernel import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
@@ -317,10 +328,13 @@ class Indexer(MultiPlatformOp):
 
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
-        assert page_size == 64, "only support page size 64"
-
-        # NOTE(dark): this support extend/decode/decode+graph
-        block_tables = metadata.get_page_table_64()
+        if is_hip():
+            assert page_size == 1, "only support page size 1"
+            block_tables = metadata.get_page_table_1()
+        else:
+            assert page_size == 64, "only support page size 64"
+            # NOTE(dark): this support extend/decode/decode+graph
+            block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
         kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
@@ -338,32 +352,65 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-        if schedule_metadata is None:
-            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                seqlens_32, blocksize, self.sm_count
-            )
+        if is_cuda():
+            if schedule_metadata is None:
+                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32, blocksize, self.sm_count
+                )
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
-        block_kv = 64
+        block_kv = 1 if is_hip() else 64
         num_heads_kv = 1
         head_dim_with_sf = 132
-        kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-        )
+        if is_hip():
+            kv_cache_fp8 = kv_cache_fp8.view(
+                -1, block_kv, num_heads_kv, head_dim_with_sf
+            )
+        else:
+            kv_cache_fp8 = kv_cache_fp8.view(
+                kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8,
-            kv_cache_fp8,
-            weights,
-            seqlens_32,
-            block_tables,
-            schedule_metadata,
-            max_seq_len,
-            clean_logits=False,
-        )
+
+        if is_hip():
+            from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+
+            batch_size, next_n, heads, _ = q_fp8.shape
+            logits = torch.full(
+                (heads, batch_size * next_n, max_seq_len),
+                float("-inf"),
+                device=q_fp8.device,
+                dtype=torch.float32,
+            )
+            deepgemm_fp8_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                logits,
+                seqlens_32,
+                block_tables,
+                max_seq_len,
+                Preshuffle=False,
+                KVBlockSize=block_kv,
+                ChunkK=128,
+                TotalCuCount=256,
+                WavePerEU=5,
+            )
+            logits = logits.sum(dim=0)
+        else:
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                seqlens_32,
+                block_tables,
+                schedule_metadata,
+                max_seq_len,
+                clean_logits=False,
+            )
 
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
@@ -402,13 +449,20 @@ class Indexer(MultiPlatformOp):
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
         page_size = forward_batch.token_to_kv_pool.page_size
-        assert page_size == 64, "only support page size 64"
+        if is_hip():
+            assert page_size == 1, "only support page size 1"
+        else:
+            assert page_size == 64, "only support page size 64"
+
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
         k_fp8_list = []
         k_scale_list = []
 
-        block_tables = metadata.get_page_table_64()
+        if is_hip():
+            block_tables = metadata.get_page_table_1()
+        else:
+            block_tables = metadata.get_page_table_64()
 
         assert (
             forward_batch.seq_lens_cpu is not None
@@ -453,14 +507,22 @@ class Indexer(MultiPlatformOp):
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
-                    q_fp8[:q_offset],
-                    kv_fp8,
-                    weights[:q_offset],
-                    ks,
-                    ke,
-                    clean_logits=False,
-                )
+                if is_hip():
+                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+                    kv, scale = kv_fp8
+                    logits = fp8_mqa_logits(
+                        q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
+                    )
+                else:
+                    logits = deep_gemm.fp8_mqa_logits(
+                        q_fp8[:q_offset],
+                        kv_fp8,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
@@ -490,14 +552,27 @@ class Indexer(MultiPlatformOp):
             end = min(start + max_rows, q_offset)
 
             with self._with_real_sm_count():
-                logits_chunk = deep_gemm.fp8_mqa_logits(
-                    q_fp8[start:end],
-                    kv_fp8,
-                    weights[start:end],
-                    ks[start:end],
-                    ke[start:end],
-                    clean_logits=False,
-                )
+                if is_hip():
+                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+                    kv, scale = kv_fp8
+                    logits = fp8_mqa_logits(
+                        q_fp8[start:end],
+                        kv_fp8,
+                        scale,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                    )
+                else:
+                    logits_chunk = deep_gemm.fp8_mqa_logits(
+                        q_fp8[start:end],
+                        kv_fp8,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                        clean_logits=False,
+                    )
 
             lengths_chunk = seq_lens_expanded[start:end]
 
@@ -887,7 +962,7 @@ class Indexer(MultiPlatformOp):
 
         weights = self._get_logits_head_gate(x, q_scale)
 
-        if is_cuda():
+        if is_cuda() or is_hip():
             assert forward_batch.seq_lens_cpu is not None
             if len(forward_batch.seq_lens_cpu) == 0:
                 # this seems b/c max-pad, no worries?
