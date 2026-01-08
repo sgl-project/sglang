@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
-rid_to_err_msg : Dict[str, str] = dict()
+rid_to_err_msg: Dict[str, str] = dict()
 
 use_image_processor_gpu = (
     int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
@@ -645,6 +645,7 @@ def launch_server(server_args: ServerArgs):
 async def handle_encode_request(request: dict):
     req_id = request["req_id"]
     try:
+
         def start_background_send(req_id):
             task = asyncio.create_task(encoder.send_with_url(req_id=req_id))
             encoder.background_tasks.add(task)

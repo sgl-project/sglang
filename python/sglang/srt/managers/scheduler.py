@@ -1310,7 +1310,6 @@ class Scheduler(
                 req.tokenizer = self.tokenizer
                 prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                 self.stream_output([req], req.return_logprob)
-        
 
         if self.enable_trace:
             for req in recv_reqs:

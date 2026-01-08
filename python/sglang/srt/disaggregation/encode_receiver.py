@@ -24,7 +24,15 @@ logger = logging.getLogger(__name__)
 
 
 class EmbeddingData:
-    def __init__(self, req_id, num_parts, part_idx, image_grid_dim, embedding=None,error_msg=None):
+    def __init__(
+        self,
+        req_id,
+        num_parts,
+        part_idx,
+        image_grid_dim,
+        embedding=None,
+        error_msg=None,
+    ):
         self.req_id = req_id
         self.num_parts = num_parts
         self.part_idx = part_idx
@@ -109,7 +117,7 @@ class WaitingImageRequest:
         )
         logger.info(f"Waiting for input {self.embedding_port = }")
         self.recv_embedding_data = None
-        # ok = 1 pending=0 fial =-1
+        # ok=1 pending=0 fail=-1
         self.status = 0
         self.error_msg = None
 
@@ -181,7 +189,7 @@ class WaitingImageRequest:
                     f"❌ Received error signal from encoder for {self.rid}: {recv_obj.error_msg}"
                 )
                 self.error_msg = recv_obj.error_msg
-                self.status = -1 
+                self.status = -1
                 self.recv_socket.close()
                 return
 
@@ -320,7 +328,7 @@ class MMReceiver:
         new_waiting = []
         abort_reqs = []
         for i, waiting_req in enumerate(self.waiting_list):
-            if local_status[i].item() > 0 :
+            if local_status[i].item() > 0:
                 new_recv_reqs.append(waiting_req.recv_req)
             else:
                 if local_status[i].item() < 0:
