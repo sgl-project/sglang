@@ -14,5 +14,8 @@ hdbscan>=0.8.28
 # Model persistence
 joblib>=1.1.0
 
+# Async HTTP for prompt harness
+aiohttp>=3.8.0
+
 # Optional: For faster UMAP on large datasets
 # pynndescent>=0.5.0

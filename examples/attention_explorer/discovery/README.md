@@ -53,6 +53,38 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Quick Start: Prompt Harness for Manifold Discovery
+
+The prompt harness drives structured probes to map different attention behaviors:
+
+```bash
+# Quick smoke test (5 minutes)
+python prompt_harness.py --duration 5 --server http://localhost:8000
+
+# Full 8-hour discovery run
+python prompt_harness.py --duration 480 --server http://localhost:8000
+
+# Generate analysis report
+python prompt_harness.py --report --db fingerprints.db
+```
+
+The harness includes 7 probe packs designed to excite specific attention programs:
+
+| Pack | Expected Zone | Purpose |
+|------|---------------|---------|
+| `json_repair` | syntax_floor | JSON/bracket repair, local structure |
+| `coreference` | semantic_bridge | Pronoun resolution, entity tracking |
+| `counting_tables` | structure_ripple | Counting, tables, periodic patterns |
+| `code_editing` | mixed | Refactoring, type hints, error handling |
+| `reasoning` | semantic_bridge | Multi-step logic puzzles |
+| `adversarial` | diffuse | Edge cases, noise, stress tests |
+| `natural` | semantic_bridge | Natural conversation baseline |
+
+The report includes:
+- Zone distribution and confusion matrix
+- Cluster purity by probe pack
+- Expected vs actual zone agreement
+
 ### 1. Initialize Database
 
 ```bash
