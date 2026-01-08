@@ -138,7 +138,7 @@ as of `sgl-model-gateway/src/tokenizer/*`.
 ## Usage Examples
 ```rust
 use std::sync::Arc;
-use sgl_model_gateway::tokenizer::{
+use smg::tokenizer::{
     create_tokenizer, SequenceDecoderOutput, StopSequenceDecoderBuilder, Tokenizer,
 };
 
@@ -172,7 +172,7 @@ for &token in encoding.token_ids() {
 
 ```rust
 // Apply a chat template when one is bundled with the tokenizer
-use sgl_model_gateway::tokenizer::{chat_template::ChatTemplateParams, HuggingFaceTokenizer};
+use smg::tokenizer::{chat_template::ChatTemplateParams, HuggingFaceTokenizer};
 
 let mut hf = HuggingFaceTokenizer::from_file_with_chat_template(
     "./tokenizer.json",
