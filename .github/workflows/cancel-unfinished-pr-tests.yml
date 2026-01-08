@@ -1,8 +1,6 @@
 name: Cancel Unfinished PR Tests
 
 on:
-  pull_request:
-    types: [synchronize]
   workflow_dispatch:
     inputs:
       workflows:
@@ -131,7 +129,7 @@ jobs:
                 fi
 
                 echo "  🚫 Cancelling..."
-                # gh run cancel "$run_id" --repo "$REPO" || echo "  ⚠️  Cancellation failed"
+                gh run cancel "$run_id" --repo "$REPO" || echo "  ⚠️  Cancellation failed"
               done
             fi
 
