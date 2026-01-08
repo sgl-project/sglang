@@ -5,6 +5,7 @@ from fastapi.responses import ORJSONResponse
 
 from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
@@ -131,6 +132,23 @@ async def model_info():
         "model_path": server_args.model_path,
     }
     return result
+
+
+@router.get("/list_loras")
+async def list_loras():
+    """List loaded LoRA adapters and current application status per module."""
+    try:
+        req = ListLorasReq()
+        output: OutputBatch = await async_scheduler_client.forward(req)
+        if output.error is None:
+            return output.output or {}
+        else:
+            raise HTTPException(status_code=500, detail=output.error)
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        logger.error(f"Error during 'list_loras': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/models", response_class=ORJSONResponse)
