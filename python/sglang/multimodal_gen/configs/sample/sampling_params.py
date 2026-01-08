@@ -345,7 +345,9 @@ class SamplingParams:
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
         sampling_params = SamplingParams.from_pretrained(model_path)
 
-        user_sampling_params = SamplingParams(*args, **kwargs)
+        user_kwargs = dict(kwargs)
+        user_kwargs.pop("diffusers_kwargs", None)
+        user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
         sampling_params._adjust(server_args)
