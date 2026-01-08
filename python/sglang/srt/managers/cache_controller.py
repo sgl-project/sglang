@@ -606,13 +606,6 @@ class HiCacheController:
             hash_values, host_indices, extra_info
         )
 
-        if len(results) != len(hash_values):
-            logger.error(
-                f"Prefetch {operation.request_id}: batch_get_v1 length mismatch: "
-                f"got {len(results)} for {len(hash_values)} hash values"
-            )
-            return
-
         inc = 0
         for i in range(len(hash_values)):
             if not results[i]:
@@ -622,11 +615,6 @@ class HiCacheController:
                 break
             inc += self.page_size
 
-        if inc == 0:
-            logger.error(
-                f"Prefetch operation {operation.request_id}: no tokens incremented, "
-                f"all {len(hash_values)} pages failed"
-            )
         operation.increment(inc)
 
     # todo: deprecate
@@ -729,12 +717,6 @@ class HiCacheController:
                 break
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
-
-        if storage_query_count == 0:
-            logger.warning(
-                f"Prefetch {operation.request_id}: _storage_hit_query found 0 hits "
-                f"for {len(tokens_to_fetch)} tokens"
-            )
 
         return hash_value, storage_query_count
 
