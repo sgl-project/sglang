@@ -37,7 +37,7 @@ class VAEConfig(ModelConfig):
     tile_sample_stride_num_frames: int = 12
     blend_num_frames: int = 0
 
-    # Except the first tile, the first few frames of the next tiles are not useful.
+    # Except the first chunk, the first few frames of the next tiles are not useful.
     temporal_tiling_num_overlap_latent_frames: int = 4
 
     use_tiling: bool = True

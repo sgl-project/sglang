@@ -11,6 +11,7 @@ from collections.abc import Iterable
 import torch
 from tqdm.auto import tqdm
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_world_group,
@@ -108,12 +109,13 @@ class DecodingStage(PipelineStage):
         return latents
 
     @torch.no_grad()
-    def decode(self, latents: torch.Tensor, server_args: ServerArgs) -> torch.Tensor:
+    def decode(self, latents: torch.Tensor, sampling_params: SamplingParams, server_args: ServerArgs) -> torch.Tensor:
         """
         Decode latent representations into pixel space using VAE.
 
         Args:
             latents: Input latent tensor with shape (batch, channels, frames, height_latents, width_latents)
+            sampling_params: Parameters for sampling, including height and width of the output
             server_args: Configuration containing:
                 - disable_autocast: Whether to disable automatic mixed precision (default: False)
                 - pipeline_config.vae_precision: VAE computation precision ("fp32", "fp16", "bf16")
@@ -155,15 +157,19 @@ class DecodingStage(PipelineStage):
             frame_slices = []
             if latents.dim() == 5:
                 # Decode video frames in chunks to avoid out of memory errors.
-                num_frames = latents.shape[2]
+                batch_size, num_channels, num_frames, _, _  = latents.shape
                 num_sample_frames = num_frames * self.vae.temporal_compression_ratio
+                gpu_mem_before_decoding = current_platform.get_available_gpu_memory()
 
-                # TODO: make it dynamic based on the available memory.
-                # Currently it's a heuristic hardcoded number that decodes 100 frames at a time.
-                tile_latent_stride_num_frames = 100 // self.vae.temporal_compression_ratio
+                # Estimated memory needed per frame
+                # TODO: Need to consider parallel / tiling
+                output_frame_size = (sampling_params.height * sampling_params.width * num_channels * latents.element_size())
+
+                num_sample_frames_per_chunk = int(gpu_mem_before_decoding // (output_frame_size / (1 << 30)) // batch_size)
+                tile_latent_stride_num_frames = min(num_sample_frames_per_chunk // self.vae.temporal_compression_ratio, num_frames)
 
                 sample_overlap_frames = (
-                    self.vae.temporal_tiling_num_overlap_latent_frames
+                    self.vae.config.temporal_tiling_num_overlap_latent_frames
                     * self.vae.temporal_compression_ratio
                 )
                 with self.progress_bar(total=num_sample_frames) as progress_bar:
@@ -177,7 +183,7 @@ class DecodingStage(PipelineStage):
                         )
                         latent_step_with_overlap = (
                             latent_step
-                            + self.vae.temporal_tiling_num_overlap_latent_frames
+                            + self.vae.config.temporal_tiling_num_overlap_latent_frames
                         )
 
                         decode_output = self.vae.decode(
@@ -261,7 +267,7 @@ class DecodingStage(PipelineStage):
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
-        frames = self.decode(batch.latents, server_args)
+        frames = self.decode(batch.latents, batch.sampling_params, server_args)
 
         # decode trajectory latents if needed
         if batch.return_trajectory_decoded:

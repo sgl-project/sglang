@@ -1261,7 +1261,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
         return enc
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        if self.enable_tiling:
+        if self.use_tiling:
             out = ParallelTiledVAE.decode(self, z)
         else:
             self.clear_cache()
