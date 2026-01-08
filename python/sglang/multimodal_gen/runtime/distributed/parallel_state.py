@@ -32,7 +32,6 @@ If you only need to use the distributed environment without model parallelism,
 """
 import contextlib
 import os
-import time
 import weakref
 from collections import namedtuple
 from collections.abc import Callable
@@ -341,7 +340,9 @@ def initialize_model_parallel(
     """
 
     if backend is None:
-        backend = envs.get_torch_distributed_backend()
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        backend = current_platform.get_torch_distributed_backend_str()
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
@@ -405,9 +406,11 @@ def initialize_model_parallel(
 
     try:
         from .yunchang import PROCESS_GROUP as _YC_PROCESS_GROUP
-        from .yunchang import set_seq_parallel_pg as _set_seq_parallel_pg
+        from .yunchang import (
+            set_seq_parallel_pg_by_sp_groups as _set_seq_parallel_pg_by_sp_groups,
+        )
     except ImportError:
-        _set_seq_parallel_pg = None
+        _set_seq_parallel_pg_by_sp_groups = None
 
         class _DummyProcessGroup:
             ULYSSES_PG = torch.distributed.group.WORLD
@@ -415,11 +418,15 @@ def initialize_model_parallel(
 
         PROCESS_GROUP = _DummyProcessGroup()
     else:
-        _set_seq_parallel_pg(
+        # Build yunchang SP sub-groups based on the true SP groups. This is
+        # critical when TP>1, because SP groups may be strided in global ranks
+        # (e.g., tp-sp order).
+        sp_groups = rank_generator.get_ranks("sp")
+        _set_seq_parallel_pg_by_sp_groups(
             sp_ulysses_degree=ulysses_degree,
             sp_ring_degree=ring_degree,
-            rank=get_world_group().rank_in_group,
-            world_size=dit_parallel_size,
+            rank=get_world_group().rank,
+            sp_groups=sp_groups,
         )
         PROCESS_GROUP = _YC_PROCESS_GROUP
 
@@ -431,9 +438,6 @@ def initialize_model_parallel(
         ulysses_group=PROCESS_GROUP.ULYSSES_PG,
         ring_group=PROCESS_GROUP.RING_PG,
     )
-
-    if ulysses_degree > 1:
-        _warmup_ulysses_communication()
 
     global _TP
     assert _TP is None, "Tensor parallel group is already initialized"
@@ -945,49 +949,6 @@ def get_ring_parallel_world_size():
 
 def get_ring_parallel_rank():
     return get_sp_group().ring_rank
-
-
-def _warmup_ulysses_communication():
-    """
-    Warmup NCCL communication for Ulysses all-to-all to avoid first-step latency.
-
-    This function performs a dummy all-to-all operation to initialize NCCL communication
-    channels, which can take several seconds on the first call.
-    """
-    logger.info("Warming up Ulysses all-to-all communication...")
-
-    try:
-        import torch.distributed._functional_collectives as ft_c
-
-        ulysses_pg = get_sp_group().ulysses_group
-        if ulysses_pg is None:
-            logger.warning("Ulysses group not initialized, skipping warmup")
-            return
-
-        warmup_start = time.time()
-
-        device = torch.device(f"cuda:{get_world_group().local_rank}")
-        dummy_tensor = torch.zeros(1024, device=device, dtype=torch.float32)
-
-        output = ft_c.all_to_all_single(
-            dummy_tensor,
-            output_split_sizes=None,
-            input_split_sizes=None,
-            group=ulysses_pg,
-        )
-
-        if isinstance(output, ft_c.AsyncCollectiveTensor):
-            output = output.wait()
-
-        torch.cuda.synchronize()
-
-        warmup_time = (time.time() - warmup_start) * 1000
-        logger.info(f"Ulysses communication warmup completed in {warmup_time:.2f}ms")
-
-    except Exception as e:
-        logger.warning(
-            f"Ulysses communication warmup failed: {e}. Continuing without warmup."
-        )
 
 
 # PP

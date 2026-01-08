@@ -29,7 +29,7 @@ python3 test_choices.py
 - Create new test files under `test/srt` or `test/lang` depending on the type of test.
 - For nightly tests, place them in `test/srt/nightly/`. Use the `NightlyBenchmarkRunner` helper class in `nightly_utils.py` for performance benchmarking tests.
 - Ensure they are referenced in the respective `run_suite.py` (e.g., `test/srt/run_suite.py`) so they are picked up in CI. For most small test cases, they can be added to the `per-commit-1-gpu` suite. Sort the test cases alphabetically by name.
-- Ensure you added `unittest.main()` for unittest and `pytest.main([__file__])` for pytest in the scripts. The CI run them via `python3 test_file.py`.
+- Ensure you added `unittest.main()` for unittest and `sys.exit(pytest.main([__file__]))` for pytest in the scripts. The CI run them via `python3 test_file.py`.
 - The CI will run some suites such as `per-commit-1-gpu`, `per-commit-2-gpu`, and `nightly-1-gpu` automatically. If you need special setup or custom test groups, you may modify the workflows in [`.github/workflows/`](https://github.com/sgl-project/sglang/tree/main/.github/workflows).
 
 ## CI Registry Quick Peek

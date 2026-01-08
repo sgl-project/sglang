@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,12 +26,13 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
 
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -326,6 +329,7 @@ class PrefillAdder:
         mixed_with_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
         prefill_max_requests: Optional[int] = None,
+        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -363,8 +367,9 @@ class PrefillAdder:
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
         self.prefill_max_requests = prefill_max_requests
+        self.prefill_delayer_single_pass = prefill_delayer_single_pass
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -454,7 +459,7 @@ class PrefillAdder:
         if _rem_tokens <= 0:
             _rem_tokens = self.rem_chunk_tokens
         truncated = req.extend_input_len > _rem_tokens
-        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
+        req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -472,17 +477,13 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
-        if self.is_hybrid_swa:
-            try:
-                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
-                yield None
-            finally:
-                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
-        else:
-            try:
-                self.tree_cache.inc_lock_ref(last_node)
-                yield None
-            finally:
+        try:
+            ret = self.tree_cache.inc_lock_ref(last_node)
+            yield None
+        finally:
+            if isinstance(self.tree_cache, SWARadixCache):
+                self.tree_cache.dec_lock_ref(last_node, ret)
+            else:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
@@ -559,7 +560,7 @@ class PrefillAdder:
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
 
-            req.extend_input_len = trunc_len
+            req.set_extend_input_len(trunc_len)
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
             self.new_chunked_req = req
@@ -573,7 +574,7 @@ class PrefillAdder:
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
-        if self.nsa_enable_prefill_cp and len(self.can_run_list) >= 1:
+        if self.nsa_prefill_cp_in_seq_split and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
@@ -608,13 +609,20 @@ class PrefillAdder:
                     req.last_host_node, req.host_hit_length
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+                return AddReqResult.OTHER
+
+            if (self.prefill_delayer_single_pass is not None) and (
+                not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                    local_prefillable=True
+                )
+            ):
                 return AddReqResult.OTHER
 
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
@@ -651,7 +659,7 @@ class PrefillAdder:
                         )
 
                 # Chunked prefill
-                req.extend_input_len = trunc_len
+                req.set_extend_input_len(trunc_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
                 self.can_run_list.append(req)

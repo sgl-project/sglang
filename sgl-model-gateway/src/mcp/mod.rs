@@ -12,14 +12,6 @@ pub mod oauth;
 pub mod proxy;
 pub mod tool_args;
 
-// Re-export the main types for convenience
-pub use config::{
-    InventoryConfig, McpConfig, McpPoolConfig, McpProxyConfig, McpServerConfig, McpTransport,
-    Prompt, RawResource, Tool, WarmupServer,
-};
-pub use connection_pool::{CachedConnection, McpConnectionPool, PoolStats};
-pub use error::{McpError, McpResult};
-pub use inventory::ToolInventory;
-pub use manager::{McpManager, McpManagerStats};
-pub use proxy::{create_http_client, resolve_proxy_config};
-pub use tool_args::ToolArgs;
+// Re-export types used outside this module
+pub use config::{McpConfig, McpServerConfig, McpTransport, Tool};
+pub use manager::McpManager;

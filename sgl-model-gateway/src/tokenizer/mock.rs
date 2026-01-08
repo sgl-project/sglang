@@ -67,7 +67,7 @@ impl MockTokenizer {
 }
 
 impl Encoder for MockTokenizer {
-    fn encode(&self, input: &str) -> Result<Encoding> {
+    fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
         // Simple word-based tokenization using the vocab
         // Split by whitespace and look up each word (decoder adds spaces back)
         let tokens: Vec<u32> = input
@@ -78,8 +78,11 @@ impl Encoder for MockTokenizer {
         Ok(Encoding::Sp(tokens))
     }
 
-    fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
-        inputs.iter().map(|input| self.encode(input)).collect()
+    fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+        inputs
+            .iter()
+            .map(|input| self.encode(input, add_special_tokens))
+            .collect()
     }
 }
 

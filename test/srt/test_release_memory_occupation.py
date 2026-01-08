@@ -39,6 +39,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.test.test_utils import (
+    DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
@@ -90,6 +91,10 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             "sampling_params_moe": {"temperature": 0, "max_new_tokens": 16},
             "expect_output_before_update_weights_moe": " go to the park. I have a picnic basket, a book, and a",
             "expect_output_after_update_weights_moe": " go to the park. I have a lot of things to do, but I",
+            "prompt_hybrid_mamba": "The weather is nice today, and I want to",
+            "sampling_params_hybrid_mamba": {"temperature": 0, "max_new_tokens": 16},
+            "expect_output_before_update_weights_hybrid_mamba": " go out for a walk. But I don't know what to wear. Can",
+            "expect_output_after_update_weights_hybrid_mamba": " go out for a walk. But I don't know what to wear. Can",
         }
 
     def _test_initial_generation(
@@ -398,6 +403,66 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             "text"
         ]
         self.assertEqual(outputs, params["expect_output_after_update_weights_moe"])
+        engine.shutdown()
+
+    def test_hybrid_mamba_model_release_and_resume(self):
+        # Test with Hybrid Mamba model
+        model_name = DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST
+
+        tp_size = 4
+
+        print(
+            f"Testing tp_size={tp_size} for test_hybrid_mamba_model_release_and_resume"
+        )
+        engine = sgl.Engine(
+            model_path=model_name,
+            random_seed=42,
+            enable_memory_saver=True,
+            tp_size=tp_size,
+        )
+        params = self._common_test_params()
+
+        self._test_initial_generation(
+            engine,
+            params["prompt_hybrid_mamba"],
+            params["sampling_params_hybrid_mamba"],
+            params["expect_output_before_update_weights_hybrid_mamba"],
+        )
+
+        t = time.perf_counter()
+        gpu_memory_usage_before_release = get_gpu_memory_gb()
+        engine.release_memory_occupation()
+        gpu_memory_usage_after_release = get_gpu_memory_gb()
+        self.assertLess(
+            gpu_memory_usage_after_release,
+            gpu_memory_usage_before_release,
+        )
+
+        print(
+            f"Release took {time.perf_counter() - t:.2f}s, memory: {gpu_memory_usage_before_release:.1f} GB → {gpu_memory_usage_after_release:.1f} GB"
+        )
+
+        if _DEBUG_EXTRA:
+            time.sleep(3)
+
+        t = time.perf_counter()
+        engine.resume_memory_occupation()
+        print(
+            f"Resume took {time.perf_counter() - t:.2f}s, memory: {get_gpu_memory_gb():.1f} GB"
+        )
+
+        engine.update_weights_from_disk(model_name)
+
+        # destroy the hf model
+        torch.cuda.empty_cache()
+
+        print("generate (#2)")
+        outputs = engine.generate(
+            params["prompt_hybrid_mamba"], params["sampling_params_hybrid_mamba"]
+        )["text"]
+        self.assertEqual(
+            outputs, params["expect_output_after_update_weights_hybrid_mamba"]
+        )
         engine.shutdown()
 
 

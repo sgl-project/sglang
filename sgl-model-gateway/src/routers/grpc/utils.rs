@@ -49,7 +49,7 @@ use crate::{
 /// preparation stages (chat, generate, embedding).
 ///
 /// Returns the tokenizer Arc, which is also cached in `ctx.state.tokenizer`.
-pub fn resolve_tokenizer(
+pub(crate) fn resolve_tokenizer(
     ctx: &mut RequestContext,
     stage_name: &str,
 ) -> Result<Arc<dyn Tokenizer>, Box<Response>> {
@@ -87,7 +87,9 @@ pub fn resolve_tokenizer(
 }
 
 /// Get gRPC client from worker, returning appropriate error response on failure
-pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<GrpcClient, Response> {
+pub(crate) async fn get_grpc_client_from_worker(
+    worker: &Arc<dyn Worker>,
+) -> Result<GrpcClient, Response> {
     // Get cached client from worker (or create one if not cached yet)
     let client_arc = worker
         .get_grpc_client()
@@ -157,7 +159,7 @@ fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
 }
 
 /// Process messages based on content format for ANY message type
-pub fn process_content_format(
+pub(crate) fn process_content_format(
     messages: &[ChatMessage],
     content_format: ChatTemplateContentFormat,
 ) -> Result<Vec<Value>, String> {
@@ -227,7 +229,7 @@ fn transform_content_field(content_value: &mut Value, content_format: ChatTempla
 
 /// Generate tool constraints for structured generation
 /// Note: tools should already be filtered if needed (by allowed_tools or specific function)
-pub fn generate_tool_constraints(
+pub(crate) fn generate_tool_constraints(
     tools: &[Tool],
     tool_choice: &Option<ToolChoice>,
     _model: &str,
@@ -279,8 +281,7 @@ pub fn generate_tool_constraints(
 /// Build JSON schema for required tool calls (array with minItems: 1)
 /// Includes $defs consolidation from all tools (matching Python's behavior)
 fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
-    // Build anyOf schemas for each tool
-    let mut any_of_schemas = Vec::new();
+    let mut any_of_schemas = Vec::with_capacity(tools.len());
     for tool in tools {
         let tool_schema = json!({
             "properties": {
@@ -296,7 +297,7 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
     }
 
     // Consolidate $defs from all tools (matching Python's _get_tool_schema_defs)
-    let mut all_defs: HashMap<String, Value> = HashMap::new();
+    let mut all_defs: Map<String, Value> = Map::new();
     for tool in tools {
         if let Value::Object(params) = &tool.function.parameters {
             if let Some(Value::Object(defs)) = params.get("$defs") {
@@ -332,8 +333,7 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
     // Add $defs if any were found (matching Python's behavior)
     if !all_defs.is_empty() {
         if let Value::Object(ref mut schema_obj) = array_schema {
-            let defs_value = Value::Object(all_defs.into_iter().collect::<Map<String, Value>>());
-            schema_obj.insert("$defs".to_string(), defs_value);
+            schema_obj.insert("$defs".to_string(), Value::Object(all_defs));
         }
     }
 
@@ -345,7 +345,7 @@ fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
 ///
 /// Returns filtered tools if filtering is needed, otherwise returns None.
 /// Used by both Chat API and Responses API (Harmony) for constraint generation.
-pub fn filter_tools_by_tool_choice(
+pub(crate) fn filter_tools_by_tool_choice(
     tools: &[Tool],
     tool_choice: &Option<ToolChoice>,
 ) -> Option<Vec<Tool>> {
@@ -379,7 +379,7 @@ pub fn filter_tools_by_tool_choice(
 ///
 /// Note: Tool existence is validated earlier in ChatCompletionRequest::validate(),
 /// so this function assumes tool_choice references valid tools.
-pub fn filter_chat_request_by_tool_choice(
+pub(crate) fn filter_chat_request_by_tool_choice(
     body: &ChatCompletionRequest,
 ) -> std::borrow::Cow<'_, ChatCompletionRequest> {
     if let Some(tools) = &body.tools {
@@ -396,7 +396,7 @@ pub fn filter_chat_request_by_tool_choice(
 
 /// Process chat messages and apply template (shared by both routers)
 /// Requires HuggingFace tokenizer with chat template support
-pub fn process_chat_messages(
+pub(crate) fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
@@ -439,8 +439,8 @@ pub fn process_chat_messages(
             .transpose()
             .map_err(|e| format!("Failed to serialize tools: {}", e))?;
 
-        // Build template kwargs, merging reasoning_effort if present
-        let mut combined_template_kwargs = HashMap::new();
+        let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
+        let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
 
         // Add reasoning_effort if present (like Python does)
         if let Some(reasoning_effort) = &request.reasoning_effort {
@@ -517,7 +517,7 @@ pub fn process_chat_messages(
 }
 
 /// Create a StopSequenceDecoder from stop parameters
-pub fn create_stop_decoder(
+pub(crate) fn create_stop_decoder(
     tokenizer: &Arc<dyn Tokenizer>,
     stop: Option<&StringOrArray>,
     stop_token_ids: Option<&Vec<u32>>,
@@ -559,7 +559,7 @@ pub fn create_stop_decoder(
 }
 
 /// Parse tool calls from JSON schema constrained response
-pub fn parse_json_schema_response(
+pub(crate) fn parse_json_schema_response(
     processed_text: &str,
     tool_choice: &Option<ToolChoice>,
     model: &str,
@@ -648,7 +648,7 @@ pub fn parse_json_schema_response(
 /// # Returns
 /// * `Ok(Vec<GenerateComplete>)` - All complete responses collected from the stream
 /// * `Err(Response)` - Error response if the stream fails or returns an error
-pub async fn collect_stream_responses(
+pub(crate) async fn collect_stream_responses(
     stream: &mut ProtoStream,
     worker_name: &str,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
@@ -693,7 +693,7 @@ pub async fn collect_stream_responses(
 
 /// Count the number of tool calls in the request message history
 /// This is used for KimiK2 format which needs globally unique indices
-pub fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> usize {
+pub(crate) fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> usize {
     request
         .messages
         .iter()
@@ -717,7 +717,7 @@ pub fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> usize {
 ///
 /// # Returns
 /// A unique ID string. KimiK2 uses `functions.{name}:{global_index}`, others use `call_{uuid}`
-pub fn generate_tool_call_id(
+pub(crate) fn generate_tool_call_id(
     model: &str,
     tool_name: &str,
     tool_index: usize,
@@ -739,7 +739,7 @@ pub fn generate_tool_call_id(
 }
 
 /// Check if a reasoning parser is available for the given model
-pub fn check_reasoning_parser_availability(
+pub(crate) fn check_reasoning_parser_availability(
     reasoning_parser_factory: &ReasoningParserFactory,
     configured_parser: Option<&str>,
     model: &str,
@@ -754,7 +754,7 @@ pub fn check_reasoning_parser_availability(
 }
 
 /// Check if a tool parser is available for the given model
-pub fn check_tool_parser_availability(
+pub(crate) fn check_tool_parser_availability(
     tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&str>,
     model: &str,
@@ -771,7 +771,7 @@ pub fn check_tool_parser_availability(
 /// If a parser name is explicitly configured, use that parser.
 /// Otherwise, auto-detect based on the model name.
 /// Get a pooled reasoning parser (for non-streaming where state doesn't matter)
-pub fn get_reasoning_parser(
+pub(crate) fn get_reasoning_parser(
     reasoning_parser_factory: &ReasoningParserFactory,
     configured_parser: Option<&str>,
     model: &str,
@@ -795,7 +795,7 @@ pub fn get_reasoning_parser(
 }
 
 /// Create a fresh reasoning parser instance (for streaming where state isolation is needed)
-pub fn create_reasoning_parser(
+pub(crate) fn create_reasoning_parser(
     reasoning_parser_factory: &ReasoningParserFactory,
     configured_parser: Option<&str>,
     model: &str,
@@ -823,7 +823,7 @@ pub fn create_reasoning_parser(
 /// If a parser name is explicitly configured, use that parser.
 /// Otherwise, auto-detect based on the model name.
 /// Get a pooled tool parser (for non-streaming where state doesn't matter)
-pub fn get_tool_parser(
+pub(crate) fn get_tool_parser(
     tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&str>,
     model: &str,
@@ -847,7 +847,7 @@ pub fn get_tool_parser(
 }
 
 /// Create a fresh tool parser instance (for streaming where state isolation is needed)
-pub fn create_tool_parser(
+pub(crate) fn create_tool_parser(
     tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&str>,
     model: &str,
@@ -874,11 +874,11 @@ pub fn create_tool_parser(
 ///
 /// This function decodes token IDs using the tokenizer and builds the logprobs structure
 /// expected by the OpenAI API format.
-pub fn convert_proto_to_openai_logprobs(
+pub(crate) fn convert_proto_to_openai_logprobs(
     proto_logprobs: &OutputLogProbs,
     tokenizer: &Arc<dyn Tokenizer>,
 ) -> Result<ChatLogProbs, String> {
-    let mut content_items = Vec::new();
+    let mut content_items = Vec::with_capacity(proto_logprobs.token_logprobs.len());
 
     // Decode token IDs to text (always with skip_special_tokens=false for logprobs)
     let token_texts: Vec<String> = proto_logprobs
@@ -901,8 +901,9 @@ pub fn convert_proto_to_openai_logprobs(
         let bytes = Some(token_text.as_bytes().to_vec());
 
         // Build top_logprobs for this position
-        let mut top_logprobs = Vec::new();
-        if let Some(top_logprobs_entry) = proto_logprobs.top_logprobs.get(i) {
+        let top_logprobs = if let Some(top_logprobs_entry) = proto_logprobs.top_logprobs.get(i) {
+            let mut top_logprobs = Vec::with_capacity(top_logprobs_entry.values.len());
+
             // Decode top token IDs (always with skip_special_tokens=false)
             let top_token_texts: Vec<String> = top_logprobs_entry
                 .token_ids
@@ -928,7 +929,10 @@ pub fn convert_proto_to_openai_logprobs(
                     });
                 }
             }
-        }
+            top_logprobs
+        } else {
+            Vec::new()
+        };
 
         content_items.push(ChatLogProbsContent {
             token: token_text,
@@ -947,7 +951,9 @@ pub fn convert_proto_to_openai_logprobs(
 ///
 /// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
 /// Each inner vec contains [logprob (f64), token_id (i32), ...]
-pub fn convert_generate_output_logprobs(proto_logprobs: &OutputLogProbs) -> Vec<Vec<Option<f64>>> {
+pub(crate) fn convert_generate_output_logprobs(
+    proto_logprobs: &OutputLogProbs,
+) -> Vec<Vec<Option<f64>>> {
     proto_logprobs
         .token_logprobs
         .iter()
@@ -960,7 +966,9 @@ pub fn convert_generate_output_logprobs(proto_logprobs: &OutputLogProbs) -> Vec<
 ///
 /// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
 /// First token has null logprob: [[null, token_id], [logprob, token_id], ...]
-pub fn convert_generate_input_logprobs(proto_logprobs: &InputLogProbs) -> Vec<Vec<Option<f64>>> {
+pub(crate) fn convert_generate_input_logprobs(
+    proto_logprobs: &InputLogProbs,
+) -> Vec<Vec<Option<f64>>> {
     proto_logprobs
         .token_logprobs
         .iter()
@@ -983,7 +991,10 @@ pub fn convert_generate_input_logprobs(proto_logprobs: &InputLogProbs) -> Vec<Ve
 /// - Any other JSON -> Other(...)
 ///
 /// For backward compatibility, also handles simple string "stop" -> Stop
-pub fn parse_finish_reason(reason_str: &str, completion_tokens: i32) -> GenerateFinishReason {
+pub(crate) fn parse_finish_reason(
+    reason_str: &str,
+    completion_tokens: i32,
+) -> GenerateFinishReason {
     if reason_str == "stop" {
         return GenerateFinishReason::Stop;
     }
@@ -1008,7 +1019,7 @@ pub fn parse_finish_reason(reason_str: &str, completion_tokens: i32) -> Generate
 // ============================================================================
 
 /// Map route path to endpoint label for metrics
-pub fn route_to_endpoint(route: &str) -> &'static str {
+pub(crate) fn route_to_endpoint(route: &str) -> &'static str {
     match route {
         "/v1/chat/completions" => metrics_labels::ENDPOINT_CHAT,
         "/generate" => metrics_labels::ENDPOINT_GENERATE,
@@ -1020,7 +1031,7 @@ pub fn route_to_endpoint(route: &str) -> &'static str {
 }
 
 /// Map HTTP status code to error type label for metrics
-pub fn error_type_from_status(status: StatusCode) -> &'static str {
+pub(crate) fn error_type_from_status(status: StatusCode) -> &'static str {
     match status.as_u16() {
         400 => metrics_labels::ERROR_VALIDATION,
         404 => metrics_labels::ERROR_NO_WORKERS,

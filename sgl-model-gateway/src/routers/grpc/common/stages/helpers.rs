@@ -14,7 +14,7 @@ use crate::{
 ///
 /// Used by both chat and generate request building stages when in PD mode.
 /// Only SGLang supports PD (prefill/decode) disaggregated mode.
-pub fn inject_bootstrap_metadata(
+pub(crate) fn inject_bootstrap_metadata(
     request: &mut ProtoGenerateRequest,
     prefill_worker: &Arc<dyn Worker>,
 ) {

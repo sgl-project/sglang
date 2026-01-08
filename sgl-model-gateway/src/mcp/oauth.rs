@@ -69,7 +69,7 @@ const CALLBACK_HTML: &str = r#"
 "#;
 
 /// OAuth authentication helper for MCP servers
-pub struct OAuthHelper {
+pub(crate) struct OAuthHelper {
     server_url: String,
     redirect_uri: String,
     callback_port: u16,

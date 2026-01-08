@@ -56,4 +56,6 @@ def test_sample_video_frames_lengths(case: Case):
     assert result == case.expected_frames
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+
+    sys.exit(pytest.main([__file__]))

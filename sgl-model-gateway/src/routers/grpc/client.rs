@@ -105,7 +105,7 @@ impl GrpcClient {
         match self {
             Self::Sglang(client) => {
                 let info = client.get_model_info().await?;
-                Ok(ModelInfo::Sglang(info))
+                Ok(ModelInfo::Sglang(Box::new(info)))
             }
             Self::Vllm(client) => {
                 let info = client.get_model_info().await?;
@@ -151,7 +151,7 @@ impl GrpcClient {
 
 /// Unified ModelInfo wrapper
 pub enum ModelInfo {
-    Sglang(crate::grpc_client::sglang_proto::GetModelInfoResponse),
+    Sglang(Box<crate::grpc_client::sglang_proto::GetModelInfoResponse>),
     Vllm(crate::grpc_client::vllm_proto::GetModelInfoResponse),
 }
 
