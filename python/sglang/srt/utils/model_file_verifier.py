@@ -11,6 +11,7 @@ Example commands:
 """
 
 import argparse
+import fnmatch
 import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -84,8 +85,6 @@ def generate_checksums(
 
 
 def _discover_files(model_path: Path) -> List[str]:
-    import fnmatch
-
     return sorted(
         e.name
         for e in model_path.iterdir()
@@ -123,8 +122,6 @@ def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
 
 
 def _get_filename_and_checksum_from_hf_file(fs, file_info):
-    import fnmatch
-
     if file_info.get("type") != "file":
         return None
 
