@@ -271,16 +271,17 @@ class RouterArgs:
             help="Cache threshold (0.0-1.0) for cache-aware routing",
         )
         routing_group.add_argument(
-            f"--{prefix}enable-reactive-eviction",
-            action="store_true",
+            f"--{prefix}disable-reactive-eviction",
+            dest="enable_reactive_eviction",
+            action="store_false",
             default=True,
-            help="Trigger cache eviction immediately when max-tree-size is exceeded",
+            help="Disable reactive cache eviction for cache aware policy. It is enabled by default.",
         )
         routing_group.add_argument(
             f"--{prefix}reactive-eviction-threshold",
             type=float,
-            default=1.2,
-            help="Multiplier for max-tree-size to trigger reactive cache eviction (high-water mark)",
+            default=RouterArgs.reactive_eviction_threshold,
+            help="Multiplier for max-tree-size to trigger reactive eviction",
         )
         routing_group.add_argument(
             f"--{prefix}balance-abs-threshold",
