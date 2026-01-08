@@ -1,7 +1,7 @@
 # Support Models on Ascend NPU
 
 This section describes the models supported on the Ascend NPU, including Large Language Models, Multimodal Language
-Models, Embedding Models, and Rerank Models. Mainstream DeepSeek/Qwen/GLM series are included.
+Models, Embedding Models, Reward Models and Rerank Models. Mainstream DeepSeek/Qwen/GLM series are included.
 You are welcome to enable various models based on your business requirements.
 
 ## Large Language Models
@@ -40,10 +40,10 @@ You are welcome to enable various models based on your business requirements.
 | inclusionAI/Ling-lite                     | Ling                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | ibm-granite/granite-3.1-8b-instruct       | Granite                        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | ibm-granite/granite-3.0-3b-a800m-instruct | Granite MoE                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| databricks/dbrx-instruct                  | DBRX (Databricks)              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| baichuan-inc/Baichuan2-13B-Chat           | Baichuan 2 (7B, 13B)           |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| baidu/ERNIE-4.5-21B-A3B-PT                | ERNIE-4.5 (4.5, 4.5MoE series) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| openbmb/MiniCPM3-4B                       | MiniCPM (v3, 4B)               |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| databricks/dbrx-instruct                  | DBRX (Databricks)              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| baichuan-inc/Baichuan2-13B-Chat           | Baichuan 2 (7B, 13B)           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| baidu/ERNIE-4.5-21B-A3B-PT                | ERNIE-4.5 (4.5, 4.5MoE series) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| openbmb/MiniCPM3-4B                       | MiniCPM (v3, 4B)               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | openai/gpt-oss-120b                       | GPTOSS                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
 
 ## Multimodal Language Models
