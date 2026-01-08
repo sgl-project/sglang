@@ -107,8 +107,13 @@ class DFlashVerifyInput(SpecInput):
     custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
+    # Shape info for padding (e.g., DP attention / CUDA graph).
+    num_tokens_per_batch: int = -1
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
+        if self.num_tokens_per_batch == -1:
+            self.num_tokens_per_batch = int(self.draft_token_num)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -207,7 +212,28 @@ class DFlashVerifyInput(SpecInput):
             kv_indices,
             req_to_token.size(1),
         )
-        return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
+        mask = self.custom_mask
+        if mask is not None:
+            mask_numel = (
+                paged_kernel_lens_sum * self.draft_token_num
+                + (self.draft_token_num**2) * bs
+            )
+            if mask.numel() < mask_numel:
+                # FIXME(attn): temporary fix for custom mask padding with cuda graph
+                mask = torch.cat(
+                    [
+                        mask,
+                        torch.full(
+                            (mask_numel - mask.numel(),),
+                            True,
+                            dtype=torch.bool,
+                            device=device,
+                        ),
+                    ],
+                    dim=0,
+                )
+                self.custom_mask = mask
+        return kv_indices, cum_kv_seq_len, qo_indptr, mask
 
     def verify(
         self,

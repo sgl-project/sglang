@@ -1747,6 +1747,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_dflash()
         ):
             return not self.is_draft_worker
 
@@ -1775,6 +1776,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_dflash()
         ):
             if self.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -1794,6 +1796,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.eagle_use_aux_hidden_state:
             self.model.set_eagle3_layers_to_capture()
+        if self.dflash_use_aux_hidden_state:
+            self.model.set_dflash_layers_to_capture(self.dflash_aux_hidden_state_layer_ids)
 
         require_mlp_tp_gather_ = require_mlp_tp_gather(self.server_args)
         if require_gathered_buffer(self.server_args):

@@ -279,6 +279,7 @@ class CudaGraphRunner:
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
             or model_runner.spec_algorithm.is_ngram()
+            or model_runner.spec_algorithm.is_dflash()
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -354,6 +355,15 @@ class CudaGraphRunner:
             and model_runner.eagle_use_aux_hidden_state
         ):
             self.model_runner.model.set_eagle3_layers_to_capture()
+        if model_runner.spec_algorithm.is_dflash() and model_runner.dflash_use_aux_hidden_state:
+            if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
+                raise ValueError(
+                    f"Model {self.model_runner.model.__class__.__name__} does not implement set_dflash_layers_to_capture, "
+                    "which is required for DFLASH aux hidden capture."
+                )
+            self.model_runner.model.set_dflash_layers_to_capture(
+                self.model_runner.dflash_aux_hidden_state_layer_ids
+            )
 
         # Capture
         try:
@@ -904,6 +914,18 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+        elif self.model_runner.spec_algorithm.is_dflash():
+            from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+            if self.model_runner.is_draft_worker:
+                raise RuntimeError("This should not happen.")
+            spec_info = DFlashVerifyInput(
+                draft_token=None,
+                positions=None,
+                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                custom_mask=self.buffers.custom_mask,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
 
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput
