@@ -17,6 +17,12 @@ import {
   TilingMode,
   classifyQualityTier,
 } from '../api/comparisonSchema';
+import {
+  fetchBlessedConfigs,
+  saveBlessedConfig,
+  deleteBlessedConfig,
+  checkSidecarAvailable,
+} from '../api/blessedConfigsApi';
 
 // ============================================================================
 // TYPES
@@ -75,6 +81,8 @@ interface ParetoState {
 
   // Blessed configs
   blessedConfigs: BlessedConfig[];
+  backendAvailable: boolean;
+  isSyncing: boolean;
 
   // Chart settings
   xAxis: 'compressionRatio' | 'memoryMb' | 'nbits';
@@ -95,6 +103,7 @@ interface ParetoState {
 
   blessConfig: (pointId: string, reason: string) => void;
   unblessConfig: (id: string) => void;
+  syncBlessedConfigs: () => Promise<void>;
 
   setXAxis: (axis: ParetoState['xAxis']) => void;
   setYAxis: (axis: ParetoState['yAxis']) => void;
@@ -262,6 +271,8 @@ export const useParetoStore = create<ParetoState>()(
       hoveredPointId: null,
 
       blessedConfigs: [],
+      backendAvailable: false,
+      isSyncing: false,
 
       xAxis: 'compressionRatio',
       yAxis: 'meanJaccard',
@@ -373,30 +384,81 @@ export const useParetoStore = create<ParetoState>()(
       },
 
       blessConfig: (pointId: string, reason: string) => {
-        const { points, blessedConfigs } = get();
+        const { points, blessedConfigs, backendAvailable } = get();
         const point = points.find((p) => p.id === pointId);
         if (!point) return;
 
         // Remove if already blessed
         const filtered = blessedConfigs.filter((c) => c.id !== pointId);
 
+        const newConfig: BlessedConfig = {
+          id: pointId,
+          configName: point.configName,
+          blessedAt: Date.now(),
+          reason,
+        };
+
         set({
-          blessedConfigs: [
-            ...filtered,
-            {
-              id: pointId,
-              configName: point.configName,
-              blessedAt: Date.now(),
-              reason,
-            },
-          ],
+          blessedConfigs: [...filtered, newConfig],
         });
+
+        // Save to backend if available
+        if (backendAvailable) {
+          saveBlessedConfig(newConfig).catch((err) => {
+            console.warn('Failed to save blessed config to backend:', err);
+          });
+        }
       },
 
       unblessConfig: (id: string) => {
+        const { backendAvailable } = get();
+
         set((state) => ({
           blessedConfigs: state.blessedConfigs.filter((c) => c.id !== id),
         }));
+
+        // Delete from backend if available
+        if (backendAvailable) {
+          deleteBlessedConfig(id).catch((err) => {
+            console.warn('Failed to delete blessed config from backend:', err);
+          });
+        }
+      },
+
+      syncBlessedConfigs: async () => {
+        set({ isSyncing: true });
+
+        try {
+          // Check if backend is available
+          const available = await checkSidecarAvailable();
+          set({ backendAvailable: available });
+
+          if (available) {
+            // Fetch configs from backend
+            const remoteConfigs = await fetchBlessedConfigs();
+            const { blessedConfigs: localConfigs } = get();
+
+            // Merge: keep local configs that aren't in remote, add all remote
+            const remoteIds = new Set(remoteConfigs.map((c) => c.id));
+            const localOnly = localConfigs.filter((c) => !remoteIds.has(c.id));
+
+            // Upload local-only configs to backend
+            for (const config of localOnly) {
+              await saveBlessedConfig(config);
+            }
+
+            // Update store with merged configs
+            set({
+              blessedConfigs: [...remoteConfigs, ...localOnly],
+              isSyncing: false,
+            });
+          } else {
+            set({ isSyncing: false });
+          }
+        } catch (err) {
+          console.warn('Failed to sync blessed configs:', err);
+          set({ isSyncing: false, backendAvailable: false });
+        }
       },
 
       setXAxis: (axis) => set({ xAxis: axis }),
@@ -412,6 +474,12 @@ export const useParetoStore = create<ParetoState>()(
         yAxis: state.yAxis,
         colorBy: state.colorBy,
       }),
+      onRehydrateStorage: () => (state) => {
+        // Sync blessed configs with backend after rehydration
+        if (state) {
+          state.syncBlessedConfigs();
+        }
+      },
     }
   )
 );

@@ -370,6 +370,83 @@ class DiscoveryIntegration:
             return False
 
 
+class BlessedConfigStorage:
+    """
+    JSON file-based storage for blessed quantization configurations.
+
+    Persists approved configs to a JSON file for sharing across browser sessions
+    and deployments. Thread-safe for concurrent read/write.
+    """
+
+    def __init__(self, storage_path: str):
+        self.storage_path = Path(storage_path)
+        self._lock = threading.Lock()
+        self._configs: Dict[str, Dict] = {}
+        self._load()
+
+    def _load(self):
+        """Load configs from JSON file."""
+        if self.storage_path.exists():
+            try:
+                with open(self.storage_path) as f:
+                    data = json.load(f)
+                self._configs = {c["id"]: c for c in data.get("configs", [])}
+            except Exception as e:
+                print(f"Warning: Failed to load blessed configs: {e}")
+                self._configs = {}
+        else:
+            self._configs = {}
+
+    def _save(self):
+        """Save configs to JSON file."""
+        try:
+            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.storage_path, "w") as f:
+                json.dump({
+                    "configs": list(self._configs.values()),
+                    "updated_at": time.time(),
+                }, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Failed to save blessed configs: {e}")
+
+    def get_all(self) -> List[Dict]:
+        """Get all blessed configs."""
+        with self._lock:
+            return list(self._configs.values())
+
+    def get(self, config_id: str) -> Optional[Dict]:
+        """Get a specific config by ID."""
+        with self._lock:
+            return self._configs.get(config_id)
+
+    def add(self, config: Dict) -> bool:
+        """Add or update a blessed config."""
+        if "id" not in config:
+            return False
+        with self._lock:
+            self._configs[config["id"]] = config
+            self._save()
+            return True
+
+    def remove(self, config_id: str) -> bool:
+        """Remove a blessed config."""
+        with self._lock:
+            if config_id in self._configs:
+                del self._configs[config_id]
+                self._save()
+                return True
+            return False
+
+    def get_stats(self) -> Dict:
+        """Get storage statistics."""
+        with self._lock:
+            return {
+                "count": len(self._configs),
+                "storage_path": str(self.storage_path),
+                "exists": self.storage_path.exists(),
+            }
+
+
 class OnlineMicroCluster:
     """
     Micro-cluster for online clustering (DenStream-style).
@@ -463,6 +540,7 @@ class RAPIDSSidecar:
         db_path: Optional[str] = None,
         discovery_dir: Optional[str] = None,
         discovery_reload_interval: float = 300.0,
+        blessed_configs_path: Optional[str] = None,
     ):
         self.buffer_size = buffer_size
         self.min_cluster_size = min_cluster_size
@@ -505,6 +583,12 @@ class RAPIDSSidecar:
                 discovery_dir, auto_reload_interval=discovery_reload_interval
             )
             print(f"Discovery integration enabled: {discovery_dir}")
+
+        # Blessed configs storage (optional)
+        self._blessed_storage: Optional[BlessedConfigStorage] = None
+        if blessed_configs_path:
+            self._blessed_storage = BlessedConfigStorage(blessed_configs_path)
+            print(f"Blessed configs storage enabled: {blessed_configs_path}")
 
         # Backend selection
         if online_mode:
@@ -977,7 +1061,41 @@ class RAPIDSSidecar:
         else:
             stats["discovery"] = {"available": False}
 
+        # Add blessed configs stats
+        if self._blessed_storage:
+            stats["blessed_configs"] = self._blessed_storage.get_stats()
+        else:
+            stats["blessed_configs"] = {"enabled": False}
+
         return stats
+
+    # -------------------------------------------------------------------------
+    # Blessed Configs API
+    # -------------------------------------------------------------------------
+
+    def get_blessed_configs(self) -> List[Dict]:
+        """Get all blessed configs."""
+        if self._blessed_storage:
+            return self._blessed_storage.get_all()
+        return []
+
+    def get_blessed_config(self, config_id: str) -> Optional[Dict]:
+        """Get a specific blessed config."""
+        if self._blessed_storage:
+            return self._blessed_storage.get(config_id)
+        return None
+
+    def add_blessed_config(self, config: Dict) -> bool:
+        """Add or update a blessed config."""
+        if self._blessed_storage:
+            return self._blessed_storage.add(config)
+        return False
+
+    def remove_blessed_config(self, config_id: str) -> bool:
+        """Remove a blessed config."""
+        if self._blessed_storage:
+            return self._blessed_storage.remove(config_id)
+        return False
 
 
 class SidecarHandler(BaseHTTPRequestHandler):
@@ -1003,6 +1121,20 @@ class SidecarHandler(BaseHTTPRequestHandler):
             # Get discovery integration status
             data = self.sidecar.get_discovery_status()
             self._send_json(data)
+
+        elif parsed.path == "/blessed-configs":
+            # Get all blessed configs
+            data = self.sidecar.get_blessed_configs()
+            self._send_json({"configs": data})
+
+        elif parsed.path.startswith("/blessed-configs/"):
+            # Get specific blessed config
+            config_id = parsed.path.split("/blessed-configs/")[1]
+            config = self.sidecar.get_blessed_config(config_id)
+            if config:
+                self._send_json(config)
+            else:
+                self.send_error(404, "Config not found")
 
         else:
             self.send_error(404)
@@ -1075,6 +1207,35 @@ class SidecarHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json({"status": "storage_disabled"})
 
+        elif parsed.path == "/blessed-configs":
+            # Add or update a blessed config
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+            data = json.loads(body)
+
+            success = self.sidecar.add_blessed_config(data)
+            if success:
+                self._send_json({
+                    "status": "saved",
+                    "config_id": data.get("id"),
+                })
+            else:
+                self.send_error(400, "Failed to save config (missing 'id' or storage disabled)")
+
+        else:
+            self.send_error(404)
+
+    def do_DELETE(self):
+        parsed = urllib.parse.urlparse(self.path)
+
+        if parsed.path.startswith("/blessed-configs/"):
+            # Delete a blessed config
+            config_id = parsed.path.split("/blessed-configs/")[1]
+            success = self.sidecar.remove_blessed_config(config_id)
+            if success:
+                self._send_json({"status": "deleted", "config_id": config_id})
+            else:
+                self.send_error(404, "Config not found or storage disabled")
         else:
             self.send_error(404)
 
@@ -1120,6 +1281,9 @@ def main():
                              "Should contain a 'latest' symlink to current run.")
     parser.add_argument("--discovery-reload-interval", type=float, default=300.0,
                         help="Seconds between discovery artifact reload checks (default: 300)")
+    parser.add_argument("--blessed-configs", type=str, default=None,
+                        help="JSON file path for blessed quantization configs storage. "
+                             "Enables /blessed-configs API endpoints.")
 
     args = parser.parse_args()
 
@@ -1141,6 +1305,7 @@ def main():
         db_path=args.db,
         discovery_dir=args.discovery_dir,
         discovery_reload_interval=args.discovery_reload_interval,
+        blessed_configs_path=args.blessed_configs,
     )
     sidecar.start()
 
@@ -1168,18 +1333,23 @@ def main():
     if args.discovery_dir:
         print(f"Discovery dir:    {args.discovery_dir}")
         print(f"Discovery reload: every {args.discovery_reload_interval}s")
+    if args.blessed_configs:
+        print(f"Blessed configs:  {args.blessed_configs}")
     print(f"{'='*60}")
     print(f"\nEndpoints:")
-    print(f"  GET  /centroids       - Current cluster centroids")
-    print(f"  GET  /stats           - Sidecar statistics")
-    print(f"  GET  /health          - Health check")
+    print(f"  GET  /centroids        - Current cluster centroids")
+    print(f"  GET  /stats            - Sidecar statistics")
+    print(f"  GET  /health           - Health check")
     print(f"  GET  /discovery/status - Discovery integration status")
-    print(f"  POST /fingerprint     - Submit fingerprint (stores + classifies)")
-    print(f"  POST /classify        - Classify fingerprint (read-only)")
-    print(f"  POST /predict         - Predict cluster for fingerprint")
-    print(f"  POST /recluster       - Force recluster")
+    print(f"  GET  /blessed-configs  - List blessed quantization configs")
+    print(f"  POST /fingerprint      - Submit fingerprint (stores + classifies)")
+    print(f"  POST /classify         - Classify fingerprint (read-only)")
+    print(f"  POST /predict          - Predict cluster for fingerprint")
+    print(f"  POST /recluster        - Force recluster")
     print(f"  POST /discovery/reload - Reload discovery artifacts")
     print(f"  POST /storage/flush    - Flush storage buffer to SQLite")
+    print(f"  POST /blessed-configs  - Add/update blessed config")
+    print(f"  DELETE /blessed-configs/:id - Remove blessed config")
     print(f"\nPress Ctrl+C to stop\n")
 
     try:
