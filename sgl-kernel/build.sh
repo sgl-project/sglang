@@ -48,10 +48,12 @@ echo "Buildx cache:   ${BUILDX_CACHE_DIR}"
 echo "Builder:        ${BUILDER_NAME}"
 echo "----------------------------------------"
 
-# Optional profiling build-args (empty string disables)
 BUILD_ARGS=()
+# Optional profiling build-args (empty string disables)
 [ -n "${ENABLE_CMAKE_PROFILE:-}" ] && BUILD_ARGS+=(--build-arg ENABLE_CMAKE_PROFILE="${ENABLE_CMAKE_PROFILE}")
 [ -n "${ENABLE_BUILD_PROFILE:-}" ] && BUILD_ARGS+=(--build-arg ENABLE_BUILD_PROFILE="${ENABLE_BUILD_PROFILE}")
+# Optional extra cmake build-args (empty string disables)
+[ -n "${CMAKE_EXTRA_ARGS:-}" ] && BUILD_ARGS+=(--build-arg CMAKE_EXTRA_ARGS="${CMAKE_EXTRA_ARGS}")
 
 docker buildx build \
   --builder "${BUILDER_NAME}" \
