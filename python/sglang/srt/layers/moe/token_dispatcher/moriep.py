@@ -216,8 +216,9 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         topk_weights,
         topk_ids,
     ):
-        #enable_fp8 = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
+        enable_fp8 = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
 
+        num_token = hidden_states.shape[0]
         scale = None
 
         if enable_fp8:
