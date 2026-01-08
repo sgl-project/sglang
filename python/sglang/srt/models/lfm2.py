@@ -24,6 +24,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_update,
 )
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -44,20 +45,22 @@ from sglang.srt.utils import add_prefix, make_layers
 logger = logging.getLogger(__name__)
 
 
-class Lfm2RMSNorm(nn.Module):
-    """LFM2-specific RMSNorm: weight * x (not (1 + weight) * x like Gemma)."""
+# We don't use it, we keep it for reference. If we run sglang.srt.layers.layernorm.RMSNorm 
+# kernel for some reason the difference in logporbs slighlty increases, but to an acceptable degree
+# class Lfm2RMSNorm(nn.Module):
+#     """LFM2-specific RMSNorm: weight * x (not (1 + weight) * x like Gemma)."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+#     def __init__(self, hidden_size: int, eps: float = 1e-6):
+#         super().__init__()
+#         self.weight = nn.Parameter(torch.ones(hidden_size))
+#         self.variance_epsilon = eps
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return (self.weight * hidden_states).to(input_dtype)
+#     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+#         input_dtype = hidden_states.dtype
+#         hidden_states = hidden_states.to(torch.float32)
+#         variance = hidden_states.pow(2).mean(-1, keepdim=True)
+#         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+#         return (self.weight * hidden_states).to(input_dtype)
 
 
 class Lfm2MLP(nn.Module):
@@ -165,8 +168,8 @@ class Lfm2Attention(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
-        self.q_layernorm = Lfm2RMSNorm(self.head_dim, eps=config.norm_eps)
-        self.k_layernorm = Lfm2RMSNorm(self.head_dim, eps=config.norm_eps)
+        self.q_layernorm = RMSNorm(self.head_dim, eps=config.norm_eps)
+        self.k_layernorm = RMSNorm(self.head_dim, eps=config.norm_eps)
 
         self.num_local_q_heads = self.qkv_proj.num_heads
         self.num_local_kv_heads = self.qkv_proj.num_kv_heads
@@ -318,8 +321,8 @@ class Lfm2DecoderLayer(nn.Module):
         self.layer_type = config.layer_types[layer_id]
         self.is_attention_layer = self.layer_type == "full_attention"
 
-        self.operator_norm = Lfm2RMSNorm(config.hidden_size, eps=config.norm_eps)
-        self.ffn_norm = Lfm2RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.operator_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
 
         if self.is_attention_layer:
             self.self_attn = Lfm2Attention(
@@ -410,7 +413,7 @@ class Lfm2Model(nn.Module):
         self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
-        self.embedding_norm = Lfm2RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.embedding_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
 
     def forward(
         self,
