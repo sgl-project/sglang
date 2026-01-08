@@ -9,7 +9,6 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
-        TestFile("test_beam_search_diff.py", 60),
         TestFile("test_deterministic.py", 228),
         TestFile("test_evs.py", 20),
         TestFile("test_external_models.py", 30),

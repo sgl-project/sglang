@@ -15,7 +15,11 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+
+register_cuda_ci(est_time=60, suite="per-commit-1-gpu")
+register_amd_ci(est_time=60, suite="per-commit-1-gpu-amd")
 
 
 class TestBeamSearchDiff(unittest.TestCase):
