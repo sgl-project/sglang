@@ -1,4 +1,5 @@
 #include <ATen/cuda/CUDAContext.h>
+
 #include <cmath>
 #include <flashinfer/vec_dtypes.cuh>
 #include <type_traits>
@@ -231,7 +232,6 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
     // If it fails, the kernel launch will error, so we provide a conservative default
     use_smem = (dynamicSmemSz < 100 * 1024);  // Conservative: disable if > 100KB
   }
-  
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
     if (use_warp_kernel) {
@@ -246,26 +246,29 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
         const size_t smem_size = USE_SMEM ? dynamicSmemSz : 0;
 
         if (use_vec16) {
-          per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 16, USE_SMEM><<<grid, block, smem_size, stream>>>(
-              static_cast<const scalar_t*>(input.data_ptr()),
-              static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-              static_cast<float*>(output_s.data_ptr()),
-              hidden_dim,
-              num_tokens);
+          per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 16, USE_SMEM>
+              <<<grid, block, smem_size, stream>>>(
+                  static_cast<const scalar_t*>(input.data_ptr()),
+                  static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+                  static_cast<float*>(output_s.data_ptr()),
+                  hidden_dim,
+                  num_tokens);
         } else if (use_vec8) {
-          per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 8, USE_SMEM><<<grid, block, smem_size, stream>>>(
-              static_cast<const scalar_t*>(input.data_ptr()),
-              static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-              static_cast<float*>(output_s.data_ptr()),
-              hidden_dim,
-              num_tokens);
+          per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 8, USE_SMEM>
+              <<<grid, block, smem_size, stream>>>(
+                  static_cast<const scalar_t*>(input.data_ptr()),
+                  static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+                  static_cast<float*>(output_s.data_ptr()),
+                  hidden_dim,
+                  num_tokens);
         } else {
-          per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 4, USE_SMEM><<<grid, block, smem_size, stream>>>(
-              static_cast<const scalar_t*>(input.data_ptr()),
-              static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-              static_cast<float*>(output_s.data_ptr()),
-              hidden_dim,
-              num_tokens);
+          per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 4, USE_SMEM>
+              <<<grid, block, smem_size, stream>>>(
+                  static_cast<const scalar_t*>(input.data_ptr()),
+                  static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+                  static_cast<float*>(output_s.data_ptr()),
+                  hidden_dim,
+                  num_tokens);
         }
       };
 

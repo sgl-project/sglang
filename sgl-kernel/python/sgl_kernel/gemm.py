@@ -159,6 +159,7 @@ def sgl_per_token_quant_fp8(
 ) -> None:
     torch.ops.sgl_kernel.sgl_per_token_quant_fp8.default(input, output_q, output_s)
 
+
 def cutlass_scaled_fp4_mm(
     a: torch.Tensor,
     b: torch.Tensor,
