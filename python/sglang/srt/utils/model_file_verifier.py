@@ -182,9 +182,9 @@ def _get_filename_and_info_from_hf_file(
 # ======== Compute Checksums ========
 
 
-def _compute_file_infos_from_folder(
+def _compute_manifest_from_folder(
     *, model_path: Path, filenames: List[str], max_workers: int
-) -> Dict[str, FileInfo]:
+) -> Manifest:
     from tqdm import tqdm
 
     def compute_one(filename: str) -> Tuple[str, Optional[FileInfo]]:
@@ -204,7 +204,7 @@ def _compute_file_infos_from_folder(
             )
         )
 
-    return {k: v for k, v in results if v is not None}
+    return Manifest(files={k: v for k, v in results if v is not None})
 
 
 def compute_sha256(*, file_path) -> str:
