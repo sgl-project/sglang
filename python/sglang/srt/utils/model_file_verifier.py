@@ -98,7 +98,7 @@ def verify(*, model_path: str, checksums_source: str, max_workers: int = 4) -> N
     actual_infos = _compute_file_infos_from_folder(
         model_path=model_path, filenames=list(expected.keys()), max_workers=max_workers
     )
-    actual = {k: v["sha256"] for k, v in actual_infos.items()}
+    actual = {k: v.sha256 for k, v in actual_infos.items()}
     _compare_checksums(expected=expected, actual=actual)
     print(f"[ModelFileVerifier] All {len(expected)} files verified successfully.")
 

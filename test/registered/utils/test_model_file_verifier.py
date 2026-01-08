@@ -112,11 +112,11 @@ class TestModelFileVerifier(_FakeModelTestCase):
             )
 
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        checksums = generate_checksums(
+        result = generate_checksums(
             source=self.test_dir, output_path=checksums_file, max_workers=4
         )
 
-        self.assertGreaterEqual(len(checksums), 10)
+        self.assertGreaterEqual(len(result.files), 10)
 
     def test_generated_json_snapshot(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
@@ -189,8 +189,8 @@ class TestModelFileVerifierCLI(_FakeModelTestCase):
 
         with open(checksums_file) as f:
             data = json.load(f)
-        self.assertIn("checksums", data)
-        self.assertEqual(len(data["checksums"]), 3)
+        self.assertIn("files", data)
+        self.assertEqual(len(data["files"]), 3)
 
     def test_cli_verify_success(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
@@ -249,12 +249,12 @@ class TestModelFileVerifierHF(_RealModelTestCase):
 
     def test_generate_checksums_from_hf(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        checksums = generate_checksums(source=MODEL_NAME, output_path=checksums_file)
+        result = generate_checksums(source=MODEL_NAME, output_path=checksums_file)
 
         self.assertTrue(os.path.exists(checksums_file))
-        self.assertGreater(len(checksums), 0)
-        for filename, sha256 in checksums.items():
-            self.assertEqual(len(sha256), 64)
+        self.assertGreater(len(result.files), 0)
+        for filename, file_info in result.files.items():
+            self.assertEqual(len(file_info.sha256), 64)
 
     def test_verify_with_hf_checksums_source(self):
         verify(model_path=self.test_dir, checksums_source=MODEL_NAME)
