@@ -5,7 +5,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
     LogProbs,
-    StreamOptions
+    StreamOptions,
 )
 
 logger = logging.getLogger(__name__)
