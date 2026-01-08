@@ -143,6 +143,10 @@ pub trait Worker: Send + Sync + fmt::Debug {
         self.url()
     }
 
+    fn metrics_url(&self) -> &str {
+        &self.metadata().metrics_url
+    }
+
     /// Get DP rank if this is a DP-aware worker
     fn dp_rank(&self) -> Option<usize> {
         None
@@ -478,6 +482,8 @@ impl Default for HealthConfig {
 pub struct WorkerMetadata {
     /// Worker URL
     pub url: String,
+    /// Metric URL
+    pub metrics_url: String,
     /// Worker type
     pub worker_type: WorkerType,
     /// Connection mode
@@ -1823,6 +1829,7 @@ mod tests {
     fn test_worker_metadata_empty_models_accepts_all() {
         let metadata = WorkerMetadata {
             url: "http://test:8080".to_string(),
+            metrics_url: "http://test:8080".to_string(),
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
             runtime_type: RuntimeType::default(),
@@ -1853,6 +1860,7 @@ mod tests {
 
         let metadata = WorkerMetadata {
             url: "http://test:8080".to_string(),
+            metrics_url: "http://test:8080".to_string(),
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
             runtime_type: RuntimeType::default(),

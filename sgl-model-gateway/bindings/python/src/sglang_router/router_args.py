@@ -30,6 +30,7 @@ class RouterArgs:
     decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
     worker_startup_timeout_secs: int = 1800
     worker_startup_check_interval: int = 30
+    worker_load_check_interval: int = 10
     cache_threshold: float = 0.3
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
@@ -39,6 +40,7 @@ class RouterArgs:
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
+    dp_minimum_tokens_scheduler: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
@@ -316,6 +318,11 @@ class RouterArgs:
             help="Enable data parallelism aware schedule",
         )
         routing_group.add_argument(
+            f"--{prefix}dp-minimum-tokens-scheduler",
+            action="store_true",
+            help="Enable minimum tokens scheduler for data parallel group",
+        )
+        routing_group.add_argument(
             f"--{prefix}enable-igw",
             action="store_true",
             help="Enable IGW (Inference-Gateway) mode for multi-model support",
@@ -358,6 +365,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.worker_startup_check_interval,
             help="Interval in seconds between checks for worker startup",
+        )
+        pd_group.add_argument(
+            f"--{prefix}worker-load-check-interval",
+            type=int,
+            default=RouterArgs.worker_load_check_interval,
+            help="Interval in seconds between checks for worker load",
         )
 
         # Logging configuration

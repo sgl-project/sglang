@@ -1,5 +1,6 @@
 use anyhow::ensure;
-use openmetrics_parser::{MetricFamily, MetricsExposition, PrometheusType, PrometheusValue};
+use openmetrics_parser::{MetricFamily, MetricsExposition, MetricNumber, PrometheusType, PrometheusValue};
+use std::collections::HashMap;
 use tracing::warn;
 
 #[derive(Debug)]
@@ -88,4 +89,74 @@ where
     };
 
     Ok(Some(it.try_fold(first, f)?))
+}
+
+pub fn extract_gauge_metrics(text: String, target_metric_family: &str) -> HashMap<isize, isize> {
+    let metrics_text = text.replace(":", "_");
+    let exposition = match openmetrics_parser::prometheus::parse_prometheus(&metrics_text) {
+        Ok(x) => x,
+        Err(err) => {
+            warn!(
+                "parse_load_response error when parsing text: pack={:?} err={:?}",
+                metrics_text, err
+            );
+            return HashMap::new();
+        }
+    };
+    extract_metrics(
+        &exposition,
+        target_metric_family,
+        &PrometheusValue::Gauge(MetricNumber::Float(0.0)))
+}
+
+pub fn extract_metrics(
+    exposition: &PrometheusExposition,
+    target_metric_family: &str,
+    target_value_type: &PrometheusValue
+) -> HashMap<isize, isize> {
+    let mut result = HashMap::new();
+    let Some(target_families) = exposition.families.get(target_metric_family) else {
+        warn!("{} don't exist!", target_metric_family);
+        return result;
+    };
+
+    for sample in target_families.iter_samples() {
+        let label_set = match sample.get_labelset() {
+            Ok(l_set) => l_set,
+            Err(e) => {
+                warn!("The metric is missing the dp_rank label{}, skipping.", e);
+                continue;
+            }
+        };
+
+        let dp_rank_str = match label_set.get_label_value("dp_rank") {
+            Some(val) => val,
+            None => {
+                warn!("Don't find dp_rank");
+                "0"
+            }
+        };
+
+        let dp_rank = match dp_rank_str.parse::<isize>() {
+            Ok(rank_num) => rank_num,
+            Err(e) => {
+                warn!("Failed to parse dp_rank value {} as number: {}", dp_rank_str, e);
+                0
+            }
+        };
+
+        let metric_value = match (&target_value_type, &sample.value) {
+            (PrometheusValue::Gauge(_), PrometheusValue::Gauge(val)) => {
+                val.as_f64()
+            }
+            (target_type, actual_type) => {
+                warn!("Unadapted PrometheusValue. Expected:{:?}, Actual:{:?}.", target_type, actual_type);
+                continue;
+            }
+        };
+
+        let value = metric_value as isize;
+        result.insert(dp_rank, value);
+    }
+    result
 }
