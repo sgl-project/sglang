@@ -78,8 +78,8 @@ if _is_cuda:
 
 
 if _is_npu:
-    import torch_npu
-    import sgl_kernel_npu
+    import torch_npu # noqa: F401
+    import sgl_kernel_npu # noqa: F401
 
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
