@@ -120,7 +120,9 @@ def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
     except Exception as e:
         raise IntegrityError(f"Failed to list files from HF repo {repo_id}: {e}")
 
-    checksums = dict(r for r in map(lambda f: _get_checksum_from_hf_file(fs, f), files) if r)
+    checksums = dict(
+        r for r in map(lambda f: _get_checksum_from_hf_file(fs, f), files) if r
+    )
     if not checksums:
         raise IntegrityError(f"No files found in HF repo {repo_id}.")
     return checksums
