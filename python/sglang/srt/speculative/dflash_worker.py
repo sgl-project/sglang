@@ -52,6 +52,11 @@ class DFlashWorker:
         self._logged_first_verify = False
 
         # Native (SGLang) draft runner (separate KV cache + attention backend).
+        # Share req_to_token_pool + token_to_kv_pool_allocator with the target worker (EAGLE3-style),
+        # while keeping a separate draft KV cache pool (the draft model has different KV values).
+        shared_req_to_token_pool, shared_token_to_kv_pool_allocator = (
+            target_worker.get_memory_pool()
+        )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_server_args.disable_cuda_graph = True
@@ -83,6 +88,8 @@ class DFlashWorker:
             dp_rank=dp_rank,
             nccl_port=nccl_port,
             is_draft_worker=True,
+            req_to_token_pool=shared_req_to_token_pool,
+            token_to_kv_pool_allocator=shared_token_to_kv_pool_allocator,
         )
         self.native_draft_model_runner = self.native_draft_worker.model_runner
         self.native_draft_model = self.native_draft_model_runner.model
@@ -104,33 +111,14 @@ class DFlashWorker:
         return getattr(self.target_worker, name)
 
     def clear_cache_pool(self):
-        if self.native_draft_model_runner is None:
-            return
-        self.native_draft_model_runner.req_to_token_pool.clear()
-        self.native_draft_model_runner.token_to_kv_pool_allocator.clear()
+        # allocator and req_to_token_pool are shared with target worker
+        pass
 
     def on_req_finished(self, req):
-        """Release native-draft KV cache for a finished request.
-
-        The native draft path uses a separate KV pool that is not managed by the
-        scheduler/tree-cache. We must explicitly free per-request draft KV slots
-        when the request completes to avoid leaking draft KV memory across
-        requests.
-        """
-        req_pool_idx = getattr(req, "req_pool_idx", None)
-        if req_pool_idx is None:
-            return
-        draft_len = getattr(req, "dflash_draft_seq_len", None)
-        if draft_len is None:
-            return
-        draft_len = int(draft_len)
-        if draft_len <= 0:
-            return
-        kv_indices = self.native_draft_model_runner.req_to_token_pool.req_to_token[
-            req_pool_idx, :draft_len
-        ]
-        self.native_draft_model_runner.token_to_kv_pool_allocator.free(kv_indices)
-        req.dflash_draft_seq_len = 0
+        # allocator and req_to_token_pool are shared with the target worker;
+        # there is no separate draft allocation to release here.
+        if hasattr(req, "dflash_draft_seq_len"):
+            req.dflash_draft_seq_len = 0
 
     def _resolve_mask_token_id(self) -> int:
         tokenizer = getattr(self.target_worker, "tokenizer", None)
@@ -223,35 +211,37 @@ class DFlashWorker:
 
         total_ctx = int(sum(int(x) for x in draft_input.ctx_lens_cpu))
         if total_ctx > 0:
-            ctx_start = torch.tensor(
-                draft_input.draft_seq_lens_cpu, dtype=torch.int64, device=device
-            )
-            ctx_len = torch.tensor(draft_input.ctx_lens_cpu, dtype=torch.int64, device=device)
-            ctx_end = ctx_start + ctx_len
+            req_to_token = self.native_draft_model_runner.req_to_token_pool.req_to_token
+            req_pool_indices_cpu = batch.req_pool_indices.tolist()
 
-            ctx_cache_loc = self.native_draft_model_runner.token_to_kv_pool_allocator.alloc(
-                total_ctx
-            )
-            if ctx_cache_loc is None:
-                raise RuntimeError(
-                    f"DFLASH native draft OOM when allocating {total_ctx} context tokens."
-                )
-
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
-                self.native_draft_model_runner.req_to_token_pool.req_to_token,
-                ctx_start,
-                ctx_end,
-                ctx_cache_loc,
-                bs,
-            )
-
+            ctx_cache_loc_chunks: List[torch.Tensor] = []
             ctx_positions_chunks: List[torch.Tensor] = []
-            for s, e in zip(ctx_start.tolist(), ctx_end.tolist(), strict=True):
-                if e > s:
-                    ctx_positions_chunks.append(
-                        torch.arange(s, e, device=device, dtype=torch.int64)
-                    )
+            new_draft_seq_lens_cpu: List[int] = []
+            for req_pool_idx, cache_len, ctx_len in zip(
+                req_pool_indices_cpu,
+                draft_input.draft_seq_lens_cpu,
+                draft_input.ctx_lens_cpu,
+                strict=True,
+            ):
+                cache_len_i = int(cache_len)
+                ctx_len_i = int(ctx_len)
+                new_draft_seq_lens_cpu.append(cache_len_i + ctx_len_i)
+                if ctx_len_i <= 0:
+                    continue
+                s = cache_len_i
+                e = cache_len_i + ctx_len_i
+                ctx_cache_loc_chunks.append(
+                    req_to_token[req_pool_idx, s:e].to(torch.int64)
+                )
+                ctx_positions_chunks.append(
+                    torch.arange(s, e, device=device, dtype=torch.int64)
+                )
+            ctx_cache_loc = (
+                torch.cat(ctx_cache_loc_chunks, dim=0)
+                if ctx_cache_loc_chunks
+                else torch.empty((0,), dtype=torch.int64, device=device)
+            )
+
             ctx_positions = (
                 torch.cat(ctx_positions_chunks, dim=0)
                 if ctx_positions_chunks
@@ -281,11 +271,7 @@ class DFlashWorker:
                         attn.attn.v_scale,
                     )
 
-            draft_input.draft_seq_lens_cpu = ctx_end.to(torch.int64).cpu().tolist()
-            for req, seq_len in zip(
-                batch.reqs, draft_input.draft_seq_lens_cpu, strict=True
-            ):
-                req.dflash_draft_seq_len = int(seq_len)
+            draft_input.draft_seq_lens_cpu = new_draft_seq_lens_cpu
             draft_input.ctx_lens_cpu = [0] * bs
             draft_input.target_hidden = draft_input.target_hidden[:0]
 
@@ -315,52 +301,55 @@ class DFlashWorker:
 
         block_start = prefix_lens.to(torch.int64)
         block_end = block_start + int(self.block_size)
-        block_cache_loc = self.native_draft_model_runner.token_to_kv_pool_allocator.alloc(
-            bs * self.block_size
-        )
-        if block_cache_loc is None:
-            raise RuntimeError(
-                f"DFLASH native draft OOM when allocating {bs * self.block_size} block tokens."
+        allocator = self.native_draft_model_runner.token_to_kv_pool_allocator
+        token_to_kv_pool_state_backup = allocator.backup_state()
+        try:
+            block_cache_loc = allocator.alloc(bs * self.block_size)
+            if block_cache_loc is None:
+                raise RuntimeError(
+                    f"DFLASH native draft OOM when allocating {bs * self.block_size} block tokens."
+                )
+
+            assign_req_to_token_pool_func(
+                batch.req_pool_indices,
+                self.native_draft_model_runner.req_to_token_pool.req_to_token,
+                block_start,
+                block_end,
+                block_cache_loc,
+                bs,
             )
 
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            self.native_draft_model_runner.req_to_token_pool.req_to_token,
-            block_start,
-            block_end,
-            block_cache_loc,
-            bs,
-        )
+            seq_lens = block_end.to(torch.int64)
+            forward_batch = ForwardBatch(
+                forward_mode=ForwardMode.EXTEND,
+                batch_size=bs,
+                input_ids=block_ids.flatten(),
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=seq_lens,
+                out_cache_loc=block_cache_loc,
+                seq_lens_sum=int(seq_lens.sum().item()),
+                seq_lens_cpu=torch.tensor(seq_lens.cpu().tolist(), dtype=torch.int64),
+                positions=positions,
+                extend_num_tokens=bs * self.block_size,
+                extend_seq_lens=extend_lens,
+                extend_prefix_lens=prefix_lens,
+                extend_start_loc=extend_start_loc,
+                extend_prefix_lens_cpu=prefix_lens_cpu,
+                extend_seq_lens_cpu=[int(self.block_size)] * bs,
+                extend_logprob_start_lens_cpu=[0] * bs,
+                req_to_token_pool=self.native_draft_model_runner.req_to_token_pool,
+                token_to_kv_pool=self.native_draft_model_runner.token_to_kv_pool,
+                attn_backend=self.native_draft_model_runner.attn_backend,
+                input_embeds=input_embeds,
+            )
 
-        seq_lens = block_end.to(torch.int64)
-        forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.EXTEND,
-            batch_size=bs,
-            input_ids=block_ids.flatten(),
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=seq_lens,
-            out_cache_loc=block_cache_loc,
-            seq_lens_sum=int(seq_lens.sum().item()),
-            seq_lens_cpu=torch.tensor(seq_lens.cpu().tolist(), dtype=torch.int64),
-            positions=positions,
-            extend_num_tokens=bs * self.block_size,
-            extend_seq_lens=extend_lens,
-            extend_prefix_lens=prefix_lens,
-            extend_start_loc=extend_start_loc,
-            extend_prefix_lens_cpu=prefix_lens_cpu,
-            extend_seq_lens_cpu=[int(self.block_size)] * bs,
-            extend_logprob_start_lens_cpu=[0] * bs,
-            req_to_token_pool=self.native_draft_model_runner.req_to_token_pool,
-            token_to_kv_pool=self.native_draft_model_runner.token_to_kv_pool,
-            attn_backend=self.native_draft_model_runner.attn_backend,
-            input_embeds=input_embeds,
-        )
-
-        with torch.inference_mode():
-            draft_hidden = self.native_draft_model_runner.forward(forward_batch).logits_output
-
-        # Crop: drop the speculative block from the draft KV cache (context stays).
-        self.native_draft_model_runner.token_to_kv_pool_allocator.free(block_cache_loc)
+            with torch.inference_mode():
+                draft_hidden = self.native_draft_model_runner.forward(
+                    forward_batch
+                ).logits_output
+        finally:
+            # Drop the speculative block from the shared allocator (EAGLE3-style).
+            allocator.restore_state(token_to_kv_pool_state_backup)
 
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
         draft_logits = F.linear(draft_hidden[:, 1:, :], head_weight)
