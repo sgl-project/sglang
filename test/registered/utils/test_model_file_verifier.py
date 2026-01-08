@@ -130,8 +130,10 @@ class TestModelFileVerifierWithRealModel(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def test_server_launch_with_checksum_intact(self):
+    def _run_server_test(self, corrupt_weights: bool):
         import requests
+        import subprocess
+        import sys
 
         from sglang.srt.utils import kill_process_tree
         from sglang.test.test_utils import (
@@ -143,67 +145,64 @@ class TestModelFileVerifierWithRealModel(unittest.TestCase):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
         generate_checksums(self.test_dir, checksums_file)
 
-        process = popen_launch_server(
-            self.test_dir,
-            DEFAULT_URL_FOR_TEST,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--model-checksum", checksums_file],
-        )
-        try:
-            response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/generate",
-                json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
+        if corrupt_weights:
+            safetensors_files = [
+                f for f in os.listdir(self.test_dir) if f.endswith(".safetensors")
+            ]
+            self.assertTrue(len(safetensors_files) > 0, "No safetensors files found")
+            target_file = os.path.join(self.test_dir, safetensors_files[0])
+            _flip_bit_in_file(target_file, byte_offset=1000, bit_position=5)
+
+        if corrupt_weights:
+            _, host, port = DEFAULT_URL_FOR_TEST.split(":")
+            host = host[2:]
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "sglang.launch_server",
+                    "--model-path",
+                    self.test_dir,
+                    "--host",
+                    host,
+                    "--port",
+                    port,
+                    "--model-checksum",
+                    checksums_file,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
             )
-            self.assertEqual(response.status_code, 200)
-            self.assertIn("text", response.json())
-        finally:
-            kill_process_tree(process.pid)
+            self.assertNotEqual(result.returncode, 0)
+            combined_output = result.stdout + result.stderr
+            self.assertTrue(
+                "IntegrityError" in combined_output
+                or "mismatch" in combined_output.lower(),
+                f"Expected integrity error, got: {combined_output[-500:]}",
+            )
+        else:
+            process = popen_launch_server(
+                self.test_dir,
+                DEFAULT_URL_FOR_TEST,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=["--model-checksum", checksums_file],
+            )
+            try:
+                response = requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/generate",
+                    json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("text", response.json())
+            finally:
+                kill_process_tree(process.pid)
+
+    def test_server_launch_with_checksum_intact(self):
+        self._run_server_test(corrupt_weights=False)
 
     def test_server_launch_fails_with_corrupted_weights(self):
-        import subprocess
-        import sys
-
-        from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
-
-        checksums_file = os.path.join(self.test_dir, "checksums.json")
-        generate_checksums(self.test_dir, checksums_file)
-
-        safetensors_files = [
-            f for f in os.listdir(self.test_dir) if f.endswith(".safetensors")
-        ]
-        self.assertTrue(len(safetensors_files) > 0, "No safetensors files found")
-        target_file = os.path.join(self.test_dir, safetensors_files[0])
-        _flip_bit_in_file(target_file, byte_offset=1000, bit_position=5)
-
-        _, host, port = DEFAULT_URL_FOR_TEST.split(":")
-        host = host[2:]
-
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.launch_server",
-                "--model-path",
-                self.test_dir,
-                "--host",
-                host,
-                "--port",
-                port,
-                "--model-checksum",
-                checksums_file,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-
-        self.assertNotEqual(result.returncode, 0)
-        combined_output = result.stdout + result.stderr
-        self.assertTrue(
-            "IntegrityError" in combined_output
-            or "mismatch" in combined_output.lower(),
-            f"Expected integrity error, got: {combined_output[-500:]}",
-        )
+        self._run_server_test(corrupt_weights=True)
 
 
 # ======== Test Utilities ========
