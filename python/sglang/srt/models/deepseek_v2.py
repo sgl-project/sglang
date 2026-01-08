@@ -3048,7 +3048,14 @@ class DeepseekV2Model(nn.Module):
             allocate_size = 0
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
-                    tp_size = get_tensor_model_parallel_world_size()
+                    tp_size = (
+                        1
+                        if get_moe_a2a_backend().is_deepep()
+                        or get_moe_a2a_backend().is_mooncake()
+                        or get_moe_a2a_backend().is_mori()
+                        or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                        else get_tensor_model_parallel_world_size()
+                    )
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts
                     )
