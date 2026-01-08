@@ -2967,8 +2967,10 @@ class ServerArgs:
         parser.add_argument(
             "--model-checksum",
             type=str,
-            default=ServerArgs.model_checksum,
-            help="Model file integrity verification. Can be a checksums.json file path or HuggingFace repo ID.",
+            nargs="?",
+            const="",
+            default=None,
+            help="Model file integrity verification. If specified without value, uses checksums.json in model-path. Can also be a checksums.json file path or HuggingFace repo ID.",
         )
         parser.add_argument(
             "--base-gpu-id",

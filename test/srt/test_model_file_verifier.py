@@ -10,7 +10,6 @@ from sglang.srt.utils.model_file_verifier import (
     compute_sha256,
 )
 
-
 # ======== Test Utilities ========
 
 
@@ -131,12 +130,15 @@ class TestModelFileVerifier(unittest.TestCase):
         result = compute_sha256(test_file)
 
         import hashlib
+
         expected = hashlib.sha256(content).hexdigest()
         self.assertEqual(result, expected)
 
     def test_parallel_checksum_computation(self):
         for i in range(10):
-            create_test_file(self.test_dir, f"shard_{i}.safetensors", f"content_{i}".encode() * 1000)
+            create_test_file(
+                self.test_dir, f"shard_{i}.safetensors", f"content_{i}".encode() * 1000
+            )
 
         verifier = ModelFileVerifier(self.test_dir, max_workers=4)
         checksums = verifier.generate_checksums()
@@ -159,16 +161,28 @@ class TestModelFileVerifierE2E(unittest.TestCase):
             create_test_file(test_dir, "config.json", b'{"test": true}')
 
             result = subprocess.run(
-                [sys.executable, "-m", "sglang.srt.utils.model_file_verifier",
-                 "generate", "--model-path", test_dir],
+                [
+                    sys.executable,
+                    "-m",
+                    "sglang.srt.utils.model_file_verifier",
+                    "generate",
+                    "--model-path",
+                    test_dir,
+                ],
                 capture_output=True,
                 text=True,
             )
             self.assertEqual(result.returncode, 0, f"Generate failed: {result.stderr}")
 
             result = subprocess.run(
-                [sys.executable, "-m", "sglang.srt.utils.model_file_verifier",
-                 "verify", "--model-path", test_dir],
+                [
+                    sys.executable,
+                    "-m",
+                    "sglang.srt.utils.model_file_verifier",
+                    "verify",
+                    "--model-path",
+                    test_dir,
+                ],
                 capture_output=True,
                 text=True,
             )
@@ -177,8 +191,14 @@ class TestModelFileVerifierE2E(unittest.TestCase):
             flip_bit_in_file(os.path.join(test_dir, "model.safetensors"))
 
             result = subprocess.run(
-                [sys.executable, "-m", "sglang.srt.utils.model_file_verifier",
-                 "verify", "--model-path", test_dir],
+                [
+                    sys.executable,
+                    "-m",
+                    "sglang.srt.utils.model_file_verifier",
+                    "verify",
+                    "--model-path",
+                    test_dir,
+                ],
                 capture_output=True,
                 text=True,
             )

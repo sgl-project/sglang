@@ -17,7 +17,6 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
-
 # ======== Exceptions ========
 
 
@@ -98,7 +97,9 @@ class ModelFileVerifier:
         with open(output, "w") as f:
             json.dump(checksums, f, indent=2, sort_keys=True)
 
-        print(f"[ModelFileVerifier] Generated checksums for {len(checksums)} files -> {output}")
+        print(
+            f"[ModelFileVerifier] Generated checksums for {len(checksums)} files -> {output}"
+        )
         return checksums
 
     def _load_expected_checksums(self) -> Dict[str, str]:
@@ -186,11 +187,15 @@ class ModelFileVerifier:
                 try:
                     name, checksum = future.result()
                     results[name] = checksum
-                    print(f"  [{len(results)}/{len(filenames)}] {name}: {checksum[:16]}...")
+                    print(
+                        f"  [{len(results)}/{len(filenames)}] {name}: {checksum[:16]}..."
+                    )
                 except FileNotFoundError:
                     pass
                 except Exception as e:
-                    raise IntegrityError(f"Failed to compute checksum for {filename}: {e}")
+                    raise IntegrityError(
+                        f"Failed to compute checksum for {filename}: {e}"
+                    )
 
         return results
 
@@ -215,18 +220,32 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    gen_parser = subparsers.add_parser("generate", help="Generate checksums.json for a model")
-    gen_parser.add_argument("--model-path", required=True, help="Path to model directory")
-    gen_parser.add_argument("--output", help="Output path (default: <model-path>/checksums.json)")
-    gen_parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers")
+    gen_parser = subparsers.add_parser(
+        "generate", help="Generate checksums.json for a model"
+    )
+    gen_parser.add_argument(
+        "--model-path", required=True, help="Path to model directory"
+    )
+    gen_parser.add_argument(
+        "--output", help="Output path (default: <model-path>/checksums.json)"
+    )
+    gen_parser.add_argument(
+        "--workers", type=int, default=4, help="Number of parallel workers"
+    )
 
-    verify_parser = subparsers.add_parser("verify", help="Verify model files against checksums")
-    verify_parser.add_argument("--model-path", required=True, help="Path to model directory")
+    verify_parser = subparsers.add_parser(
+        "verify", help="Verify model files against checksums"
+    )
+    verify_parser.add_argument(
+        "--model-path", required=True, help="Path to model directory"
+    )
     verify_parser.add_argument(
         "--checksums",
         help="Checksums source: JSON file path or HuggingFace repo ID (default: <model-path>/checksums.json)",
     )
-    verify_parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers")
+    verify_parser.add_argument(
+        "--workers", type=int, default=4, help="Number of parallel workers"
+    )
 
     args = parser.parse_args()
 

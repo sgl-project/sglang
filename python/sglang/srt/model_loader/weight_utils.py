@@ -45,7 +45,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_validate_and_cleanup_local_snapshot,
 )
 from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
-from sglang.srt.utils.model_file_verifier import IntegrityError, ModelFileVerifier
+from sglang.srt.utils.model_file_verifier import ModelFileVerifier
 from sglang.utils import is_in_ci
 
 try:

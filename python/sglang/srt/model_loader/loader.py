@@ -98,11 +98,11 @@ from sglang.srt.model_loader.weight_utils import (
     initialize_dummy_weights,
     multi_thread_pt_weights_iterator,
     multi_thread_safetensors_weights_iterator,
-    verify_model_files,
     np_cache_weights_iterator,
     pt_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
+    verify_model_files,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
