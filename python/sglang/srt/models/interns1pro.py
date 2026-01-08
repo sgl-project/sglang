@@ -166,12 +166,16 @@ class InternS1ProForConditionalGeneration(Qwen3VLMoeForConditionalGeneration):
             attn_tp_rank = attn_tp_rank // n_replicate
         loaded_weight = loaded_weight.chunk(attn_tp_size, dim=0)[attn_tp_rank]
 
-        # rotary_emb is shared cross layers
-        param_name = name.replace(".rotary_emb.", ".layers.0.self_attn.rotary_emb.")
-        assert param_name in params_dict
-        param = params_dict[param_name]
-        weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        weight_loader(param, loaded_weight)
+        # copy rotary_emb weights to decode layers
+        for layer_idx in range(self.config.num_hidden_layers):
+            param_name = name.replace(
+                ".rotary_emb.", f".layers.{layer_idx}.self_attn.rotary_emb."
+            )
+            if param_name not in params_dict:
+                continue
+            param = params_dict[param_name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """load weights"""
