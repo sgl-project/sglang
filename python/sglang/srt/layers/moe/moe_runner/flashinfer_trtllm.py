@@ -21,8 +21,12 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
-from sglang.srt.utils.common import is_sm120_supported, next_power_of_2
-from sglang.srt.utils.common import is_flashinfer_available
+from sglang.srt.utils.common import (
+    is_flashinfer_available,
+    is_sm120_supported,
+    next_power_of_2,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         StandardCombineInput,
