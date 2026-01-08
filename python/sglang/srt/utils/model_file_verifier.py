@@ -190,6 +190,8 @@ def _compute_checksums(
 
     def compute_one(filename: str) -> Tuple[str, str]:
         full_path = model_path / filename
+        if not full_path.exists():
+            return filename, None
         sha256 = compute_sha256(file_path=full_path)
         return filename, sha256
 
@@ -202,7 +204,7 @@ def _compute_checksums(
             )
         )
 
-    return dict(results)
+    return {k: v for k, v in results if v is not None}
 
 
 def compute_sha256(*, file_path) -> str:
