@@ -111,8 +111,7 @@ def _discover_files(model_path: str) -> List[str]:
 def _load_checksums(source: str) -> Dict[str, str]:
     if os.path.isfile(source):
         return _load_checksums_from_file(source)
-    else:
-        return _load_checksums_from_hf(source)
+    return _load_checksums_from_hf(source)
 
 
 def _load_checksums_from_file(path: str) -> Dict[str, str]:

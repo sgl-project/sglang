@@ -125,11 +125,7 @@ class TestModelFileVerifierWithRealModel(unittest.TestCase):
 
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
-        for item in os.listdir(self.original_model_path):
-            src = os.path.join(self.original_model_path, item)
-            dst = os.path.join(self.test_dir, item)
-            if os.path.isfile(src):
-                shutil.copy2(src, dst)
+        shutil.copytree(self.original_model_path, self.test_dir, dirs_exist_ok=True)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
