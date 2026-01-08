@@ -98,6 +98,7 @@ from sglang.srt.model_loader.weight_utils import (
     initialize_dummy_weights,
     multi_thread_pt_weights_iterator,
     multi_thread_safetensors_weights_iterator,
+    verify_model_files,
     np_cache_weights_iterator,
     pt_weights_iterator,
     safetensors_weights_iterator,
@@ -421,6 +422,9 @@ class DefaultModelLoader(BaseModelLoader):
             )
         else:
             hf_folder = model_name_or_path
+
+        if self.load_config.model_checksum:
+            verify_model_files(hf_folder, self.load_config.model_checksum)
 
         hf_weights_files: List[str] = []
         for pattern in allow_patterns:
