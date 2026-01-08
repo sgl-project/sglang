@@ -276,14 +276,7 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
         # Capture extend
-        # TODO: support draft extend cuda graph for more attention backends
-        if self.draft_extend_attn_backend and (
-            _is_npu
-            or (
-                _is_cuda
-                and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
-            )
-        ):
+        if self.draft_extend_attn_backend and (_is_cuda or _is_npu):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(

@@ -431,7 +431,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=False,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrappers)
-        elif forward_batch.forward_mode.is_draft_extend():
+        elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -612,7 +612,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             prefill_wrappers = []
             for i in range(self.num_wrappers):
                 prefill_wrappers.append(
@@ -709,7 +709,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
             )
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],

@@ -59,6 +59,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.speculative_num_draft_tokens = (
+            model_runner.server_args.speculative_num_draft_tokens
+        )
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
@@ -67,19 +70,26 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        print(
+            f"[EAGLE DraftExtend] capture_bs={self.capture_bs} compile_bs={self.compile_bs}"
+        )
         self.padded_static_len = -1
 
         # Attention backend
-        self.num_tokens_per_bs = self.speculative_num_steps + 1
+        if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
+            self.num_tokens_per_bs = self.speculative_num_draft_tokens
+        else:
+            self.num_tokens_per_bs = self.speculative_num_steps + 1
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        print(
+            f"[EAGLE DraftExtend] max_bs={self.max_bs} num_tokens_per_bs={self.num_tokens_per_bs} max_num_token={self.max_num_token}"
+        )
 
         self.eagle_worker.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
-        self.seq_len_fill_value = (
-            self.eagle_worker.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
-        )
+        self.seq_len_fill_value = self.eagle_worker.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
@@ -371,9 +381,14 @@ class EAGLEDraftExtendCudaGraphRunner:
         set_global_graph_memory_pool(graph.pool())
         return graph, out
 
-    def replay(self, forward_batch: ForwardBatch):
+    def replay_prepare(self, forward_batch: ForwardBatch):
+        """Prepare buffers and metadata for CUDA graph replay.
+
+        This method can be called on a separate stream (e.g., Plan Stream) to
+        overlap with other GPU work. After calling this, replay() should be
+        called with skip_prepare=True.
+        """
         assert forward_batch.out_cache_loc is not None
-        self.deepep_adapter.replay()
 
         # batch_size and num_seqs can be different in case there are finished examples
         # in the batch, which will not be counted as num_seqs
@@ -442,6 +457,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         if bs != raw_bs:
             forward_batch.spec_info.positions = self.positions[:num_tokens]
             forward_batch.spec_info.accept_length = self.accept_length[:bs]
+        elif self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
+            # For V2, accept_length is not passed in, so we use the captured one
+            forward_batch.spec_info.accept_length = self.accept_length[:bs]
 
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
@@ -455,18 +473,35 @@ class EAGLEDraftExtendCudaGraphRunner:
             seq_lens_cpu=self.seq_lens_cpu,
         )
 
-        # Replay
+        # Store state for replay()
         self.raw_bs = raw_bs
         self.bs = bs
+        self.num_tokens = num_tokens
+
+    def replay(self, forward_batch: ForwardBatch, skip_prepare: bool = False):
+        """Replay the captured CUDA graph.
+
+        Args:
+            forward_batch: The forward batch to replay.
+            skip_prepare: If True, assumes replay_prepare() was already called
+                         (e.g., on Plan Stream). If False, calls replay_prepare()
+                         internally (original behavior).
+        """
+        self.deepep_adapter.replay()
+
+        if not skip_prepare:
+            self.replay_prepare(forward_batch)
+
+        # Replay the graph
         self._replay(forward_batch)
-        out = self.output_buffers[bs]
+        out = self.output_buffers[self.bs]
 
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             # DRAFT_EXTEND_V2: all tokens calculations whether accepted or not.
-            unpadding_bs = num_tokens
-        elif bs != raw_bs:
-            forward_batch.spec_info.accept_length = self.accept_length[:raw_bs]
-            unpadding_bs = raw_bs
+            unpadding_bs = self.num_tokens
+        elif self.bs != self.raw_bs:
+            forward_batch.spec_info.accept_length = self.accept_length[: self.raw_bs]
+            unpadding_bs = self.raw_bs
         else:
             unpadding_bs = None
 
