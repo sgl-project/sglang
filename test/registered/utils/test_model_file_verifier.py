@@ -35,26 +35,6 @@ class TestModelFileVerifier(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def test_generate_checksums(self):
-        checksums_file = os.path.join(self.test_dir, "checksums.json")
-        checksums = generate_checksums(source=self.test_dir, output_path=checksums_file)
-
-        self.assertEqual(len(checksums), 3)
-        for filename in self.files:
-            self.assertIn(filename, checksums)
-            self.assertEqual(len(checksums[filename]), 64)
-
-        self.assertTrue(os.path.exists(checksums_file))
-
-        with open(checksums_file) as f:
-            saved = json.load(f)
-        self.assertEqual(saved["checksums"], checksums)
-
-    def test_verify_intact_files(self):
-        checksums_file = os.path.join(self.test_dir, "checksums.json")
-        generate_checksums(source=self.test_dir, output_path=checksums_file)
-        verify(model_path=self.test_dir, checksums_source=checksums_file)
-
     def test_detect_bit_rot(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
         generate_checksums(source=self.test_dir, output_path=checksums_file)
@@ -78,11 +58,6 @@ class TestModelFileVerifier(unittest.TestCase):
             verify(model_path=self.test_dir, checksums_source=checksums_file)
 
         self.assertIn("config.json", str(ctx.exception))
-
-    def test_verify_with_external_checksums_file(self):
-        external_checksums_path = os.path.join(self.test_dir, "external_checksums.json")
-        generate_checksums(source=self.test_dir, output_path=external_checksums_path)
-        verify(model_path=self.test_dir, checksums_source=external_checksums_path)
 
     def test_compute_sha256(self):
         test_file = os.path.join(self.test_dir, "test.bin")
@@ -109,6 +84,135 @@ class TestModelFileVerifier(unittest.TestCase):
         )
 
         self.assertGreaterEqual(len(checksums), 10)
+
+
+# ======== CLI Tests ========
+
+
+class TestModelFileVerifierCLI(unittest.TestCase):
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.files = {
+            "model.safetensors": b"fake safetensors content " * 100,
+            "config.json": b'{"model_type": "llama"}',
+        }
+        for filename, content in self.files.items():
+            _create_test_file(self.test_dir, filename, content)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_cli_generate(self):
+        checksums_file = os.path.join(self.test_dir, "checksums.json")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang.srt.utils.model_file_verifier",
+                "generate",
+                "--model-path",
+                self.test_dir,
+                "--model-checksum",
+                checksums_file,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
+        self.assertTrue(os.path.exists(checksums_file))
+
+        with open(checksums_file) as f:
+            data = json.load(f)
+        self.assertIn("checksums", data)
+        self.assertEqual(len(data["checksums"]), 2)
+
+    def test_cli_verify_success(self):
+        checksums_file = os.path.join(self.test_dir, "checksums.json")
+        generate_checksums(source=self.test_dir, output_path=checksums_file)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang.srt.utils.model_file_verifier",
+                "verify",
+                "--model-path",
+                self.test_dir,
+                "--model-checksum",
+                checksums_file,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
+        self.assertIn("verified successfully", result.stdout)
+
+    def test_cli_verify_fails_on_corruption(self):
+        checksums_file = os.path.join(self.test_dir, "checksums.json")
+        generate_checksums(source=self.test_dir, output_path=checksums_file)
+
+        target_file = os.path.join(self.test_dir, "model.safetensors")
+        _flip_bit_in_file(target_file, byte_offset=50, bit_position=3)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang.srt.utils.model_file_verifier",
+                "verify",
+                "--model-path",
+                self.test_dir,
+                "--model-checksum",
+                checksums_file,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertTrue(
+            "IntegrityError" in combined or "mismatch" in combined.lower(),
+            f"Expected integrity error, got: {combined}",
+        )
+
+
+# ======== HuggingFace Tests ========
+
+
+class TestModelFileVerifierHF(unittest.TestCase):
+
+    MODEL_NAME = "Qwen/Qwen3-0.6B"
+
+    @classmethod
+    def setUpClass(cls):
+        from huggingface_hub import snapshot_download
+
+        cls.original_model_path = snapshot_download(
+            cls.MODEL_NAME,
+            allow_patterns=["*.safetensors", "*.json"],
+        )
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        shutil.copytree(self.original_model_path, self.test_dir, dirs_exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_generate_checksums_from_hf(self):
+        checksums_file = os.path.join(self.test_dir, "checksums.json")
+        checksums = generate_checksums(
+            source=self.MODEL_NAME, output_path=checksums_file
+        )
+
+        self.assertTrue(os.path.exists(checksums_file))
+        self.assertGreater(len(checksums), 0)
+        for filename, sha256 in checksums.items():
+            self.assertEqual(len(sha256), 64)
+
+    def test_verify_with_hf_checksums_source(self):
+        verify(model_path=self.test_dir, checksums_source=self.MODEL_NAME)
 
 
 # ======== Real Model E2E Tests ========
