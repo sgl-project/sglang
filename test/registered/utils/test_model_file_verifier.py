@@ -274,6 +274,32 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
     def test_server_launch_fails_with_corrupted_weights(self):
         self._run_server_test(corrupt_weights=True)
 
+    def test_server_launch_with_model_checksum_flag_only(self):
+        import requests
+
+        from sglang.srt.utils import kill_process_tree
+        from sglang.test.test_utils import (
+            DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            DEFAULT_URL_FOR_TEST,
+            popen_launch_server,
+        )
+
+        process = popen_launch_server(
+            model=MODEL_NAME,
+            base_url=DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--model-checksum"],
+        )
+        try:
+            response = requests.post(
+                f"{DEFAULT_URL_FOR_TEST}/generate",
+                json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("text", response.json())
+        finally:
+            kill_process_tree(process.pid)
+
 
 # ======== Test Utilities ========
 
