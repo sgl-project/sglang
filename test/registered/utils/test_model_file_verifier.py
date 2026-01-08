@@ -16,24 +16,52 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 
+MODEL_NAME = "Qwen/Qwen3-0.6B"
 
-# ======== Unit Tests ========
+
+# ======== Base Test Classes ========
 
 
-class TestModelFileVerifier(unittest.TestCase):
+class _FakeModelTestCase(unittest.TestCase):
+
+    FAKE_FILES = {
+        "model.safetensors": b"fake safetensors content " * 100,
+        "config.json": b'{"model_type": "llama"}',
+        "tokenizer.json": b'{"version": "1.0"}',
+    }
 
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
-        self.files = {
-            "model.safetensors": b"fake safetensors content " * 100,
-            "config.json": b'{"model_type": "llama"}',
-            "tokenizer.json": b'{"version": "1.0"}',
-        }
-        for filename, content in self.files.items():
+        for filename, content in self.FAKE_FILES.items():
             _create_test_file(self.test_dir, filename, content)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class _RealModelTestCase(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        from huggingface_hub import snapshot_download
+
+        cls.original_model_path = snapshot_download(
+            MODEL_NAME,
+            allow_patterns=["*.safetensors", "*.json"],
+        )
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        shutil.copytree(self.original_model_path, self.test_dir, dirs_exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+# ======== Unit Tests ========
+
+
+class TestModelFileVerifier(_FakeModelTestCase):
 
     def test_detect_bit_rot(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
@@ -89,19 +117,7 @@ class TestModelFileVerifier(unittest.TestCase):
 # ======== CLI Tests ========
 
 
-class TestModelFileVerifierCLI(unittest.TestCase):
-
-    def setUp(self):
-        self.test_dir = tempfile.mkdtemp()
-        self.files = {
-            "model.safetensors": b"fake safetensors content " * 100,
-            "config.json": b'{"model_type": "llama"}',
-        }
-        for filename, content in self.files.items():
-            _create_test_file(self.test_dir, filename, content)
-
-    def tearDown(self):
-        shutil.rmtree(self.test_dir, ignore_errors=True)
+class TestModelFileVerifierCLI(_FakeModelTestCase):
 
     def test_cli_generate(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
@@ -125,7 +141,7 @@ class TestModelFileVerifierCLI(unittest.TestCase):
         with open(checksums_file) as f:
             data = json.load(f)
         self.assertIn("checksums", data)
-        self.assertEqual(len(data["checksums"]), 2)
+        self.assertEqual(len(data["checksums"]), 3)
 
     def test_cli_verify_success(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
@@ -180,31 +196,11 @@ class TestModelFileVerifierCLI(unittest.TestCase):
 # ======== HuggingFace Tests ========
 
 
-class TestModelFileVerifierHF(unittest.TestCase):
-
-    MODEL_NAME = "Qwen/Qwen3-0.6B"
-
-    @classmethod
-    def setUpClass(cls):
-        from huggingface_hub import snapshot_download
-
-        cls.original_model_path = snapshot_download(
-            cls.MODEL_NAME,
-            allow_patterns=["*.safetensors", "*.json"],
-        )
-
-    def setUp(self):
-        self.test_dir = tempfile.mkdtemp()
-        shutil.copytree(self.original_model_path, self.test_dir, dirs_exist_ok=True)
-
-    def tearDown(self):
-        shutil.rmtree(self.test_dir, ignore_errors=True)
+class TestModelFileVerifierHF(_RealModelTestCase):
 
     def test_generate_checksums_from_hf(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        checksums = generate_checksums(
-            source=self.MODEL_NAME, output_path=checksums_file
-        )
+        checksums = generate_checksums(source=MODEL_NAME, output_path=checksums_file)
 
         self.assertTrue(os.path.exists(checksums_file))
         self.assertGreater(len(checksums), 0)
@@ -212,31 +208,13 @@ class TestModelFileVerifierHF(unittest.TestCase):
             self.assertEqual(len(sha256), 64)
 
     def test_verify_with_hf_checksums_source(self):
-        verify(model_path=self.test_dir, checksums_source=self.MODEL_NAME)
+        verify(model_path=self.test_dir, checksums_source=MODEL_NAME)
 
 
 # ======== Real Model E2E Tests ========
 
 
-class TestModelFileVerifierWithRealModel(unittest.TestCase):
-
-    MODEL_NAME = "Qwen/Qwen3-0.6B"
-
-    @classmethod
-    def setUpClass(cls):
-        from huggingface_hub import snapshot_download
-
-        cls.original_model_path = snapshot_download(
-            cls.MODEL_NAME,
-            allow_patterns=["*.safetensors", "*.json"],
-        )
-
-    def setUp(self):
-        self.test_dir = tempfile.mkdtemp()
-        shutil.copytree(self.original_model_path, self.test_dir, dirs_exist_ok=True)
-
-    def tearDown(self):
-        shutil.rmtree(self.test_dir, ignore_errors=True)
+class TestModelFileVerifierWithRealModel(_RealModelTestCase):
 
     def _run_server_test(self, *, corrupt_weights: bool):
         import requests
