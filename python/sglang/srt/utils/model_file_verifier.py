@@ -106,8 +106,6 @@ def _load_checksums(source: str) -> Dict[str, str]:
 
 
 def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
-    import fnmatch
-
     try:
         from huggingface_hub import HfFileSystem
     except ImportError:
@@ -122,28 +120,31 @@ def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
     except Exception as e:
         raise IntegrityError(f"Failed to list files from HF repo {repo_id}: {e}")
 
-    def _get_checksum(file_info):
-        if file_info.get("type") != "file":
-            return None
-
-        filename = Path(file_info.get("name", "")).name
-        if any(fnmatch.fnmatch(filename, pat) for pat in IGNORE_PATTERNS):
-            return None
-
-        lfs_info = file_info.get("lfs")
-        if lfs_info and "sha256" in lfs_info:
-            return filename, lfs_info["sha256"]
-
-        if "sha256" in file_info:
-            return filename, file_info["sha256"]
-
-        content = fs.read_bytes(file_info.get("name", ""))
-        return filename, hashlib.sha256(content).hexdigest()
-
-    checksums = dict(r for r in map(_get_checksum, files) if r)
+    checksums = dict(r for r in map(lambda f: _get_checksum_from_hf_file(fs, f), files) if r)
     if not checksums:
         raise IntegrityError(f"No files found in HF repo {repo_id}.")
     return checksums
+
+
+def _get_checksum_from_hf_file(fs, file_info):
+    import fnmatch
+
+    if file_info.get("type") != "file":
+        return None
+
+    filename = Path(file_info.get("name", "")).name
+    if any(fnmatch.fnmatch(filename, pat) for pat in IGNORE_PATTERNS):
+        return None
+
+    lfs_info = file_info.get("lfs")
+    if lfs_info and "sha256" in lfs_info:
+        return filename, lfs_info["sha256"]
+
+    if "sha256" in file_info:
+        return filename, file_info["sha256"]
+
+    content = fs.read_bytes(file_info.get("name", ""))
+    return filename, hashlib.sha256(content).hexdigest()
 
 
 # ======== Compute Checksums ========
