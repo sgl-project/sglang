@@ -3,6 +3,7 @@ Model File Verifier - Verify model file integrity using SHA256 checksums.
 
 Standalone usage:
     python -m sglang.srt.utils.model_file_verifier generate --model-path /path/to/model --output checksums.json
+    python -m sglang.srt.utils.model_file_verifier generate --model-path Qwen/Qwen3-0.6B --output checksums.json
     python -m sglang.srt.utils.model_file_verifier verify --model-path /path/to/model --model-checksum checksums.json
 
 As a module:
@@ -67,15 +68,12 @@ def _compare_checksums(expected: Dict[str, str], actual: Dict[str, str]) -> None
 
 
 def generate_checksums(
-    model_path: str, output_path: str, max_workers: int = 4
+    source: str, output_path: str, max_workers: int = 4
 ) -> Dict[str, str]:
-    model_path = Path(model_path).resolve()
-    files = _discover_files(model_path)
-
-    if not files:
-        raise IntegrityError(f"No model files found in {model_path}")
-
-    checksums = _compute_checksums(model_path, files, max_workers)
+    if Path(source).is_dir():
+        checksums = _generate_checksums_from_local(source, max_workers)
+    else:
+        checksums = _load_checksums_from_hf(source)
 
     output = {"checksums": checksums}
     Path(output_path).write_text(json.dumps(output, indent=2, sort_keys=True))
@@ -84,6 +82,18 @@ def generate_checksums(
         f"[ModelFileVerifier] Generated checksums for {len(checksums)} files -> {output_path}"
     )
     return checksums
+
+
+def _generate_checksums_from_local(
+    model_path: str, max_workers: int
+) -> Dict[str, str]:
+    model_path = Path(model_path).resolve()
+    files = _discover_files(model_path)
+
+    if not files:
+        raise IntegrityError(f"No model files found in {model_path}")
+
+    return _compute_checksums(model_path, files, max_workers)
 
 
 def _discover_files(model_path: Path) -> List[str]:
@@ -143,7 +153,7 @@ def _load_checksums_from_hf(repo_id: str) -> Dict[str, str]:
     if files_without_checksum:
         raise IntegrityError(
             f"Files without SHA256 checksum in HF repo {repo_id}: {files_without_checksum}. "
-            "Generate a local checksums.json instead."
+            "Generate checksums from local directory instead."
         )
 
     return checksums
@@ -193,7 +203,7 @@ class IntegrityError(Exception):
 
 
 def _cli_generate(args):
-    generate_checksums(args.model_path, args.output, args.workers)
+    generate_checksums(args.source, args.output, args.workers)
 
 
 def _cli_verify(args):
@@ -210,13 +220,15 @@ def main():
         "generate", help="Generate checksums.json for a model"
     )
     gen_parser.add_argument(
-        "--model-path", required=True, help="Path to model directory"
+        "--source",
+        required=True,
+        help="Local model directory or HuggingFace repo ID",
     )
     gen_parser.add_argument(
         "--output", required=True, help="Output path for checksums.json"
     )
     gen_parser.add_argument(
-        "--workers", type=int, default=4, help="Number of parallel workers"
+        "--workers", type=int, default=4, help="Number of parallel workers (local only)"
     )
     gen_parser.set_defaults(func=_cli_generate)
 
