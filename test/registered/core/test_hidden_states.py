@@ -4,7 +4,10 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
+
+register_cuda_ci(est_time=55, suite="stage-b-test-small-1-gpu")
 
 
 class TestHiddenState(CustomTestCase):

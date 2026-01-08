@@ -3,7 +3,11 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=1, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestPrepareServerArgs(CustomTestCase):
