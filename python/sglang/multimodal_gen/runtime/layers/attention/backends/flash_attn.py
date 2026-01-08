@@ -201,23 +201,24 @@ class FlashAttentionImpl(AttentionImpl):
 
         if use_upstream:
             bsz, seqlen, nheads_q, d = q_shape
-            bsz_k, seqlen_k, nheads_k, d_k = k_shape
-            bsz_v, seqlen_v, nheads_v, d_v = v_shape
-            q_ = query.contiguous().reshape(bsz * seqlen, nheads_q, d)
-            k_ = key.contiguous().reshape(bsz * seqlen, nheads_k, d)
-            v_ = value.contiguous().reshape(bsz * seqlen, nheads_v, d)
-            cu = _get_cu_seqlens(q_.device.index, bsz, seqlen)
+            q_ = query.contiguous()
+            k_ = key.contiguous()
+            v_ = value.contiguous()
             out = flash_attn_varlen_func_upstream(
                 q_,
                 k_,
                 v_,
-                cu,
-                cu,
+                None,
+                None,
                 seqlen,
                 seqlen,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
+                return_attn_probs=return_softmax_lse,
             )
+            if return_softmax_lse:
+                out, softmax_lse = out
+                return out.reshape(bsz, seqlen, nheads_q, -1), softmax_lse
             return out.reshape(bsz, seqlen, nheads_q, d)
 
         output = flash_attn_func(
