@@ -157,6 +157,8 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                enable_reactive_eviction: _,
+                reactive_eviction_threshold,
             } => {
                 if !(0.0..=1.0).contains(cache_threshold) {
                     return Err(ConfigError::InvalidValue {
@@ -187,6 +189,13 @@ impl ConfigValidator {
                         field: "max_tree_size".to_string(),
                         value: max_tree_size.to_string(),
                         reason: "Must be > 0".to_string(),
+                    });
+                }
+                if *reactive_eviction_threshold < 1.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "reactive_eviction_threshold".to_string(),
+                        value: reactive_eviction_threshold.to_string(),
+                        reason: "Must be >= 1.0".to_string(),
                     });
                 }
             }
