@@ -21,6 +21,8 @@ from .constants import (
     DEFAULT_STARTUP_TIMEOUT,
     ENV_SHOW_WORKER_LOGS,
     HEALTH_CHECK_INTERVAL,
+    INITIAL_GRACE_PERIOD,
+    LAUNCH_STAGGER_DELAY,
     LOCAL_MODES,
     ConnectionMode,
     WorkerType,
@@ -253,7 +255,10 @@ class ModelInstance:
         except subprocess.TimeoutExpired:
             logger.warning("%s did not terminate, killing", self.key)
             self.process.kill()
-            self.process.wait()
+            try:
+                self.process.wait(timeout=5)  # Brief timeout after kill
+            except subprocess.TimeoutExpired:
+                logger.error("%s did not die after SIGKILL, abandoning", self.key)
 
 
 class ModelPool:
@@ -361,6 +366,7 @@ class ModelPool:
             logger.info("Detected InfiniBand device: %s", ib_device)
 
         deferred: list[str] = []
+        launched_count = 0
 
         # Process requirements in order - all workers treated uniformly
         for identity in valid_requirements:
@@ -395,6 +401,14 @@ class ModelPool:
             # Each prefill worker needs its own bootstrap port for PD communication
             bootstrap_port = get_open_port() if identity.is_prefill else None
 
+            # Stagger launches to avoid resource contention during model loading
+            if launched_count > 0 and LAUNCH_STAGGER_DELAY > 0:
+                logger.info(
+                    "Staggering launch by %ds to reduce resource contention",
+                    LAUNCH_STAGGER_DELAY,
+                )
+                time.sleep(LAUNCH_STAGGER_DELAY)
+
             # Launch the worker
             self._launch_model(
                 model_id=identity.model_id,
@@ -407,6 +421,7 @@ class ModelPool:
                 ),
                 instance_key=identity.key,
             )
+            launched_count += 1
 
         # Log deferred workers
         if deferred:
@@ -559,6 +574,14 @@ class ModelPool:
             self._startup_timeout,
         )
 
+        # Initial grace period to allow models to load before health checks
+        if INITIAL_GRACE_PERIOD > 0:
+            logger.info(
+                "Waiting %ds for initial model loading before health checks...",
+                INITIAL_GRACE_PERIOD,
+            )
+            time.sleep(INITIAL_GRACE_PERIOD)
+
         while pending and (time.time() - start_time) < self._startup_timeout:
             check_count += 1
             elapsed = time.time() - start_time
@@ -574,11 +597,31 @@ class ModelPool:
                         key,
                         instance.process.pid,
                     )
-                    # Read stderr for debugging
+                    # Read stderr for debugging (non-blocking to avoid hangs)
                     if instance.process.stderr:
-                        stderr = instance.process.stderr.read()
-                        if stderr:
-                            logger.error("Stderr: %s", stderr.decode()[-2000:])
+                        try:
+                            import os
+                            import select
+
+                            # Use select for non-blocking read with short timeout
+                            # to avoid hanging if child processes keep stderr open
+                            ready, _, _ = select.select(
+                                [instance.process.stderr], [], [], 0.5
+                            )
+                            if ready:
+                                # Use os.read with limited size instead of .read()
+                                # which reads until EOF and can block if pipe stays open
+                                fd = instance.process.stderr.fileno()
+                                stderr = os.read(fd, 65536)  # Read up to 64KB
+                                if stderr:
+                                    logger.error(
+                                        "Stderr: %s",
+                                        stderr.decode(errors="replace")[-2000:],
+                                    )
+                        except Exception as e:
+                            logger.warning("Could not read stderr: %s", e)
+                    # Evict dead instance and release GPUs
+                    self._evict_instance(key)
                     pending.discard(key)
                     continue
 
@@ -614,10 +657,35 @@ class ModelPool:
                 self._startup_timeout,
                 pending,
             )
-            # Terminate failed instances
+            # Log stderr from failed workers for debugging
             for key in pending:
-                self.instances[key].terminate()
-                del self.instances[key]
+                instance = self.instances.get(key)
+                if instance and instance.process.stderr:
+                    try:
+                        import os
+                        import select
+
+                        # Use select for non-blocking read with short timeout
+                        # to avoid hanging if worker is unresponsive
+                        ready, _, _ = select.select(
+                            [instance.process.stderr], [], [], 0.1
+                        )
+                        if ready:
+                            # Use os.read with limited size instead of .read()
+                            # which reads until EOF and can block if pipe stays open
+                            fd = instance.process.stderr.fileno()
+                            stderr = os.read(fd, 65536)  # Read up to 64KB
+                            if stderr:
+                                logger.error(
+                                    "[%s] Last stderr output:\n%s",
+                                    key,
+                                    stderr.decode(errors="replace")[-3000:],
+                                )
+                    except Exception as e:
+                        logger.error("[%s] Could not read stderr: %s", key, e)
+            # Terminate failed instances and release their GPUs
+            for key in pending:
+                self._evict_instance(key)
         else:
             elapsed = time.time() - start_time
             logger.info(

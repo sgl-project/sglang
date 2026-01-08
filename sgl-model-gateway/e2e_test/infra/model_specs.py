@@ -67,7 +67,7 @@ MODEL_SPECS: dict[str, dict] = {
     "qwen-30b": {
         "model": _resolve_model_path("Qwen/Qwen3-30B-A3B"),
         "memory_gb": 60,
-        "tp": 2,
+        "tp": 4,
         "features": ["chat", "streaming", "thinking", "reasoning"],
     },
     # Mistral for function calling
