@@ -217,6 +217,8 @@ class TestModelFileVerifierHF(_RealModelTestCase):
 class TestModelFileVerifierWithRealModel(_RealModelTestCase):
 
     def _run_server_test(self, *, corrupt_weights: bool):
+        from io import StringIO
+
         import requests
 
         from sglang.srt.utils import kill_process_tree
@@ -238,6 +240,8 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
             target_file = os.path.join(self.test_dir, safetensors_files[0])
             _flip_bit_in_file(target_file, byte_offset=1000, bit_position=5)
 
+        stdout_io, stderr_io = StringIO(), StringIO()
+
         if corrupt_weights:
             with self.assertRaises(PopenLaunchServerError) as ctx:
                 popen_launch_server(
@@ -245,6 +249,7 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
                     base_url=DEFAULT_URL_FOR_TEST,
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                     other_args=["--model-checksum", checksums_file],
+                    return_stdout_stderr=(stdout_io, stderr_io),
                 )
             self.assertTrue(
                 "IntegrityError" in ctx.exception.output

@@ -1,13 +1,13 @@
 """
 Model File Verifier - Verify model file integrity using SHA256 checksums.
 
-Standalone usage:
-    python -m sglang.srt.utils.model_file_verifier generate --model-path /path/to/model --model-checksum checksums.json
-    python -m sglang.srt.utils.model_file_verifier generate --model-path Qwen/Qwen3-0.6B --model-checksum checksums.json
-    python -m sglang.srt.utils.model_file_verifier verify --model-path /path/to/model --model-checksum checksums.json
+Example commands:
+    # Verify using HuggingFace model online metadata
+    python -m sglang.srt.utils.model_file_verifier verify --model-path /path/to/model --model-checksum Qwen/Qwen3-0.6B
 
-As a module:
-    from sglang.srt.utils.model_file_verifier import verify, generate_checksums
+    # Verify using locally generated checksum
+    python -m sglang.srt.utils.model_file_verifier generate --model-path <hf-id-or-model-path> --model-checksum checksums.json
+    python -m sglang.srt.utils.model_file_verifier verify --model-path /path/to/model --model-checksum checksums.json
 """
 
 import argparse

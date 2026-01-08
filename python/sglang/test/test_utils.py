@@ -690,9 +690,11 @@ def popen_launch_server(
         while time.perf_counter() - start_time < timeout:
             return_code = process.poll()
             if return_code is not None:
+                # Server failed to start (non-zero exit code) or crashed
                 stdout, stderr = _get_captured_output()
                 raise PopenLaunchServerError(
-                    f"Server process exited with code {return_code}.",
+                    f"Server process exited with code {return_code}. "
+                    "Check server logs for errors.",
                     stdout=stdout,
                     stderr=stderr,
                 )
@@ -716,7 +718,7 @@ def popen_launch_server(
             if return_code is not None:
                 stdout, stderr = _get_captured_output()
                 raise PopenLaunchServerError(
-                    f"Server unexpectedly exits ({return_code=}).",
+                    f"Server unexpectedly exits ({return_code=}). Usually there will be error logs describing the cause far above this line.",
                     stdout=stdout,
                     stderr=stderr,
                 )
