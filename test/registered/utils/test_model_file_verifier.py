@@ -23,7 +23,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    PopenLaunchServerError,
     popen_launch_server,
 )
 
@@ -240,7 +239,7 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
 
         stdout_io, stderr_io = StringIO(), StringIO()
         ctx = (
-            self.assertRaises(PopenLaunchServerError)
+            self.assertRaises(Exception)
             if corrupt_weights
             else nullcontext()
         )
@@ -254,8 +253,9 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
             )
 
         if corrupt_weights:
-            self.assertIn(corrupted_file, ctx.exception.output)
-            self.assertIn("mismatch", ctx.exception.output.lower())
+            stdout_text = stdout_io.getvalue()
+            self.assertIn(corrupted_file, stdout_text)
+            self.assertIn("mismatch", stdout_text.lower())
         else:
             try:
                 response = requests.post(
