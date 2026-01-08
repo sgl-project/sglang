@@ -423,12 +423,10 @@ class DefaultModelLoader(BaseModelLoader):
             hf_folder = model_name_or_path
 
         server_args = get_global_server_args()
-        if server_args and server_args.model_checksum is not None:
-            from sglang.srt.utils.model_file_verifier import ModelFileVerifier
+        if server_args and server_args.model_checksum:
+            from sglang.srt.utils.model_file_verifier import verify
 
-            checksums_source = server_args.model_checksum or None
-            verifier = ModelFileVerifier(hf_folder, checksums_source)
-            verifier.verify()
+            verify(hf_folder, server_args.model_checksum)
 
         hf_weights_files: List[str] = []
         for pattern in allow_patterns:

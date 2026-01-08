@@ -97,7 +97,7 @@ class TestModelFileVerifier(unittest.TestCase):
         with self.assertRaises(IntegrityError) as ctx:
             verifier.verify()
 
-        self.assertIn("No checksums found", str(ctx.exception))
+        self.assertIn("checksums_source is required", str(ctx.exception))
 
     def test_compute_sha256(self):
         test_file = os.path.join(self.test_dir, "test.bin")
