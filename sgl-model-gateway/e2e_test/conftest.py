@@ -1,5 +1,17 @@
 """Pytest configuration for E2E tests.
 
+Parallel Execution
+------------------
+Tests can run in parallel using pytest-parallel with shared worker processes.
+Use --workers 1 --tests-per-worker N for N concurrent test threads:
+
+    pytest --workers 1 --tests-per-worker 4 e2e_test/router/
+
+This leverages the thread-safe ModelPool and GPUAllocator classes to enable
+true shared-worker parallelism where all threads share the same session-scoped
+model_pool fixture. Tests marked with @pytest.mark.thread_unsafe will be
+automatically skipped in parallel mode.
+
 Markers
 -------
 This module defines several pytest markers for configuring E2E tests:
@@ -51,6 +63,18 @@ This module defines several pytest markers for configuring E2E tests:
 
 @pytest.mark.slow
     Mark test as slow-running.
+
+@pytest.mark.thread_unsafe(reason=None)
+    Mark test as incompatible with parallel thread execution.
+    Tests with this marker are automatically skipped when running
+    with --tests-per-worker > 1.
+
+    Args:
+        reason: Optional explanation of why the test is thread-unsafe.
+
+    Examples:
+        @pytest.mark.thread_unsafe
+        @pytest.mark.thread_unsafe(reason="Modifies global state")
 
 Fixtures
 --------
@@ -119,8 +143,15 @@ if not _wheel_installed and str(_SRC) not in sys.path:
 
 
 def _setup_logging() -> None:
-    """Configure clean logging to stdout with timestamps."""
-    fmt = "%(asctime)s.%(msecs)03d [%(name)s] %(message)s"
+    """Configure clean logging to stdout with timestamps and thread info.
+
+    In parallel mode (--tests-per-worker > 1), logs from different threads
+    would be interleaved. Including thread name helps identify which test
+    produced each log line.
+    """
+    # Include thread name for parallel execution readability
+    # MainThread for sequential, Thread-N for parallel workers
+    fmt = "%(asctime)s.%(msecs)03d [%(threadName)s] [%(name)s] %(message)s"
     datefmt = "%H:%M:%S"
 
     handler = logging.StreamHandler(sys.stdout)
@@ -148,11 +179,14 @@ logger = logging.getLogger(__name__)
 
 def pytest_runtest_logstart(nodeid: str, location: tuple) -> None:
     """Print clear test header at start of each test."""
+    import threading
+
     from infra import LOG_SEPARATOR_WIDTH
 
     test_name = nodeid.split("::")[-1] if "::" in nodeid else nodeid
+    thread_name = threading.current_thread().name
     print(f"\n{'=' * LOG_SEPARATOR_WIDTH}")
-    print(f"TEST: {test_name}")
+    print(f"[{thread_name}] TEST: {test_name}")
     print(f"{'=' * LOG_SEPARATOR_WIDTH}")
 
 
@@ -170,6 +204,7 @@ from fixtures import (
     pytest_collection_finish,
     pytest_collection_modifyitems,
     pytest_configure,
+    pytest_runtest_setup,
     setup_backend,
 )
 
@@ -180,6 +215,7 @@ __all__ = [
     "pytest_collection_modifyitems",
     "pytest_collection_finish",
     "pytest_configure",
+    "pytest_runtest_setup",
     # Fixtures
     "model_pool",
     "model_client",

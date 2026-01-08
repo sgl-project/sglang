@@ -46,6 +46,16 @@ MODEL_SPECS: dict[str, dict] = {
         "tp": 1,
         "features": ["chat", "streaming", "function_calling", "pythonic_tools"],
     },
+    # Function calling specialist (larger, for Response API tests)
+    "qwen-14b": {
+        "model": _resolve_model_path("Qwen/Qwen2.5-14B-Instruct"),
+        "memory_gb": 28,
+        "tp": 2,
+        "features": ["chat", "streaming", "function_calling", "pythonic_tools"],
+        "worker_args": [
+            "--context-length=1000"
+        ],  # Faster startup, prevents memory issues
+    },
     # Reasoning model
     "deepseek-7b": {
         "model": _resolve_model_path("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"),
@@ -121,3 +131,21 @@ DEFAULT_QWEN_FUNCTION_CALLING_MODEL_PATH = MODEL_SPECS["qwen-7b"]["model"]
 DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH = MODEL_SPECS["mistral-7b"]["model"]
 DEFAULT_GPT_OSS_MODEL_PATH = MODEL_SPECS["gpt-oss"]["model"]
 DEFAULT_EMBEDDING_MODEL_PATH = MODEL_SPECS["embedding"]["model"]
+
+
+# =============================================================================
+# Third-party model configurations (cloud APIs)
+# =============================================================================
+
+THIRD_PARTY_MODELS: dict[str, dict] = {
+    "openai": {
+        "description": "OpenAI API",
+        "model": "gpt-5-nano",
+        "api_key_env": "OPENAI_API_KEY",
+    },
+    "xai": {
+        "description": "xAI API",
+        "model": "grok-4-fast",
+        "api_key_env": "XAI_API_KEY",
+    },
+}

@@ -6,8 +6,10 @@ Workers are expensive to start (~30-60s each), so they're kept running across te
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
+import threading
 from typing import TYPE_CHECKING
 
 import pytest
@@ -19,8 +21,24 @@ from .hooks import get_pool_requirements
 
 logger = logging.getLogger(__name__)
 
-# Global model pool instance
+# Global model pool instance with thread-safe initialization
 _model_pool: "ModelPool | None" = None
+_model_pool_lock = threading.Lock()
+_shutdown_registered = False
+
+
+def _shutdown_model_pool() -> None:
+    """Shutdown the global model pool at process exit.
+
+    This is registered with atexit to ensure cleanup happens after all tests
+    complete, which is important for pytest-parallel where multiple threads
+    share the session-scoped fixture.
+    """
+    global _model_pool
+    if _model_pool is not None:
+        logger.info("Shutting down model pool at process exit")
+        _model_pool.shutdown()
+        _model_pool = None
 
 
 @pytest.fixture(scope="session")
@@ -65,81 +83,93 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
         WorkerType,
     )
 
-    if _model_pool is not None:
-        return _model_pool
+    # Thread-safe initialization: use lock to ensure only one thread creates the pool
+    # This is critical for pytest-parallel which runs tests as concurrent threads
+    with _model_pool_lock:
+        if _model_pool is not None:
+            return _model_pool
 
-    # Check if we should skip model startup
-    if os.environ.get(ENV_SKIP_MODEL_POOL, "").lower() in ("1", "true", "yes"):
-        logger.info("%s is set, skipping model pool startup", ENV_SKIP_MODEL_POOL)
-        _model_pool = ModelPool(GPUAllocator(gpus=[]))
-        return _model_pool
+        # Check if we should skip model startup
+        if os.environ.get(ENV_SKIP_MODEL_POOL, "").lower() in ("1", "true", "yes"):
+            logger.info("%s is set, skipping model pool startup", ENV_SKIP_MODEL_POOL)
+            _model_pool = ModelPool(GPUAllocator(gpus=[]))
+            return _model_pool
 
-    # Determine requirements from scanned tests or env vars
-    models_env = os.environ.get(ENV_MODELS, "")
-    backends_env = os.environ.get(ENV_BACKENDS, "")
+        # Determine requirements from scanned tests or env vars
+        models_env = os.environ.get(ENV_MODELS, "")
+        backends_env = os.environ.get(ENV_BACKENDS, "")
 
-    if models_env or backends_env:
-        # Use env var overrides
-        models = (
-            {m.strip() for m in models_env.split(",") if m.strip()}
-            if models_env
-            else {DEFAULT_MODEL}
+        if models_env or backends_env:
+            # Use env var overrides
+            models = (
+                {m.strip() for m in models_env.split(",") if m.strip()}
+                if models_env
+                else {DEFAULT_MODEL}
+            )
+
+            # Parse backend strings to ConnectionMode enums
+            backend_modes: set[ConnectionMode] = set()
+            if backends_env:
+                for b in backends_env.split(","):
+                    b = b.strip()
+                    if b:
+                        try:
+                            mode = ConnectionMode(b)
+                            if mode in LOCAL_MODES:
+                                backend_modes.add(mode)
+                        except ValueError:
+                            logger.warning("Unknown backend '%s', skipping", b)
+
+            # Default to HTTP if no valid backends
+            if not backend_modes:
+                backend_modes = {ConnectionMode.HTTP}
+
+            # Create WorkerIdentity objects (regular workers only from env vars)
+            requirements = [
+                WorkerIdentity(m, b, WorkerType.REGULAR, 0)
+                for m in models
+                for b in backend_modes
+            ]
+            logger.info(
+                "Using env var requirements: %s", [str(r) for r in requirements]
+            )
+        else:
+            # Use scanned requirements from test markers
+            requirements = get_pool_requirements()
+            logger.info(
+                "Using scanned requirements: %s", [str(r) for r in requirements]
+            )
+
+        # Filter to valid models
+        requirements = [r for r in requirements if r.model_id in MODEL_SPECS]
+
+        if not requirements:
+            logger.warning("No valid requirements, model pool will be empty")
+            _model_pool = ModelPool(GPUAllocator(gpus=[]))
+            return _model_pool
+
+        # Create and start the pool
+        allocator = GPUAllocator()
+        _model_pool = ModelPool(allocator)
+
+        startup_timeout = int(os.environ.get(ENV_STARTUP_TIMEOUT, "300"))
+        _model_pool.startup(
+            requirements=requirements,
+            startup_timeout=startup_timeout,
         )
 
-        # Parse backend strings to ConnectionMode enums
-        backend_modes: set[ConnectionMode] = set()
-        if backends_env:
-            for b in backends_env.split(","):
-                b = b.strip()
-                if b:
-                    try:
-                        mode = ConnectionMode(b)
-                        if mode in LOCAL_MODES:
-                            backend_modes.add(mode)
-                    except ValueError:
-                        logger.warning("Unknown backend '%s', skipping", b)
+        # Log final GPU allocation summary
+        logger.info(_model_pool.allocator.summary())
 
-        # Default to HTTP if no valid backends
-        if not backend_modes:
-            backend_modes = {ConnectionMode.HTTP}
+        # Register cleanup with atexit instead of request.addfinalizer
+        # This is critical for pytest-parallel where multiple threads share
+        # the session-scoped fixture - addfinalizer can fire too early
+        global _shutdown_registered
+        if not _shutdown_registered:
+            atexit.register(_shutdown_model_pool)
+            _shutdown_registered = True
 
-        # Create WorkerIdentity objects (regular workers only from env vars)
-        requirements = [
-            WorkerIdentity(m, b, WorkerType.REGULAR, 0)
-            for m in models
-            for b in backend_modes
-        ]
-        logger.info("Using env var requirements: %s", [str(r) for r in requirements])
-    else:
-        # Use scanned requirements from test markers
-        requirements = get_pool_requirements()
-        logger.info("Using scanned requirements: %s", [str(r) for r in requirements])
-
-    # Filter to valid models
-    requirements = [r for r in requirements if r.model_id in MODEL_SPECS]
-
-    if not requirements:
-        logger.warning("No valid requirements, model pool will be empty")
-        _model_pool = ModelPool(GPUAllocator(gpus=[]))
         return _model_pool
-
-    # Create and start the pool
-    allocator = GPUAllocator()
-    _model_pool = ModelPool(allocator)
-
-    startup_timeout = int(os.environ.get(ENV_STARTUP_TIMEOUT, "300"))
-    _model_pool.startup(
-        requirements=requirements,
-        startup_timeout=startup_timeout,
-    )
-
-    # Log final GPU allocation summary
-    logger.info(_model_pool.allocator.summary())
-
-    # Register cleanup
-    request.addfinalizer(_model_pool.shutdown)
-
-    return _model_pool
 
 
 @pytest.fixture
@@ -164,12 +194,10 @@ def model_client(request: pytest.FixtureRequest, model_pool: "ModelPool"):
     model_id = marker.args[0]
 
     try:
+        # get() auto-acquires the returned instance
         instance = model_pool.get(model_id)
     except KeyError:
         pytest.skip(f"Model {model_id} not available in model pool")
-
-    # Acquire reference to prevent eviction during test
-    instance.acquire()
 
     client = openai.OpenAI(
         base_url=f"{instance.base_url}/v1",
@@ -203,12 +231,10 @@ def model_base_url(request: pytest.FixtureRequest, model_pool: "ModelPool") -> s
     model_id = marker.args[0]
 
     try:
+        # get() auto-acquires the returned instance
         instance = model_pool.get(model_id)
     except KeyError:
         pytest.skip(f"Model {model_id} not available in model pool")
-
-    # Acquire reference to prevent eviction during test
-    instance.acquire()
 
     yield instance.base_url
 

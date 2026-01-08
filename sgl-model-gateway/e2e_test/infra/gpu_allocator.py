@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -200,6 +201,7 @@ class GPUAllocator:
         self.gpus = gpus if gpus is not None else self._detect_gpus()
         self.slots: list[GPUSlot] = []
         self._used_gpus: set[int] = set()  # Track GPUs used across all allocations
+        self._lock = threading.RLock()  # Protects slots and _used_gpus
 
     def _detect_gpus(self) -> list[GPUInfo]:
         """Auto-detect available GPUs via nvidia-ml-py (NVML)."""
@@ -261,6 +263,8 @@ class GPUAllocator:
         Note: This method tracks used GPUs across multiple calls, so subsequent
         allocations will use different GPUs than previous ones.
 
+        Thread-safe: Protected by internal lock.
+
         Args:
             model_specs: Dict of model_id -> spec dict with 'memory_gb' and 'tp' keys
             preserve_order: If True, allocate in dict order (test order) instead
@@ -269,6 +273,13 @@ class GPUAllocator:
         Returns:
             List of GPUSlots with assigned models (only the newly allocated slots)
         """
+        with self._lock:
+            return self._allocate_slots_unlocked(model_specs, preserve_order)
+
+    def _allocate_slots_unlocked(
+        self, model_specs: dict[str, dict], preserve_order: bool = False
+    ) -> list[GPUSlot]:
+        """Internal allocation logic. Caller must hold _lock."""
         if not self.gpus:
             logger.warning("No GPUs available for allocation")
             return []
@@ -362,23 +373,32 @@ class GPUAllocator:
         return new_slots
 
     def get_slot_for_model(self, model_id: str) -> GPUSlot | None:
-        """Get the slot assigned to a specific model."""
-        for slot in self.slots:
-            if slot.assigned_model == model_id:
-                return slot
-        return None
+        """Get the slot assigned to a specific model.
+
+        Thread-safe: Protected by internal lock.
+        """
+        with self._lock:
+            for slot in self.slots:
+                if slot.assigned_model == model_id:
+                    return slot
+            return None
 
     def release_gpus(self, gpu_ids: list[int]) -> None:
         """Release GPUs back to the available pool.
 
+        Thread-safe: Protected by internal lock.
+
         Args:
             gpu_ids: List of GPU IDs to release.
         """
-        for gpu_id in gpu_ids:
-            self._used_gpus.discard(gpu_id)
-        # Remove slots that used these GPUs
-        self.slots = [s for s in self.slots if not any(g in gpu_ids for g in s.gpu_ids)]
-        logger.info("Released GPUs %s, now used: %s", gpu_ids, self._used_gpus)
+        with self._lock:
+            for gpu_id in gpu_ids:
+                self._used_gpus.discard(gpu_id)
+            # Remove slots that used these GPUs
+            self.slots = [
+                s for s in self.slots if not any(g in gpu_ids for g in s.gpu_ids)
+            ]
+            logger.info("Released GPUs %s, now used: %s", gpu_ids, self._used_gpus)
 
     def release_slot(self, slot: GPUSlot) -> None:
         """Release a GPU slot back to the available pool.
@@ -391,20 +411,27 @@ class GPUAllocator:
     def available_gpus(self) -> list[int]:
         """Get list of available (unused) GPU IDs.
 
+        Thread-safe: Protected by internal lock.
+
         Returns:
             List of GPU IDs that are not currently allocated.
         """
-        return [g.id for g in self.gpus if g.id not in self._used_gpus]
+        with self._lock:
+            return [g.id for g in self.gpus if g.id not in self._used_gpus]
 
     def summary(self) -> str:
-        """Return a summary of GPU allocations."""
-        lines = ["GPU Allocation Summary:"]
-        lines.append(f"  Total GPUs: {len(self.gpus)}")
-        lines.append(f"  Used GPUs: {sorted(self._used_gpus)}")
-        lines.append(f"  Allocated Slots: {len(self.slots)}")
-        for slot in self.slots:
-            lines.append(
-                f"    - {slot.assigned_model}: GPUs {slot.gpu_ids} "
-                f"({slot.total_memory_gb:.1f}GB) port={slot.port}"
-            )
-        return "\n".join(lines)
+        """Return a summary of GPU allocations.
+
+        Thread-safe: Protected by internal lock.
+        """
+        with self._lock:
+            lines = ["GPU Allocation Summary:"]
+            lines.append(f"  Total GPUs: {len(self.gpus)}")
+            lines.append(f"  Used GPUs: {sorted(self._used_gpus)}")
+            lines.append(f"  Allocated Slots: {len(self.slots)}")
+            for slot in self.slots:
+                lines.append(
+                    f"    - {slot.assigned_model}: GPUs {slot.gpu_ids} "
+                    f"({slot.total_memory_gb:.1f}GB) port={slot.port}"
+                )
+            return "\n".join(lines)
