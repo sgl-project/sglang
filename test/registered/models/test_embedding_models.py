@@ -4,7 +4,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=73, suite="stage-b-test-small-1-gpu")
 register_amd_ci(
     est_time=73,
-    suite="stage-b-test-small-1-gpu",
+    suite="stage-b-test-small-1-gpu-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/11127",
 )
 

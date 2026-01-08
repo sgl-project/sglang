@@ -554,3 +554,42 @@ class Gateway:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.shutdown()
+
+
+def launch_cloud_gateway(
+    runtime: str,  # "openai" or "xai"
+    *,
+    history_backend: str = "memory",
+    extra_args: list[str] | None = None,
+    timeout: float = 60,
+    show_output: bool | None = None,
+) -> Gateway:
+    """Launch gateway with cloud API runtime.
+
+    Args:
+        runtime: Cloud runtime ("openai" or "xai")
+        history_backend: History storage backend ("memory" or "oracle")
+        extra_args: Additional router arguments
+        timeout: Startup timeout in seconds
+        show_output: Show subprocess output
+
+    Returns:
+        Gateway instance with running router
+    """
+    from .model_specs import THIRD_PARTY_MODELS
+
+    if runtime not in THIRD_PARTY_MODELS:
+        raise ValueError(
+            f"Unknown cloud runtime: {runtime}. "
+            f"Available: {list(THIRD_PARTY_MODELS.keys())}"
+        )
+
+    gateway = Gateway()
+    gateway.start(
+        cloud_backend=runtime,
+        history_backend=history_backend,
+        timeout=timeout,
+        show_output=show_output,
+        extra_args=extra_args,
+    )
+    return gateway

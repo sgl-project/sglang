@@ -1,7 +1,7 @@
 """
 Benchmark tests for HiCache Storage with Mooncake backend.
 Usage:
-    python3.10 -m pytest test/srt/hicache/test_hicache_storage_mooncake_backend.py -v
+    python3.10 -m pytest test/registered/hicache/test_hicache_storage_mooncake_backend.py -v
 """
 
 import os
@@ -12,12 +12,15 @@ import unittest
 import requests
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     find_available_port,
     is_in_ci,
 )
+
+register_cuda_ci(est_time=300, suite="stage-b-test-large-2-gpu")
 
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):

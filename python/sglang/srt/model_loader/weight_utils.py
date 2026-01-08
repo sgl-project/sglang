@@ -822,6 +822,26 @@ def multi_thread_safetensors_weights_iterator(
                 yield name, param
 
 
+def _load_pt_file(bin_file: str) -> dict:
+    """Load a PyTorch checkpoint file, handling legacy tar format.
+
+    PyTorch 2.6 changed the default of weights_only from False to True.
+    Legacy tar format files cannot be loaded with weights_only=True.
+    This function tries weights_only=True first, then falls back to False
+    for legacy tar format files from trusted sources (HuggingFace Hub).
+    """
+    try:
+        return torch.load(bin_file, map_location="cpu", weights_only=True)
+    except RuntimeError as e:
+        if "legacy .tar format" in str(e):
+            logger.warning(
+                "Loading %s with weights_only=False (legacy tar format)",
+                os.path.basename(bin_file),
+            )
+            return torch.load(bin_file, map_location="cpu", weights_only=False)
+        raise
+
+
 def pt_weights_iterator(
     hf_weights_files: List[str],
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
@@ -835,7 +855,7 @@ def pt_weights_iterator(
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
     ):
-        state = torch.load(bin_file, map_location="cpu", weights_only=True)
+        state = _load_pt_file(bin_file)
         yield from state.items()
         del state
 
@@ -849,12 +869,9 @@ def multi_thread_pt_weights_iterator(
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
-    def _load_file(bin_file: str):
-        return torch.load(bin_file, map_location="cpu", weights_only=True)
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(_load_file, bin_file) for bin_file in hf_weights_files
+            executor.submit(_load_pt_file, bin_file) for bin_file in hf_weights_files
         ]
 
         if enable_tqdm:

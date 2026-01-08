@@ -276,7 +276,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--hicache-size`                                | `0`             | Type: int                                                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--hicache-write-policy`                        | `write_through` | `write_back`,<br/> `write_through`,<br/> `write_through_selective` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--radix-eviction-policy`                       | `lru`           | `lru`, `lfu`                                                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--hicache-io-backend`                          | `kernel`        | `kernel_ascend`                                                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--hicache-io-backend`                          | `kernel`        | `kernel_ascend`,<br/>`direct`                                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--hicache-mem-layout`                          | `layer_first`   | `page_first_direct`,<br/> `page_first_kv_split`                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--hicache-storage-`<br/>`backend`              | `None`          | `file`                                                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | `--hicache-storage-`<br/>`prefetch-policy`      | `best_effort`   | `best_effort`,<br/> `wait_complete`,<br/> `timeout`                |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
@@ -432,15 +432,15 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## Custom weight loader
 
-| Argument                                                                | Defaults | Options                        |                    A2                    | A3                                       |
-|-------------------------------------------------------------------------|----------|--------------------------------|:----------------------------------------:|------------------------------------------|
-| `--custom-weight-loader`                                                | `None`   | List[str]                      |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
-| `--weight-loader-disable-`<br/>`mmap`                                   | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--remote-instance-weight-`<br/>`loader-seed-instance-ip`               | `None`   | Type: str                      |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
-| `--remote-instance-weight-`<br/>`loader-seed-instance-service-port`     | `None`   | Type: int                      |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
-| `--remote-instance-weight-`<br/>`loader-send-weights-group-ports`       | `None`   | Type: JSON<br/> list           |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
-| `--remote-instance-weight-`<br/>`loader-backend`                        | `nccl`   | Type: str                      |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
-| `--remote-instance-weight-`<br/>`loader-start-seed-via-transfer-engine` | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
+| Argument                                                                | Defaults | Options                         |                    A2                    | A3                                       |
+|-------------------------------------------------------------------------|----------|---------------------------------|:----------------------------------------:|------------------------------------------|
+| `--custom-weight-loader`                                                | `None`   | List[str]                       |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
+| `--weight-loader-disable-`<br/>`mmap`                                   | `False`  | bool flag<br/> (set to enable)  | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| `--remote-instance-weight-`<br/>`loader-seed-instance-ip`               | `None`   | Type: str                       |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
+| `--remote-instance-weight-`<br/>`loader-seed-instance-service-port`     | `None`   | Type: int                       |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
+| `--remote-instance-weight-`<br/>`loader-send-weights-group-ports`       | `None`   | Type: JSON<br/> list            |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
+| `--remote-instance-weight-`<br/>`loader-backend`                        | `nccl`   | `transfer_engine`, <br/> `nccl` |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
+| `--remote-instance-weight-`<br/>`loader-start-seed-via-transfer-engine` | `False`  | bool flag<br/> (set to enable)  |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
 
 ## For PD-Multiplexing
 

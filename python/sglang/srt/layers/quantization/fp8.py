@@ -562,6 +562,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert is_sm100_supported() or is_sm90_supported()
 
+    @staticmethod
+    def is_deepgemm_moe_runner_backend_enabled() -> bool:
+        """Check if MoE will actually use DeepGEMM runner for FP8."""
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_deep_gemm():
+            return True
+        if moe_runner_backend.is_auto():
+            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
+                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            )
+        return False
+
     def create_weights(
         self,
         layer: Module,
@@ -808,13 +823,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     should_deepgemm_weight_requant_ue8m0,
                 )
 
+                # Check if MoE will actually use DeepGEMM runner
+                will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
+
                 if (
                     should_deepgemm_weight_requant_ue8m0(
                         weight_block_size=getattr(
                             self.quant_config, "weight_block_size", None
                         ),
                     )
-                    and get_moe_runner_backend().is_deep_gemm()
+                    and will_use_deepgemm
                     and not layer.w13_weight_scale_inv.format_ue8m0
                 ):
                     assert isinstance(
@@ -1031,17 +1049,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-
-        from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
-            ):
+            if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON

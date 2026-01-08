@@ -445,7 +445,7 @@ def apply_qk_norm(
         q.is_cuda
         and allow_inplace
         and (q_eps == k_eps)
-        and can_use_fused_inplace_qknorm(head_dim)
+        and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
             q=q.view(batch_size, -1, head_dim),

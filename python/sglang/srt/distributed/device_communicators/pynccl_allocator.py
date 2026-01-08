@@ -65,7 +65,10 @@ _active_symmetric_memory_context = None
 
 
 def is_symmetric_memory_enabled():
-    return get_global_server_args().enable_symm_mem
+    try:
+        return get_global_server_args().enable_symm_mem
+    except ValueError:
+        return False
 
 
 def set_graph_pool_id(graph_pool_id):

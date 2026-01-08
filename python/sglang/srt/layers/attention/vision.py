@@ -825,7 +825,7 @@ class VisionAttention(nn.Module):
         # internvl
         if self.qk_normalization:
             # jit kernel
-            if can_use_jit_qk_norm(self.head_size):
+            if can_use_jit_qk_norm(self.head_size, q.dtype):
 
                 # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
                 head_dim_for_norm = head * self.head_size

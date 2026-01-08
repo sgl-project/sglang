@@ -8,7 +8,6 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
-import dataclasses
 import os
 
 import imageio
@@ -21,7 +20,6 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
-from sglang.multimodal_gen.utils import shallow_asdict
 
 logger = init_logger(__name__)
 
@@ -30,22 +28,13 @@ def prepare_request(
     server_args: ServerArgs,
     sampling_params: SamplingParams,
 ) -> Req:
-    params_dict = shallow_asdict(sampling_params)
-
-    diffusers_kwargs = params_dict.pop("diffusers_kwargs", None)
-    extra = params_dict.get("extra") or {}
+    """
+    Create a Req object with sampling_params as a parameter.
+    """
+    req = Req(sampling_params=sampling_params, VSA_sparsity=server_args.VSA_sparsity)
+    diffusers_kwargs = getattr(sampling_params, "diffusers_kwargs", None)
     if diffusers_kwargs:
-        extra["diffusers_kwargs"] = diffusers_kwargs
-        params_dict["extra"] = extra
-
-    # Filter to only fields that exist in Req
-    req_fields = {f.name for f in dataclasses.fields(Req)}
-    filtered_params = {k: v for k, v in params_dict.items() if k in req_fields}
-
-    req = Req(
-        **filtered_params,
-        VSA_sparsity=server_args.VSA_sparsity,
-    )
+        req.extra["diffusers_kwargs"] = diffusers_kwargs
 
     req.adjust_size(server_args)
 

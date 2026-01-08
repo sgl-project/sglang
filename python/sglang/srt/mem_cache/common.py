@@ -484,6 +484,14 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     tree_cache.cache_finished_req(req, is_insert=is_insert)
+
+    # MambaRadixCache may alloc mamba state before alloc KV cache
+    if req.req_pool_idx is None:
+        assert isinstance(
+            tree_cache, MambaRadixCache
+        ), "Only MambaRadixCache can handle abort with prefix cache hit before alloc"
+        return
+
     start_p, end_p = req.pop_overallocated_kv_cache()
 
     global_server_args = get_global_server_args()

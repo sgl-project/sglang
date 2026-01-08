@@ -44,6 +44,9 @@
 
 namespace host {
 
+template <typename>
+inline constexpr bool dependent_false_v = false;
+
 struct DebugInfo : public source_location_t {
   DebugInfo(source_location_t loc = source_location_t::current()) : source_location_t(loc) {}
 };

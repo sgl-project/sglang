@@ -780,6 +780,7 @@ class ChatCompletionStreamResponse(BaseModel):
 class MultimodalEmbeddingInput(BaseModel):
     text: Optional[str] = None
     image: Optional[str] = None
+    video: Optional[str] = None
 
 
 EmbeddingInput = Union[

@@ -252,6 +252,19 @@ class GPUWorker:
         self.pipeline.unmerge_lora_weights(target)
         return OutputBatch()
 
+    def list_loras(self) -> OutputBatch:
+        """
+        List loaded LoRA adapters and current application status per module.
+        """
+        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+            LoRAPipeline,
+        )
+
+        if not isinstance(self.pipeline, LoRAPipeline):
+            return OutputBatch(error="Lora is not enabled")
+        status = self.pipeline.get_lora_status()
+        return OutputBatch(output=status)
+
 
 def run_scheduler_process(
     local_rank: int,

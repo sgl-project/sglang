@@ -1,7 +1,7 @@
 """
 Benchmark tests for HiCache Storage with 3FS backend.
 Usage:
-    python3 -m pytest test/srt/hicache/test_hicache_storage_3fs_backend.py -v
+    python3 -m pytest test/registered/hicache/test_hicache_storage_3fs_backend.py -v
 """
 
 import json
@@ -10,7 +10,10 @@ import unittest
 
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
 
 
 class HiCacheStorage3FSBackendBaseMixin(HiCacheStorageBaseMixin):
