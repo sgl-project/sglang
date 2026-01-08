@@ -2123,9 +2123,15 @@ class ServerArgs:
                 or self.prefill_attention_backend == "trtllm_mha"
             ):
                 if self.speculative_eagle_topk > 1:
-                    raise ValueError(
-                        "trtllm_mha backend only supports topk = 1 for speculative decoding."
+                    logger.warning(
+                        f"trtllm_mha backend only supports topk = 1 for speculative decoding, but topk = {self.speculative_eagle_topk}. "
+                        "Switching to flashinfer backend."
                     )
+                    self.attention_backend = "flashinfer"
+                    if self.decode_attention_backend == "trtllm_mha":
+                        self.decode_attention_backend = "flashinfer"
+                    if self.prefill_attention_backend == "trtllm_mha":
+                        self.prefill_attention_backend = "flashinfer"
 
             if (
                 self.speculative_eagle_topk == 1
