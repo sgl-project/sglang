@@ -43,21 +43,27 @@ jobs:
             gh run list \
               --repo "$REPO" \
               --workflow "$workflow_file" \
-              --json databaseId,status,event,url \
+              --json databaseId,status,event,url,headBranch \
               --limit 1000 \
-              | jq -c '.[]
-                  | select((.status=="queued" or .status=="waiting" or .status=="in_progress") and .event=="pull_request")' \
+            | jq -c '.[]
+                | select(.event=="pull_request" and (.status=="queued" or .status=="waiting" or .status=="in_progress"))' \
             | while read -r run; do
                 run_id=$(echo "$run" | jq -r '.databaseId')
                 run_url=$(echo "$run" | jq -r '.url // empty')
+                head_branch=$(echo "$run" | jq -r '.headBranch // empty')
 
-                pr_number=$(gh api "repos/$REPO/actions/runs/$run_id" \
-                  --jq '.pull_requests[0].number // empty' 2>/dev/null || true)
+                # Parse PR number from headBranch like "123/merge" or "pull/123/merge" or "refs/pull/123/merge"
+                pr_number=$(echo "$head_branch" | sed -nE 's#^(refs/)?pull/([0-9]+)/merge$#\2#p')
+                if [ -z "$pr_number" ]; then
+                  pr_number=$(echo "$head_branch" | sed -nE 's#^([0-9]+)/merge$#\1#p')
+                fi
 
                 if [ -z "$pr_number" ]; then
-                  echo "⚠️ Run $run_id has no associated PR, skipping ($run_url)"
+                  echo "⚠️ Run $run_id not parseable as PR (headBranch='$head_branch'), skipping ($run_url)"
                   continue
                 fi
+
+                echo "Run $run_id is associated with PR #$pr_number (headBranch='$head_branch')"
 
                 labels=$(gh pr view "$pr_number" --repo "$REPO" --json labels \
                   | jq -r '.labels[].name' || true)
@@ -68,7 +74,6 @@ jobs:
                 fi
 
                 echo "🚫 Cancelling run $run_id (PR #$pr_number) $run_url"
-                gh run cancel "$run_id" --repo "$REPO" \
-                  || echo "⚠️ Could not cancel run $run_id"
+                gh run cancel "$run_id" --repo "$REPO" || echo "⚠️ Could not cancel run $run_id"
             done
           done
