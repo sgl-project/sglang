@@ -49,7 +49,9 @@ def _compare_checksums(*, expected: Dict[str, str], actual: Dict[str, str]) -> N
         if filename not in actual:
             errors.append(f"{filename}: missing")
         elif actual[filename] != expected_hash:
-            errors.append(f"{filename}: mismatch (expected={expected_hash[:16]}..., actual={actual[filename][:16]}...)")
+            errors.append(
+                f"{filename}: mismatch (expected={expected_hash[:16]}..., actual={actual[filename][:16]}...)"
+            )
 
     if errors:
         raise IntegrityError("Integrity check failed: " + "; ".join(errors))
@@ -85,8 +87,11 @@ def _discover_files(model_path: Path) -> List[str]:
     import fnmatch
 
     return sorted(
-        e.name for e in model_path.iterdir()
-        if e.is_file() and not e.name.startswith(".") and not any(fnmatch.fnmatch(e.name, p) for p in IGNORE_PATTERNS)
+        e.name
+        for e in model_path.iterdir()
+        if e.is_file()
+        and not e.name.startswith(".")
+        and not any(fnmatch.fnmatch(e.name, p) for p in IGNORE_PATTERNS)
     )
 
 
