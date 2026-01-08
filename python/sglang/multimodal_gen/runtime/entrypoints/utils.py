@@ -35,7 +35,7 @@ def prepare_request(
     diffusers_kwargs = getattr(sampling_params, "diffusers_kwargs", None)
     if diffusers_kwargs:
         req.extra["diffusers_kwargs"] = diffusers_kwargs
-        
+
     req.adjust_size(server_args)
 
     if (req.width is not None and req.width <= 0) or (
