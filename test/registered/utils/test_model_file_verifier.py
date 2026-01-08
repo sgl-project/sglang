@@ -238,11 +238,7 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
             _flip_bit_in_file(os.path.join(self.test_dir, corrupted_file))
 
         stdout_io, stderr_io = StringIO(), StringIO()
-        ctx = (
-            self.assertRaises(Exception)
-            if corrupt_weights
-            else nullcontext()
-        )
+        ctx = self.assertRaises(Exception) if corrupt_weights else nullcontext()
         with ctx:
             process = popen_launch_server(
                 model=self.test_dir,
@@ -253,9 +249,9 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
             )
 
         if corrupt_weights:
-            stdout_text = stdout_io.getvalue()
-            self.assertIn(corrupted_file, stdout_text)
-            self.assertIn("mismatch", stdout_text.lower())
+            output = stdout_io.getvalue() + stderr_io.getvalue()
+            self.assertIn(corrupted_file, output)
+            self.assertIn("mismatch", output.lower())
         else:
             try:
                 response = requests.post(
