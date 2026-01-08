@@ -20,6 +20,8 @@ import requests
 from openai import OpenAI
 from tqdm import tqdm
 
+from .constants import MAX_RETRY_ATTEMPTS
+
 logger = logging.getLogger(__name__)
 
 OPENAI_SYSTEM_MESSAGE_API = "You are a helpful assistant."
@@ -119,7 +121,6 @@ class ChatCompletionSampler(SamplerBase):
         image: str,
         encoding: str = "base64",
         format: str = "png",
-        fovea: int = 768,
     ):
         new_image = {
             "type": "image_url",
@@ -141,7 +142,7 @@ class ChatCompletionSampler(SamplerBase):
                 self._pack_message("system", self.system_message)
             ] + message_list
         trial = 0
-        while trial < 6:  # Max 63 seconds backoff (1+2+4+8+16+32)
+        while trial < MAX_RETRY_ATTEMPTS:
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
@@ -162,14 +163,15 @@ class ChatCompletionSampler(SamplerBase):
                 log_fn(
                     "Request failed (retry %d/%d, backoff %ds): %s",
                     trial + 1,
-                    6,
+                    MAX_RETRY_ATTEMPTS,
                     exception_backoff,
                     e,
                 )
                 time.sleep(exception_backoff)
                 trial += 1
         logger.warning(
-            "All retry attempts exhausted after 6 retries, returning empty response"
+            "All retry attempts exhausted after %d retries, returning empty response",
+            MAX_RETRY_ATTEMPTS,
         )
         return ""
 

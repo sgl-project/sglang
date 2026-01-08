@@ -58,3 +58,11 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_STARTUP_TIMEOUT = 300
 DEFAULT_ROUTER_TIMEOUT = 60
 HEALTH_CHECK_INTERVAL = 5
+
+# Retry configuration
+MAX_RETRY_ATTEMPTS = (
+    6  # Max retries with exponential backoff (total ~63s: 1+2+4+8+16+32)
+)
+
+# Display formatting
+LOG_SEPARATOR_WIDTH = 60  # Width for log separator lines (e.g., "="*60)
