@@ -46,6 +46,16 @@ MODEL_SPECS: dict[str, dict] = {
         "tp": 1,
         "features": ["chat", "streaming", "function_calling", "pythonic_tools"],
     },
+    # Function calling specialist (larger, for Response API tests)
+    "qwen-14b": {
+        "model": _resolve_model_path("Qwen/Qwen2.5-14B-Instruct"),
+        "memory_gb": 28,
+        "tp": 2,
+        "features": ["chat", "streaming", "function_calling", "pythonic_tools"],
+        "worker_args": [
+            "--context-length=1000"
+        ],  # Faster startup, prevents memory issues
+    },
     # Reasoning model
     "deepseek-7b": {
         "model": _resolve_model_path("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"),

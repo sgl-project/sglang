@@ -585,21 +585,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
     def init_routed_experts_capturer(self):
-        # TODO: the redundant logic with TpModelWorker
-        max_running_requests = min(
-            (
-                self.max_total_num_tokens // 2
-                if self.server_args.max_running_requests is None
-                else self.server_args.max_running_requests
-                // (
-                    self.server_args.dp_size
-                    if self.server_args.enable_dp_attention
-                    else 1
-                )
-            ),
-            self.req_to_token_pool.size,
-        )
-
         if not self.server_args.disable_shared_experts_fusion and hasattr(
             self.model, "num_fused_shared_experts"
         ):
@@ -613,7 +598,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
-                max_running_requests=max_running_requests,
+                max_running_requests=self.max_running_requests,
                 device=self.device,
             )
         )
