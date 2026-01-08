@@ -12,6 +12,8 @@
 # limitations under the License.
 # ==============================================================================
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe.fused_moe_triton.layer import get_moe_runner_backend
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -23,9 +25,6 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
-from sglang.srt.environ import envs
-from sglang.srt.layers.moe.fused_moe_triton.layer import get_moe_runner_backend
-from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()

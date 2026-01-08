@@ -124,6 +124,9 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
     AttnForwardMethod,
     DeepseekMHAForwardMixin,
 )
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    DeepseekV2WeightLoaderMixin,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _is_cpu,
@@ -134,9 +137,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_npu,
     _use_aiter,
     _use_aiter_gfx95,
-)
-from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
-    DeepseekV2WeightLoaderMixin,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
