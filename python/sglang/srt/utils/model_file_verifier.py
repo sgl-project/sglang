@@ -12,9 +12,8 @@ As a module:
 import argparse
 import hashlib
 import json
-import os
-import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 IGNORE_PATTERNS = [
@@ -28,7 +27,7 @@ IGNORE_PATTERNS = [
 
 
 def verify(model_path: str, checksums_source: str, max_workers: int = 4) -> None:
-    model_path = os.path.abspath(model_path)
+    model_path = Path(model_path).resolve()
     expected = _load_checksums(checksums_source)
 
     if not expected:
@@ -72,7 +71,7 @@ def verify(model_path: str, checksums_source: str, max_workers: int = 4) -> None
 def generate_checksums(
     model_path: str, output_path: str, max_workers: int = 4
 ) -> Dict[str, str]:
-    model_path = os.path.abspath(model_path)
+    model_path = Path(model_path).resolve()
     files = _discover_files(model_path)
 
     if not files:
@@ -80,8 +79,7 @@ def generate_checksums(
 
     checksums = _compute_checksums(model_path, files, max_workers)
 
-    with open(output_path, "w") as f:
-        json.dump(checksums, f, indent=2, sort_keys=True)
+    Path(output_path).write_text(json.dumps(checksums, indent=2, sort_keys=True))
 
     print(
         f"[ModelFileVerifier] Generated checksums for {len(checksums)} files -> {output_path}"
@@ -89,19 +87,18 @@ def generate_checksums(
     return checksums
 
 
-def _discover_files(model_path: str) -> List[str]:
+def _discover_files(model_path: Path) -> List[str]:
     import fnmatch
 
     files = []
-    for entry in os.listdir(model_path):
-        if entry.startswith("."):
+    for entry in model_path.iterdir():
+        if entry.name.startswith("."):
             continue
-        full_path = os.path.join(model_path, entry)
-        if not os.path.isfile(full_path):
+        if not entry.is_file():
             continue
-        if any(fnmatch.fnmatch(entry, pat) for pat in IGNORE_PATTERNS):
+        if any(fnmatch.fnmatch(entry.name, pat) for pat in IGNORE_PATTERNS):
             continue
-        files.append(entry)
+        files.append(entry.name)
     return sorted(files)
 
 
@@ -109,17 +106,9 @@ def _discover_files(model_path: str) -> List[str]:
 
 
 def _load_checksums(source: str) -> Dict[str, str]:
-    if os.path.isfile(source):
-        return _load_checksums_from_file(source)
+    if Path(source).is_file():
+        return json.loads(Path(source).read_text())
     return _load_checksums_from_hf(source)
-
-
-def _load_checksums_from_file(path: str) -> Dict[str, str]:
-    with open(path) as f:
-        data = json.load(f)
-    if isinstance(data, dict) and all(isinstance(v, str) for v in data.values()):
-        return data
-    raise IntegrityError(f"Invalid checksums file format: {path}")
 
 
 def _load_checksums_from_hf(repo_id: str) -> Dict[str, str]:
@@ -141,7 +130,7 @@ def _load_checksums_from_hf(repo_id: str) -> Dict[str, str]:
     for file_info in files:
         if file_info.get("type") != "file":
             continue
-        filename = os.path.basename(file_info.get("name", ""))
+        filename = Path(file_info.get("name", "")).name
         lfs_info = file_info.get("lfs")
         if lfs_info and "sha256" in lfs_info:
             checksums[filename] = lfs_info["sha256"]
@@ -161,14 +150,14 @@ def _load_checksums_from_hf(repo_id: str) -> Dict[str, str]:
 
 
 def _compute_checksums(
-    model_path: str, filenames: List[str], max_workers: int
+    model_path: Path, filenames: List[str], max_workers: int
 ) -> Dict[str, str]:
     from tqdm import tqdm
 
     results = {}
 
     def compute_one(filename: str) -> Tuple[str, str]:
-        full_path = os.path.join(model_path, filename)
+        full_path = model_path / filename
         sha256 = compute_sha256(full_path)
         return filename, sha256
 
@@ -189,7 +178,7 @@ def _compute_checksums(
     return results
 
 
-def compute_sha256(file_path: str) -> str:
+def compute_sha256(file_path: Path) -> str:
     sha256 = hashlib.sha256()
     with open(file_path, "rb") as f:
         while chunk := f.read(64 * 1024):
@@ -205,14 +194,6 @@ class IntegrityError(Exception):
 
 
 # ======== CLI ========
-
-
-def _cli_generate(args):
-    generate_checksums(args.model_path, args.output, args.workers)
-
-
-def _cli_verify(args):
-    verify(args.model_path, args.model_checksum, args.workers)
 
 
 def main():
@@ -233,7 +214,6 @@ def main():
     gen_parser.add_argument(
         "--workers", type=int, default=4, help="Number of parallel workers"
     )
-    gen_parser.set_defaults(func=_cli_generate)
 
     verify_parser = subparsers.add_parser(
         "verify", help="Verify model files against checksums"
@@ -249,10 +229,13 @@ def main():
     verify_parser.add_argument(
         "--workers", type=int, default=4, help="Number of parallel workers"
     )
-    verify_parser.set_defaults(func=_cli_verify)
 
     args = parser.parse_args()
-    args.func(args)
+
+    if args.command == "generate":
+        generate_checksums(args.model_path, args.output, args.workers)
+    elif args.command == "verify":
+        verify(args.model_path, args.model_checksum, args.workers)
 
 
 if __name__ == "__main__":
