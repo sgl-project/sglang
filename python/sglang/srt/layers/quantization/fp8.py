@@ -19,7 +19,10 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    enable_nextn_moe_sparse_fully_dp,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -577,7 +580,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = (
+            1
+            if enable_nextn_moe_sparse_fully_dp()
+            else get_tensor_model_parallel_world_size()
+        )
         if self.block_quant:
             block_n, block_k = (
                 self.quant_config.weight_block_size[0],

@@ -1198,16 +1198,20 @@ class ServerArgs:
                 ):
                     if envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get():
                         self.speculative_moe_runner_backend = "deep_gemm"
-                        self.speculative_moe_a2a_backend = "deepep"
+                        if self.speculative_moe_tp_size == 1:
+                            self.speculative_moe_a2a_backend = "none"
+                        else:
+                            self.speculative_moe_a2a_backend = "deepep"
                         logger.info(
                             "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
                         )
                     else:
-                        self.speculative_moe_runner_backend = "triton"
+                        if self.speculative_moe_runner_backend is None:
+                            logger.info(
+                                "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
+                            )
+                            self.speculative_moe_runner_backend = "triton"
                         self.speculative_moe_a2a_backend = "none"
-                        logger.info(
-                            "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
-                        )
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
