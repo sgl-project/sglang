@@ -494,6 +494,11 @@ class ModelPool:
             if ib_device:
                 cmd.extend(["--disaggregation-ib-device", ib_device])
 
+        # Additional worker args from model spec (e.g., --context-length)
+        worker_args = spec.get("worker_args", [])
+        if worker_args:
+            cmd.extend(worker_args)
+
         # Build key based on worker type (or use custom key)
         if instance_key:
             key = instance_key
