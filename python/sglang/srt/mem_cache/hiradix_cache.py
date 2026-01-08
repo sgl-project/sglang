@@ -160,9 +160,11 @@ class HiRadixCache(RadixCache):
                             extra_config = json.load(f)
                         elif ext == ".toml":
                             import tomllib
+                            
                             extra_config = tomllib.load(f)
                         elif ext in (".yaml", ".yml"):
                             import yaml
+                            
                             extra_config = yaml.safe_load(f)
                         else:
                             raise ValueError(
