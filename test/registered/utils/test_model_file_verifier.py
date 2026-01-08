@@ -221,9 +221,13 @@ class TestModelFileVerifierHF(_RealModelTestCase):
 
 class TestModelFileVerifierWithRealModel(_RealModelTestCase):
 
-    def _run_server_test(self, *, corrupt_weights: bool):
-        checksums_file = os.path.join(self.test_dir, "checksums.json")
-        generate_checksums(source=self.test_dir, output_path=checksums_file)
+    def _run_server_test(self, *, corrupt_weights: bool, use_hf_checksum: bool = False):
+        if use_hf_checksum:
+            checksum_arg = MODEL_NAME
+        else:
+            checksums_file = os.path.join(self.test_dir, "checksums.json")
+            generate_checksums(source=self.test_dir, output_path=checksums_file)
+            checksum_arg = checksums_file
 
         corrupted_file = None
         if corrupt_weights:
@@ -245,7 +249,7 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
                 model=self.test_dir,
                 base_url=DEFAULT_URL_FOR_TEST,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=["--model-checksum", checksums_file],
+                other_args=["--model-checksum", checksum_arg],
                 return_stdout_stderr=(stdout_io, stderr_io),
             )
 
@@ -269,57 +273,11 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
     def test_server_launch_fails_with_corrupted_weights(self):
         self._run_server_test(corrupt_weights=True)
 
-    def _run_server_test_with_hf_checksum(self, *, corrupt_weights: bool):
-        corrupted_file = None
-        if corrupt_weights:
-            safetensors_files = [
-                f for f in os.listdir(self.test_dir) if f.endswith(".safetensors")
-            ]
-            self.assertTrue(len(safetensors_files) > 0, "No safetensors files found")
-            corrupted_file = safetensors_files[0]
-            _flip_bit_in_file(os.path.join(self.test_dir, corrupted_file))
-
-        stdout_io, stderr_io = StringIO(), StringIO()
-        ctx = (
-            self.assertRaises(PopenLaunchServerError)
-            if corrupt_weights
-            else nullcontext()
-        )
-        with ctx as cm:
-            process = popen_launch_server(
-                model=self.test_dir,
-                base_url=DEFAULT_URL_FOR_TEST,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=["--model-checksum", MODEL_NAME],
-                return_stdout_stderr=(stdout_io, stderr_io),
-            )
-        if corrupt_weights:
-            self.assertIn(
-                corrupted_file,
-                cm.exception.output,
-                f"Expected {corrupted_file} in error",
-            )
-            self.assertIn(
-                "mismatch",
-                cm.exception.output.lower(),
-                f"Expected mismatch error: {cm.exception.output[-500:]}",
-            )
-        else:
-            try:
-                response = requests.post(
-                    f"{DEFAULT_URL_FOR_TEST}/generate",
-                    json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
-                )
-                self.assertEqual(response.status_code, 200)
-                self.assertIn("text", response.json())
-            finally:
-                kill_process_tree(process.pid)
-
     def test_server_launch_with_hf_checksum_intact(self):
-        self._run_server_test_with_hf_checksum(corrupt_weights=False)
+        self._run_server_test(corrupt_weights=False, use_hf_checksum=True)
 
     def test_server_launch_with_hf_checksum_corrupted(self):
-        self._run_server_test_with_hf_checksum(corrupt_weights=True)
+        self._run_server_test(corrupt_weights=True, use_hf_checksum=True)
 
 
 # ======== Test Utilities ========
