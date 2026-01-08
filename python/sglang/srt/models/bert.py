@@ -17,6 +17,7 @@ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 BertConfig = None
@@ -391,7 +392,10 @@ class BertModel(nn.Module):
 
         hidden_states = self.encoder(hidden_states, forward_batch=forward_batch)
 
-        if not self.use_bert_pooler:
+        if get_global_server_args().is_embedding:
+            hidden_states = hidden_states[0:1]
+            hidden_states = torch.nn.functional.normalize(hidden_states, p=2, dim=1)
+        elif not self.use_bert_pooler:
             hidden_states = self.pooler(hidden_states, forward_batch)
 
         return hidden_states
