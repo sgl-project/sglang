@@ -379,10 +379,19 @@ impl Tree {
         let mut remaining = text;
         let mut prev = Arc::clone(&self.root);
 
+        // Helper to carry instructions out of the match block to satisfy borrow checker
+        enum InsertStep {
+            Done,
+            Continue {
+                next_prev: NodeRef,
+                advance_chars: usize,
+            },
+        }
+
         while !remaining.is_empty() {
             let first_char = remaining.chars().next().unwrap();
 
-            match prev.children.entry(first_char) {
+            let step = match prev.children.entry(first_char) {
                 Entry::Vacant(entry) => {
                     let remaining_char_count = remaining.chars().count();
                     let epoch = get_epoch();
@@ -413,18 +422,21 @@ impl Tree {
                         .tenant_last_access_time
                         .insert(Arc::clone(&tenant_id), epoch);
                     entry.insert(new_node);
-                    return;
+                    InsertStep::Done
                 }
                 Entry::Occupied(mut entry) => {
                     let matched_node = entry.get().clone();
-                    let matched_node_text = matched_node.text.read().unwrap();
-                    let matched_node_text_count = matched_node_text.char_count();
-                    let shared_count = shared_prefix_count(remaining, matched_node_text.as_str());
+                    let (matched_node_text_count, matched_node_text_str) = {
+                        let text_guard = matched_node.text.read().unwrap();
+                        (text_guard.char_count(), text_guard.as_str().to_string())
+                    };
+                    let shared_count = shared_prefix_count(remaining, &matched_node_text_str);
 
                     if shared_count < matched_node_text_count {
-                        let (matched_text, contracted_text) =
-                            matched_node_text.split_at_char(shared_count);
-                        drop(matched_node_text);
+                        let (matched_text, contracted_text) = {
+                            let text_guard = matched_node.text.read().unwrap();
+                            text_guard.split_at_char(shared_count)
+                        };
 
                         let new_node = Arc::new(Node {
                             text: RwLock::new(matched_text),
@@ -466,10 +478,11 @@ impl Tree {
                                 .insert(Arc::clone(&tenant_id), 0);
                         }
 
-                        prev = new_node;
-                        remaining = advance_by_chars(remaining, shared_count);
+                        InsertStep::Continue {
+                            next_prev: new_node,
+                            advance_chars: shared_count,
+                        }
                     } else {
-                        drop(matched_node_text);
                         if !matched_node
                             .tenant_last_access_time
                             .contains_key(tenant_id.as_ref())
@@ -490,9 +503,22 @@ impl Tree {
                                 .tenant_last_access_time
                                 .insert(Arc::clone(&tenant_id), 0);
                         }
-                        prev = matched_node;
-                        remaining = advance_by_chars(remaining, shared_count);
+                        InsertStep::Continue {
+                            next_prev: matched_node,
+                            advance_chars: shared_count,
+                        }
                     }
+                }
+            };
+
+            match step {
+                InsertStep::Done => return,
+                InsertStep::Continue {
+                    next_prev,
+                    advance_chars,
+                } => {
+                    prev = next_prev;
+                    remaining = advance_by_chars(remaining, advance_chars);
                 }
             }
         }
