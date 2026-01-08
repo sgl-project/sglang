@@ -17,7 +17,7 @@ import dataclasses
 import logging
 import os
 import signal
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from typing import Dict, List, Union
 
 import psutil
@@ -174,6 +174,35 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # If it is embedding model, no detokenization is needed.
         return recv_obj
 
+    def _grouped_batch_decode(
+        self,
+        ids_list: list[list[int]],
+        skip_list: list[bool],
+        space_list: list[bool],
+    ) -> list[str]:
+        """Batch decode with grouping by (skip_special_tokens, spaces_between_special_tokens)."""
+
+        assert self.tokenizer is not None
+
+        # Group indices by (skip, space) tuple
+        groups: dict[tuple[bool, bool], list[tuple[int, list[int]]]] = defaultdict(list)
+        for idx, (ids, skip, space) in enumerate(zip(ids_list, skip_list, space_list)):
+            groups[(skip, space)].append((idx, ids))
+
+        # Decode each group and collect results
+        results: list[str] = [""] * len(ids_list)
+        for (skip, space), items in groups.items():
+            indices, grouped_ids = zip(*items)
+            decoded = self.tokenizer.batch_decode(
+                list(grouped_ids),
+                skip_special_tokens=skip,
+                spaces_between_special_tokens=space,
+            )
+            for idx, text in zip(indices, decoded):
+                results[idx] = text
+
+        return results
+
     def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
 
@@ -203,27 +232,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
 
         # Decode token ids to strings
-        # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
-        skip_uniform = len(set(recv_obj.skip_special_tokens)) == 1
-        space_uniform = len(set(recv_obj.spaces_between_special_tokens)) == 1
-        if not self.disable_tokenizer_batch_decode or not (
-            skip_uniform and space_uniform
-        ):
+        if not self.disable_tokenizer_batch_decode:
             if not self.is_dummy:
                 # Run normal batch decode
-                surr_texts = self.tokenizer.batch_decode(
+                surr_texts = self._grouped_batch_decode(
                     surr_ids,
-                    skip_special_tokens=recv_obj.skip_special_tokens[0],
-                    spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
-                        0
-                    ],
+                    recv_obj.skip_special_tokens,
+                    recv_obj.spaces_between_special_tokens,
                 )
-                read_texts = self.tokenizer.batch_decode(
+                read_texts = self._grouped_batch_decode(
                     read_ids,
-                    skip_special_tokens=recv_obj.skip_special_tokens[0],
-                    spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
-                        0
-                    ],
+                    recv_obj.skip_special_tokens,
+                    recv_obj.spaces_between_special_tokens,
                 )
             else:
                 # If it is dummy weights, just return dummy strings to prevent potential detokenization edge cases
