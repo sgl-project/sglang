@@ -350,43 +350,29 @@ def top_k_top_p_min_p_sampling_from_probs_ascend(
     need_min_p_sampling: bool,
 ):
     """A top-k, top-p and min-p sampling implementation for ascend npu with torch_npu interface."""
-    # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
-    if hasattr(torch_npu, "npu_top_k_top_p") and torch.all(
-        (top_ks <= 1024) & (top_ks >= 1)
-    ):
-        logits_top_k_top_p = torch_npu.npu_top_k_top_p(probs, top_ps, top_ks)
-        probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
+    probs = torch.softmax(probs, dim=-1)
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
 
-        if need_min_p_sampling:
-            min_p_thresholds = probs_top_k_top_p.max(dim=-1) * min_ps
-            min_p_mask = probs_top_k_top_p < min_p_thresholds.view(-1, 1)
-            probs_top_k_top_p.masked_fill_(min_p_mask, 0.0)
+    # when top_k is -1 (in which sglang turns it to TOP_K_ALL), make it explicitly equal to logit's size
+    topk_all_mask = top_ks == TOP_K_ALL
+    top_ks.masked_fill_(topk_all_mask, probs.shape[1])
+    top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
+        1, -1
+    ) >= top_ks.view(-1, 1)
+    probs_sort.masked_fill_(top_k_mask, 0.0)
 
-        batch_next_token_ids = torch.multinomial(probs_top_k_top_p, num_samples=1)
-    else:
-        probs = torch.softmax(probs, dim=-1)
-        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    top_p_mask = probs_sum - probs_sort > top_ps.view(-1, 1)
+    probs_sort.masked_fill_(top_p_mask, 0.0)
 
-        # when top_k is -1 (in which sglang turns it to TOP_K_ALL), make it explicitly equal to logit's size
-        topk_all_mask = top_ks == TOP_K_ALL
-        top_ks.masked_fill_(topk_all_mask, probs.shape[1])
-        top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
-            1, -1
-        ) >= top_ks.view(-1, 1)
-        probs_sort.masked_fill_(top_k_mask, 0.0)
+    if need_min_p_sampling:
+        min_p_thresholds = probs_sort[:, 0] * min_ps
+        min_p_mask = probs_sort < min_p_thresholds.view(-1, 1)
+        probs_sort.masked_fill_(min_p_mask, 0.0)
 
-        probs_sum = torch.cumsum(probs_sort, dim=-1)
-        top_p_mask = probs_sum - probs_sort > top_ps.view(-1, 1)
-        probs_sort.masked_fill_(top_p_mask, 0.0)
-
-        if need_min_p_sampling:
-            min_p_thresholds = probs_sort[:, 0] * min_ps
-            min_p_mask = probs_sort < min_p_thresholds.view(-1, 1)
-            probs_sort.masked_fill_(min_p_mask, 0.0)
-
-        sampled_index = torch.multinomial(probs_sort, num_samples=1)
-        probs_idx = probs_idx.to(torch.int32)
-        batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
+    sampled_index = torch.multinomial(probs_sort, num_samples=1)
+    probs_idx = probs_idx.to(torch.int32)
+    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
 
     return batch_next_token_ids.view(-1)
 
