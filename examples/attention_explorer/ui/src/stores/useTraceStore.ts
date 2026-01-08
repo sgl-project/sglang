@@ -11,7 +11,7 @@ import {
   detectSegments,
   computeSessionMetrics,
   extractFingerprint,
-  classifyManifold,
+  getManifoldZone,
 } from '../api/types';
 
 interface TraceState {
@@ -161,12 +161,14 @@ export const useTraceStore = create<TraceState>((set, get) => ({
       const newSteps = [...trace.steps];
       if (attention || moe) {
         const fp = attention ? extractFingerprint(attention) : undefined;
+        // Use getManifoldZone to prefer server-side zone (security fix)
+        const zone = attention ? getManifoldZone(attention) : undefined;
         const step: DecodeStep = {
           tokenIndex,
           attention,
           moe,
           fingerprint: fp || undefined,
-          manifoldZone: fp ? classifyManifold(fp) : undefined,
+          manifoldZone: zone !== 'unknown' ? zone : undefined,
         };
         newSteps.push(step);
       }
