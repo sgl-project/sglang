@@ -132,11 +132,6 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
         draft_model_path = os.getenv(
             "SGLANG_DFLASH_DRAFT_MODEL_PATH", "/tmp/Qwen3-8B-DFlash-bf16"
         )
-        if not os.path.isdir(draft_model_path):
-            self.skipTest(
-                f"Draft model folder not found: {draft_model_path}. "
-                "Set SGLANG_DFLASH_DRAFT_MODEL_PATH to run this benchmark."
-            )
 
         attention_backend = os.getenv("SGLANG_DFLASH_ATTENTION_BACKEND", "flashinfer")
         max_new_tokens = int(os.getenv("SGLANG_DFLASH_MAX_NEW_TOKENS", "2048"))
@@ -341,11 +336,6 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
         draft_model_path = os.getenv(
             "SGLANG_DFLASH_DRAFT_MODEL_PATH", "/tmp/Qwen3-8B-DFlash-bf16"
         )
-        if not os.path.isdir(draft_model_path):
-            self.skipTest(
-                f"Draft model folder not found: {draft_model_path}. "
-                "Set SGLANG_DFLASH_DRAFT_MODEL_PATH to run this benchmark."
-            )
 
         attention_backend = os.getenv("SGLANG_DFLASH_ATTENTION_BACKEND", "flashinfer")
         # Keep env var names for backwards compatibility with the previous parity test.
