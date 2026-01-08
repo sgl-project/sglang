@@ -254,7 +254,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             assert False, f"Unsupported {self.topk_transform_method = }"
 
 
-_NSA_IMPL_T: TypeAlias = Literal["flashmla_sparse", "flashmla_kv", "fa3", "tilelang"]
+_NSA_IMPL_T: TypeAlias = Literal["flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm_gen"]
 
 
 class NativeSparseAttnBackend(
@@ -318,11 +318,12 @@ class NativeSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
 
-        # Allocate global workspace buffer for TRTLLm ragged attention kernel (SM100/B200)
-        if self.device_sm_major >= 10:
+        # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm_gen decode)
+        # Use torch.zeros() for zero-initialization required by TRT-LLM Gen multi-block reduction
+        if self.device_sm_major >= 10 or self.nsa_decode_impl == "trtllm_gen":
             global global_workspace_buffer
             if global_workspace_buffer is None:
-                global_workspace_buffer = torch.empty(
+                global_workspace_buffer = torch.zeros(
                     envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                     dtype=torch.uint8,
                     device=model_runner.device,
@@ -1454,6 +1455,17 @@ class NativeSparseAttnBackend(
                 bs=forward_batch.batch_size,
             )
 
+        elif self.nsa_decode_impl == "trtllm_gen":
+            if q_rope is not None:
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_trtllm_gen(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                metadata=metadata,
+                sm_scale=layer.scaling,
+            )
+
         else:
             assert False, f"Unsupported {self.nsa_decode_impl = }"
 
@@ -1712,6 +1724,40 @@ class NativeSparseAttnBackend(
         )
         # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
         return o
+
+    def _forward_trtllm_gen(                                                                                                         
+        self,                                                                                                                        
+        q_all: torch.Tensor,                                                                                                         
+        kv_cache: torch.Tensor,                                                                                                      
+        page_table_1: torch.Tensor,                                                                                                  
+        metadata: NSAMetadata,                                                                                                       
+        sm_scale: float,                                                                                                                                                                                                                        
+    ) -> torch.Tensor:                                                                                                               
+        """Forward using TRT-LLM Gen sparse MLA kernel."""                                                                           
+        import flashinfer.decode
+        batch_size = page_table_1.shape[0]
+        _, num_heads, head_dim = q_all.shape
+
+        q = q_all.view(batch_size, 1, num_heads, head_dim)
+        kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
+        block_tables = page_table_1.unsqueeze(1)
+
+        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=q,
+            kv_cache=kv,
+            workspace_buffer=self.workspace_buffer,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=block_tables,
+            seq_lens=metadata.cache_seqlens_int32,
+            max_seq_len=metadata.max_seq_len_k,
+            sparse_mla_top_k=self.nsa_index_topk,
+            bmm1_scale=sm_scale,
+            backend="trtllm-gen",
+        )
+        # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
+        return out.squeeze(1)
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
