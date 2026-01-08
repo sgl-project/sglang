@@ -131,7 +131,7 @@ def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
 
     fs = HfFileSystem()
     checksums = {}
-    files_without_checksum = []
+    files_to_download = []
 
     try:
         files = fs.ls(repo_id, detail=True)
@@ -142,19 +142,24 @@ def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
         if file_info.get("type") != "file":
             continue
         filename = Path(file_info.get("name", "")).name
+        full_path = file_info.get("name", "")
         lfs_info = file_info.get("lfs")
         if lfs_info and "sha256" in lfs_info:
             checksums[filename] = lfs_info["sha256"]
         elif "sha256" in file_info:
             checksums[filename] = file_info["sha256"]
         else:
-            files_without_checksum.append(filename)
+            files_to_download.append((filename, full_path))
 
-    if files_without_checksum:
-        raise IntegrityError(
-            f"Files without SHA256 checksum in HF repo {repo_id}: {files_without_checksum}. "
-            "Generate checksums from local directory instead."
-        )
+    for filename, full_path in files_to_download:
+        try:
+            content = fs.read_bytes(full_path)
+            checksums[filename] = hashlib.sha256(content).hexdigest()
+        except Exception as e:
+            raise IntegrityError(f"Failed to download {filename} from HF: {e}")
+
+    if not checksums:
+        raise IntegrityError(f"No files found in HF repo {repo_id}.")
 
     return checksums
 

@@ -562,7 +562,7 @@ def popen_with_error_check(command: list[str], allow_exit: bool = False):
     return process
 
 
-class PopenLaunchServerError(TimeoutError):
+class PopenLaunchServerError(Exception):
     def __init__(self, message: str, stdout: str = None, stderr: str = None):
         super().__init__(message)
         self.stdout = stdout or ""
