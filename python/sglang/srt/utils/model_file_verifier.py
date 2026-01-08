@@ -59,7 +59,6 @@ class ChecksumFile:
 
 
 IGNORE_PATTERNS = [
-    "checksums.json",
     ".DS_Store",
     "*.lock",
     ".gitattributes",
@@ -78,11 +77,12 @@ def verify(*, model_path: str, checksums_source: str, max_workers: int = 4) -> N
     model_path = Path(model_path).resolve()
     expected = _load_checksums(checksums_source)
     actual_infos = _compute_file_infos_from_folder(
-        model_path=model_path, filenames=list(expected.keys()), max_workers=max_workers
+        model_path=model_path, filenames=list(expected.files.keys()), max_workers=max_workers
     )
-    actual = {k: v.sha256 for k, v in actual_infos.items()}
-    _compare_checksums(expected=expected, actual=actual)
-    print(f"[ModelFileVerifier] All {len(expected)} files verified successfully.")
+    expected_dict = {k: v.sha256 for k, v in expected.files.items()}
+    actual_dict = {k: v.sha256 for k, v in actual_infos.items()}
+    _compare_checksums(expected=expected_dict, actual=actual_dict)
+    print(f"[ModelFileVerifier] All {len(expected.files)} files verified successfully.")
 
 
 def _compare_checksums(*, expected: Dict[str, str], actual: Dict[str, str]) -> None:
