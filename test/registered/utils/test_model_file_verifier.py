@@ -291,6 +291,9 @@ def _create_test_file(directory: str, filename: str, content: bytes) -> str:
 
 
 def _flip_bit_in_file(file_path: str, byte_offset: int = 100, bit_position: int = 0):
+    file_size = os.path.getsize(file_path)
+    assert byte_offset < file_size, f"byte_offset {byte_offset} >= file_size {file_size}"
+
     with open(file_path, "r+b") as f:
         f.seek(byte_offset)
         original_byte = f.read(1)[0]
