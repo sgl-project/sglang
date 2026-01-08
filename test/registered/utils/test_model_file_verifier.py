@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -5,7 +6,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
+from io import StringIO
 
+import requests
+from huggingface_hub import snapshot_download
+
+from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.model_file_verifier import (
     IntegrityError,
     compute_sha256,
@@ -13,6 +20,12 @@ from sglang.srt.utils.model_file_verifier import (
     verify,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    PopenLaunchServerError,
+    popen_launch_server,
+)
 
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 
@@ -43,8 +56,6 @@ class _RealModelTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from huggingface_hub import snapshot_download
-
         cls.original_model_path = snapshot_download(MODEL_NAME)
 
     def setUp(self):
@@ -91,9 +102,6 @@ class TestModelFileVerifier(_FakeModelTestCase):
             f.write(content)
 
         result = compute_sha256(file_path=test_file)
-
-        import hashlib
-
         expected = hashlib.sha256(content).hexdigest()
         self.assertEqual(result, expected)
 
@@ -214,19 +222,6 @@ class TestModelFileVerifierHF(_RealModelTestCase):
 class TestModelFileVerifierWithRealModel(_RealModelTestCase):
 
     def _run_server_test(self, *, corrupt_weights: bool):
-        from contextlib import nullcontext
-        from io import StringIO
-
-        import requests
-
-        from sglang.srt.utils import kill_process_tree
-        from sglang.test.test_utils import (
-            DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            DEFAULT_URL_FOR_TEST,
-            PopenLaunchServerError,
-            popen_launch_server,
-        )
-
         checksums_file = os.path.join(self.test_dir, "checksums.json")
         generate_checksums(source=self.test_dir, output_path=checksums_file)
 
@@ -275,19 +270,6 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
         self._run_server_test(corrupt_weights=True)
 
     def _run_server_test_with_hf_checksum(self, *, corrupt_weights: bool):
-        from contextlib import nullcontext
-        from io import StringIO
-
-        import requests
-
-        from sglang.srt.utils import kill_process_tree
-        from sglang.test.test_utils import (
-            DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            DEFAULT_URL_FOR_TEST,
-            PopenLaunchServerError,
-            popen_launch_server,
-        )
-
         corrupted_file = None
         if corrupt_weights:
             safetensors_files = [
