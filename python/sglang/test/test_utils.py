@@ -562,6 +562,17 @@ def popen_with_error_check(command: list[str], allow_exit: bool = False):
     return process
 
 
+class PopenLaunchServerError(TimeoutError):
+    def __init__(self, message: str, stdout: str = "", stderr: str = ""):
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
+
+    @property
+    def output(self) -> str:
+        return self.stdout + self.stderr
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -579,10 +590,14 @@ def popen_launch_server(
     Args:
         device: Device type ("auto", "cuda", "rocm" or "cpu").
                 If "auto", will detect available platforms automatically.
+
+    Raises:
+        PopenLaunchServerError: If server fails to start, with stdout/stderr attached.
     """
+    from io import StringIO
+
     other_args = other_args or []
 
-    # Auto-detect device if needed
     if device == "auto":
         device = auto_config_device()
         other_args = list(other_args)
@@ -607,78 +622,59 @@ def popen_launch_server(
     ]
 
     if pd_separated or use_mixed_pd_engine:
-        command.extend(
-            [
-                "--lb-host",
-                host,
-                "--lb-port",
-                port,
-            ]
-        )
+        command.extend(["--lb-host", host, "--lb-port", port])
     else:
-        command.extend(
-            [
-                "--host",
-                host,
-                "--port",
-                port,
-            ]
-        )
+        command.extend(["--host", host, "--port", port])
 
     if use_mixed_pd_engine:
-        command.extend(
-            [
-                "--mixed",
-                "--num-replicas",
-                str(num_replicas),
-            ]
-        )
+        command.extend(["--mixed", "--num-replicas", str(num_replicas)])
 
     if api_key:
         command += ["--api-key", api_key]
 
     print(f"command={shlex.join(command)}")
 
+    stdout_capture = StringIO()
+    stderr_capture = StringIO()
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+        bufsize=1,
+    )
+
+    def _dump(src, sinks):
+        for line in iter(src.readline, ""):
+            for sink in sinks:
+                sink.write(line)
+                sink.flush()
+        src.close()
+
+    stdout_sinks = [stdout_capture, sys.stdout]
+    stderr_sinks = [stderr_capture, sys.stderr]
     if return_stdout_stderr:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            text=True,
-            bufsize=1,
+        stdout_sinks.append(return_stdout_stderr[0])
+        stderr_sinks.append(return_stdout_stderr[1])
+
+    threading.Thread(target=_dump, args=(process.stdout, stdout_sinks), daemon=True).start()
+    threading.Thread(target=_dump, args=(process.stderr, stderr_sinks), daemon=True).start()
+
+    def _raise_error(message: str):
+        raise PopenLaunchServerError(
+            message,
+            stdout=stdout_capture.getvalue(),
+            stderr=stderr_capture.getvalue(),
         )
-
-        def _dump(src, sinks):
-            for line in iter(src.readline, ""):
-                for sink in sinks:
-                    sink.write(line)
-                    sink.flush()
-            src.close()
-
-        threading.Thread(
-            target=_dump,
-            args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=_dump,
-            args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
-            daemon=True,
-        ).start()
-    else:
-        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     start_time = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout:
             return_code = process.poll()
             if return_code is not None:
-                # Server failed to start (non-zero exit code) or crashed
-                raise Exception(
-                    f"Server process exited with code {return_code}. "
-                    "Check server logs for errors."
-                )
+                _raise_error(f"Server process exited with code {return_code}.")
 
             try:
                 headers = {
@@ -697,14 +693,12 @@ def popen_launch_server(
 
             return_code = process.poll()
             if return_code is not None:
-                raise Exception(
-                    f"Server unexpectedly exits ({return_code=}). Usually there will be error logs describing the cause far above this line."
-                )
+                _raise_error(f"Server unexpectedly exits ({return_code=}).")
 
             time.sleep(10)
 
     kill_process_tree(process.pid)
-    raise TimeoutError("Server failed to start within the timeout period.")
+    _raise_error("Server failed to start within the timeout period.")
 
 
 def popen_launch_pd_server(
