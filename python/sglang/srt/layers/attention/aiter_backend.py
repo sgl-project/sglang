@@ -595,7 +595,7 @@ class AiterAttnBackend(AttentionBackend):
         get_pa_metadata_v1(
             seqlens_qo_indptr=qo_indptr,
             pages_kv_indptr=pages_kv_indptr,
-            context_lens=context_lens,
+            context_lens=context_lens.int(),
             num_heads_per_head_k=tp_q_head_num // self.num_kv_head,
             num_heads_k=self.num_kv_head,
             is_causal=True,
@@ -1149,9 +1149,9 @@ class AiterAttnBackend(AttentionBackend):
                 max_seqlen_k=self.forward_metadata.max_kv_len,
                 softmax_scale=layer.scaling,
                 causal=True,
-                q_descale=layer.k_scale,
-                k_descale=layer.k_scale,
-                v_descale=layer.v_scale,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)

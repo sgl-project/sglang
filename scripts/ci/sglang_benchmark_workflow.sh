@@ -105,7 +105,7 @@ if [[ "${TYPE}" == "launch" ]]; then
             --mem-fraction-static 0.85 \
             --disable-radix-cache \
             --max-prefill-tokens 32768 \
-            --cuda-graph-max-bs 8 \
+            --cuda-graph-max-bs 16 \
             --page-size 1024  \
             --mm-enable-dp-encoder \
             --kv-cache-dtype fp8_e4m3 \
