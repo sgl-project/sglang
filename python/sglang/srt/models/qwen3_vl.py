@@ -405,19 +405,25 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         weight_list = [[] for _ in range(4)]
 
         for t, h, w in zip(grid_ts, grid_hs, grid_ws):
-            h_idxs = torch.linspace(0, num_grid_per_side - 1, h)
-            w_idxs = torch.linspace(0, num_grid_per_side - 1, w)
+            if self.align_corners:
+                h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
+                w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
+            else:
+                h_idxs = (torch.arange(h, device=device) + 0.5) * (self.num_grid_per_side / h) - 0.5
+                w_idxs = (torch.arange(w, device=device) + 0.5) * (self.num_grid_per_side / w) - 0.5
+                h_idxs = h_idxs.clamp(0, self.num_grid_per_side - 1)
+                w_idxs = w_idxs.clamp(0, self.num_grid_per_side - 1)
 
             h_idxs_floor = h_idxs.int()
             w_idxs_floor = w_idxs.int()
-            h_idxs_ceil = (h_idxs.int() + 1).clip(max=num_grid_per_side - 1)
-            w_idxs_ceil = (w_idxs.int() + 1).clip(max=num_grid_per_side - 1)
+            h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+            w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
 
             dh = h_idxs - h_idxs_floor
             dw = w_idxs - w_idxs_floor
 
-            base_h = h_idxs_floor * num_grid_per_side
-            base_h_ceil = h_idxs_ceil * num_grid_per_side
+            base_h = h_idxs_floor * self.num_grid_per_side
+            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
 
             indices = [
                 (base_h[None].T + w_idxs_floor[None]).flatten(),

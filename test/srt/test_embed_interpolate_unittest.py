@@ -27,7 +27,7 @@ class TestEmbedInterpolate(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.pDevice = torch.get_default_device()
-        torch.set_default_device("npu")
+        torch.set_default_device("cuda")
 
     @classmethod
     def tearDownClass(cls):
@@ -37,7 +37,7 @@ class TestEmbedInterpolate(unittest.TestCase):
         self.assertTrue(issubclass(UnquantizedLinearMethod, LinearMethodBase))
         t_dim = [16, 32]
         s_dim = [192, 574]
-        sarg = ServerArgs(model_path="dummy", device="npu")
+        sarg = ServerArgs(model_path="dummy", device="cuda")
         mconf = Qwen3VLConfig(
             hidden_size=64,
             num_heads=1,
@@ -71,9 +71,10 @@ class TestEmbedInterpolate(unittest.TestCase):
             norm_eps=1e-6,
             prefix="visual",
         )
-        embeddings = model.fast_pos_embed_interpolate(
-            [(t, s, s) for t, s in zip(t_dim, s_dim)]
+        grid_thw = torch.tensor(
+            [(t, s, s) for t, s in zip(t_dim, s_dim)], dtype=torch.int32
         )
+        embeddings = model.fast_pos_embed_interpolate(grid_thw)
 
         embeddings_s0 = embeddings[: s_dim[0] * s_dim[0], :]
         embeddings_s1 = embeddings[s_dim[0] * s_dim[0] : 2 * s_dim[0] * s_dim[0], :]
