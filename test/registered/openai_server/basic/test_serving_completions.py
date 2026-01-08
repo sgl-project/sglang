@@ -156,6 +156,31 @@ class ServingCompletionTestCase(unittest.TestCase):
         # (but might have json_schema from the legacy json_schema field)
         self.assertIsNone(sampling_params.get("structural_tag"))
 
+    def test_logprobs_false_non_streaming(self):
+        """Test that logprobs=False doesn't cause KeyError in non-streaming response."""
+        req = CompletionRequest(
+            model="x", prompt="Hello", max_tokens=10, logprobs=False
+        )
+
+        mock_ret = [
+            {
+                "text": " world",
+                "meta_info": {
+                    "id": "test-id",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "finish_reason": {"type": "stop"},
+                    "weight_version": "v1",
+                },
+            }
+        ]
+
+        response = self.sc._build_completion_response(req, mock_ret, 1234567890)
+
+        self.assertEqual(len(response.choices), 1)
+        self.assertEqual(response.choices[0].text, " world")
+        self.assertEqual(len(response.choices[0].logprobs.top_logprobs), 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
