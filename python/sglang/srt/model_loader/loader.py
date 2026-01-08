@@ -906,7 +906,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     continue
 
                 try:
-                    qweight, scale = scaled_fp8_blockwise(weight, default_block_size)
+                    qweight, scale = scaled_fp8_blockwise(weight.to(torch.bfloat16), default_block_size)
                     # Scale shape is (blk_m, blk_n, 1); squeeze the last dim
                     scale = scale.squeeze(-1)
 
@@ -1260,7 +1260,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
                         try:
                             qweight, scale = scaled_fp8_blockwise(
-                                weight, default_block_size
+                                weight.to(torch.bfloat16), default_block_size
                             )
                             # scale shape is (blk_m, blk_n, 1), need to squeeze
                             scale = scale.squeeze(-1)
