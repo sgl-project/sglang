@@ -209,12 +209,17 @@ def _add_common_args(parser):
         help="Local model directory or HuggingFace repo ID",
     )
     parser.add_argument(
+        "--model-checksum",
+        required=True,
+        help="Checksums JSON file path",
+    )
+    parser.add_argument(
         "--workers", type=int, default=4, help="Number of parallel workers"
     )
 
 
 def _cli_generate(args):
-    generate_checksums(args.model_path, args.output, args.workers)
+    generate_checksums(args.model_path, args.model_checksum, args.workers)
 
 
 def _cli_verify(args):
@@ -231,20 +236,12 @@ def main():
         "generate", help="Generate checksums.json for a model"
     )
     _add_common_args(gen_parser)
-    gen_parser.add_argument(
-        "--output", required=True, help="Output path for checksums.json"
-    )
     gen_parser.set_defaults(func=_cli_generate)
 
     verify_parser = subparsers.add_parser(
         "verify", help="Verify model files against checksums"
     )
     _add_common_args(verify_parser)
-    verify_parser.add_argument(
-        "--model-checksum",
-        required=True,
-        help="Checksums source: JSON file path or HuggingFace repo ID",
-    )
     verify_parser.set_defaults(func=_cli_verify)
 
     args = parser.parse_args()
