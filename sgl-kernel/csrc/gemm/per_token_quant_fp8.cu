@@ -108,7 +108,7 @@ __global__ void per_token_quant_fp8_kernel(
 #endif
     }
     if constexpr (kVecSize == 16) {
-      *(uint4*)(token_output + i * kVecSize)) = *(uint4*)output_arr;
+      *(uint4*)(token_output + i * kVecSize) = *(uint4*)output_arr;
     } else {
       // Use element-wise copy for vector size 8 to ensure correctness
       for (int k = 0; k < kVecSize; ++k) {
@@ -214,7 +214,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   // Calculate dynamic shared memory size needed for caching one token's data
   // Each CTA has 8 tokens, each token needs hidden_dim * sizeof(T) bytes
   const int sizeof_T = input.scalar_type() == torch::kFloat16 ? 2 : (input.scalar_type() == torch::kBFloat16 ? 2 : 4);
-  const size_t dynamicSmemSz = hidden_dim * sizeof_T;
+  const size_t dynamicSmemSz = hidden_dim * sizeof_T * TOKENS_PER_CTA;
 
   // Check if shared memory can be used (similar to TensorRT-LLM logic)
   // Threshold is 48KB (48 * 1024 bytes), the default dynamic shared memory quota on NVIDIA GPUs
