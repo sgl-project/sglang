@@ -52,17 +52,51 @@ def synchronized(func):
     return wrapper
 
 
+class HostTensorAllocator(abc.ABC):
+    def __init__(self):
+        """Initialize the HostTensorAllocator."""
+        self.dtype = None
+        self.dims = None
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        """Allocate a tensor of given dims and dtype on the memory."""
+        self.dtype = dtype
+        self.dims = dims
+        tensor = torch.empty(dims, dtype=dtype, device=device)
+        return tensor
+
+
+def get_allocator_from_storage(allocator_type):
+    if allocator_type == "mooncake":
+        try:
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                MooncakeHostTensorAllocator,
+            )
+
+            return MooncakeHostTensorAllocator()
+        except ImportError:
+            logger.warning(
+                "Mooncake's tensor allocator requires mooncake >= 0.3.8. "
+                "Please upgrade Mooncake by 'pip install mooncake --upgrade'. "
+                "Fallback to use default allocator."
+            )
+            return HostTensorAllocator()
+    else:
+        return HostTensorAllocator()
+
+
 def alloc_with_host_register(
     dims,
     dtype: torch.dtype,
     device: str,
     pin_memory: bool,
+    allocator: HostTensorAllocator,
 ) -> torch.Tensor:
     """
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
     """
-    buffer = torch.empty(dims, dtype=dtype, device=device)
+    buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         torch.cuda.cudart().cudaHostRegister(
             buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
@@ -75,6 +109,7 @@ def alloc_with_pin_memory(
     dtype: torch.dtype,
     device: str,
     pin_memory: bool,
+    allocator: None,
 ) -> torch.Tensor:
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.
@@ -102,12 +137,14 @@ class HostKVCache(abc.ABC):
         layout: str,
         pin_memory: bool,
         device: str,
+        allocator_type: str = "default",
     ):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
+        self.allocator = get_allocator_from_storage(allocator_type)
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
@@ -239,6 +276,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         layout: str,
         pin_memory: bool = True,
         device: str = "cpu",
+        allocator_type: str = "default",
     ):
         super().__init__(
             device_pool,
@@ -248,6 +286,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             layout,
             pin_memory,
             device,
+            allocator_type,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
@@ -307,7 +346,11 @@ class MHATokenToKVPoolHost(HostKVCache):
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         buffer = alloc_func(
-            dims, dtype=self.dtype, device=self.device, pin_memory=self.pin_memory
+            dims,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
         )
         return buffer
 
@@ -645,6 +688,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         layout: str,
         pin_memory: bool = True,
         device: str = "cpu",
+        allocator_type: str = "default",
     ):
         super().__init__(
             device_pool,
@@ -654,6 +698,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             layout,
             pin_memory,
             device,
+            allocator_type,
         )
         self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
         self.data_ptrs = torch.tensor(
@@ -715,12 +760,14 @@ class MLATokenToKVPoolHost(HostKVCache):
                 dtype=self.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
+                allocator=self.allocator,
             )
             self.v_buffer = alloc_func(
                 (*base_dims, self.qk_rope_head_dim),
                 dtype=self.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
+                allocator=self.allocator,
             )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
@@ -734,7 +781,11 @@ class MLATokenToKVPoolHost(HostKVCache):
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         buffer = alloc_func(
-            dims, dtype=self.dtype, device=self.device, pin_memory=self.pin_memory
+            dims,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
         )
         return buffer
 

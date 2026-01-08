@@ -609,7 +609,10 @@ mod tests {
     }
 
     async fn create_test_app_context() -> Arc<AppContext> {
-        use crate::{config::RouterConfig, core::WorkerService, middleware::TokenBucket};
+        use crate::{
+            config::RouterConfig, core::WorkerService, middleware::TokenBucket,
+            observability::inflight_tracker::InFlightRequestTracker,
+        };
 
         let router_config = RouterConfig::builder()
             .worker_startup_timeout_secs(1)
@@ -628,7 +631,6 @@ mod tests {
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
                 router_config.policy.clone(),
             )),
-            tokenizer: None,
             reasoning_parser_factory: None,
             tool_parser_factory: None,
             router_manager: None,
@@ -643,12 +645,14 @@ mod tests {
             worker_job_queue: worker_job_queue.clone(),
             workflow_engine: Arc::new(std::sync::OnceLock::new()),
             mcp_manager: Arc::new(std::sync::OnceLock::new()),
+            tokenizer_registry: Arc::new(crate::tokenizer::registry::TokenizerRegistry::new()),
             wasm_manager: None,
             worker_service: Arc::new(WorkerService::new(
                 worker_registry,
                 worker_job_queue,
                 router_config,
             )),
+            inflight_tracker: InFlightRequestTracker::new(),
         })
     }
 

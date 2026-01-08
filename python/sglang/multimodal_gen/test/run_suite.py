@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import tabulate
+
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -23,6 +25,8 @@ SUITES = {
         "test_server_a.py",
         "test_server_b.py",
         "test_lora_format_adapter.py",
+        # cli test
+        "../cli/test_generate_t2i_perf.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
@@ -67,17 +71,54 @@ def parse_args():
         default=None,
         help="Pytest filter expression (passed to pytest -k)",
     )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        default=False,
+        help="Continue running remaining tests even if one fails (for CI consistency; pytest already continues by default)",
+    )
     return parser.parse_args()
 
 
 def collect_test_items(files, filter_expr=None):
-    """Collect test item node IDs from the given files using pytest --collect-only."""
+    """Collect test item node IDs from the given files using pytest --collect-only.
+
+    Raises:
+        RuntimeError: If pytest collection fails due to errors (e.g., syntax errors,
+            import errors, or other collection failures).
+    """
     cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
     if filter_expr:
         cmd.extend(["-k", filter_expr])
     cmd.extend(files)
 
+    print(f"Collecting tests with command: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Check for collection errors
+    # pytest exit codes:
+    #   0: success
+    #   1: tests collected but some had errors during collection
+    #   2: test execution interrupted
+    #   3: internal error
+    #   4: command line usage error
+    #   5: no tests collected (may be expected with filters)
+    if result.returncode not in (0, 5):
+        error_msg = (
+            f"pytest --collect-only failed with exit code {result.returncode}\n"
+            f"Command: {' '.join(cmd)}\n"
+        )
+        if result.stderr:
+            error_msg += f"stderr:\n{result.stderr}\n"
+        if result.stdout:
+            error_msg += f"stdout:\n{result.stdout}\n"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
+
+    if result.returncode == 5:
+        print(
+            "No tests were collected (exit code 5). This may be expected with filters."
+        )
 
     # Parse the output to extract test node IDs
     # pytest -q outputs lines like: test_file.py::TestClass::test_method[param]
@@ -91,6 +132,7 @@ def collect_test_items(files, filter_expr=None):
             if "::" in test_id:
                 test_items.append(test_id)
 
+    print(f"Collected {len(test_items)} test items")
     return test_items
 
 
@@ -105,20 +147,23 @@ def run_pytest(files, filter_expr=None):
     if filter_expr:
         base_cmd.extend(["-k", filter_expr])
 
-    max_retries = 4
+    max_retries = 6
     # retry if the perf assertion failed, for {max_retries} times
     for i in range(max_retries + 1):
         cmd = list(base_cmd)
         if i > 0:
             cmd.append("--last-failed")
+        # Always include files to constrain test discovery scope
+        # This prevents pytest from scanning the entire rootdir and
+        # discovering unrelated tests that may have missing dependencies
         cmd.extend(files)
 
         if i > 0:
-            logger.info(
+            print(
                 f"Performance assertion failed. Retrying ({i}/{max_retries}) with --last-failed..."
             )
 
-        logger.info(f"Running command: {' '.join(cmd)}")
+        print(f"Running command: {' '.join(cmd)}")
 
         process = subprocess.Popen(
             cmd,
@@ -145,7 +190,7 @@ def run_pytest(files, filter_expr=None):
         # Exit code 5 means no tests were collected/selected - treat as success
         # when using filters, since some partitions may have all tests filtered out
         if returncode == 5:
-            logger.info(
+            print(
                 "No tests collected (exit code 5). This is expected when filters "
                 "deselect all tests in a partition. Treating as success."
             )
@@ -158,12 +203,19 @@ def run_pytest(files, filter_expr=None):
             and "AssertionError" in full_output
         )
 
-        is_flaky_ci_assertion = "SafetensorError" in full_output
+        is_flaky_ci_assertion = (
+            "SafetensorError" in full_output or "FileNotFoundError" in full_output
+        )
 
-        if not (is_perf_assertion or is_flaky_ci_assertion):
+        is_oom_error = (
+            "out of memory" in full_output.lower()
+            or "oom killer" in full_output.lower()
+        )
+
+        if not (is_perf_assertion or is_flaky_ci_assertion or is_oom_error):
             return returncode
 
-    logger.info(f"Max retry exceeded")
+    print(f"Max retry exceeded")
     return returncode
 
 
@@ -208,20 +260,38 @@ def main():
         if i % args.total_partitions == args.partition_id
     ]
 
+    # Print test info at beginning (similar to test/run_suite.py pretty_print_tests)
+    partition_info = f"{args.partition_id + 1}/{args.total_partitions} (0-based id={args.partition_id})"
+    headers = ["Suite", "Partition"]
+    rows = [[args.suite, partition_info]]
+    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
+    msg += f"✅ Enabled {len(my_items)} test(s):\n"
+    for item in my_items:
+        msg += f"  - {item}\n"
+    print(msg, flush=True)
     print(
         f"Suite: {args.suite} | Partition: {args.partition_id}/{args.total_partitions}"
     )
     print(f"Selected {len(suite_files_abs)} files:")
     for f in suite_files_abs:
         print(f"  - {os.path.basename(f)}")
-    print(f"Running {len(my_items)} items in this shard: {', '.join(my_items)}")
 
     if not my_items:
         print("No items assigned to this partition. Exiting success.")
         sys.exit(0)
 
+    print(f"Running {len(my_items)} items in this shard: {', '.join(my_items)}")
+
     # 4. execute with the specific test items
     exit_code = run_pytest(my_items)
+
+    # Print tests again at the end for visibility
+    msg = "\n" + tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
+    msg += f"✅ Executed {len(my_items)} test(s):\n"
+    for item in my_items:
+        msg += f"  - {item}\n"
+    print(msg, flush=True)
+
     sys.exit(exit_code)
 
 

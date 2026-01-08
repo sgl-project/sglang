@@ -58,8 +58,8 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     NSATokenToKVPool,
     ReqToTokenPool,
-    SWAKVPool,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
 from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -274,6 +274,7 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -323,7 +324,11 @@ class DecodePreallocQueue:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
-            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+            # Auto enable FAKE mode if configured
+            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+                req.bootstrap_host is None
+                and self.scheduler.server_args.disaggregation_decode_enable_fake_auto
+            ):
                 kv_receiver_class = get_kv_class(
                     TransferBackend.FAKE, KVClassType.RECEIVER
                 )
@@ -686,7 +691,7 @@ class DecodePreallocQueue:
 
         # populate metadata
         req.fill_ids = req.origin_input_ids + req.output_ids
-        req.extend_input_len = len(req.origin_input_ids)
+        req.set_extend_input_len(len(req.fill_ids))
 
         return kv_loc
 
@@ -933,8 +938,7 @@ class SchedulerDisaggregationDecodeMixin:
         # 2. decode + prebuilt -> decode + idle (idle forward, prebuilt returns)
         # 3. prebuilt + None -> None (None forward, prebuilt returns) + None
         # 4. prebuilt + decode + None -> idle (idle forward, prebuilt returns) + decode + idle
-        if self.require_mlp_sync:
-            ret = self.prepare_mlp_sync_batch(ret)
+        ret = self.maybe_prepare_mlp_sync_batch_and_log_stats(ret)
 
         if ret:
             trace_event_batch("schedule", ret.reqs)

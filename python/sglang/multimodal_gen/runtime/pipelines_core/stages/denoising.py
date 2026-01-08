@@ -38,13 +38,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
-
-try:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-        FlashAttentionBackend,
-    )
-except ImportError:
-    FlashAttentionBackend = None
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
@@ -63,40 +56,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
-
-try:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (
-        SlidingTileAttentionBackend,
-    )
-
-    st_attn_available = True
-except ImportError:
-    st_attn_available = False
-
-try:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (
-        VMOBAAttentionBackend,
-    )
-    from sglang.multimodal_gen.utils import is_vmoba_available
-
-    vmoba_attn_available = is_vmoba_available()
-except ImportError:
-    vmoba_attn_available = False
-
-try:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (
-        VideoSparseAttentionBackend,
-    )
-
-    vsa_available = True
-except ImportError:
-    vsa_available = False
 
 logger = init_logger(__name__)
 
@@ -124,9 +93,8 @@ class DenoisingStage(PipelineStage):
 
         # torch compile
         if self.server_args.enable_torch_compile:
-            self.torch_compile_module(self.transformer)
-            if transformer_2 is not None:
-                self.torch_compile_module(self.transformer_2)
+            for transformer in filter(None, [self.transformer, self.transformer_2]):
+                self.compile_module_with_torch_compile(transformer)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -146,8 +114,9 @@ class DenoisingStage(PipelineStage):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
+        self._is_warmed_up = False
 
-    def torch_compile_module(self, module):
+    def compile_module_with_torch_compile(self, module):
         """
         Compile a module's forward with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object has no forward.
@@ -516,25 +485,28 @@ class DenoisingStage(PipelineStage):
         Returns:
             A dictionary containing all the prepared variables for the denoising loop.
         """
+        assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
+        # NOTE: In warmup requests we may override req.num_inference_steps (e.g. set to 1)
+        # for latency amortization, but cache-dit needs the *original* total steps to
+        # initialize/refresh its context correctly.
+        cache_dit_num_inference_steps = batch.extra.get(
+            "cache_dit_num_inference_steps", batch.num_inference_steps
+        )
         if not server_args.model_loaded["transformer"]:
+            # FIXME: reuse more code
             loader = TransformerLoader()
             self.transformer = loader.load(
-                server_args.model_paths["transformer"], server_args
+                server_args.model_paths["transformer"], server_args, "transformer"
             )
-
             # enable cache-dit before torch.compile (delayed mounting)
-            self._maybe_enable_cache_dit(batch.num_inference_steps)
-
-            if self.server_args.enable_torch_compile:
-                self.transformer = torch.compile(
-                    self.transformer, mode="max-autotune", fullgraph=True
-                )
+            self._maybe_enable_cache_dit(cache_dit_num_inference_steps)
+            self.compile_module_with_torch_compile(self.transformer)
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
         else:
-            self._maybe_enable_cache_dit(batch.num_inference_steps)
+            self._maybe_enable_cache_dit(cache_dit_num_inference_steps)
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
@@ -563,7 +535,7 @@ class DenoisingStage(PipelineStage):
             ]
 
         # Prepare STA parameters
-        if st_attn_available and self.attn_backend == SlidingTileAttentionBackend:
+        if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
             self.prepare_sta_param(batch, server_args)
 
         # Get latents and embeddings
@@ -696,6 +668,7 @@ class DenoisingStage(PipelineStage):
         trajectory_latents: list,
         trajectory_timesteps: list,
         server_args: ServerArgs,
+        is_warmup: bool = False,
     ):
         # Gather results if using sequence parallelism
         if trajectory_latents:
@@ -732,15 +705,15 @@ class DenoisingStage(PipelineStage):
 
         # Save STA mask search results if needed
         if (
-            st_attn_available
-            and self.attn_backend == SlidingTileAttentionBackend
+            not is_warmup
+            and self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
             and server_args.STA_mode == STA_Mode.STA_SEARCHING
         ):
             self.save_sta_search_results(batch)
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
-        if torch.backends.mps.is_available():
+        if torch.backends.mps.is_available() and not is_warmup:
             logger.info(
                 "Memory before deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
@@ -753,6 +726,11 @@ class DenoisingStage(PipelineStage):
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
+
+        # reset offload managers with prefetching first layer for next forward
+        for dit in filter(None, [self.transformer, self.transformer_2]):
+            if isinstance(dit, OffloadableDiTMixin):
+                dit.prepare_for_next_denoise()
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
@@ -980,7 +958,7 @@ class DenoisingStage(PipelineStage):
         denoising_start_time = time.time()
 
         # to avoid device-sync caused by timestep comparison
-
+        is_warmup = batch.is_warmup
         self.scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
@@ -992,7 +970,10 @@ class DenoisingStage(PipelineStage):
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t_host in enumerate(timesteps_cpu):
                     with StageProfiler(
-                        f"denoising_step_{i}", logger=logger, timings=batch.timings
+                        f"denoising_step_{i}",
+                        logger=logger,
+                        timings=batch.timings,
+                        perf_dump_path_provided=batch.perf_dump_path is not None,
                     ):
                         t_int = int(t_host.item())
                         t_device = timesteps[i]
@@ -1074,11 +1055,12 @@ class DenoisingStage(PipelineStage):
                         ):
                             progress_bar.update()
 
-                        self.step_profile()
+                        if not is_warmup:
+                            self.step_profile()
 
         denoising_end_time = time.time()
 
-        if num_timesteps > 0:
+        if num_timesteps > 0 and not is_warmup:
             self.log_info(
                 "average time per step: %.4f seconds",
                 (denoising_end_time - denoising_start_time) / len(timesteps),
@@ -1090,6 +1072,7 @@ class DenoisingStage(PipelineStage):
             trajectory_latents=trajectory_latents,
             trajectory_timesteps=trajectory_timesteps,
             server_args=server_args,
+            is_warmup=is_warmup,
         )
         return batch
 
@@ -1186,8 +1169,9 @@ class DenoisingStage(PipelineStage):
             self.attn_metadata_builder_cls = None
         if self.attn_metadata_builder_cls:
             self.attn_metadata_builder = self.attn_metadata_builder_cls()
-        if (st_attn_available and self.attn_backend == SlidingTileAttentionBackend) or (
-            vsa_available and self.attn_backend == VideoSparseAttentionBackend
+        if (
+            self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
+            or self.attn_backend.get_enum() == AttentionBackendEnum.VIDEO_SPARSE_ATTN
         ):
             attn_metadata = self.attn_metadata_builder.build(
                 current_timestep=i,
@@ -1197,7 +1181,7 @@ class DenoisingStage(PipelineStage):
                 VSA_sparsity=server_args.VSA_sparsity,
                 device=get_local_torch_device(),
             )
-        elif vmoba_attn_available and self.attn_backend == VMOBAAttentionBackend:
+        elif self.attn_backend.get_enum() == AttentionBackendEnum.VMOBA_ATTN:
             moba_params = server_args.moba_config.copy()
             moba_params.update(
                 {
@@ -1207,7 +1191,7 @@ class DenoisingStage(PipelineStage):
                     "device": get_local_torch_device(),
                 }
             )
-        elif self.attn_backend == FlashAttentionBackend:
+        elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
             attn_metadata = self.attn_metadata_builder.build(
                 raw_latent_shape=batch.raw_latent_shape
             )

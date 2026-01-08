@@ -3,8 +3,10 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -56,6 +58,41 @@ class TestDPAttentionDP2TP2(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
+
+
+class TestDPRetract(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "2",
+                "--enable-dp-attention",
+                "--dp",
+                "2",
+                "--max-total-tokens",
+                "4500",
+                "--max-running-requests",
+                "128",
+                "--chunked-prefill-size",
+                "256",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_radix_attention(self):
+        with envs.SGLANG_TEST_RETRACT.override(True):
+            run_radix_attention_test(self.base_url)
+            self.assertIsNone(self.process.poll())
 
 
 class TestDPAttentionDP2TP2DeepseekV3MTP(CustomTestCase):

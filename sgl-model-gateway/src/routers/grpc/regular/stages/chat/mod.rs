@@ -7,6 +7,6 @@ mod preparation;
 mod request_building;
 mod response_processing;
 
-pub use preparation::ChatPreparationStage;
-pub use request_building::ChatRequestBuildingStage;
-pub use response_processing::ChatResponseProcessingStage;
+pub(crate) use preparation::ChatPreparationStage;
+pub(crate) use request_building::ChatRequestBuildingStage;
+pub(crate) use response_processing::ChatResponseProcessingStage;

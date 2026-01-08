@@ -52,6 +52,7 @@ def get_model_config(
     if hasattr(config, "text_config"):
         config = config.get_text_config()
 
+    hidden_size = config.hidden_size
     if architecture == "DbrxForCausalLM":
         E = config.ffn_config.moe_num_experts // ep_size
         topk = config.ffn_config.moe_top_k
@@ -118,6 +119,7 @@ def get_model_config(
         E = config.n_routed_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+        hidden_size = getattr(config, "moe_latent_size", None) or hidden_size
     else:
         # Default: Mixtral
         E = config.num_local_experts // ep_size
@@ -131,7 +133,7 @@ def get_model_config(
     return {
         "num_experts": E,
         "topk": topk,
-        "hidden_size": config.hidden_size,
+        "hidden_size": hidden_size,
         "shard_intermediate_size": shard_intermediate_size,
         "dtype": config.torch_dtype,
         "block_shape": block_shape,

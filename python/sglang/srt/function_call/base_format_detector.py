@@ -83,7 +83,7 @@ class BaseFormatDetector(ABC):
 
             results.append(
                 ToolCallItem(
-                    tool_index=-1,  # Caller should update this based on the actual tools array called
+                    tool_index=tool_indices.get(name, -1),
                     name=name,
                     parameters=json.dumps(
                         act.get("parameters") or act.get("arguments", {}),
@@ -249,7 +249,7 @@ class BaseFormatDetector(ABC):
                 if cur_arguments:
                     # Calculate how much of the arguments we've already streamed
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
-                    cur_args_json = json.dumps(cur_arguments)
+                    cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
                     prev_arguments = None
                     if self.current_tool_id < len(self.prev_tool_call_arr):
                         prev_arguments = self.prev_tool_call_arr[
@@ -270,7 +270,7 @@ class BaseFormatDetector(ABC):
 
                     # If the tool is still being parsed, send incremental changes
                     elif prev_arguments:
-                        prev_args_json = json.dumps(prev_arguments)
+                        prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
                         if cur_args_json != prev_args_json:
                             prefix = _find_common_prefix(prev_args_json, cur_args_json)
                             argument_diff = prefix[sent:]

@@ -6,19 +6,25 @@ pub mod mock_openai_server;
 pub mod mock_worker;
 pub mod streaming_helpers;
 pub mod test_app;
+pub mod test_certs;
+pub mod test_config;
+pub mod tls_mock_worker;
 
+// Re-export commonly used test builders
 use std::{
     fs,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
 };
 
+use mock_worker::{MockWorker, MockWorkerConfig};
 use serde_json::json;
-use sgl_model_gateway::{
+use smg::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::{
-        BasicWorkerBuilder, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry, WorkerType,
+        BasicWorkerBuilder, Job, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry,
+        WorkerType,
     },
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
@@ -27,8 +33,258 @@ use sgl_model_gateway::{
     policies::PolicyRegistry,
     protocols::common::{Function, Tool},
     reasoning_parser::ParserFactory as ReasoningParserFactory,
+    routers::{RouterFactory, RouterTrait},
+    tokenizer::registry::TokenizerRegistry,
     tool_parser::ParserFactory as ToolParserFactory,
 };
+#[allow(unused_imports)]
+pub use test_config::{TestRouterConfig, TestWorkerConfig};
+
+/// Test context for directly testing mock workers without full router setup.
+pub struct WorkerTestContext {
+    pub workers: Vec<MockWorker>,
+    pub worker_urls: Vec<String>,
+}
+
+impl WorkerTestContext {
+    pub async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
+        let mut workers = Vec::new();
+        let mut worker_urls = Vec::new();
+
+        for worker_config in worker_configs {
+            let mut worker = MockWorker::new(worker_config);
+            let url = worker.start().await.unwrap();
+            worker_urls.push(url);
+            workers.push(worker);
+        }
+
+        if !workers.is_empty() {
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+
+        Self {
+            workers,
+            worker_urls,
+        }
+    }
+
+    pub fn first_worker_url(&self) -> Option<&str> {
+        self.worker_urls.first().map(|s| s.as_str())
+    }
+
+    pub async fn make_request(
+        &self,
+        endpoint: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let client = reqwest::Client::new();
+        let worker_url = self
+            .first_worker_url()
+            .ok_or_else(|| "No workers available".to_string())?;
+
+        let response = client
+            .post(format!("{}{}", worker_url, endpoint))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("Request failed with status: {}", response.status()));
+        }
+
+        response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))
+    }
+
+    pub async fn make_streaming_request(
+        &self,
+        endpoint: &str,
+        body: serde_json::Value,
+    ) -> Result<Vec<String>, String> {
+        use futures_util::StreamExt;
+
+        let client = reqwest::Client::new();
+        let worker_url = self
+            .first_worker_url()
+            .ok_or_else(|| "No workers available".to_string())?;
+
+        let response = client
+            .post(format!("{}{}", worker_url, endpoint))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("Request failed with status: {}", response.status()));
+        }
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !content_type.contains("text/event-stream") {
+            return Err("Response is not a stream".to_string());
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut events = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            if let Ok(bytes) = chunk {
+                let text = String::from_utf8_lossy(&bytes);
+                for line in text.lines() {
+                    if let Some(stripped) = line.strip_prefix("data: ") {
+                        events.push(stripped.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(events)
+    }
+
+    pub async fn shutdown(mut self) {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        for worker in &mut self.workers {
+            worker.stop().await;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Test context for integration tests that go through the full axum app stack.
+pub struct AppTestContext {
+    pub workers: Vec<MockWorker>,
+    pub router: Arc<dyn RouterTrait>,
+    pub config: RouterConfig,
+    pub app_context: Arc<AppContext>,
+}
+
+impl AppTestContext {
+    pub async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3002)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+
+        Self::new_with_config(config, worker_configs).await
+    }
+
+    pub async fn new_with_config(
+        mut config: RouterConfig,
+        worker_configs: Vec<MockWorkerConfig>,
+    ) -> Self {
+        let mut workers = Vec::new();
+        let mut worker_urls = Vec::new();
+
+        for worker_config in worker_configs {
+            let mut worker = MockWorker::new(worker_config);
+            let url = worker.start().await.unwrap();
+            worker_urls.push(url);
+            workers.push(worker);
+        }
+
+        if !workers.is_empty() {
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+
+        match &mut config.mode {
+            RoutingMode::Regular {
+                worker_urls: ref mut urls,
+            } => {
+                if urls.is_empty() {
+                    *urls = worker_urls.clone();
+                }
+            }
+            RoutingMode::OpenAI {
+                worker_urls: ref mut urls,
+            } => {
+                if urls.is_empty() {
+                    *urls = worker_urls.clone();
+                }
+            }
+            _ => {}
+        }
+
+        let app_context = create_test_context(config.clone()).await;
+
+        if !worker_urls.is_empty() {
+            let job_queue = app_context
+                .worker_job_queue
+                .get()
+                .expect("JobQueue should be initialized");
+            let job = Job::InitializeWorkersFromConfig {
+                router_config: Box::new(config.clone()),
+            };
+            job_queue
+                .submit(job)
+                .await
+                .expect("Failed to submit worker initialization job");
+
+            let expected_count = worker_urls.len();
+            let start = tokio::time::Instant::now();
+            let timeout_duration = tokio::time::Duration::from_secs(10);
+            loop {
+                let healthy_workers = app_context
+                    .worker_registry
+                    .get_all()
+                    .iter()
+                    .filter(|w| w.is_healthy())
+                    .count();
+
+                if healthy_workers >= expected_count {
+                    break;
+                }
+
+                if start.elapsed() > timeout_duration {
+                    panic!(
+                        "Timeout waiting for {} workers to become healthy (only {} ready)",
+                        expected_count, healthy_workers
+                    );
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        let router = RouterFactory::create_router(&app_context).await.unwrap();
+        let router = Arc::from(router);
+
+        Self {
+            workers,
+            router,
+            config,
+            app_context,
+        }
+    }
+
+    pub async fn create_app(&self) -> axum::Router {
+        test_app::create_test_app_with_context(
+            Arc::clone(&self.router),
+            Arc::clone(&self.app_context),
+        )
+    }
+
+    pub async fn shutdown(mut self) {
+        for worker in &mut self.workers {
+            worker.stop().await;
+        }
+    }
+}
 
 /// Helper function to create AppContext for tests
 pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
@@ -76,7 +332,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
-            .tokenizer(None) // tokenizer
+            .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
             .worker_registry(worker_registry)
@@ -94,17 +350,14 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
 
     // Initialize JobQueue after AppContext is created
     let weak_context = Arc::downgrade(&app_context);
-    let job_queue = sgl_model_gateway::core::JobQueue::new(
-        sgl_model_gateway::core::JobQueueConfig::default(),
-        weak_context,
-    );
+    let job_queue = smg::core::JobQueue::new(smg::core::JobQueueConfig::default(), weak_context);
     app_context
         .worker_job_queue
         .set(job_queue)
         .expect("JobQueue should only be initialized once");
 
     // Initialize WorkflowEngine and register workflows
-    use sgl_model_gateway::{
+    use smg::{
         core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
         workflow::WorkflowEngine,
     };
@@ -141,7 +394,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
     }
 
     // Initialize MCP manager with empty config
-    use sgl_model_gateway::mcp::{McpConfig, McpManager};
+    use smg::mcp::{McpConfig, McpManager};
     let empty_config = McpConfig {
         servers: vec![],
         pool: Default::default(),
@@ -181,6 +434,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
     };
 
     // Initialize registries
+    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     let worker_registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
 
@@ -211,7 +465,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
-            .tokenizer(None) // tokenizer
+            .tokenizer_registry(tokenizer_registry)
             .reasoning_parser_factory(reasoning_parser_factory)
             .tool_parser_factory(tool_parser_factory)
             .worker_registry(worker_registry)
@@ -229,17 +483,14 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
 
     // Initialize JobQueue after AppContext is created
     let weak_context = Arc::downgrade(&app_context);
-    let job_queue = sgl_model_gateway::core::JobQueue::new(
-        sgl_model_gateway::core::JobQueueConfig::default(),
-        weak_context,
-    );
+    let job_queue = smg::core::JobQueue::new(smg::core::JobQueueConfig::default(), weak_context);
     app_context
         .worker_job_queue
         .set(job_queue)
         .expect("JobQueue should only be initialized once");
 
     // Initialize WorkflowEngine and register workflows
-    use sgl_model_gateway::{
+    use smg::{
         core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
         workflow::WorkflowEngine,
     };
@@ -276,7 +527,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
     }
 
     // Initialize MCP manager with empty config
-    use sgl_model_gateway::mcp::{McpConfig, McpManager};
+    use smg::mcp::{McpConfig, McpManager};
     let empty_config = McpConfig {
         servers: vec![],
         pool: Default::default(),
@@ -301,7 +552,7 @@ pub async fn create_test_context_with_mcp_config(
     config: RouterConfig,
     mcp_config_path: &str,
 ) -> Arc<AppContext> {
-    use sgl_model_gateway::mcp::{McpConfig, McpManager};
+    use smg::mcp::{McpConfig, McpManager};
 
     let client = reqwest::Client::new();
 
@@ -347,7 +598,7 @@ pub async fn create_test_context_with_mcp_config(
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
-            .tokenizer(None) // tokenizer
+            .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
             .worker_registry(worker_registry)
@@ -365,17 +616,14 @@ pub async fn create_test_context_with_mcp_config(
 
     // Initialize JobQueue after AppContext is created
     let weak_context = Arc::downgrade(&app_context);
-    let job_queue = sgl_model_gateway::core::JobQueue::new(
-        sgl_model_gateway::core::JobQueueConfig::default(),
-        weak_context,
-    );
+    let job_queue = smg::core::JobQueue::new(smg::core::JobQueueConfig::default(), weak_context);
     app_context
         .worker_job_queue
         .set(job_queue)
         .expect("JobQueue should only be initialized once");
 
     // Initialize WorkflowEngine and register workflows
-    use sgl_model_gateway::{
+    use smg::{
         core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
         workflow::WorkflowEngine,
     };

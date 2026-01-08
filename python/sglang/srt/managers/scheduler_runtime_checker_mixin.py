@@ -10,11 +10,8 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.utils.common import (
-    ceil_align,
-    disable_request_logging,
-    raise_error_or_warn,
-)
+from sglang.srt.utils.common import ceil_align, raise_error_or_warn
+from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:

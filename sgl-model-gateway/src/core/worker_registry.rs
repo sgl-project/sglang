@@ -5,13 +5,137 @@
 //! # Performance Optimizations
 //! The model index uses immutable Arc snapshots instead of RwLock for lock-free reads.
 //! This is critical for high-concurrency scenarios where many requests query the same model.
+//!
+//! # Consistent Hash Ring
+//! The registry maintains a pre-computed hash ring per model for O(log n) consistent hashing.
+//! The ring is rebuilt only when workers are added/removed, not per-request.
+//! Uses virtual nodes (150 per worker) for even distribution and blake3 for stable hashing.
 
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::core::{ConnectionMode, RuntimeType, Worker, WorkerType};
+use crate::{
+    core::{
+        circuit_breaker::CircuitState,
+        worker::{HealthChecker, RuntimeType, WorkerType},
+        ConnectionMode, Worker,
+    },
+    observability::metrics::Metrics,
+};
+
+/// Number of virtual nodes per physical worker for even distribution.
+/// 150 is a common choice that provides good balance between memory and distribution.
+const VIRTUAL_NODES_PER_WORKER: usize = 150;
+
+/// Consistent hash ring for O(log n) worker selection.
+///
+/// Each worker is placed at multiple positions (virtual nodes) on the ring
+/// based on hash(worker_url + vnode_index). This provides:
+/// - Even key distribution across workers
+/// - Minimal key redistribution when workers are added/removed (~1/N keys move)
+/// - O(log n) lookup via binary search
+///
+/// Uses blake3 for stable, fast hashing that's consistent across Rust versions.
+#[derive(Debug, Clone)]
+pub struct HashRing {
+    /// Sorted list of (ring_position, worker_url)
+    /// Multiple entries per worker (virtual nodes) for even distribution.
+    /// Uses Arc<str> to share URL across all virtual nodes (150 refs vs 150 copies).
+    entries: Arc<[(u64, Arc<str>)]>,
+}
+
+impl HashRing {
+    /// Build a hash ring from a list of workers.
+    /// Creates VIRTUAL_NODES_PER_WORKER entries per worker for even distribution.
+    pub fn new(workers: &[Arc<dyn Worker>]) -> Self {
+        let mut entries: Vec<(u64, Arc<str>)> =
+            Vec::with_capacity(workers.len() * VIRTUAL_NODES_PER_WORKER);
+
+        for worker in workers {
+            // Create Arc<str> once per worker, share across all virtual nodes
+            let url: Arc<str> = Arc::from(worker.url());
+
+            // Create multiple virtual nodes per worker
+            for vnode in 0..VIRTUAL_NODES_PER_WORKER {
+                let vnode_key = format!("{}#{}", url, vnode);
+                let pos = Self::hash_position(&vnode_key);
+                entries.push((pos, Arc::clone(&url)));
+            }
+        }
+
+        // Sort by ring position for binary search
+        entries.sort_unstable_by_key(|(pos, _)| *pos);
+
+        Self {
+            entries: Arc::from(entries.into_boxed_slice()),
+        }
+    }
+
+    /// Hash a string to a ring position using blake3 (stable across versions).
+    #[inline]
+    fn hash_position(s: &str) -> u64 {
+        let hash = blake3::hash(s.as_bytes());
+        // Take first 8 bytes as u64
+        u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+    }
+
+    /// Find worker URL for a key using consistent hashing.
+    /// Returns the first healthy worker URL at or after the key's position (clockwise).
+    ///
+    /// - `key`: The routing key to hash
+    /// - `is_healthy`: Function to check if a worker URL is healthy
+    pub fn find_healthy_url<F>(&self, key: &str, is_healthy: F) -> Option<&str>
+    where
+        F: Fn(&str) -> bool,
+    {
+        if self.entries.is_empty() {
+            return None;
+        }
+
+        let key_pos = Self::hash_position(key);
+
+        // Binary search to find first entry at or after key_pos
+        let start = self.entries.partition_point(|(pos, _)| *pos < key_pos);
+
+        // Walk clockwise from start, wrapping around
+        // Track visited URLs to avoid checking same worker multiple times (virtual nodes)
+        let mut checked_urls =
+            std::collections::HashSet::with_capacity(self.worker_count().min(16));
+
+        for i in 0..self.entries.len() {
+            let (_, url) = &self.entries[(start + i) % self.entries.len()];
+            let url_str: &str = url;
+
+            // Skip if we already checked this worker (from another virtual node)
+            if !checked_urls.insert(url_str) {
+                continue;
+            }
+
+            if is_healthy(url_str) {
+                return Some(url_str);
+            }
+        }
+
+        None
+    }
+
+    /// Check if the ring is empty
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Get the number of entries in the ring (including virtual nodes)
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Get the number of unique workers in the ring
+    pub fn worker_count(&self) -> usize {
+        self.entries.len() / VIRTUAL_NODES_PER_WORKER.max(1)
+    }
+}
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -55,6 +179,10 @@ pub struct WorkerRegistry {
     /// Uses Arc<[T]> instead of Arc<RwLock<Vec<T>>> for lock-free reads.
     model_index: ModelIndex,
 
+    /// Consistent hash rings per model for O(log n) routing.
+    /// Rebuilt on worker add/remove (copy-on-write).
+    hash_rings: Arc<DashMap<String, Arc<HashRing>>>,
+
     /// Workers indexed by worker type
     type_workers: Arc<DashMap<WorkerType, Vec<WorkerId>>>,
 
@@ -71,10 +199,27 @@ impl WorkerRegistry {
         Self {
             workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::new()),
+            hash_rings: Arc::new(DashMap::new()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Rebuild the hash ring for a model based on current workers in the model index
+    fn rebuild_hash_ring(&self, model_id: &str) {
+        if let Some(workers) = self.model_index.get(model_id) {
+            let ring = HashRing::new(&workers);
+            self.hash_rings.insert(model_id.to_string(), Arc::new(ring));
+        } else {
+            // No workers for this model, remove the ring
+            self.hash_rings.remove(model_id);
+        }
+    }
+
+    /// Get the hash ring for a model (O(1) lookup)
+    pub fn get_hash_ring(&self, model_id: &str) -> Option<Arc<HashRing>> {
+        self.hash_rings.get(model_id).map(|r| Arc::clone(&r))
     }
 
     /// Register a new worker
@@ -97,7 +242,7 @@ impl WorkerRegistry {
         // This creates a new immutable snapshot with the added worker
         let model_id = worker.model_id().to_string();
         self.model_index
-            .entry(model_id)
+            .entry(model_id.clone())
             .and_modify(|existing| {
                 // Create new snapshot with the additional worker
                 let mut new_workers: Vec<Arc<dyn Worker>> = existing.iter().cloned().collect();
@@ -105,6 +250,9 @@ impl WorkerRegistry {
                 *existing = Arc::from(new_workers.into_boxed_slice());
             })
             .or_insert_with(|| Arc::from(vec![worker.clone()].into_boxed_slice()));
+
+        // Rebuild hash ring for this model
+        self.rebuild_hash_ring(&model_id);
 
         // Update type index (clone needed for DashMap key ownership)
         self.type_workers
@@ -146,7 +294,8 @@ impl WorkerRegistry {
             // Remove from model index using copy-on-write
             // Create new snapshot without the removed worker
             let worker_url = worker.url();
-            if let Some(mut entry) = self.model_index.get_mut(worker.model_id()) {
+            let model_id = worker.model_id().to_string();
+            if let Some(mut entry) = self.model_index.get_mut(&model_id) {
                 let new_workers: Vec<Arc<dyn Worker>> = entry
                     .iter()
                     .filter(|w| w.url() != worker_url)
@@ -154,6 +303,9 @@ impl WorkerRegistry {
                     .collect();
                 *entry = Arc::from(new_workers.into_boxed_slice());
             }
+
+            // Rebuild hash ring for this model
+            self.rebuild_hash_ring(&model_id);
 
             // Remove from type index
             if let Some(mut type_workers) = self.type_workers.get_mut(worker.worker_type()) {
@@ -168,6 +320,7 @@ impl WorkerRegistry {
             }
 
             worker.set_healthy(false);
+            Metrics::remove_worker_metrics(worker.url());
 
             Some(worker)
         } else {
@@ -205,12 +358,6 @@ impl WorkerRegistry {
             .get(model_id)
             .map(|workers| Arc::clone(&workers))
             .unwrap_or_else(|| Arc::from(Self::EMPTY_WORKERS))
-    }
-
-    /// Alias for get_by_model for backwards compatibility
-    #[inline]
-    pub fn get_by_model_fast(&self, model_id: &str) -> Arc<[Arc<dyn Worker>]> {
-        self.get_by_model(model_id)
     }
 
     /// Get all workers by worker type
@@ -322,7 +469,7 @@ impl WorkerRegistry {
         // Start with the most efficient collection based on filters
         // Use model index when possible as it's O(1) lookup
         let workers: Vec<Arc<dyn Worker>> = if let Some(model) = model_id {
-            self.get_by_model_fast(model).to_vec()
+            self.get_by_model(model).to_vec()
         } else {
             self.get_all()
         };
@@ -377,6 +524,10 @@ impl WorkerRegistry {
         let mut regular_count = 0;
         let mut prefill_count = 0;
         let mut decode_count = 0;
+        let mut http_count = 0;
+        let mut grpc_count = 0;
+        let mut cb_open_count = 0;
+        let mut cb_half_open_count = 0;
 
         // Iterate DashMap directly to avoid cloning all workers via get_all()
         for entry in self.workers.iter() {
@@ -391,16 +542,32 @@ impl WorkerRegistry {
                 WorkerType::Prefill { .. } => prefill_count += 1,
                 WorkerType::Decode => decode_count += 1,
             }
+
+            match worker.connection_mode() {
+                ConnectionMode::Http => http_count += 1,
+                ConnectionMode::Grpc { .. } => grpc_count += 1,
+            }
+
+            match worker.circuit_breaker().state() {
+                CircuitState::Open => cb_open_count += 1,
+                CircuitState::HalfOpen => cb_half_open_count += 1,
+                CircuitState::Closed => {}
+            }
         }
 
         WorkerRegistryStats {
             total_workers,
             total_models,
             healthy_workers: healthy_count,
+            unhealthy_workers: total_workers.saturating_sub(healthy_count),
             total_load,
             regular_workers: regular_count,
             prefill_workers: prefill_count,
             decode_workers: decode_count,
+            http_workers: http_count,
+            grpc_workers: grpc_count,
+            circuit_breaker_open: cb_open_count,
+            circuit_breaker_half_open: cb_half_open_count,
         }
     }
 
@@ -425,7 +592,7 @@ impl WorkerRegistry {
 
     /// Start a health checker for all workers in the registry
     /// This should be called once after the registry is populated with workers
-    pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
+    pub(crate) fn start_health_checker(&self, check_interval_secs: u64) -> HealthChecker {
         use std::sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -469,7 +636,7 @@ impl WorkerRegistry {
             }
         });
 
-        crate::core::HealthChecker::new(handle, shutdown)
+        HealthChecker::new(handle, shutdown)
     }
 }
 
@@ -482,13 +649,30 @@ impl Default for WorkerRegistry {
 /// Statistics for the worker registry
 #[derive(Debug, Clone)]
 pub struct WorkerRegistryStats {
+    /// Total number of registered workers
     pub total_workers: usize,
+    /// Number of unique models served
     pub total_models: usize,
+    /// Number of workers passing health checks
     pub healthy_workers: usize,
+    /// Number of workers failing health checks
+    pub unhealthy_workers: usize,
+    /// Sum of current load across all workers
     pub total_load: usize,
+    /// Number of regular (non-PD) workers
     pub regular_workers: usize,
+    /// Number of prefill workers (PD mode)
     pub prefill_workers: usize,
+    /// Number of decode workers (PD mode)
     pub decode_workers: usize,
+    /// Number of HTTP-connected workers
+    pub http_workers: usize,
+    /// Number of gRPC-connected workers
+    pub grpc_workers: usize,
+    /// Number of workers with circuit breaker in Open state (not accepting requests)
+    pub circuit_breaker_open: usize,
+    /// Number of workers with circuit breaker in HalfOpen state (testing recovery)
+    pub circuit_breaker_half_open: usize,
 }
 
 #[cfg(test)]
@@ -496,7 +680,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig};
+    use crate::core::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder};
 
     #[test]
     fn test_worker_registry() {
@@ -517,7 +701,7 @@ mod tests {
                 .build(),
         );
 
-        // Register worker (WorkerFactory returns Box<dyn Worker>, convert to Arc)
+        // Register worker
         let worker_id = registry.register(Arc::from(worker));
 
         assert!(registry.get(&worker_id).is_some());
@@ -578,24 +762,21 @@ mod tests {
         registry.register(Arc::from(worker2));
         registry.register(Arc::from(worker3));
 
-        let llama_workers = registry.get_by_model_fast("llama-3");
+        let llama_workers = registry.get_by_model("llama-3");
         assert_eq!(llama_workers.len(), 2);
         let urls: Vec<String> = llama_workers.iter().map(|w| w.url().to_string()).collect();
         assert!(urls.contains(&"http://worker1:8080".to_string()));
         assert!(urls.contains(&"http://worker2:8080".to_string()));
 
-        let gpt_workers = registry.get_by_model_fast("gpt-4");
+        let gpt_workers = registry.get_by_model("gpt-4");
         assert_eq!(gpt_workers.len(), 1);
         assert_eq!(gpt_workers[0].url(), "http://worker3:8080");
 
-        let unknown_workers = registry.get_by_model_fast("unknown-model");
+        let unknown_workers = registry.get_by_model("unknown-model");
         assert_eq!(unknown_workers.len(), 0);
 
-        let llama_workers_slow = registry.get_by_model("llama-3");
-        assert_eq!(llama_workers.len(), llama_workers_slow.len());
-
         registry.remove_by_url("http://worker1:8080");
-        let llama_workers_after = registry.get_by_model_fast("llama-3");
+        let llama_workers_after = registry.get_by_model("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
     }

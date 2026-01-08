@@ -13,6 +13,8 @@ from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import (
+    MinimalA2AAttnOp,
+    SparseLinearAttention,
     UlyssesAttention_VSA,
     USPAttention,
 )
@@ -23,7 +25,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     ScaleResidual,
     ScaleResidualLayerNormScaleShift,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -41,6 +43,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -129,10 +132,10 @@ class WanSelfAttention(nn.Module):
         self.parallel_attention = parallel_attention
 
         # layers
-        self.to_q = ReplicatedLinear(dim, dim)
-        self.to_k = ReplicatedLinear(dim, dim)
-        self.to_v = ReplicatedLinear(dim, dim)
-        self.to_out = ReplicatedLinear(dim, dim)
+        self.to_q = ColumnParallelLinear(dim, dim, gather_output=True)
+        self.to_k = ColumnParallelLinear(dim, dim, gather_output=True)
+        self.to_v = ColumnParallelLinear(dim, dim, gather_output=True)
+        self.to_out = ColumnParallelLinear(dim, dim, gather_output=True)
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
@@ -215,8 +218,8 @@ class WanI2VCrossAttention(WanSelfAttention):
             supported_attention_backends=supported_attention_backends,
         )
 
-        self.add_k_proj = ReplicatedLinear(dim, dim)
-        self.add_v_proj = ReplicatedLinear(dim, dim)
+        self.add_k_proj = ColumnParallelLinear(dim, dim, gather_output=True)
+        self.add_v_proj = ColumnParallelLinear(dim, dim, gather_output=True)
         self.norm_added_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_added_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
@@ -262,23 +265,32 @@ class WanTransformerBlock(nn.Module):
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        attention_type: str = "original",
+        sla_topk: float = 0.1,
     ):
         super().__init__()
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True)
+        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
 
-        self.to_out = ReplicatedLinear(dim, dim, bias=True)
-        self.attn1 = USPAttention(
-            num_heads=num_heads,
-            head_size=dim // num_heads,
-            causal=False,
-            supported_attention_backends=supported_attention_backends,
-            prefix=f"{prefix}.attn1",
-        )
+        self.to_out = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        if attention_type == "sla":
+            self.attn1 = MinimalA2AAttnOp(
+                SparseLinearAttention(
+                    dim // num_heads, topk=sla_topk, BLKQ=128, BLKK=64
+                )
+            )
+        else:
+            self.attn1 = USPAttention(
+                num_heads=num_heads,
+                head_size=dim // num_heads,
+                causal=False,
+                supported_attention_backends=supported_attention_backends,
+                prefix=f"{prefix}.attn1",
+            )
 
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
@@ -442,12 +454,14 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True)
-        self.to_gate_compress = ReplicatedLinear(dim, dim, bias=True)
+        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_gate_compress = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=True
+        )
 
-        self.to_out = ReplicatedLinear(dim, dim, bias=True)
+        self.to_out = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
         self.attn1 = UlyssesAttention_VSA(
             num_heads=num_heads,
             head_size=dim // num_heads,
@@ -591,7 +605,7 @@ class WanTransformerBlock_VSA(nn.Module):
         return hidden_states
 
 
-class WanTransformer3DModel(CachableDiT):
+class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
     _supported_attention_backends = WanVideoConfig()._supported_attention_backends
@@ -647,6 +661,8 @@ class WanTransformer3DModel(CachableDiT):
                     self._supported_attention_backends
                     | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
                     prefix=f"{config.prefix}.blocks.{i}",
+                    attention_type=config.attention_type,
+                    sla_topk=config.sla_topk,
                 )
                 for i in range(config.num_layers)
             ]
@@ -693,6 +709,8 @@ class WanTransformer3DModel(CachableDiT):
             rope_theta=10000,
             dtype=torch.float32 if current_platform.is_mps() else torch.float64,
         )
+
+        self.layer_names = ["blocks"]
 
     def forward(
         self,
@@ -792,25 +810,10 @@ class WanTransformer3DModel(CachableDiT):
             if enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
-            offload_mgr = getattr(self, "_layerwise_offload_manager", None)
-            if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
-                for i, block in enumerate(self.blocks):
-                    with offload_mgr.layer_scope(
-                        prefetch_layer_idx=i + 1,
-                        release_layer_idx=i,
-                        non_blocking=True,
-                    ):
-                        hidden_states = block(
-                            hidden_states,
-                            encoder_hidden_states,
-                            timestep_proj,
-                            freqs_cis,
-                        )
-            else:
-                for block in self.blocks:
-                    hidden_states = block(
-                        hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
-                    )
+            for block in self.blocks:
+                hidden_states = block(
+                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                )
             # if teacache is enabled, we need to cache the original hidden states
             if enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)

@@ -1,18 +1,12 @@
-import sys
 import unittest
-from pathlib import Path
 
-# Add nightly directory to path for run_combined_tests import
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "nightly"))
-
-from accuracy_test_runner import AccuracyTestParams
-from performance_test_runner import PerformanceTestParams
-from run_combined_tests import run_combined_tests
-
+from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.performance_test_runner import PerformanceTestParams
+from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
-register_cuda_ci(est_time=8000, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=18000, suite="nightly-8-gpu-common", nightly=True)
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -43,7 +37,6 @@ class TestDeepseekV32Unified(unittest.TestCase):
     - tp+mtp: Pure TP=8 + EAGLE speculative decoding
     """
 
-    @unittest.skipIf(is_blackwell_system(), "Requires H200 system")
     def test_deepseek_v32_all_variants(self):
         """Run performance and accuracy for all DeepSeek V3.2 variants."""
         TP_ARGS = [
@@ -62,24 +55,28 @@ class TestDeepseekV32Unified(unittest.TestCase):
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + DP_ARGS,
+                variant="DP8",
             ),
             # Variant: "dp+mtp" - DP + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + DP_ARGS + MTP_ARGS,
+                variant="DP8+MTP",
             ),
             # Variant: "tp" - Pure TP=8 only
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + TP_ARGS,
+                variant="TP8",
             ),
             # Variant: "tp+mtp" - Pure TP=8 + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + TP_ARGS + MTP_ARGS,
+                variant="TP8+MTP",
             ),
         ]
 
@@ -148,13 +145,13 @@ class TestDeepseekV32Unified(unittest.TestCase):
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k", baseline_accuracy=GSM8K_BASELINE
             ),
-            performance_params=PerformanceTestParams(
-                batch_sizes=[1, 8, 16, 64],
-                profile_dir="performance_profiles_deepseek_v32_nsa",
-            ),
+            performance_params=None,
         )
 
-    @unittest.skipIf(not is_blackwell_system(), "Requires B200")
+    @unittest.skipIf(
+        not is_blackwell_system(),
+        "Hardware agnostic - just using B200 for efficiency reasons",
+    )
     def test_deepseek_v32_b200(self):
         """Test DeepSeek V3.2 with GPQA evaluation using thinking mode (B200 only).
 

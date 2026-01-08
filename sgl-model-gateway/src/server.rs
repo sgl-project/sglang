@@ -23,13 +23,16 @@ use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::{
+        job_queue::{JobQueue, JobQueueConfig},
         steps::{
             create_external_worker_registration_workflow, create_mcp_registration_workflow,
-            create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
-            create_worker_registration_workflow, create_worker_removal_workflow,
-            create_worker_update_workflow,
+            create_tokenizer_registration_workflow, create_wasm_module_registration_workflow,
+            create_wasm_module_removal_workflow, create_worker_registration_workflow,
+            create_worker_removal_workflow, create_worker_update_workflow,
         },
-        Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
+        worker::WorkerType,
+        worker_manager::WorkerManager,
+        Job,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -46,10 +49,11 @@ use crate::{
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
+        tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
-    routers::{conversations, router_manager::RouterManager, RouterTrait},
+    routers::{conversations, parse, router_manager::RouterManager, tokenize, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     workflow::{LoggingSubscriber, WorkflowEngine},
@@ -66,14 +70,14 @@ async fn parse_function_call(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ParseFunctionCallRequest>,
 ) -> Response {
-    state.router.parse_function_call(&req).await
+    parse::parse_function_call(&state.context, &req).await
 }
 
 async fn parse_reasoning(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SeparateReasoningRequest>,
 ) -> Response {
-    state.router.parse_reasoning(&req).await
+    parse::parse_reasoning(&state.context, &req).await
 }
 
 async fn sink_handler() -> Response {
@@ -461,6 +465,56 @@ async fn update_worker(
     }
 }
 
+// ============================================================================
+// Tokenize / Detokenize Handlers
+// ============================================================================
+
+async fn v1_tokenize(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TokenizeRequest>,
+) -> Response {
+    tokenize::tokenize(&state.context.tokenizer_registry, request).await
+}
+
+async fn v1_detokenize(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<DetokenizeRequest>,
+) -> Response {
+    tokenize::detokenize(&state.context.tokenizer_registry, request).await
+}
+
+async fn v1_tokenizers_add(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AddTokenizerRequest>,
+) -> Response {
+    tokenize::add_tokenizer(&state.context, request).await
+}
+
+async fn v1_tokenizers_list(State(state): State<Arc<AppState>>) -> Response {
+    tokenize::list_tokenizers(&state.context.tokenizer_registry).await
+}
+
+async fn v1_tokenizers_get(
+    State(state): State<Arc<AppState>>,
+    Path(tokenizer_id): Path<String>,
+) -> Response {
+    tokenize::get_tokenizer_info(&state.context, &tokenizer_id).await
+}
+
+async fn v1_tokenizers_status(
+    State(state): State<Arc<AppState>>,
+    Path(tokenizer_id): Path<String>,
+) -> Response {
+    tokenize::get_tokenizer_status(&state.context, &tokenizer_id).await
+}
+
+async fn v1_tokenizers_remove(
+    State(state): State<Arc<AppState>>,
+    Path(tokenizer_id): Path<String>,
+) -> Response {
+    tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -473,11 +527,14 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
+    /// Control plane authentication configuration
+    pub control_plane_auth: Option<crate::auth::ControlPlaneAuthConfig>,
 }
 
 pub fn build_app(
     app_state: Arc<AppState>,
     auth_config: AuthConfig,
+    control_plane_auth_state: Option<crate::auth::ControlPlaneAuthState>,
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
@@ -516,6 +573,9 @@ pub fn build_app(
             "/v1/conversations/{conversation_id}/items/{item_id}",
             get(v1_conversations_get_item).delete(v1_conversations_delete_item),
         )
+        // Tokenize / Detokenize endpoints
+        .route("/v1/tokenize", post(v1_tokenize))
+        .route("/v1/detokenize", post(v1_detokenize))
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             middleware::concurrency_limit_middleware,
@@ -539,6 +599,7 @@ pub fn build_app(
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));
 
+    // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
@@ -547,21 +608,44 @@ pub fn build_app(
         .route("/wasm", post(add_wasm_module))
         .route("/wasm/{module_uuid}", delete(remove_wasm_module))
         .route("/wasm", get(list_wasm_modules))
-        .route_layer(axum::middleware::from_fn_with_state(
-            auth_config.clone(),
-            middleware::auth_middleware,
-        ));
+        // Tokenizer management endpoints
+        .route(
+            "/v1/tokenizers",
+            post(v1_tokenizers_add).get(v1_tokenizers_list),
+        )
+        .route(
+            "/v1/tokenizers/{tokenizer_id}",
+            get(v1_tokenizers_get).delete(v1_tokenizers_remove),
+        )
+        .route(
+            "/v1/tokenizers/{tokenizer_id}/status",
+            get(v1_tokenizers_status),
+        );
 
+    // Build worker routes
     let worker_routes = Router::new()
         .route("/workers", post(create_worker).get(list_workers_rest))
         .route(
             "/workers/{worker_id}",
             get(get_worker).put(update_worker).delete(delete_worker),
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            auth_config.clone(),
-            middleware::auth_middleware,
-        ));
+        );
+
+    // Apply authentication middleware to control plane routes
+    let apply_control_plane_auth = |routes: Router<Arc<AppState>>| {
+        if let Some(ref cp_state) = control_plane_auth_state {
+            routes.route_layer(axum::middleware::from_fn_with_state(
+                cp_state.clone(),
+                crate::auth::control_plane_auth_middleware,
+            ))
+        } else {
+            routes.route_layer(axum::middleware::from_fn_with_state(
+                auth_config.clone(),
+                middleware::auth_middleware,
+            ))
+        }
+    };
+    let admin_routes = apply_control_plane_auth(admin_routes);
+    let worker_routes = apply_control_plane_auth(worker_routes);
 
     Router::new()
         .merge(protected_routes)
@@ -573,7 +657,9 @@ pub fn build_app(
             max_payload_size,
         ))
         .layer(middleware::create_logging_layer())
-        .layer(middleware::HttpMetricsLayer::new())
+        .layer(middleware::HttpMetricsLayer::new(
+            app_state.context.inflight_tracker.clone(),
+        ))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
@@ -607,7 +693,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 json_format: false,
                 log_dir: config.log_dir.clone(),
                 colorize: true,
-                log_file_name: "sgl-model-gateway".to_string(),
+                log_file_name: "smg".to_string(),
                 log_targets: None,
             },
             config.router_config.trace_config.clone(),
@@ -632,6 +718,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let app_context = Arc::new(
         AppContext::from_config(config.router_config.clone(), config.request_timeout_secs).await?,
     );
+
+    if config.prometheus_config.is_some() {
+        app_context.inflight_tracker.start_sampler(20);
+    }
 
     let weak_context = Arc::downgrade(&app_context);
     let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
@@ -669,6 +759,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     engine
         .register_workflow(create_wasm_module_removal_workflow())
         .expect("wasm_module_removal workflow should be valid");
+    engine
+        .register_workflow(create_tokenizer_registration_workflow())
+        .expect("tokenizer_registration workflow should be valid");
     app_context
         .workflow_engine
         .set(engine)
@@ -811,9 +904,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         api_key: config.router_config.api_key.clone(),
     };
 
+    // Initialize control plane authentication if configured
+    let control_plane_auth_state =
+        crate::auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
+
     let app = build_app(
         app_state,
         auth_config,
+        control_plane_auth_state,
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),

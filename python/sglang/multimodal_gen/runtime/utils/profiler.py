@@ -111,19 +111,14 @@ class SGLDiffusionProfiler:
         self.profiler.stop()
 
         if export_trace:
-            self._export_trace(dump_rank)
+            if dump_rank is not None and dump_rank != self.rank:
+                pass
+            else:
+                self._export_trace()
 
         SGLDiffusionProfiler._instance = None
 
-    def _export_trace(self, dump_rank: int | None = None):
-        if dump_rank is None:
-            dump_rank = self.rank
-
-        current_rank = (
-            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        )
-        if current_rank != dump_rank:
-            return
+    def _export_trace(self):
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)
@@ -131,7 +126,7 @@ class SGLDiffusionProfiler:
             trace_path = os.path.abspath(
                 os.path.join(
                     self.log_dir,
-                    f"{self.request_id}-{sanitized_profile_mode_id}-global-rank{dump_rank}.trace.json.gz",
+                    f"{self.request_id}-{sanitized_profile_mode_id}-global-rank{self.rank}.trace.json.gz",
                 )
             )
             self.profiler.export_chrome_trace(trace_path)
