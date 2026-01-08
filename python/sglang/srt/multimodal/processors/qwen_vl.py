@@ -163,6 +163,7 @@ async def preprocess_video(
     nframes, _, height, width = video.shape
     min_pixels = video_config.get("min_pixels", VIDEO_MIN_PIXELS)
     total_pixels = video_config.get("total_pixels", VIDEO_TOTAL_PIXELS)
+    video_factor = video_config.get("factor", image_factor)
     max_pixels = max(
         min(
             video_config.get("max_pixels", VIDEO_MAX_PIXELS),
@@ -184,13 +185,13 @@ async def preprocess_video(
         resized_height, resized_width = smart_resize(
             video_config["resized_height"],
             video_config["resized_width"],
-            factor=image_factor,
+            factor=video_factor,
         )
     else:
         resized_height, resized_width = smart_resize(
             height,
             width,
-            factor=image_factor,
+            factor=video_factor,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         )
