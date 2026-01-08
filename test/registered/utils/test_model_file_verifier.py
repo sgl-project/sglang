@@ -1,6 +1,8 @@
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -35,7 +37,7 @@ class TestModelFileVerifier(unittest.TestCase):
 
     def test_generate_checksums(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        checksums = generate_checksums(self.test_dir, checksums_file)
+        checksums = generate_checksums(source=self.test_dir, output_path=checksums_file)
 
         self.assertEqual(len(checksums), 3)
         for filename in self.files:
@@ -50,37 +52,37 @@ class TestModelFileVerifier(unittest.TestCase):
 
     def test_verify_intact_files(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        generate_checksums(self.test_dir, checksums_file)
-        verify(self.test_dir, checksums_file)
+        generate_checksums(source=self.test_dir, output_path=checksums_file)
+        verify(model_path=self.test_dir, checksums_source=checksums_file)
 
     def test_detect_bit_rot(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        generate_checksums(self.test_dir, checksums_file)
+        generate_checksums(source=self.test_dir, output_path=checksums_file)
 
         target_file = os.path.join(self.test_dir, "model.safetensors")
         _flip_bit_in_file(target_file, byte_offset=50, bit_position=3)
 
         with self.assertRaises(IntegrityError) as ctx:
-            verify(self.test_dir, checksums_file)
+            verify(model_path=self.test_dir, checksums_source=checksums_file)
 
         self.assertIn("model.safetensors", str(ctx.exception))
         self.assertIn("mismatch", str(ctx.exception).lower())
 
     def test_detect_missing_file(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        generate_checksums(self.test_dir, checksums_file)
+        generate_checksums(source=self.test_dir, output_path=checksums_file)
 
         os.remove(os.path.join(self.test_dir, "config.json"))
 
         with self.assertRaises(IntegrityError) as ctx:
-            verify(self.test_dir, checksums_file)
+            verify(model_path=self.test_dir, checksums_source=checksums_file)
 
         self.assertIn("config.json", str(ctx.exception))
 
     def test_verify_with_external_checksums_file(self):
         external_checksums_path = os.path.join(self.test_dir, "external_checksums.json")
-        generate_checksums(self.test_dir, external_checksums_path)
-        verify(self.test_dir, external_checksums_path)
+        generate_checksums(source=self.test_dir, output_path=external_checksums_path)
+        verify(model_path=self.test_dir, checksums_source=external_checksums_path)
 
     def test_compute_sha256(self):
         test_file = os.path.join(self.test_dir, "test.bin")
@@ -88,7 +90,7 @@ class TestModelFileVerifier(unittest.TestCase):
         with open(test_file, "wb") as f:
             f.write(content)
 
-        result = compute_sha256(test_file)
+        result = compute_sha256(file_path=test_file)
 
         import hashlib
 
@@ -102,7 +104,9 @@ class TestModelFileVerifier(unittest.TestCase):
             )
 
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        checksums = generate_checksums(self.test_dir, checksums_file, max_workers=4)
+        checksums = generate_checksums(
+            source=self.test_dir, output_path=checksums_file, max_workers=4
+        )
 
         self.assertGreaterEqual(len(checksums), 10)
 
@@ -130,20 +134,14 @@ class TestModelFileVerifierWithRealModel(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def _run_server_test(self, corrupt_weights: bool):
+    def _run_server_test(self, *, corrupt_weights: bool):
         import requests
-        import subprocess
-        import sys
 
         from sglang.srt.utils import kill_process_tree
-        from sglang.test.test_utils import (
-            DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            DEFAULT_URL_FOR_TEST,
-            popen_launch_server,
-        )
+        from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        generate_checksums(self.test_dir, checksums_file)
+        generate_checksums(source=self.test_dir, output_path=checksums_file)
 
         if corrupt_weights:
             safetensors_files = [
@@ -153,50 +151,60 @@ class TestModelFileVerifierWithRealModel(unittest.TestCase):
             target_file = os.path.join(self.test_dir, safetensors_files[0])
             _flip_bit_in_file(target_file, byte_offset=1000, bit_position=5)
 
-        if corrupt_weights:
-            _, host, port = DEFAULT_URL_FOR_TEST.split(":")
-            host = host[2:]
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "sglang.launch_server",
-                    "--model-path",
-                    self.test_dir,
-                    "--host",
-                    host,
-                    "--port",
-                    port,
-                    "--model-checksum",
-                    checksums_file,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            self.assertNotEqual(result.returncode, 0)
-            combined_output = result.stdout + result.stderr
-            self.assertTrue(
-                "IntegrityError" in combined_output
-                or "mismatch" in combined_output.lower(),
-                f"Expected integrity error, got: {combined_output[-500:]}",
-            )
-        else:
-            process = popen_launch_server(
+        _, host, port = DEFAULT_URL_FOR_TEST.split(":")
+        host = host[2:]
+
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "sglang.launch_server",
+                "--model-path",
                 self.test_dir,
-                DEFAULT_URL_FOR_TEST,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=["--model-checksum", checksums_file],
-            )
-            try:
+                "--host",
+                host,
+                "--port",
+                port,
+                "--model-checksum",
+                checksums_file,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        try:
+            if corrupt_weights:
+                stdout, stderr = process.communicate(timeout=60)
+                self.assertNotEqual(process.returncode, 0)
+                combined_output = stdout + stderr
+                self.assertTrue(
+                    "IntegrityError" in combined_output
+                    or "mismatch" in combined_output.lower(),
+                    f"Expected integrity error, got: {combined_output[-500:]}",
+                )
+            else:
+                import time
+
+                for _ in range(60):
+                    time.sleep(1)
+                    try:
+                        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health")
+                        if response.status_code == 200:
+                            break
+                    except requests.exceptions.ConnectionError:
+                        continue
+                else:
+                    self.fail("Server did not start in time")
+
                 response = requests.post(
                     f"{DEFAULT_URL_FOR_TEST}/generate",
                     json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
                 )
                 self.assertEqual(response.status_code, 200)
                 self.assertIn("text", response.json())
-            finally:
-                kill_process_tree(process.pid)
+        finally:
+            kill_process_tree(process.pid)
 
     def test_server_launch_with_checksum_intact(self):
         self._run_server_test(corrupt_weights=False)

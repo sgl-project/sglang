@@ -2,8 +2,8 @@
 Model File Verifier - Verify model file integrity using SHA256 checksums.
 
 Standalone usage:
-    python -m sglang.srt.utils.model_file_verifier generate --model-path /path/to/model --output checksums.json
-    python -m sglang.srt.utils.model_file_verifier generate --model-path Qwen/Qwen3-0.6B --output checksums.json
+    python -m sglang.srt.utils.model_file_verifier generate --model-path /path/to/model --model-checksum checksums.json
+    python -m sglang.srt.utils.model_file_verifier generate --model-path Qwen/Qwen3-0.6B --model-checksum checksums.json
     python -m sglang.srt.utils.model_file_verifier verify --model-path /path/to/model --model-checksum checksums.json
 
 As a module:
@@ -27,15 +27,15 @@ IGNORE_PATTERNS = [
 # ======== Verify ========
 
 
-def verify(model_path: str, checksums_source: str, max_workers: int = 4) -> None:
+def verify(*, model_path: str, checksums_source: str, max_workers: int = 4) -> None:
     model_path = Path(model_path).resolve()
     expected = _load_checksums(checksums_source)
-    actual = _compute_checksums(model_path, list(expected.keys()), max_workers)
-    _compare_checksums(expected, actual)
+    actual = _compute_checksums(model_path=model_path, filenames=list(expected.keys()), max_workers=max_workers)
+    _compare_checksums(expected=expected, actual=actual)
     print(f"[ModelFileVerifier] All {len(expected)} files verified successfully.")
 
 
-def _compare_checksums(expected: Dict[str, str], actual: Dict[str, str]) -> None:
+def _compare_checksums(*, expected: Dict[str, str], actual: Dict[str, str]) -> None:
     mismatches = []
     missing = []
 
@@ -68,12 +68,12 @@ def _compare_checksums(expected: Dict[str, str], actual: Dict[str, str]) -> None
 
 
 def generate_checksums(
-    source: str, output_path: str, max_workers: int = 4
+    *, source: str, output_path: str, max_workers: int = 4
 ) -> Dict[str, str]:
     if Path(source).is_dir():
-        checksums = _generate_checksums_from_local(source, max_workers)
+        checksums = _generate_checksums_from_local(model_path=source, max_workers=max_workers)
     else:
-        checksums = _load_checksums_from_hf(source)
+        checksums = _load_checksums_from_hf(repo_id=source)
 
     output = {"checksums": checksums}
     Path(output_path).write_text(json.dumps(output, indent=2, sort_keys=True))
@@ -85,7 +85,7 @@ def generate_checksums(
 
 
 def _generate_checksums_from_local(
-    model_path: str, max_workers: int
+    *, model_path: str, max_workers: int
 ) -> Dict[str, str]:
     model_path = Path(model_path).resolve()
     files = _discover_files(model_path)
@@ -93,7 +93,7 @@ def _generate_checksums_from_local(
     if not files:
         raise IntegrityError(f"No model files found in {model_path}")
 
-    return _compute_checksums(model_path, files, max_workers)
+    return _compute_checksums(model_path=model_path, filenames=files, max_workers=max_workers)
 
 
 def _discover_files(model_path: Path) -> List[str]:
@@ -118,10 +118,10 @@ def _load_checksums(source: str) -> Dict[str, str]:
     if Path(source).is_file():
         data = json.loads(Path(source).read_text())
         return data["checksums"]
-    return _load_checksums_from_hf(source)
+    return _load_checksums_from_hf(repo_id=source)
 
 
-def _load_checksums_from_hf(repo_id: str) -> Dict[str, str]:
+def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
     try:
         from huggingface_hub import HfFileSystem
     except ImportError:
@@ -163,13 +163,13 @@ def _load_checksums_from_hf(repo_id: str) -> Dict[str, str]:
 
 
 def _compute_checksums(
-    model_path: Path, filenames: List[str], max_workers: int
+    *, model_path: Path, filenames: List[str], max_workers: int
 ) -> Dict[str, str]:
     from tqdm import tqdm
 
     def compute_one(filename: str) -> Tuple[str, str]:
         full_path = model_path / filename
-        sha256 = compute_sha256(full_path)
+        sha256 = compute_sha256(file_path=full_path)
         return filename, sha256
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -184,7 +184,7 @@ def _compute_checksums(
     return dict(results)
 
 
-def compute_sha256(file_path: Path) -> str:
+def compute_sha256(*, file_path) -> str:
     sha256 = hashlib.sha256()
     with open(file_path, "rb") as f:
         while chunk := f.read(64 * 1024):
@@ -218,14 +218,6 @@ def _add_common_args(parser):
     )
 
 
-def _cli_generate(args):
-    generate_checksums(args.model_path, args.model_checksum, args.workers)
-
-
-def _cli_verify(args):
-    verify(args.model_path, args.model_checksum, args.workers)
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Model File Verifier - Verify model file integrity using checksums"
@@ -236,13 +228,25 @@ def main():
         "generate", help="Generate checksums.json for a model"
     )
     _add_common_args(gen_parser)
-    gen_parser.set_defaults(func=_cli_generate)
+    gen_parser.set_defaults(
+        func=lambda args: generate_checksums(
+            source=args.model_path,
+            output_path=args.model_checksum,
+            max_workers=args.workers,
+        )
+    )
 
     verify_parser = subparsers.add_parser(
         "verify", help="Verify model files against checksums"
     )
     _add_common_args(verify_parser)
-    verify_parser.set_defaults(func=_cli_verify)
+    verify_parser.set_defaults(
+        func=lambda args: verify(
+            model_path=args.model_path,
+            checksums_source=args.model_checksum,
+            max_workers=args.workers,
+        )
+    )
 
     args = parser.parse_args()
     args.func(args)
