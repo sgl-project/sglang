@@ -29,6 +29,7 @@ class LoadFormat(str, enum.Enum):
     REMOTE_INSTANCE = "remote_instance"
     RDMA = "rdma"
     LOCAL_CACHED = "local_cached"
+    SERVERLESS_LLM = "serverless_llm"
     FASTSAFETENSORS = "fastsafetensors"
     PRIVATE = "private"
 
