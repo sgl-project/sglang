@@ -64,8 +64,8 @@ jobs:
                     --json labels \
                     | jq -r '.labels[].name' || true)
 
-                  if echo "$labels" | grep -q "^high-priority$"; then
-                    echo "🛑 PR #$pr_number has label 'high-priority' → skip cancel"
+                  if echo "$labels" | grep -Fxq "high priority"; then
+                    echo "🛑 PR #$pr_number has label 'high priority' → skip cancel"
                     continue
                   fi
 
