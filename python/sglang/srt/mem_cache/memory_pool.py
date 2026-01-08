@@ -55,7 +55,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_float4_e2m1fn_x2, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -1117,9 +1117,15 @@ class HybridLinearKVPool(KVCache):
         self.use_mla = use_mla
         if not use_mla:
 
-            TokenToKVPoolClass = MHATokenToKVPool
+            if is_float4_e2m1fn_x2(dtype):
+                TokenToKVPoolClass = MHATokenToKVPoolFP4
+            else:
+                TokenToKVPoolClass = MHATokenToKVPool
 
             if _is_npu:
+                assert not is_float4_e2m1fn_x2(
+                    dtype
+                ), "FP4 is not supported on NPU yet."
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
                 )
