@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from typing import List, Optional, Tuple
 
@@ -103,6 +104,8 @@ class EagleDraftWorker(BaseDraftWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # TODO(xjwei): too ugly!!!
+        self.enable_spec_overlap_reflow = os.environ.get("ENABLE_SPECULATIVE_OVERLAP_REFLOW", "0") == "1"
 
         # Set constant
         EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
@@ -283,7 +286,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Run draft
-        if can_cuda_graph:
+        if can_cuda_graph and not self.enable_spec_overlap_reflow:  # TODO(xjwei) 目前流重构与之相匹配的图捕获，应该去捕获draft模型的内容，开了流重构后，此处的draft里面就没有模型了，不需要被捕获。
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch,
             )
@@ -422,6 +425,102 @@ class EagleDraftWorker(BaseDraftWorker):
 
         return parent_list, top_scores_index, draft_tokens
 
+    def draft_v2(self, model_worker_batch: ModelWorkerBatch, batch_result: GenerationBatchResult):
+        if self.speculative_num_steps == 0:
+            return
+
+        model_worker_batch.forward_mode = (
+            ForwardMode.IDLE
+            if model_worker_batch.forward_mode.is_idle()
+            else ForwardMode.DECODE
+        )
+        model_worker_batch.input_ids = batch_result.next_draft_input.topk_index
+        model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+        model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.cpu()
+
+        draft_input: EagleDraftInput = model_worker_batch.spec_info
+        forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
+            self.req_to_token_pool,
+            model_worker_batch,
+            self.cuda_graph_runner,
+            self.draft_runner,
+            self.topk,
+            self.speculative_num_steps,
+        )
+
+        # Run draft
+        if can_cuda_graph:
+            ret_topk_p_list, ret_topk_index_list = self.cuda_graph_runner.replay(
+                forward_batch,
+            )
+        else:
+            if not forward_batch.forward_mode.is_idle():
+                self.draft_attn_backend.init_forward_metadata(forward_batch)
+            ret_topk_p_list, ret_topk_index_list = self.draft_forward_v2(
+                forward_batch
+            )
+
+        next_draft_input = batch_result.next_draft_input
+        ret_topk_p_list = [next_draft_input.topk_p] + ret_topk_index_list
+        ret_topk_index_list = [next_draft_input.topk_index] + ret_topk_index_list
+        (
+            next_draft_input.topk_p,
+            next_draft_input.topk_index,
+            next_draft_input.hidden_states,
+        ) = (
+            torch.cat(ret_topk_p_list, dim=1).clone(),
+            torch.cat(ret_topk_index_list, dim=1).clone(),
+            None,  # if use spec overlap reflow, we do not need to save hidden_states for target mode
+        )
+
+    def draft_forward_2(self, forward_batch: ForwardBatch):
+        # Parse args
+        spec_info: EagleDraftInput = forward_batch.spec_info
+        out_cache_loc = forward_batch.out_cache_loc
+        ret_topk_p, ret_topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+
+        out_cache_loc = out_cache_loc.reshape(
+            forward_batch.batch_size, self.topk, self.speculative_num_steps
+        )
+        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
+            self.speculative_num_steps, -1
+        )
+
+        # Return values
+        ret_topk_p_list = []
+        ret_topk_index_list = []
+
+        # Forward multiple steps
+        scores = None
+        for i in range(self.speculative_num_steps):
+            if i == self.speculative_num_steps - 1:
+                break
+
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, ret_topk_p, ret_topk_index, hidden_states, scores, self.topk
+            )
+            forward_batch.input_ids = input_ids
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            forward_batch.positions.add_(1)
+            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            spec_info.hidden_states = hidden_states
+
+            draft_logits_output = self.draft_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            ).logits_output
+            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+            hidden_states = draft_logits_output.hidden_states
+
+            ret_topk_p_list.append(ret_topk_p)
+            ret_topk_index_list.append(ret_topk_index)
+
+        return ret_topk_p_list, ret_topk_index_list
+
     def draft_extend(self):
         pass
 
@@ -523,105 +622,32 @@ class EagleDraftWorker(BaseDraftWorker):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
-        ret_topk_p_list = []
-        ret_topk_index_list = []
 
-        draft_logits_output = self.draft_runner.forward(
-            forward_batch, skip_attn_backend_init=True
-        ).logits_output
-        # Reorganize the spec info for the next batch
-        draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-            select_index
-        ]
-        probs = torch.softmax(
-            draft_logits_output.next_token_logits[select_index], dim=-1
+        # Run draft extend batch in the main compute stream
+        can_cuda_graph = (
+            self.cuda_graph_runner_for_draft_extend
+            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
-        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-        ret_topk_p_list.append(ret_topk_p)
-        ret_topk_index_list.append(ret_topk_index)
-        seq_lens_bk = batch.seq_lens
-        for step in range(self.speculative_num_steps):
-            # log_info_on_rank0(logger, f"step: {step}, forward_batch.input_ids: {forward_batch.input_ids}")
-            # if can_cuda_graph:
-            #     draft_logits_output = (
-            #         self.cuda_graph_runner_for_draft_extend.get_runner(step).replay(
-            #             forward_batch, init_state=(step == 0)
-            #         )
-            #     )
-            #     ret_topk_p, ret_topk_index = (
-            #         draft_logits_output.topk_p,
-            #         draft_logits_output.topk_index,
-            #     )
-            # else:
-            # todo draft_extend + decode
-            if step == self.speculative_num_steps - 1:
-                break
-            if step == 0:
-                scores = None
-                batch.forward_mode = (
-                    ForwardMode.IDLE
-                    if batch.forward_mode.is_idle()
-                    else ForwardMode.DECODE
-                )
-                batch.input_ids = ret_topk_index
-                # batch.seq_lens = batch_result.next_draft_input.new_seq_lens
-                # batch.seq_lens_cpu = batch.seq_lens.cpu()
-                with self.plan_stream_ctx:
-                    forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
-                        self.req_to_token_pool,
-                        batch,
-                        None,
-                        self.draft_runner,
-                        self.topk,
-                        self.speculative_num_steps,
-                    )
-                    if not batch.forward_mode.is_idle():
-                        self.draft_attn_backend.init_forward_metadata(forward_batch)
-                if self.plan_stream:
-                    torch.get_device_module(self.device).current_stream().wait_stream(
-                        self.plan_stream
-                    )
-                spec_info = forward_batch.spec_info
-                out_cache_loc = forward_batch.out_cache_loc
-                out_cache_loc = out_cache_loc.reshape(
-                    forward_batch.batch_size, self.topk, self.speculative_num_steps
-                )
-                out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-                    self.speculative_num_steps, -1
-                )
-                # if not forward_batch.forward_mode.is_idle():
-                #     print(f"xxxxxx draft xxx {out_cache_loc=}")
-
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                step,
-                ret_topk_p,
-                ret_topk_index,
-                draft_logits_output.hidden_states,
-                scores,
-                self.topk,
+        if can_cuda_graph:
+            draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
+                forward_batch
             )
-            forward_batch.input_ids = input_ids
-            forward_batch.out_cache_loc = out_cache_loc[step]
-            forward_batch.positions.add_(1)
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[step]
-            spec_info.hidden_states = hidden_states
-            # print(f"{input_ids.shape=} {forward_batch.out_cache_loc.shape=} {forward_batch.seq_lens_cpu=} {forward_batch.seq_lens=}")
-
-            # if not forward_batch.forward_mode.is_idle():
-            #     print(
-            #         f"xxxxxxxxx {step=} {forward_batch.input_ids=} {hidden_states.float().sum()=} {forward_batch.out_cache_loc=}"
-            #     )
-            # print(f"======xxx {forward_batch.forward_mode=}")
+        else:
             draft_logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
-            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-            # if not forward_batch.forward_mode.is_idle():
-            #     print(f"xxxxxxxxx {step=} {ret_topk_index=}")
-            ret_topk_p_list.append(ret_topk_p)
-            ret_topk_index_list.append(ret_topk_index)
-        batch.seq_lens = seq_lens_bk
+
+        # Reorganize the spec info for the next batch
+        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
+            select_index
+        ]
+        draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+            select_index
+        ]
+        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+        ret_hidden_states = draft_logits_output.hidden_states
+
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
         (
@@ -629,10 +655,16 @@ class EagleDraftWorker(BaseDraftWorker):
             next_draft_input.topk_index,
             next_draft_input.hidden_states,
         ) = (
-            torch.cat(ret_topk_p_list, dim=1).clone(),
-            torch.cat(ret_topk_index_list, dim=1).clone(),
-            None,
+            ret_topk_p,
+            ret_topk_index,
+            ret_hidden_states,
         )
+
+        if self.enable_spec_overlap_reflow:
+            seq_lens_bk = batch.seq_lens
+            batch.spec_info = next_draft_input
+            self.draft_v2(batch, batch_result)
+            batch.seq_lens = seq_lens_bk
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
