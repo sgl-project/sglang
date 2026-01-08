@@ -59,7 +59,6 @@ class DFlashWorker:
         )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
-        draft_server_args.disable_cuda_graph = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
         if draft_backend is None:
             draft_backend, _ = draft_server_args.get_attention_backends()
@@ -319,28 +318,34 @@ class DFlashWorker:
                 bs,
             )
 
-            seq_lens = block_end.to(torch.int64)
+            # Use TARGET_VERIFY mode (cuda-graphable) to run a fixed-size draft block.
+            # In this mode, `seq_lens` stores the prefix lengths; attention backends
+            # derive kv_len by adding `draft_token_num`.
+            draft_spec_info = DFlashVerifyInput(
+                draft_token=torch.empty((0,), dtype=torch.long, device=device),
+                positions=torch.empty((0,), dtype=torch.int64, device=device),
+                draft_token_num=int(self.block_size),
+                custom_mask=None,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
+            seq_lens = prefix_lens.to(torch.int32)
             forward_batch = ForwardBatch(
-                forward_mode=ForwardMode.EXTEND,
+                forward_mode=ForwardMode.TARGET_VERIFY,
                 batch_size=bs,
                 input_ids=block_ids.flatten(),
                 req_pool_indices=batch.req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=block_cache_loc,
                 seq_lens_sum=int(seq_lens.sum().item()),
-                seq_lens_cpu=torch.tensor(seq_lens.cpu().tolist(), dtype=torch.int64),
+                seq_lens_cpu=torch.tensor(prefix_lens_cpu, dtype=torch.int32),
                 positions=positions,
-                extend_num_tokens=bs * self.block_size,
-                extend_seq_lens=extend_lens,
-                extend_prefix_lens=prefix_lens,
-                extend_start_loc=extend_start_loc,
-                extend_prefix_lens_cpu=prefix_lens_cpu,
-                extend_seq_lens_cpu=[int(self.block_size)] * bs,
-                extend_logprob_start_lens_cpu=[0] * bs,
                 req_to_token_pool=self.native_draft_model_runner.req_to_token_pool,
                 token_to_kv_pool=self.native_draft_model_runner.token_to_kv_pool,
                 attn_backend=self.native_draft_model_runner.attn_backend,
                 input_embeds=input_embeds,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                spec_info=draft_spec_info,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
             )
 
             with torch.inference_mode():
