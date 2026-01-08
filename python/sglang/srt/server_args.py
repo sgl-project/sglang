@@ -1471,8 +1471,10 @@ class ServerArgs:
                         self.mamba_track_interval % self.page_size == 0
                     ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
                     assert (
-                        FLA_CHUNK_SIZE % self.page_size == 0
-                    ), f"Page size for hybrid GDN model must be divisible by {FLA_CHUNK_SIZE}, got {self.page_size}"
+                        max(FLA_CHUNK_SIZE, self.page_size)
+                        % min(FLA_CHUNK_SIZE, self.page_size)
+                        == 0
+                    ), f"max(FLA_CHUNK_SIZE, self.page_size) % min(FLA_CHUNK_SIZE, self.page_size) should be 0, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
 
             elif not self.disable_radix_cache:
                 logger.warning(
@@ -1991,21 +1993,31 @@ class ServerArgs:
             or self.disaggregation_decode_enable_offload_kvcache
         ) and self.hicache_io_backend == "kernel":
             # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
-            if self.decode_attention_backend is None:
-                if not self.use_mla_backend():
-                    self.decode_attention_backend = (
-                        "flashinfer" if is_flashinfer_available() else "triton"
-                    )
+            # Only override when the *effective* decode backend would be FA3.
+            # Otherwise, respect the user's chosen attention backend (e.g., aiter on ROCm).
+            effective_decode_backend = (
+                self.decode_attention_backend
+                if self.decode_attention_backend is not None
+                else self.attention_backend
+            )
+            if effective_decode_backend == "fa3":
+                if self.decode_attention_backend is None:
+                    # If decode backend wasn't explicitly set, pick a safe default that works with HiCache kernel IO.
+                    if not self.use_mla_backend():
+                        self.decode_attention_backend = (
+                            "flashinfer" if is_flashinfer_available() else "triton"
+                        )
+                    else:
+                        self.decode_attention_backend = (
+                            "flashinfer" if is_sm100_supported() else "triton"
+                        )
                 else:
-                    self.decode_attention_backend = (
-                        "flashinfer" if is_sm100_supported() else "triton"
+                    # If user explicitly requested FA3 decode, fall back to direct IO.
+                    self.hicache_io_backend = "direct"
+                    logger.warning(
+                        "FlashAttention3 decode backend is not compatible with hierarchical cache. "
+                        "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                     )
-            elif self.decode_attention_backend == "fa3":
-                self.hicache_io_backend = "direct"
-                logger.warning(
-                    "FlashAttention3 decode backend is not compatible with hierarchical cache. "
-                    "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
-                )
 
     def _handle_speculative_decoding(self):
         if (

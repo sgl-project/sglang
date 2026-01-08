@@ -144,4 +144,6 @@ def mixer2_gated_norm_tensor_parallel(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+
+    sys.exit(pytest.main([__file__]))
