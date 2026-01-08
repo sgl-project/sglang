@@ -16,7 +16,6 @@ suites = {
         TestFile("test_video_utils.py", 5),
         TestFile("test_modelopt_export.py", 9),
     ],
-    "per-commit-2-gpu": [],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 650),
         TestFile("test_gpt_oss_4gpu.py", 300),
