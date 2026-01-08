@@ -42,7 +42,11 @@ class Manifest:
                 DeprecationWarning,
                 stacklevel=3,
             )
-            return cls(files={k: FileInfo(sha256=v, size=-1) for k, v in data["checksums"].items()})
+            return cls(
+                files={
+                    k: FileInfo(sha256=v, size=-1) for k, v in data["checksums"].items()
+                }
+            )
         return cls(files={k: FileInfo(**v) for k, v in data["files"].items()})
 
     def to_dict(self) -> dict:
@@ -111,7 +115,9 @@ def generate_checksums(
     else:
         manifest = Manifest(files=_load_file_infos_from_hf(repo_id=source))
 
-    Path(output_path).write_text(json.dumps(manifest.to_dict(), indent=2, sort_keys=True))
+    Path(output_path).write_text(
+        json.dumps(manifest.to_dict(), indent=2, sort_keys=True)
+    )
 
     print(
         f"[ModelFileVerifier] Generated checksums for {len(manifest.files)} files -> {output_path}"
