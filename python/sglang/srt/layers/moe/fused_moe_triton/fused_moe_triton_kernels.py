@@ -65,13 +65,17 @@ def should_enable_swap_ab(
 ) -> bool:
     if not _is_cuda:
         return False
-    device_name = get_device_name()
-    is_h20_device = device_name and "H20" in device_name and "H200" not in device_name
+
+    @functools.lru_cache(maxsize=1)
+    def is_h20_device_and_sm90_supported():
+        device_name = get_device_name()
+        is_h20_device = (
+            device_name and "H20" in device_name and "H200" not in device_name
+        )
+        return is_h20_device and is_sm90_supported()
+
     return (
-        is_h20_device
-        and is_sm90_supported()
-        and BLOCK_SIZE_M < 64
-        and BLOCK_SIZE_N >= 64
+        is_h20_device_and_sm90_supported() and BLOCK_SIZE_M < 64 and BLOCK_SIZE_N >= 64
     )
 
 
