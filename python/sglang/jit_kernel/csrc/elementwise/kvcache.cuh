@@ -1,8 +1,9 @@
 #include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/tile.cuh>
+#include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
-#include <sgl_kernel/warp.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -27,8 +28,17 @@ struct StoreKVCacheParams {
 constexpr uint32_t kNumWarps = 4;
 constexpr uint32_t kThreadsPerBlock = kNumWarps * device::kWarpThreads;
 
+/**
+ * \brief Use a single warp to copy key and value data from source to destination.
+ * Each thread in the warp copies a portion of the data in a coalesced manner.
+ * \tparam kElementBytes The size of each key/value element in bytes.
+ * \param k_src Pointer to the source key data.
+ * \param v_src Pointer to the source value data.
+ * \param k_dst Pointer to the destination key data.
+ * \param v_dst Pointer to the destination value data.
+ */
 template <int64_t kElementBytes>
-__device__ void copy_impl(
+SGL_DEVICE void copy_kv_warp(
     const void* __restrict__ k_src,
     const void* __restrict__ v_src,
     void* __restrict__ k_dst,
@@ -42,31 +52,39 @@ __device__ void copy_impl(
 
   static_assert(kAlignment > 0, "Element size must be multiple of 4 bytes");
 
-  using vec_t = aligned_vector<uint32_t, kAlignment / 4>;
+  using vec_t = AlignedStorage<uint32_t, kAlignment / 4>;
   constexpr auto kLoopBytes = sizeof(vec_t) * kWarpThreads;
   constexpr auto kLoopCount = kElementBytes / kLoopBytes;
 
+  const auto gmem = tile::Memory<vec_t>::warp();
+
 #pragma unroll kLoopCount
   for (int64_t i = 0; i < kLoopCount; ++i) {
-    const auto k = warp::load<vec_t>(pointer::offset(k_src, i * kLoopBytes));
-    const auto v = warp::load<vec_t>(pointer::offset(v_src, i * kLoopBytes));
-    warp::store(pointer::offset(k_dst, i * kLoopBytes), k);
-    warp::store(pointer::offset(v_dst, i * kLoopBytes), v);
+    const auto k = gmem.load(k_src, i);
+    const auto v = gmem.load(v_src, i);
+    gmem.store(k_dst, k, i);
+    gmem.store(v_dst, v, i);
   }
 
   // handle the epilogue if any
   if constexpr (kLoopCount * kLoopBytes < kElementBytes) {
-    constexpr auto kOffset = kLoopCount * kLoopBytes;
-    if ((threadIdx.x % kWarpThreads) * sizeof(vec_t) < kElementBytes - kOffset) {
-      const auto k = warp::load<vec_t>(pointer::offset(k_src, kOffset));
-      const auto v = warp::load<vec_t>(pointer::offset(v_src, kOffset));
-      warp::store(pointer::offset(k_dst, kOffset), k);
-      warp::store(pointer::offset(v_dst, kOffset), v);
+    if (gmem.in_bound(kElementBytes / sizeof(vec_t), kLoopCount)) {
+      const auto k = gmem.load(k_src, kLoopCount);
+      const auto v = gmem.load(v_src, kLoopCount);
+      gmem.store(k_dst, k, kLoopCount);
+      gmem.store(v_dst, v, kLoopCount);
     }
   }
 }
 
-// Each warp handles one item
+/**
+ * \brief Kernel to store key-value pairs into the KV cache.
+ * Each element is split into multiple parts to allow parallel memory copy.
+ * \tparam kElementBytes The size of each key/value element in bytes.
+ * \tparam kSplit The number of warps that handle each element.
+ * \tparam kUsePDL Whether to use PDL feature.
+ * \tparam T The data type of the indices (`int32_t` or `int64_t`).
+ */
 template <int64_t kElementBytes, int kSplit, bool kUsePDL, typename T>
 __global__ void store_kvcache(const __grid_constant__ StoreKVCacheParams params) {
   using namespace device;
@@ -89,7 +107,7 @@ __global__ void store_kvcache(const __grid_constant__ StoreKVCacheParams params)
   const auto k_dst = pointer::offset(k_cache, index * stride_cache, split_id * kSplitSize);
   const auto v_dst = pointer::offset(v_cache, index * stride_cache, split_id * kSplitSize);
 
-  copy_impl<kSplitSize>(k_src, v_src, k_dst, v_dst);
+  copy_kv_warp<kSplitSize>(k_src, v_src, k_dst, v_dst);
   PDLTriggerSecondary<kUsePDL>();
 }
 

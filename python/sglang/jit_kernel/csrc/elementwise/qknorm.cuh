@@ -1,41 +1,24 @@
-#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/math.cuh>
+#include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/tile.cuh>
+#include <sgl_kernel/type.cuh>
+#include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <type_traits>
 
 namespace {
-
-[[maybe_unused]]
-__device__ auto to_float2(nv_bfloat162 x) -> float2 {
-  return __bfloat1622float2(x);
-}
-
-[[maybe_unused]]
-__device__ auto to_float2(half2 x) -> float2 {
-  return __half22float2(x);
-}
-
-template <typename T>
-__device__ auto from_float2(float2 x) -> T {
-  if constexpr (std::is_same_v<T, nv_bfloat162>) {
-    return __float22bfloat162_rn(x);
-  } else if constexpr (std::is_same_v<T, half2>) {
-    return __float22half2_rn(x);
-  } else {
-    static_assert(sizeof(T) == 0, "Unsupported type");
-  }
-}
 
 struct QKNormParams {
   void* __restrict__ q;
@@ -59,43 +42,45 @@ __always_inline __device__ void apply_norm(void* __restrict__ input, const void*
 
   float sum_of_squares = 0.0f;
 
-  using vec_t = aligned_vector<PackedFloat, kLoopCount>;
-  const auto input_vec = warp::load<vec_t>(input);
+  using vec_t = AlignedVector<PackedFloat, kLoopCount>;
+  const auto gmem = tile::Memory<vec_t>::warp();
+  const auto input_vec = gmem.load(input);
 
 #pragma unroll
   for (auto i = 0u; i < kLoopCount; ++i) {
     const auto fp16_input = input_vec[i];
-    const auto fp32_input = to_float2(fp16_input);
+    const auto fp32_input = cast<fp32x2_t>(fp16_input);
     sum_of_squares += fp32_input.x * fp32_input.x;
     sum_of_squares += fp32_input.y * fp32_input.y;
   }
 
   sum_of_squares = warp::reduce_sum(sum_of_squares);
-  const auto norm_factor = rsqrtf(sum_of_squares / kHeadDim + eps);
-  const auto weight_vec = warp::load<vec_t>(weight);
+  const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + eps);
+  const auto weight_vec = gmem.load(weight);
   vec_t output_vec;
 
 #pragma unroll
   for (auto i = 0u; i < kLoopCount; ++i) {
-    const auto fp32_input = to_float2(input_vec[i]);
-    const auto fp32_weight = to_float2(weight_vec[i]);
-    output_vec[i] = from_float2<PackedFloat>({
+    const auto fp32_input = cast<fp32x2_t>(input_vec[i]);
+    const auto fp32_weight = cast<fp32x2_t>(weight_vec[i]);
+    output_vec[i] = cast<PackedFloat, fp32x2_t>({
         fp32_input.x * norm_factor * fp32_weight.x,
         fp32_input.y * norm_factor * fp32_weight.y,
     });
   }
 
-  warp::store(input, output_vec);
+  gmem.store(input, output_vec);
 }
 
 constexpr uint32_t kWarpsPerBlock = 4;
 constexpr uint32_t kThreadsPerBlock = kWarpsPerBlock * device::kWarpThreads;
 
-template <int64_t kHeadDim, bool kUsePDL, typename PackedFloat, typename Float>
+template <int64_t kHeadDim, bool kUsePDL, typename Float>
 __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
   using namespace device;
+  using PackedFloat = packed_t<Float>;  // pack2 fp16
 
-  static_assert(sizeof(Float) == 2 && sizeof(PackedFloat) == 4, "Only support FP16/BF16");
+  static_assert(sizeof(Float) == 2, "Only support FP16/BF16");
   const auto& [q, k, q_stride, k_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] = params;
 
   const auto num_blks = gridDim.x;
@@ -121,13 +106,8 @@ __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
 
 template <int64_t kHeadDim, bool kUsePDL, typename DType>
 struct QKNormKernel {
-  static_assert(
-      std::is_same_v<DType, half> || std::is_same_v<DType, nv_bfloat16>,
-      "Unsupported DType: QKNormKernel only supports half and nv_bfloat16.");
-  using DType2 = host::PackedDType<DType, 2>::type;
-
-  // only initialize once (static variable) to avoid overhead
-  static constexpr auto kernel = fused_qknorm<kHeadDim, kUsePDL, DType2, DType>;
+  static_assert(std::is_same_v<DType, fp16_t> || std::is_same_v<DType, bf16_t>);
+  static constexpr auto kernel = fused_qknorm<kHeadDim, kUsePDL, DType>;
 
   static void
   run(const tvm::ffi::TensorView q,
@@ -143,30 +123,22 @@ struct QKNormKernel {
     auto D = SymbolicSize{"head_dim"};
     auto Sq = SymbolicSize{"q_stride"};
     auto Sk = SymbolicSize{"k_stride"};
-    auto dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
 
-    /*
-     * We need the .template disambiguator here because this call happens in a dependent context.
-     * After switching to with_dtype<DType>(...) (where DType is a template parameter), the chained expression becomes
-     * dependent. In C++, when calling a member function template via ./-> on a dependent expression, the compiler may
-     * otherwise parse <kDLCUDA> as the < operator instead of template arguments. Adding .template forces correct
-     * parsing and fixes compilation errors (often seen with NVCC/clang). Ref:
-     * https://en.cppreference.com/w/cpp/language/dependent_name
-     */
     TensorMatcher({N, Q, D})  // q input
         .with_strides({Sq, D, 1})
-        .with_dtype<DType>(dtype)
-        .template with_device<kDLCUDA>(device)
+        .with_dtype<DType>()
+        .with_device(device)
         .verify(q);
     TensorMatcher({N, K, D})  // k input
         .with_strides({Sk, D, 1})
-        .with_dtype<DType>(dtype)
-        .template with_device<kDLCUDA>(device)
+        .with_dtype<DType>()
+        .with_device(device)
         .verify(k);
     TensorMatcher({D})  // weight
-        .with_dtype<DType>(dtype)
-        .template with_device<kDLCUDA>(device)
+        .with_dtype<DType>()
+        .with_device(device)
         .verify(q_weight)
         .verify(k_weight);
 
