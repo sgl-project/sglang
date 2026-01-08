@@ -3,3 +3,4 @@ export { SessionSelector } from './SessionSelector';
 export { MetricsDiffCard } from './MetricsDiffCard';
 export { FingerprintDiffChart } from './FingerprintDiffChart';
 export { ZoneBadgeComparison } from './ZoneBadgeComparison';
+export { QuantComparePanel } from './QuantComparePanel';
