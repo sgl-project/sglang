@@ -116,39 +116,29 @@ def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
         )
 
     fs = HfFileSystem()
-    checksums = {}
-    files_to_download = []
 
     try:
         files = fs.ls(repo_id, detail=True)
     except Exception as e:
         raise IntegrityError(f"Failed to list files from HF repo {repo_id}: {e}")
 
-    for file_info in files:
+    def _get_checksum(file_info):
         if file_info.get("type") != "file":
-            continue
+            return None
         filename = Path(file_info.get("name", "")).name
         if any(fnmatch.fnmatch(filename, pat) for pat in IGNORE_PATTERNS):
-            continue
-        full_path = file_info.get("name", "")
+            return None
         lfs_info = file_info.get("lfs")
         if lfs_info and "sha256" in lfs_info:
-            checksums[filename] = lfs_info["sha256"]
-        elif "sha256" in file_info:
-            checksums[filename] = file_info["sha256"]
-        else:
-            files_to_download.append((filename, full_path))
+            return filename, lfs_info["sha256"]
+        if "sha256" in file_info:
+            return filename, file_info["sha256"]
+        content = fs.read_bytes(file_info.get("name", ""))
+        return filename, hashlib.sha256(content).hexdigest()
 
-    for filename, full_path in files_to_download:
-        try:
-            content = fs.read_bytes(full_path)
-            checksums[filename] = hashlib.sha256(content).hexdigest()
-        except Exception as e:
-            raise IntegrityError(f"Failed to download {filename} from HF: {e}")
-
+    checksums = dict(r for r in map(_get_checksum, files) if r)
     if not checksums:
         raise IntegrityError(f"No files found in HF repo {repo_id}.")
-
     return checksums
 
 
