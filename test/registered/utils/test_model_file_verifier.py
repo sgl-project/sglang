@@ -131,6 +131,8 @@ class TestModelFileVerifierWithRealModel(unittest.TestCase):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_server_launch_with_checksum_intact(self):
+        import requests
+
         from sglang.srt.utils import kill_process_tree
         from sglang.test.test_utils import (
             DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -148,8 +150,12 @@ class TestModelFileVerifierWithRealModel(unittest.TestCase):
             other_args=["--model-checksum", checksums_file],
         )
         try:
-            self.assertIsNotNone(process)
-            self.assertIsNone(process.poll())
+            response = requests.post(
+                f"{DEFAULT_URL_FOR_TEST}/generate",
+                json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("text", response.json())
         finally:
             kill_process_tree(process.pid)
 
