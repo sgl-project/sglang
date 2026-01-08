@@ -112,7 +112,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
 
-    def _handle_continue_final_message(
+    def _handle_last_assistant_message(
         self,
         messages: List[Dict[str, Any]],
         request: ChatCompletionRequest,
@@ -122,6 +122,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         If continue_final_message is enabled and the last message is from assistant,
         extract its content and remove it from the message list.
+        If continue_final_message is False and the last message is from assistant,
+        convert it to a user message to ensure the last message is always from user.
+
         Only processes text-based content (strings), ignoring multimodal content (lists).
 
         Args:
@@ -130,20 +133,21 @@ class OpenAIServingChat(OpenAIServingBase):
 
         Returns:
             Tuple of (processed_messages, assistant_prefix)
-            - processed_messages: Messages with last assistant message removed if continue_final_message is True
+            - processed_messages: Messages with last assistant message handled appropriately
             - assistant_prefix: Content of the last assistant message (string only), or None
         """
         assistant_prefix = None
-        if (
-            messages
-            and messages[-1].get("role") == "assistant"
-            and request.continue_final_message
-        ):
+        if messages and messages[-1].get("role") == "assistant":
             last_content = messages[-1].get("content")
             # Only process string content, ignore multimodal content (lists)
             if isinstance(last_content, str):
-                assistant_prefix = last_content
-                messages = messages[:-1]
+                if request.continue_final_message:
+                    # Extract content and remove the assistant message
+                    assistant_prefix = last_content
+                    messages = messages[:-1]
+                else:
+                    # Convert the last assistant message to user message
+                    messages[-1] = {"role": "user", "content": last_content}
         return messages, assistant_prefix
 
     def _append_assistant_prefix_to_prompt_ids(
@@ -379,7 +383,7 @@ class OpenAIServingChat(OpenAIServingBase):
             messages = [msg.model_dump() for msg in messages]
 
             # Handle continue_final_message: separate final assistant message
-            messages, assistant_prefix = self._handle_continue_final_message(
+            messages, assistant_prefix = self._handle_last_assistant_message(
                 messages, request
             )
 
@@ -434,7 +438,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle continue_final_message: separate final assistant message
             openai_compatible_messages, assistant_prefix = (
-                self._handle_continue_final_message(openai_compatible_messages, request)
+                self._handle_last_assistant_message(openai_compatible_messages, request)
             )
 
             try:
