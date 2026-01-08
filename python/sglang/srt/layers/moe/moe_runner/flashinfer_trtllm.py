@@ -190,7 +190,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     if runner_config.routed_scaling_factor is not None
                     else 1.0
                 ),
-                tile_tokens_dim=None,
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=False,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
