@@ -106,19 +106,10 @@ def _load_checksums(source: str) -> Dict[str, str]:
 
 
 def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
-    try:
-        from huggingface_hub import HfFileSystem
-    except ImportError:
-        raise IntegrityError(
-            "huggingface_hub not installed. Install it or provide a local checksums file."
-        )
+    from huggingface_hub import HfFileSystem
 
     fs = HfFileSystem()
-
-    try:
-        files = fs.ls(repo_id, detail=True)
-    except Exception as e:
-        raise IntegrityError(f"Failed to list files from HF repo {repo_id}: {e}")
+    files = fs.ls(repo_id, detail=True)
 
     checksums = dict(
         r
@@ -127,6 +118,7 @@ def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
     )
     if not checksums:
         raise IntegrityError(f"No files found in HF repo {repo_id}.")
+
     return checksums
 
 
