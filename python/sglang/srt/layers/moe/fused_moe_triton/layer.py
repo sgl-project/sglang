@@ -217,6 +217,8 @@ class FusedMoE(torch.nn.Module):
             hidden_size = round_up(hidden_size, 256)
         self.hidden_size = hidden_size
 
+        stream_id = torch.cuda.current_stream().cuda_stream
+
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=self.num_local_experts,
@@ -234,6 +236,7 @@ class FusedMoE(torch.nn.Module):
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit,
             is_gated=is_gated,
+            stream_id=stream_id,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
