@@ -33,7 +33,7 @@ class Hunyuan3DPipelineConfig(PipelineConfig):
     shape_output_type: str = "trimesh"
 
     # Paint model configuration
-    paint_enable: bool = True
+    paint_enable: bool = False
     paint_model_path: str | None = None
     paint_max_num_view: int = 6
     paint_resolution: int = 512
