@@ -2927,7 +2927,7 @@ class ServerArgs:
             "--enable-force-include-usage",
             action="store_true",
             help="If set to True, include usage on every request "
-                 "(even when stream_options is not specified)",
+            "(even when stream_options is not specified)",
         )
         parser.add_argument(
             "--random-seed",

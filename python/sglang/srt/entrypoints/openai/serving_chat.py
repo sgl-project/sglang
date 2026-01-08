@@ -37,8 +37,8 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
-    to_openai_style_logprobs,
     should_include_usage,
+    to_openai_style_logprobs,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -552,7 +552,8 @@ class OpenAIServingChat(OpenAIServingBase):
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
-                self.tokenizer_manager.server_args.enable_force_include_usage)
+                self.tokenizer_manager.server_args.enable_force_include_usage,
+            )
 
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -1141,7 +1142,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         include_usage, continuous_usage_stats = should_include_usage(
             request.stream_options,
-            self.tokenizer_manager.server_args.enable_force_include_usage)
+            self.tokenizer_manager.server_args.enable_force_include_usage,
+        )
 
         # Yield normal text
         if normal_text:
