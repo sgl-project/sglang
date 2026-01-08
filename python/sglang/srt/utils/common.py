@@ -80,7 +80,6 @@ import requests
 import torch
 import torch.distributed
 import torch.distributed as dist
-import torch.fx.experimental._config as fx_config
 import triton
 import zmq
 from fastapi.responses import ORJSONResponse
