@@ -29,12 +29,12 @@ IGNORE_PATTERNS = [
 def verify(model_path: str, checksums_source: str, max_workers: int = 4) -> None:
     model_path = Path(model_path).resolve()
     expected = _load_checksums(checksums_source)
-
-    if not expected:
-        raise IntegrityError(f"No checksums found in {checksums_source}")
-
     actual = _compute_checksums(model_path, list(expected.keys()), max_workers)
+    _compare_checksums(expected, actual)
+    print(f"[ModelFileVerifier] All {len(expected)} files verified successfully.")
 
+
+def _compare_checksums(expected: Dict[str, str], actual: Dict[str, str]) -> None:
     mismatches = []
     missing = []
 
@@ -61,8 +61,6 @@ def verify(model_path: str, checksums_source: str, max_workers: int = 4) -> None
             )
             error_parts.append(f"Checksum mismatches: {mismatch_details}")
         raise IntegrityError(" | ".join(error_parts))
-
-    print(f"[ModelFileVerifier] All {len(expected)} files verified successfully.")
 
 
 # ======== Generate ========
@@ -121,6 +119,7 @@ def _load_checksums_from_hf(repo_id: str) -> Dict[str, str]:
 
     fs = HfFileSystem()
     checksums = {}
+    files_without_checksum = []
 
     try:
         files = fs.ls(repo_id, detail=True)
@@ -136,11 +135,13 @@ def _load_checksums_from_hf(repo_id: str) -> Dict[str, str]:
             checksums[filename] = lfs_info["sha256"]
         elif "sha256" in file_info:
             checksums[filename] = file_info["sha256"]
+        else:
+            files_without_checksum.append(filename)
 
-    if not checksums:
+    if files_without_checksum:
         raise IntegrityError(
-            f"No SHA256 checksums found in HF repo {repo_id}. "
-            "Only LFS files have checksums. Generate a local checksums.json instead."
+            f"Files without SHA256 checksum in HF repo {repo_id}: {files_without_checksum}. "
+            "Generate a local checksums.json instead."
         )
 
     return checksums
@@ -196,6 +197,14 @@ class IntegrityError(Exception):
 # ======== CLI ========
 
 
+def _cli_generate(args):
+    generate_checksums(args.model_path, args.output, args.workers)
+
+
+def _cli_verify(args):
+    verify(args.model_path, args.model_checksum, args.workers)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Model File Verifier - Verify model file integrity using SHA256 checksums"
@@ -214,6 +223,7 @@ def main():
     gen_parser.add_argument(
         "--workers", type=int, default=4, help="Number of parallel workers"
     )
+    gen_parser.set_defaults(func=_cli_generate)
 
     verify_parser = subparsers.add_parser(
         "verify", help="Verify model files against checksums"
@@ -229,13 +239,10 @@ def main():
     verify_parser.add_argument(
         "--workers", type=int, default=4, help="Number of parallel workers"
     )
+    verify_parser.set_defaults(func=_cli_verify)
 
     args = parser.parse_args()
-
-    if args.command == "generate":
-        generate_checksums(args.model_path, args.output, args.workers)
-    elif args.command == "verify":
-        verify(args.model_path, args.model_checksum, args.workers)
+    args.func(args)
 
 
 if __name__ == "__main__":
