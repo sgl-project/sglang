@@ -22,17 +22,17 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 from sglang.srt.utils.common import is_sm120_supported, next_power_of_2
-
+from sglang.srt.utils.common import is_flashinfer_available
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         StandardCombineInput,
         StandardDispatchOutput,
     )
-
-if is_sm120_supported():
-    from flashinfer import fp4_quantize
-else:
-    from sgl_kernel import scaled_fp4_quant as fp4_quantize
+if is_flashinfer_available():
+    if is_sm120_supported():
+        from flashinfer import fp4_quantize
+    else:
+        from sgl_kernel import scaled_fp4_quant as fp4_quantize
 
 
 def align_fp8_moe_weights_for_flashinfer_trtllm(
