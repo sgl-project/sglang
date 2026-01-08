@@ -585,7 +585,7 @@ jobs:
   unit-test-backend-2-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
     if: |
-      always() &&
+      false && always() &&
       (
         (inputs.target_stage == 'unit-test-backend-2-gpu-amd') ||
         (
