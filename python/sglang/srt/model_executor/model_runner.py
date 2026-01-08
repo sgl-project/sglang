@@ -1997,7 +1997,7 @@ class ModelRunner:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        if self.server_args.attention_backend == "ascend":
+        if self.server_args.attention_backend == "ascend" and not self.mambaish_config: 
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,
