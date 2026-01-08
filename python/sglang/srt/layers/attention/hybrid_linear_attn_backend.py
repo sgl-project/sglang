@@ -814,22 +814,17 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         beta = beta.unsqueeze(0)
         g = g.unsqueeze(0)
 
-        initial_state = ssm_states[cache_indices].contiguous()
-        (
-            core_attn_out,
-            last_recurrent_state,
-        ) = chunk_kda(
+        core_attn_out = chunk_kda(
             q=q,
             k=k,
             v=v,
             g=g,
             beta=beta,
-            initial_state=initial_state,
-            output_final_state=True,
+            initial_state=ssm_states,
+            initial_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=query_start_loc,
         )
-        ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 
@@ -1064,7 +1059,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            recurrent_state = ssm_states[cache_indices]
+            # Only cuda env uses fuse ssm_states update
+            recurrent_state = ssm_states
+            recurrent_state_indices_args = {"initial_state_indices": cache_indices}
+            if is_npu():
+                recurrent_state = ssm_states[cache_indices]
+                recurrent_state_indices_args = {}
             core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -1072,13 +1072,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 g=g,
                 beta=beta,
                 initial_state=recurrent_state,
-                output_final_state=True,
                 cu_seqlens=query_start_loc,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
+                **recurrent_state_indices_args,
             )
-            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            ssm_states[cache_indices] = last_recurrent_state
+            if is_npu():
+                last_recurrent_state = last_recurrent_state.to(
+                    ssm_states.dtype, copy=False
+                )
+                ssm_states[cache_indices] = last_recurrent_state
 
             self._track_mamba_state_extend(
                 forward_batch, h, ssm_states, forward_metadata
