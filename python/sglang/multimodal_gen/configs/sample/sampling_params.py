@@ -320,6 +320,19 @@ class SamplingParams:
         if not isinstance(self.prompt, str):
             raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
 
+        if self.guidance_scale is None:
+            try:
+                from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
+                    Hunyuan3DPipelineConfig,
+                )
+
+                if isinstance(pipeline_config, Hunyuan3DPipelineConfig):
+                    self.guidance_scale = pipeline_config.shape_guidance_scale
+                else:
+                    self.guidance_scale = 1.0
+            except Exception:
+                self.guidance_scale = 1.0
+
         self.data_type = server_args.pipeline_config.task_type.data_type()
 
         if self.output_path is None and server_args.output_path is not None:
