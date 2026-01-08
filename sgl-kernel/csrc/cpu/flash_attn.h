@@ -103,7 +103,6 @@ template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 struct flash_attn_softmax {
   static inline void apply(
       float* __restrict__ s_i,
-      float* __restrict__ s_delta,
       scalar_t* __restrict__ s_delta2,
       float* __restrict__ v_prime,
       float* __restrict__ s_prime,
@@ -115,6 +114,7 @@ struct flash_attn_softmax {
       const float sm_scale) {
     using Vec = at::vec::Vectorized<float>;
     const Vec scale_vec = Vec(sm_scale);
+    float* s_delta = s_i;
     for (int row = 0; row < m_size; ++row) {
       // s_i <- s_i * scale
       at::vec::map<float>(
@@ -157,7 +157,6 @@ template <int BLOCK_M, int BLOCK_N>
 struct flash_attn_softmax<at::BFloat16, BLOCK_M, BLOCK_N> {
   static inline void apply(
       float* __restrict__ s_i,
-      float* __restrict__ s_delta,
       at::BFloat16* __restrict__ s_delta2,
       float* __restrict__ v_prime,
       float* __restrict__ s_prime,
@@ -167,6 +166,7 @@ struct flash_attn_softmax<at::BFloat16, BLOCK_M, BLOCK_N> {
       int padded_n_size,
       int head_size_v,
       const float sm_scale) {
+    float* s_delta = s_i;
     const __m512 vscale = _mm512_set1_ps(sm_scale);
 
     int n_remainder = n_size & 15;  // 0xF
