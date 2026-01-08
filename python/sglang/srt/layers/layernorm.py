@@ -318,7 +318,11 @@ class GemmaRMSNorm(CustomOp):
 
         # Re-dispatch
         if _is_hip:
-            self._forward_method = self.forward_native
+            if _use_aiter:
+                self.weight._is_gemma_rmsnorm_weight = True
+                self._forward_method = self.forward_aiter
+            else:
+                self._forward_method = self.forward_native
 
     def _forward_impl(
         self,
@@ -332,6 +336,25 @@ class GemmaRMSNorm(CustomOp):
             return x, residual
         out = gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
+
+    def forward_aiter(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            residual_out = torch.empty_like(x)
+            output = torch.empty_like(x)
+            fused_add_rms_norm(
+                output,
+                x,
+                residual,
+                residual_out,
+                self.weight,
+                self.variance_epsilon,
+            )
+            return output, residual_out
+        return rms_norm(x, self.weight, self.variance_epsilon)
 
     def forward_native(
         self,

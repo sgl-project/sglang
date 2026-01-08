@@ -2,8 +2,15 @@ from typing import Optional, Union
 
 import torch
 
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.srt.layers.attention.fla.fused_gdn_gating_prefill import (
+    fused_gdn_gating_and_sigmoid,
+)
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_update,
 )
@@ -14,6 +21,12 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
     causal_conv1d_fn,
     causal_conv1d_update,
+)
+from sglang.srt.layers.attention.mamba.causal_conv1d_fwd_split_qkv import (
+    causal_conv1d_fn_split_qkv,
+)
+from sglang.srt.layers.attention.mamba.causal_conv1d_split_qkv import (
+    causal_conv1d_update_split_qkv,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
@@ -261,25 +274,35 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_states,
-            conv_weights,
-            bias,
-            activation,
-            conv_state_indices=cache_indices,
-        )
-
-        query, key, value = torch.split(
-            mixed_qkv,
-            [
-                key_dim // attn_tp_size,
-                key_dim // attn_tp_size,
-                value_dim // attn_tp_size,
-            ],
-            dim=-1,
-        )
-        # Reshape from [l, h*d] to [1, l, h, d]
+        if _is_hip:
+            query, key, value = causal_conv1d_update_split_qkv(
+                mixed_qkv,
+                conv_states,
+                conv_weights,
+                key_dim=key_dim // attn_tp_size,
+                value_dim=value_dim // attn_tp_size,
+                bias=bias,
+                activation=activation,
+                conv_state_indices=cache_indices,
+            )
+        else:
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states,
+                conv_weights,
+                bias,
+                activation,
+                conv_state_indices=cache_indices,
+            )
+            query, key, value = torch.split(
+                mixed_qkv,
+                [
+                    key_dim // attn_tp_size,
+                    key_dim // attn_tp_size,
+                    value_dim // attn_tp_size,
+                ],
+                dim=-1,
+            )
         seq_len = query.shape[0]
         num_heads = query.shape[1] // head_k_dim
         query = query.view(1, seq_len, num_heads, head_k_dim)
@@ -373,26 +396,46 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
             )
         else:
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv.transpose(0, 1),
-                conv_weights,
-                bias,
-                activation=activation,
-                conv_states=conv_states_to_use,
-                has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+            key_split_dim = key_dim // attn_tp_size
+            value_split_dim = value_dim // attn_tp_size
 
-        key_split_dim = key_dim // attn_tp_size
-        value_split_dim = value_dim // attn_tp_size
+            if _is_hip:
 
-        query, key, value = torch.split(
-            mixed_qkv,
-            [key_split_dim, key_split_dim, value_split_dim],
-            dim=-1,
-        )
+                query, key, value = causal_conv1d_fn_split_qkv(
+                    mixed_qkv.transpose(0, 1),
+                    conv_weights,
+                    bias,
+                    conv_states=conv_states_to_use,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    k_dim=key_split_dim,
+                    v_dim=value_split_dim,
+                    cache_indices=cache_indices,
+                    has_initial_state=has_initial_states,
+                    activation=activation,
+                )
+
+                query = query[:seq_len]
+                key = key[:seq_len]
+                value = value[:seq_len]
+            else:
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv.transpose(0, 1),
+                    conv_weights,
+                    bias,
+                    activation=activation,
+                    conv_states=conv_states_to_use,
+                    has_initial_state=has_initial_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                ).transpose(0, 1)[:seq_len]
+
+                query, key, value = torch.split(
+                    mixed_qkv,
+                    [key_split_dim, key_split_dim, value_split_dim],
+                    dim=-1,
+                )
 
         actual_seq_len = query.shape[0]
         num_heads = query.shape[1] // head_k_dim
@@ -402,8 +445,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, actual_seq_len, num_heads, head_k_dim)
         value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
-        beta = b.sigmoid()
-        g = fused_gdn_gating(A_log, a, dt_bias)
+        if _is_hip:
+            g, beta = fused_gdn_gating_and_sigmoid(A_log, a, b, dt_bias)
+        else:
+            beta = b.sigmoid()
+            g = fused_gdn_gating(A_log, a, dt_bias)
 
         g = g.unsqueeze(0)
         beta = beta.unsqueeze(0)

@@ -824,6 +824,11 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
                 f"Attempted to load weight ({loaded_weight.size()}) "
                 f"into parameter ({param.size()})"
             )
+            if (
+                hasattr(param, "_is_gemma_rmsnorm_weight")
+                and param._is_gemma_rmsnorm_weight
+            ):
+                loaded_weight = (loaded_weight + 1.0).to(dtype=loaded_weight.dtype)
 
             param.data.copy_(loaded_weight)
     except Exception:

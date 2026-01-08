@@ -7,11 +7,38 @@ import triton.language as tl
 from sglang.srt.layers.attention.fla.utils import input_guard
 
 
+def is_cuda():
+    return triton.runtime.driver.active.get_current_target().backend == "cuda"
+
+
+def get_cuda_autotune_config():
+    return [
+        triton.Config({"BV": 8}, num_stages=3, num_warps=1),
+    ]
+
+
+def get_hip_autotune_config():
+    return [
+        triton.Config({"BV": 64}, num_stages=1, num_warps=4),
+    ]
+
+
+def get_autotune_config():
+    if is_cuda():
+        return get_cuda_autotune_config()
+    else:
+        return get_hip_autotune_config()
+
+
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
+)
+@triton.autotune(
+    configs=get_autotune_config(),
+    key=["K", "V"],
 )
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
@@ -187,11 +214,9 @@ def fused_sigmoid_gating_delta_rule_update(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 8)
-    NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
+    BK = triton.next_power_of_2(K)
+    NK = triton.cdiv(K, BK)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
-    num_warps = 1
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -199,7 +224,7 @@ def fused_sigmoid_gating_delta_rule_update(
         assert scale > 0, "scale must be positive"
 
     o = q.new_empty(NK, *v.shape)
-    grid = (NK, NV, N * HV)
+    grid = lambda META: (NK, triton.cdiv(V, META["BV"]), N * HV)
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
@@ -223,10 +248,7 @@ def fused_sigmoid_gating_delta_rule_update(
         K=K,
         V=V,
         BK=BK,
-        BV=BV,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        num_warps=num_warps,
-        num_stages=num_stages,
     )
     o = o.squeeze(0)
     return o

@@ -70,11 +70,15 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.utils import add_prefix, is_cuda, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, make_layers, is_hip, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _is_hip:
+    from sglang.srt.layers.elementwise import fused_sigmoid_mul_broadcast
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -113,7 +117,12 @@ class Qwen2MoeMLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        if _use_aiter:
+            from aiter import silu_and_mul
+
+            self.act_fn = silu_and_mul
+        else:
+            self.act_fn = SiluAndMul()
 
     def forward(
         self,
@@ -122,7 +131,15 @@ class Qwen2MoeMLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if _use_aiter:
+            x = torch.empty(
+                (gate_up.shape[0], gate_up.shape[1] // 2),
+                dtype=gate_up.dtype,
+                device=gate_up.device,
+            )
+            self.act_fn(x, gate_up)
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )
@@ -209,9 +226,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
-                shared_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
-                )
+                if _is_hip:
+                    gate_output = self.shared_expert_gate(hidden_states)
+                    fused_sigmoid_mul_broadcast(
+                        gate_output, shared_output, out=shared_output
+                    )
+                else:
+                    shared_output = (
+                        F.sigmoid(self.shared_expert_gate(hidden_states))
+                        * shared_output
+                    )
         return shared_output
 
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):

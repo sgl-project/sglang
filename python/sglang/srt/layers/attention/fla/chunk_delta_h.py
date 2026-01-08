@@ -14,8 +14,10 @@ from sglang.srt.layers.attention.fla.index import (
 )
 from sglang.srt.layers.attention.fla.op import exp, safe_exp
 from sglang.srt.layers.attention.fla.utils import is_nvidia_hopper
+from sglang.srt.utils import is_hip
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
+_is_hip = is_hip()
 
 
 @triton.heuristics(
@@ -290,6 +292,11 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
+    if _is_hip:
+        _BV, _num_warps, _num_stages = 16, 4, 2
+    else:
+        _BV, _num_warps, _num_stages = 32, 4, 2
+
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
         v=u,
@@ -307,8 +314,8 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
-        BV=32,
-        num_warps=4,
-        num_stages=2,
+        BV=_BV,
+        num_warps=_num_warps,
+        num_stages=_num_stages,
     )
     return h, v_new, final_state
