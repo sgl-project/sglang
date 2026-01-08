@@ -68,7 +68,6 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 
-    warnings.warn(f"HIP does not support fused_marlin_moe currently.")
 elif _is_xpu:
     from sgl_kernel import awq_dequantize
 
@@ -198,6 +197,8 @@ class AWQMarlinConfig(QuantizationConfig):
         full_config: dict[str, Any],
     ) -> None:
         super().__init__()
+        if _is_hip:
+            warnings.warn(f"HIP does not support fused_marlin_moe currently.")
         self.pack_factor = 32 // weight_bits  # packed into int32
         self.group_size = group_size
         self.zero_point = zero_point

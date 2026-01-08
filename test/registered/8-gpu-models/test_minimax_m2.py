@@ -37,6 +37,7 @@ class TestMiniMaxM2Unified(unittest.TestCase):
                 MINIMAX_M2_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
+                variant="TP8+EP8",
             ),
         ]
 

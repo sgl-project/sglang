@@ -100,6 +100,54 @@ def extend_attention_fwd_torch(
         o[q_start:q_end] = torch.einsum("qhk,khd->qhd", attn_weights, v_full_hq)
 
 
+def decode_attention_fwd_torch(
+    q: torch.Tensor,  # [B, H_Q, D]
+    k_buffer: torch.Tensor,  # [total_tokens, H_KV, D]
+    v_buffer: torch.Tensor,  # [total_tokens, H_KV, D]
+    kv_indptr: torch.Tensor,  # [B+1]
+    kv_indices: torch.Tensor,  # [prefix_tokens]
+    sm_scale: float,
+):
+    """
+    Torch reference implementation for decode attention with stable softmax.
+    Supports both MHA and GQA configurations.
+    """
+    B = kv_indptr.size(0) - 1
+    _, H_Q, D = q.shape
+    _, H_KV, _ = k_buffer.shape
+
+    assert H_Q % H_KV == 0, "H_Q must be divisible by H_KV for GQA"
+    group_size = H_Q // H_KV
+
+    o_ref = torch.empty((B, H_Q, D), dtype=torch.float32, device=q.device)
+
+    for b in range(B):
+        start = int(kv_indptr[b].item())
+        end = int(kv_indptr[b + 1].item())
+        idx = kv_indices[start:end]
+
+        k_seq = k_buffer.index_select(0, idx)  # [L, H_KV, D]
+        v_seq = v_buffer.index_select(0, idx)  # [L, H_KV, D]
+
+        if H_KV != H_Q:
+            k_seq = k_seq.repeat_interleave(group_size, dim=1)  # [L, H_Q, D]
+            v_seq = v_seq.repeat_interleave(group_size, dim=1)  # [L, H_Q, D]
+
+        q_f32 = q[b].to(torch.float32)  # [H_Q, D]
+        k_f32 = k_seq.to(torch.float32)  # [L, H_Q, D]
+        v_f32 = v_seq.to(torch.float32)  # [L, H_Q, D]
+
+        # logits: [H_Q, L]
+        logits = torch.einsum("hd,lhd->hl", q_f32, k_f32) * float(sm_scale)
+        logits = logits - logits.max(dim=-1, keepdim=True).values
+        p = torch.softmax(logits, dim=-1)  # [H_Q, L]
+
+        # out: [H_Q, D]
+        o_ref[b] = torch.einsum("hl,lhd->hd", p, v_f32)
+
+    return o_ref
+
+
 class TestTritonAttention(CustomTestCase):
 
     def _set_all_seeds(self, seed):
@@ -470,10 +518,18 @@ class TestTritonAttention(CustomTestCase):
             sm_scale,
         )
 
-    def test_decode_attention(self):
-        # Here we just to ensure there is no error
-        # TODO: correctnesss test
+        # Correctness reference (float32, stable softmax)
+        o_ref = decode_attention_fwd_torch(
+            q, k_buffer, v_buffer, kv_indptr, kv_indices, sm_scale
+        )
 
+        max_abs_err = (o.to(torch.float32) - o_ref).abs().max().item()
+        self.assertTrue(
+            torch.allclose(o.to(torch.float32), o_ref, atol=1e-2, rtol=1e-2),
+            msg=f"decode_attention mismatch, max_abs_err={max_abs_err}",
+        )
+
+    def test_decode_attention(self):
         # Test configurations
         configs = [
             (2, 4, 4, 64),  # MHA

@@ -1,6 +1,6 @@
 import unittest
 
-from test_gpt_oss_common import BaseTestGptOss
+from sglang.test.gpt_oss_common import BaseTestGptOss
 
 
 class TestGptOss4Gpu(BaseTestGptOss):

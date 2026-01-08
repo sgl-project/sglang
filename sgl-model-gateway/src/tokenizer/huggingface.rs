@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use anyhow::{Error, Result};
-use tokenizers::tokenizer::Tokenizer as HfTokenizer;
+use tokenizers::{processors::template::TemplateProcessing, tokenizer::Tokenizer as HfTokenizer};
+use tracing::debug;
 
 use super::{
     chat_template::{
@@ -38,7 +39,7 @@ impl HuggingFaceTokenizer {
         file_path: &str,
         chat_template_path: Option<&str>,
     ) -> Result<Self> {
-        let tokenizer = HfTokenizer::from_file(file_path)
+        let mut tokenizer = HfTokenizer::from_file(file_path)
             .map_err(|e| Error::msg(format!("Failed to load tokenizer: {}", e)))?;
 
         // Extract special tokens
@@ -51,14 +52,19 @@ impl HuggingFaceTokenizer {
             .map(|(token, &id)| (id, token.clone()))
             .collect();
 
-        // Load chat template
-        let chat_template = if let Some(template_path) = chat_template_path {
-            // Load from specified .jinja file
-            Self::load_chat_template_from_file(template_path)?
-        } else {
-            // Try to load from tokenizer_config.json
-            Self::load_chat_template(file_path)
-        };
+        // Load chat template and tokenizer config
+        let (chat_template, add_bos_token, add_eos_token) =
+            if let Some(template_path) = chat_template_path {
+                // Load from specified .jinja file
+                (
+                    Self::load_chat_template_from_file(template_path)?,
+                    None,
+                    None,
+                )
+            } else {
+                // Try to load from tokenizer_config.json
+                Self::load_chat_template_and_config(file_path)
+            };
 
         // Detect content format once at initialization
         let content_format = if let Some(ref template) = chat_template {
@@ -66,6 +72,25 @@ impl HuggingFaceTokenizer {
         } else {
             ChatTemplateContentFormat::String // Default if no template
         };
+
+        // Configure post_processor based on tokenizer_config.json (matches Python transformers)
+        // Only modify when at least one setting is explicitly true
+        let needs_eos = add_eos_token == Some(true);
+        let needs_bos = match add_bos_token {
+            Some(true) => true,
+            Some(false) => false,
+            // Not set: preserve existing behavior from tokenizer.json
+            None => needs_eos && Self::tokenizer_adds_special_tokens(&tokenizer),
+        };
+
+        if needs_bos || needs_eos {
+            if let Some(post_processor) =
+                Self::build_post_processor(needs_bos, needs_eos, &special_tokens, &vocab)
+            {
+                debug!(needs_bos, needs_eos, "Configured post_processor");
+                tokenizer.with_post_processor(Some(post_processor));
+            }
+        }
 
         Ok(HuggingFaceTokenizer {
             tokenizer,
@@ -75,6 +100,54 @@ impl HuggingFaceTokenizer {
             chat_template,
             content_format,
         })
+    }
+
+    /// Check if the tokenizer's post_processor adds special tokens (e.g., BOS)
+    fn tokenizer_adds_special_tokens(tokenizer: &HfTokenizer) -> bool {
+        tokenizer
+            .encode("", true)
+            .map(|enc| !enc.get_ids().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Build a TemplateProcessing post_processor (matches Python transformers' update_post_processor)
+    /// Template format: "{bos}:0 $A:0 {eos}:0" with optional BOS/EOS based on config
+    fn build_post_processor(
+        add_bos_token: bool,
+        add_eos_token: bool,
+        special_tokens: &SpecialTokens,
+        vocab: &HashMap<String, TokenIdType>,
+    ) -> Option<TemplateProcessing> {
+        // Build template string exactly like Python:
+        // single = f"{(bos + ':0 ') if add_bos_token else ''}$A:0{(' ' + eos + ':0') if add_eos_token else ''}"
+        let mut template = String::with_capacity(32);
+        let mut tokens = Vec::with_capacity(2);
+
+        if add_bos_token {
+            let bos = special_tokens.bos_token.as_ref()?;
+            let bos_id = vocab.get(bos).copied()?;
+            template.push_str(bos);
+            template.push_str(":0 ");
+            tokens.push((bos.clone(), bos_id));
+        }
+
+        template.push_str("$A:0");
+
+        if add_eos_token {
+            let eos = special_tokens.eos_token.as_ref()?;
+            let eos_id = vocab.get(eos).copied()?;
+            template.push(' ');
+            template.push_str(eos);
+            template.push_str(":0");
+            tokens.push((eos.clone(), eos_id));
+        }
+
+        TemplateProcessing::builder()
+            .try_single(template.as_str())
+            .ok()?
+            .special_tokens(tokens)
+            .build()
+            .ok()
     }
 
     /// Create from an existing HuggingFace tokenizer
@@ -130,21 +203,33 @@ impl HuggingFaceTokenizer {
         }
     }
 
-    /// Try to load chat template from tokenizer_config.json
-    fn load_chat_template(tokenizer_path: &str) -> Option<String> {
-        // Try to find tokenizer_config.json in the same directory
-        let path = std::path::Path::new(tokenizer_path);
-        let dir = path.parent()?;
-        let config_path = dir.join("tokenizer_config.json");
+    /// Load chat template and special token settings from tokenizer_config.json
+    /// Returns Option<bool> to distinguish between explicit false vs not set
+    fn load_chat_template_and_config(
+        tokenizer_path: &str,
+    ) -> (Option<String>, Option<bool>, Option<bool>) {
+        (|| {
+            let path = std::path::Path::new(tokenizer_path);
+            let config_path = path.parent()?.join("tokenizer_config.json");
 
-        if config_path.exists() {
-            if let Ok(template) =
-                super::chat_template::load_chat_template_from_config(config_path.to_str()?)
-            {
-                return template;
+            if !config_path.exists() {
+                return None;
             }
-        }
-        None
+
+            let config_str = config_path.to_str()?;
+            let content = std::fs::read_to_string(&config_path).ok()?;
+            let config: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+            let chat_template = super::chat_template::load_chat_template_from_config(config_str)
+                .ok()
+                .flatten();
+
+            let add_bos_token = config.get("add_bos_token").and_then(|v| v.as_bool());
+            let add_eos_token = config.get("add_eos_token").and_then(|v| v.as_bool());
+
+            Some((chat_template, add_bos_token, add_eos_token))
+        })()
+        .unwrap_or((None, None, None))
     }
 
     /// Load chat template from a file (.jinja or .json containing Jinja)
@@ -217,23 +302,23 @@ impl HuggingFaceTokenizer {
 }
 
 impl Encoder for HuggingFaceTokenizer {
-    fn encode(&self, input: &str) -> Result<Encoding> {
+    fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
         self.tokenizer
-            .encode(input, false)
+            .encode(input, add_special_tokens)
             .map_err(|e| Error::msg(format!("Encoding failed: {}", e)))
             .map(|encoding| Encoding::Hf(Box::new(encoding)))
     }
 
-    fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
-        let encodings = self
-            .tokenizer
-            .encode_batch(inputs.to_vec(), false)
-            .map_err(|e| Error::msg(format!("Batch encoding failed: {}", e)))?;
-
-        Ok(encodings
-            .into_iter()
-            .map(|e| Encoding::Hf(Box::new(e)))
-            .collect())
+    fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+        self.tokenizer
+            .encode_batch(inputs.to_vec(), add_special_tokens)
+            .map_err(|e| Error::msg(format!("Batch encoding failed: {}", e)))
+            .map(|encodings| {
+                encodings
+                    .into_iter()
+                    .map(|e| Encoding::Hf(Box::new(e)))
+                    .collect()
+            })
     }
 }
 

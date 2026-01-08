@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
+    PipelineConfig,
 )
 
 
@@ -69,8 +70,24 @@ class ZImagePipelineConfig(ImagePipelineConfig):
         )
         return inputs
 
+    def shard_latents_for_sp(self, batch, latents):
+        if latents.dim() == 5:
+            return PipelineConfig.shard_latents_for_sp(self, batch, latents)
+        return super().shard_latents_for_sp(batch, latents)
+
+    def gather_latents_for_sp(self, latents):
+        if latents.dim() == 5:
+            return PipelineConfig.gather_latents_for_sp(self, latents)
+        return super().gather_latents_for_sp(latents)
+
     def post_denoising_loop(self, latents, batch):
         bs, channels, num_frames, height, width = latents.shape
+        raw_latent_shape = getattr(batch, "raw_latent_shape", None)
+        if raw_latent_shape is not None and num_frames > raw_latent_shape[2]:
+            latents = latents[:, :, : raw_latent_shape[2], :, :]
+            num_frames = raw_latent_shape[2]
+        if num_frames != 1:
+            return latents[:, :, 0, :, :]
         return latents.view(bs, channels, height, width)
 
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):

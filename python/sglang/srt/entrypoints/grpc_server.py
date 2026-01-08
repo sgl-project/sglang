@@ -5,6 +5,7 @@ Uses GrpcRequestManager for orchestration without tokenization.
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import signal
@@ -210,7 +211,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         sampling_params.normalize(tokenizer=None)
 
         # Create health check request
-        is_generation = self.scheduler_info.get("is_generation", True)
+        is_generation = self.scheduler_info.get("is_generation")
+        if is_generation is None:
+            is_generation = not self.server_args.is_embedding
+
         if is_generation:
             health_req = TokenizedGenerateReqInput(
                 rid=rid,
@@ -229,10 +233,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 health_req.bootstrap_host = FAKE_BOOTSTRAP_HOST
                 health_req.bootstrap_room = 0
         else:
+            sampling_params.max_new_tokens = 0
             health_req = TokenizedEmbeddingReqInput(
                 rid=rid,
                 input_text="",
                 input_ids=[0],
+                image_inputs={"mm_items": []},
+                token_type_ids=[0],
+                sampling_params=sampling_params,
             )
 
         # Submit health check request
@@ -327,6 +335,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             pad_token_id=self.model_info["pad_token_id"],
             bos_token_id=self.model_info["bos_token_id"],
             max_req_input_len=self.model_info["max_req_input_len"],
+            # Classification model support
+            id2label_json=self.model_info.get("id2label_json") or "",
+            num_labels=self.model_info.get("num_labels") or 0,
         )
 
     async def GetServerInfo(
@@ -736,6 +747,22 @@ async def serve_grpc(
 
     # Update model info from scheduler info and model config
     if model_info is None:
+        # Extract classification labels from HuggingFace config (if available)
+        # Match logic in serving_classify.py::_get_id2label_mapping
+        hf_config = model_config.hf_config
+        id2label = getattr(hf_config, "id2label", None)
+        num_labels = getattr(hf_config, "num_labels", 0) or 0
+
+        # If no id2label but num_labels exists, create default mapping
+        if not id2label and num_labels:
+            id2label = {i: f"LABEL_{i}" for i in range(num_labels)}
+        elif id2label and not num_labels:
+            num_labels = len(id2label)
+
+        # Convert to JSON string for proto transport
+        # id2label is a dict like {0: "negative", 1: "positive"}
+        id2label_json = json.dumps(id2label) if id2label else ""
+
         model_info = {
             "model_name": server_args.model_path,
             "max_context_length": scheduler_info.get(
@@ -743,12 +770,15 @@ async def serve_grpc(
             ),
             "vocab_size": scheduler_info.get("vocab_size", 128256),
             "supports_vision": scheduler_info.get("supports_vision", False),
-            "model_type": getattr(model_config.hf_config, "model_type", None),
-            "architectures": getattr(model_config.hf_config, "architectures", None),
+            "model_type": getattr(hf_config, "model_type", None),
+            "architectures": getattr(hf_config, "architectures", None),
             "max_req_input_len": scheduler_info.get("max_req_input_len", 8192),
             "eos_token_ids": scheduler_info.get("eos_token_ids", []),
             "pad_token_id": scheduler_info.get("pad_token_id", 0),
             "bos_token_id": scheduler_info.get("bos_token_id", 1),
+            # Classification model support
+            "id2label_json": id2label_json,
+            "num_labels": num_labels or 0,
         }
 
     # Create request manager with the correct port args

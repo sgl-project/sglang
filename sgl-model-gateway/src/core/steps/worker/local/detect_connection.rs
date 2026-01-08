@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use tracing::debug;
 
+use super::strip_protocol;
 use crate::{
     app_context::AppContext,
     core::ConnectionMode,
@@ -13,14 +14,6 @@ use crate::{
     routers::grpc::client::GrpcClient,
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
-
-/// Strip protocol prefix from URL.
-fn strip_protocol(url: &str) -> String {
-    url.trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .trim_start_matches("grpc://")
-        .to_string()
-}
 
 /// Try HTTP health check.
 async fn try_http_health_check(

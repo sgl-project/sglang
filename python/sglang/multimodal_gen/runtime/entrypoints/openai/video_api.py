@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
+    add_common_data_to_response,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -53,14 +54,13 @@ def _build_sampling_params_from_request(
     else:
         width, height = _parse_size(request.size)
     seconds = request.seconds if request.seconds is not None else 4
-    # Prefer user-provided fps/num_frames from request; fallback to defaults
     fps_default = 24
     fps = request.fps if request.fps is not None else fps_default
-    # If user provides num_frames, use it directly; otherwise derive from seconds * fps
     derived_num_frames = fps * seconds
     num_frames = (
         request.num_frames if request.num_frames is not None else derived_num_frames
     )
+
     server_args = get_global_server_args()
     sampling_kwargs = {
         "request_id": request_id,
@@ -90,6 +90,13 @@ def _build_sampling_params_from_request(
         server_args=server_args,
         **sampling_kwargs,
     )
+
+    if request.num_inference_steps is not None:
+        sampling_params.num_inference_steps = request.num_inference_steps
+    if request.guidance_scale is not None:
+        sampling_params.guidance_scale = request.guidance_scale
+    if request.seed is not None:
+        sampling_params.seed = request.seed
 
     return sampling_params
 
@@ -124,8 +131,9 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
             "progress": 100,
             "completed_at": int(time.time()),
         }
-        if result.peak_memory_mb and result.peak_memory_mb > 0:
-            update_fields["peak_memory_mb"] = result.peak_memory_mb
+        update_fields = add_common_data_to_response(
+            update_fields, request_id=job_id, result=result
+        )
         await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
         logger.error(f"{e}")
@@ -135,6 +143,7 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
 
 
 # TODO: support image to video generation
+# TODO: this is currently not used
 @router.post("", response_model=VideoResponse)
 async def create_video(
     request: Request,
@@ -258,6 +267,9 @@ async def create_video(
         server_args=get_global_server_args(),
         sampling_params=sampling_params,
     )
+    # Add diffusers_kwargs if provided
+    if req.diffusers_kwargs:
+        batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
     # Enqueue the job asynchronously and return immediately
     asyncio.create_task(_dispatch_job_async(request_id, batch))
     return VideoResponse(**job)

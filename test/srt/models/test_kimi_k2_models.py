@@ -28,6 +28,8 @@ class TestKimiK2Thinking(CustomTestCase):
             "kimi_k2",
             "--reasoning-parser",
             "kimi_k2",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
         ]
         cls.process = popen_launch_server(
             cls.model,

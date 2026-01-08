@@ -55,9 +55,15 @@ async def health():
     return {"status": "ok"}
 
 
-@health_router.get("/models")
+@health_router.get("/models", deprecated=True)
 async def get_models(request: Request):
-    """Get information about the model served by this server."""
+    """
+    Get information about the model served by this server.
+
+    .. deprecated::
+        Use /v1/models instead for OpenAI-compatible model discovery.
+        This endpoint will be removed in a future version.
+    """
     from sglang.multimodal_gen.registry import get_model_info
 
     server_args: ServerArgs = request.app.state.server_args
