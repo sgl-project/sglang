@@ -1514,7 +1514,11 @@ def _execute_server_warmup(server_args: ServerArgs):
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
-    elif is_vlm and server_args.disaggregation_mode == "null" and model_info["is_generation"]:
+    elif (
+        is_vlm
+        and server_args.disaggregation_mode == "null"
+        and model_info["is_generation"]
+    ):
         # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
         # Only use chat completions format for generation models, not embedding models
         json_data = {

@@ -782,6 +782,7 @@ class MultimodalEmbeddingInput(BaseModel):
     image: Optional[str] = None
     video: Optional[str] = None
 
+
 EmbeddingInput = Union[
     List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]
 ]
