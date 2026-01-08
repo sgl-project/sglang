@@ -369,7 +369,7 @@ impl Tree {
         // Intern the tenant ID once for reuse
         let tenant_id = intern_tenant(tenant);
 
-        // Ensure tenant exists at root (don't update timestamp - root is never evicted)
+        // Ensure tenant exists at root
         self.root
             .tenant_last_access_time
             .entry(Arc::clone(&tenant_id))
@@ -379,24 +379,11 @@ impl Tree {
         let mut remaining = text;
         let mut prev = Arc::clone(&self.root);
 
-        // Result type to carry state out of the match block
-        // This allows the entry guard to be dropped before we update prev
-        enum InsertStep {
-            Done,
-            Continue {
-                next_prev: NodeRef,
-                advance_chars: usize,
-            },
-        }
-
         while !remaining.is_empty() {
             let first_char = remaining.chars().next().unwrap();
 
-            // Use entry API for atomic check-and-insert semantics (required for thread safety)
-            let step = match prev.children.entry(first_char) {
+            match prev.children.entry(first_char) {
                 Entry::Vacant(entry) => {
-                    // No match - create new node with remaining text (this is the leaf)
-                    // Compute remaining char count lazily - only here when creating leaf
                     let remaining_char_count = remaining.chars().count();
                     let epoch = get_epoch();
 
@@ -408,7 +395,7 @@ impl Tree {
                         last_tenant: parking_lot::RwLock::new(Some(Arc::clone(&tenant_id))),
                     });
 
-                    // Attach tenant to the new leaf node with timestamp
+                    // Update counts when creating a leaf
                     self.tenant_char_count
                         .entry(Arc::clone(&tenant_id))
                         .and_modify(|count| {
@@ -421,31 +408,22 @@ impl Tree {
                                 .fetch_add(remaining_char_count, Ordering::Relaxed);
                             remaining_char_count
                         });
+
                     new_node
                         .tenant_last_access_time
                         .insert(Arc::clone(&tenant_id), epoch);
-
                     entry.insert(new_node);
-                    InsertStep::Done
+                    return;
                 }
-
                 Entry::Occupied(mut entry) => {
                     let matched_node = entry.get().clone();
-
                     let matched_node_text = matched_node.text.read().unwrap();
                     let matched_node_text_count = matched_node_text.char_count();
-                    let matched_node_text_str = matched_node_text.as_str();
-
-                    // Use slice-based comparison - no allocation
-                    let shared_count = shared_prefix_count(remaining, matched_node_text_str);
+                    let shared_count = shared_prefix_count(remaining, matched_node_text.as_str());
 
                     if shared_count < matched_node_text_count {
-                        // Split the matched node
                         let (matched_text, contracted_text) =
                             matched_node_text.split_at_char(shared_count);
-                        let matched_text_count = shared_count;
-
-                        // Drop read lock before creating new node
                         drop(matched_node_text);
 
                         let new_node = Arc::new(Node {
@@ -458,18 +436,15 @@ impl Tree {
                             ),
                         });
 
-                        let first_new_char = contracted_text.first_char().unwrap();
-                        new_node
-                            .children
-                            .insert(first_new_char, Arc::clone(&matched_node));
-
+                        new_node.children.insert(
+                            contracted_text.first_char().unwrap(),
+                            Arc::clone(&matched_node),
+                        );
                         entry.insert(Arc::clone(&new_node));
 
                         *matched_node.text.write().unwrap() = contracted_text;
                         *matched_node.parent.write().unwrap() = Some(Arc::clone(&new_node));
 
-                        // Attach tenant to the new split node (intermediate - no timestamp update)
-                        // The cloned DashMap already has the tenant; just ensure char count is correct
                         if !new_node
                             .tenant_last_access_time
                             .contains_key(tenant_id.as_ref())
@@ -477,29 +452,24 @@ impl Tree {
                             self.tenant_char_count
                                 .entry(Arc::clone(&tenant_id))
                                 .and_modify(|count| {
-                                    *count += matched_text_count;
+                                    *count += shared_count;
                                     self.total_char_count
-                                        .fetch_add(matched_text_count, Ordering::Relaxed);
+                                        .fetch_add(shared_count, Ordering::Relaxed);
                                 })
                                 .or_insert_with(|| {
                                     self.total_char_count
-                                        .fetch_add(matched_text_count, Ordering::Relaxed);
-                                    matched_text_count
+                                        .fetch_add(shared_count, Ordering::Relaxed);
+                                    shared_count
                                 });
                             new_node
                                 .tenant_last_access_time
                                 .insert(Arc::clone(&tenant_id), 0);
                         }
 
-                        InsertStep::Continue {
-                            next_prev: new_node,
-                            advance_chars: shared_count,
-                        }
+                        prev = new_node;
+                        remaining = advance_by_chars(remaining, shared_count);
                     } else {
-                        // Full match - move to next node (intermediate - no timestamp update)
                         drop(matched_node_text);
-
-                        // Ensure tenant exists at this intermediate node
                         if !matched_node
                             .tenant_last_access_time
                             .contains_key(tenant_id.as_ref())
@@ -520,30 +490,12 @@ impl Tree {
                                 .tenant_last_access_time
                                 .insert(Arc::clone(&tenant_id), 0);
                         }
-
-                        InsertStep::Continue {
-                            next_prev: matched_node,
-                            advance_chars: shared_count,
-                        }
+                        prev = matched_node;
+                        remaining = advance_by_chars(remaining, shared_count);
                     }
-                }
-            };
-
-            // Entry guard is now dropped - safe to update prev
-            match step {
-                InsertStep::Done => return, // New leaf created with timestamp, we're done
-                InsertStep::Continue {
-                    next_prev,
-                    advance_chars,
-                } => {
-                    prev = next_prev;
-                    remaining = advance_by_chars(remaining, advance_chars);
                 }
             }
         }
-
-        // Loop exited normally (remaining empty) - prev is the leaf node
-        // Update its timestamp for LRU ordering
         let epoch = get_epoch();
         prev.tenant_last_access_time
             .insert(Arc::clone(&tenant_id), epoch);
