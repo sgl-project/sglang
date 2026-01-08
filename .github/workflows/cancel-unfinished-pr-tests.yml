@@ -3,12 +3,6 @@ name: Cancel Unfinished PR Tests
 on:
   pull_request:
     types: [synchronize]
-    inputs:
-      workflows:
-        description: 'Space-separated list of workflow filenames to cancel'
-        required: true
-        type: string
-        default: 'pr-test.yml'
   workflow_dispatch:
     inputs:
       workflows:
@@ -33,7 +27,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          WORKFLOWS: ${{ github.event.inputs.workflows }}
+          WORKFLOWS: ${{ github.event.inputs.workflows || 'pr-test.yml' }}
         shell: bash
         run: |
           set -euo pipefail
