@@ -1,7 +1,10 @@
+import torch
+
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.utils.custom_op import register_custom_op
-import torch
-@register_custom_op(mutates_args=[],eager=True)
+
+
+@register_custom_op(mutates_args=[])
 def print_tensor_debug(
     t: torch.Tensor,
     name: str,
@@ -12,7 +15,6 @@ def print_tensor_debug(
 
     if not t.is_cuda or torch.cuda.current_device() != 0:
         return
-
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -43,4 +45,3 @@ def print_tensor_debug(
         print(f"  has_inf   : {has_inf}", flush=True)
 
     print("=" * 80 + "\n", flush=True)
-
