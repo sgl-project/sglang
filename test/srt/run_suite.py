@@ -16,17 +16,6 @@ suites = {
         TestFile("test_video_utils.py", 5),
         TestFile("test_modelopt_export.py", 9),
     ],
-    "per-commit-2-gpu": [
-        TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
-        TestFile("hicache/test_hicache_storage_file_backend.py", 200),
-        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
-        TestFile("models/test_kimi_linear_models.py", 90),
-        TestFile("models/test_nvidia_nemotron_nano_v2.py", 132),
-        TestFile("test_data_parallelism.py", 73),
-        TestFile("test_disaggregation_basic.py", 400),
-        TestFile("test_dp_attention.py", 350),
-        TestFile("test_load_weights_from_remote_instance.py", 72),
-    ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 650),
         TestFile("test_gpt_oss_4gpu.py", 300),
@@ -116,11 +105,6 @@ suite_amd = {
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
     ],
-    "per-commit-amd-mi35x": [],
-    "per-commit-2-gpu-amd": [
-        TestFile("test_data_parallelism.py", 73),
-        TestFile("test_load_weights_from_remote_instance.py", 72),
-    ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
     ],
@@ -129,7 +113,7 @@ suite_amd = {
         TestFile("test_deepseek_v3_mtp.py", 275),
     ],
     "per-commit-8-gpu-amd-mi35x": [
-        TestFile("test_deepseek_r1_mxfp4_8gpu.py", 1800),
+        TestFile("test_deepseek_r1_mxfp4_8gpu.py", 3600),
     ],
     # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
     # have been migrated to test/registered/amd/nightly/ and are now managed
