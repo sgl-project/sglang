@@ -12,7 +12,13 @@ It is recommended to use uv for faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install "sglang" --prerelease=allow
+uv pip install "sglang"
+```
+
+For different CUDA versions, you can try to add `--extra-index-url` to find the correct [PyTorch](https://pytorch.org/get-started/locally/) wheel.
+For example, on GB200, you will need to do the following. Otherwise, it will install the CPU version of PyTorch.
+```
+uv pip install "sglang" --extra-index-url https://download.pytorch.org/whl/cu129
 ```
 
 **Quick fixes to common problems**
