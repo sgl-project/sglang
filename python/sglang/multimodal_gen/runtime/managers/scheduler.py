@@ -1,6 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import asyncio
+import os
 import pickle
 from collections import deque
 from copy import deepcopy
@@ -8,12 +10,14 @@ from typing import Any, List
 
 import zmq
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
     _parse_size,
+    save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -28,6 +32,8 @@ from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
 
 logger = init_logger(__name__)
+
+MINIMUM_PNG_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 
 class Scheduler:
@@ -147,13 +153,35 @@ class Scheduler:
             # insert warmup reqs constructed with each warmup-resolution
             for resolution in self.server_args.warmup_resolutions:
                 width, height = _parse_size(resolution)
-                req = Req(
-                    data_type=self.server_args.pipeline_config.task_type.data_type(),
-                    width=width,
-                    height=height,
-                    prompt="",
-                    is_warmup=True,
-                )
+                task_type = self.server_args.pipeline_config.task_type
+
+                if task_type in (ModelTaskType.I2I, ModelTaskType.TI2I):
+                    uploads_dir = os.path.join("outputs", "uploads")
+                    os.makedirs(uploads_dir, exist_ok=True)
+                    input_path = asyncio.run(
+                        save_image_to_path(
+                            MINIMUM_PNG_PICTURE_BASE64_FOR_WARMUP,
+                            os.path.join(uploads_dir, f"warmup_image.jpg"),
+                        )
+                    )
+                    req = Req(
+                        data_type=task_type.data_type(),
+                        width=width,
+                        height=height,
+                        prompt="",
+                        negative_prompt="",
+                        image_path=[input_path],
+                        is_warmup=True,
+                    )
+                else:
+                    req = Req(
+                        data_type=task_type.data_type(),
+                        width=width,
+                        height=height,
+                        prompt="",
+                        is_warmup=True,
+                    )
+
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
