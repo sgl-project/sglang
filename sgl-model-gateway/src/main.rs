@@ -182,6 +182,14 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
+    /// Enable reactive cache eviction when tree size exceeds high-water mark
+    #[arg(long, default_value_t = true, help_heading = "Routing Policy")]
+    enable_reactive_eviction: bool,
+
+    /// Multiplier for max_tree_size to trigger reactive eviction (high-water mark)
+    #[arg(long, default_value_t = 1.2, help_heading = "Routing Policy")]
+    reactive_eviction_threshold: f32,
+
     /// Enable IGW (Inference Gateway) mode for multi-model support
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     enable_igw: bool,
@@ -684,6 +692,8 @@ impl CliArgs {
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+                enable_reactive_eviction: self.enable_reactive_eviction,
+                reactive_eviction_threshold: self.reactive_eviction_threshold,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,

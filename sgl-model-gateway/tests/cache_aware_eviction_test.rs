@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use smg::{
-    core::{BasicWorkerBuilder, ModelCard, Worker, WorkerType},
+    core::{BasicWorkerBuilder, ModelCard, Worker},
     policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
 };
 
