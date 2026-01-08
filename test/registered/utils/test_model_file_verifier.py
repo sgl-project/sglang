@@ -240,7 +240,11 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
             _flip_bit_in_file(os.path.join(self.test_dir, corrupted_file))
 
         stdout_io, stderr_io = StringIO(), StringIO()
-        ctx = self.assertRaises(PopenLaunchServerError) if corrupt_weights else nullcontext()
+        ctx = (
+            self.assertRaises(PopenLaunchServerError)
+            if corrupt_weights
+            else nullcontext()
+        )
         with ctx:
             process = popen_launch_server(
                 model=self.test_dir,
