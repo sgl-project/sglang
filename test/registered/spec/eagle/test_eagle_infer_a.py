@@ -1,4 +1,5 @@
 import os
+import random
 import unittest
 
 import requests
@@ -9,11 +10,11 @@ from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
-    DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
+    DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+    DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -21,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=470, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=500, suite="stage-b-test-small-1-gpu")
 
 torch_dtype = torch.float16
 prefill_tolerance = 5e-2
@@ -30,8 +31,8 @@ decode_tolerance: float = 5e-2
 
 class TestEAGLEEngine(CustomTestCase):
     BASE_CONFIG = {
-        "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-        "speculative_draft_model_path": DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+        "model_path": DEFAULT_TARGET_MODEL_EAGLE,
+        "speculative_draft_model_path": DEFAULT_DRAFT_MODEL_EAGLE,
         "speculative_algorithm": "EAGLE",
         "speculative_num_steps": 5,
         "speculative_eagle_topk": 4,
@@ -71,6 +72,7 @@ class TestEAGLEEngine(CustomTestCase):
                 engine = sgl.Engine(**config, log_level="info", decode_log_interval=10)
                 try:
                     self._test_single_generation(engine)
+                    self._test_first_token_finish(engine)
                     self._test_batch_generation(engine)
                     self._test_eos_token(engine)
                     self._test_acc_length(engine)
@@ -109,6 +111,20 @@ class TestEAGLEEngine(CustomTestCase):
             avg_spec_accept_length, self.THRESHOLDS["batch_avg_accept_len"]
         )
 
+    def _test_first_token_finish(self, engine):
+        prompt = [
+            f"There are {i} apples on the table. How to divide them equally?"
+            for i in range(8)
+        ]
+        params = [
+            {"temperature": 0, "max_new_tokens": random.randint(1, 3)} for _ in range(8)
+        ]
+        outputs = engine.generate(prompt, params)
+        for i, output in enumerate(outputs):
+            print(f"Prompt: {prompt[i]}")
+            print(f"Generated: {output['text']}")
+            print("-" * 40)
+
     def _test_eos_token(self, engine):
         prompt = "[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\nToday is a sunny day and I like [/INST]"
         params = {
@@ -117,7 +133,7 @@ class TestEAGLEEngine(CustomTestCase):
             "skip_special_tokens": False,
         }
 
-        tokenizer = get_tokenizer(DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST)
+        tokenizer = get_tokenizer(DEFAULT_TARGET_MODEL_EAGLE)
         output = engine.generate(prompt, params)["text"]
         print(f"{output=}")
 
@@ -171,8 +187,8 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
 
 class TestEAGLE3Engine(TestEAGLEEngine):
     BASE_CONFIG = {
-        "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
-        "speculative_draft_model_path": DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
+        "model_path": DEFAULT_TARGET_MODEL_EAGLE3,
+        "speculative_draft_model_path": DEFAULT_DRAFT_MODEL_EAGLE3,
         "speculative_algorithm": "EAGLE3",
         "speculative_num_steps": 5,
         "speculative_eagle_topk": 16,
@@ -190,8 +206,8 @@ class TestEAGLE3Engine(TestEAGLEEngine):
 
 class TestEAGLERadixCache(CustomTestCase):
     BASE_CONFIG = {
-        "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3,
-        "speculative_draft_model_path": DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
+        "model_path": DEFAULT_TARGET_MODEL_EAGLE3,
+        "speculative_draft_model_path": DEFAULT_DRAFT_MODEL_EAGLE3,
         "speculative_algorithm": "EAGLE3",
         "speculative_num_steps": 2,
         "speculative_eagle_topk": 2,
@@ -212,8 +228,9 @@ class TestEAGLERadixCache(CustomTestCase):
             # Chunked prefill & Page Size > 1
             {**self.BASE_CONFIG, "chunked_prefill_size": 64, "page_size": 4},
             {**self.BASE_CONFIG, "page_size": 4},
-            # Preferred by some kernels
-            {**self.BASE_CONFIG, "page_size": 64},
+            # Large page size tend to expose IMA bugs.
+            {**self.BASE_CONFIG, "page_size": 256},
+            {**self.BASE_CONFIG, "cuda_graph_bs": [5], "page_size": 4},
             # Disable CUDA Graph
             {
                 **self.BASE_CONFIG,
@@ -292,14 +309,14 @@ class TestEAGLEDraftExtend(CustomTestCase):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            DEFAULT_TARGET_MODEL_EAGLE,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                DEFAULT_DRAFT_MODEL_EAGLE,
                 "--speculative-num-steps",
                 1,
                 "--speculative-eagle-topk",
@@ -358,14 +375,14 @@ class TestEAGLEDraftExtendFlashinfer(TestEAGLEDraftExtend):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            DEFAULT_TARGET_MODEL_EAGLE,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                DEFAULT_DRAFT_MODEL_EAGLE,
                 "--speculative-num-steps",
                 1,
                 "--speculative-eagle-topk",
@@ -387,14 +404,14 @@ class TestEAGLEDraftExtendTriton(TestEAGLEDraftExtend):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            DEFAULT_TARGET_MODEL_EAGLE,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                DEFAULT_DRAFT_MODEL_EAGLE,
                 "--speculative-num-steps",
                 1,
                 "--speculative-eagle-topk",

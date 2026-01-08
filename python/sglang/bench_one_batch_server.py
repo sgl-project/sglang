@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import requests
 from pydantic import BaseModel
+from tabulate import tabulate
 from transformers import AutoProcessor, PreTrainedTokenizer
 
 from sglang.bench_serving import (
@@ -66,6 +67,7 @@ class BenchArgs:
     pydantic_result_filename: Optional[str] = None
     append_to_github_summary: bool = True
     seed: int = 42
+    cache_hit_rate: float = 0.0
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -142,6 +144,13 @@ class BenchArgs:
             help="Disable appending the output of this run to github ci summary",
         )
         parser.add_argument("--seed", type=int, default=BenchArgs.seed)
+        parser.add_argument(
+            "--cache-hit-rate",
+            type=float,
+            default=BenchArgs.cache_hit_rate,
+            help="Cache hit rate for benchmarking (0.0-1.0). "
+            "0.0 means no cache hits (flush all), 0.4 means 40%% of input tokens are cached.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -211,6 +220,57 @@ def launch_server_process(server_args: ServerArgs):
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
+def _warmup_cache(
+    url: str,
+    input_ids: List[List[int]],
+    input_len: int,
+    cache_hit_rate: float,
+    dataset_name: str = "random",
+    image_data: Optional[List] = None,
+):
+    """Warm up the cache by sending prefix tokens to populate the radix cache.
+
+    Args:
+        url: Server URL
+        input_ids: List of input token id lists
+        input_len: Length of input tokens
+        cache_hit_rate: Fraction of input tokens to cache (0.0-1.0)
+        dataset_name: Name of the dataset (used to determine if image data should be included)
+        image_data: Optional image data for VLM models
+    """
+    cached_token_len = int(input_len * cache_hit_rate)
+    if cached_token_len <= 0:
+        return
+
+    print(
+        f"Warming up cache with {cache_hit_rate*100:.1f}% hit rate "
+        f"({cached_token_len} tokens per request)"
+    )
+    # Create prefix input_ids for cache warming
+    cache_warmup_input_ids = [ids[:cached_token_len] for ids in input_ids]
+    cache_warmup_payload = {
+        "input_ids": cache_warmup_input_ids,
+        "sampling_params": {
+            "temperature": 0.0,
+            "max_new_tokens": 1,  # Minimal output, just to populate cache
+            "ignore_eos": True,
+        },
+        "stream": False,
+    }
+    if dataset_name == "mmmu" and image_data is not None:
+        # include image data in cache warmup
+        cache_warmup_payload["image_data"] = image_data
+
+    warmup_response = requests.post(
+        url + "/generate",
+        json=cache_warmup_payload,
+    )
+    if warmup_response.status_code != 200:
+        print(f"Warning: Cache warmup request failed: {warmup_response.text}")
+    else:
+        print("Cache warmup completed")
+
+
 def run_one_case(
     url: str,
     batch_size: int,
@@ -231,6 +291,7 @@ def run_one_case(
     dataset_name: str = BenchArgs.dataset_name,
     dataset_path: str = BenchArgs.dataset_path,
     parallel_batch: bool = False,
+    cache_hit_rate: float = BenchArgs.cache_hit_rate,
 ):
     requests.post(url + "/flush_cache")
 
@@ -294,6 +355,17 @@ def run_one_case(
         input_ids = [req.prompt for req in input_requests]
 
     payload["input_ids"] = input_ids
+
+    # Warm up cache if cache_hit_rate > 0.0
+    if cache_hit_rate > 0.0:
+        _warmup_cache(
+            url=url,
+            input_ids=input_ids,
+            input_len=input_len,
+            cache_hit_rate=cache_hit_rate,
+            dataset_name=dataset_name,
+            image_data=payload.get("image_data"),
+        )
 
     # Turn on profiler
     profile_link = None
@@ -393,22 +465,27 @@ def should_skip_due_to_token_capacity(
     return False
 
 
+def should_skip_due_to_max_running_requests(
+    batch_size, skip_max_running_requests_threshold
+):
+    if batch_size > skip_max_running_requests_threshold:
+        print(
+            "=" * 8
+            + f"Skip benchmark {batch_size=} > {skip_max_running_requests_threshold=} due to max running requests limit."
+            + "=" * 8
+        )
+        return True
+    return False
+
+
 def get_report_summary(
     results: List[BenchOneCaseResult], bench_args: BenchArgs, server_args: ServerArgs
 ):
     summary = (
-        f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
+        f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}."
     )
-    summary += "| batch size | input len | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |"
-
-    if bench_args.profile:
-        summary += " profile |"
-
-    summary += "\n"
-    summary += "| ---------- | --------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |"
-
-    if bench_args.profile:
-        summary += "-------------|"
+    if bench_args.cache_hit_rate > 0.0:
+        summary += f" Cache hit rate: {bench_args.cache_hit_rate*100:.1f}%."
     summary += "\n"
 
     if is_blackwell():
@@ -419,27 +496,48 @@ def get_report_summary(
 
     # sort result by input_len
     results.sort(key=lambda x: x.input_len)
+    rows = []
+    headers = [
+        "batch size",
+        "input len",
+        "latency (s)",
+        "input throughput (tok/s)",
+        "output throughput (tok/s)",
+        "acc length",
+        "ITL (ms)",
+        "input cost ($/1M)",
+        "output cost ($/1M)",
+    ]
+    if bench_args.profile:
+        headers.append("profile")
+
     for res in results:
         hourly_cost = hourly_cost_per_gpu * server_args.tp_size
-        accept_length = round(res.acc_length, 2) if res.acc_length > 0 else "n/a"
-        line = (
-            f"| {res.batch_size} | "
-            f"{res.input_len} | "
-            f"{res.latency:.2f} | "
-            f"{res.input_throughput:.2f} | "
-            f"{res.output_throughput:.2f} | "
-            f"{accept_length} | "
-            f"{1 / (res.output_throughput/res.batch_size) * 1000:.2f} | "
-            f"{1e6 / (res.input_throughput * input_util) / 3600 * hourly_cost:.2f} | "
-            f"{1e6 / res.output_throughput / 3600 * hourly_cost:.2f} |"
-        )
+        accept_length = f"{res.acc_length:.2f}" if res.acc_length > 0 else "n/a"
+        itl_ms = 1000 * res.batch_size / res.output_throughput
+        input_cost = 1e6 / (res.input_throughput * input_util) / 3600 * hourly_cost
+        output_cost = 1e6 / res.output_throughput / 3600 * hourly_cost
+
+        row = [
+            res.batch_size,
+            res.input_len,
+            f"{res.latency:.2f}",
+            f"{res.input_throughput:.2f}",
+            f"{res.output_throughput:.2f}",
+            accept_length,
+            f"{itl_ms:.2f}",
+            f"{input_cost:.2f}",
+            f"{output_cost:.2f}",
+        ]
         if bench_args.profile:
             if res.profile_link:
-                line += f" [Profile]({res.profile_link}) |"
+                row.append(f"[Profile]({res.profile_link})")
             else:
-                line += f" n/a |"
-        line += "\n"
-        summary += line
+                row.append("n/a")
+        rows.append(row)
+
+    summary += tabulate(rows, headers=headers, tablefmt="github")
+    summary += "\n"
 
     return summary
 
@@ -467,6 +565,16 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     skip_token_capacity_threshold = (
         internal_state[0].get("memory_usage", {}).get("token_capacity", 1000000000)
     )
+
+    # Get effective max running requests
+    max_running_requests_per_dp = internal_state[0].get(
+        "effective_max_running_requests_per_dp", -1
+    )
+    dp_size = server_info.get("dp_size", None) or 1
+    assert (
+        max_running_requests_per_dp > 0
+    ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
+    skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
 
     # Warmup
     if not bench_args.skip_warmup:
@@ -498,7 +606,9 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         for bs, il, ol in itertools.product(
             bench_args.batch_size, bench_args.input_len, bench_args.output_len
         ):
-            if should_skip_due_to_token_capacity(
+            if should_skip_due_to_max_running_requests(
+                bs, skip_max_running_requests_threshold
+            ) or should_skip_due_to_token_capacity(
                 bs, il, ol, skip_token_capacity_threshold
             ):
                 continue
@@ -518,6 +628,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     dataset_name=bench_args.dataset_name,
                     dataset_path=bench_args.dataset_path,
                     parallel_batch=bench_args.parallel_batch,
+                    cache_hit_rate=bench_args.cache_hit_rate,
                 )
             )
 
@@ -527,7 +638,9 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 for bs, il, ol in itertools.product(
                     bench_args.batch_size, bench_args.input_len, bench_args.output_len
                 ):
-                    if should_skip_due_to_token_capacity(
+                    if should_skip_due_to_max_running_requests(
+                        bs, skip_max_running_requests_threshold
+                    ) or should_skip_due_to_token_capacity(
                         bs, il, ol, skip_token_capacity_threshold
                     ):
                         continue
@@ -550,6 +663,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                             dataset_name=bench_args.dataset_name,
                             dataset_path=bench_args.dataset_path,
                             parallel_batch=bench_args.parallel_batch,
+                            cache_hit_rate=bench_args.cache_hit_rate,
                             profile=bench_args.profile,
                             profile_steps=bench_args.profile_steps,
                             profile_by_stage=bench_args.profile_by_stage,
@@ -578,8 +692,6 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
     if is_in_ci() and bench_args.append_to_github_summary:
         write_github_step_summary(summary)
-    else:
-        print(summary)
 
     # Save results as pydantic models in the JSON format
     if bench_args.pydantic_result_filename:

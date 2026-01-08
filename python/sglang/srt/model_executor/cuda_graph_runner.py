@@ -30,7 +30,6 @@ from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
@@ -52,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -128,7 +128,7 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
-        if isinstance(sub, CustomOp):
+        if isinstance(sub, MultiPlatformOp):
             if reverse:
                 sub.leave_torch_compile()
             else:
@@ -321,6 +321,11 @@ class CudaGraphRunner:
                 num_tokens_per_bs=self.num_tokens_per_bs,
             )
 
+        enable_mamba_track = (
+            self.model_runner.server_args.enable_mamba_extra_buffer()
+            and self.model_runner.spec_algorithm.is_none()
+        )
+
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
         self.buffers: GraphInputBuffers = GraphInputBuffers.create(
@@ -338,12 +343,16 @@ class CudaGraphRunner:
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
+            enable_mamba_track=enable_mamba_track,
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
         # Speculative_inference
-        if model_runner.spec_algorithm.is_eagle3():
+        if (
+            model_runner.spec_algorithm.is_eagle3()
+            and model_runner.eagle_use_aux_hidden_state
+        ):
             self.model_runner.model.set_eagle3_layers_to_capture()
 
         # Capture
@@ -369,6 +378,7 @@ class CudaGraphRunner:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -537,7 +547,7 @@ class CudaGraphRunner:
     def capture_one_batch_size(
         self, bs: int, forward: Callable, stream_idx: Optional[int] = None
     ):
-        buffers = self.buffers
+        buffers: GraphInputBuffers = self.buffers
         graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -611,6 +621,18 @@ class CudaGraphRunner:
         else:
             lora_ids = None
 
+        # mamba state tracking
+        mamba_track_indices = (
+            buffers.mamba_track_indices[:bs]
+            if buffers.mamba_track_indices is not None
+            else None
+        )
+        mamba_track_mask = (
+            buffers.mamba_track_mask[:bs]
+            if buffers.mamba_track_mask is not None
+            else None
+        )
+
         if stream_idx is None:
             attn_backend = self.model_runner.attn_backend
         else:
@@ -631,6 +653,9 @@ class CudaGraphRunner:
             attn_backend=attn_backend,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
+            mamba_track_indices=mamba_track_indices,
+            mamba_track_mask=mamba_track_mask,
+            mamba_track_seqlens=None,  # Prefill only
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
@@ -756,6 +781,7 @@ class CudaGraphRunner:
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)

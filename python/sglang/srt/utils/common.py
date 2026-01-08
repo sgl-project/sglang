@@ -18,7 +18,6 @@ import argparse
 import asyncio
 import builtins
 import ctypes
-import dataclasses
 import functools
 import importlib
 import inspect
@@ -49,7 +48,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
@@ -66,7 +65,6 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
-    Set,
     Tuple,
     TypeVar,
     Union,
@@ -105,22 +103,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-show_time_cost = False
-time_infos = {}
-
-
-def get_or_create_event_loop():
-    """Gets the running event loop or creates a new one if it doesn't exist."""
-    try:
-        return asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        return loop
-
-
-HIP_FP8_E4M3_FNUZ_MAX = 224.0
-
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 @lru_cache(maxsize=1)
@@ -129,6 +111,7 @@ def is_hip() -> bool:
 
 
 if is_hip():
+    HIP_FP8_E4M3_FNUZ_MAX = 224.0
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
 else:
     FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -161,7 +144,15 @@ def is_xpu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_npu() -> bool:
-    return hasattr(torch, "npu") and torch.npu.is_available()
+    if not hasattr(torch, "npu"):
+        return False
+
+    if not torch.npu.is_available():
+        raise RuntimeError(
+            "torch_npu detected, but NPU device is not available or visible."
+        )
+
+    return True
 
 
 @lru_cache(maxsize=1)
@@ -191,14 +182,6 @@ def get_cuda_version():
     return (0, 0)
 
 
-def _check(cc_major):
-    if not is_cuda():
-        return False
-    return torch.cuda.get_device_capability()[0] == cc_major and tuple(
-        map(int, torch.version.cuda.split(".")[:2])
-    ) >= (12, 3)
-
-
 @contextmanager
 def device_context(device: torch.device):
     if device.type == "cpu" and is_cpu():
@@ -213,96 +196,49 @@ def device_context(device: torch.device):
             raise ValueError(f"Unknown device module: {device}")
 
 
-is_ampere_with_cuda_12_3 = lambda: _check(8)
-is_hopper_with_cuda_12_3 = lambda: _check(9)
-
-
-@lru_cache(maxsize=1)
-def is_blackwell():
+def _check_cuda_device_version(
+    device_capability_majors: List[int], cuda_version: Tuple[int, int]
+):
     if not is_cuda():
         return False
-    return torch.cuda.get_device_capability()[0] in [10, 12]
-
-
-@lru_cache(maxsize=1)
-def is_blackwell_supported(device=None) -> bool:
-    if not is_cuda_alike():
-        return False
-    return is_sm100_supported(device) or is_sm120_supported(device)
-
-
-@lru_cache(maxsize=1)
-def is_sm120_supported(device=None) -> bool:
-    if not is_cuda_alike():
-        return False
-    return (torch.cuda.get_device_capability(device)[0] == 12) and (
-        torch.version.cuda >= "12.8"
+    return (
+        torch.cuda.get_device_capability()[0] in device_capability_majors
+        and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
     )
 
 
-@lru_cache(maxsize=1)
-def is_sm100_supported(device=None) -> bool:
-    if not is_cuda():
-        return False
-    return (torch.cuda.get_device_capability(device)[0] == 10) and (
-        torch.version.cuda >= "12.8"
+is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(12, 3)
     )
-
-
-@lru_cache(maxsize=1)
-def is_sm90_supported(device=None) -> bool:
-    if not is_cuda():
-        return False
-    return (torch.cuda.get_device_capability(device)[0] == 9) and (
-        torch.version.cuda >= "12.3"
+)
+is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
     )
-
-
-_warned_bool_env_var_keys = set()
-
-
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name, default)
-    value = value.lower()
-
-    truthy_values = ("true", "1")
-    falsy_values = ("false", "0")
-
-    if (value not in truthy_values) and (value not in falsy_values):
-        if value not in _warned_bool_env_var_keys:
-            logger.warning(
-                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
-            )
-        _warned_bool_env_var_keys.add(value)
-
-    return value in truthy_values
-
-
-def get_int_env_var(name: str, default: int = 0) -> int:
-    # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-def get_float_env_var(name: str, default: float = 0.0) -> float:
-    # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        return default
-
-
-def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+)
+is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version,
+        device_capability_majors=[10, 12],
+        cuda_version=(12, 8),
+    )
+)
+is_sm120_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[12], cuda_version=(12, 8)
+    )
+)
+is_sm100_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
+    )
+)
+is_sm90_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
+    )
+)
 
 
 try:
@@ -364,6 +300,55 @@ def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
 
+_warned_bool_env_var_keys = set()
+
+
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name, default)
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        # Warn once per env var key (not per value), otherwise different keys that share the
+        # same invalid value may suppress warnings incorrectly.
+        if name not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+            )
+        _warned_bool_env_var_keys.add(name)
+
+    return value in truthy_values
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def get_float_env_var(name: str, default: float = 0.0) -> float:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def support_triton(backend: str) -> bool:
+    return backend not in ["torch_native", "intel_amx"]
+
+
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
     "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
 )
@@ -419,6 +404,10 @@ class DynamicGradMode(_DecoratorContextManager):
             return self.__class__(self.mode)
         else:
             return self.__class__()
+
+
+show_time_cost = False
+time_infos = {}
 
 
 def enable_show_time_cost():
@@ -849,6 +838,7 @@ def load_audio(
 class ImageData:
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    max_dynamic_patch: Optional[int] = None
 
 
 def load_image(
@@ -1145,18 +1135,6 @@ def add_api_key_middleware(app, api_key: str):
         return await call_next(request)
 
 
-def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
-    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
-        if not os.path.exists(model_path):
-            from modelscope import snapshot_download
-
-            model_path = snapshot_download(model_path)
-            tokenizer_path = snapshot_download(
-                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
-            )
-    return model_path, tokenizer_path
-
-
 def configure_logger(server_args, prefix: str = ""):
     if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
         if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
@@ -1262,41 +1240,61 @@ def point_to_point_pyobj(
     group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     dst: int = 1,
+    async_send: bool = False,
 ):
-    """Send data from src to dst in group using DeviceToDevice communication."""
-    device = torch.get_device_module().current_device()
+    """Send data from src to dst in group."""
+    from sglang.srt.distributed.parallel_state import P2PWork
+
+    if async_send:
+        send_func = dist.isend
+    else:
+        send_func = dist.send
     if rank == src:
+        p2p_works = []
         if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-            dist.send(tensor_size, dst=dst, group=group)
+            tensor_size = torch.tensor(
+                [0],
+                dtype=torch.long,
+            )
+            work = send_func(tensor_size, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_size))
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            ).to(
-                device=device
-            )  # Move to GPU
-            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
+            )
+            tensor_size = torch.tensor([size], dtype=torch.long)
 
-            dist.send(tensor_size, dst=dst, group=group)
-            dist.send(tensor_data, dst=dst, group=group)
-        return data
+            work = send_func(tensor_size, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_size))
+            work = send_func(tensor_data, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_data))
+        return p2p_works
 
     elif rank == dst:
-        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
-        dist.recv(tensor_size, src=src, group=group)
+        tensor_size = torch.tensor(
+            [0],
+            dtype=torch.long,
+        )
+        work = dist.irecv(tensor_size, src=src, group=group)
+        work.wait()
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
-        dist.recv(tensor_data, src=src, group=group)
+        tensor_data = torch.empty(
+            size,
+            dtype=torch.uint8,
+        )
+        work = dist.irecv(tensor_data, src=src, group=group)
+        work.wait()
 
-        serialized_data = bytes(
-            tensor_data.cpu().numpy()
-        )  # Move back to host for deserialization
+        serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
         return data
 
@@ -1503,29 +1501,95 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
-def add_prometheus_track_response_middleware(app):
-    from prometheus_client import Counter
+class RefCountedGauge:
+    def __init__(self, gauge):
+        self._gauge = gauge
+        self._refcount: Dict[str, int] = {}
 
-    http_response_status_counter = Counter(
+    def inc(self, key: str):
+        if key in self._refcount:
+            self._refcount[key] += 1
+        else:
+            self._refcount[key] = 1
+            self._gauge.inc()
+
+    def dec(self, key: str):
+        if key in self._refcount:
+            self._refcount[key] -= 1
+            if self._refcount[key] == 0:
+                del self._refcount[key]
+                self._gauge.dec()
+
+
+def add_prometheus_track_response_middleware(app):
+    from prometheus_client import Counter, Gauge
+
+    http_request_counter = Counter(
+        name="sglang:http_requests_total",
+        documentation="Total number of HTTP requests by endpoint and method",
+        labelnames=["endpoint", "method"],
+    )
+
+    http_response_counter = Counter(
         name="sglang:http_responses_total",
         documentation="Total number of HTTP responses by endpoint and status code",
         labelnames=["endpoint", "status_code", "method"],
     )
 
+    http_requests_active = Gauge(
+        name="sglang:http_requests_active",
+        documentation="Number of currently active HTTP requests",
+        labelnames=["endpoint", "method"],
+        multiprocess_mode="livesum",
+    )
+
+    routing_keys_active = RefCountedGauge(
+        Gauge(
+            name="sglang:routing_keys_active",
+            documentation="Number of unique routing keys with active requests",
+            multiprocess_mode="livesum",
+        )
+    )
+
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
-        response = await call_next(request)
+        # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
+        # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
+        path, is_handled_path = _get_fastapi_request_path(request)
+        method = request.method
+        routing_key = request.headers.get("x-smg-routing-key")
 
-        route = request.scope.get("route")
-        endpoint = route.path if route else "Unknown"
+        http_request_counter.labels(endpoint=path, method=method).inc()
+        http_requests_active.labels(endpoint=path, method=method).inc()
+        if routing_key:
+            routing_keys_active.inc(routing_key)
 
-        http_response_status_counter.labels(
-            endpoint=endpoint,
-            status_code=str(response.status_code),
-            method=request.method,
-        ).inc()
+        try:
+            response = await call_next(request)
 
-        return response
+            http_response_counter.labels(
+                endpoint=path,
+                method=method,
+                status_code=str(response.status_code),
+            ).inc()
+
+            return response
+        finally:
+            http_requests_active.labels(endpoint=path, method=method).dec()
+            if routing_key:
+                routing_keys_active.dec(routing_key)
+
+
+# https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
+def _get_fastapi_request_path(request) -> Tuple[str, bool]:
+    from starlette.routing import Match
+
+    for route in request.app.routes:
+        match, child_scope = route.matches(request.scope)
+        if match == Match.FULL:
+            return route.path, True
+
+    return request.url.path, False
 
 
 def bind_port(port):
@@ -1845,7 +1909,7 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "xpu"
         return "xpu:{}".format(device_id)
 
-    if hasattr(torch, "npu") and torch.npu.is_available():
+    if is_npu():
         if device_id == None:
             return "npu"
         return "npu:{}".format(device_id)
@@ -1925,16 +1989,7 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     return major, minor
 
 
-def get_npu_compiler_config():
-    config = {
-        "frozen_parameter": True,
-        "tiling_schedule_optimize": True,
-        "topology_sorting_strategy": "StableRDFS",
-    }
-    return config
-
-
-def get_compiler_backend() -> str:
+def get_compiler_backend(mode=None) -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 
@@ -1949,10 +2004,10 @@ def get_compiler_backend() -> str:
                 "Please install torchair for torch.compile support on NPU."
             )
         compiler_config = CompilerConfig()
-        predefined_config = get_npu_compiler_config()
-        for k, v in predefined_config.items():
-            setattr(compiler_config.experimental_config, k, v)
-
+        compiler_config.mode = "max-autotune"
+        if mode == "npugraph_ex":
+            compiler_config.mode = "reduce-overhead"
+            compiler_config.debug.run_eagerly = True
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
@@ -1960,12 +2015,6 @@ def get_compiler_backend() -> str:
 
 
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
-
-
-# Some backends use pytorch version < 2.4.0 which doesn't
-# support `torch.library.custom_op`.
-def supports_custom_op() -> bool:
-    return hasattr(torch.library, "custom_op")
 
 
 def direct_register_custom_op(
@@ -2074,53 +2123,6 @@ def set_gpu_proc_affinity(
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
-
-
-@lru_cache(maxsize=2)
-def disable_request_logging() -> bool:
-    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
-
-
-def dataclass_to_string_truncated(
-    data, max_length=2048, skip_names: Optional[Set[str]] = None
-):
-    if skip_names is None:
-        skip_names = set()
-    if isinstance(data, str):
-        if len(data) > max_length:
-            half_length = max_length // 2
-            return f"{repr(data[:half_length])} ... {repr(data[-half_length:])}"
-        else:
-            return f"{repr(data)}"
-    elif isinstance(data, (list, tuple)):
-        if len(data) > max_length:
-            half_length = max_length // 2
-            return str(data[:half_length]) + " ... " + str(data[-half_length:])
-        else:
-            return str(data)
-    elif isinstance(data, dict):
-        return (
-            "{"
-            + ", ".join(
-                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-                if k not in skip_names
-            )
-            + "}"
-        )
-    elif dataclasses.is_dataclass(data):
-        fields = dataclasses.fields(data)
-        return (
-            f"{data.__class__.__name__}("
-            + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
-                for f in fields
-                if f.name not in skip_names
-            )
-            + ")"
-        )
-    else:
-        return str(data)
 
 
 def permute_weight(x: torch.Tensor) -> torch.Tensor:
@@ -2291,7 +2293,7 @@ def pyspy_dump_schedulers():
     try:
         pid = psutil.Process().pid
         # Command to run py-spy with the PID
-        cmd = f"py-spy dump --pid {pid}"
+        cmd = f"py-spy dump --native --pid {pid}"
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, check=True
         )
@@ -2454,10 +2456,6 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     logger.info(
         f"Dummy health check server started in background thread at {host}:{port}"
     )
-
-
-def create_checksum(directory: str):
-    raise NotImplementedError()
 
 
 def set_cuda_arch():
@@ -3459,7 +3457,7 @@ def check_cuda_result(raw_output):
     return results
 
 
-def get_physical_device_id(pytorch_device_id: int) -> int:
+def get_physical_device_id() -> int:
     """
     Convert PyTorch logical device ID to physical device ID.
     """
@@ -3719,9 +3717,9 @@ def reserve_rope_cache_for_long_sequences(
     """Pre-expand RoPE cache for long sequences and speculative decoding."""
     from sglang.srt.environ import envs
 
-    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.value
-    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.value
-    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.value
+    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
+    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
+    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.get()
 
     # 1) Estimate base context upper bound
     base_ctx = (
@@ -3779,3 +3777,13 @@ def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
         if count % log_interval == 0:
             logger.warning(message)
         setattr(obj, counter_name, count + 1)
+
+
+def get_or_create_event_loop():
+    """Gets the running event loop or creates a new one if it doesn't exist."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop

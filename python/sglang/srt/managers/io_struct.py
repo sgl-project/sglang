@@ -16,12 +16,16 @@ The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Scheduler).
 """
 
+from __future__ import annotations
+
 import copy
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+
+import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -92,6 +96,10 @@ class RequestTimingMetricsMixin:
     # Prefill launch latency: time spent during prefill kernel launch.
     # Calculated as: prefill_end_time_host - prefill_start_time_host
     prefill_launch_latency: Optional[List[Optional[float]]]
+
+    # Prefill finished time: timestamp when prefill phase completes (wall clock time).
+    # This marks when the prefill computation finishes.
+    prefill_finished_ts: Optional[List[Optional[float]]]
 
 
 @dataclass
@@ -192,6 +200,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     log_metrics: bool = True
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
+    # Whether to return captured routed experts
+    return_routed_experts: bool = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -215,8 +225,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
-    # For reasoning
-    reasoning: bool = False
+    # Require reasoning for the request (hybrid reasoning model only)
+    require_reasoning: bool = False
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -244,6 +254,19 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    # Propagates trace context via Engine.generate/async_generate
+    external_trace_header: Optional[Dict] = None
+
+    # For EPD-disaggregated inference
+    need_wait_for_image: Optional[bool] = None
+    num_items_assigned: Optional[List] = None
+
+    # Multimodal tiling controls (extensions)
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+    image_max_dynamic_patch: Optional[int] = None
+    video_max_dynamic_patch: Optional[int] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -610,6 +633,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 if isinstance(self.return_hidden_states, list)
                 else self.return_hidden_states
             ),
+            return_routed_experts=self.return_routed_experts,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -647,6 +671,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
+            external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
             **{
                 field: getattr(self, field)
@@ -679,6 +704,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether to return captured routed experts
+    return_routed_experts: bool = False
+
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
@@ -700,8 +728,8 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
 
-    # For reasoning
-    reasoning: bool = False
+    # Require reasoning for the request (hybrid reasoning model only)
+    require_reasoning: bool = False
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -723,6 +751,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    need_wait_for_image: bool = False
+    num_items_assigned: Optional[List] = None
 
 
 @dataclass
@@ -775,8 +806,8 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     # For background responses (OpenAI responses API)
     background: bool = False
 
-    # tracing context
-    trace_context: Optional[Dict] = None
+    # Propagates trace context via Engine.encode/async_encode
+    external_trace_header: Optional[Dict] = None
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
@@ -857,6 +888,7 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            external_trace_header=self.external_trace_header,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
             **{
@@ -941,6 +973,9 @@ class BatchTokenIDOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The routed experts for each output token
+    output_routed_experts: List[torch.Tensor]
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -952,6 +987,11 @@ class BatchTokenIDOutput(
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
+
+    # Load for DP balance
+    load: GetLoadReqOutput = None
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclass
@@ -1020,6 +1060,9 @@ class BatchStrOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The routed experts for each output token
+    output_routed_experts: List[List[int]]
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -1031,6 +1074,12 @@ class BatchStrOutput(
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
+
+    # Load for DP balance
+    load: GetLoadReqOutput = None
+
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclass
@@ -1460,6 +1509,7 @@ class FreezeGCReq(BaseReq):
 class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
+    log_requests_format: Optional[str] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
@@ -1616,6 +1666,7 @@ class GetLoadReqOutput(BaseReq):
     num_reqs: int
     num_waiting_reqs: int
     num_tokens: int
+    ts_tic: float
 
 
 @dataclass

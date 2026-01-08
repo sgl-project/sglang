@@ -7,7 +7,6 @@ import glob
 import importlib.util
 import json
 import os
-import time
 import traceback
 from abc import ABC
 from collections.abc import Generator, Iterable
@@ -17,12 +16,16 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from diffusers import AutoModel
 from safetensors.torch import load_file as safetensors_load_file
 from torch.distributed import init_device_mesh
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPipelineConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     maybe_load_fsdp_model,
@@ -87,31 +90,24 @@ def _list_safetensors_files(model_path: str) -> list[str]:
     return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
 
 
-def load_native(library, component_module_path: str, server_args: ServerArgs):
-    if library == "transformers":
-        from transformers import AutoModel
-
-        config = get_hf_config(
-            component_module_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-        )
-        return AutoModel.from_pretrained(
-            component_module_path,
-            config=config,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-        )
-    elif library == "diffusers":
-        from diffusers import AutoModel
-
-        return AutoModel.from_pretrained(
-            component_module_path,
-            revision=server_args.revision,
-            trust_remote_code=server_args.trust_remote_code,
-        )
+def get_memory_usage_of_component(module) -> float | None:
+    """
+    returned value is in GB, rounded to 2 decimal digits
+    """
+    if not isinstance(module, nn.Module):
+        return None
+    BYTES_PER_GB = 1024**3
+    if hasattr(module, "get_memory_footprint"):
+        usage = module.get_memory_footprint() / BYTES_PER_GB
     else:
-        raise ValueError(f"Unsupported library: {library}")
+        # manually
+        param_size = sum(p.numel() * p.element_size() for p in module.parameters())
+        buffer_size = sum(b.numel() * b.element_size() for b in module.buffers())
+
+        total_size_bytes = param_size + buffer_size
+        usage = total_size_bytes / (1024**3)
+
+    return round(usage, 2)
 
 
 class ComponentLoader(ABC):
@@ -120,9 +116,11 @@ class ComponentLoader(ABC):
     def __init__(self, device=None) -> None:
         self.device = device
 
-    def should_offload(self, server_args, model_config: ModelConfig | None = None):
-        # offload by default
-        return True
+    def should_offload(
+        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+    ):
+        # not offload by default
+        return False
 
     def target_device(self, should_offload):
         if should_offload:
@@ -140,7 +138,7 @@ class ComponentLoader(ABC):
         server_args: ServerArgs,
         module_name: str,
         transformers_or_diffusers: str,
-    ):
+    ) -> tuple[AutoModel, float]:
         """
         Template method that standardizes logging around the core load implementation.
         The priority of loading method is:
@@ -149,17 +147,28 @@ class ComponentLoader(ABC):
         If all of the above methods failed, an error will be thrown
 
         """
-        logger.info("Loading %s from %s", module_name, component_model_path)
+        gpu_mem_before_loading = current_platform.get_available_gpu_memory()
+        logger.info(
+            "Loading %s from %s. avail mem: %.2f GB",
+            module_name,
+            component_model_path,
+            gpu_mem_before_loading,
+        )
         try:
             component = self.load_customized(
                 component_model_path, server_args, module_name
             )
-            source = "customized"
-        except Exception as _e:
-            traceback.print_exc()
-            logger.error(
-                f"Error while loading customized {module_name}, falling back to native version"
-            )
+            source = "sgl-diffusion"
+        except Exception as e:
+            if "Unsupported model architecture" in str(e):
+                logger.info(
+                    f"Module: {module_name} doesn't have a customized version yet, using native version"
+                )
+            else:
+                traceback.print_exc()
+                logger.error(
+                    f"Error while loading customized {module_name}, falling back to native version"
+                )
             # fallback to native version
             component = self.load_native(
                 component_model_path, server_args, transformers_or_diffusers
@@ -176,24 +185,54 @@ class ComponentLoader(ABC):
 
         if component is None:
             logger.warning("Loaded %s returned None", module_name)
+            consumed = 0.0
         else:
+            current_gpu_mem = current_platform.get_available_gpu_memory()
+            consumed = get_memory_usage_of_component(component)
+            if consumed is None or consumed == 0.0:
+                consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
-                f"Loaded %s: %s from: {source}",
+                f"Loaded %s: %s ({source} version). model size: %.2f GB, avail mem: %.2f GB",
                 module_name,
                 component.__class__.__name__,
+                consumed,
+                current_gpu_mem,
             )
-        return component
+        return component, consumed
 
     def load_native(
         self,
         component_model_path: str,
         server_args: ServerArgs,
         transformers_or_diffusers: str,
-    ):
+    ) -> AutoModel:
         """
         Load the component using the native library (transformers/diffusers).
         """
-        return load_native(transformers_or_diffusers, component_model_path, server_args)
+        if transformers_or_diffusers == "transformers":
+            from transformers import AutoModel
+
+            config = get_hf_config(
+                component_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+            return AutoModel.from_pretrained(
+                component_model_path,
+                config=config,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+        elif transformers_or_diffusers == "diffusers":
+            from diffusers import AutoModel
+
+            return AutoModel.from_pretrained(
+                component_model_path,
+                revision=server_args.revision,
+                trust_remote_code=server_args.trust_remote_code,
+            )
+        else:
+            raise ValueError(f"Unsupported library: {transformers_or_diffusers}")
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, module_name: str
@@ -267,12 +306,17 @@ class TextEncoderLoader(ComponentLoader):
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
 
-    counter_before_loading_weights: float = 0.0
-    counter_after_loading_weights: float = 0.0
-
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
         should_offload = server_args.text_encoder_cpu_offload
-        fsdp_shard_conditions = getattr(model_config, "_fsdp_shard_conditions", [])
+        if not should_offload:
+            return False
+        # _fsdp_shard_conditions is in arch_config, not directly on model_config
+        arch_config = (
+            getattr(model_config, "arch_config", model_config) if model_config else None
+        )
+        fsdp_shard_conditions = (
+            getattr(arch_config, "_fsdp_shard_conditions", []) if arch_config else []
+        )
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
 
@@ -341,8 +385,6 @@ class TextEncoderLoader(ComponentLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files, to_cpu=to_cpu)
 
-        if self.counter_before_loading_weights == 0.0:
-            self.counter_before_loading_weights = time.perf_counter()
         # apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
@@ -423,17 +465,19 @@ class TextEncoderLoader(ComponentLoader):
             with local_torch_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
+                enable_image_understanding = (
+                    True
+                    if isinstance(
+                        server_args.pipeline_config, QwenImageEditPipelineConfig
+                    )
+                    else False
+                )
+                model_config.enable_image_understanding = enable_image_understanding
                 model = model_cls(model_config)
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
                 self._get_all_weights(model, model_path, to_cpu=should_offload)
-            )
-            self.counter_after_loading_weights = time.perf_counter()
-            logger.info(
-                "Loading weights took %.2f seconds",
-                self.counter_after_loading_weights
-                - self.counter_before_loading_weights,
             )
 
             # Explicitly move model to target device after loading weights
@@ -447,7 +491,7 @@ class TextEncoderLoader(ComponentLoader):
                     )
                 else:
                     mesh = init_device_mesh(
-                        "cuda",
+                        current_platform.device_type,
                         mesh_shape=(1, dist.get_world_size()),
                         mesh_dim_names=("offload", "replicate"),
                     )
@@ -476,7 +520,15 @@ class TextEncoderLoader(ComponentLoader):
 class ImageEncoderLoader(TextEncoderLoader):
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
         should_offload = server_args.image_encoder_cpu_offload
-        fsdp_shard_conditions = getattr(model_config, "_fsdp_shard_conditions", [])
+        if not should_offload:
+            return False
+        # _fsdp_shard_conditions is in arch_config, not directly on model_config
+        arch_config = (
+            getattr(model_config, "arch_config", model_config) if model_config else None
+        )
+        fsdp_shard_conditions = (
+            getattr(arch_config, "_fsdp_shard_conditions", []) if arch_config else []
+        )
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
 
@@ -542,8 +594,10 @@ class TokenizerLoader(ComponentLoader):
 class VAELoader(ComponentLoader):
     """Loader for VAE."""
 
-    def should_offload(self, server_args, cpu_offload_flag, model_config):
-        return True
+    def should_offload(
+        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+    ):
+        return server_args.vae_cpu_offload
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, *args
@@ -564,7 +618,8 @@ class VAELoader(ComponentLoader):
         # NOTE: some post init logics are only available after updated with config
         vae_config.post_init()
 
-        target_device = self.target_device(server_args.vae_cpu_offload)
+        should_offload = self.should_offload(server_args)
+        target_device = self.target_device(should_offload)
 
         # Check for auto_map first (custom VAE classes)
         auto_map = config.get("auto_map", {})
@@ -621,11 +676,6 @@ class TransformerLoader(ComponentLoader):
                 "Only diffusers format is supported."
             )
 
-        logger.info("transformer cls_name: %s", cls_name)
-        if server_args.override_transformer_cls_name is not None:
-            cls_name = server_args.override_transformer_cls_name
-            logger.info("Overriding transformer cls_name to %s", cls_name)
-
         server_args.model_paths["transformer"] = component_model_path
 
         # Config from Diffusers supersedes sgl_diffusion's model config
@@ -660,16 +710,16 @@ class TransformerLoader(ComponentLoader):
                 ), "Custom initialization weights must be a safetensors file"
                 safetensors_list = [custom_weights_path]
 
-        logger.info(
-            "Loading model from %s safetensors files: %s",
-            len(safetensors_list),
-            safetensors_list,
-        )
-
         default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
 
+        logger.info(
+            "Loading %s from %s safetensors files, default_dtype: %s",
+            cls_name,
+            len(safetensors_list),
+            default_dtype,
+        )
+
         # Load the model using FSDP loader
-        logger.info("Loading %s, default_dtype: %s", cls_name, default_dtype)
         assert server_args.hsdp_shard_dim is not None
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
@@ -686,6 +736,7 @@ class TransformerLoader(ComponentLoader):
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             output_dtype=None,
+            strict=False,
         )
 
         total_params = sum(p.numel() for p in model.parameters())
@@ -696,10 +747,6 @@ class TransformerLoader(ComponentLoader):
         ), "Model dtype does not match default dtype"
 
         model = model.eval()
-
-        if hasattr(model, "fuse_qkv_projections"):
-            logger.info("Fusing QKV projections for better performance")
-            model.fuse_qkv_projections()
 
         return model
 
@@ -723,8 +770,7 @@ class SchedulerLoader(ComponentLoader):
         scheduler = scheduler_cls(**config)
         if server_args.pipeline_config.flow_shift is not None:
             scheduler.set_shift(server_args.pipeline_config.flow_shift)
-        if server_args.pipeline_config.timesteps_scale is not None:
-            scheduler.set_timesteps_scale(server_args.pipeline_config.timesteps_scale)
+
         return scheduler
 
 
@@ -760,12 +806,6 @@ class PipelineComponentLoader:
         Returns:
             The loaded module
         """
-        logger.info(
-            "Loading %s using %s from %s",
-            module_name,
-            transformers_or_diffusers,
-            component_model_path,
-        )
 
         # Get the appropriate loader for this module type
         loader = ComponentLoader.for_module_type(module_name, transformers_or_diffusers)

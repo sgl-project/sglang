@@ -1,5 +1,7 @@
 # SGLang Documentation
 
+This is the documentation website for the SGLang project (https://github.com/sgl-project/sglang).
+
 We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase.
 Most documentation files are located under the `docs/` folder.
 
