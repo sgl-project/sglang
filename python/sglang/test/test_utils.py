@@ -564,23 +564,30 @@ def popen_with_error_check(command: list[str], allow_exit: bool = False):
 
 def _try_enable_offline_mode_if_cache_complete(
     model_name_or_path: str, env: dict, other_args: Optional[list[str]] = None
-):
+) -> Optional[str]:
     """
-    CI helper: Check if model cache is validated and enable offline mode.
+    CI helper: Check if model cache is complete and enable offline mode.
 
-    The heavy validation is done once during CI initialization (prepare_runner.sh
-    via prevalidate_cached_models.py). This function checks the validation marker
-    AND performs a lightweight runtime validation to ensure the current runner's
-    cache is complete.
+    Uses per-run validation markers that are NOT shared across runners.
+    Each runner independently validates its cache using lightweight checks
+    before enabling offline mode.
+
+    IMPORTANT: Even if a per-run marker exists, this function ALWAYS validates
+    the current launch's requirements (e.g., hf_quant_config.json for modelopt).
+    The marker is only a hint that this snapshot was validated earlier in the run.
 
     Args:
         model_name_or_path: Model identifier or path
-        env: Environment dict to modify (will add HF_HUB_OFFLINE=1 if marker exists)
+        env: Environment dict to modify (will add HF_HUB_OFFLINE=1 if validation passes)
         other_args: Launch command arguments (used to detect quantization requirement)
+
+    Returns:
+        Per-run marker path if offline mode was enabled, None otherwise
     """
     from sglang.srt.model_loader.ci_weight_validation import (
-        _get_validation_marker_path,
-        _read_validation_marker,
+        _get_per_run_marker_path,
+        _read_per_run_marker,
+        _write_per_run_marker,
         validate_cache_lightweight,
     )
     from sglang.srt.utils import find_local_repo_dir
@@ -592,34 +599,22 @@ def _try_enable_offline_mode_if_cache_complete(
         print(
             f"CI_OFFLINE: Subprocess env already has HF_HUB_OFFLINE=1, skip - {model_name_or_path}"
         )
-        return
+        return None
 
     # Skip if already a local path
     if os.path.isdir(model_name_or_path):
-        return
+        return None
 
     # Try to find local snapshot
     try:
         snapshot_dir = find_local_repo_dir(model_name_or_path, revision=None)
         if not snapshot_dir or not os.path.isdir(snapshot_dir):
-            return
+            return None
     except Exception:
-        return
-
-    # Check validation marker (first gate: written by prepare_runner.sh prevalidation)
-    marker = _read_validation_marker(snapshot_dir)
-    if marker is None:
-        print(
-            f"CI_OFFLINE: No validation marker for {model_name_or_path}, "
-            "will use online mode (allows HF to download missing files)"
-        )
-        return
-
-    # Marker exists - now perform lightweight runtime validation (second gate)
-    # This ensures the current runner's cache is complete, not just that some
-    # other runner validated it successfully
+        return None
 
     # Detect if quantization requires hf_quant_config.json
+    # Do this BEFORE checking marker to ensure current launch requirements are known
     requires_hf_quant_config = False
     for i, arg in enumerate(other_args):
         if arg == "--quantization" and i + 1 < len(other_args):
@@ -628,36 +623,62 @@ def _try_enable_offline_mode_if_cache_complete(
                 requires_hf_quant_config = True
                 break
 
-    # Perform lightweight validation
+    # Check per-run marker (fast hint - snapshot validated earlier in this run)
+    per_run_marker = _read_per_run_marker(snapshot_dir)
+    if per_run_marker is not None:
+        # Marker exists, but STILL validate for current launch requirements
+        # This prevents a test without --quantization from enabling offline
+        # for a later test with --quantization that needs hf_quant_config.json
+        is_valid = validate_cache_lightweight(snapshot_dir, requires_hf_quant_config)
+
+        if not is_valid:
+            # Current launch requirements not met, ignore marker
+            print(
+                f"CI_OFFLINE: Per-run marker found but current validation failed "
+                f"(requires_hf_quant_config={requires_hf_quant_config}), "
+                f"will use online mode - {model_name_or_path}"
+            )
+            return None
+
+        # Marker exists and current validation passed
+        env["HF_HUB_OFFLINE"] = "1"
+        marker_path = _get_per_run_marker_path(snapshot_dir)
+        print(
+            f"CI_OFFLINE: Per-run marker found and current validation passed "
+            f"(requires_hf_quant_config={requires_hf_quant_config}), "
+            f"enabling offline mode - {model_name_or_path}"
+        )
+        return marker_path
+
+    # No per-run marker - perform lightweight validation
     is_valid = validate_cache_lightweight(snapshot_dir, requires_hf_quant_config)
 
     if not is_valid:
-        # Runtime validation failed - cache is incomplete on this runner
-        # Remove marker to prevent other tests from using it
-        marker_path = _get_validation_marker_path(snapshot_dir)
-        try:
-            if marker_path and os.path.exists(marker_path):
-                os.remove(marker_path)
-                print(
-                    f"CI_OFFLINE: Runtime validation failed, marker removed "
-                    f"(requires_hf_quant_config={requires_hf_quant_config}) - {model_name_or_path}"
-                )
-        except Exception as e:
-            print(f"CI_OFFLINE: Failed to remove marker: {e}")
-
+        # Validation failed - cache is incomplete on this runner
         print(
-            f"CI_OFFLINE: Cache incomplete on this runner, will use online mode - {model_name_or_path}"
+            f"CI_OFFLINE: Cache validation failed "
+            f"(requires_hf_quant_config={requires_hf_quant_config}), "
+            f"will use online mode - {model_name_or_path}"
         )
-        return
+        return None
 
-    # Both gates passed - enable offline mode
+    # Validation passed - enable offline mode and write per-run marker
     env["HF_HUB_OFFLINE"] = "1"
+
+    # Write per-run marker for subsequent tests in this run
+    _write_per_run_marker(snapshot_dir, model_name_or_path)
+
+    # Return marker path for potential invalidation if offline launch fails
+    marker_path = _get_per_run_marker_path(snapshot_dir)
+
     snapshot_basename = os.path.basename(snapshot_dir)
     print(
         f"CI_OFFLINE: Enabled HF_HUB_OFFLINE=1 for subprocess - "
-        f"marker found and runtime validation passed for {model_name_or_path} "
+        f"validation passed for {model_name_or_path} "
         f"(snapshot={snapshot_basename}, requires_hf_quant_config={requires_hf_quant_config})"
     )
+
+    return marker_path
 
 
 def popen_launch_server(
@@ -693,11 +714,16 @@ def popen_launch_server(
     else:
         env = env.copy()
 
+    # Store per-run marker path in local variable (not in env)
+    # to avoid leaking internal CI keys to subprocess
+    per_run_marker_path = None
     try:
         from sglang.utils import is_in_ci
 
         if is_in_ci():
-            _try_enable_offline_mode_if_cache_complete(model, env, other_args)
+            per_run_marker_path = _try_enable_offline_mode_if_cache_complete(
+                model, env, other_args
+            )
     except Exception as e:
         # Don't fail the test if cache validation fails
         print(f"CI cache validation failed (non-fatal): {e}")
@@ -758,7 +784,14 @@ def popen_launch_server(
 
     # Helper function to launch server process
     def _launch_process(env_dict):
-        hf_hub_offline = env_dict.get("HF_HUB_OFFLINE", "0")
+        # Create clean child env without internal CI keys
+        # This prevents leaking implementation details to the server subprocess
+        child_env = env_dict.copy()
+        keys_to_remove = [k for k in child_env if k.startswith("_CI_OFFLINE_")]
+        for k in keys_to_remove:
+            del child_env[k]
+
+        hf_hub_offline = child_env.get("HF_HUB_OFFLINE", "0")
         print(
             f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}"
         )
@@ -768,7 +801,7 @@ def popen_launch_server(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=env_dict,
+                env=child_env,  # Use clean env for subprocess
                 text=True,
                 bufsize=1,
             )
@@ -791,7 +824,9 @@ def popen_launch_server(
                 daemon=True,
             ).start()
         else:
-            proc = subprocess.Popen(command, stdout=None, stderr=None, env=env_dict)
+            proc = subprocess.Popen(
+                command, stdout=None, stderr=None, env=child_env
+            )  # Use clean env
 
         return proc
 
@@ -851,6 +886,18 @@ def popen_launch_server(
                 process.wait(timeout=5)
         except Exception as e:
             print(f"CI_OFFLINE: Error cleaning up failed offline process: {e}")
+
+        # Invalidate per-run marker to prevent subsequent tests from using offline mode
+        # Use local variable (not env) - marker path was stored at validation time
+        if per_run_marker_path:
+            try:
+                if os.path.exists(per_run_marker_path):
+                    os.remove(per_run_marker_path)
+                    print(
+                        f"CI_OFFLINE: Invalidated per-run marker due to offline launch failure"
+                    )
+            except Exception as e:
+                print(f"CI_OFFLINE: Failed to remove per-run marker: {e}")
 
         # Retry with online mode
         env["HF_HUB_OFFLINE"] = "0"

@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """
-Pre-validate all cached HuggingFace models and write markers for offline mode.
+Pre-validate all cached HuggingFace models to provide detailed feedback.
 
 This script runs once during CI initialization (in prepare_runner.sh) to:
 1. Scan snapshots in ~/.cache/huggingface/hub/ (with time/quantity limits)
-2. Validate completeness (config/tokenizer/weights) using file locks
-3. Write markers for complete snapshots
+2. Validate completeness (config/tokenizer/weights)
+3. Output detailed failure reasons for debugging
 
-After this, popen_launch_server can simply read markers to decide offline mode.
-
-Concurrency safety:
-- Uses per-snapshot file locks (fcntl) to prevent multiple runners from
-  validating the same snapshot simultaneously
-- Double-check pattern: check marker before and after acquiring lock
+NOTE: This script no longer writes shared validation markers. Each test run
+independently validates its cache using per-run markers to avoid cross-runner
+cache state pollution.
 """
 
-import fcntl
 import glob
-import hashlib
-import json
 import os
 import sys
 import time
@@ -29,8 +23,7 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
 from sglang.srt.model_loader.ci_weight_validation import (
-    _read_validation_marker,
-    ci_validate_cache_and_enable_offline_if_complete,
+    validate_cache_with_detailed_reason,
 )
 
 # Limits to avoid spending too much time on validation
@@ -135,60 +128,43 @@ def scan_weight_files(snapshot_dir):
     return weight_files
 
 
-def validate_snapshot_with_lock(model_name, snapshot_dir, weight_files):
+def validate_snapshot(model_name, snapshot_dir, weight_files, validated_cache):
     """
-    Validate a snapshot with file lock to prevent concurrent validations.
+    Validate a snapshot and return detailed status.
 
-    Uses a blocking lock approach: if another runner is validating the same
-    snapshot, this function waits until the lock is available, then re-checks
-    the marker (which the other runner likely wrote) to avoid duplicate work.
+    Uses in-process cache to avoid duplicate validation within the same run.
+
+    Args:
+        model_name: Model identifier
+        snapshot_dir: Path to snapshot directory
+        weight_files: List of weight files to validate
+        validated_cache: Dict to track already-validated snapshots in this run
 
     Returns:
         Tuple of (result, reason):
         - (True, None) if validation passed
         - (False, reason_str) if validation failed
-        - (None, None) if skipped (already has marker)
+        - (None, None) if skipped (already validated in this run)
     """
-    # 1. Fast path: check marker first (no lock needed)
-    marker = _read_validation_marker(snapshot_dir)
-    if marker is not None:
-        return None, None  # Already validated, skip
-
-    # 2. Acquire blocking lock
-    # Use same hash as marker: sha256(realpath(snapshot_dir))[:12]
-    # Lock file: /tmp/sglang_hf_validation_{dir_hash}.lock
-    # Marker file: /tmp/sglang_hf_validation_{dir_hash}.json
-    normalized_dir = os.path.realpath(snapshot_dir).rstrip("/")
-    dir_hash = hashlib.sha256(normalized_dir.encode("utf-8")).hexdigest()[:12]
-    lock_path = f"/tmp/sglang_hf_validation_{dir_hash}.lock"
+    # Fast path: check in-process cache first
+    if snapshot_dir in validated_cache:
+        return None, None  # Already validated in this run, skip
 
     try:
-        # Use "a" mode to avoid truncating, with block auto-releases lock
-        with open(lock_path, "a") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        # Perform validation with detailed reason
+        is_complete, reason = validate_cache_with_detailed_reason(
+            snapshot_dir=snapshot_dir,
+            weight_files=weight_files,
+            model_name_or_path=model_name,
+        )
 
-            # 3. Double-check marker after acquiring lock (prevent race condition)
-            # Another runner might have completed validation while we waited
-            marker = _read_validation_marker(snapshot_dir)
-            if marker is not None:
-                return None, None  # Skip, another runner completed
+        # Cache result to avoid re-validation in this run
+        validated_cache[snapshot_dir] = (is_complete, reason)
 
-            # 4. Perform validation with detailed reason (only if marker still doesn't exist)
-            from sglang.srt.model_loader.ci_weight_validation import (
-                validate_cache_with_detailed_reason,
-            )
-
-            is_complete, reason = validate_cache_with_detailed_reason(
-                snapshot_dir=snapshot_dir,
-                weight_files=weight_files,
-                model_name_or_path=model_name,
-            )
-
-            return is_complete, reason
+        return is_complete, reason
 
     except Exception as e:
-        error_msg = f"Failed to acquire lock or validate: {e}"
-        print(f"  Error: {error_msg}")
+        error_msg = f"Validation raised exception: {e}"
         return False, error_msg
 
 
@@ -224,6 +200,9 @@ def main():
     skipped_count = 0
     processed_count = 0
 
+    # In-process cache to avoid re-validating same snapshot in this run
+    validated_cache = {}
+
     for model_name, snapshot_dir in snapshots:
         # Check time limit
         elapsed = time.time() - start_time
@@ -251,10 +230,10 @@ def main():
             skipped_count += 1
             continue
 
-        # Validate with lock
+        # Validate
         try:
-            result, reason = validate_snapshot_with_lock(
-                model_name, snapshot_dir, weight_files
+            result, reason = validate_snapshot(
+                model_name, snapshot_dir, weight_files, validated_cache
             )
 
             if result is True:
@@ -268,7 +247,7 @@ def main():
                     print(f"  Validation failed (incomplete cache)")
                 failed_count += 1
             else:  # None (skipped)
-                print(f"  Skipped (already validated)")
+                print(f"  Skipped (already validated in this run)")
                 skipped_count += 1
 
         except Exception as e:

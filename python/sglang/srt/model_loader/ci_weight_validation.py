@@ -117,6 +117,152 @@ def _get_validation_marker_path(snapshot_dir: str) -> Optional[str]:
     return f"/tmp/sglang_hf_validation_{dir_hash}.json"
 
 
+def _get_per_run_marker_dir() -> str:
+    """
+    Get the directory for per-run validation markers.
+
+    These markers are specific to the current CI run and are not shared across
+    runners. They are stored in a temporary directory that is cleaned up after
+    the run completes.
+
+    Returns:
+        Path to per-run marker directory
+    """
+    # Prefer RUNNER_TEMP (GitHub Actions) or TMPDIR, fallback to /tmp
+    base_dir = os.environ.get("RUNNER_TEMP", os.environ.get("TMPDIR", "/tmp"))
+    marker_dir = os.path.join(base_dir, "sglang_ci_offline_markers")
+    os.makedirs(marker_dir, exist_ok=True)
+    return marker_dir
+
+
+def _get_per_run_marker_path(snapshot_dir: str) -> Optional[str]:
+    """
+    Get the path to per-run validation marker file for a snapshot.
+
+    Per-run markers are specific to the current CI run and are not shared
+    across runners. This prevents cross-runner cache state pollution.
+
+    Args:
+        snapshot_dir: Path to snapshot directory
+
+    Returns:
+        Path to per-run marker file or None if snapshot_dir is invalid
+    """
+    if not snapshot_dir or not os.path.isdir(snapshot_dir):
+        return None
+
+    normalized_dir = os.path.realpath(snapshot_dir).rstrip("/")
+    dir_hash = hashlib.sha256(normalized_dir.encode("utf-8")).hexdigest()[:12]
+
+    marker_dir = _get_per_run_marker_dir()
+    return os.path.join(marker_dir, f"{dir_hash}.json")
+
+
+def _read_per_run_marker(snapshot_dir: str) -> Optional[dict]:
+    """
+    Read per-run validation marker for a snapshot.
+
+    Args:
+        snapshot_dir: Path to snapshot directory
+
+    Returns:
+        Marker dict if exists and valid, None otherwise
+    """
+    marker_path = _get_per_run_marker_path(snapshot_dir)
+    if not marker_path or not os.path.exists(marker_path):
+        return None
+
+    try:
+        with open(marker_path, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+
+        # Validate marker structure
+        if not isinstance(marker, dict):
+            return None
+
+        required_keys = ["timestamp", "model_id", "snapshot_hash", "validation_passed"]
+        if not all(k in marker for k in required_keys):
+            return None
+
+        if marker.get("validation_passed") is not True:
+            return None
+
+        return marker
+
+    except Exception as e:
+        logger.debug("Failed to read per-run marker from %s: %s", marker_path, e)
+        return None
+
+
+def _write_per_run_marker(
+    snapshot_dir: str, model_id: str, required_files: Optional[list] = None
+) -> None:
+    """
+    Write per-run validation marker for a snapshot.
+
+    Args:
+        snapshot_dir: Path to snapshot directory
+        model_id: Model identifier
+        required_files: List of required files that were validated
+    """
+    marker_path = _get_per_run_marker_path(snapshot_dir)
+    if not marker_path:
+        logger.debug("Cannot write per-run marker: invalid snapshot_dir")
+        return
+
+    from datetime import datetime
+
+    snapshot_hash = os.path.basename(snapshot_dir)
+
+    marker = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "model_id": model_id,
+        "snapshot_hash": snapshot_hash,
+        "validation_passed": True,
+        "required_files": required_files or [],
+    }
+
+    try:
+        marker_dir = os.path.dirname(marker_path)
+        os.makedirs(marker_dir, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=marker_dir,
+            delete=False,
+            suffix=".tmp",
+        ) as f:
+            temp_path = f.name
+            json.dump(marker, f, indent=2)
+
+        os.replace(temp_path, marker_path)
+        logger.debug("Wrote per-run marker to %s", marker_path)
+    except Exception as e:
+        logger.warning("Failed to write per-run marker to %s: %s", marker_path, e)
+        try:
+            if "temp_path" in locals() and os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+
+
+def _remove_per_run_marker(snapshot_dir: str) -> None:
+    """
+    Remove per-run validation marker for a snapshot.
+
+    Args:
+        snapshot_dir: Path to snapshot directory
+    """
+    marker_path = _get_per_run_marker_path(snapshot_dir)
+    if marker_path and os.path.exists(marker_path):
+        try:
+            os.remove(marker_path)
+            logger.debug("Removed per-run marker: %s", marker_path)
+        except Exception as e:
+            logger.warning("Failed to remove per-run marker %s: %s", marker_path, e)
+
+
 def _read_validation_marker(snapshot_dir: str) -> Optional[dict]:
     """
     Read validation marker for a snapshot.
@@ -605,12 +751,11 @@ def ci_validate_cache_and_enable_offline_if_complete(
 
 def validate_cache_with_detailed_reason(
     snapshot_dir: str, weight_files: List[str], model_name_or_path: str
-) -> Tuple[Optional[bool], Optional[str]]:
+) -> Tuple[bool, Optional[str]]:
     """
     Validate cache and return detailed reason for failure.
 
-    This is a wrapper around ci_validate_cache_and_enable_offline_if_complete
-    that captures and returns the specific reason for validation failure.
+    This function performs validation without relying on shared validation markers.
     Used by prevalidate_cached_models.py to provide detailed feedback.
 
     Args:
@@ -622,19 +767,12 @@ def validate_cache_with_detailed_reason(
         Tuple of (success, reason):
         - (True, None) if validation passed
         - (False, reason_str) if validation failed with specific reason
-        - (None, None) if skipped (marker already exists)
     """
     # Guard: weight_files is required
     if not weight_files:
         return False, "No weight files provided"
 
-    # Check if validation marker exists (fast path)
-    # Don't treat marker as "passed" here - let caller decide to skip
-    marker = _read_validation_marker(snapshot_dir)
-    if marker is not None:
-        return None, None  # Skip - already validated
-
-    # No marker - perform full validation and capture failure reasons
+    # Perform full validation and capture failure reasons
     revision = os.path.basename(snapshot_dir)
 
     # Read from environment variable instead of huggingface_hub.constants
@@ -657,8 +795,7 @@ def validate_cache_with_detailed_reason(
     if not weights_valid:
         return False, f"Weight validation failed: {error_msg}"
 
-    # All validations passed - write marker
-    _write_validation_marker(snapshot_dir, passed=True)
+    # All validations passed
     return True, None
 
 
