@@ -41,20 +41,18 @@ class ChecksumFile:
 
     @classmethod
     def from_dict(cls, data: dict) -> "ChecksumFile":
+        if "checksums" in data:
+            warnings.warn(
+                "The 'checksums' format is deprecated. "
+                "Please regenerate with the latest version to use the new 'files' format.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            return cls(files={k: FileInfo(sha256=v, size=0) for k, v in data["checksums"].items()})
         return cls(files={k: FileInfo.from_dict(v) for k, v in data["files"].items()})
 
     def to_dict(self) -> dict:
         return {"files": {k: asdict(v) for k, v in self.files.items()}}
-
-
-@dataclass
-class LegacyChecksumFile:
-    """Deprecated: Old format with only checksums, no file sizes."""
-    checksums: Dict[str, str]
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "LegacyChecksumFile":
-        return cls(checksums=data["checksums"])
 
 
 # ======== Constants ========
@@ -140,28 +138,11 @@ def _discover_files(model_path: Path) -> List[str]:
 # ======== Load Checksums ========
 
 
-def _load_checksums(source: str) -> Dict[str, str]:
+def _load_checksums(source: str) -> ChecksumFile:
     if Path(source).is_file():
         data = json.loads(Path(source).read_text())
-        return _extract_checksums_from_json(data)
-    checksums_from_hf = _load_file_infos_from_hf(repo_id=source)
-    return {k: v.sha256 for k, v in checksums_from_hf.items()}
-
-
-def _extract_checksums_from_json(data: dict) -> Dict[str, str]:
-    if "files" in data:
-        checksum_file = ChecksumFile.from_dict(data)
-        return {k: v.sha256 for k, v in checksum_file.files.items()}
-    if "checksums" in data:
-        warnings.warn(
-            "The 'checksums' format is deprecated. "
-            "Please regenerate with the latest version to use the new 'files' format.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        legacy = LegacyChecksumFile.from_dict(data)
-        return legacy.checksums
-    raise IntegrityError("Invalid checksum file format: missing 'files' or 'checksums'")
+        return ChecksumFile.from_dict(data)
+    return ChecksumFile(files=_load_file_infos_from_hf(repo_id=source))
 
 
 def _load_file_infos_from_hf(*, repo_id: str) -> Dict[str, FileInfo]:
