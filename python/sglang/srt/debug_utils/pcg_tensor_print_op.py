@@ -5,10 +5,27 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 
 @register_custom_op(mutates_args=[])
-def print_tensor_debug(
-    t: torch.Tensor,
-    name: str,
-) -> None:
+def print_tensor_debug(t: torch.Tensor, name: str) -> None:
+    """
+    Debug operator specifically for PCG.
+    Injects a synchronized logging point into the compiled graph to print tensor.
+
+    Usage:
+        torch.ops.sglang.print_tensor_debug(hidden_states, "tensor_name")
+
+    Output Effect:
+        ================================================================================
+        [TensorDebug] <name>
+        --------------------------------------------------------------------------------
+          shape     : (<dimensions>)
+          dtype     : <type>
+          data_ptr  : <address>
+          min / max : <val> / <val>
+          mean      : <val>
+          has_nan   : <bool>
+          has_inf   : <bool>
+        ================================================================================
+    """
     ctx = get_forward_context()
     if ctx is None:
         return
