@@ -144,14 +144,15 @@ def validate_snapshot_with_lock(model_name, snapshot_dir, weight_files):
     the marker (which the other runner likely wrote) to avoid duplicate work.
 
     Returns:
-        True if validation passed
-        False if validation failed
-        None if skipped (already has marker)
+        Tuple of (result, reason):
+        - (True, None) if validation passed
+        - (False, reason_str) if validation failed
+        - (None, None) if skipped (already has marker)
     """
     # 1. Fast path: check marker first (no lock needed)
     marker = _read_validation_marker(snapshot_dir)
     if marker is not None:
-        return None  # Already validated, skip
+        return None, None  # Already validated, skip
 
     # 2. Acquire blocking lock
     # Use same hash as marker: sha256(realpath(snapshot_dir))[:12]
@@ -170,20 +171,25 @@ def validate_snapshot_with_lock(model_name, snapshot_dir, weight_files):
             # Another runner might have completed validation while we waited
             marker = _read_validation_marker(snapshot_dir)
             if marker is not None:
-                return None  # Skip, another runner completed
+                return None, None  # Skip, another runner completed
 
-            # 4. Perform validation (only if marker still doesn't exist)
-            is_complete = ci_validate_cache_and_enable_offline_if_complete(
+            # 4. Perform validation with detailed reason (only if marker still doesn't exist)
+            from sglang.srt.model_loader.ci_weight_validation import (
+                validate_cache_with_detailed_reason,
+            )
+
+            is_complete, reason = validate_cache_with_detailed_reason(
                 snapshot_dir=snapshot_dir,
                 weight_files=weight_files,
                 model_name_or_path=model_name,
             )
 
-            return is_complete
+            return is_complete, reason
 
     except Exception as e:
-        print(f"  Error: Failed to acquire lock or validate: {e}")
-        return False
+        error_msg = f"Failed to acquire lock or validate: {e}"
+        print(f"  Error: {error_msg}")
+        return False, error_msg
 
 
 def main():
@@ -247,13 +253,19 @@ def main():
 
         # Validate with lock
         try:
-            result = validate_snapshot_with_lock(model_name, snapshot_dir, weight_files)
+            result, reason = validate_snapshot_with_lock(
+                model_name, snapshot_dir, weight_files
+            )
 
             if result is True:
                 print(f"  Validation passed")
                 validated_count += 1
             elif result is False:
-                print(f"  Validation failed (incomplete cache)")
+                # Print detailed failure reason
+                if reason:
+                    print(f"  Validation failed: {reason}")
+                else:
+                    print(f"  Validation failed (incomplete cache)")
                 failed_count += 1
             else:  # None (skipped)
                 print(f"  Skipped (already validated)")

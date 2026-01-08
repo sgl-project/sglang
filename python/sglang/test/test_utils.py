@@ -562,20 +562,30 @@ def popen_with_error_check(command: list[str], allow_exit: bool = False):
     return process
 
 
-def _try_enable_offline_mode_if_cache_complete(model_name_or_path: str, env: dict):
+def _try_enable_offline_mode_if_cache_complete(
+    model_name_or_path: str, env: dict, other_args: Optional[list[str]] = None
+):
     """
     CI helper: Check if model cache is validated and enable offline mode.
 
     The heavy validation is done once during CI initialization (prepare_runner.sh
-    via prevalidate_cached_models.py). This function only reads the validation
-    marker to decide whether to enable offline mode.
+    via prevalidate_cached_models.py). This function checks the validation marker
+    AND performs a lightweight runtime validation to ensure the current runner's
+    cache is complete.
 
     Args:
         model_name_or_path: Model identifier or path
         env: Environment dict to modify (will add HF_HUB_OFFLINE=1 if marker exists)
+        other_args: Launch command arguments (used to detect quantization requirement)
     """
-    from sglang.srt.model_loader.ci_weight_validation import _read_validation_marker
+    from sglang.srt.model_loader.ci_weight_validation import (
+        _get_validation_marker_path,
+        _read_validation_marker,
+        validate_cache_lightweight,
+    )
     from sglang.srt.utils import find_local_repo_dir
+
+    other_args = other_args or []
 
     # Fast-path: If subprocess env already has HF_HUB_OFFLINE=1, skip
     if env.get("HF_HUB_OFFLINE") == "1":
@@ -596,21 +606,58 @@ def _try_enable_offline_mode_if_cache_complete(model_name_or_path: str, env: dic
     except Exception:
         return
 
-    # Check validation marker (written by prepare_runner.sh prevalidation)
+    # Check validation marker (first gate: written by prepare_runner.sh prevalidation)
     marker = _read_validation_marker(snapshot_dir)
-    if marker is not None:
-        # IMPORTANT: Set HF_HUB_OFFLINE=1 ONLY for this subprocess, not globally
-        env["HF_HUB_OFFLINE"] = "1"
-        snapshot_basename = os.path.basename(snapshot_dir)
-        print(
-            f"CI_OFFLINE: Enabled HF_HUB_OFFLINE=1 for subprocess - "
-            f"marker found for {model_name_or_path} (snapshot={snapshot_basename})"
-        )
-    else:
+    if marker is None:
         print(
             f"CI_OFFLINE: No validation marker for {model_name_or_path}, "
             "will use online mode (allows HF to download missing files)"
         )
+        return
+
+    # Marker exists - now perform lightweight runtime validation (second gate)
+    # This ensures the current runner's cache is complete, not just that some
+    # other runner validated it successfully
+
+    # Detect if quantization requires hf_quant_config.json
+    requires_hf_quant_config = False
+    for i, arg in enumerate(other_args):
+        if arg == "--quantization" and i + 1 < len(other_args):
+            quant_value = other_args[i + 1].lower()
+            if quant_value in ["modelopt_fp4", "modelopt_fp8", "modelopt"]:
+                requires_hf_quant_config = True
+                break
+
+    # Perform lightweight validation
+    is_valid = validate_cache_lightweight(snapshot_dir, requires_hf_quant_config)
+
+    if not is_valid:
+        # Runtime validation failed - cache is incomplete on this runner
+        # Remove marker to prevent other tests from using it
+        marker_path = _get_validation_marker_path(snapshot_dir)
+        try:
+            if marker_path and os.path.exists(marker_path):
+                os.remove(marker_path)
+                print(
+                    f"CI_OFFLINE: Runtime validation failed, marker removed "
+                    f"(requires_hf_quant_config={requires_hf_quant_config}) - {model_name_or_path}"
+                )
+        except Exception as e:
+            print(f"CI_OFFLINE: Failed to remove marker: {e}")
+
+        print(
+            f"CI_OFFLINE: Cache incomplete on this runner, will use online mode - {model_name_or_path}"
+        )
+        return
+
+    # Both gates passed - enable offline mode
+    env["HF_HUB_OFFLINE"] = "1"
+    snapshot_basename = os.path.basename(snapshot_dir)
+    print(
+        f"CI_OFFLINE: Enabled HF_HUB_OFFLINE=1 for subprocess - "
+        f"marker found and runtime validation passed for {model_name_or_path} "
+        f"(snapshot={snapshot_basename}, requires_hf_quant_config={requires_hf_quant_config})"
+    )
 
 
 def popen_launch_server(
@@ -650,7 +697,7 @@ def popen_launch_server(
         from sglang.utils import is_in_ci
 
         if is_in_ci():
-            _try_enable_offline_mode_if_cache_complete(model, env)
+            _try_enable_offline_mode_if_cache_complete(model, env, other_args)
     except Exception as e:
         # Don't fail the test if cache validation fails
         print(f"CI cache validation failed (non-fatal): {e}")
@@ -706,76 +753,141 @@ def popen_launch_server(
 
     print(f"command={shlex.join(command)}")
 
-    # Log critical env info for debugging offline mode in CI
-    hf_hub_offline = env.get("HF_HUB_OFFLINE", "0")
-    print(f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}")
+    # Track if offline mode was enabled for potential retry
+    offline_enabled = env.get("HF_HUB_OFFLINE") == "1"
 
-    if return_stdout_stderr:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            text=True,
-            bufsize=1,
+    # Helper function to launch server process
+    def _launch_process(env_dict):
+        hf_hub_offline = env_dict.get("HF_HUB_OFFLINE", "0")
+        print(
+            f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}"
         )
 
-        def _dump(src, sinks):
-            for line in iter(src.readline, ""):
-                for sink in sinks:
-                    sink.write(line)
-                    sink.flush()
-            src.close()
+        if return_stdout_stderr:
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env_dict,
+                text=True,
+                bufsize=1,
+            )
 
-        threading.Thread(
-            target=_dump,
-            args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=_dump,
-            args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
-            daemon=True,
-        ).start()
-    else:
-        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+            def _dump(src, sinks):
+                for line in iter(src.readline, ""):
+                    for sink in sinks:
+                        sink.write(line)
+                        sink.flush()
+                src.close()
 
-    start_time = time.perf_counter()
-    with requests.Session() as session:
-        while time.perf_counter() - start_time < timeout:
-            return_code = process.poll()
-            if return_code is not None:
-                # Server failed to start (non-zero exit code) or crashed
-                raise Exception(
-                    f"Server process exited with code {return_code}. "
-                    "Check server logs for errors."
-                )
+            threading.Thread(
+                target=_dump,
+                args=(proc.stdout, [return_stdout_stderr[0], sys.stdout]),
+                daemon=True,
+            ).start()
+            threading.Thread(
+                target=_dump,
+                args=(proc.stderr, [return_stdout_stderr[1], sys.stderr]),
+                daemon=True,
+            ).start()
+        else:
+            proc = subprocess.Popen(command, stdout=None, stderr=None, env=env_dict)
 
+        return proc
+
+    # Helper function to wait for server health check
+    def _wait_for_health(proc, timeout_duration):
+        start_time = time.perf_counter()
+        with requests.Session() as session:
+            while time.perf_counter() - start_time < timeout_duration:
+                return_code = proc.poll()
+                if return_code is not None:
+                    # Server process exited prematurely
+                    return False, f"Server process exited with code {return_code}"
+
+                try:
+                    headers = {
+                        "Content-Type": "application/json; charset=utf-8",
+                        "Authorization": f"Bearer {api_key}",
+                    }
+                    response = session.get(
+                        f"{base_url}/health_generate",
+                        headers=headers,
+                        timeout=5,
+                    )
+                    if response.status_code == 200:
+                        return True, None
+                except requests.RequestException:
+                    pass
+
+                return_code = proc.poll()
+                if return_code is not None:
+                    return (
+                        False,
+                        f"Server unexpectedly exited (return_code={return_code})",
+                    )
+
+                time.sleep(10)
+
+        # Timeout
+        return False, "Server failed to start within the timeout period"
+
+    # First launch attempt
+    process = _launch_process(env)
+    success, error_msg = _wait_for_health(process, timeout)
+
+    # If offline launch failed, retry with online mode
+    if not success and offline_enabled:
+        print(
+            f"CI_OFFLINE: Offline launch failed ({error_msg}), retrying with online mode..."
+        )
+
+        # Kill failed process
+        try:
+            if process.poll() is None:
+                kill_process_tree(process.pid)
+            else:
+                # Process already exited, just wait to clean up
+                process.wait(timeout=5)
+        except Exception as e:
+            print(f"CI_OFFLINE: Error cleaning up failed offline process: {e}")
+
+        # Retry with online mode
+        env["HF_HUB_OFFLINE"] = "0"
+        process = _launch_process(env)
+        success, error_msg = _wait_for_health(process, timeout)
+
+        if success:
+            print("CI_OFFLINE: Online retry succeeded")
+            return process
+        else:
+            # Online retry also failed - kill process and raise original error
             try:
-                headers = {
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Authorization": f"Bearer {api_key}",
-                }
-                response = session.get(
-                    f"{base_url}/health_generate",
-                    headers=headers,
-                    timeout=5,
-                )
-                if response.status_code == 200:
-                    return process
-            except requests.RequestException:
-                pass
-
-            return_code = process.poll()
-            if return_code is not None:
-                raise Exception(
-                    f"Server unexpectedly exits ({return_code=}). Usually there will be error logs describing the cause far above this line."
+                kill_process_tree(process.pid)
+            except Exception as e:
+                print(
+                    f"CI_OFFLINE: Error killing process after online retry failure: {e}"
                 )
 
-            time.sleep(10)
+            if "exited" in error_msg:
+                raise Exception(error_msg + ". Check server logs for errors.")
+            else:
+                raise TimeoutError(error_msg)
 
-    kill_process_tree(process.pid)
-    raise TimeoutError("Server failed to start within the timeout period.")
+    # First attempt succeeded or offline was not enabled
+    if success:
+        return process
+    else:
+        # First attempt failed and offline was not enabled - kill and raise
+        try:
+            kill_process_tree(process.pid)
+        except Exception as e:
+            print(f"CI_OFFLINE: Error killing process after first attempt failure: {e}")
+
+        if "exited" in error_msg:
+            raise Exception(error_msg + ". Check server logs for errors.")
+        else:
+            raise TimeoutError(error_msg)
 
 
 def popen_launch_pd_server(

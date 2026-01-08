@@ -603,6 +603,125 @@ def ci_validate_cache_and_enable_offline_if_complete(
     return True
 
 
+def validate_cache_with_detailed_reason(
+    snapshot_dir: str, weight_files: List[str], model_name_or_path: str
+) -> Tuple[Optional[bool], Optional[str]]:
+    """
+    Validate cache and return detailed reason for failure.
+
+    This is a wrapper around ci_validate_cache_and_enable_offline_if_complete
+    that captures and returns the specific reason for validation failure.
+    Used by prevalidate_cached_models.py to provide detailed feedback.
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+        weight_files: List of weight file paths to validate
+        model_name_or_path: Model identifier for logging
+
+    Returns:
+        Tuple of (success, reason):
+        - (True, None) if validation passed
+        - (False, reason_str) if validation failed with specific reason
+        - (None, None) if skipped (marker already exists)
+    """
+    # Guard: weight_files is required
+    if not weight_files:
+        return False, "No weight files provided"
+
+    # Check if validation marker exists (fast path)
+    # Don't treat marker as "passed" here - let caller decide to skip
+    marker = _read_validation_marker(snapshot_dir)
+    if marker is not None:
+        return None, None  # Skip - already validated
+
+    # No marker - perform full validation and capture failure reasons
+    revision = os.path.basename(snapshot_dir)
+
+    # Read from environment variable instead of huggingface_hub.constants
+    allow_remote_check = os.environ.get("HF_HUB_OFFLINE") != "1"
+
+    # Validate config and tokenizer files
+    config_valid, missing_config_files = _validate_config_and_tokenizer_files(
+        snapshot_dir=snapshot_dir,
+        model_id=model_name_or_path,
+        revision=revision,
+        allow_remote_check=allow_remote_check,
+    )
+
+    if not config_valid:
+        missing_files_str = ", ".join(missing_config_files)
+        return False, f"Missing config/tokenizer files: {missing_files_str}"
+
+    # Validate weight files
+    weights_valid, error_msg, _ = _validate_sharded_model(snapshot_dir, weight_files)
+    if not weights_valid:
+        return False, f"Weight validation failed: {error_msg}"
+
+    # All validations passed - write marker
+    _write_validation_marker(snapshot_dir, passed=True)
+    return True, None
+
+
+def validate_cache_lightweight(
+    snapshot_dir: str, requires_hf_quant_config: bool = False
+) -> bool:
+    """
+    Lightweight runtime validation for cache completeness.
+
+    This is used during test runs to ensure the current runner's cache
+    is complete before enabling offline mode. Much faster than full validation
+    as it only checks file existence, not corruption.
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+        requires_hf_quant_config: If True, hf_quant_config.json must exist
+                                  (required for modelopt quantization)
+
+    Returns:
+        True if cache is complete, False otherwise
+    """
+    # Check required config files
+    required_files = [
+        "config.json",
+        "tokenizer_config.json",
+    ]
+
+    for fname in required_files:
+        if not os.path.exists(os.path.join(snapshot_dir, fname)):
+            return False
+
+    # Check tokenizer files (at least one must exist)
+    tokenizer_files = [
+        "tokenizer.json",
+        "tokenizer.model",
+        "tiktoken.model",
+    ]
+
+    has_tokenizer = any(
+        os.path.exists(os.path.join(snapshot_dir, fname)) for fname in tokenizer_files
+    )
+    if not has_tokenizer:
+        return False
+
+    # Check for weight files (model.safetensors.index.json or at least one shard)
+    has_index = os.path.exists(
+        os.path.join(snapshot_dir, "model.safetensors.index.json")
+    )
+    # *.safetensors already covers model-*.safetensors pattern
+    has_shards = bool(glob_module.glob(os.path.join(snapshot_dir, "*.safetensors")))
+
+    if not has_index and not has_shards:
+        return False
+
+    # Check hf_quant_config.json if required (for modelopt quantization)
+    if requires_hf_quant_config:
+        hf_quant_path = os.path.join(snapshot_dir, "hf_quant_config.json")
+        if not os.path.exists(hf_quant_path):
+            return False
+
+    return True
+
+
 def _validate_safetensors_file(file_path: str) -> bool:
     """
     Validate that a safetensors file is readable and not corrupted.
