@@ -1,4 +1,4 @@
-name: Cancel All PR Test Runs (Pendings Only)
+name: Cancel All PR Test Runs
 
 on:
   workflow_dispatch:
@@ -14,13 +14,13 @@ permissions:
   contents: read   # Needed to read repo info
 
 jobs:
-  cancel-pending-pr-test:
+  cancel-pr-test:
     runs-on: ubuntu-latest
     steps:
       - name: Install GitHub CLI
         run: sudo apt-get install -y gh jq
 
-      - name: Cancel all pending/waiting PR-associated runs for specified workflows
+      - name: Cancel all PR-associated runs for specified workflows
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -38,7 +38,7 @@ jobs:
               --workflow "$workflow_file" \
               --json databaseId,status,event \
               --limit 1000 \
-              | jq -r '.[] | select((.status=="queued" or .status=="waiting") and .event=="pull_request") | .databaseId' \
+              | jq -r '.[] | select((.status=="in_progress" or .status=="queued" or .status=="waiting") and .event=="pull_request") | .databaseId' \
               | while read run_id; do
                   echo "Attempting to cancel run ID: $run_id for workflow: $workflow_file"
 
