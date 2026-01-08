@@ -9,8 +9,10 @@ use super::discover_dp::DpInfo;
 use crate::{
     app_context::AppContext,
     core::{
-        BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, DPAwareWorkerBuilder,
-        HealthConfig, ModelCard, RuntimeType, Worker, WorkerType,
+        circuit_breaker::CircuitBreakerConfig,
+        model_card::ModelCard,
+        worker::{HealthConfig, RuntimeType, WorkerType},
+        BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, UNKNOWN_MODEL_ID,
     },
     protocols::worker_spec::WorkerConfigRequest,
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
@@ -62,15 +64,15 @@ impl StepExecutor for CreateLocalWorkerStep {
             final_labels.insert(key.clone(), value.clone());
         }
 
-        // Determine model_id: config > served_model_name > model_path > "unknown"
+        // Determine model_id: config > served_model_name > model_path > UNKNOWN_MODEL_ID
         let model_id = config
             .model_id
             .clone()
             .or_else(|| final_labels.get("served_model_name").cloned())
             .or_else(|| final_labels.get("model_path").cloned())
-            .unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
 
-        if model_id != "unknown" {
+        if model_id != UNKNOWN_MODEL_ID {
             debug!("Using model_id: {}", model_id);
         }
 
@@ -172,6 +174,40 @@ fn build_model_card(
     if let Some(architectures_json) = labels.get("architectures") {
         if let Ok(architectures) = serde_json::from_str::<Vec<String>>(architectures_json) {
             card = card.with_architectures(architectures);
+        }
+    }
+
+    // Parse classification model id2label mapping
+    // The proto field is id2label_json: JSON string like {"0": "negative", "1": "positive"}
+    if let Some(id2label_json) = labels.get("id2label_json") {
+        if !id2label_json.is_empty() {
+            // Parse JSON: keys are string indices, values are label names
+            if let Ok(string_map) = serde_json::from_str::<HashMap<String, String>>(id2label_json) {
+                // Convert string keys ("0", "1") to u32 keys (0, 1)
+                let id2label: HashMap<u32, String> = string_map
+                    .into_iter()
+                    .filter_map(|(k, v)| k.parse::<u32>().ok().map(|idx| (idx, v)))
+                    .collect();
+
+                if !id2label.is_empty() {
+                    card = card.with_id2label(id2label);
+                    debug!("Parsed id2label with {} classes", card.num_labels);
+                }
+            }
+        }
+    }
+    // Fallback: if num_labels is set but id2label wasn't parsed, create default labels
+    // Match logic in serving_classify.py::_get_id2label_mapping
+    else if let Some(num_labels_str) = labels.get("num_labels") {
+        if let Ok(num_labels) = num_labels_str.parse::<u32>() {
+            if num_labels > 0 {
+                // Create default mapping: {0: "LABEL_0", 1: "LABEL_1", ...}
+                let id2label: HashMap<u32, String> = (0..num_labels)
+                    .map(|i| (i, format!("LABEL_{}", i)))
+                    .collect();
+                card = card.with_id2label(id2label);
+                debug!("Created default id2label with {} classes", num_labels);
+            }
         }
     }
 

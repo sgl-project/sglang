@@ -94,12 +94,10 @@ class ModelConfig:
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
-        hybrid_kvcache_ratio: Optional[
-            float
-        ] = None,  # TODO: remove this, it is not a model config
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
+        is_multi_layer_eagle: bool = False,
         encoder_only: bool = False,
         language_only: bool = False,
     ) -> None:
@@ -111,6 +109,7 @@ class ModelConfig:
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
+        self.is_multi_layer_eagle = is_multi_layer_eagle
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -158,18 +157,7 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
-        self.is_hybrid_swa = is_hybrid_model(
-            self.hf_config.architectures,
-            hybrid_kvcache_ratio=hybrid_kvcache_ratio,
-            context_length=context_length,
-            attention_chunk_size=self.attention_chunk_size,
-        )
-        if self.is_hybrid_swa is not None:
-            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
-                get_hybrid_layer_ids(
-                    self.hf_config.architectures, self.hf_text_config.num_hidden_layers
-                )
-            )
+        self.sliding_window_size = self._get_sliding_window_size()
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
@@ -198,11 +186,17 @@ class ModelConfig:
             and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
         )
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
+        self.is_local_attention_model = is_local_attention_model(
+            self.hf_config.architectures
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
         self._derive_context_length(context_length)
         self._derive_model_shapes()
+
+        # Update hybrid model
+        self._derive_hybrid_model()
 
         # Verify quantization
         self._verify_quantization()
@@ -254,11 +248,11 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=quantization,
-            hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
+            is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
@@ -286,6 +280,11 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "MiMoV2FlashForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "MiMoV2MTP"
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
@@ -300,6 +299,24 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
+
+    def _derive_hybrid_model(self):
+        # Use self.context_len after it has been initialized to prevent using context_len which may be None.
+        self.is_hybrid_swa = is_hybrid_swa_model(self.hf_config.architectures)
+
+        if self.is_hybrid_swa:
+            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
+                get_hybrid_layer_ids(
+                    self.hf_config.architectures,
+                    self.hf_text_config.num_hidden_layers,
+                    getattr(self.hf_text_config, "hybrid_layer_pattern", None),
+                )
+            )
+
+        self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
+            "MiMoV2FlashForCausalLM",
+            "MiMoV2MTP",
+        ]
 
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
@@ -341,6 +358,11 @@ class ModelConfig:
             self.hf_text_config,
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
+        )
+        self.v_head_dim = getattr(
+            self.hf_text_config,
+            "v_head_dim",
+            self.head_dim,
         )
 
         # FIXME: temporary special judge for MLA architecture
@@ -526,6 +548,15 @@ class ModelConfig:
         # parallel size so each GPU has at least one KV head.
         return max(1, total_num_kv_heads // tensor_parallel_size)
 
+    def get_swa_num_kv_heads(self, tensor_parallel_size) -> int:
+        """Similar to get_num_kv_heads(), but for SWA."""
+        if not self.is_hybrid_swa_compress:
+            return 0
+
+        # For MiMoV2FlashForCausalLM models
+        total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
+        return max(1, total_num_kv_heads // tensor_parallel_size)
+
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
@@ -634,6 +665,12 @@ class ModelConfig:
             return "fp8"
         else:
             return "fp8"  # Default fallback
+
+    def _get_sliding_window_size(self) -> Optional[int]:
+        sliding_window_size = getattr(self.hf_text_config, "sliding_window_size", None)
+        if sliding_window_size is None:
+            sliding_window_size = getattr(self.hf_text_config, "sliding_window", None)
+        return sliding_window_size
 
     def _validate_quantize_and_serve_config(self):
         """Validate quantize_and_serve configuration."""
@@ -752,6 +789,15 @@ class ModelConfig:
                         f"method specified in the `quantization` argument "
                         f"({self.quantization})."
                     )
+
+            # Check if the scale_fmt is ue8m0, and warn user if deepgemm is enabled for non-ue8m0 models on blackwell
+            self.use_scale_ue8m0 = quant_cfg.get("scale_fmt", None) == "ue8m0"
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if not self.use_scale_ue8m0 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                logger.warning(
+                    "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
+                )
 
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
@@ -1003,6 +1049,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+    "GlmAsrForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
@@ -1038,6 +1085,7 @@ multimodal_model_archs = [
     "DeepseekOCRForCausalLM",
     "JetVLMForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
+    "MiDashengLMModel",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
@@ -1070,6 +1118,10 @@ def is_encoder_decoder_model(model_architectures: List[str]):
     return "MllamaForConditionalGeneration" in model_architectures
 
 
+def is_local_attention_model(model_architectures: List[str]):
+    return "Llama4ForConditionalGeneration" in model_architectures
+
+
 def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
     """Check if chunked prefill is supported for a MultiModal model."""
     unsupported = [
@@ -1091,25 +1143,21 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-def is_hybrid_model(
+def is_hybrid_swa_model(model_architectures: List[str]):
+
+    hybrid_swa_archs = {
+        "Llama4ForConditionalGeneration",
+        "MiMoV2FlashForCausalLM",
+        "MiMoV2MTP",
+    }
+    return any(arch in hybrid_swa_archs for arch in model_architectures)
+
+
+def get_hybrid_layer_ids(
     model_architectures: List[str],
-    hybrid_kvcache_ratio: Optional[float],
-    context_length: Optional[int],
-    attention_chunk_size: Optional[int],
+    num_hidden_layers: int,
+    hybrid_layer_pattern: Optional[List[int]] = None,
 ):
-    if hybrid_kvcache_ratio is None:
-        return None
-    elif (
-        hybrid_kvcache_ratio > 0
-        and model_architectures[0] == "Llama4ForConditionalGeneration"
-        and context_length > attention_chunk_size
-    ):
-        return hybrid_kvcache_ratio
-    else:
-        return None
-
-
-def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int):
     if "Llama4ForConditionalGeneration" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
@@ -1117,6 +1165,15 @@ def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int)
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
+    elif "MiMoV2FlashForCausalLM" in model_architectures:
+        swa_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
+        ]
+        full_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
+        ]
+    elif "MiMoV2MTP" in model_architectures:
+        return [0], []
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

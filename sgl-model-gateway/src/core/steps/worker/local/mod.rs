@@ -4,6 +4,7 @@ mod discover_dp;
 mod discover_metadata;
 mod find_worker_to_update;
 mod find_workers_to_remove;
+mod register_tokenizer;
 mod remove_from_policy_registry;
 mod remove_from_worker_registry;
 mod update_policies_for_worker;
@@ -12,12 +13,21 @@ mod update_worker_properties;
 
 use std::{sync::Arc, time::Duration};
 
+/// Strip protocol prefix (http://, https://, grpc://) from URL.
+pub(crate) fn strip_protocol(url: &str) -> String {
+    url.trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_start_matches("grpc://")
+        .to_string()
+}
+
 pub use create_worker::CreateLocalWorkerStep;
 pub use detect_connection::DetectConnectionModeStep;
 pub use discover_dp::{get_dp_info, DiscoverDPInfoStep, DpInfo};
 pub use discover_metadata::DiscoverMetadataStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
+pub use register_tokenizer::RegisterTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 pub use remove_from_worker_registry::RemoveFromWorkerRegistryStep;
 pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
@@ -137,6 +147,20 @@ pub fn create_local_worker_workflow(router_config: &RouterConfig) -> WorkflowDef
             .with_timeout(Duration::from_secs(5))
             .with_failure_action(FailureAction::FailWorkflow)
             .depends_on(&["create_worker"]),
+        )
+        .add_step(
+            StepDefinition::new(
+                "register_tokenizer",
+                "Register Tokenizer",
+                Arc::new(RegisterTokenizerStep),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 3,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
+            })
+            .with_timeout(Duration::from_secs(10))
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&["register_workers"]),
         )
         // Step 5a: Update policies (parallel with activation)
         .add_step(

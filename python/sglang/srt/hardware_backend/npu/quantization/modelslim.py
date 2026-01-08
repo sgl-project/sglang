@@ -82,6 +82,11 @@ class ModelSlimConfig(QuantizationConfig):
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
+        self.activation_use_clip = (
+            self.quant_description.get("config_groups", {})
+            .get("group_1", {})
+            .get("activation_use_clip", False)
+        )
         self.target_scheme_map = (
             CompressedTensorsConfig._quantization_scheme_map_from_config(
                 config=quant_config
@@ -180,7 +185,9 @@ class ModelSlimConfig(QuantizationConfig):
             if (
                 self.is_moe_w4_dynamic and self.is_moe_input_quant is not None
             ) or is_moe_w4a8_dynamic:
-                return NPUW4A8Int4DynamicMoEMethod()
+                return NPUW4A8Int4DynamicMoEMethod(
+                    activation_use_clip=self.activation_use_clip
+                )
             elif self.is_moe_w4_dynamic and self.is_moe_input_quant is None:
                 return NPUW4A16Int4DynamicMoEMethod(self)
             else:
