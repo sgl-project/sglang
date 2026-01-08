@@ -482,8 +482,7 @@ def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
     src_dtype = x.dtype
     weight = norm.weight.tensor_split(tp_size)[tp_rank].float()
     x_fp32 = x.float()
-    orin_x = x_fp32
-    x = x_fp32.pow(2).mean(dim=-1, keepdim=True)
-    x = get_tp_group().all_reduce(x, op=torch._C._distributed_c10d.ReduceOp.AVG)
-    x = orin_x * torch.rsqrt(x + norm.variance_epsilon) * weight
-    return x.to(dtype=src_dtype)
+    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+    variance = get_tp_group().all_reduce(variance, op=torch._C._distributed_c10d.ReduceOp.AVG)
+    output = x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * weight
+    return output.to(dtype=src_dtype)
