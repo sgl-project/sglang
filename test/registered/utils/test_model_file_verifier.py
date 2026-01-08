@@ -6,8 +6,9 @@ import unittest
 
 from sglang.srt.utils.model_file_verifier import (
     IntegrityError,
-    ModelFileVerifier,
     compute_sha256,
+    generate_checksums,
+    verify,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -34,8 +35,7 @@ class TestModelFileVerifier(unittest.TestCase):
 
     def test_generate_checksums(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        verifier = ModelFileVerifier(self.test_dir)
-        checksums = verifier.generate_checksums(checksums_file)
+        checksums = generate_checksums(self.test_dir, checksums_file)
 
         self.assertEqual(len(checksums), 3)
         for filename in self.files:
@@ -50,54 +50,37 @@ class TestModelFileVerifier(unittest.TestCase):
 
     def test_verify_intact_files(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        verifier = ModelFileVerifier(self.test_dir)
-        verifier.generate_checksums(checksums_file)
-
-        verifier2 = ModelFileVerifier(self.test_dir, checksums_file)
-        verifier2.verify()
+        generate_checksums(self.test_dir, checksums_file)
+        verify(self.test_dir, checksums_file)
 
     def test_detect_bit_rot(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        verifier = ModelFileVerifier(self.test_dir)
-        verifier.generate_checksums(checksums_file)
+        generate_checksums(self.test_dir, checksums_file)
 
         target_file = os.path.join(self.test_dir, "model.safetensors")
         _flip_bit_in_file(target_file, byte_offset=50, bit_position=3)
 
-        verifier2 = ModelFileVerifier(self.test_dir, checksums_file)
         with self.assertRaises(IntegrityError) as ctx:
-            verifier2.verify()
+            verify(self.test_dir, checksums_file)
 
         self.assertIn("model.safetensors", str(ctx.exception))
         self.assertIn("mismatch", str(ctx.exception).lower())
 
     def test_detect_missing_file(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        verifier = ModelFileVerifier(self.test_dir)
-        verifier.generate_checksums(checksums_file)
+        generate_checksums(self.test_dir, checksums_file)
 
         os.remove(os.path.join(self.test_dir, "config.json"))
 
-        verifier2 = ModelFileVerifier(self.test_dir, checksums_file)
         with self.assertRaises(IntegrityError) as ctx:
-            verifier2.verify()
+            verify(self.test_dir, checksums_file)
 
         self.assertIn("config.json", str(ctx.exception))
 
     def test_verify_with_external_checksums_file(self):
         external_checksums_path = os.path.join(self.test_dir, "external_checksums.json")
-        verifier = ModelFileVerifier(self.test_dir)
-        verifier.generate_checksums(external_checksums_path)
-
-        verifier2 = ModelFileVerifier(self.test_dir, external_checksums_path)
-        verifier2.verify()
-
-    def test_no_checksums_source_raises_error(self):
-        verifier = ModelFileVerifier(self.test_dir)
-        with self.assertRaises(IntegrityError) as ctx:
-            verifier.verify()
-
-        self.assertIn("checksums_source is required", str(ctx.exception))
+        generate_checksums(self.test_dir, external_checksums_path)
+        verify(self.test_dir, external_checksums_path)
 
     def test_compute_sha256(self):
         test_file = os.path.join(self.test_dir, "test.bin")
@@ -119,8 +102,7 @@ class TestModelFileVerifier(unittest.TestCase):
             )
 
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        verifier = ModelFileVerifier(self.test_dir, max_workers=4)
-        checksums = verifier.generate_checksums(checksums_file)
+        checksums = generate_checksums(self.test_dir, checksums_file, max_workers=4)
 
         self.assertGreaterEqual(len(checksums), 10)
 
@@ -161,8 +143,7 @@ class TestModelFileVerifierWithRealModel(unittest.TestCase):
         )
 
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        verifier = ModelFileVerifier(self.test_dir)
-        verifier.generate_checksums(checksums_file)
+        generate_checksums(self.test_dir, checksums_file)
 
         process = popen_launch_server(
             self.test_dir,
@@ -183,8 +164,7 @@ class TestModelFileVerifierWithRealModel(unittest.TestCase):
         from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
         checksums_file = os.path.join(self.test_dir, "checksums.json")
-        verifier = ModelFileVerifier(self.test_dir)
-        verifier.generate_checksums(checksums_file)
+        generate_checksums(self.test_dir, checksums_file)
 
         safetensors_files = [
             f for f in os.listdir(self.test_dir) if f.endswith(".safetensors")
