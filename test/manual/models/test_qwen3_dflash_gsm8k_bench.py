@@ -330,6 +330,121 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
         }
         print(json.dumps(report, indent=2), flush=True)
 
+    def test_qwen3_dflash_native_matches_hf(self):
+        if is_in_ci():
+            self.skipTest("Manual benchmark; skipped in CI.")
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for this manual DFlash benchmark.")
+
+        target_model = os.getenv("SGLANG_DFLASH_TARGET_MODEL", "Qwen/Qwen3-8B")
+        draft_model_path = os.getenv(
+            "SGLANG_DFLASH_DRAFT_MODEL_PATH", "/tmp/Qwen3-8B-DFlash-bf16"
+        )
+        if not os.path.isdir(draft_model_path):
+            self.skipTest(
+                f"Draft model folder not found: {draft_model_path}. "
+                "Set SGLANG_DFLASH_DRAFT_MODEL_PATH to run this benchmark."
+            )
+
+        attention_backend = os.getenv("SGLANG_DFLASH_ATTENTION_BACKEND", "flashinfer")
+        max_new_tokens = int(os.getenv("SGLANG_DFLASH_PARITY_MAX_NEW_TOKENS", "256"))
+        parallel = int(os.getenv("SGLANG_DFLASH_PARITY_PARALLEL", "1"))
+        num_questions = int(os.getenv("SGLANG_DFLASH_PARITY_NUM_QUESTIONS", "10"))
+        max_total_tokens = int(os.getenv("SGLANG_DFLASH_PARITY_MAX_TOTAL_TOKENS", "8192"))
+        num_shots = int(os.getenv("SGLANG_DFLASH_NUM_SHOTS", "1"))
+        disable_radix_cache = os.getenv("SGLANG_DFLASH_DISABLE_RADIX_CACHE", "1") != "0"
+        prompt_style = os.getenv("SGLANG_DFLASH_PROMPT_STYLE", "fewshot_qa")
+
+        # Read GSM8K data (download if absent).
+        data_path = os.getenv("SGLANG_DFLASH_GSM8K_PATH", "test.jsonl")
+        url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+        if not os.path.isfile(data_path):
+            data_path = download_and_cache_file(url)
+        lines = list(read_jsonl(data_path))
+
+        tokenizer = None
+        if prompt_style == "dflash_chat":
+            tokenizer = AutoTokenizer.from_pretrained(target_model)
+
+        few_shot = _get_few_shot_examples(lines, num_shots) if prompt_style == "fewshot_qa" else ""
+        prompts: list[str] = []
+        for i in range(len(lines[:num_questions])):
+            if prompt_style == "fewshot_qa":
+                prompts.append(few_shot + _get_one_example(lines, i, False))
+            elif prompt_style == "dflash_chat":
+                assert tokenizer is not None
+                user_content = (
+                    lines[i]["question"]
+                    + "\nPlease reason step by step, and put your final answer within \\boxed{}."
+                )
+                prompts.append(
+                    tokenizer.apply_chat_template(
+                        [{"role": "user", "content": user_content}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                )
+            else:
+                raise ValueError(f"Unsupported SGLANG_DFLASH_PROMPT_STYLE: {prompt_style}")
+
+        common_server_args = [
+            "--attention-backend",
+            attention_backend,
+            "--max-total-tokens",
+            str(max_total_tokens),
+        ]
+        if disable_radix_cache:
+            common_server_args.append("--disable-radix-cache")
+        extra_server_args = os.getenv("SGLANG_DFLASH_EXTRA_SERVER_ARGS", "").strip()
+        if extra_server_args:
+            common_server_args.extend(shlex.split(extra_server_args))
+
+        def _run_dflash(draft_impl: str, port: int) -> list[dict]:
+            base_url = f"http://127.0.0.1:{port}"
+            env = dict(os.environ)
+            env["SGLANG_DFLASH_DRAFT_IMPL"] = draft_impl
+            proc = popen_launch_server(
+                target_model,
+                base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    *common_server_args,
+                    "--speculative-algorithm",
+                    "DFLASH",
+                    "--speculative-draft-model-path",
+                    draft_model_path,
+                ],
+                env=env,
+            )
+            try:
+                _send_generate(base_url, "Hello", max_new_tokens=8)  # warmup
+                _, outputs = _run_generate_batch(
+                    base_url,
+                    prompts,
+                    max_new_tokens=max_new_tokens,
+                    parallel=parallel,
+                )
+                return outputs
+            finally:
+                kill_process_tree(proc.pid)
+                try:
+                    proc.wait(timeout=30)
+                except Exception:
+                    pass
+
+        hf_outputs = _run_dflash("hf", find_available_port(21000))
+        native_outputs = _run_dflash("native", find_available_port(22000))
+
+        for i, (hf_out, native_out) in enumerate(
+            zip(hf_outputs, native_outputs, strict=True)
+        ):
+            if hf_out.get("output_ids") != native_out.get("output_ids"):
+                raise AssertionError(
+                    "HF and native DFLASH outputs diverged at index "
+                    f"{i}.\nhf={hf_out.get('output_ids')}\nnative={native_out.get('output_ids')}"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

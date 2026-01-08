@@ -2607,14 +2607,14 @@ class Scheduler(
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                release_kv_cache(req, self.tree_cache)
+                self._release_kv_cache_and_draft(req)
 
             # For mamba radix cache
             if (
                 req.mamba_pool_idx is not None
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                self._release_kv_cache_and_draft(req, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
