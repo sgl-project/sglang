@@ -1,12 +1,14 @@
 import argparse
 import asyncio
 import json
+import os
 import queue
 import random
 import threading
 import time
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 import numpy as np
@@ -140,6 +142,11 @@ def parse_args():
         default="",
         help="String of LoRA path. Currently we only support benchmarking on a single LoRA adaptor.",
     )
+    parser.add_argument(
+        "--enable-session-cache",
+        action="store_true",
+        help="If set, enable session cache.",
+    )
     return parser.parse_args()
 
 
@@ -164,6 +171,8 @@ async def async_request_sglang_generate(
                 if response.status == 200:
                     prompt_tokens = 0
                     cached_tokens = 0
+                    fresh_kv_cache = None
+
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
@@ -195,6 +204,9 @@ async def async_request_sglang_generate(
 
                                 most_recent_timestamp = timestamp
                                 generated_text = data["text"]
+                                fresh_kv_cache = data.get("session_params", {}).get(
+                                    "fresh_kv_cache", None
+                                )
 
                     output.generated_text = generated_text
                     output.success = True
@@ -202,6 +214,7 @@ async def async_request_sglang_generate(
                     output.prompt_len = prompt_tokens
                     output.cached_tokens = cached_tokens
                     output.generated_len = len(output.itl) + 1
+                    output.fresh_kv_cache = fresh_kv_cache
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -215,7 +228,7 @@ async def async_request_sglang_generate(
     return output
 
 
-def gen_payload(prompt, output_len, lora_path=""):
+def gen_payload(prompt, output_len, lora_path="", session_params=None):
     payload = {
         "text": prompt,
         "sampling_params": {
@@ -228,6 +241,7 @@ def gen_payload(prompt, output_len, lora_path=""):
         "lora_path": lora_path,
         "return_logprob": False,
         "logprob_start_len": -1,
+        "session_params": session_params or {},
     }
     return payload
 
@@ -312,11 +326,17 @@ class WorkloadGenerator:
             random_sample=not args.disable_random_sample,
         )
 
+        self.enable_session_cache = args.enable_session_cache
+        self.prepare_session_cache(args.num_clients)
+
         init_requests = [
             (
                 i,
                 gen_payload(
-                    self.candidate_inputs[i], args.output_length, args.lora_path
+                    self.candidate_inputs[i],
+                    args.output_length,
+                    args.lora_path,
+                    session_params=self.gen_session_params(i),
                 ),
             )
             for i in range(args.num_clients)
@@ -355,6 +375,58 @@ class WorkloadGenerator:
         self.num_rounds = args.num_rounds
         self.max_parallel = args.max_parallel
         self.output_length = args.output_length
+
+    def prepare_session_cache(self, num_clients):
+        if not self.enable_session_cache:
+            return
+
+        self.sessions: Dict[int, Any] = {
+            i: {"id": f"session_{i}"} for i in range(num_clients)
+        }
+
+        # Create session cache files
+        hicache_file_path = os.getenv(
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", "/tmp/hicache"
+        )
+        Path(hicache_file_path).mkdir(parents=True, exist_ok=True)
+        for i in range(num_clients):
+            Path(f"{hicache_file_path}/session_{i}").touch()
+
+    def gen_session_params(
+        self,
+        client_id,
+        stored_kv_cache: Optional[List] = None,
+    ):
+        if not self.enable_session_cache:
+            return None
+
+        session_params = self.sessions[client_id]
+        if stored_kv_cache:
+            session_params["stored_kv_cache"] = (
+                session_params.get("stored_kv_cache", []) + stored_kv_cache
+            )
+            last_kv_cache = stored_kv_cache[-1]
+
+            session_params["fresh_kv_cache"] = [
+                {
+                    "token_start": last_kv_cache["token_start"]
+                    + last_kv_cache["token_length"],
+                    "token_length": 32768,
+                    "kv_uri": f"file:///session_{client_id}",
+                    "kv_start": last_kv_cache["kv_start"] + last_kv_cache["kv_length"],
+                }
+            ]
+        else:
+            session_params["fresh_kv_cache"] = [
+                {
+                    "token_start": 0,
+                    "token_length": 32768,
+                    "kv_uri": f"file:///session_{client_id}",
+                    "kv_start": 0,
+                }
+            ]
+
+        return session_params
 
     async def handle_request(self, item):
         try:
@@ -445,6 +517,9 @@ class WorkloadGenerator:
                             self.client_records[client_id]["history"],
                             self.output_length,
                             args.lora_path,
+                            session_params=self.gen_session_params(
+                                client_id, response.fresh_kv_cache
+                            ),
                         ),
                     )
                     if self.enable_round_barrier:
