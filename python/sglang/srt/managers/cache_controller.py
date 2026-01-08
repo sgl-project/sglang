@@ -658,10 +658,6 @@ class HiCacheController:
         while not self.stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
-                if operation.is_terminated():
-                    self.prefetch_revoke_queue.put(operation.request_id)
-                    self.append_host_mem_release(operation.host_indices)
-                    continue
                 self._page_transfer(operation)
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
@@ -724,11 +720,6 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                if operation.is_terminated():
-                    self.prefetch_revoke_queue.put(operation.request_id)
-                    self.append_host_mem_release(operation.host_indices)
-                    continue
-
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
