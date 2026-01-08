@@ -234,41 +234,35 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
                 f for f in os.listdir(self.test_dir) if f.endswith(".safetensors")
             ]
             self.assertTrue(len(safetensors_files) > 0, "No safetensors files found")
-            target_file = os.path.join(self.test_dir, safetensors_files[0])
-            _flip_bit_in_file(target_file, byte_offset=1000, bit_position=5)
+            _flip_bit_in_file(os.path.join(self.test_dir, safetensors_files[0]))
 
         stdout_io, stderr_io = StringIO(), StringIO()
-
-        if corrupt_weights:
-            with self.assertRaises(PopenLaunchServerError) as ctx:
-                popen_launch_server(
-                    model=self.test_dir,
-                    base_url=DEFAULT_URL_FOR_TEST,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                    other_args=["--model-checksum", checksums_file],
-                    return_stdout_stderr=(stdout_io, stderr_io),
-                )
-            self.assertTrue(
-                "IntegrityError" in ctx.exception.output
-                or "mismatch" in ctx.exception.output.lower(),
-                f"Expected integrity error, got: {ctx.exception.output[-500:]}",
-            )
-        else:
+        try:
             process = popen_launch_server(
                 model=self.test_dir,
                 base_url=DEFAULT_URL_FOR_TEST,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=["--model-checksum", checksums_file],
+                return_stdout_stderr=(stdout_io, stderr_io),
             )
-            try:
-                response = requests.post(
-                    f"{DEFAULT_URL_FOR_TEST}/generate",
-                    json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
-                )
-                self.assertEqual(response.status_code, 200)
-                self.assertIn("text", response.json())
-            finally:
-                kill_process_tree(process.pid)
+        except PopenLaunchServerError as e:
+            self.assertTrue(corrupt_weights, f"Unexpected server failure: {e.output[-500:]}")
+            self.assertTrue(
+                "IntegrityError" in e.output or "mismatch" in e.output.lower(),
+                f"Expected integrity error, got: {e.output[-500:]}",
+            )
+            return
+
+        self.assertFalse(corrupt_weights, "Expected server to fail with corrupted weights")
+        try:
+            response = requests.post(
+                f"{DEFAULT_URL_FOR_TEST}/generate",
+                json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("text", response.json())
+        finally:
+            kill_process_tree(process.pid)
 
     def test_server_launch_with_checksum_intact(self):
         self._run_server_test(corrupt_weights=False)
