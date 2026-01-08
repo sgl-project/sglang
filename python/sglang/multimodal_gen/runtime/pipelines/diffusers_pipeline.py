@@ -554,6 +554,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         try:
             pipe = cache_dit.enable_cache(pipe, **cache_options)
         except Exception:
+            # cache-dit is an external integration and can raise a variety of errors.
             logger.exception("Failed to enable cache-dit for diffusers pipeline")
             raise
 
@@ -641,7 +642,10 @@ class DiffusersPipeline(ComposedPipelineBase):
             if encoder is not None:
                 return encoder
         except Exception:
-            pass
+            logger.debug(
+                "cache-dit get_text_encoder_from_pipe failed; falling back to attribute lookup",
+                exc_info=True,
+            )
 
         for attr in ["text_encoder_2", "text_encoder_3", "text_encoder"]:
             if hasattr(pipe, attr):
