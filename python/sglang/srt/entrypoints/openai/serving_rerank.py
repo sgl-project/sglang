@@ -513,50 +513,40 @@ class OpenAIServingRerank(OpenAIServingBase):
 
         # Get logprobs from the response
         meta_info = ret.get("meta_info", {})
-        input_top_logprobs = meta_info.get("input_top_logprobs", [])
         output_top_logprobs = meta_info.get("output_top_logprobs", [])
 
-        # Use input_top_logprobs at the last position - this gives us the model's
-        # prediction for what token comes next after processing the full prompt
-        # (which should be "yes" or "no")
-        if input_top_logprobs:
-            top_logprobs = input_top_logprobs[-1]
-        elif output_top_logprobs:
-            top_logprobs = output_top_logprobs[0]
-        else:
-            logger.warning("No logprobs found in response, returning 0.0")
-            return 0.0
+        # Use output_top_logprobs[0] - the model's prediction for the first generated token
+        top_logprobs = output_top_logprobs[0] if output_top_logprobs else []
+
+        # -- DEBUG -- Log top tokens and target token IDs
+        if isinstance(top_logprobs, list) and top_logprobs:
+            # Decode token IDs to see what model is actually outputting
+            try:
+                tokenizer = self.tokenizer_manager.tokenizer
+                decoded_tokens = []
+                for item in top_logprobs[:10]:
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        logprob, token_id = item[0], item[1]
+                        token_str = tokenizer.decode([token_id])
+                        decoded_tokens.append(f"({token_id}='{token_str}', {logprob:.3f})")
+                logger.info(f"[DEBUG] Top 10 tokens decoded: {decoded_tokens}")
+            except Exception:
+                logger.info(f"[DEBUG] Top 5 logprobs: {top_logprobs[:5]}")
+        # -- DEBUG --
 
         # Find yes and no token probabilities
+        # Format: list of tuples (logprob, token_id, token_text)
         p_yes = 0.0
         p_no = 0.0
 
-        if isinstance(top_logprobs, dict):
-            # Format: {token_id: logprob}
-            for token_id, logprob in top_logprobs.items():
-                token_id_int = int(token_id) if isinstance(token_id, str) else token_id
-                if token_id_int == self._yes_token_id:
-                    p_yes = math.exp(logprob)
-                elif token_id_int == self._no_token_id:
-                    p_no = math.exp(logprob)
-        elif isinstance(top_logprobs, list):
-            # Format: list of tuples (logprob, token_id, token_text) or list of dicts
-            for item in top_logprobs:
-                if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    # SGLang format: (logprob, token_id, token_text)
-                    logprob, token_id = item[0], item[1]
-                    if token_id == self._yes_token_id:
-                        p_yes = math.exp(logprob)
-                    elif token_id == self._no_token_id:
-                        p_no = math.exp(logprob)
-                elif isinstance(item, dict):
-                    token_id = item.get("token_id", item.get("id"))
-                    logprob = item.get("logprob", item.get("logprobs"))
-                    if token_id == self._yes_token_id:
-                        p_yes = math.exp(logprob) if logprob else 0.0
-                    elif token_id == self._no_token_id:
-                        p_no = math.exp(logprob) if logprob else 0.0
+        for item in top_logprobs:
+            logprob, token_id = item[0], item[1]
+            if token_id == self._yes_token_id:
+                p_yes = math.exp(logprob)
+            elif token_id == self._no_token_id:
+                p_no = math.exp(logprob)
 
+        logger.info(f"[DEBUG] p_yes={p_yes}, p_no={p_no}, score={_qwen3_rerank_score(p_yes, p_no)}")
         return _qwen3_rerank_score(p_yes, p_no)
 
     def _build_rerank_response(
