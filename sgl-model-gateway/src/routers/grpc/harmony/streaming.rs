@@ -105,7 +105,7 @@ impl ToolCallMode {
 ///
 /// Returns an SSE stream that parses Harmony tokens incrementally and
 /// emits ChatCompletionChunk events for streaming responses.
-pub struct HarmonyStreamingProcessor;
+pub(crate) struct HarmonyStreamingProcessor;
 
 impl HarmonyStreamingProcessor {
     /// Create a new Harmony streaming processor
@@ -116,6 +116,9 @@ impl HarmonyStreamingProcessor {
     /// Process a streaming Harmony Chat Completion response
     ///
     /// Returns an SSE response with streaming token updates.
+    ///
+    /// Note: Caller should attach load guards to the returned response using
+    /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
     pub fn process_streaming_chat_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -171,6 +174,19 @@ impl HarmonyStreamingProcessor {
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
+            }
+            context::ExecutionResult::Embedding { .. } => {
+                error!("Harmony streaming not supported for embeddings");
+                let error_chunk = format!(
+                    "data: {}\n\n",
+                    json!({
+                        "error": {
+                            "message": "Embeddings not supported in Harmony streaming",
+                            "type": "invalid_request_error"
+                        }
+                    })
+                );
+                let _ = tx.send(Ok(Bytes::from(error_chunk)));
             }
         }
 
@@ -640,6 +656,9 @@ impl HarmonyStreamingProcessor {
                     mcp_tool_names,
                 )
                 .await
+            }
+            context::ExecutionResult::Embedding { .. } => {
+                Err("Embeddings not supported in Responses API streaming".to_string())
             }
         }
     }
