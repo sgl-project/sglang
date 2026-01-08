@@ -27,8 +27,7 @@ class DFlashDraftInput(SpecInput):
     the draft model and to track draft-side cache progress.
 
     Invariant (per request):
-      - Native path: `draft_seq_len + ctx_len == batch.seq_lens[i]`
-      - HF path: `draft_cache.get_seq_length() + ctx_len == batch.seq_lens[i]`
+      - `draft_seq_len + ctx_len == batch.seq_lens[i]`
         where `ctx_len` is the number of target context-feature tokens carried in
         `target_hidden` for that request.
     """
@@ -45,10 +44,7 @@ class DFlashDraftInput(SpecInput):
 
     # Native implementation: how many tokens are already materialized in the draft KV cache.
     # The next draft step appends `ctx_lens_cpu[i]` tokens starting at `draft_seq_lens_cpu[i]`.
-    draft_seq_lens_cpu: List[int] | None = None
-
-    # HF-style baseline implementation: per-request transformers DynamicCache objects.
-    draft_caches: List[object] | None = None
+    draft_seq_lens_cpu: List[int]
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
@@ -65,10 +61,7 @@ class DFlashDraftInput(SpecInput):
 
         self.verified_id = self.verified_id[new_indices]
         self.ctx_lens_cpu = [old_ctx_lens_cpu[i] for i in keep_indices]
-        if self.draft_seq_lens_cpu is not None:
-            self.draft_seq_lens_cpu = [self.draft_seq_lens_cpu[i] for i in keep_indices]
-        if self.draft_caches is not None:
-            self.draft_caches = [self.draft_caches[i] for i in keep_indices]
+        self.draft_seq_lens_cpu = [self.draft_seq_lens_cpu[i] for i in keep_indices]
 
         if old_target_hidden is None or old_target_hidden.numel() == 0:
             self.target_hidden = old_target_hidden
@@ -90,14 +83,7 @@ class DFlashDraftInput(SpecInput):
     def merge_batch(self, spec_info: "DFlashDraftInput"):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], dim=0)
         self.ctx_lens_cpu.extend(spec_info.ctx_lens_cpu)
-        if self.draft_seq_lens_cpu is not None or spec_info.draft_seq_lens_cpu is not None:
-            if self.draft_seq_lens_cpu is None or spec_info.draft_seq_lens_cpu is None:
-                raise ValueError("Cannot merge DFLASH draft batches with mismatched draft_seq_lens_cpu presence.")
-            self.draft_seq_lens_cpu.extend(spec_info.draft_seq_lens_cpu)
-        if self.draft_caches is not None or spec_info.draft_caches is not None:
-            if self.draft_caches is None or spec_info.draft_caches is None:
-                raise ValueError("Cannot merge DFLASH draft batches with mismatched draft_caches presence.")
-            self.draft_caches.extend(spec_info.draft_caches)
+        self.draft_seq_lens_cpu.extend(spec_info.draft_seq_lens_cpu)
         if self.target_hidden is None or self.target_hidden.numel() == 0:
             self.target_hidden = spec_info.target_hidden
         elif spec_info.target_hidden is not None and spec_info.target_hidden.numel() > 0:

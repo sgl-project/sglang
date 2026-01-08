@@ -1,5 +1,4 @@
 import logging
-import os
 from copy import deepcopy
 from typing import List, Optional, Union
 
@@ -16,7 +15,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dflash_draft_model import load_dflash_draft_model
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -53,73 +51,36 @@ class DFlashWorker:
         self._warned_forced_greedy = False
         self._logged_first_verify = False
 
-        self.draft_impl = os.getenv("SGLANG_DFLASH_DRAFT_IMPL", "native").strip().lower()
-        if self.draft_impl not in ("native", "hf"):
-            raise ValueError(
-                "Invalid SGLANG_DFLASH_DRAFT_IMPL. "
-                f"Expected 'native' or 'hf', got: {self.draft_impl!r}"
-            )
-
-        self.native_draft_worker: TpModelWorker | None = None
-        self.native_draft_model_runner = None
-        self.native_draft_model = None
-        self.draft_model = None
-        self.draft_config = None
-
-        draft_device = torch.device(target_worker.device)
-        draft_dtype = target_worker.model_runner.dtype
-
-        if self.draft_impl == "native":
-            # Native (SGLang) draft runner (separate KV cache + attention backend).
-            draft_server_args = deepcopy(server_args)
-            draft_server_args.skip_tokenizer_init = True
-            draft_server_args.disable_cuda_graph = True
-            # Force FA3 for draft (Hopper-friendly, and supports ENCODER_ONLY attention).
-            draft_server_args.attention_backend = "fa3"
-            # Keep draft context length aligned with the target.
-            draft_server_args.context_length = target_worker.model_runner.model_config.context_len
-            self.native_draft_worker = TpModelWorker(
-                server_args=draft_server_args,
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                moe_ep_rank=moe_ep_rank,
-                pp_rank=0,
-                dp_rank=dp_rank,
-                nccl_port=nccl_port,
-                is_draft_worker=True,
-            )
-            self.native_draft_model_runner = self.native_draft_worker.model_runner
-            self.native_draft_model = self.native_draft_model_runner.model
-            self.block_size = int(getattr(self.native_draft_model, "block_size", 16))
-            if self.tp_rank == 0:
-                logger.info(
-                    "Initialized native DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s",
-                    getattr(draft_server_args, "attention_backend", None),
-                    self.native_draft_model.__class__.__name__,
-                    self.block_size,
-                )
-        else:
-            # HF-style baseline draft implementation (DynamicCache).
-            self.draft_model, self.draft_config = load_dflash_draft_model(
-                server_args.speculative_draft_model_path,
-                device=draft_device,
-                dtype=draft_dtype,
-            )
-            self.block_size = int(getattr(self.draft_config, "block_size", 16))
-            if self.tp_rank == 0:
-                logger.info(
-                    "Initialized HF-style DFLASH draft model. path=%s, dtype=%s, device=%s, block_size=%s, num_hidden_layers=%s",
-                    server_args.speculative_draft_model_path,
-                    draft_dtype,
-                    draft_device,
-                    self.block_size,
-                    getattr(self.draft_config, "num_hidden_layers", None),
-                )
-
+        # Native (SGLang) draft runner (separate KV cache + attention backend).
+        draft_server_args = deepcopy(server_args)
+        draft_server_args.skip_tokenizer_init = True
+        draft_server_args.disable_cuda_graph = True
+        # Force FA3 for draft (Hopper-friendly, and supports ENCODER_ONLY attention).
+        draft_server_args.attention_backend = "fa3"
+        # Keep draft context length aligned with the target.
+        draft_server_args.context_length = target_worker.model_runner.model_config.context_len
+        self.native_draft_worker = TpModelWorker(
+            server_args=draft_server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
+            pp_rank=0,
+            dp_rank=dp_rank,
+            nccl_port=nccl_port,
+            is_draft_worker=True,
+        )
+        self.native_draft_model_runner = self.native_draft_worker.model_runner
+        self.native_draft_model = self.native_draft_model_runner.model
+        self.block_size = int(getattr(self.native_draft_model, "block_size", 16))
         if self.tp_rank == 0:
             logger.info(
-                "DFLASH draft impl selected. impl=%s, mask_token_id=%s",
-                self.draft_impl,
+                "Initialized native DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s",
+                getattr(draft_server_args, "attention_backend", None),
+                self.native_draft_model.__class__.__name__,
+                self.block_size,
+            )
+            logger.info(
+                "DFLASH draft impl selected. impl=native, mask_token_id=%s",
                 self._mask_token_id,
             )
 
@@ -141,10 +102,6 @@ class DFlashWorker:
         when the request completes to avoid leaking draft KV memory across
         requests.
         """
-        if self.draft_impl != "native":
-            return
-        if self.native_draft_model_runner is None:
-            return
         req_pool_idx = getattr(req, "req_pool_idx", None)
         if req_pool_idx is None:
             return
@@ -204,13 +161,6 @@ class DFlashWorker:
         return int(mask_token_id)
 
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch, draft_input: DFlashDraftInput):
-        if self.draft_impl == "native":
-            return self._prepare_for_speculative_decoding_native(batch, draft_input)
-        return self._prepare_for_speculative_decoding_hf(batch, draft_input)
-
-    def _prepare_for_speculative_decoding_native(
-        self, batch: ScheduleBatch, draft_input: DFlashDraftInput
-    ):
         if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
             return
 
@@ -233,15 +183,11 @@ class DFlashWorker:
             raise RuntimeError(
                 f"DFLASH ctx_lens_cpu length mismatch: got {len(draft_input.ctx_lens_cpu)} for bs={bs}."
             )
-        if draft_input.draft_seq_lens_cpu is None:
-            raise RuntimeError("DFLASH native draft state missing draft_seq_lens_cpu.")
         if len(draft_input.draft_seq_lens_cpu) != bs:
             raise RuntimeError(
                 "DFLASH draft_seq_lens_cpu length mismatch: "
                 f"got {len(draft_input.draft_seq_lens_cpu)} for bs={bs}."
             )
-        if self.native_draft_model_runner is None or self.native_draft_model is None:
-            raise RuntimeError("DFLASH native draft runner is not initialized.")
 
         embed_weight, head_weight = self.target_worker.model_runner.model.get_embed_and_head()
 
@@ -421,117 +367,6 @@ class DFlashWorker:
         batch.spec_info = verify_input
         batch.return_hidden_states = False
 
-    def _prepare_for_speculative_decoding_hf(
-        self, batch: ScheduleBatch, draft_input: DFlashDraftInput
-    ):
-        if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
-            return
-
-        if batch.has_grammar:
-            raise ValueError("DFLASH does not support grammar-constrained decoding yet.")
-        if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
-            if not self._warned_forced_greedy and self.tp_rank == 0:
-                logger.warning(
-                    "DFLASH currently supports greedy verification only; "
-                    "ignoring non-greedy sampling params (e.g. temperature/top_p/top_k) and using argmax."
-                )
-                self._warned_forced_greedy = True
-
-        if self.draft_model is None:
-            raise RuntimeError("DFLASH HF draft model is not initialized.")
-        if draft_input.draft_caches is None:
-            raise RuntimeError("DFLASH HF draft state missing draft_caches.")
-
-        bs = batch.batch_size()
-        device = self.model_runner.device
-
-        if draft_input.target_hidden is None:
-            raise RuntimeError("DFLASH draft state missing target_hidden context features.")
-        if len(draft_input.ctx_lens_cpu) != bs:
-            raise RuntimeError(
-                f"DFLASH ctx_lens_cpu length mismatch: got {len(draft_input.ctx_lens_cpu)} for bs={bs}."
-            )
-        if len(draft_input.draft_caches) != bs:
-            raise RuntimeError(
-                f"DFLASH draft_caches length mismatch: got {len(draft_input.draft_caches)} for bs={bs}."
-            )
-
-        embed_weight, head_weight = self.target_worker.model_runner.model.get_embed_and_head()
-
-        # Slice ragged target_hidden on CPU for simplicity.
-        offsets: List[int] = [0]
-        for ln in draft_input.ctx_lens_cpu:
-            offsets.append(offsets[-1] + int(ln))
-
-        candidates: List[torch.Tensor] = []
-        for i, ctx_len in enumerate(draft_input.ctx_lens_cpu):
-            start_pos = int(batch.seq_lens_cpu[i].item())
-            cache = draft_input.draft_caches[i]
-            cache_len = int(cache.get_seq_length())
-
-            if cache_len + int(ctx_len) != start_pos:
-                raise RuntimeError(
-                    "DFLASH draft cache length mismatch. "
-                    f"{cache_len=} + {ctx_len=} != {start_pos=}. "
-                    "This can happen if prefix caching is enabled; start with `--disable-radix-cache` for now."
-                )
-
-            target_hidden = draft_input.target_hidden[offsets[i] : offsets[i + 1]]
-            target_hidden = target_hidden.unsqueeze(0)  # [1, ctx_len, feat]
-
-            block_ids = torch.full(
-                (1, self.block_size),
-                self._mask_token_id,
-                dtype=torch.long,
-                device=device,
-            )
-            block_ids[0, 0] = draft_input.verified_id[i].to(torch.long)
-
-            noise_embedding = F.embedding(block_ids, embed_weight)
-            position_ids = torch.arange(
-                cache_len,
-                start_pos + self.block_size,
-                dtype=torch.long,
-                device=device,
-            ).unsqueeze(0)
-
-            with torch.inference_mode():
-                hidden = self.draft_model(
-                    noise_embedding=noise_embedding,
-                    target_hidden=target_hidden,
-                    position_ids=position_ids,
-                    past_key_values=cache,
-                    use_cache=True,
-                )
-                cache.crop(start_pos)
-
-                draft_hidden = hidden[:, -self.block_size + 1 :, :]
-                draft_logits = F.linear(draft_hidden, head_weight)
-                draft_tokens = torch.argmax(draft_logits, dim=-1).to(torch.long)
-
-            candidate = torch.cat(
-                [block_ids[0, 0].view(1), draft_tokens.view(-1)],
-                dim=0,
-            )
-            candidates.append(candidate)
-
-        draft_tokens = torch.stack(candidates, dim=0)  # [bs, block_size]
-        positions = (
-            batch.seq_lens.to(torch.long).unsqueeze(1)
-            + torch.arange(self.block_size, device=device, dtype=torch.long)[None, :]
-        ).flatten()
-
-        verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.flatten(),
-            positions=positions,
-            draft_token_num=self.block_size,
-        )
-        verify_input.prepare_for_verify(batch, self.page_size)
-
-        batch.forward_mode = ForwardMode.TARGET_VERIFY if not batch.forward_mode.is_idle() else ForwardMode.IDLE
-        batch.spec_info = verify_input
-        batch.return_hidden_states = False
-
     def forward_batch_generation(
         self,
         batch: Union[ScheduleBatch, ModelWorkerBatch],
@@ -569,27 +404,14 @@ class DFlashWorker:
 
             ctx_lens_cpu = model_worker_batch.seq_lens_cpu.tolist()
 
-            if self.draft_impl == "native":
-                batch.spec_info = DFlashDraftInput(
-                    verified_id=next_token_ids.to(torch.int64),
-                    target_hidden=logits_output.hidden_states,
-                    ctx_lens_cpu=ctx_lens_cpu,
-                    draft_seq_lens_cpu=[0] * len(ctx_lens_cpu),
-                    draft_caches=None,
-                )
-                for req in batch.reqs:
-                    req.dflash_draft_seq_len = 0
-            else:
-                if self.draft_model is None:
-                    raise RuntimeError("DFLASH HF draft model is not initialized.")
-                draft_caches = [self.draft_model.make_cache() for _ in batch.reqs]
-                batch.spec_info = DFlashDraftInput(
-                    verified_id=next_token_ids.to(torch.int64),
-                    target_hidden=logits_output.hidden_states,
-                    ctx_lens_cpu=ctx_lens_cpu,
-                    draft_seq_lens_cpu=None,
-                    draft_caches=draft_caches,
-                )
+            batch.spec_info = DFlashDraftInput(
+                verified_id=next_token_ids.to(torch.int64),
+                target_hidden=logits_output.hidden_states,
+                ctx_lens_cpu=ctx_lens_cpu,
+                draft_seq_lens_cpu=[0] * len(ctx_lens_cpu),
+            )
+            for req in batch.reqs:
+                req.dflash_draft_seq_len = 0
 
             return GenerationBatchResult(
                 logits_output=logits_output,

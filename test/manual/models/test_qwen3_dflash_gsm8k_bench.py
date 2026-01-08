@@ -331,6 +331,7 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
         print(json.dumps(report, indent=2), flush=True)
 
     def test_qwen3_dflash_native_matches_hf(self):
+        """Legacy name: previously asserted HF-vs-native parity; now a native smoke/stability run."""
         if is_in_ci():
             self.skipTest("Manual benchmark; skipped in CI.")
         if not torch.cuda.is_available():
@@ -347,6 +348,7 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
             )
 
         attention_backend = os.getenv("SGLANG_DFLASH_ATTENTION_BACKEND", "flashinfer")
+        # Keep env var names for backwards compatibility with the previous parity test.
         max_new_tokens = int(os.getenv("SGLANG_DFLASH_PARITY_MAX_NEW_TOKENS", "256"))
         parallel = int(os.getenv("SGLANG_DFLASH_PARITY_PARALLEL", "1"))
         num_questions = int(os.getenv("SGLANG_DFLASH_PARITY_NUM_QUESTIONS", "10"))
@@ -400,50 +402,43 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
         if extra_server_args:
             common_server_args.extend(shlex.split(extra_server_args))
 
-        def _run_dflash(draft_impl: str, port: int) -> list[dict]:
-            base_url = f"http://127.0.0.1:{port}"
-            env = dict(os.environ)
-            env["SGLANG_DFLASH_DRAFT_IMPL"] = draft_impl
-            proc = popen_launch_server(
-                target_model,
+        port = find_available_port(21000)
+        base_url = f"http://127.0.0.1:{port}"
+        proc = popen_launch_server(
+            target_model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                *common_server_args,
+                "--speculative-algorithm",
+                "DFLASH",
+                "--speculative-draft-model-path",
+                draft_model_path,
+            ],
+        )
+        try:
+            _send_generate(base_url, "Hello", max_new_tokens=8)  # warmup
+            _, outputs = _run_generate_batch(
                 base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    *common_server_args,
-                    "--speculative-algorithm",
-                    "DFLASH",
-                    "--speculative-draft-model-path",
-                    draft_model_path,
-                ],
-                env=env,
+                prompts,
+                max_new_tokens=max_new_tokens,
+                parallel=parallel,
             )
+        finally:
+            kill_process_tree(proc.pid)
             try:
-                _send_generate(base_url, "Hello", max_new_tokens=8)  # warmup
-                _, outputs = _run_generate_batch(
-                    base_url,
-                    prompts,
-                    max_new_tokens=max_new_tokens,
-                    parallel=parallel,
-                )
-                return outputs
-            finally:
-                kill_process_tree(proc.pid)
-                try:
-                    proc.wait(timeout=30)
-                except Exception:
-                    pass
+                proc.wait(timeout=30)
+            except Exception:
+                pass
 
-        hf_outputs = _run_dflash("hf", find_available_port(21000))
-        native_outputs = _run_dflash("native", find_available_port(22000))
-
-        for i, (hf_out, native_out) in enumerate(
-            zip(hf_outputs, native_outputs, strict=True)
-        ):
-            if hf_out.get("output_ids") != native_out.get("output_ids"):
-                raise AssertionError(
-                    "HF and native DFLASH outputs diverged at index "
-                    f"{i}.\nhf={hf_out.get('output_ids')}\nnative={native_out.get('output_ids')}"
-                )
+        self.assertEqual(len(outputs), len(prompts))
+        spec_verify_cts: list[int] = []
+        for out in outputs:
+            meta = out.get("meta_info", {})
+            if "spec_verify_ct" in meta:
+                spec_verify_cts.append(int(meta["spec_verify_ct"]))
+        self.assertTrue(spec_verify_cts, "Missing spec_verify_ct in DFLASH responses.")
+        self.assertGreater(sum(spec_verify_cts), 0, "DFLASH did not run verify steps.")
 
 
 if __name__ == "__main__":
