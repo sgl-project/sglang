@@ -131,3 +131,21 @@ DEFAULT_QWEN_FUNCTION_CALLING_MODEL_PATH = MODEL_SPECS["qwen-7b"]["model"]
 DEFAULT_MISTRAL_FUNCTION_CALLING_MODEL_PATH = MODEL_SPECS["mistral-7b"]["model"]
 DEFAULT_GPT_OSS_MODEL_PATH = MODEL_SPECS["gpt-oss"]["model"]
 DEFAULT_EMBEDDING_MODEL_PATH = MODEL_SPECS["embedding"]["model"]
+
+
+# =============================================================================
+# Third-party model configurations (cloud APIs)
+# =============================================================================
+
+THIRD_PARTY_MODELS: dict[str, dict] = {
+    "openai": {
+        "description": "OpenAI API",
+        "model": "gpt-5-nano",
+        "api_key_env": "OPENAI_API_KEY",
+    },
+    "xai": {
+        "description": "xAI API",
+        "model": "grok-4-fast",
+        "api_key_env": "XAI_API_KEY",
+    },
+}
