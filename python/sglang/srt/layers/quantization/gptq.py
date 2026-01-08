@@ -893,6 +893,21 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
             )
             return
 
+        group_size = self.quant_config.group_size
+        scale_expanded = layer.w13_scales.data.repeat_interleave(group_size, dim=1)
+
+        neg_mask = scale_expanded < 0
+
+        if neg_mask.any():
+            neg_mask = neg_mask.transpose(-1, -2)
+            neg_mask = neg_mask.contiguous().reshape(w13_qweight_tmp.shape)
+            w13_qweight_tmp[neg_mask] = -w13_qweight_tmp[neg_mask]
+
+            if w13_qweight_tmp.max() > 7:
+                w13_qweight_tmp.clamp_(max=7)
+
+            layer.w13_scales.data.abs_()
+
         layer.w13_qweight = torch.nn.Parameter(
             torch_npu.npu_convert_weight_to_int4pack(
                 w13_qweight_tmp.reshape(
@@ -927,6 +942,21 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             return
+
+        group_size = self.quant_config.group_size
+        scale_expanded = layer.w2_scales.data.repeat_interleave(group_size, dim=1)
+
+        neg_mask = scale_expanded < 0
+
+        if neg_mask.any():
+            neg_mask = neg_mask.transpose(-1, -2)
+            neg_mask = neg_mask.contiguous().reshape(w2_qweight_tmp.shape)
+            w2_qweight_tmp[neg_mask] = -w2_qweight_tmp[neg_mask]
+
+            if w2_qweight_tmp.max() > 7:
+                w2_qweight_tmp.clamp_(max=7)
+
+            layer.w2_scales.data.abs_()
 
         layer.w2_qweight = torch.nn.Parameter(
             torch_npu.npu_convert_weight_to_int4pack(
