@@ -2,6 +2,8 @@
 
 #include <sgl_kernel/utils.h>
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
@@ -74,11 +76,6 @@ __always_inline __device__ auto offset(const T* ptr, U... offset) -> const void*
 
 }  // namespace pointer
 
-template <typename T, std::size_t N>
-struct device_vec {
-  T data[N];
-};
-
 template <bool kUsePDL>
 __forceinline__ __device__ void PDLWaitPrimary() {
 #ifndef USE_ROCM
@@ -100,6 +97,50 @@ __forceinline__ __device__ void PDLTriggerSecondary() {
 }  // namespace device
 
 namespace host {
+
+// DType
+template <typename DType, int Pack>
+struct PackedDType {
+  static_assert(dependent_false_v<DType>, "Unsupported dtype for Packed");
+};
+
+template <>
+struct PackedDType<float, 2> {
+  using type = float2;
+};
+
+template <>
+struct PackedDType<float, 4> {
+  using type = float4;
+};
+
+template <>
+struct PackedDType<__half, 2> {
+  using type = __half2;
+};
+
+struct alignas(8) half4 {
+  __half x, y, z, w;
+};
+
+template <>
+struct PackedDType<__half, 4> {
+  using type = half4;
+};
+
+template <>
+struct PackedDType<nv_bfloat16, 2> {
+  using type = nv_bfloat162;
+};
+
+struct alignas(8) bf16_4 {
+  nv_bfloat16 x, y, z, w;
+};
+
+template <>
+struct PackedDType<nv_bfloat16, 4> {
+  using type = bf16_4;
+};
 
 inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
   if (error != ::cudaSuccess) {

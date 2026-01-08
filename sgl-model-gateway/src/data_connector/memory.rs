@@ -288,7 +288,8 @@ impl MemoryResponseStorage {
     }
 
     /// Get statistics about the store
-    pub fn stats(&self) -> MemoryStoreStats {
+    #[allow(dead_code)]
+    pub(super) fn stats(&self) -> MemoryStoreStats {
         let store = self.store.read();
         MemoryStoreStats {
             response_count: store.responses.len(),
@@ -459,7 +460,8 @@ impl ResponseStorage for MemoryResponseStorage {
 
 /// Statistics for the memory store
 #[derive(Debug, Clone)]
-pub struct MemoryStoreStats {
+#[allow(dead_code)]
+pub(super) struct MemoryStoreStats {
     pub response_count: usize,
     pub identifier_count: usize,
 }

@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
+    LoRAPipeline,
     Req,
     build_pipeline,
 )
@@ -27,6 +28,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     globally_suppress_loggers,
@@ -87,6 +89,24 @@ class GPUWorker:
 
         self.pipeline = build_pipeline(self.server_args)
 
+        # apply layerwise offload after lora is applied while building LoRAPipeline
+        # otherwise empty offloaded weights could fail lora converting
+        if self.server_args.dit_layerwise_offload:
+            # enable layerwise offload if possible
+            for dit in filter(
+                None,
+                [
+                    self.pipeline.get_module("transformer"),
+                    self.pipeline.get_module("transformer_2"),
+                ],
+            ):
+                if isinstance(dit, OffloadableDiTMixin):
+                    dit.configure_layerwise_offload(self.server_args)
+                else:
+                    logger.info(
+                        f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
+                    )
+
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
         )
@@ -96,7 +116,6 @@ class GPUWorker:
         Execute a forward pass.
         """
         assert self.pipeline is not None
-        # TODO: dealing with first req for now
         req = batch[0]
         output_batch = None
         try:
@@ -105,7 +124,18 @@ class GPUWorker:
 
             start_time = time.monotonic()
 
-            output_batch = self.pipeline.forward(req, self.server_args)
+            result = self.pipeline.forward(req, self.server_args)
+
+            if isinstance(result, Req):
+                output_batch = OutputBatch(
+                    output=result.output,
+                    timings=result.timings,
+                    trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
+                    trajectory_latents=getattr(result, "trajectory_latents", None),
+                    trajectory_decoded=getattr(result, "trajectory_decoded", None),
+                )
+            else:
+                output_batch = result
 
             if self.rank == 0:
                 peak_memory_bytes = torch.cuda.max_memory_allocated()
@@ -135,10 +165,6 @@ class GPUWorker:
                 f"Error executing request {req.request_id}: {e}", exc_info=True
             )
             if output_batch is None:
-                from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-                    OutputBatch,
-                )
-
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
         finally:
@@ -184,7 +210,7 @@ class GPUWorker:
         lora_path: str | None = None,
         target: str = "all",
         strength: float = 1.0,
-    ) -> None:
+    ) -> OutputBatch:
         """
         Set the LoRA adapter for the pipeline.
 
@@ -194,10 +220,14 @@ class GPUWorker:
             target: Which transformer(s) to apply the LoRA to.
             strength: LoRA strength for merge, default 1.0.
         """
-        assert self.pipeline is not None
+        if not isinstance(self.pipeline, LoRAPipeline):
+            return OutputBatch(error="Lora is not enabled")
         self.pipeline.set_lora(lora_nickname, lora_path, target, strength)
+        return OutputBatch()
 
-    def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
+    def merge_lora_weights(
+        self, target: str = "all", strength: float = 1.0
+    ) -> OutputBatch:
         """
         Merge LoRA weights.
 
@@ -205,18 +235,35 @@ class GPUWorker:
             target: Which transformer(s) to merge.
             strength: LoRA strength for merge, default 1.0.
         """
-        assert self.pipeline is not None
+        if not isinstance(self.pipeline, LoRAPipeline):
+            return OutputBatch(error="Lora is not enabled")
         self.pipeline.merge_lora_weights(target, strength)
+        return OutputBatch()
 
-    def unmerge_lora_weights(self, target: str = "all") -> None:
+    def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
         """
         Unmerge LoRA weights.
 
         Args:
             target: Which transformer(s) to unmerge.
         """
-        assert self.pipeline is not None
+        if not isinstance(self.pipeline, LoRAPipeline):
+            return OutputBatch(error="Lora is not enabled")
         self.pipeline.unmerge_lora_weights(target)
+        return OutputBatch()
+
+    def list_loras(self) -> OutputBatch:
+        """
+        List loaded LoRA adapters and current application status per module.
+        """
+        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+            LoRAPipeline,
+        )
+
+        if not isinstance(self.pipeline, LoRAPipeline):
+            return OutputBatch(error="Lora is not enabled")
+        status = self.pipeline.get_lora_status()
+        return OutputBatch(output=status)
 
 
 def run_scheduler_process(

@@ -219,8 +219,7 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
-                if self.require_mlp_sync:
-                    batch = self.prepare_mlp_sync_batch(batch)
+                batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -564,8 +563,8 @@ class SchedulerPPMixin:
                     sampling_params=sampling_params,
                 )
                 req.fill_ids = req.origin_input_ids
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
                 req.logprob_start_len = -1
+                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(
@@ -1343,7 +1342,8 @@ class ChunkSizePredictor:
         smoothed_chunk_size = base_chunk_size + smooth_coeff * (
             calculated_chunk_size_float - base_chunk_size
         )
-        calculated_chunk_size = int(smoothed_chunk_size)
+        # Make sure the dynamic chunk size is at least 1/4 of the base chunk size
+        calculated_chunk_size = max(int(smoothed_chunk_size), base_chunk_size // 4)
 
         # Align to page_size (minimum alignment size is 64)
         alignment_size = max(page_size, 64)

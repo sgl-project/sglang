@@ -10,6 +10,7 @@ This module contains implementations of image encoding stages for diffusion pipe
 import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
@@ -279,9 +280,12 @@ class ImageVAEEncodingStage(PipelineStage):
                 #     self.vae.enable_parallel()
                 if not vae_autocast_enabled:
                     video_condition = video_condition.to(vae_dtype)
-                encoder_output: DiagonalGaussianDistribution = self.vae.encode(
+                latent_dist: DiagonalGaussianDistribution = self.vae.encode(
                     video_condition
                 )
+                # for auto_encoder from diffusers
+                if isinstance(latent_dist, AutoencoderKLOutput):
+                    latent_dist = latent_dist.latent_dist
 
             generator = batch.generator
             if generator is None:
@@ -290,7 +294,7 @@ class ImageVAEEncodingStage(PipelineStage):
             sample_mode = server_args.pipeline_config.vae_config.encode_sample_mode()
 
             latent_condition = self.retrieve_latents(
-                encoder_output, generator, sample_mode=sample_mode
+                latent_dist, generator, sample_mode=sample_mode
             )
             latent_condition = server_args.pipeline_config.postprocess_vae_encode(
                 latent_condition, self.vae

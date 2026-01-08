@@ -39,7 +39,21 @@ class QwenImageArchConfig(DiTArchConfig):
 
 
 @dataclass
+class QwenImageEditPlus_2511_ArchConfig(DiTArchConfig):
+    zero_cond_t: bool = True
+
+
+@dataclass
 class QwenImageDitConfig(DiTConfig):
     arch_config: DiTArchConfig = field(default_factory=QwenImageArchConfig)
 
     prefix: str = "qwenimage"
+
+
+@dataclass
+class QwenImageEditPlus_2511_DitConfig(DiTConfig):
+    arch_config: DiTArchConfig = field(
+        default_factory=QwenImageEditPlus_2511_ArchConfig
+    )
+
+    prefix: str = "qwenimageedit"

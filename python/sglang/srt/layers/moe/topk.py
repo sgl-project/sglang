@@ -35,7 +35,6 @@ try:
 except ImportError:
     pass
 
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -49,6 +48,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -191,7 +191,7 @@ class BypassedTopKOutput(NamedTuple):
 # -------------------------------- TopK ---------------------------------------
 
 
-class TopK(CustomOp):
+class TopK(MultiPlatformOp):
     """
     Parameters:
     --top_k: The all number of top experts selected per token, including the fused shared expert(s).

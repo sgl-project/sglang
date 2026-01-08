@@ -1,7 +1,7 @@
 use std::{sync::Arc, thread};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use sgl_model_gateway::{
+use smg::{
     core::{BasicWorkerBuilder, Worker, WorkerType},
     policies::{LoadBalancingPolicy, ManualPolicy, SelectWorkerInfo},
 };

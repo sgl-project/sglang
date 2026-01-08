@@ -12,7 +12,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
-    Timer,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -66,28 +65,27 @@ class ParallelExecutor(PipelineExecutor):
 
         # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
         for stage in stages:
-            with Timer(stage.__class__.__name__):
-                paradigm = stage.parallelism_type
+            paradigm = stage.parallelism_type
 
-                if paradigm == StageParallelismType.MAIN_RANK_ONLY:
-                    if rank == 0:
-                        # Only main rank executes, others just wait
-                        batch = stage(batch, server_args)
-                    torch.distributed.barrier()
-
-                elif paradigm == StageParallelismType.CFG_PARALLEL:
-                    obj_list = [batch] if rank == 0 else []
-                    broadcasted_list = broadcast_pyobj(
-                        obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
-                    )
-                    if rank != 0:
-                        batch = broadcasted_list[0]
+            if paradigm == StageParallelismType.MAIN_RANK_ONLY:
+                if rank == 0:
+                    # Only main rank executes, others just wait
                     batch = stage(batch, server_args)
+                torch.distributed.barrier()
 
-                    torch.distributed.barrier()
+            elif paradigm == StageParallelismType.CFG_PARALLEL:
+                obj_list = [batch] if rank == 0 else []
+                broadcasted_list = broadcast_pyobj(
+                    obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
+                )
+                if rank != 0:
+                    batch = broadcasted_list[0]
+                batch = stage(batch, server_args)
 
-                elif paradigm == StageParallelismType.REPLICATED:
-                    batch = stage(batch, server_args)
+                torch.distributed.barrier()
+
+            elif paradigm == StageParallelismType.REPLICATED:
+                batch = stage(batch, server_args)
         return batch
 
     def execute(

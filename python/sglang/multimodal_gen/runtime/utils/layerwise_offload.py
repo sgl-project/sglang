@@ -1,8 +1,13 @@
 import re
-from contextlib import contextmanager
-from typing import Dict, Set
+from itertools import chain
+from typing import Any, Dict, List, Set, Tuple
 
 import torch
+
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 # Adapted from skywork AI Infra diffusion optimize
@@ -24,36 +29,39 @@ class LayerwiseOffloadManager:
         self,
         model: torch.nn.Module,
         *,
-        module_list_attr: str,
+        layers_attr_str: str,
         num_layers: int,
         enabled: bool,
         pin_cpu_memory: bool = True,
-        auto_initialize: bool = False,
     ) -> None:
         self.model = model
-        self.module_list_attr = module_list_attr
+        self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
 
         self.enabled = bool(enabled and torch.cuda.is_available())
-        self.device = (
-            torch.device("cuda", torch.cuda.current_device()) if self.enabled else None
-        )
-        self.copy_stream = torch.cuda.Stream() if self.enabled else None
+        if not self.enabled:
+            return
+        self.device = torch.device("cuda", torch.cuda.current_device())
+        self.copy_stream = torch.cuda.Stream()
 
         self._layer_name_re = re.compile(
-            rf"(^|\.){re.escape(module_list_attr)}\.(\d+)(\.|$)"
+            rf"(^|\.){re.escape(layers_attr_str)}\.(\d+)(\.|$)"
         )
 
-        self._cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
-        self._cpu_dtypes: Dict[int, Dict[str, torch.dtype]] = {}
-        self._gpu_layers: Dict[int, Set[str]] = {}
+        # layer_idx -> {dtype: consolidated_pinned_cpu_tensor}
+        # stores the consolidated weight from a same layer, of same dtype
+        self._consolidated_cpu_weights: Dict[int, Dict[torch.dtype, torch.Tensor]] = {}
+        # layer_idx -> {name: {dtype, offset, numel, shape}}
+        # stores the offset and numel of each weight from a same layer, of same dtype
+        self._weight_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        # layer indices that are already in gpu
+        self._gpu_layers: Set[int] = set()
 
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
 
-        if auto_initialize:
-            self.initialize()
+        self._initialize()
 
     def _match_layer_idx(self, name: str) -> int | None:
         m = self._layer_name_re.search(name)
@@ -64,43 +72,76 @@ class LayerwiseOffloadManager:
         except Exception:
             return None
 
-    def _offload_tensor(self, name: str, tensor: torch.Tensor, layer_idx: int) -> None:
-        if layer_idx not in self._cpu_weights:
-            self._cpu_weights[layer_idx] = {}
-            self._cpu_dtypes[layer_idx] = {}
-
-        cpu_weight = tensor.detach().to("cpu")
-        if self.pin_cpu_memory:
-            cpu_weight = cpu_weight.pin_memory()
-        self._cpu_weights[layer_idx][name] = cpu_weight
-        self._cpu_dtypes[layer_idx][name] = tensor.dtype
-
-        if self.device is not None:
-            tensor.data = torch.empty((1,), device=self.device, dtype=tensor.dtype)
-
     @torch.compiler.disable
-    def initialize(self) -> None:
+    def _initialize(self) -> None:
         if not self.enabled:
             return
 
         self._named_parameters = dict(self.model.named_parameters())
         self._named_buffers = dict(self.model.named_buffers())
 
-        for name, param in self._named_parameters.items():
+        # 1. collect and group tensors by layer and dtype
+        layer_groups: Dict[int, Dict[torch.dtype, List[Tuple[str, torch.Tensor]]]] = {}
+        all_tensors = chain(self._named_parameters.items(), self._named_buffers.items())
+        for name, tensor in all_tensors:
             layer_idx = self._match_layer_idx(name)
             if layer_idx is None or layer_idx >= self.num_layers:
                 continue
-            self._offload_tensor(name, param, layer_idx)
+            layer_groups.setdefault(layer_idx, {}).setdefault(tensor.dtype, []).append(
+                (name, tensor)
+            )
 
-        for name, buf in self._named_buffers.items():
-            layer_idx = self._match_layer_idx(name)
-            if layer_idx is None or layer_idx >= self.num_layers:
-                continue
-            self._offload_tensor(name, buf, layer_idx)
+        # 2. concat and offload (in pinned memory)
+        for layer_idx, dtype_to_params in layer_groups.items():
+            self._consolidated_cpu_weights[layer_idx] = {}
+            self._weight_metadata[layer_idx] = {}
 
-        self.prefetch_layer(0, non_blocking=False)
-        if self.copy_stream is not None:
+            for dtype, weights in dtype_to_params.items():
+                total_numel = sum(t.numel() for _, t in weights)
+
+                # create concatenated CPU buffer (in pinned memory)
+                cpu_buffer = torch.empty(
+                    total_numel, dtype=dtype, pin_memory=self.pin_cpu_memory
+                )
+
+                # offload weights to the buffer
+                current_offset = 0
+                for name, weight in weights:
+                    numel = weight.numel()
+                    cpu_buffer[current_offset : current_offset + numel].copy_(
+                        weight.flatten()
+                    )
+                    self._weight_metadata[layer_idx][name] = {
+                        "dtype": dtype,
+                        "offset": current_offset,
+                        "numel": numel,
+                        "shape": weight.shape,
+                    }
+
+                    weight.data = torch.empty((1,), device=self.device, dtype=dtype)
+
+                    current_offset += numel
+
+                self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
+
+        # prefetch the first layer for warm-up
+        self.prepare_for_next_denoise(non_blocking=False)
+
+        self.register_forward_hooks()
+        logger.info("LayerwiseOffloadManager initialized")
+
+    def prepare_for_next_denoise(self, non_blocking=True):
+        self.prefetch_layer(0, non_blocking=non_blocking)
+        if not non_blocking and self.copy_stream is not None:
             torch.cuda.current_stream().wait_stream(self.copy_stream)
+
+    def get_target_with_name(self, name: str) -> torch.Tensor:
+        """get the target model weight/buffer to be replaced"""
+        if name in self._named_parameters:
+            target = self._named_parameters[name]
+        else:
+            target = self._named_buffers[name]
+        return target
 
     @torch.compiler.disable
     def prefetch_layer(self, layer_idx: int, non_blocking: bool = True) -> None:
@@ -110,54 +151,32 @@ class LayerwiseOffloadManager:
             return
         if layer_idx in self._gpu_layers:
             return
-        if layer_idx not in self._cpu_weights:
+        if layer_idx not in self._consolidated_cpu_weights:
             return
-
         self.copy_stream.wait_stream(torch.cuda.current_stream())
 
-        param_names: Set[str] = set()
+        # create gpu buffer and load from CPU buffer
+        gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
+        with torch.cuda.stream(self.copy_stream):
+            for dtype, cpu_buffer in self._consolidated_cpu_weights[layer_idx].items():
+                gpu_buffer = torch.empty(
+                    cpu_buffer.shape, dtype=dtype, device=self.device
+                )
+                gpu_buffer.copy_(cpu_buffer, non_blocking=non_blocking)
+                gpu_buffers[dtype] = gpu_buffer
 
-        for name, cpu_weight in self._cpu_weights[layer_idx].items():
-            if name in self._named_parameters:
-                target = self._named_parameters[name]
-            else:
-                target = self._named_buffers[name]
+        # restore model's weights by their metadata using gpu buffer
+        for name, meta in self._weight_metadata[layer_idx].items():
+            dtype = meta["dtype"]
+            gpu_buffer = gpu_buffers[dtype]
 
-            gpu_weight = torch.empty(
-                cpu_weight.shape,
-                dtype=self._cpu_dtypes[layer_idx][name],
-                device=self.device,
-            )
-            with torch.cuda.stream(self.copy_stream):
-                gpu_weight.copy_(cpu_weight, non_blocking=non_blocking)
-            target.data = gpu_weight
-            param_names.add(name)
+            # map the parameter's data to the correct slice of the GPU buffer
+            target = self.get_target_with_name(name)
+            target.data = gpu_buffer[
+                meta["offset"] : meta["offset"] + meta["numel"]
+            ].view(meta["shape"])
 
-        self._gpu_layers[layer_idx] = param_names
-
-    @contextmanager
-    def layer_scope(
-        self,
-        *,
-        prefetch_layer_idx: int | None,
-        release_layer_idx: int | None,
-        non_blocking: bool = True,
-    ):
-        """A helper context manager to improve readability at call sites.
-
-        It optionally prefetches ``prefetch_layer_idx`` before entering the
-        context, and waits for the copy stream then releases
-        ``release_layer_idx`` on exit.
-        """
-        if self.enabled and prefetch_layer_idx is not None:
-            self.prefetch_layer(prefetch_layer_idx, non_blocking=non_blocking)
-        try:
-            yield
-        finally:
-            if self.enabled and self.copy_stream is not None:
-                torch.cuda.current_stream().wait_stream(self.copy_stream)
-            if self.enabled and release_layer_idx is not None:
-                self.release_layer(release_layer_idx)
+        self._gpu_layers.add(layer_idx)
 
     @torch.compiler.disable
     def release_layer(self, layer_idx: int) -> None:
@@ -166,16 +185,14 @@ class LayerwiseOffloadManager:
         if layer_idx <= 0:
             return
 
-        param_names = self._gpu_layers.pop(layer_idx, None)
-        if not param_names:
+        if layer_idx not in self._gpu_layers:
             return
 
-        for name in param_names:
-            if name in self._named_parameters:
-                target = self._named_parameters[name]
-            else:
-                target = self._named_buffers[name]
-            target.data = torch.empty((1,), device=self.device, dtype=target.dtype)
+        for name, meta in self._weight_metadata.get(layer_idx, {}).items():
+            target = self.get_target_with_name(name)
+            target.data = torch.empty((1,), device=self.device, dtype=meta["dtype"])
+
+        self._gpu_layers.discard(layer_idx)
 
     @torch.compiler.disable
     def release_all(self) -> None:
@@ -184,14 +201,68 @@ class LayerwiseOffloadManager:
         if self.copy_stream is not None:
             torch.cuda.current_stream().wait_stream(self.copy_stream)
 
-        layer_indices = list(self._gpu_layers.keys())
-        for layer_idx in layer_indices:
-            param_names = self._gpu_layers.pop(layer_idx, None)
-            if not param_names:
+        for layer_idx in list(self._gpu_layers):
+            self.release_layer(layer_idx)
+
+    def register_forward_hooks(self) -> None:
+        if not self.enabled:
+            return
+
+        layers = getattr(self.model, self.layers_attr_str)
+
+        def make_pre_hook(i):
+            def hook(module, input):
+                self.prefetch_layer(i + 1, non_blocking=True)
+
+            return hook
+
+        def make_post_hook(i):
+            def hook(module, input, output):
+                if self.copy_stream is not None:
+                    torch.cuda.current_stream().wait_stream(self.copy_stream)
+                self.release_layer(i)
+
+            return hook
+
+        # register prefetch & release hooks for each layer
+        for i, layer in enumerate(layers):
+            layer.register_forward_pre_hook(make_pre_hook(i))
+            layer.register_forward_hook(make_post_hook(i))
+
+
+class OffloadableDiTMixin:
+    """
+    A mixin that registers forward hooks for a DiT to enable layerwise offload
+    """
+
+    # the list of names of a DiT's layers/blocks
+    layer_names: List[str]
+    layerwise_offload_managers: list[LayerwiseOffloadManager] | None = None
+
+    def configure_layerwise_offload(self, server_args: ServerArgs):
+        self.layerwise_offload_managers = []
+        for layer_name in self.layer_names:
+            # a manager per layer-list
+            module_list = getattr(self, layer_name, None)
+            if module_list is None or not isinstance(module_list, torch.nn.ModuleList):
                 continue
-            for name in param_names:
-                if name in self._named_parameters:
-                    target = self._named_parameters[name]
-                else:
-                    target = self._named_buffers[name]
-                target.data = torch.empty((1,), device=self.device, dtype=target.dtype)
+
+            num_layers = len(module_list)
+            manager = LayerwiseOffloadManager(
+                model=self,
+                layers_attr_str=layer_name,
+                num_layers=num_layers,
+                enabled=True,
+                pin_cpu_memory=server_args.pin_cpu_memory,
+            )
+            self.layerwise_offload_managers.append(manager)
+
+        logger.info(
+            f"Enabled layerwise offload for {self.__class__.__name__} on modules: {self.layer_names}"
+        )
+
+    def prepare_for_next_denoise(self):
+        if self.layerwise_offload_managers is None:
+            return
+        for manager in self.layerwise_offload_managers:
+            manager.prepare_for_next_denoise(non_blocking=True)

@@ -1,5 +1,5 @@
 import unittest
-from typing import Optional
+from typing import Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -89,11 +89,49 @@ class MockIndexerMetadata(BaseIndexerMetadata):
             result.extend(range(1, seq_len + 1))
         return torch.tensor(result, dtype=torch.int32, device=self.device)
 
+    def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return: (tokens, ), (tokens, ) int32, k_start and k_end in kv cache for each token.
+        For extend mode, token i attends to tokens [0, i].
+        """
+        ks_list = []
+        ke_list = []
+        k_offset = 0
+        for seq_len in self.seq_lens:
+            # For a sequence being extended from position 0 to seq_len
+            # Token i attends to [k_offset, k_offset + i + 1)
+            ks = torch.full((seq_len,), k_offset, dtype=torch.int32, device=self.device)
+            ke = torch.arange(
+                k_offset + 1,
+                k_offset + seq_len + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            ks_list.append(ks)
+            ke_list.append(ke)
+            k_offset += seq_len
+        return torch.cat(ks_list, dim=0), torch.cat(ke_list, dim=0)
+
+    def get_indexer_seq_len_cpu(self) -> torch.Tensor:
+        """Return: seq lens for each batch."""
+        return torch.tensor(self.seq_lens, dtype=torch.int32, device="cpu")
+
+    def get_token_to_batch_idx(self) -> torch.Tensor:
+        """Return: batch idx for each token."""
+        result = []
+        for batch_idx, seq_len in enumerate(self.seq_lens):
+            result.extend([batch_idx] * seq_len)
+        return torch.tensor(result, dtype=torch.int32, device=self.device)
+
     def topk_transform(
         self,
         logits: torch.Tensor,
         topk: int,
         ks: Optional[torch.Tensor] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        ke_offset: Optional[torch.Tensor] = None,
+        batch_idx_list: Optional[torch.Tensor] = None,
+        topk_indices_offset_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform topk selection on the logits.

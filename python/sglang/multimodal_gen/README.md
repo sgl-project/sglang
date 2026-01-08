@@ -64,6 +64,19 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --save-output
 ```
 
+### LoRA support
+
+Apply LoRA adapters via `--lora-path`:
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image-Edit-2511 \
+  --lora-path prithivMLmods/Qwen-Image-Edit-2511-Anime \
+  --prompt "Transform into anime." \
+  --image-path "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png" \
+  --save-output
+```
+
 For more usage examples (e.g. OpenAI compatible API, server mode), check [cli.md](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/cli.md).
 
 ## Contributing

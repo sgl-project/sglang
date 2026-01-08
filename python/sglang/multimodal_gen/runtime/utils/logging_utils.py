@@ -466,7 +466,10 @@ def log_generation_timer(
         yield timer
         timer.end_time = time.perf_counter()
         timer.duration = timer.end_time - timer.start_time
-        logger.info("Pixel data generated successfully in %.2f seconds", timer.duration)
+        logger.info(
+            f"Pixel data generated successfully in {GREEN}%.2f{RESET} seconds",
+            timer.duration,
+        )
     except Exception as e:
         if request_idx is not None:
             logger.error(
@@ -487,7 +490,7 @@ def log_batch_completion(
     logger: logging.Logger, num_outputs: int, total_time: float
 ) -> None:
     logger.info(
-        "Completed batch processing. Generated %d outputs in %.2f seconds.",
+        f"Completed batch processing. Generated %d outputs in {GREEN}%.2f{RESET} seconds",
         num_outputs,
         total_time,
     )

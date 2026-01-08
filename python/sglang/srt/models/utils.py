@@ -22,11 +22,12 @@ import numpy as np
 import torch
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
-from sglang.jit_kernel.utils import register_jit_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.layernorm import RMSNorm
@@ -223,7 +224,6 @@ def apply_qk_norm(
     Returns:
         Tuple of normalized query and key tensors
     """
-    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
@@ -233,7 +233,7 @@ def apply_qk_norm(
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-        and can_use_fused_inplace_qknorm(head_dim)
+        and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
             q=q.view(batch_size, -1, head_dim),
@@ -265,4 +265,4 @@ def apply_qk_norm(
 
 
 # Register the inplace op
-fused_inplace_qknorm = register_jit_op(fused_inplace_qknorm, out_args=["q", "k"])
+fused_inplace_qknorm = register_custom_op(fused_inplace_qknorm, mutates_args=["q", "k"])

@@ -58,6 +58,7 @@ Its core features include:
    advanced_features/pd_multiplexing.md
    advanced_features/vlm_query.ipynb
    advanced_features/dp_for_multi_modal_encoder.md
+   advanced_features/cuda_graph_for_multi_modal_encoder.md
    advanced_features/sgl_model_gateway.md
    advanced_features/deterministic_inference.md
    advanced_features/observability.md
