@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Model File Verifier - Verify model file integrity using SHA256 checksums.
 
