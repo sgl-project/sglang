@@ -31,15 +31,17 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Multi-model HTTP serving and inference gateway routing with model-specific policies.
 - Prefill/decode disaggregation, including bootstrap port handling and cache-aware merging.
 - gRPC routing with fully Rust tokenizer loading, reasoning parser selection, and tool parser integration for OpenAI-compatible endpoints—supporting streaming and non-streaming modes across DeepSeek, Llama, Kimi K2, Qwen, GPT-OSS, Mistral, Step-3, GLM4, GLM4.7 and other reasoning-capable models.
-- OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/conversations`, `/v1/embeddings`, and `/v1/rerank` endpoints.
+- OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/conversations`, `/v1/embeddings`, `/v1/rerank`, `/v1/classify` endpoints.
+- **Tokenization APIs**: HTTP endpoints for tokenize (`/v1/tokenize`) and detokenize (`/v1/detokenize`) with batch support; tokenizer management APIs for dynamic registration.
+- **Parser endpoints**: Reasoning parser (`/parse/reasoning`) and function call parser (`/parse/function_call`) for separating reasoning content and extracting tool calls.
 - Native MCP client integration supporting all MCP transport protocols (STDIO, HTTP, SSE, and Streamable) for tool execution loops.
-- Pluggable history connectors: in-memory, disabled, or Oracle ATP (with pooling and credential support).
+- Pluggable history connectors: in-memory, disabled, Oracle ATP, or PostgreSQL (with pooling and credential support).
 - Reliability controls: retry with jitter, worker-scoped circuit breakers, token bucket limiter with optional queue, and cache flush APIs.
 - Service discovery for regular and PD workloads with independent selectors.
-- Prometheus metrics and structured tracing for every stage of routing.
+- **Comprehensive observability**: 40+ Prometheus metrics across HTTP, router, worker, circuit breaker, retry, discovery, MCP, and database layers; OpenTelemetry tracing with OTLP export; structured logging with request ID propagation.
 
 ## Documentation
-- **User Guide**: [docs.sglang.io/advanced_features/router.html](https://docs.sglang.io/advanced_features/router.html)
+- **User Guide**: [docs.sglang.io/advanced_features/sgl_model_gateway.html](https://docs.sglang.io/advanced_features/sgl_model_gateway.html)
 - Additional guides, API references, and deployment patterns are continuously updated alongside SGLang releases.
 
 ## Installation
@@ -476,10 +478,161 @@ The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/
 | `POST /v1/responses`                                                             | Create background responses, returns response IDs.         |
 | `GET /v1/responses/{id}`                                                         | Retrieve stored responses.                                 |
 | Conversation endpoints (`/v1/conversations`, `/v1/conversations/{id}`, `/v1/conversations/{id}/items`) | Manage chat history.                                       |
-| `POST /v1/embeddings`                                                            | Forward embedding requests.                                |
+| `POST /v1/embeddings`                                                            | Forward embedding requests (HTTP and gRPC).                |
 | `POST /v1/rerank`, `POST /rerank`                                                | Ranking APIs.                                              |
+| `POST /v1/classify`                                                              | Text classification endpoint.                              |
+
+### Classification API
+
+The `/v1/classify` endpoint provides text classification using sequence classification models (e.g., `Qwen2ForSequenceClassification`, `BertForSequenceClassification`).
+
+**Request:**
+```bash
+curl http://localhost:30000/v1/classify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "jason9693/Qwen2.5-1.5B-apeach",
+    "input": "I love this product!"
+  }'
+```
+
+**Response:**
+```json
+{
+  "id": "classify-a1b2c3d4-5678-90ab-cdef-1234567890ab",
+  "object": "list",
+  "created": 1767034308,
+  "model": "jason9693/Qwen2.5-1.5B-apeach",
+  "data": [
+    {
+      "index": 0,
+      "label": "positive",
+      "probs": [0.12, 0.88],
+      "num_classes": 2
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 6,
+    "completion_tokens": 0,
+    "total_tokens": 6
+  }
+}
+```
+
+**Fields:**
+- `label`: Predicted class label (from model's `id2label` config, or `LABEL_N` fallback)
+- `probs`: Probability distribution over all classes (softmax of logits)
+- `num_classes`: Number of classification classes
+
+**Notes:**
+- Classification reuses the embedding backend—the scheduler returns logits which are converted to probabilities via softmax
+- Labels come from the model's HuggingFace config (`id2label` field); models without this mapping use generic labels (`LABEL_0`, `LABEL_1`, etc.)
+- Both HTTP and gRPC routers support classification
 
 Public health endpoints (`/liveness`, `/readiness`, `/health`, `/health_generate`) reflect registry state; readiness ensures PD workers are paired and IGW has at least one healthy route.
+
+### Tokenization Endpoints
+
+The gateway provides HTTP endpoints for text tokenization, designed to mirror the SGLang Python tokenization API with support for batch operations.
+
+| Endpoint                      | Method   | Description                                           |
+|-------------------------------|----------|-------------------------------------------------------|
+| `POST /v1/tokenize`           | `POST`   | Tokenize text to token IDs (single or batch).         |
+| `POST /v1/detokenize`         | `POST`   | Convert token IDs back to text (single or batch).     |
+| `POST /v1/tokenizers`         | `POST`   | Register a new tokenizer (async, returns job status). |
+| `GET /v1/tokenizers`          | `GET`    | List all registered tokenizers.                       |
+| `GET /v1/tokenizers/{id}`     | `GET`    | Get tokenizer info by UUID.                           |
+| `GET /v1/tokenizers/{id}/status` | `GET` | Check async tokenizer loading status.                 |
+| `DELETE /v1/tokenizers/{id}`  | `DELETE` | Remove a tokenizer from the registry.                 |
+
+**Tokenize Request:**
+```json
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "prompt": "Hello, world!"
+}
+```
+
+**Batch Tokenize Request:**
+```json
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "prompt": ["Hello", "World", "How are you?"]
+}
+```
+
+**Tokenize Response:**
+```json
+{
+  "tokens": [15339, 11, 1917, 0],
+  "count": 4,
+  "char_count": 13
+}
+```
+
+**Detokenize Request:**
+```json
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "tokens": [15339, 11, 1917, 0],
+  "skip_special_tokens": true
+}
+```
+
+**Add Tokenizer (async registration):**
+```bash
+# Register from HuggingFace
+curl -X POST http://localhost:30000/v1/tokenizers \
+  -H "Content-Type: application/json" \
+  -d '{"name": "llama3", "source": "meta-llama/Llama-3.1-8B-Instruct"}'
+
+# Check status
+curl http://localhost:30000/v1/tokenizers/{tokenizer_id}/status
+```
+
+### Parser Endpoints
+
+The gateway provides admin endpoints for parsing reasoning content and function calls from LLM outputs.
+
+| Endpoint                 | Method | Description                                            |
+|--------------------------|--------|--------------------------------------------------------|
+| `POST /parse/reasoning`  | `POST` | Separate reasoning (`<think>`) from normal text.       |
+| `POST /parse/function_call` | `POST` | Parse function/tool calls from text.                |
+
+**Separate Reasoning Request:**
+```json
+{
+  "text": "<think>Let me analyze this step by step...</think>The answer is 42.",
+  "parser": "deepseek-r1"
+}
+```
+
+**Response:**
+```json
+{
+  "normal_text": "The answer is 42.",
+  "reasoning_text": "Let me analyze this step by step..."
+}
+```
+
+**Supported Reasoning Parsers:**
+- `deepseek-r1` - DeepSeek-R1 (initial reasoning mode)
+- `qwen3` - Qwen-3 models
+- `qwen3-thinking` / `qwen-thinking` - Qwen thinking variant
+- `kimi` - Kimi K2 with Unicode tokens
+- `glm45` / `glm47` - GLM-4.5/4.6/4.7 models
+- `step3` - Step-3 models
+- `minimax` - MiniMax models
+
+**Function Call Parsing:**
+```json
+{
+  "text": "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"NYC\"}}",
+  "parser": "json"
+}
+```
+
+Supported tool parsers: `json`, `python`, `xml`.
 
 ## Conversations, Responses, and Data Connectors
 - `--history-backend memory` (default) stores responses and conversations in-process.
@@ -566,11 +719,67 @@ Only one of `--oracle-dsn` or `--oracle-tns-alias` should be supplied.
   Per-model overrides are available in PD mode (`--prefill-policy`, `--decode-policy`) and IGW mode via the worker registry.
 
 ## Observability
-- **Logging**: Structured tracing through `tracing` with optional file sink (`--log-dir`) and `--log-level` (`debug`, `info`, `warn`, `error`).
-- **Prometheus Metrics**: Enable with `--prometheus-host`/`--prometheus-port` (defaults to `0.0.0.0:29000`). Metrics cover request latency, retry behavior, circuit breaker states, worker health/load, queue depth, PD pipeline stats, tokenizer timings, and MCP activity.
-- **Request IDs**: Configurable headers via `--request-id-headers`; responses include `x-request-id`.
-- **CORS**: Set `--cors-allowed-origins` for browser access.
-- **Request Tracing via OpenTelemetry**: Enable with `--enable-trace` and set opentelemetry collector endpoint with `--otlp-traces-endpoint <ip>:<port>`.
+
+### Logging
+Structured tracing through `tracing` with optional file sink (`--log-dir`) and `--log-level` (`debug`, `info`, `warn`, `error`).
+
+### Prometheus Metrics
+Enable with `--prometheus-host`/`--prometheus-port` (defaults to `0.0.0.0:29000`).
+
+**Metric Categories (40+ metrics):**
+
+| Layer | Metric Prefix | Description |
+|-------|---------------|-------------|
+| HTTP | `smg_http_*` | Request counts, duration, active connections, rate limiting |
+| Router | `smg_router_*` | Requests by model/endpoint, latency, errors, upstream responses |
+| Inference | `smg_router_ttft/tpot/tokens_*` | Time to first token, time per output token, token counts (gRPC) |
+| Worker | `smg_worker_*` | Pool size, active connections, health checks, selection events |
+| Circuit Breaker | `smg_worker_cb_*` | State (closed/open/half-open), transitions, outcomes |
+| Retry | `smg_worker_retries_*` | Retry attempts, exhausted retries, backoff duration |
+| Discovery | `smg_discovery_*` | K8s registrations, sync duration, workers discovered |
+| MCP | `smg_mcp_*` | Tool calls, duration, active servers, iterations |
+| Database | `smg_db_*` | Operations, duration, connections, items stored |
+
+**Key Metrics:**
+- `smg_router_ttft_seconds` - Time to first token histogram (gRPC mode)
+- `smg_router_tpot_seconds` - Time per output token histogram (gRPC mode)
+- `smg_router_tokens_total` - Total input/output tokens by model
+- `smg_router_generation_duration_seconds` - End-to-end generation time
+- `smg_worker_cb_state` - Circuit breaker state gauge (0=closed, 1=open, 2=half-open)
+
+**Duration Buckets:**
+1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, 15s, 30s, 45s, 60s, 90s, 120s, 180s, 240s
+
+### OpenTelemetry Tracing
+Enable distributed tracing with OTLP export:
+
+```bash
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --enable-trace \
+  --otlp-traces-endpoint localhost:4317
+```
+
+**Features:**
+- OTLP/gRPC exporter (default port 4317)
+- W3C Trace Context propagation for HTTP and gRPC
+- Batch span processing (500ms delay, 64 span batch size)
+- Custom filtering to reduce noise (only exports relevant spans)
+- Trace context injection into upstream worker requests
+
+**Configuration:**
+- `--enable-trace` - Enable OpenTelemetry tracing
+- `--otlp-traces-endpoint <host:port>` - OTLP collector endpoint
+
+### Request ID Propagation
+Configure headers for request ID extraction:
+```bash
+--request-id-headers x-request-id x-trace-id x-correlation-id
+```
+Responses include `x-request-id` header for correlation.
+
+### CORS
+Set `--cors-allowed-origins` for browser access.
 
 ## Security
 
@@ -608,6 +817,177 @@ curl -X POST "http://localhost:8080/add_worker?url=http://worker3:8000&api_key=w
 - Router logs a warning when a worker is registered without a key while the router expects authentication.
 - When router and workers share the same key, still include the key when invoking dynamic registration APIs.
 
+### TLS (HTTPS) for Gateway Server
+
+Enable TLS to serve the gateway over HTTPS:
+
+```bash
+python3 -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --tls-cert-path /path/to/server.crt \
+  --tls-key-path /path/to/server.key
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `--tls-cert-path` | Path to server certificate (PEM format) |
+| `--tls-key-path` | Path to server private key (PEM format) |
+
+Both parameters must be provided together. The gateway uses rustls with the ring crypto provider for TLS termination. If TLS is not configured, the gateway falls back to plain HTTP.
+
+### mTLS for Worker Communication
+
+Enable mutual TLS (mTLS) for secure communication with workers in HTTP mode:
+
+```bash
+python3 -m sglang_router.launch_router \
+  --worker-urls https://worker1:8443 https://worker2:8443 \
+  --client-cert-path /path/to/client.crt \
+  --client-key-path /path/to/client.key \
+  --ca-cert-path /path/to/ca.crt
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `--client-cert-path` | Path to client certificate for mTLS (PEM format) |
+| `--client-key-path` | Path to client private key for mTLS (PEM format) |
+| `--ca-cert-path` | Path to CA certificate for verifying worker TLS (PEM format) |
+
+**Key Points:**
+- Client certificate and key must be provided together
+- Multiple CA certificates can be added with multiple `--ca-cert-path` flags
+- Uses rustls backend when TLS is configured
+- Single HTTP client is created for all workers (assumes single security domain)
+- TCP keepalive (30 seconds) is enabled for long-lived connections
+
+**Full TLS Example (Gateway HTTPS + Worker mTLS):**
+```bash
+python3 -m sglang_router.launch_router \
+  --worker-urls https://worker1:8443 https://worker2:8443 \
+  --tls-cert-path /etc/certs/server.crt \
+  --tls-key-path /etc/certs/server.key \
+  --client-cert-path /etc/certs/client.crt \
+  --client-key-path /etc/certs/client.key \
+  --ca-cert-path /etc/certs/ca.crt \
+  --api-key "secure-api-key"
+```
+
+### Control Plane Authentication
+
+The gateway supports role-based access control (RBAC) for control plane APIs (worker management, tokenizer registration, cache operations). Two authentication methods are available:
+
+#### Authentication Methods
+
+| Method | Use Case | Configuration |
+|--------|----------|---------------|
+| **API Keys** | Service accounts, internal services | `--control-plane-api-keys` |
+| **JWT/OIDC** | User authentication via Identity Provider | `--jwt-issuer`, `--jwt-audience` |
+
+Both methods can be used together. Requests are authenticated in order: API key → JWT token.
+
+#### Roles
+
+| Role | Access |
+|------|--------|
+| `admin` | Full access to all control plane APIs (workers, tokenizers, cache, etc.) |
+| `user` | Inference/data plane APIs only (chat completions, embeddings, etc.) |
+
+#### API Key Authentication
+
+Static API keys for service accounts and automation:
+
+```bash
+python3 -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --control-plane-api-keys 'svc1:CI Pipeline:admin:secret-key-123' \
+                           'svc2:Monitoring:user:readonly-key-456' \
+  --control-plane-audit-enabled
+```
+
+**Format:** `id:name:role:key`
+- `id` - Unique identifier for the key
+- `name` - Human-readable description
+- `role` - Either `admin` or `user`
+- `key` - The secret key (stored as SHA-256 hash internally)
+
+**Usage:**
+```bash
+curl -H "Authorization: Bearer secret-key-123" \
+  http://localhost:30000/workers
+```
+
+#### JWT/OIDC Authentication
+
+Authenticate users via an external Identity Provider (Azure AD, Okta, Auth0, Keycloak, etc.):
+
+```bash
+python3 -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --jwt-issuer "https://login.microsoftonline.com/{tenant-id}/v2.0" \
+  --jwt-audience "api://my-gateway-client-id" \
+  --jwt-jwks-uri "https://login.microsoftonline.com/{tenant-id}/discovery/v2.0/keys" \
+  --jwt-role-mapping 'Gateway.Admins=admin' 'Gateway.Users=user' \
+  --control-plane-audit-enabled
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `--jwt-issuer` | OIDC issuer URL. Used to validate the `iss` claim and discover JWKS endpoint via `.well-known/openid-configuration`. |
+| `--jwt-audience` | Expected audience (`aud` claim). Typically your application's client ID or API identifier (e.g., `api://client-id`). |
+| `--jwt-jwks-uri` | (Optional) Explicit JWKS URI. If omitted, discovered automatically from the issuer's OIDC configuration. |
+| `--jwt-role-mapping` | Map IDP group/role names to gateway roles. Format: `idp_role=gateway_role`. |
+
+**How it works:**
+1. User authenticates with Identity Provider (OAuth2/OIDC flow)
+2. IDP issues a JWT token
+3. User sends token to gateway: `Authorization: Bearer <jwt-token>`
+4. Gateway validates the JWT:
+   - Verifies signature against JWKS
+   - Checks `iss` matches `--jwt-issuer`
+   - Checks `aud` matches `--jwt-audience`
+   - Validates expiration and other standard claims
+   - Extracts role from `roles` claim (or `groups` as fallback)
+   - Maps IDP role to gateway role via `--jwt-role-mapping`
+
+**Example Azure AD Configuration:**
+```bash
+# Azure AD issues tokens with:
+#   iss: https://login.microsoftonline.com/{tenant}/v2.0
+#   aud: api://your-client-id (or the client ID itself)
+#   roles: ["Gateway.Admins"] or groups: ["group-id"]
+
+python3 -m sglang_router.launch_router \
+  --jwt-issuer "https://login.microsoftonline.com/your-tenant-id/v2.0" \
+  --jwt-audience "api://your-client-id" \
+  --jwt-role-mapping 'Gateway.Admins=admin' 'Gateway.Users=user'
+```
+
+#### Audit Logging
+
+Enable `--control-plane-audit-enabled` to log all control plane operations with:
+- Timestamp
+- Principal (API key ID or JWT subject)
+- Role
+- Action performed
+- Success/failure status
+
+#### Combined Authentication Example
+
+Use both API keys and JWT for different use cases:
+
+```bash
+python3 -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  # API keys for service accounts
+  --control-plane-api-keys 'ci:CI/CD Pipeline:admin:ci-secret' \
+  # JWT for human users via Azure AD
+  --jwt-issuer "https://login.microsoftonline.com/{tenant}/v2.0" \
+  --jwt-audience "api://gateway" \
+  --jwt-role-mapping 'Platform.Admins=admin' 'Platform.Users=user' \
+  # Enable audit logging
+  --control-plane-audit-enabled
+```
+
 ## Development & Testing
 ```bash
 # Build Rust components (debug mode, fast)
@@ -621,7 +1001,7 @@ cd bindings/python && maturin develop
 
 # Run Python tests
 cd ../..  # Back to sgl-model-gateway root
-pytest py_test/
+pytest e2e_test/
 ```
 For production builds, use `maturin build --release --out dist` from the `bindings/python/` directory to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
 
@@ -644,7 +1024,7 @@ cargo build --release
 # rustc-wrapper = "sccache"
 ```
 
-> **Note:** sccache and incremental compilation are mutually exclusive—sccache cannot cache incrementally compiled crates. The project defaults to incremental compilation for faster local iteration. Use sccache for clean/release builds where caching across builds matters more.
+> **Note:** sccache and incremental compilation are mutually exclusive—sccache cannot cache incrementally compiled crates. The project defaults to incremental compilation for faster local iteration. Use sccache for clean/release builds where caching across builds matters more. CI workflows use sccache with GitHub Actions cache backend for cross-job compilation caching.
 
 ---
 

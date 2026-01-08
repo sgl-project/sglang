@@ -12,6 +12,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
+from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -53,7 +54,6 @@ from sglang.srt.utils.common import (
     fast_topk,
     get_available_gpu_memory,
     is_cuda,
-    is_hip,
     is_npu,
     next_power_of_2,
 )
@@ -62,6 +62,7 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
@@ -257,8 +258,14 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
         # Capture extend
-        # FIXME cuda not support draft_extend capture
-        if self.draft_extend_attn_backend and _is_npu:
+        # TODO: support draft extend cuda graph for more attention backends
+        if self.draft_extend_attn_backend and (
+            _is_npu
+            or (
+                _is_cuda
+                and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
+            )
+        ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -488,7 +495,7 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
             num_tokens_per_batch=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_batch=1,
+            num_tokens_for_logprob_per_batch=self.speculative_num_steps + 1,
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
@@ -511,6 +518,9 @@ class EagleDraftWorker(BaseDraftWorker):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
+
+        if forward_batch.spec_info.accept_length is None:
+            forward_batch.spec_info.accept_length = batch_result.accept_lens
 
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (

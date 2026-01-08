@@ -67,7 +67,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     round_up,
 )
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.srt.utils.custom_op import register_custom_op
 
 if is_flashinfer_available():
     from flashinfer import fp4_quantize
@@ -814,6 +814,18 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
+        if (
+            "bias" in weight_name
+            and self.quant_config.quant_description["quant_method"] == "modelslim"
+        ):
+            self._load_per_channel_weight_scale(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=tp_rank,
+            )
+
     def weight_loader_fused(
         self,
         param: torch.nn.Parameter,
@@ -897,7 +909,7 @@ class FusedMoE(torch.nn.Module):
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for piecewise cuda graph"
-            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+            return moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
                 topk_output.topk_weights,
                 topk_output.topk_ids,
@@ -1069,7 +1081,7 @@ class FlashInferFusedMoE(FusedMoE):
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for piecewise cuda graph"
-            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+            return moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
                 topk_output.topk_weights,
                 topk_output.topk_ids,
@@ -1134,14 +1146,14 @@ class FlashInferFusedMoE(FusedMoE):
 
         else:
 
-            final_hidden_states = self.quant_method.apply_with_router_logits(
+            final_hidden_states = self.quant_method.apply(
                 layer=self,
                 dispatch_output=StandardDispatchOutput(
                     hidden_states=hidden_states,
                     hidden_states_scale=None,
                     topk_output=topk_output,
                 ),
-            )
+            ).hidden_states
 
         # NOTE for symmetric memory tagging:
         # We do not create the context in this function.
@@ -1198,16 +1210,14 @@ class FlashInferFP4MoE(FusedMoE):
         ), "Only bypassed topk output is supported for flashinfer fp4 moe"
 
         if is_in_piecewise_cuda_graph():
-            return (
-                torch.ops.sglang.flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
-                    hidden_states,
-                    topk_output.router_logits,
-                    topk_output.topk_config.top_k,
-                    topk_output.topk_config.topk_group,
-                    topk_output.topk_config.num_expert_group,
-                    topk_output.topk_config.correction_bias,
-                    self.layer_id,
-                )
+            return flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
+                hidden_states,
+                topk_output.router_logits,
+                topk_output.topk_config.top_k,
+                topk_output.topk_config.topk_group,
+                topk_output.topk_config.num_expert_group,
+                topk_output.topk_config.correction_bias,
+                self.layer_id,
             )
         else:
             return self.forward_impl(hidden_states, topk_output)
@@ -1305,6 +1315,7 @@ class FlashInferFP4MoE(FusedMoE):
         return result
 
 
+@register_custom_op(out_shape="hidden_states")
 def moe_forward_piecewise_cuda_graph_impl(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -1321,16 +1332,7 @@ def moe_forward_piecewise_cuda_graph_impl(
     return moe_layer.forward_impl(hidden_states, topk_output)
 
 
-def moe_forward_piecewise_cuda_graph_impl_fake(
-    hidden_states: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    router_logits: torch.Tensor,
-    layer_id: int,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
+@register_custom_op(out_shape="hidden_states")
 def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -1353,30 +1355,3 @@ def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
     forward_context = get_forward_context()
     moe_layer = forward_context.moe_layers[layer_id]
     return moe_layer.forward_impl(hidden_states, topk_output)
-
-
-def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl_fake(
-    hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-    top_k: int,
-    topk_group: Optional[int],
-    num_expert_group: Optional[int],
-    correction_bias: Optional[torch.Tensor],
-    layer_id: int,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
-direct_register_custom_op(
-    op_name="moe_forward_piecewise_cuda_graph_impl",
-    op_func=moe_forward_piecewise_cuda_graph_impl,
-    mutates_args=[],
-    fake_impl=moe_forward_piecewise_cuda_graph_impl_fake,
-)
-
-direct_register_custom_op(
-    op_name="flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl",
-    op_func=flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl,
-    mutates_args=[],
-    fake_impl=flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl_fake,
-)

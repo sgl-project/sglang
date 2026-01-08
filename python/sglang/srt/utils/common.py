@@ -18,7 +18,6 @@ import argparse
 import asyncio
 import builtins
 import ctypes
-import dataclasses
 import functools
 import importlib
 import inspect
@@ -66,7 +65,6 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
-    Set,
     Tuple,
     TypeVar,
     Union,
@@ -146,7 +144,15 @@ def is_xpu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_npu() -> bool:
-    return hasattr(torch, "npu") and torch.npu.is_available()
+    if not hasattr(torch, "npu"):
+        return False
+
+    if not torch.npu.is_available():
+        raise RuntimeError(
+            "torch_npu detected, but NPU device is not available or visible."
+        )
+
+    return True
 
 
 @lru_cache(maxsize=1)
@@ -306,11 +312,13 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     falsy_values = ("false", "0")
 
     if (value not in truthy_values) and (value not in falsy_values):
-        if value not in _warned_bool_env_var_keys:
+        # Warn once per env var key (not per value), otherwise different keys that share the
+        # same invalid value may suppress warnings incorrectly.
+        if name not in _warned_bool_env_var_keys:
             logger.warning(
                 f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
             )
-        _warned_bool_env_var_keys.add(value)
+        _warned_bool_env_var_keys.add(name)
 
     return value in truthy_values
 
@@ -830,6 +838,7 @@ def load_audio(
 class ImageData:
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    max_dynamic_patch: Optional[int] = None
 
 
 def load_image(
@@ -1492,33 +1501,95 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
-def add_prometheus_track_response_middleware(app):
-    from prometheus_client import Counter
+class RefCountedGauge:
+    def __init__(self, gauge):
+        self._gauge = gauge
+        self._refcount: Dict[str, int] = {}
 
-    http_response_status_counter = Counter(
+    def inc(self, key: str):
+        if key in self._refcount:
+            self._refcount[key] += 1
+        else:
+            self._refcount[key] = 1
+            self._gauge.inc()
+
+    def dec(self, key: str):
+        if key in self._refcount:
+            self._refcount[key] -= 1
+            if self._refcount[key] == 0:
+                del self._refcount[key]
+                self._gauge.dec()
+
+
+def add_prometheus_track_response_middleware(app):
+    from prometheus_client import Counter, Gauge
+
+    http_request_counter = Counter(
+        name="sglang:http_requests_total",
+        documentation="Total number of HTTP requests by endpoint and method",
+        labelnames=["endpoint", "method"],
+    )
+
+    http_response_counter = Counter(
         name="sglang:http_responses_total",
         documentation="Total number of HTTP responses by endpoint and status code",
         labelnames=["endpoint", "status_code", "method"],
     )
 
+    http_requests_active = Gauge(
+        name="sglang:http_requests_active",
+        documentation="Number of currently active HTTP requests",
+        labelnames=["endpoint", "method"],
+        multiprocess_mode="livesum",
+    )
+
+    routing_keys_active = RefCountedGauge(
+        Gauge(
+            name="sglang:routing_keys_active",
+            documentation="Number of unique routing keys with active requests",
+            multiprocess_mode="livesum",
+        )
+    )
+
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
-        response = await call_next(request)
+        # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
+        # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
+        path, is_handled_path = _get_fastapi_request_path(request)
+        method = request.method
+        routing_key = request.headers.get("x-smg-routing-key")
 
-        route = request.scope.get("route")
-        endpoint = (
-            route.path
-            if route
-            else ("unknown_route" if response.status_code == 404 else request.url.path)
-        )
+        http_request_counter.labels(endpoint=path, method=method).inc()
+        http_requests_active.labels(endpoint=path, method=method).inc()
+        if routing_key:
+            routing_keys_active.inc(routing_key)
 
-        http_response_status_counter.labels(
-            endpoint=endpoint,
-            status_code=str(response.status_code),
-            method=request.method,
-        ).inc()
+        try:
+            response = await call_next(request)
 
-        return response
+            http_response_counter.labels(
+                endpoint=path,
+                method=method,
+                status_code=str(response.status_code),
+            ).inc()
+
+            return response
+        finally:
+            http_requests_active.labels(endpoint=path, method=method).dec()
+            if routing_key:
+                routing_keys_active.dec(routing_key)
+
+
+# https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
+def _get_fastapi_request_path(request) -> Tuple[str, bool]:
+    from starlette.routing import Match
+
+    for route in request.app.routes:
+        match, child_scope = route.matches(request.scope)
+        if match == Match.FULL:
+            return route.path, True
+
+    return request.url.path, False
 
 
 def bind_port(port):
@@ -1838,7 +1909,7 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "xpu"
         return "xpu:{}".format(device_id)
 
-    if hasattr(torch, "npu") and torch.npu.is_available():
+    if is_npu():
         if device_id == None:
             return "npu"
         return "npu:{}".format(device_id)
@@ -1944,12 +2015,6 @@ def get_compiler_backend(mode=None) -> str:
 
 
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
-
-
-# Some backends use pytorch version < 2.4.0 which doesn't
-# support `torch.library.custom_op`.
-def supports_custom_op() -> bool:
-    return hasattr(torch.library, "custom_op")
 
 
 def direct_register_custom_op(
@@ -2058,53 +2123,6 @@ def set_gpu_proc_affinity(
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
-
-
-@lru_cache(maxsize=2)
-def disable_request_logging() -> bool:
-    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
-
-
-def dataclass_to_string_truncated(
-    data, max_length=2048, skip_names: Optional[Set[str]] = None
-):
-    if skip_names is None:
-        skip_names = set()
-    if isinstance(data, str):
-        if len(data) > max_length:
-            half_length = max_length // 2
-            return f"{repr(data[:half_length])} ... {repr(data[-half_length:])}"
-        else:
-            return f"{repr(data)}"
-    elif isinstance(data, (list, tuple)):
-        if len(data) > max_length:
-            half_length = max_length // 2
-            return str(data[:half_length]) + " ... " + str(data[-half_length:])
-        else:
-            return str(data)
-    elif isinstance(data, dict):
-        return (
-            "{"
-            + ", ".join(
-                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-                if k not in skip_names
-            )
-            + "}"
-        )
-    elif dataclasses.is_dataclass(data):
-        fields = dataclasses.fields(data)
-        return (
-            f"{data.__class__.__name__}("
-            + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
-                for f in fields
-                if f.name not in skip_names
-            )
-            + ")"
-        )
-    else:
-        return str(data)
 
 
 def permute_weight(x: torch.Tensor) -> torch.Tensor:
@@ -2438,10 +2456,6 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     logger.info(
         f"Dummy health check server started in background thread at {host}:{port}"
     )
-
-
-def create_checksum(directory: str):
-    raise NotImplementedError()
 
 
 def set_cuda_arch():
@@ -3443,7 +3457,7 @@ def check_cuda_result(raw_output):
     return results
 
 
-def get_physical_device_id(pytorch_device_id: int) -> int:
+def get_physical_device_id() -> int:
     """
     Convert PyTorch logical device ID to physical device ID.
     """
