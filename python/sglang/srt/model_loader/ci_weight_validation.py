@@ -33,8 +33,8 @@ logger = logging.getLogger(__name__)
 # Validation marker version - increment when validation logic changes
 # v2: Added trust_remote_code module validation (modeling_*.py must exist in snapshot)
 # v3: Added remote file existence checks for hf_quant_config.json
-# v4: Added marker recheck mechanism with required_files tracking
-VALIDATION_MARKER_VERSION = "4"
+# v5: Invalidate all previous markers to force fresh validation
+VALIDATION_MARKER_VERSION = "5"
 
 
 def _remote_file_exists(
@@ -117,64 +117,6 @@ def _get_validation_marker_path(snapshot_dir: str) -> Optional[str]:
     return f"/tmp/sglang_hf_validation_{dir_hash}.json"
 
 
-def _recheck_marker_against_snapshot(
-    snapshot_dir: str, marker: dict, marker_path: str
-) -> bool:
-    """
-    Recheck that all required files from marker actually exist in snapshot_dir.
-
-    This prevents blindly trusting markers from different machines that may share
-    the same HF cache directory structure but have incomplete snapshots.
-
-    Args:
-        snapshot_dir: Path to snapshot directory
-        marker: Marker dict containing required_files list
-        marker_path: Path to marker file (for deletion if recheck fails)
-
-    Returns:
-        True if all required files exist, False if any are missing
-    """
-    required_files = marker.get("required_files", [])
-    if not required_files:
-        # Old marker format without required_files - delete it and force re-validation
-        logger.warning(
-            "Marker has no required_files (old format). "
-            "Deleting old marker and forcing re-validation."
-        )
-        try:
-            if os.path.exists(marker_path):
-                os.remove(marker_path)
-                logger.debug("Deleted old-format marker: %s", marker_path)
-        except Exception as e:
-            logger.warning("Failed to delete old marker %s: %s", marker_path, e)
-        return False
-
-    missing_files = []
-    for filename in required_files:
-        file_path = os.path.join(snapshot_dir, filename)
-        if not os.path.exists(file_path):
-            missing_files.append(filename)
-
-    if missing_files:
-        logger.warning(
-            "Marker recheck failed: required files missing from snapshot_dir: %s. "
-            "This likely means cache was validated on a different machine. "
-            "Deleting stale marker and forcing re-validation.",
-            missing_files,
-        )
-        # Delete stale marker - it's invalid for this machine's snapshot
-        try:
-            if os.path.exists(marker_path):
-                os.remove(marker_path)
-                logger.debug("Deleted stale marker: %s", marker_path)
-        except Exception as e:
-            logger.warning("Failed to delete stale marker %s: %s", marker_path, e)
-        return False
-
-    logger.debug("Marker recheck passed: all required files exist")
-    return True
-
-
 def _read_validation_marker(snapshot_dir: str) -> Optional[dict]:
     """
     Read validation marker for a snapshot.
@@ -224,21 +166,13 @@ def _read_validation_marker(snapshot_dir: str) -> Optional[dict]:
             )
             return None
 
-        # Recheck that all required files actually exist in snapshot_dir
-        # This prevents blindly trusting markers from different machines
-        if not _recheck_marker_against_snapshot(snapshot_dir, marker, marker_path):
-            # Recheck failed - marker was deleted, return None to force re-validation
-            return None
-
         return marker
     except (json.JSONDecodeError, OSError) as e:
         logger.debug("Failed to read validation marker at %s: %s", marker_path, e)
         return None
 
 
-def _write_validation_marker(
-    snapshot_dir: str, passed: bool, required_files: Optional[List[str]] = None
-) -> None:
+def _write_validation_marker(snapshot_dir: str, passed: bool) -> None:
     """
     Write validation marker for a snapshot (atomic write).
 
@@ -248,7 +182,6 @@ def _write_validation_marker(
     Args:
         snapshot_dir: Path to snapshot directory
         passed: Whether validation passed
-        required_files: List of files that MUST exist in snapshot (for recheck)
     """
     if not passed:
         # Don't cache failures - allow retry on next launch
@@ -265,7 +198,6 @@ def _write_validation_marker(
         "version": VALIDATION_MARKER_VERSION,
         "validated_at": datetime.utcnow().isoformat() + "Z",
         "validation_passed": passed,
-        "required_files": required_files or [],  # Record required files for recheck
     }
 
     try:
@@ -355,7 +287,7 @@ def _validate_config_and_tokenizer_files(
     model_id: Optional[str] = None,
     revision: Optional[str] = None,
     allow_remote_check: bool = False,
-) -> Tuple[bool, List[str], List[str]]:
+) -> Tuple[bool, List[str]]:
     """
     Validate that critical config and tokenizer files exist and are valid.
 
@@ -377,18 +309,18 @@ def _validate_config_and_tokenizer_files(
         allow_remote_check: Whether to check Hub for file existence to determine requirements
 
     Returns:
-        Tuple of (is_valid, missing_files, required_files)
+        Tuple of (is_valid, missing_files)
         - is_valid: True if all required files are present and valid
         - missing_files: List of missing or invalid file names
-        - required_files: List of file names that MUST exist for this model (for marker recheck)
     """
     missing_files = []
+
+    # Check required config files
     required_files = [
         "config.json",
         "tokenizer_config.json",
-    ]  # Track files that MUST exist
+    ]
 
-    # Check required config files
     for file_name in required_files:
         file_path = os.path.join(snapshot_dir, file_name)
         if not _validate_json_file(file_path, file_name):
@@ -427,9 +359,6 @@ def _validate_config_and_tokenizer_files(
     # Apply conditional requirement logic
     if remote_hf_quant_exists is True:
         # Hub has this file for this revision - it's REQUIRED
-        required_files.append(
-            "hf_quant_config.json"
-        )  # Add to required files for marker
         if not local_hf_quant_exists:
             missing_files.append(
                 f"hf_quant_config.json (required: exists on Hub for revision {revision or 'default'} but missing locally)"
@@ -449,24 +378,18 @@ def _validate_config_and_tokenizer_files(
                 missing_files.append("hf_quant_config.json (exists but invalid)")
     else:
         # remote_hf_quant_exists is None - unknown (network error or remote check disabled)
-        # Treat as cache INCOMPLETE to avoid enabling offline mode with potentially missing files
+        # Treat as OPTIONAL - only enforce when we can positively confirm Hub has it
         if local_hf_quant_exists:
             # Local file exists - validate it
             if not _validate_json_file(hf_quant_config_path, "hf_quant_config.json"):
                 missing_files.append("hf_quant_config.json (exists but invalid)")
-        else:
-            # No local file and cannot verify remote - treat as incomplete
-            if allow_remote_check:
-                # We tried to check remote but failed - mark as incomplete to skip offline this time
-                missing_files.append(
-                    "hf_quant_config.json (cannot verify Hub status, treating as incomplete to avoid offline mode)"
-                )
-                logger.warning(
-                    "Cannot verify hf_quant_config.json on Hub for %s (revision=%s) - network error or API issue. "
-                    "Marking cache as incomplete to skip offline mode this time. Will retry on next validation.",
-                    model_id or "unknown",
-                    revision or "default",
-                )
+        # If local file missing and remote unknown, just log it - don't block marker
+        logger.debug(
+            "Cannot verify hf_quant_config.json on Hub for %s (revision=%s), "
+            "treating as optional since remote status unknown",
+            model_id or "unknown",
+            revision or "default",
+        )
 
     # Check optional quantize_config.json / quant_config.json (validate if exists)
     # These files are needed for AWQ/GPTQ/AutoRound quantized models
@@ -545,7 +468,6 @@ def _validate_config_and_tokenizer_files(
     ]
 
     tokenizer_found = False
-    found_tokenizer_file = None
     for tokenizer_file in tokenizer_files:
         tokenizer_path = os.path.join(snapshot_dir, tokenizer_file)
         if os.path.exists(tokenizer_path) and os.path.isfile(tokenizer_path):
@@ -553,14 +475,12 @@ def _validate_config_and_tokenizer_files(
             if tokenizer_file == "tokenizer.json":
                 if _validate_json_file(tokenizer_path, tokenizer_file):
                     tokenizer_found = True
-                    found_tokenizer_file = tokenizer_file
                     break
             else:
                 # For .model files, just check they're non-empty
                 try:
                     if os.path.getsize(tokenizer_path) > 0:
                         tokenizer_found = True
-                        found_tokenizer_file = tokenizer_file
                         break
                 except OSError:
                     pass
@@ -569,12 +489,9 @@ def _validate_config_and_tokenizer_files(
         missing_files.append(
             "tokenizer file (none of: tokenizer.json, tokenizer.model, tiktoken.model)"
         )
-    else:
-        # Add the found tokenizer file to required_files for marker recheck
-        required_files.append(found_tokenizer_file)
 
     is_valid = len(missing_files) == 0
-    return is_valid, missing_files, required_files
+    return is_valid, missing_files
 
 
 def ci_validate_cache_and_enable_offline_if_complete(
@@ -649,11 +566,7 @@ def ci_validate_cache_and_enable_offline_if_complete(
     )
 
     # Validate config and tokenizer files with remote existence checks
-    (
-        config_valid,
-        missing_config_files,
-        required_files,
-    ) = _validate_config_and_tokenizer_files(
+    config_valid, missing_config_files = _validate_config_and_tokenizer_files(
         snapshot_dir=snapshot_dir,
         model_id=model_name_or_path,
         revision=revision,
@@ -684,9 +597,9 @@ def ci_validate_cache_and_enable_offline_if_complete(
         f"CI_OFFLINE: Cache validation PASSED, offline mode will be enabled - {model_name_or_path}",
     )
 
-    # Write marker with passed=True and required_files for future reuse
+    # Write marker with passed=True for future reuse
     # (Failures are not cached, so this only happens on success)
-    _write_validation_marker(snapshot_dir, passed=True, required_files=required_files)
+    _write_validation_marker(snapshot_dir, passed=True)
     return True
 
 
