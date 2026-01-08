@@ -76,6 +76,7 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
+
 if _is_npu:
     import torch_npu
     import sgl_kernel_npu
@@ -1183,7 +1184,9 @@ def soft_fp8_blockfp8_matmul_npu(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None, "input_scale is not supported for soft_fp8_blockfp8_matmul_npu"
+    assert (
+        input_scale is None
+    ), "input_scale is not supported for soft_fp8_blockfp8_matmul_npu"
     assert bias is None, "bias is not supported for soft_fp8_blockfp8_matmul_npu"
     output = torch.ops.npu.fp8_w8a16_matmul(input, weight, weight_scale, "bf16")
     return output

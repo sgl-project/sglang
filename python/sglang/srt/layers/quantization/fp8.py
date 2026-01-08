@@ -1150,7 +1150,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # TODO(cwan): refactor other backends
             pass
 
-
     # fusedmoe
     def npu_fused_experts_fp8(
         self,
@@ -1219,7 +1218,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if len(original_shape) == 3:
             final_hidden_states = final_hidden_states.view(original_shape)
         return final_hidden_states
-
 
     # deepep
     def apply_without_routing_weights(
