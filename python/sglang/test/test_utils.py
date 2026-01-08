@@ -590,14 +590,10 @@ def popen_launch_server(
     Args:
         device: Device type ("auto", "cuda", "rocm" or "cpu").
                 If "auto", will detect available platforms automatically.
-
-    Raises:
-        PopenLaunchServerError: If server fails to start, with stdout/stderr attached.
     """
-    from io import StringIO
-
     other_args = other_args or []
 
+    # Auto-detect device if needed
     if device == "auto":
         device = auto_config_device()
         other_args = list(other_args)
@@ -622,59 +618,84 @@ def popen_launch_server(
     ]
 
     if pd_separated or use_mixed_pd_engine:
-        command.extend(["--lb-host", host, "--lb-port", port])
+        command.extend(
+            [
+                "--lb-host",
+                host,
+                "--lb-port",
+                port,
+            ]
+        )
     else:
-        command.extend(["--host", host, "--port", port])
+        command.extend(
+            [
+                "--host",
+                host,
+                "--port",
+                port,
+            ]
+        )
 
     if use_mixed_pd_engine:
-        command.extend(["--mixed", "--num-replicas", str(num_replicas)])
+        command.extend(
+            [
+                "--mixed",
+                "--num-replicas",
+                str(num_replicas),
+            ]
+        )
 
     if api_key:
         command += ["--api-key", api_key]
 
     print(f"command={shlex.join(command)}")
 
-    stdout_capture = StringIO()
-    stderr_capture = StringIO()
-
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        text=True,
-        bufsize=1,
-    )
-
-    def _dump(src, sinks):
-        for line in iter(src.readline, ""):
-            for sink in sinks:
-                sink.write(line)
-                sink.flush()
-        src.close()
-
-    stdout_sinks = [stdout_capture, sys.stdout]
-    stderr_sinks = [stderr_capture, sys.stderr]
     if return_stdout_stderr:
-        stdout_sinks.append(return_stdout_stderr[0])
-        stderr_sinks.append(return_stdout_stderr[1])
-
-    threading.Thread(target=_dump, args=(process.stdout, stdout_sinks), daemon=True).start()
-    threading.Thread(target=_dump, args=(process.stderr, stderr_sinks), daemon=True).start()
-
-    def _raise_error(message: str):
-        raise PopenLaunchServerError(
-            message,
-            stdout=stdout_capture.getvalue(),
-            stderr=stderr_capture.getvalue(),
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
+            bufsize=1,
         )
+
+        def _dump(src, sinks):
+            for line in iter(src.readline, ""):
+                for sink in sinks:
+                    sink.write(line)
+                    sink.flush()
+            src.close()
+
+        threading.Thread(
+            target=_dump,
+            args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=_dump,
+            args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
+            daemon=True,
+        ).start()
+    else:
+        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+
+    def _get_captured_output():
+        if return_stdout_stderr:
+            return return_stdout_stderr[0].getvalue(), return_stdout_stderr[1].getvalue()
+        return None, None
 
     start_time = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout:
             return_code = process.poll()
             if return_code is not None:
-                _raise_error(f"Server process exited with code {return_code}.")
+                stdout, stderr = _get_captured_output()
+                raise PopenLaunchServerError(
+                    f"Server process exited with code {return_code}.",
+                    stdout=stdout,
+                    stderr=stderr,
+                )
 
             try:
                 headers = {
@@ -693,12 +714,22 @@ def popen_launch_server(
 
             return_code = process.poll()
             if return_code is not None:
-                _raise_error(f"Server unexpectedly exits ({return_code=}).")
+                stdout, stderr = _get_captured_output()
+                raise PopenLaunchServerError(
+                    f"Server unexpectedly exits ({return_code=}).",
+                    stdout=stdout,
+                    stderr=stderr,
+                )
 
             time.sleep(10)
 
     kill_process_tree(process.pid)
-    _raise_error("Server failed to start within the timeout period.")
+    stdout, stderr = _get_captured_output()
+    raise PopenLaunchServerError(
+        "Server failed to start within the timeout period.",
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
 def popen_launch_pd_server(
