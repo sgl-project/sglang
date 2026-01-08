@@ -50,23 +50,30 @@ jobs:
             | while read -r run; do
                 run_id=$(echo "$run" | jq -r '.databaseId')
                 run_url=$(echo "$run" | jq -r '.url // empty')
-                head_branch=$(echo "$run" | jq -r '.headBranch // empty')
-                head_sha=$(echo "$run" | jq -r '.headSha // empty')
-                if [ -z "$head_sha" ]; then
-                  echo "⚠️ Run $run_id has no headSha, skipping ($run_url)"
+
+                # Fetch run details to get true head owner + head branch (works for fork PR too)
+                run_json=$(gh api -H "Accept: application/vnd.github+json" \
+                  "repos/$REPO/actions/runs/$run_id" 2>/dev/null || true)
+
+                head_owner=$(echo "$run_json" | jq -r '.head_repository.owner.login // empty')
+                head_branch=$(echo "$run_json" | jq -r '.head_branch // empty')
+
+                if [ -z "$head_owner" ] || [ -z "$head_branch" ]; then
+                  echo "⚠️ Run $run_id missing head info (owner='$head_owner', branch='$head_branch'), skipping ($run_url)"
                   continue
                 fi
 
-                # Find PRs associated with this commit (prefer open PR)
+                # Find PR by head=OWNER:BRANCH in the base repo
                 pr_number=$(gh api -H "Accept: application/vnd.github+json" \
-                  "repos/$REPO/commits/$head_sha/pulls" \
-                  --jq 'map(select(.state=="open"))[0].number // .[0].number // empty' 2>/dev/null || true)
+                  "repos/$REPO/pulls" -f state=open -f head="${head_owner}:${head_branch}" \
+                  --jq '.[0].number // empty' 2>/dev/null || true)
 
                 if [ -z "$pr_number" ]; then
-                  pr_number=$(gh api -H "Accept: application/vnd.github.groot-preview+json" \
-                    "repos/$REPO/commits/$head_sha/pulls" \
-                    --jq 'map(select(.state=="open"))[0].number // .[0].number // empty' 2>/dev/null || true)
+                  echo "⚠️ Run $run_id PR not found via head='${head_owner}:${head_branch}', skipping ($run_url)"
+                  continue
                 fi
+
+                echo "Run $run_id is associated with PR #$pr_number (head='${head_owner}:${head_branch}')"
 
                 # Debug when missing
                 if [ -z "$pr_number" ]; then
