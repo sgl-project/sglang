@@ -40,24 +40,6 @@ Again, please go through the entire documentation to confirm your system is usin
 
 You can install SGLang using one of the methods below.
 
-### Install from Source
-
-```bash
-# Use the last release branch
-git clone -b v0.5.6.post2 https://github.com/sgl-project/sglang.git
-cd sglang
-
-# Compile sgl-kernel
-pip install --upgrade pip
-cd sgl-kernel
-python setup_rocm.py install
-
-# Install sglang python package
-cd ..
-rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-pip install -e "python[all_hip]"
-```
-
 ### Install Using Docker (Recommended)
 
 The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [rocm.Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
@@ -113,6 +95,48 @@ The steps below show how to build and use an image.
    ```
 
 With your AMD system properly configured and SGLang installed, you can now fully leverage AMD hardware to power SGLang’s machine learning capabilities.
+
+### Install from Source
+
+```bash
+# Use the last release branch
+git clone -b v0.5.7 https://github.com/sgl-project/sglang.git
+cd sglang
+
+# Compile sgl-kernel
+pip install --upgrade pip
+cd sgl-kernel
+python setup_rocm.py install
+
+# Install sglang python package
+cd ..
+rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
+pip install -e "python[all_hip]"
+```
+
+### Install from Source with Dependency Management (Experimental)
+
+**NOTE (Experimental):** The dependency matrix is still being validated (ROCm / PyTorch / Python / etc.).
+If you run into issues, please fall back to [Install Using Docker (Recommended)](https://github.com/sgl-project/sglang/blob/main/docs/platforms/amd_gpu.md#install-using-docker-recommended).
+
+```bash
+# Use the last release branch (example)
+git clone -b v0.5.7 https://github.com/sgl-project/sglang.git
+cd sglang
+
+# Install AITER from Source
+git clone https://github.com/ROCm/aiter.git
+cd aiter
+git checkout v0.1.9.post1
+git submodule update --init --recursive
+GPU_ARCH_LIST="gfx950" # for MI35x; or "gfx942" for MI300x/MI325x
+GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop # optionally you can set PREBUILD_KERNELS=1 for gfx942 (MI300x/MI325x) to precompile kernels enabling faster server startup
+
+# Install sglang python package
+cd ..
+rm -rf python/pyproject.toml && mv python/pyproject_rocm.toml python/pyproject.toml
+pip install -e "python[rocm700]"
+```
 
 ## Examples
 
