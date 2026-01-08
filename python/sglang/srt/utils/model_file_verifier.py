@@ -16,13 +16,64 @@ import hashlib
 import json
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, TypedDict
+from typing import Dict, List, Optional, Tuple
 
 
-class FileInfo(TypedDict):
+@dataclass
+class FileInfo:
     sha256: str
     size: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "FileInfo":
+        if not isinstance(data, dict):
+            raise IntegrityError(f"FileInfo expects dict, got {type(data).__name__}")
+        if "sha256" not in data:
+            raise IntegrityError("FileInfo missing required field 'sha256'")
+        if not isinstance(data["sha256"], str):
+            raise IntegrityError(f"FileInfo.sha256 expects str, got {type(data['sha256']).__name__}")
+        size = data.get("size", 0)
+        if not isinstance(size, int):
+            raise IntegrityError(f"FileInfo.size expects int, got {type(size).__name__}")
+        return cls(sha256=data["sha256"], size=size)
+
+
+@dataclass
+class ChecksumFile:
+    files: Dict[str, FileInfo]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ChecksumFile":
+        if not isinstance(data, dict):
+            raise IntegrityError(f"ChecksumFile expects dict, got {type(data).__name__}")
+        if "files" not in data:
+            raise IntegrityError("ChecksumFile missing required field 'files'")
+        if not isinstance(data["files"], dict):
+            raise IntegrityError(f"ChecksumFile.files expects dict, got {type(data['files']).__name__}")
+        files = {k: FileInfo.from_dict(v) for k, v in data["files"].items()}
+        return cls(files=files)
+
+    def to_dict(self) -> dict:
+        return {"files": {k: asdict(v) for k, v in self.files.items()}}
+
+
+@dataclass
+class LegacyChecksumFile:
+    """Deprecated: Old format with only checksums, no file sizes."""
+    checksums: Dict[str, str]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "LegacyChecksumFile":
+        if not isinstance(data, dict):
+            raise IntegrityError(f"LegacyChecksumFile expects dict, got {type(data).__name__}")
+        if "checksums" not in data:
+            raise IntegrityError("LegacyChecksumFile missing required field 'checksums'")
+        if not isinstance(data["checksums"], dict):
+            raise IntegrityError(f"LegacyChecksumFile.checksums expects dict, got {type(data['checksums']).__name__}")
+        return cls(checksums=data["checksums"])
+
 
 IGNORE_PATTERNS = [
     "checksums.json",
@@ -70,7 +121,7 @@ def _compare_checksums(*, expected: Dict[str, str], actual: Dict[str, str]) -> N
 
 def generate_checksums(
     *, source: str, output_path: str, max_workers: int = 4
-) -> Dict[str, FileInfo]:
+) -> ChecksumFile:
     if Path(source).is_dir():
         model_path = Path(source).resolve()
         files = _discover_files(model_path)
@@ -82,13 +133,13 @@ def generate_checksums(
     else:
         file_infos = _load_file_infos_from_hf(repo_id=source)
 
-    output = {"files": file_infos}
-    Path(output_path).write_text(json.dumps(output, indent=2, sort_keys=True))
+    checksum_file = ChecksumFile(files=file_infos)
+    Path(output_path).write_text(json.dumps(checksum_file.to_dict(), indent=2, sort_keys=True))
 
     print(
         f"[ModelFileVerifier] Generated checksums for {len(file_infos)} files -> {output_path}"
     )
-    return file_infos
+    return checksum_file
 
 
 def _discover_files(model_path: Path) -> List[str]:
@@ -109,12 +160,13 @@ def _load_checksums(source: str) -> Dict[str, str]:
         data = json.loads(Path(source).read_text())
         return _extract_checksums_from_json(data)
     checksums_from_hf = _load_file_infos_from_hf(repo_id=source)
-    return {k: v["sha256"] for k, v in checksums_from_hf.items()}
+    return {k: v.sha256 for k, v in checksums_from_hf.items()}
 
 
 def _extract_checksums_from_json(data: dict) -> Dict[str, str]:
     if "files" in data:
-        return {k: v["sha256"] for k, v in data["files"].items()}
+        checksum_file = ChecksumFile.from_dict(data)
+        return {k: v.sha256 for k, v in checksum_file.files.items()}
     if "checksums" in data:
         warnings.warn(
             "The 'checksums' format is deprecated. "
@@ -122,7 +174,8 @@ def _extract_checksums_from_json(data: dict) -> Dict[str, str]:
             DeprecationWarning,
             stacklevel=3,
         )
-        return data["checksums"]
+        legacy = LegacyChecksumFile.from_dict(data)
+        return legacy.checksums
     raise IntegrityError("Invalid checksum file format: missing 'files' or 'checksums'")
 
 
