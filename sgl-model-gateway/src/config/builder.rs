@@ -818,7 +818,7 @@ mod tests {
     fn test_builder_cache_aware_policy() {
         let config = RouterConfigBuilder::new()
             .regular_mode(vec!["http://worker1:8000".to_string()])
-            .cache_aware_policy(0.8, 10, 1.5, 300, 1000)
+            .cache_aware_policy(0.8, 10, 1.5, 300, 1000, true, 1.2)
             .build()
             .unwrap();
 

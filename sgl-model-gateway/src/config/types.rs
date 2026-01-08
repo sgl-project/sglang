@@ -821,6 +821,8 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            enable_reactive_eviction: true,
+            reactive_eviction_threshold: 1.2,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -842,6 +844,8 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            enable_reactive_eviction: true,
+            reactive_eviction_threshold: 1.2,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -864,6 +868,8 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 600,
             max_tree_size: 5000,
+            enable_reactive_eviction: true,
+            reactive_eviction_threshold: 1.2,
         };
 
         match cache_aware {
@@ -1174,7 +1180,7 @@ mod tests {
                 "http://worker2:8000".to_string(),
                 "http://worker3:8000".to_string(),
             ])
-            .cache_aware_policy(0.9, 5, 1.2, 600, 10000)
+            .cache_aware_policy(0.9, 5, 1.2, 600, 10000, true, 1.2)
             .host("0.0.0.0")
             .port(3001)
             .max_payload_size(536870912)
@@ -1262,6 +1268,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                enable_reactive_eviction: true,
+                reactive_eviction_threshold: 1.2,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1348,6 +1356,8 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 2000,
+            enable_reactive_eviction: true,
+            reactive_eviction_threshold: 1.2,
         };
 
         match pd.get_prefill_policy(&main_policy) {

@@ -722,6 +722,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                enable_reactive_eviction: true,
+                reactive_eviction_threshold: 1.2,
             },
         );
 
@@ -741,6 +743,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                enable_reactive_eviction: true,
+                reactive_eviction_threshold: 1.2,
             },
         );
 
@@ -795,6 +799,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                enable_reactive_eviction: true,
+                reactive_eviction_threshold: 1.2,
             },
         );
 
@@ -839,6 +845,8 @@ mod tests {
                     balance_rel_threshold: 1.1,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,
+                    enable_reactive_eviction: true,
+                    reactive_eviction_threshold: 1.2,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,

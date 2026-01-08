@@ -116,6 +116,8 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 30,
             max_tree_size: 1000,
+            enable_reactive_eviction: true,
+            reactive_eviction_threshold: 1.2,
         });
         assert_eq!(policy.name(), "cache_aware");
 
