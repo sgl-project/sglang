@@ -487,6 +487,12 @@ class DenoisingStage(PipelineStage):
         """
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
+        # NOTE: In warmup requests we may override req.num_inference_steps (e.g. set to 1)
+        # for latency amortization, but cache-dit needs the *original* total steps to
+        # initialize/refresh its context correctly.
+        cache_dit_num_inference_steps = batch.extra.get(
+            "cache_dit_num_inference_steps", batch.num_inference_steps
+        )
         if not server_args.model_loaded["transformer"]:
             # FIXME: reuse more code
             loader = TransformerLoader()
@@ -494,13 +500,13 @@ class DenoisingStage(PipelineStage):
                 server_args.model_paths["transformer"], server_args, "transformer"
             )
             # enable cache-dit before torch.compile (delayed mounting)
-            self._maybe_enable_cache_dit(batch.num_inference_steps)
+            self._maybe_enable_cache_dit(cache_dit_num_inference_steps)
             self.compile_module_with_torch_compile(self.transformer)
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
         else:
-            self._maybe_enable_cache_dit(batch.num_inference_steps)
+            self._maybe_enable_cache_dit(cache_dit_num_inference_steps)
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
