@@ -102,7 +102,6 @@ from sglang.srt.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
-    verify_model_files,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -425,10 +424,11 @@ class DefaultModelLoader(BaseModelLoader):
 
         server_args = get_global_server_args()
         if server_args and server_args.model_checksum is not None:
-            checksums_source = server_args.model_checksum
-            if checksums_source == "":
-                checksums_source = os.path.join(hf_folder, "checksums.json")
-            verify_model_files(hf_folder, checksums_source)
+            from sglang.srt.utils.model_file_verifier import ModelFileVerifier
+
+            checksums_source = server_args.model_checksum or None
+            verifier = ModelFileVerifier(hf_folder, checksums_source)
+            verifier.verify()
 
         hf_weights_files: List[str] = []
         for pattern in allow_patterns:
