@@ -1,0 +1,189 @@
+name: Release Branch Cut
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name to create (e.g., release/v0.5.7)'
+        required: true
+        type: string
+      commit_sha:
+        description: 'Commit SHA from main to cut the release branch from (defaults to latest main)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  cut-release-branch:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    environment: 'prod'
+    outputs:
+      branch_name: ${{ steps.set_output.outputs.branch_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate branch name
+        run: |
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+
+          if [ -z "$BRANCH_NAME" ]; then
+            echo "::error::Branch name is required"
+            exit 1
+          fi
+
+          # Validate branch name format (should start with release/)
+          if [[ ! "$BRANCH_NAME" =~ ^release/ ]]; then
+            echo "::warning::Branch name '$BRANCH_NAME' does not follow convention 'release/vX.Y.Z'"
+          fi
+
+          echo "Branch name: $BRANCH_NAME"
+
+      - name: Validate commit SHA
+        id: validate
+        run: |
+          COMMIT_SHA="${{ github.event.inputs.commit_sha }}"
+
+          # If no commit SHA provided, use latest main
+          if [ -z "$COMMIT_SHA" ]; then
+            COMMIT_SHA=$(git rev-parse HEAD)
+            echo "No commit SHA provided, using latest main: $COMMIT_SHA"
+          fi
+
+          # Verify the commit exists and is on main
+          if ! git cat-file -t "$COMMIT_SHA" > /dev/null 2>&1; then
+            echo "::error::Commit SHA '$COMMIT_SHA' does not exist"
+            exit 1
+          fi
+
+          # Check if commit is an ancestor of main (i.e., is on main branch)
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" main; then
+            echo "::error::Commit SHA '$COMMIT_SHA' is not on the main branch"
+            exit 1
+          fi
+
+          echo "COMMIT_SHA=$COMMIT_SHA" >> $GITHUB_OUTPUT
+          echo "Validated commit SHA: $COMMIT_SHA"
+
+      - name: Check if branch already exists
+        run: |
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+
+          if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
+            echo "::error::Branch '$BRANCH_NAME' already exists"
+            exit 1
+          fi
+
+          echo "Branch '$BRANCH_NAME' does not exist, proceeding with creation"
+
+      - name: Create and push release branch
+        id: set_output
+        run: |
+          COMMIT_SHA="${{ steps.validate.outputs.COMMIT_SHA }}"
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+
+          # Create branch from the specified commit
+          git checkout -b "$BRANCH_NAME" "$COMMIT_SHA"
+
+          # Push the new branch
+          git push origin "$BRANCH_NAME"
+
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "Successfully created and pushed branch '$BRANCH_NAME' from commit '$COMMIT_SHA'"
+
+      - name: Summary
+        run: |
+          COMMIT_SHA="${{ steps.validate.outputs.COMMIT_SHA }}"
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+
+          echo "## Release Branch Cut Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | \`$BRANCH_NAME\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`$COMMIT_SHA\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Tests are automatically triggered on the release branch" >> $GITHUB_STEP_SUMMARY
+          echo "2. Apply any hotfixes if needed" >> $GITHUB_STEP_SUMMARY
+          echo "3. Create a tag to trigger release: \`gh workflow run release-tag.yml -f version=X.Y.Z -f ref=$BRANCH_NAME\`" >> $GITHUB_STEP_SUMMARY
+
+  run-pr-tests-nvidia:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
+    secrets: inherit
+
+  run-pr-tests-amd:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test-amd.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
+    secrets: inherit
+
+  run-pr-test-npu:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test-npu.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
+    secrets: inherit
+
+  run-pr-tests-xeon:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test-xeon.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
+    secrets: inherit
+
+  run-pr-tests-xpu:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test-xpu.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
+    secrets: inherit
+
+  run-nightly-tests-nvidia:
+    needs: cut-release-branch
+    uses: ./.github/workflows/nightly-test-nvidia.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+    secrets: inherit
+
+  run-nightly-tests-amd:
+    needs: cut-release-branch
+    uses: ./.github/workflows/nightly-test-amd.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+    secrets: inherit
+
+  run-nightly-tests-npu:
+    needs: cut-release-branch
+    uses: ./.github/workflows/nightly-test-npu.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+    secrets: inherit
+
+  run-nightly-tests-intel:
+    needs: cut-release-branch
+    uses: ./.github/workflows/nightly-test-intel.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+    secrets: inherit

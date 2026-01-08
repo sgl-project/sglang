@@ -16,42 +16,6 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
-/// Streaming parse result
-#[derive(Debug, Clone)]
-pub enum StreamResult {
-    /// Need more data to continue parsing
-    Incomplete,
-    /// Found a tool name (for streaming)
-    ToolName { index: usize, name: String },
-    /// Found incremental arguments (for streaming)
-    ToolArguments { index: usize, arguments: String },
-    /// Completed parsing a tool
-    ToolComplete(ToolCall),
-    /// Normal text (not part of tool call)
-    NormalText(String),
-}
-
-/// Token configuration for parsing
-#[derive(Debug, Clone)]
-pub struct TokenConfig {
-    /// Start tokens for tool calls
-    pub start_tokens: Vec<String>,
-    /// End tokens for tool calls
-    pub end_tokens: Vec<String>,
-    /// Separator between multiple tool calls
-    pub separator: String,
-}
-
-impl TokenConfig {
-    /// Iterate over start/end token pairs
-    pub fn iter_pairs(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.start_tokens
-            .iter()
-            .zip(self.end_tokens.iter())
-            .map(|(s, e)| (s.as_str(), e.as_str()))
-    }
-}
-
 /// Simple partial tool call for streaming
 #[derive(Debug, Clone)]
 pub struct PartialToolCall {

@@ -104,14 +104,15 @@ curl -sS -X POST "http://localhost:30010/v1/images/generations" \
 
 **Endpoint:** `POST /v1/images/edits`
 
-This endpoint accepts a multipart form upload with an input image and a text prompt. The server can return either a base64-encoded image or a URL to download the image.
+This endpoint accepts a multipart form upload with input images and a text prompt. The server can return either a base64-encoded image or a URL to download the image.
 
 **Curl Example (b64_json response):**
 
 ```bash
 curl -sS -X POST "http://localhost:30010/v1/images/edits" \
   -H "Authorization: Bearer sk-proj-1234567890" \
-  -F "image=@input.png" \
+  -F "image=@local_input_image.png" \
+  -F "url=image_url.jpg" \
   -F "prompt=A calico cat playing a piano on stage" \
   -F "size=1024x1024" \
   -F "response_format=b64_json"
@@ -122,7 +123,8 @@ curl -sS -X POST "http://localhost:30010/v1/images/edits" \
 ```bash
 curl -sS -X POST "http://localhost:30010/v1/images/edits" \
   -H "Authorization: Bearer sk-proj-1234567890" \
-  -F "image=@input.png" \
+  -F "image=@local_input_image.png" \
+  -F "url=image_url.jpg" \
   -F "prompt=A calico cat playing a piano on stage" \
   -F "size=1024x1024" \
   -F "response_format=url"
@@ -246,6 +248,8 @@ Loads a LoRA adapter and merges its weights into the model.
 **Parameters:**
 - `lora_nickname` (string, required): A unique identifier for this LoRA
 - `lora_path` (string, optional): Path to the `.safetensors` file or Hugging Face repo ID. Required for the first load; optional if re-activating a cached nickname
+- `target` (string, optional): Which transformer(s) to apply the LoRA to. One of "all" (default), "transformer", "transformer_2", "critic"
+- `strength` (float, optional): LoRA strength for merge, default 1.0. Values < 1.0 reduce the effect, values > 1.0 amplify the effect
 
 **Curl Example:**
 
@@ -254,7 +258,8 @@ curl -X POST http://localhost:30010/v1/set_lora \
   -H "Content-Type: application/json" \
   -d '{
         "lora_nickname": "lora_name",
-        "lora_path": "/path/to/lora.safetensors"
+        "lora_path": "/path/to/lora.safetensors",
+        "strength": 0.8
       }'
 ```
 
@@ -268,11 +273,16 @@ Manually merges the currently set LoRA weights into the base model.
 
 **Endpoint:** `POST /v1/merge_lora_weights`
 
+**Parameters:**
+- `target` (string, optional): Which transformer(s) to merge. One of "all" (default), "transformer", "transformer_2", "critic"
+- `strength` (float, optional): LoRA strength for merge, default 1.0. Values < 1.0 reduce the effect, values > 1.0 amplify the effect
+
 **Curl Example:**
 
 ```bash
 curl -X POST http://localhost:30010/v1/merge_lora_weights \
-  -H "Content-Type: application/json"
+  -H "Content-Type: application/json" \
+  -d '{"strength": 0.8}'
 ```
 
 
@@ -288,6 +298,43 @@ Unmerges the currently active LoRA weights from the base model, restoring it to 
 curl -X POST http://localhost:30010/v1/unmerge_lora_weights \
   -H "Content-Type: application/json"
 ```
+
+#### List LoRA Adapters
+
+Returns loaded LoRA adapters and current application status per module.
+
+**Endpoint:** `GET /v1/list_loras`
+
+**Curl Example:**
+
+```bash
+curl -sS -X GET "http://localhost:30010/v1/list_loras"
+```
+
+**Response Example:**
+
+```json
+{
+  "loaded_adapters": [
+    { "nickname": "lora_a", "path": "/weights/lora_a.safetensors" },
+    { "nickname": "lora_b", "path": "/weights/lora_b.safetensors" }
+  ],
+  "active": {
+    "transformer": [
+      {
+        "nickname": "lora2",
+        "path": "tarn59/pixel_art_style_lora_z_image_turbo",
+        "merged": true,
+        "strength": 1.0
+      }
+    ]
+  }
+}
+```
+
+Notes:
+- If LoRA is not enabled for the current pipeline, the server will return an error.
+- `num_lora_layers_with_weights` counts only layers that have LoRA weights applied for the active adapter.
 
 ### Example: Switching LoRAs
 
