@@ -3607,7 +3607,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.view(torch.uint8).contiguous()
                 )
-                self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.view(torch.uint8).transpose(1, 2).contiguous())
+                self_attn.w_vc = bind_or_assign(
+                    self_attn.w_vc, w_vc.view(torch.uint8).transpose(1, 2).contiguous()
+                )
             elif not use_deep_gemm_bmm:
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)

@@ -192,7 +192,9 @@ def forward_mla_prepare_npu(
         k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
 
         if m.w_kc.dtype == torch.uint8:
-            q_nope_out = torch.ops.npu.fp8_w8a16_batch_matmul(q_nope.transpose(0, 1).contiguous(), m.w_kc, m.w_scale_k, "bf16")
+            q_nope_out = torch.ops.npu.fp8_w8a16_batch_matmul(
+                q_nope.transpose(0, 1).contiguous(), m.w_kc, m.w_scale_k, "bf16"
+            )
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
 
@@ -254,7 +256,9 @@ def forward_mla_core_npu(
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     if m.w_vc.dtype == torch.uint8:
-        attn_bmm_output = torch.ops.npu.fp8_w8a16_batch_matmul(attn_output.transpose(0, 1).contiguous(), m.w_vc, m.w_scale_v, "bf16")
+        attn_bmm_output = torch.ops.npu.fp8_w8a16_batch_matmul(
+            attn_output.transpose(0, 1).contiguous(), m.w_vc, m.w_scale_v, "bf16"
+        )
         attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
     else:
         attn_bmm_output = torch.empty(

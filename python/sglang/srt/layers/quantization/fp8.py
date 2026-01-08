@@ -99,7 +99,7 @@ if _use_aiter or _use_hip_int4:
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
-if _is_npu: 
+if _is_npu:
     import torch_npu
     import sgl_kernel_npu
 
@@ -399,8 +399,12 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight.data = weight.data
             layer.weight_scale_inv.data = weight_scale.data
             if _is_npu:
-                layer.weight.data = layer.weight.data.view(torch.uint8).transpose(-1,-2).contiguous()
-                layer.weight_scale_inv.data = layer.weight_scale_inv.data.transpose(-1,-2).contiguous()
+                layer.weight.data = (
+                    layer.weight.data.view(torch.uint8).transpose(-1, -2).contiguous()
+                )
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.transpose(
+                    -1, -2
+                ).contiguous()
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -812,10 +816,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
                 _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             elif _is_npu:
-                layer.w13_weight.data = layer.w13_weight.data.view(torch.uint8).transpose(1,2).contiguous()
-                layer.w2_weight.data = layer.w2_weight.data.view(torch.uint8).transpose(1,2).contiguous()
-                layer.w13_weight_scale_inv.data = layer.w13_weight_scale_inv.data.transpose(1, 2).contiguous()
-                layer.w2_weight_scale_inv.data = layer.w2_weight_scale_inv.data.transpose(1, 2).contiguous()
+                layer.w13_weight.data = (
+                    layer.w13_weight.data.view(torch.uint8).transpose(1, 2).contiguous()
+                )
+                layer.w2_weight.data = (
+                    layer.w2_weight.data.view(torch.uint8).transpose(1, 2).contiguous()
+                )
+                layer.w13_weight_scale_inv.data = (
+                    layer.w13_weight_scale_inv.data.transpose(1, 2).contiguous()
+                )
+                layer.w2_weight_scale_inv.data = (
+                    layer.w2_weight_scale_inv.data.transpose(1, 2).contiguous()
+                )
             else:
                 # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
                 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
@@ -1137,7 +1149,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             # TODO(cwan): refactor other backends
             pass
-    
+
+
     # fusedmoe
     def npu_fused_experts_fp8(
         self,
@@ -1153,7 +1166,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ):
         original_shape = hidden_states.shape
         original_dtype = hidden_states.dtype
-        scale_dtype = original_dtype if original_dtype == torch.bfloat16 else torch.float32
         if len(original_shape) == 3:
             hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         num_tokens = hidden_states.shape[0]
@@ -1167,7 +1179,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
         hidden_states, expanded_row_idx, expanded_expert_idx = (
             torch_npu.npu_moe_init_routing(
-                hidden_states, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
+                hidden_states,
+                row_idx=row_idx,
+                expert_idx=topk_ids,
+                active_num=num_tokens,
             )
         )
         expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
@@ -1176,7 +1191,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         expert_tokens = expert_tokens.to(torch.int64)
         # gmm1: gate_up_proj
         hidden_states = soft_fp8_blockfp8_gmm_npu(
-            input = hidden_states,
+            input=hidden_states,
             weight=w13,
             weight_scale=w13_weight_scale_inv,
             group_list=expert_tokens,
@@ -1186,7 +1201,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         hidden_states = torch_npu.npu_swiglu(hidden_states)
         # gmm2: down_proj
         hidden_states = soft_fp8_blockfp8_gmm_npu(
-            input = hidden_states,
+            input=hidden_states,
             weight=w2,
             weight_scale=w2_weight_scale_inv,
             group_list=expert_tokens,
@@ -1204,14 +1219,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if len(original_shape) == 3:
             final_hidden_states = final_hidden_states.view(original_shape)
         return final_hidden_states
-    
+
+
     # deepep
     def apply_without_routing_weights(
-            self,
-            layer,
-            hidden_states,
-            group_list,
-        ):
+        self,
+        layer,
+        hidden_states,
+        group_list,
+    ):
         expert_tokens = group_list.cumsum(dim=0).to(torch.int64)
         hidden_states = soft_fp8_blockfp8_gmm_npu(
             input=hidden_states,
@@ -1252,14 +1268,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             topk_weights = topk_weights.to(x.dtype)
 
             output = self.npu_fused_experts_fp8(
-                hidden_states = x,
-                w13 = layer.w13_weight,
-                w13_weight_scale_inv = layer.w13_weight_scale_inv,
-                w2 = layer.w2_weight,
-                w2_weight_scale_inv = layer.w2_weight_scale_inv,
-                topk_weights = topk_weights,
-                topk_ids =  topk_ids,
-                top_k = topk_ids.shape[1],
+                hidden_states=x,
+                w13=layer.w13_weight,
+                w13_weight_scale_inv=layer.w13_weight_scale_inv,
+                w2=layer.w2_weight,
+                w2_weight_scale_inv=layer.w2_weight_scale_inv,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                top_k=topk_ids.shape[1],
             )
 
             return StandardCombineInput(hidden_states=output)
