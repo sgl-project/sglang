@@ -21,7 +21,7 @@ async fn test_trigger_eviction_blind_spot() {
     let workers: Vec<Arc<dyn smg::core::Worker>> = vec![Arc::new(
         BasicWorkerBuilder::new(worker_url)
             .worker_type(WorkerType::Regular)
-            .model_id("test-model")
+            .model("test-model")
             .build(),
     )];
 
