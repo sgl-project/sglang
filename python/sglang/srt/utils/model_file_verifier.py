@@ -1,12 +1,19 @@
 """
 Model File Verifier - Verify model file integrity using SHA256 checksums.
 
-Example command:
+Example commands:
+    # Verify using HuggingFace model online metadata
     python -m sglang.srt.utils.model_file_verifier verify --model-path /path/to/model --model-checksum Qwen/Qwen3-0.6B
+
+    # Verify using locally generated checksum
+    python -m sglang.srt.utils.model_file_verifier generate --model-path <hf-id-or-model-path> --model-checksum checksums.json
+    python -m sglang.srt.utils.model_file_verifier verify --model-path /path/to/model --model-checksum checksums.json
 """
 
 import argparse
+import fnmatch
 import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -29,7 +36,7 @@ IGNORE_PATTERNS = [
 
 def verify(*, model_path: str, checksums_source: str, max_workers: int = 4) -> None:
     model_path = Path(model_path).resolve()
-    expected = _load_checksums_from_hf(repo_id=checksums_source)
+    expected = _load_checksums(checksums_source)
     actual = _compute_checksums_from_folder(
         model_path=model_path, filenames=list(expected.keys()), max_workers=max_workers
     )
@@ -51,7 +58,50 @@ def _compare_checksums(*, expected: Dict[str, str], actual: Dict[str, str]) -> N
         raise IntegrityError("Integrity check failed: " + "; ".join(errors))
 
 
+# ======== Generate ========
+
+
+def generate_checksums(
+    *, source: str, output_path: str, max_workers: int = 4
+) -> Dict[str, str]:
+    if Path(source).is_dir():
+        model_path = Path(source).resolve()
+        files = _discover_files(model_path)
+        if not files:
+            raise IntegrityError(f"No model files found in {model_path}")
+        checksums = _compute_checksums_from_folder(
+            model_path=model_path, filenames=files, max_workers=max_workers
+        )
+    else:
+        checksums = _load_checksums_from_hf(repo_id=source)
+
+    output = {"checksums": checksums}
+    Path(output_path).write_text(json.dumps(output, indent=2, sort_keys=True))
+
+    print(
+        f"[ModelFileVerifier] Generated checksums for {len(checksums)} files -> {output_path}"
+    )
+    return checksums
+
+
+def _discover_files(model_path: Path) -> List[str]:
+    return sorted(
+        e.name
+        for e in model_path.iterdir()
+        if e.is_file()
+        and not e.name.startswith(".")
+        and not any(fnmatch.fnmatch(e.name, p) for p in IGNORE_PATTERNS)
+    )
+
+
 # ======== Load Checksums ========
+
+
+def _load_checksums(source: str) -> Dict[str, str]:
+    if Path(source).is_file():
+        data = json.loads(Path(source).read_text())
+        return data["checksums"]
+    return _load_checksums_from_hf(repo_id=source)
 
 
 def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
@@ -72,8 +122,6 @@ def _load_checksums_from_hf(*, repo_id: str) -> Dict[str, str]:
 
 
 def _get_filename_and_checksum_from_hf_file(fs, file_info):
-    import fnmatch
-
     if file_info.get("type") != "file":
         return None
 
@@ -137,30 +185,54 @@ class IntegrityError(Exception):
 # ======== CLI ========
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Model File Verifier - Verify model file integrity using checksums"
-    )
+def _add_common_args(parser):
     parser.add_argument(
         "--model-path",
         required=True,
-        help="Local model directory",
+        help="Local model directory or HuggingFace repo ID",
     )
     parser.add_argument(
         "--model-checksum",
         required=True,
-        help="HuggingFace repo ID for checksums",
+        help="Checksums JSON file path",
     )
     parser.add_argument(
         "--workers", type=int, default=4, help="Number of parallel workers"
     )
 
-    args = parser.parse_args()
-    verify(
-        model_path=args.model_path,
-        checksums_source=args.model_checksum,
-        max_workers=args.workers,
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Model File Verifier - Verify model file integrity using checksums"
     )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    gen_parser = subparsers.add_parser(
+        "generate", help="Generate checksums.json for a model"
+    )
+    _add_common_args(gen_parser)
+    gen_parser.set_defaults(
+        func=lambda args: generate_checksums(
+            source=args.model_path,
+            output_path=args.model_checksum,
+            max_workers=args.workers,
+        )
+    )
+
+    verify_parser = subparsers.add_parser(
+        "verify", help="Verify model files against checksums"
+    )
+    _add_common_args(verify_parser)
+    verify_parser.set_defaults(
+        func=lambda args: verify(
+            model_path=args.model_path,
+            checksums_source=args.model_checksum,
+            max_workers=args.workers,
+        )
+    )
+
+    args = parser.parse_args()
+    args.func(args)
 
 
 if __name__ == "__main__":
