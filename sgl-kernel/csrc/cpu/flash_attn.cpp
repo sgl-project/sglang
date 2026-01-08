@@ -84,8 +84,7 @@ void flash_attn_kernel_impl(
     int tid = get_thread_num();
     // s_i and s_delta: [BLOCK_M, BLOCK_N]
     float* __restrict__ s_i = reinterpret_cast<float*>((char*)(buffer) + tid * buffer_size_per_thread);
-    float* __restrict__ s_delta = s_i;
-    scalar_t* __restrict__ s_delta2 = reinterpret_cast<scalar_t*>(s_i);
+    scalar_t* __restrict__ s_delta = reinterpret_cast<scalar_t*>(s_i);
 
     // v_prime: [BLOCK_M, head_size_v]
     float* __restrict__ v_prime = s_i + BLOCK_M * BLOCK_N;
@@ -159,7 +158,7 @@ void flash_attn_kernel_impl(
         }
 
         flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-            s_i, s_delta, s_delta2, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
 
         // get value and pack
         pack_vnni2<scalar_t>(
@@ -179,7 +178,7 @@ void flash_attn_kernel_impl(
             /* ldb   */ head_size_v,
             /* ldc   */ head_size_v,
             /* add_C */ true,
-            /* A     */ s_delta2,
+            /* A     */ s_delta,
             /* B     */ Btmp,
             /* C     */ v_prime);
       }  // loop with seqlen_k
@@ -264,8 +263,7 @@ void flash_attn_varlen_kernel_impl(
     int tid = get_thread_num();
     // s_i and s_delta: [BLOCK_M, BLOCK_N]
     float* __restrict__ s_i = reinterpret_cast<float*>((char*)(buffer) + tid * buffer_size_per_thread);
-    float* __restrict__ s_delta = s_i;
-    scalar_t* __restrict__ s_delta2 = reinterpret_cast<scalar_t*>(s_i);
+    scalar_t* __restrict__ s_delta = reinterpret_cast<scalar_t*>(s_i);
 
     // v_prime: [BLOCK_M, head_size_v]
     float* __restrict__ v_prime = s_i + BLOCK_M * BLOCK_N;
@@ -342,7 +340,7 @@ void flash_attn_varlen_kernel_impl(
         }
 
         flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-            s_i, s_delta, s_delta2, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
 
         // get value and pack
         pack_vnni2<scalar_t>(
@@ -362,7 +360,7 @@ void flash_attn_varlen_kernel_impl(
             /* ldb   */ head_size_v,
             /* ldc   */ head_size_v,
             /* add_C */ true,
-            /* A     */ s_delta2,
+            /* A     */ s_delta,
             /* B     */ Btmp,
             /* C     */ v_prime);
       }  // loop with seqlen_k
