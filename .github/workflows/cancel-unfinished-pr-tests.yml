@@ -43,7 +43,7 @@ jobs:
             gh run list \
               --repo "$REPO" \
               --workflow "$workflow_file" \
-              --json databaseId,status,event,url,headBranch \
+              --json databaseId,status,event,url,headSha \
               --limit 1000 \
             | jq -c '.[]
                 | select(.event=="pull_request" and (.status=="queued" or .status=="waiting" or .status=="in_progress"))' \
@@ -51,9 +51,17 @@ jobs:
                 run_id=$(echo "$run" | jq -r '.databaseId')
                 run_url=$(echo "$run" | jq -r '.url // empty')
                 head_branch=$(echo "$run" | jq -r '.headBranch // empty')
+                head_sha=$(echo "$run" | jq -r '.headSha // empty')
+                if [ -z "$head_sha" ]; then
+                  echo "⚠️ Run $run_id has no headSha, skipping ($run_url)"
+                  continue
+                fi
 
-                # Parse PR number from headBranch like "123/merge" or "pull/123/merge" or "refs/pull/123/merge"
-                pr_number=$(echo "$head_branch" | sed -nE 's#^(refs/)?pull/([0-9]+)/merge$#\2#p')
+                # Find PRs associated with this commit
+                pr_number=$(gh api -H "Accept: application/vnd.github+json" \
+                  "repos/$REPO/commits/$head_sha/pulls" \
+                  --jq 'map(select(.state=="open"))[0].number // .[0].number // empty' 2>/dev/null || true)
+
                 if [ -z "$pr_number" ]; then
                   pr_number=$(echo "$head_branch" | sed -nE 's#^([0-9]+)/merge$#\1#p')
                 fi
@@ -74,6 +82,6 @@ jobs:
                 fi
 
                 echo "🚫 Cancelling run $run_id (PR #$pr_number) $run_url"
-                gh run cancel "$run_id" --repo "$REPO" || echo "⚠️ Could not cancel run $run_id"
+                # gh run cancel "$run_id" --repo "$REPO" || echo "⚠️ Could not cancel run $run_id"
             done
           done
