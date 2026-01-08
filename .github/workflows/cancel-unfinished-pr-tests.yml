@@ -36,23 +36,57 @@ jobs:
           read -r -a WORKFLOW_FILES <<< "${WORKFLOWS}"
 
           echo "Targeting ${#WORKFLOW_FILES[@]} workflow(s): ${WORKFLOWS}"
+          echo ""
 
           for workflow_file in "${WORKFLOW_FILES[@]}"; do
-            echo "--- Checking workflow: $workflow_file ---"
+            echo "========================================="
+            echo "Workflow: $workflow_file"
+            echo "========================================="
 
-            gh run list \
+            # Get all unfinished runs
+            all_runs=$(gh run list \
               --repo "$REPO" \
               --workflow "$workflow_file" \
-              --json databaseId,status,event,url \
+              --json databaseId,status,event,url,createdAt \
               --limit 1000 \
-            | jq -c '.[]
-                | select(.event=="pull_request" and (.status=="queued" or .status=="waiting" or .status=="in_progress"))' \
-            | while read -r run; do
+            | jq -c '.[] | select(.status=="queued" or .status=="waiting" or .status=="in_progress")')
+
+            if [ -z "$all_runs" ]; then
+              echo "✅ No unfinished runs found"
+              echo ""
+              continue
+            fi
+
+            # Count runs by event type
+            total_runs=$(echo "$all_runs" | wc -l)
+            pr_runs=$(echo "$all_runs" | jq -s '[.[] | select(.event=="pull_request")] | length')
+            other_runs=$(echo "$all_runs" | jq -s '[.[] | select(.event!="pull_request")] | length')
+
+            echo "📊 Summary: $total_runs unfinished runs ($pr_runs PR-related, $other_runs other)"
+            echo ""
+
+            # Process non-PR runs first
+            if [ "$other_runs" -gt 0 ]; then
+              echo "--- Non-PR Runs ---"
+              echo "$all_runs" | jq -c 'select(.event!="pull_request")' | while read -r run; do
+                run_url=$(echo "$run" | jq -r '.url')
+                run_event=$(echo "$run" | jq -r '.event')
+                run_status=$(echo "$run" | jq -r '.status')
+                echo "  • $run_event ($run_status): $run_url"
+              done
+              echo ""
+            fi
+
+            # Process PR runs
+            if [ "$pr_runs" -gt 0 ]; then
+              echo "--- PR Runs (checking for cancellation) ---"
+              echo "$all_runs" | jq -c 'select(.event=="pull_request")' | while read -r run; do
                 run_id=$(echo "$run" | jq -r '.databaseId')
-                run_url=$(echo "$run" | jq -r '.url // empty')
+                run_url=$(echo "$run" | jq -r '.url')
+                run_status=$(echo "$run" | jq -r '.status')
 
                 echo ""
-                echo "Run: $run_url"
+                echo "Run ($run_status): $run_url"
 
                 # Fetch full run details to get head repository and branch info
                 run_details=$(gh api -H "Accept: application/vnd.github+json" \
@@ -98,5 +132,12 @@ jobs:
 
                 echo "  🚫 Cancelling..."
                 # gh run cancel "$run_id" --repo "$REPO" || echo "  ⚠️  Cancellation failed"
-            done
+              done
+            fi
+
+            echo ""
           done
+
+          echo "========================================="
+          echo "✅ Processing complete"
+          echo "========================================="
