@@ -398,7 +398,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
     def fast_pos_embed_interpolate(self, grid_thw):
         grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
-        num_grid_per_side = int(self.num_position_embeddings**0.5)
         device = self.pos_embed.weight.device
 
         idx_list = [[] for _ in range(4)]
@@ -409,8 +408,12 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
                 w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
             else:
-                h_idxs = (torch.arange(h, device=device) + 0.5) * (self.num_grid_per_side / h) - 0.5
-                w_idxs = (torch.arange(w, device=device) + 0.5) * (self.num_grid_per_side / w) - 0.5
+                h_idxs = (torch.arange(h, device=device) + 0.5) * (
+                    self.num_grid_per_side / h
+                ) - 0.5
+                w_idxs = (torch.arange(w, device=device) + 0.5) * (
+                    self.num_grid_per_side / w
+                ) - 0.5
                 h_idxs = h_idxs.clamp(0, self.num_grid_per_side - 1)
                 w_idxs = w_idxs.clamp(0, self.num_grid_per_side - 1)
 

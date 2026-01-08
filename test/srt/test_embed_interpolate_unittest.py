@@ -27,7 +27,7 @@ class TestEmbedInterpolate(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.pDevice = torch.get_default_device()
-        torch.set_default_device("cuda")
+        torch.set_default_device("npu")
 
     @classmethod
     def tearDownClass(cls):
@@ -37,7 +37,7 @@ class TestEmbedInterpolate(unittest.TestCase):
         self.assertTrue(issubclass(UnquantizedLinearMethod, LinearMethodBase))
         t_dim = [16, 32]
         s_dim = [192, 574]
-        sarg = ServerArgs(model_path="dummy", device="cuda")
+        sarg = ServerArgs(model_path="dummy", device="npu")
         mconf = Qwen3VLConfig(
             hidden_size=64,
             num_heads=1,
