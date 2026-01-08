@@ -14,30 +14,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 
 
-# ======== Test Utilities ========
-
-
-def create_test_file(directory: str, filename: str, content: bytes) -> str:
-    path = os.path.join(directory, filename)
-    with open(path, "wb") as f:
-        f.write(content)
-    return path
-
-
-def flip_bit_in_file(file_path: str, byte_offset: int = 100, bit_position: int = 0):
-    with open(file_path, "r+b") as f:
-        f.seek(byte_offset)
-        original_byte = f.read(1)
-        if not original_byte:
-            f.seek(0)
-            original_byte = f.read(1)
-            f.seek(0)
-        else:
-            f.seek(byte_offset)
-        flipped_byte = bytes([original_byte[0] ^ (1 << bit_position)])
-        f.write(flipped_byte)
-
-
 # ======== Unit Tests ========
 
 
@@ -51,7 +27,7 @@ class TestModelFileVerifier(unittest.TestCase):
             "tokenizer.json": b'{"version": "1.0"}',
         }
         for filename, content in self.files.items():
-            create_test_file(self.test_dir, filename, content)
+            _create_test_file(self.test_dir, filename, content)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
@@ -84,7 +60,7 @@ class TestModelFileVerifier(unittest.TestCase):
         verifier.generate_checksums()
 
         target_file = os.path.join(self.test_dir, "model.safetensors")
-        flip_bit_in_file(target_file, byte_offset=50, bit_position=3)
+        _flip_bit_in_file(target_file, byte_offset=50, bit_position=3)
 
         verifier2 = ModelFileVerifier(self.test_dir)
         with self.assertRaises(IntegrityError) as ctx:
@@ -140,7 +116,7 @@ class TestModelFileVerifier(unittest.TestCase):
 
     def test_parallel_checksum_computation(self):
         for i in range(10):
-            create_test_file(
+            _create_test_file(
                 self.test_dir, f"shard_{i}.safetensors", f"content_{i}".encode() * 1000
             )
 
@@ -161,8 +137,8 @@ class TestModelFileVerifierE2E(unittest.TestCase):
 
         test_dir = tempfile.mkdtemp()
         try:
-            create_test_file(test_dir, "model.safetensors", b"test content " * 100)
-            create_test_file(test_dir, "config.json", b'{"test": true}')
+            _create_test_file(test_dir, "model.safetensors", b"test content " * 100)
+            _create_test_file(test_dir, "config.json", b'{"test": true}')
 
             result = subprocess.run(
                 [
@@ -193,7 +169,7 @@ class TestModelFileVerifierE2E(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, f"Verify failed: {result.stderr}")
 
-            flip_bit_in_file(os.path.join(test_dir, "model.safetensors"))
+            _flip_bit_in_file(os.path.join(test_dir, "model.safetensors"))
 
             result = subprocess.run(
                 [
@@ -220,8 +196,8 @@ class TestModelFileVerifierE2E(unittest.TestCase):
 
         test_dir = tempfile.mkdtemp()
         try:
-            create_test_file(test_dir, "model.safetensors", b"test content " * 100)
-            create_test_file(test_dir, "config.json", b'{"test": true}')
+            _create_test_file(test_dir, "model.safetensors", b"test content " * 100)
+            _create_test_file(test_dir, "config.json", b'{"test": true}')
 
             checksums_path = os.path.join(test_dir, "my_checksums.json")
             result = subprocess.run(
@@ -258,6 +234,9 @@ class TestModelFileVerifierE2E(unittest.TestCase):
 
         finally:
             shutil.rmtree(test_dir, ignore_errors=True)
+
+
+# ======== Real Model E2E Tests ========
 
 
 class TestModelFileVerifierWithRealModel(unittest.TestCase):
@@ -321,7 +300,7 @@ class TestModelFileVerifierWithRealModel(unittest.TestCase):
         ]
         self.assertTrue(len(safetensors_files) > 0, "No safetensors files found")
         target_file = os.path.join(self.test_dir, safetensors_files[0])
-        flip_bit_in_file(target_file, byte_offset=1000, bit_position=5)
+        _flip_bit_in_file(target_file, byte_offset=1000, bit_position=5)
 
         _, host, port = DEFAULT_URL_FOR_TEST.split(":")
         host = host[2:]
@@ -351,6 +330,30 @@ class TestModelFileVerifierWithRealModel(unittest.TestCase):
             or "mismatch" in combined_output.lower(),
             f"Expected integrity error, got: {combined_output[-500:]}",
         )
+
+
+# ======== Test Utilities ========
+
+
+def _create_test_file(directory: str, filename: str, content: bytes) -> str:
+    path = os.path.join(directory, filename)
+    with open(path, "wb") as f:
+        f.write(content)
+    return path
+
+
+def _flip_bit_in_file(file_path: str, byte_offset: int = 100, bit_position: int = 0):
+    with open(file_path, "r+b") as f:
+        f.seek(byte_offset)
+        original_byte = f.read(1)
+        if not original_byte:
+            f.seek(0)
+            original_byte = f.read(1)
+            f.seek(0)
+        else:
+            f.seek(byte_offset)
+        flipped_byte = bytes([original_byte[0] ^ (1 << bit_position)])
+        f.write(flipped_byte)
 
 
 if __name__ == "__main__":
