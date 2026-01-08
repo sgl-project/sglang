@@ -1,6 +1,8 @@
 name: Cancel Unfinished PR Tests
 
 on:
+  pull_request:
+    types: [synchronize]
   workflow_dispatch:
     inputs:
       workflows:
