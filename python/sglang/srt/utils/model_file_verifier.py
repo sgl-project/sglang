@@ -10,7 +10,6 @@ As a module:
 """
 
 import argparse
-import fnmatch
 import hashlib
 import json
 import os
@@ -18,24 +17,14 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple
 
-DEFAULT_PATTERNS = [
-    "*.safetensors",
-    "*.bin",
-    "*.json",
-    "*.model",
-    "*.tiktoken",
-    "*.txt",
+IGNORE_PATTERNS = [
+    "checksums.json",
+    ".DS_Store",
+    "*.lock",
 ]
 
 
-# ======== Exceptions ========
-
-
-class IntegrityError(Exception):
-    pass
-
-
-# ======== Core Functions ========
+# ======== Verify ========
 
 
 def verify(model_path: str, checksums_source: str, max_workers: int = 4) -> None:
@@ -77,6 +66,9 @@ def verify(model_path: str, checksums_source: str, max_workers: int = 4) -> None
     print(f"[ModelFileVerifier] All {len(expected)} files verified successfully.")
 
 
+# ======== Generate ========
+
+
 def generate_checksums(
     model_path: str, output_path: str, max_workers: int = 4
 ) -> Dict[str, str]:
@@ -97,7 +89,23 @@ def generate_checksums(
     return checksums
 
 
-# ======== Helper Functions ========
+def _discover_files(model_path: str) -> List[str]:
+    import fnmatch
+
+    files = []
+    for entry in os.listdir(model_path):
+        if entry.startswith("."):
+            continue
+        full_path = os.path.join(model_path, entry)
+        if not os.path.isfile(full_path):
+            continue
+        if any(fnmatch.fnmatch(entry, pat) for pat in IGNORE_PATTERNS):
+            continue
+        files.append(entry)
+    return sorted(files)
+
+
+# ======== Load Checksums ========
 
 
 def _load_checksums(source: str) -> Dict[str, str]:
@@ -150,19 +158,7 @@ def _load_checksums_from_hf(repo_id: str) -> Dict[str, str]:
     return checksums
 
 
-def _discover_files(model_path: str) -> List[str]:
-    files = []
-    for entry in os.listdir(model_path):
-        if entry.startswith("."):
-            continue
-        full_path = os.path.join(model_path, entry)
-        if not os.path.isfile(full_path):
-            continue
-        for pattern in DEFAULT_PATTERNS:
-            if fnmatch.fnmatch(entry, pattern):
-                files.append(entry)
-                break
-    return sorted(files)
+# ======== Compute Checksums ========
 
 
 def _compute_checksums(
@@ -200,6 +196,13 @@ def compute_sha256(file_path: str) -> str:
         while chunk := f.read(64 * 1024):
             sha256.update(chunk)
     return sha256.hexdigest()
+
+
+# ======== Exceptions ========
+
+
+class IntegrityError(Exception):
+    pass
 
 
 # ======== CLI ========
