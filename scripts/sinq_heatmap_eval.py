@@ -34,6 +34,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
 import traceback
 
 import torch
@@ -95,6 +96,135 @@ QUICK_PROMPTS = [
 
 
 # ============================================================================
+# MANIFOLD ZONE CLASSIFICATION
+# ============================================================================
+
+# Manifold zones based on attention distance distribution
+ManifoldZone = str  # Type alias: 'syntax_floor' | 'semantic_bridge' | 'long_range' | 'structure_ripple' | 'diffuse' | 'unknown'
+
+MANIFOLD_ZONES = ['syntax_floor', 'semantic_bridge', 'long_range', 'structure_ripple', 'diffuse', 'unknown']
+
+
+@dataclass
+class AttentionFingerprint:
+    """Fingerprint computed from attention positions and scores."""
+    local_mass: float    # Attention on nearby tokens (distance 0-32)
+    mid_mass: float      # Attention on mid-range tokens (distance 33-256)
+    long_mass: float     # Attention on distant tokens (distance 257+)
+    entropy: float       # Distribution entropy
+    histogram: List[float] = field(default_factory=list)  # Distance histogram
+
+
+def compute_fingerprint(
+    positions: List[int],
+    scores: List[float],
+    current_pos: int,
+) -> AttentionFingerprint:
+    """
+    Compute attention fingerprint from positions and scores.
+
+    Distance bands:
+    - Local: 0-32 tokens (syntax/immediate context)
+    - Mid: 33-256 tokens (semantic/paragraph level)
+    - Long: 257+ tokens (document-level/cross-context)
+    """
+    if not positions or not scores:
+        return AttentionFingerprint(
+            local_mass=0.0,
+            mid_mass=0.0,
+            long_mass=0.0,
+            entropy=0.0,
+            histogram=[0.0] * 16,
+        )
+
+    # Compute distance histogram (16 bins, log-scale)
+    histogram = [0.0] * 16
+    local_mass = 0.0
+    mid_mass = 0.0
+    long_mass = 0.0
+    total_mass = sum(scores)
+
+    if total_mass == 0:
+        return AttentionFingerprint(
+            local_mass=0.0,
+            mid_mass=0.0,
+            long_mass=0.0,
+            entropy=0.0,
+            histogram=histogram,
+        )
+
+    for pos, score in zip(positions, scores):
+        distance = max(1, current_pos - pos)
+
+        # Distance bands
+        if distance <= 32:
+            local_mass += score
+        elif distance <= 256:
+            mid_mass += score
+        else:
+            long_mass += score
+
+        # Log-scale histogram bin
+        bin_idx = min(15, int(np.log2(distance)))
+        histogram[bin_idx] += score
+
+    # Normalize
+    local_mass /= total_mass
+    mid_mass /= total_mass
+    long_mass /= total_mass
+    histogram = [h / total_mass for h in histogram]
+
+    # Compute entropy
+    entropy = 0.0
+    for score in scores:
+        if score > 0:
+            p = score / total_mass
+            entropy -= p * np.log2(p + 1e-10)
+
+    return AttentionFingerprint(
+        local_mass=local_mass,
+        mid_mass=mid_mass,
+        long_mass=long_mass,
+        entropy=entropy,
+        histogram=histogram,
+    )
+
+
+def classify_manifold_zone(fp: AttentionFingerprint) -> ManifoldZone:
+    """
+    Classify attention fingerprint into a manifold zone.
+
+    Zones:
+    - syntax_floor: High local attention (formatting, JSON, code syntax)
+    - semantic_bridge: High mid-range attention (retrieval, semantic connections)
+    - long_range: High long-range attention (document planning, cross-context)
+    - structure_ripple: Periodic patterns (code blocks, lists)
+    - diffuse: Distributed attention (creative, exploratory)
+    """
+    if fp.local_mass > 0.5:
+        return 'syntax_floor'
+    if fp.mid_mass > 0.4:
+        return 'semantic_bridge'
+    if fp.long_mass > 0.35:
+        return 'long_range'
+    if fp.entropy < 2.0 and fp.local_mass > 0.3:
+        return 'structure_ripple'
+    if fp.entropy > 3.5:
+        return 'diffuse'
+    return 'diffuse'  # Default
+
+
+def compute_zone_from_topk(
+    positions: List[int],
+    scores: List[float],
+    current_pos: int,
+) -> ManifoldZone:
+    """Compute manifold zone from top-k attention positions."""
+    fp = compute_fingerprint(positions, scores, current_pos)
+    return classify_manifold_zone(fp)
+
+
+# ============================================================================
 # METRICS COMPUTATION
 # ============================================================================
 
@@ -121,6 +251,10 @@ class PromptMetrics:
     mass_retained: float
     kl_divergence: float
     output_match: bool
+    # Manifold zone tracking
+    baseline_zone: ManifoldZone = 'unknown'
+    candidate_zone: ManifoldZone = 'unknown'
+    zone_drift: bool = False
     per_step_jaccard: List[float] = field(default_factory=list)
 
 
@@ -139,6 +273,9 @@ class ConfigResult:
     mean_mass_retained: float = 0.0
     mean_kl_divergence: float = 0.0
     output_match_rate: float = 0.0
+    # Manifold analysis
+    zone_drift_rate: float = 0.0
+    zone_transition_matrix: Dict[str, Dict[str, int]] = field(default_factory=dict)
     # Existing fields
     compression_ratio: float = 0.0
     bf16_memory_mb: float = 0.0
@@ -518,6 +655,26 @@ class SINQEvaluator:
                         )
                         step_metrics.append(step_m)
 
+                # Compute manifold zones from aggregated attention
+                # We use the middle step as representative (or all steps averaged)
+                baseline_zone = 'unknown'
+                candidate_zone = 'unknown'
+
+                if min_len > 0:
+                    # Aggregate all positions/scores across steps for zone classification
+                    # Use mid-point step for zone classification
+                    mid_step = min_len // 2
+                    bf16_positions, bf16_scores = bf16_topk_steps[mid_step]
+                    quant_positions, quant_scores = quant_topk_steps[mid_step]
+
+                    # Current position is approximately input_len + step
+                    current_pos = input_len + mid_step
+
+                    baseline_zone = compute_zone_from_topk(bf16_positions, bf16_scores, current_pos)
+                    candidate_zone = compute_zone_from_topk(quant_positions, quant_scores, current_pos)
+
+                zone_drift = baseline_zone != candidate_zone
+
                 # Aggregate step metrics
                 if step_metrics:
                     jaccards = [m.jaccard for m in step_metrics]
@@ -537,6 +694,9 @@ class SINQEvaluator:
                         mass_retained=float(np.mean(mass_retaineds)),
                         kl_divergence=float(np.mean(kl_divs)),
                         output_match=(bf16_response.strip() == quant_response.strip()),
+                        baseline_zone=baseline_zone,
+                        candidate_zone=candidate_zone,
+                        zone_drift=zone_drift,
                         per_step_jaccard=jaccards,
                     )
                 else:
@@ -550,11 +710,15 @@ class SINQEvaluator:
                         mass_retained=0.0,
                         kl_divergence=0.0,
                         output_match=False,
+                        baseline_zone=baseline_zone,
+                        candidate_zone=candidate_zone,
+                        zone_drift=zone_drift,
                     )
 
                 prompt_metrics_list.append(pm)
+                drift_marker = " [DRIFT]" if zone_drift else ""
                 print(f"  Prompt '{prompt[:30]}...': J={pm.jaccard:.3f} wJ={pm.weighted_jaccard:.3f} "
-                      f"ρ={pm.spearman:.3f} mass={pm.mass_retained:.3f}")
+                      f"ρ={pm.spearman:.3f} zone={baseline_zone}->{candidate_zone}{drift_marker}")
 
             # Cleanup
             del model_to_quant
@@ -571,6 +735,17 @@ class SINQEvaluator:
             all_kl = [pm.kl_divergence for pm in prompt_metrics_list]
             all_matches = [pm.output_match for pm in prompt_metrics_list]
 
+            # Compute zone drift rate and transition matrix
+            drift_count = sum(1 for pm in prompt_metrics_list if pm.zone_drift)
+            zone_drift_rate = drift_count / len(prompt_metrics_list) if prompt_metrics_list else 0.0
+
+            # Build zone transition matrix
+            zone_transition_matrix: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+            for pm in prompt_metrics_list:
+                zone_transition_matrix[pm.baseline_zone][pm.candidate_zone] += 1
+            # Convert to regular dict for serialization
+            zone_transition_dict = {k: dict(v) for k, v in zone_transition_matrix.items()}
+
             return ConfigResult(
                 config=config,
                 mean_jaccard=float(np.mean(all_jaccards)),
@@ -583,6 +758,8 @@ class SINQEvaluator:
                 mean_mass_retained=float(np.mean(all_mass)),
                 mean_kl_divergence=float(np.mean(all_kl)),
                 output_match_rate=sum(all_matches) / len(all_matches) if all_matches else 0.0,
+                zone_drift_rate=zone_drift_rate,
+                zone_transition_matrix=zone_transition_dict,
                 compression_ratio=compression_ratio,
                 bf16_memory_mb=self.bf16_memory,
                 quant_memory_mb=quant_memory,
@@ -912,6 +1089,9 @@ def save_results(results: List[ConfigResult], output_dir: Path):
                 "mean_mass_retained": r.mean_mass_retained,
                 "mean_kl_divergence": r.mean_kl_divergence,
                 "output_match_rate": r.output_match_rate,
+                # Manifold analysis
+                "zone_drift_rate": r.zone_drift_rate,
+                "zone_transition_matrix": r.zone_transition_matrix,
                 # Compression
                 "compression_ratio": r.compression_ratio,
                 "bf16_memory_mb": r.bf16_memory_mb,
@@ -932,6 +1112,9 @@ def save_results(results: List[ConfigResult], output_dir: Path):
                         "mass_retained": pm.mass_retained,
                         "kl_divergence": pm.kl_divergence,
                         "output_match": pm.output_match,
+                        "baseline_zone": pm.baseline_zone,
+                        "candidate_zone": pm.candidate_zone,
+                        "zone_drift": pm.zone_drift,
                         "per_step_jaccard": pm.per_step_jaccard,
                     }
                     for pm in r.per_prompt_metrics
@@ -1009,6 +1192,30 @@ def print_summary(results: List[ConfigResult], total_time: float):
         print(f"  Degraded (≥20%):  {len(degraded):>3} configs")
         print(f"  Failed (<20%):    {len(failed):>3} configs")
 
+        # Manifold zone drift analysis
+        print("\n" + "-"*90)
+        print("MANIFOLD ZONE DRIFT ANALYSIS")
+        print("-"*90)
+        drift_rates = [r.zone_drift_rate for r in valid]
+        avg_drift = np.mean(drift_rates) if drift_rates else 0.0
+        min_drift = np.min(drift_rates) if drift_rates else 0.0
+        max_drift = np.max(drift_rates) if drift_rates else 0.0
+        no_drift_configs = [r for r in valid if r.zone_drift_rate == 0.0]
+        high_drift_configs = [r for r in valid if r.zone_drift_rate > 0.5]
+
+        print(f"  Average zone drift rate: {avg_drift:.1%}")
+        print(f"  Min drift:               {min_drift:.1%}")
+        print(f"  Max drift:               {max_drift:.1%}")
+        print(f"  Configs with no drift:   {len(no_drift_configs)}")
+        print(f"  Configs with >50% drift: {len(high_drift_configs)}")
+
+        # Top 5 by lowest zone drift (stable manifold behavior)
+        sorted_by_drift = sorted(valid, key=lambda x: x.zone_drift_rate)
+        if sorted_by_drift:
+            print("\n  Top 5 most stable (lowest zone drift):")
+            for r in sorted_by_drift[:5]:
+                print(f"    {r.config.name:<30} drift={r.zone_drift_rate:.1%} jaccard={r.mean_jaccard:.3f}")
+
         # Best trade-off (highest Jaccard with compression > 2x)
         good_compression = [r for r in valid if r.compression_ratio >= 2.0]
         if good_compression:
@@ -1022,6 +1229,7 @@ def print_summary(results: List[ConfigResult], total_time: float):
             print(f"  Mass Retained:   {best_tradeoff.mean_mass_retained:.3f}")
             print(f"  KL Divergence:   {best_tradeoff.mean_kl_divergence:.3f}")
             print(f"  Output Match:    {best_tradeoff.output_match_rate:.1%}")
+            print(f"  Zone Drift:      {best_tradeoff.zone_drift_rate:.1%}")
             print(f"  Compression:     {best_tradeoff.compression_ratio:.2f}x")
             print(f"  Memory:          {best_tradeoff.quant_memory_mb:.0f} MB")
             print(f"{'='*90}")
@@ -1079,6 +1287,11 @@ def export_schema_v1(
             "mass_retained": pm.mass_retained,
             "kl_divergence": pm.kl_divergence,
             "output_match": pm.output_match,
+            "manifold_zone": {
+                "baseline": pm.baseline_zone,
+                "candidate": pm.candidate_zone,
+                "drift": pm.zone_drift,
+            },
             "per_step_jaccard": pm.per_step_jaccard,
         })
 
@@ -1142,6 +1355,11 @@ def export_schema_v1(
                 },
                 "output_agreement": {
                     "exact_match_rate": result.output_match_rate,
+                },
+                "manifold_analysis": {
+                    "zone_drift_rate": result.zone_drift_rate,
+                    "zone_transition_matrix": result.zone_transition_matrix,
+                    "zones": MANIFOLD_ZONES,
                 },
                 "compression_ratio": result.compression_ratio,
                 "quality_tier": classify_quality_tier(result.mean_jaccard),
