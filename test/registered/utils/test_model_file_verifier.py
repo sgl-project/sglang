@@ -293,15 +293,9 @@ def _create_test_file(directory: str, filename: str, content: bytes) -> str:
 def _flip_bit_in_file(file_path: str, byte_offset: int = 100, bit_position: int = 0):
     with open(file_path, "r+b") as f:
         f.seek(byte_offset)
-        original_byte = f.read(1)
-        if not original_byte:
-            f.seek(0)
-            original_byte = f.read(1)
-            f.seek(0)
-        else:
-            f.seek(byte_offset)
-        flipped_byte = bytes([original_byte[0] ^ (1 << bit_position)])
-        f.write(flipped_byte)
+        original_byte = f.read(1)[0]
+        f.seek(byte_offset)
+        f.write(bytes([original_byte ^ (1 << bit_position)]))
 
 
 if __name__ == "__main__":
