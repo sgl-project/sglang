@@ -35,11 +35,11 @@ class FileInfo:
 
 
 @dataclass
-class ChecksumFile:
+class Manifest:
     files: Dict[str, FileInfo]
 
     @classmethod
-    def from_dict(cls, data: dict) -> "ChecksumFile":
+    def from_dict(cls, data: dict) -> "Manifest":
         if "checksums" in data:
             warnings.warn(
                 "The 'checksums' format is deprecated. "
@@ -109,7 +109,7 @@ def _compare_checksums(*, expected: Dict[str, str], actual: Dict[str, str]) -> N
 
 def generate_checksums(
     *, source: str, output_path: str, max_workers: int = 4
-) -> ChecksumFile:
+) -> Manifest:
     if Path(source).is_dir():
         model_path = Path(source).resolve()
         files = _discover_files(model_path)
@@ -121,15 +121,13 @@ def generate_checksums(
     else:
         file_infos = _load_file_infos_from_hf(repo_id=source)
 
-    checksum_file = ChecksumFile(files=file_infos)
-    Path(output_path).write_text(
-        json.dumps(checksum_file.to_dict(), indent=2, sort_keys=True)
-    )
+    manifest = Manifest(files=file_infos)
+    Path(output_path).write_text(json.dumps(manifest.to_dict(), indent=2, sort_keys=True))
 
     print(
         f"[ModelFileVerifier] Generated checksums for {len(file_infos)} files -> {output_path}"
     )
-    return checksum_file
+    return manifest
 
 
 def _discover_files(model_path: Path) -> List[str]:
@@ -145,11 +143,11 @@ def _discover_files(model_path: Path) -> List[str]:
 # ======== Load Checksums ========
 
 
-def _load_checksums(source: str) -> ChecksumFile:
+def _load_checksums(source: str) -> Manifest:
     if Path(source).is_file():
         data = json.loads(Path(source).read_text())
-        return ChecksumFile.from_dict(data)
-    return ChecksumFile(files=_load_file_infos_from_hf(repo_id=source))
+        return Manifest.from_dict(data)
+    return Manifest(files=_load_file_infos_from_hf(repo_id=source))
 
 
 def _load_file_infos_from_hf(*, repo_id: str) -> Dict[str, FileInfo]:
