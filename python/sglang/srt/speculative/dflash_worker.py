@@ -55,8 +55,23 @@ class DFlashWorker:
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_server_args.disable_cuda_graph = True
-        # Force FA3 for draft (Hopper-friendly, and supports ENCODER_ONLY attention).
-        draft_server_args.attention_backend = "fa3"
+        draft_backend = draft_server_args.speculative_draft_attention_backend
+        if draft_backend is None:
+            draft_backend, _ = draft_server_args.get_attention_backends()
+        if draft_backend is None:
+            draft_backend = "flashinfer"
+        if draft_backend not in ("flashinfer", "fa3"):
+            raise ValueError(
+                "DFLASH draft worker only supports attention_backend in {'flashinfer', 'fa3'} for now, "
+                f"but got {draft_backend!r}. "
+                "Use `--speculative-draft-attention-backend` to override the draft backend."
+            )
+
+        # Make the draft worker backend explicit and self-contained (no further overrides).
+        draft_server_args.speculative_draft_attention_backend = None
+        draft_server_args.prefill_attention_backend = None
+        draft_server_args.decode_attention_backend = None
+        draft_server_args.attention_backend = draft_backend
         # Keep draft context length aligned with the target.
         draft_server_args.context_length = target_worker.model_runner.model_config.context_len
         self.native_draft_worker = TpModelWorker(
