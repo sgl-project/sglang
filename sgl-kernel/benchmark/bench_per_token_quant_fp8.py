@@ -73,10 +73,20 @@ def vllm_per_token_quant_fp8(
 
 def sglang_per_token_quant_fp8(
     input: torch.Tensor,
+    use_smem_cache: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SGLang per-token FP8 quantization with shared memory control.
+    
+    Args:
+        input: Input tensor (float16/bfloat16)
+        use_smem_cache: Whether to use shared memory caching (default True)
+    
+    Returns:
+        Tuple of (quantized output, scale)
+    """
     scale = torch.zeros(input.size(0), device=input.device, dtype=torch.float32)
     output = torch.empty_like(input, device=input.device, dtype=fp8_type_)
-    sgl_per_token_quant_fp8(input, output, scale)
+    sgl_per_token_quant_fp8(input, output, scale, use_smem_cache)
 
     return output, scale
 
@@ -174,17 +184,17 @@ configs = list(itertools.product(batch_size_range, seq_len_range, hidden_dim_ran
         x_vals=configs,
         line_arg="provider",
         line_vals=(
-            ["torch", "vllm", "sglang"] if VLLM_AVAILABLE else ["torch", "sglang"]
+            ["torch", "vllm", "sglang_smem", "sglang_no_smem"] if VLLM_AVAILABLE else ["torch", "sglang_smem", "sglang_no_smem"]
         ),
         line_names=(
-            ["Torch Reference", "VLLM", "SGL Kernel"]
+            ["Torch Reference", "VLLM", "SGL Kernel (With SMEM)", "SGL Kernel (Without SMEM)"]
             if VLLM_AVAILABLE
-            else ["Torch Reference", "SGL Kernel"]
+            else ["Torch Reference", "SGL Kernel (With SMEM)", "SGL Kernel (Without SMEM)"]
         ),
         styles=(
-            [("red", "-"), ("blue", "-"), ("green", "-")]
+            [("red", "-"), ("blue", "-"), ("green", "-"), ("green", "--")]
             if VLLM_AVAILABLE
-            else [("red", "-"), ("green", "-")]
+            else [("red", "-"), ("green", "-"), ("green", "--")]
         ),
         ylabel="us",
         plot_name="per-token-dynamic-quant-fp8-performance",
@@ -205,8 +215,12 @@ def benchmark_quantization(batch_size, seq_len, hidden_dim, provider):
         if not VLLM_AVAILABLE:
             return (0, 0, 0)
         fn = lambda: vllm_per_token_quant_fp8(x.clone())
-    elif provider == "sglang":
-        fn = lambda: sglang_per_token_quant_fp8(x.clone())
+    elif provider == "sglang_smem":
+        fn = lambda: sglang_per_token_quant_fp8(x.clone(), use_smem_cache=True)
+    elif provider == "sglang_no_smem":
+        fn = lambda: sglang_per_token_quant_fp8(x.clone(), use_smem_cache=False)
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
 
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
 
