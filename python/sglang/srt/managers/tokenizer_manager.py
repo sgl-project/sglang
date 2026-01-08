@@ -116,6 +116,8 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
+_REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+
 logger = logging.getLogger(__name__)
 
 
@@ -345,6 +347,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             log_requests=self.server_args.log_requests,
             log_requests_level=self.server_args.log_requests_level,
             log_requests_format=self.server_args.log_requests_format,
+            log_requests_target=self.server_args.log_requests_target,
         )
 
         # Dumping
@@ -483,7 +486,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self._attach_multi_http_worker_info(obj)
 
         # Log the request
-        self.request_logger.log_received_request(obj, self.tokenizer)
+        self.request_logger.log_received_request(obj, self.tokenizer, request)
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
@@ -1080,7 +1083,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         is_stream = getattr(obj, "stream", False)
         while True:
             try:
-                await asyncio.wait_for(state.event.wait(), timeout=4)
+                await asyncio.wait_for(
+                    state.event.wait(), timeout=_REQUEST_STATE_WAIT_TIMEOUT
+                )
             except asyncio.TimeoutError:
                 if (
                     request is not None
@@ -1107,7 +1112,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         "response_sent_to_client_ts"
                     ] = state.response_sent_to_client_ts
                 self.request_logger.log_finished_request(
-                    obj, out, is_multimodal_gen=self.model_config.is_multimodal_gen
+                    obj,
+                    out,
+                    is_multimodal_gen=self.model_config.is_multimodal_gen,
+                    request=request,
                 )
 
                 if self.request_metrics_exporter_manager.exporter_enabled():
@@ -1651,7 +1659,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if recv_obj.input_token_logprobs_val is None:
             return
 
-        if len(recv_obj.input_token_logprobs_val) > 0:
+        if (
+            len(recv_obj.input_token_logprobs_val) > 0
+            and recv_obj.input_token_logprobs_val[recv_obj_index] is not None
+        ):
             state.input_token_logprobs_val.extend(
                 recv_obj.input_token_logprobs_val[recv_obj_index]
             )

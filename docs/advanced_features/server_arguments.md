@@ -231,7 +231,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--max-loras-per-batch` | Maximum number of adapters for a running batch, including base-only requests. | `8` | Type: int |
 | `--max-loaded-loras` | If specified, limits the maximum number of LoRA adapters loaded in CPU memory at a time. Must be ≥ `--max-loras-per-batch`. | `None` | Type: int |
 | `--lora-eviction-policy` | LoRA adapter eviction policy when the GPU memory pool is full. | `lru` | `lru`, `fifo` |
-| `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | `triton` | `triton`, `csgmv` |
+| `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | `csgmv` | `triton`, `csgmv` |
 | `--max-lora-chunk-size` | Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when `--lora-backend` is `csgmv`. Larger values may improve performance. | `16` | `16`, `32`, `64`, `128` |
 
 ## Kernel Backends (Attention, Sampling, Grammar, GEMM)
@@ -404,6 +404,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-layerwise-nvtx-marker` | Enable layerwise NVTX profiling annotations for the model. This adds NVTX markers to every layer for detailed per-layer performance analysis with Nsight Systems. | `False` | bool flag (set to enable) |
 | `--enable-attn-tp-input-scattered` | Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.                                                                                                      | `False`  | bool flag (set to enable) |
 | `--enable-nsa-prefill-context-parallel` | Context parallelism used in the long sequence prefill phase of DeepSeek v3.2 | `False` | bool flag (set to enable) |
+| `--nsa-prefill-cp-mode` | Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: `in-seq-split` (default), `round-robin-split`. `round-robin-split` distributes tokens across ranks based on `token_idx % cp_size`. It supports multi-batch prefill, fused MoE, and FP8 KV cache.      | `in-seq-split`      | Type: str                 |
 
 ## Forward hooks
 | Argument | Description | Defaults | Options |
