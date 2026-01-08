@@ -33,15 +33,20 @@ def _is_qwen3_reranker_template(chat_template: str) -> bool:
 
 
 def _is_qwen3_vl_reranker_template(chat_template: str) -> bool:
-    """Detect if the chat template is for Qwen3-VL multimodal reranker."""
+    """Detect if the chat template is for Qwen3-VL multimodal reranker.
+
+    VL reranker templates use `query` and `document` as jinja variables
+    and include vision token placeholders for image/video support.
+    """
     if not chat_template:
         return False
     t = chat_template.lower()
-    # VL reranker template includes both reranker phrases and vision token placeholders
+    # Check for reranker phrase (yes/no judgment)
     has_reranker_phrase = ('answer can only be "yes" or "no"' in t) or (
         "answer can only be" in t and '"yes"' in t and '"no"' in t
     )
-    has_vision_tokens = "<query>" in t and "<document>" in t
+    # Check for vision token placeholders (unique to VL templates)
+    has_vision_tokens = "<|vision_start|>" in t or "<|image_pad|>" in t
     return has_reranker_phrase and has_vision_tokens
 
 
