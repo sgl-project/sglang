@@ -26,7 +26,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
@@ -46,30 +45,17 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.utils import (
+    _is_cpu,
+    _is_cpu_amx_available,
+    _is_cuda,
+    _is_fp8_fnuz,
+    _is_hip,
+    _is_npu,
+    _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
 )
-from sglang.srt.utils import (
-    bind_or_assign,
-    cpu_has_amx_support,
-    get_bool_env_var,
-    is_cpu,
-    is_cuda,
-    is_gfx95_supported,
-    is_hip,
-    is_npu,
-    log_info_on_rank0,
-)
-
-_is_npu = is_npu()
-_is_cuda = is_cuda()
-_is_cpu = is_cpu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_hip = is_hip()
-_is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_is_gfx95_supported = is_gfx95_supported()
-_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
