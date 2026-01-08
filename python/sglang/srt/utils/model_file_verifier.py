@@ -105,17 +105,16 @@ def generate_checksums(
         files = _discover_files(model_path)
         if not files:
             raise IntegrityError(f"No model files found in {model_path}")
-        file_infos = _compute_file_infos_from_folder(
+        manifest = _compute_manifest_from_folder(
             model_path=model_path, filenames=files, max_workers=max_workers
         )
     else:
-        file_infos = _load_file_infos_from_hf(repo_id=source)
+        manifest = Manifest(files=_load_file_infos_from_hf(repo_id=source))
 
-    manifest = Manifest(files=file_infos)
     Path(output_path).write_text(json.dumps(manifest.to_dict(), indent=2, sort_keys=True))
 
     print(
-        f"[ModelFileVerifier] Generated checksums for {len(file_infos)} files -> {output_path}"
+        f"[ModelFileVerifier] Generated checksums for {len(manifest.files)} files -> {output_path}"
     )
     return manifest
 
