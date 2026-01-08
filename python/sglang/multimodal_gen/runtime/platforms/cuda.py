@@ -216,8 +216,7 @@ class CudaPlatformBase(Platform):
             return AttentionBackendEnum.FA
 
         target_backend: AttentionBackendEnum | None = None
-        # TODO(will): maybe come up with a more general interface for local attention
-        # if distributed is False, we always try to use Flash attn
+
         if selected_backend == AttentionBackendEnum.SLIDING_TILE_ATTN:
             return _require_backend(
                 cls_path=backend_cls_paths[AttentionBackendEnum.SLIDING_TILE_ATTN],

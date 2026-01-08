@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import enum
 import random
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -23,10 +24,84 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class AttentionBackendSpec:
+    fallback: str | None = None
+    log_msg: str
+    import_path: str
+    fallback_msg: str | None = None
+    error_prefix: str | None = None
+    error_msg: str | None = None
+    imports: list[tuple[str, str | None]]
+
+
 class AttentionBackendEnum(enum.Enum):
+    SLIDING_TILE_ATTN = AttentionBackendSpec(
+        log_msg="Using Sliding Tile Attention backend.",
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend",
+        error_prefix="Failed to import Sliding Tile Attention backend",
+        error_msg="Sliding Tile Attention backend is not installed. ",
+        imports=[
+            ("st_attn", "sliding_tile_attention"),
+            (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn",
+                "SlidingTileAttentionBackend",
+            ),
+        ],
+    )
+
+    SAGE_ATTN = AttentionBackendSpec(
+        fallback="fa",
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend",
+        log_msg="Using SAGE Attention backend.",
+        fallback_msg=(
+            "Sage Attention backend is not installed (To install it, run "
+            "`pip install sageattention==2.2.0 --no-build-isolation`). "
+            "Falling back to Flash Attention."
+        ),
+        imports=[
+            ("sageattention", "sageattn"),
+            (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn",
+                "SageAttentionBackend",
+            ),
+        ],
+    )
+
+    SAGE_ATTN_3 = AttentionBackendSpec(
+        fallback="torch_sdpa",
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend",
+        log_msg="Using Sage Attention 3 backend",
+        fallback_msg=(
+            "Sage Attention 3 backend is not installed (To install it, see "
+            "https://github.com/thu-ml/SageAttention/tree/main/"
+            "sageattention3_blackwell#installation). Falling back to Torch SDPA."
+        ),
+        imports=[
+            (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3",
+                "SageAttention3Backend",
+            )
+        ],
+    )
+
+    VIDEO_SPARSE_ATTN = AttentionBackendSpec(
+        log_msg="Using Video Sparse Attention backend.",
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend",
+        error_prefix="Failed to import Video Sparse Attention backend",
+        error_msg="Video Sparse Attention backend is not installed.",
+        imports=[
+            ("vsa", "block_sparse_attn"),
+            (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn",
+                "VideoSparseAttentionBackend",
+            ),
+        ],
+    )
+
     FA2 = enum.auto()
     FA = enum.auto()
-    SLIDING_TILE_ATTN = enum.auto()
+
     TORCH_SDPA = enum.auto()
     SAGE_ATTN = enum.auto()
     SAGE_ATTN_3 = enum.auto()
