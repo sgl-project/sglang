@@ -50,6 +50,7 @@ def _compare_checksums(*, expected: Dict[str, str], actual: Dict[str, str]) -> N
             errors.append(f"{filename}: missing")
         elif actual[filename] != expected_hash:
             errors.append(f"{filename}: mismatch (expected={expected_hash[:16]}..., actual={actual[filename][:16]}...)")
+
     if errors:
         raise IntegrityError("Integrity check failed: " + "; ".join(errors))
 
