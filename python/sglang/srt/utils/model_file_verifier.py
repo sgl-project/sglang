@@ -52,6 +52,7 @@ class Manifest:
                     k: FileInfo(sha256=v, size=0) for k, v in data["checksums"].items()
                 }
             )
+
         return cls(files={k: FileInfo.from_dict(v) for k, v in data["files"].items()})
 
     def to_dict(self) -> dict:
