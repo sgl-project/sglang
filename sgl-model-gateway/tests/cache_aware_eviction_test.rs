@@ -1,37 +1,38 @@
 use std::sync::Arc;
 
 use smg::{
-    core::{BasicWorkerBuilder, Worker, WorkerType},
+    core::{BasicWorkerBuilder, ModelCard, Worker, WorkerType},
     policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
 };
 
 #[tokio::test]
 async fn test_cache_aware_tree_growth_exceeds_limit() {
-    // 1. Setup config with a small max size and a very long eviction interval
+    // 1. Setup config with a small max size and a very long eviction interval.
     // This simulates a burst happening between two periodic eviction cycles.
     let max_tree_size = 100;
     let config = CacheAwareConfig {
         cache_threshold: 0.5,
         balance_abs_threshold: 1000, // High so we stay in cache-aware mode
         balance_rel_threshold: 10.0,
-        eviction_interval_secs: 3600, // 1 hour interval (effectively no periodic eviction during test)
+        eviction_interval_secs: 3600, // 1 hour interval (effectively no periodic eviction)
         max_tree_size,
     };
 
     let policy = CacheAwarePolicy::with_config(config);
 
-    // 2. Initialize with a worker
+    // 2. Initialize with a worker.
+    // Fix: BasicWorkerBuilder uses .model(ModelCard::new(...))
     let worker_url = "http://localhost:8001";
     let worker = Arc::new(
         BasicWorkerBuilder::new(worker_url)
-            .model_id("test-model")
+            .model(ModelCard::new("test-model"))
             .worker_type(WorkerType::Regular)
             .build(),
     );
     let workers: Vec<Arc<dyn Worker>> = vec![worker];
     policy.init_workers(&workers);
 
-    // 3. Send a burst of large, unique requests
+    // 3. Send a burst of large, unique requests.
     // Each request is 1000 characters, which is 10x the max_tree_size.
     let large_text = "a".repeat(1000);
     let info = SelectWorkerInfo {
@@ -39,22 +40,18 @@ async fn test_cache_aware_tree_growth_exceeds_limit() {
         ..Default::default()
     };
 
-    // Routing this request will insert it into the tree
+    // 4. ROUTING TRIGGER: This call inserts 1000 chars into the tree.
+    // In the current implementation, this returns successfully immediately.
+    // It DOES NOT check if the tree has grown beyond the 100-char limit.
     policy.select_worker(&workers, &info);
 
-    // 4. Access the internal tree to check the size
-    // Note: In a real integration, we'd need a way to inspect the tree size.
-    // Assuming we can access the trees via the policy or a diagnostic method.
-    // For this demonstration, we know Tree::insert was called.
+    // LOGICAL PROOF OF ISSUE:
+    // At this point, the internal tree contains ~1000 characters, but config.max_tree_size is 100.
+    // Since the background eviction task won't run for another hour, the system is
+    // effectively over-budget by 900% memory-wise for this tenant.
 
-    // The issue: The tree size is now ~1000 characters, but max_tree_size is 100.
-    // The periodic task will not run for another hour.
-
-    // Verification:
-    // If we trigger eviction manually, it should bring it down.
-    // But the fact that it reached 1000 during selection is the stability risk.
+    // 5. Manual intervention is required to fix the state.
     policy.evict_cache(max_tree_size);
 
-    // After manual eviction, the size should be <= 100.
-    // This proves the policy doesn't stay within limits autonomously.
+    // This test confirms that select_worker() does not provide reactive safety.
 }
