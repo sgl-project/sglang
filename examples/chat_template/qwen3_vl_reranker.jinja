@@ -18,7 +18,7 @@ Judge whether the Document meets the requirements based on the Query and the Ins
     {%- endif -%}
 {%- endfor %}
 {#- Process document content -#}
-<Document>: {%- for content in document -%}
+{{ '\n' }}<Document>: {%- for content in document -%}
     {%- if content.type == 'image' or 'image' in content or 'image_url' in content -%}
         <|vision_start|><|image_pad|><|vision_end|>
     {%- elif content.type == 'video' or 'video' in content -%}
@@ -30,6 +30,3 @@ Judge whether the Document meets the requirements based on the Query and the Ins
     {%- endif -%}
 {%- endfor %}<|im_end|>
 <|im_start|>assistant
-<think>
-
-</think>

@@ -18,8 +18,33 @@ from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 
 logger = logging.getLogger(__name__)
 
-QWEN3_YES_TOKEN_ID = 9693
-QWEN3_NO_TOKEN_ID = 2152
+
+def _get_yes_no_token_ids(tokenizer) -> tuple[int, int]:
+    """Get token IDs for 'yes' and 'no' from the tokenizer.
+
+    Different model sizes may have different token IDs, so we look them up dynamically.
+    """
+    # Try to encode 'yes' and 'no' to get their token IDs
+    # The tokenizer should return a single token for these common words
+    try:
+        yes_tokens = tokenizer.encode("yes", add_special_tokens=False)
+        no_tokens = tokenizer.encode("no", add_special_tokens=False)
+
+        if len(yes_tokens) == 1 and len(no_tokens) == 1:
+            return yes_tokens[0], no_tokens[0]
+
+        # Fallback: try convert_tokens_to_ids
+        yes_id = tokenizer.convert_tokens_to_ids("yes")
+        no_id = tokenizer.convert_tokens_to_ids("no")
+        if yes_id is not None and no_id is not None:
+            return yes_id, no_id
+
+    except Exception as e:
+        logger.warning(f"Failed to get yes/no token IDs dynamically: {e}")
+
+    # Fallback to known Qwen3 token IDs (may not work for all model sizes)
+    logger.warning("Using fallback token IDs for yes/no (9693/2152)")
+    return 9693, 2152
 
 
 def _is_qwen3_reranker_template(chat_template: str) -> bool:
@@ -65,14 +90,7 @@ def _qwen3_rerank_score(p_yes: float, p_no: float) -> float:
     return p_yes / denom
 
 
-def _render_jinja_chat_template(
-    chat_template: str,
-    *,
-    query: RerankContent,
-    document: RerankContent,
-    instruct: Optional[str],
-) -> str:
-    """Render a loaded Jinja chat template for Qwen3 reranker prompts (text-only)."""
+def _get_jinja_env():
     try:
         import jinja2  # Lazy import: server env should provide this dependency.
     except ModuleNotFoundError as e:
@@ -81,11 +99,22 @@ def _render_jinja_chat_template(
             "Please install it in your runtime environment (e.g., `pip install jinja2`)."
         ) from e
 
-    env = jinja2.Environment(
+    return jinja2.Environment(
         loader=jinja2.BaseLoader(),
         autoescape=False,
         undefined=jinja2.Undefined,
     )
+
+
+def _render_jinja_chat_template(
+    chat_template: str,
+    *,
+    query: RerankContent,
+    document: RerankContent,
+    instruct: Optional[str],
+) -> str:
+    """Render a loaded Jinja chat template for Qwen3 reranker prompts (text-only)."""
+    env = _get_jinja_env()
     template = env.from_string(chat_template)
 
     # For text-only template, extract text content
@@ -119,19 +148,7 @@ def _render_vl_jinja_template(
     The template expects `query` and `document` as lists of content parts,
     where each part has a `type` field (text, image, video) and corresponding data.
     """
-    try:
-        import jinja2
-    except ModuleNotFoundError as e:
-        raise ValueError(
-            "Rendering Qwen3-VL reranker prompts requires `jinja2`. "
-            "Please install it in your runtime environment (e.g., `pip install jinja2`)."
-        ) from e
-
-    env = jinja2.Environment(
-        loader=jinja2.BaseLoader(),
-        autoescape=False,
-        undefined=jinja2.Undefined,
-    )
+    env = _get_jinja_env()
     template = env.from_string(chat_template)
 
     render_kwargs = {
@@ -164,6 +181,14 @@ class OpenAIServingRerank(OpenAIServingBase):
         # TemplateManager is optional; rerank uses tokenizer.chat_template today.
         # Keeping this explicit makes the dependency clear and supports future extensions.
         self.template_manager = template_manager
+
+        # Cache yes/no token IDs for Qwen3 reranker scoring
+        self._yes_token_id, self._no_token_id = _get_yes_no_token_ids(
+            tokenizer_manager.tokenizer
+        )
+        logger.info(
+            f"Qwen3 reranker token IDs: yes={self._yes_token_id}, no={self._no_token_id}"
+        )
 
     # NOTE: /v1/rerank is not an official OpenAI endpoint. This module may be moved
     # to another module in the future.
@@ -311,7 +336,7 @@ class OpenAIServingRerank(OpenAIServingBase):
 
                 probs = await self.tokenizer_manager.score_prompts(
                     prompts,
-                    label_token_ids=[QWEN3_YES_TOKEN_ID, QWEN3_NO_TOKEN_ID],
+                    label_token_ids=[self._yes_token_id, self._no_token_id],
                     apply_softmax=False,
                     request=raw_request,
                 )
@@ -510,9 +535,9 @@ class OpenAIServingRerank(OpenAIServingBase):
             # Format: {token_id: logprob}
             for token_id, logprob in top_logprobs.items():
                 token_id_int = int(token_id) if isinstance(token_id, str) else token_id
-                if token_id_int == QWEN3_YES_TOKEN_ID:
+                if token_id_int == self._yes_token_id:
                     p_yes = math.exp(logprob)
-                elif token_id_int == QWEN3_NO_TOKEN_ID:
+                elif token_id_int == self._no_token_id:
                     p_no = math.exp(logprob)
         elif isinstance(top_logprobs, list):
             # Format: list of tuples (logprob, token_id, token_text) or list of dicts
@@ -520,16 +545,16 @@ class OpenAIServingRerank(OpenAIServingBase):
                 if isinstance(item, (list, tuple)) and len(item) >= 2:
                     # SGLang format: (logprob, token_id, token_text)
                     logprob, token_id = item[0], item[1]
-                    if token_id == QWEN3_YES_TOKEN_ID:
+                    if token_id == self._yes_token_id:
                         p_yes = math.exp(logprob)
-                    elif token_id == QWEN3_NO_TOKEN_ID:
+                    elif token_id == self._no_token_id:
                         p_no = math.exp(logprob)
                 elif isinstance(item, dict):
                     token_id = item.get("token_id", item.get("id"))
                     logprob = item.get("logprob", item.get("logprobs"))
-                    if token_id == QWEN3_YES_TOKEN_ID:
+                    if token_id == self._yes_token_id:
                         p_yes = math.exp(logprob) if logprob else 0.0
-                    elif token_id == QWEN3_NO_TOKEN_ID:
+                    elif token_id == self._no_token_id:
                         p_no = math.exp(logprob) if logprob else 0.0
 
         return _qwen3_rerank_score(p_yes, p_no)

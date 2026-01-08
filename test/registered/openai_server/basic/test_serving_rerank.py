@@ -145,6 +145,7 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
                 self.server_args = object()
                 self.model_config = Mock()
                 self.model_config.is_generation = True
+                self.model_config.model_path = "qwen/qwen3"
                 self.tokenizer = Mock()
                 self.tokenizer.chat_template = (
                     'Note that the answer can only be "yes" or "no". '
@@ -221,3 +222,83 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
         self.assertIsNone(res[0].document)
         self.assertEqual(res[0].index, 1)
         self.assertAlmostEqual(res[0].score, 0.9)
+
+    def test_handle_vl_reranker_request(self):
+        """Test the Qwen3-VL reranker path with mocked logprobs."""
+        import math
+
+        # Mock tokenizer manager that supports generate_request
+        class _AsyncGen:
+            def __init__(self, val):
+                self.val = val
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return self.val
+
+        class _TM(_DummyTokenizerManager):
+            def __init__(self):
+                self.server_args = object()
+                self.model_config = Mock()
+                self.model_config.is_generation = True
+                self.model_config.model_path = "qwen/qwen3-vl"
+                self.tokenizer = Mock()
+                # Mock VL template detection
+                self.tokenizer.chat_template = (
+                    "{% for x in query %}{{ x.text }}{% endfor %}"
+                    "{% for x in document %}{{ x.text }}{% endfor %}"
+                    'answer can only be "yes" or "no" <|vision_start|>'
+                )
+
+            async def generate_request(self, req, _raw):
+                # Return logprobs for yes/no
+                # Mock logprobs: P(yes) > P(no) for first doc, P(no) > P(yes) for second
+
+                if not hasattr(self, "call_count"):
+                    self.call_count = 0
+
+                if self.call_count == 0:
+                    # First doc: yes is likely
+                    yes_logprob = math.log(0.8)
+                    no_logprob = math.log(0.2)
+                else:
+                    # Second doc: no is likely
+                    yes_logprob = math.log(0.3)
+                    no_logprob = math.log(0.7)
+
+                self.call_count += 1
+
+                # Qwen3 token IDs: YES=9693, NO=2152
+                logprobs = {
+                    "9693": yes_logprob,
+                    "2152": no_logprob,
+                }
+
+                # The code checks input_top_logprobs[-1] or output_top_logprobs[0]
+                meta_info = {"output_top_logprobs": [logprobs]}
+
+                yield {"meta_info": meta_info, "embedding": None}
+
+        handler = OpenAIServingRerank(_TM())
+        req = V1RerankReqInput(
+            query="query", documents=["doc1", "doc2"], return_documents=True
+        )
+        # Force VL path is handled by detection logic inside handler
+        # We mocked chat_template to satisfy _is_qwen3_vl_reranker_template
+
+        raw_request = Mock()
+        res = asyncio.run(handler._handle_non_streaming_request(req, req, raw_request))
+
+        self.assertEqual(len(res), 2)
+        # First doc should have higher score
+        self.assertEqual(res[0].document, "doc1")
+        self.assertAlmostEqual(res[0].score, 0.8)  # 0.8 / (0.8+0.2) = 0.8
+
+        self.assertEqual(res[1].document, "doc2")
+        self.assertAlmostEqual(res[1].score, 0.3)  # 0.3 / (0.3+0.7) = 0.3
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
