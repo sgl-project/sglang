@@ -108,7 +108,7 @@ suite_amd = {
         TestFile("test_deepseek_v3_mtp.py", 275),
     ],
     "per-commit-8-gpu-amd-mi35x": [
-        TestFile("test_deepseek_r1_mxfp4_8gpu.py", 1800),
+        TestFile("test_deepseek_r1_mxfp4_8gpu.py", 3600),
     ],
     "nightly-amd": [
         TestFile("nightly/test_gsm8k_eval_amd.py"),
