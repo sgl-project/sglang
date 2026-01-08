@@ -528,6 +528,68 @@ Consider updating perf_baselines.json with the snippets below:
             "[LoRA Switch E2E] All dynamic switch E2E tests passed for %s", case.id
         )
 
+    def _test_multi_lora_e2e(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+        generate_fn: Callable[[str, openai.Client], str],
+        first_lora_path: str,
+        second_lora_path: str,
+    ) -> None:
+        """
+        Test multiple LoRA adapters with different set_lora input scenarios.
+        Tests: basic multi-LoRA, different strengths, cached adapters, switch back to single.
+        """
+        base_url = f"http://localhost:{ctx.port}/v1"
+        client = OpenAI(base_url=base_url, api_key="dummy")
+
+        # Test 1: Basic multi-LoRA with list format
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={
+                "lora_nickname": ["default", "lora2"],
+                "lora_path": [first_lora_path, second_lora_path],
+                "target": "all",
+                "strength": [1.0, 1.0],
+            },
+        )
+        assert resp.status_code == 200, f"set_lora with multiple adapters failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        # Test 2: Different strengths
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={
+                "lora_nickname": ["default", "lora2"],
+                "lora_path": [first_lora_path, second_lora_path],
+                "target": "all",
+                "strength": [0.8, 0.5],
+            },
+        )
+        assert resp.status_code == 200, f"set_lora with different strengths failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        # Test 3: Different targets
+        requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={
+                "lora_nickname": ["default", "lora2"],
+                "lora_path": [first_lora_path, second_lora_path],
+                "target": ["transformer", "transformer_2"],
+                "strength": [0.8, 0.5],
+            },
+        )
+        assert resp.status_code == 200, f"set_lora with cached adapters failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        # Test 4: Switch back to single LoRA
+        resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        assert resp.status_code == 200, f"set_lora back to single adapter failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        logger.info("[Multi-LoRA] All multi-LoRA tests passed for %s", case.id)
+
     def _test_v1_models_endpoint(
         self, ctx: ServerContext, case: DiffusionTestCase
     ) -> None:
