@@ -174,8 +174,8 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
         self.retrieve_parent_token_list = []
-        self.cached_graph_decode_query_start_loc: torch.Tensor = None
-        self.cached_graph_verify_query_start_loc: torch.Tensor = None
+        self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
+        self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
@@ -449,10 +449,10 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
-        self.cached_graph_decode_query_start_loc = torch.arange(
+        self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
-        self.cached_graph_verify_query_start_loc = torch.arange(
+        self.cached_cuda_graph_verify_query_start_loc = torch.arange(
             0,
             max_bs * draft_token_num + 1,
             step=draft_token_num,
@@ -473,7 +473,7 @@ class MambaAttnBackendBase(AttentionBackend):
             self.query_start_loc_list.append(
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)
             )
-        self.cached_graph_decode_query_start_loc = torch.arange(
+        self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
 
@@ -486,11 +486,11 @@ class MambaAttnBackendBase(AttentionBackend):
     ):
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
-                self.cached_graph_decode_query_start_loc[: bs + 1]
+                self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
             self.query_start_loc_list[bs - 1].copy_(
-                self.cached_graph_verify_query_start_loc[: bs + 1]
+                self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -534,11 +534,11 @@ class MambaAttnBackendBase(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_graph_decode_query_start_loc[: bs + 1]
+                    self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
                 )
             else:
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_graph_decode_query_start_loc[: bs - num_padding]
+                    self.cached_cuda_graph_decode_query_start_loc[: bs - num_padding]
                 )
                 self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
                     bs - num_padding
@@ -546,11 +546,11 @@ class MambaAttnBackendBase(AttentionBackend):
         elif forward_mode.is_target_verify():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_graph_verify_query_start_loc[: bs + 1]
+                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                 )
             else:
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_graph_verify_query_start_loc[: bs - num_padding]
+                    self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
                 )
                 self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
                     (bs - num_padding) * spec_info.draft_token_num
