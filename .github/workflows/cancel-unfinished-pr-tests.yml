@@ -3,6 +3,12 @@ name: Cancel Unfinished PR Tests
 on:
   pull_request:
     types: [synchronize]
+    inputs:
+      workflows:
+        description: 'Space-separated list of workflow filenames to cancel'
+        required: true
+        type: string
+        default: 'pr-test.yml'
   workflow_dispatch:
     inputs:
       workflows:
