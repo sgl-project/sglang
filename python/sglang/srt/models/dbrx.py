@@ -33,6 +33,8 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
+from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -99,15 +101,17 @@ class DbrxExperts(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.num_total_experts = config.ffn_config.moe_num_experts
+        self.num_experts = self.num_total_experts = config.ffn_config.moe_num_experts
         self.top_k = config.ffn_config.moe_top_k
-        self.d_model = config.d_model
+        self.hidden_size = self.d_model = config.d_model
         self.intermediate_size = config.ffn_config.ffn_hidden_size // self.tp_size
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+        self.moe_runner_config = MoeRunnerConfig(inplace=True)
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
                 self.use_triton_kernels
             )
+            self.quant_method.create_moe_runner(self, self.moe_runner_config)
         else:
             self.quant_method: Optional[QuantizeMethodBase] = (
                 quant_config.get_quant_method(self, prefix)
@@ -123,7 +127,6 @@ class DbrxExperts(nn.Module):
             self.top_k,
             renormalize=True,
         )
-        self.moe_runner_config = MoeRunnerConfig(inplace=True)
         if is_npu():
             devices = "npu"
         elif is_cuda():
@@ -196,12 +199,18 @@ class DbrxExperts(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.quant_method.apply(
-            x=hidden_states,
-            layer=self,
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
             topk_output=topk_output,
-            moe_runner_config=self.moe_runner_config,
         )
+        final_hidden_states = self.quant_method.apply(
+            layer=self, dispatch_output=dispatch_output
+        )
+        if isinstance(
+            final_hidden_states, CombineInput
+        ):  # quant_method use `UnquantizedFusedMoEMethod`
+            final_hidden_states = final_hidden_states.hidden_states
 
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
