@@ -256,5 +256,97 @@ class TestModelFileVerifierE2E(unittest.TestCase):
             shutil.rmtree(test_dir, ignore_errors=True)
 
 
+class TestModelFileVerifierWithRealModel(unittest.TestCase):
+
+    MODEL_NAME = "Qwen/Qwen3-0.6B"
+
+    @classmethod
+    def setUpClass(cls):
+        from huggingface_hub import snapshot_download
+
+        cls.original_model_path = snapshot_download(
+            cls.MODEL_NAME,
+            allow_patterns=["*.safetensors", "*.json"],
+        )
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        for item in os.listdir(self.original_model_path):
+            src = os.path.join(self.original_model_path, item)
+            dst = os.path.join(self.test_dir, item)
+            if os.path.isfile(src):
+                shutil.copy2(src, dst)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_server_launch_with_checksum_intact(self):
+        from sglang.srt.utils import kill_process_tree
+        from sglang.test.test_utils import (
+            DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            DEFAULT_URL_FOR_TEST,
+            popen_launch_server,
+        )
+
+        verifier = ModelFileVerifier(self.test_dir)
+        verifier.generate_checksums()
+
+        process = popen_launch_server(
+            self.test_dir,
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--model-checksum"],
+        )
+        try:
+            self.assertIsNotNone(process)
+            self.assertIsNone(process.poll())
+        finally:
+            kill_process_tree(process.pid)
+
+    def test_server_launch_fails_with_corrupted_weights(self):
+        import subprocess
+        import sys
+
+        from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
+
+        verifier = ModelFileVerifier(self.test_dir)
+        verifier.generate_checksums()
+
+        safetensors_files = [
+            f for f in os.listdir(self.test_dir) if f.endswith(".safetensors")
+        ]
+        self.assertTrue(len(safetensors_files) > 0, "No safetensors files found")
+        target_file = os.path.join(self.test_dir, safetensors_files[0])
+        flip_bit_in_file(target_file, byte_offset=1000, bit_position=5)
+
+        _, host, port = DEFAULT_URL_FOR_TEST.split(":")
+        host = host[2:]
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang.launch_server",
+                "--model-path",
+                self.test_dir,
+                "--host",
+                host,
+                "--port",
+                port,
+                "--model-checksum",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        combined_output = result.stdout + result.stderr
+        self.assertTrue(
+            "IntegrityError" in combined_output or "mismatch" in combined_output.lower(),
+            f"Expected integrity error, got: {combined_output[-500:]}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
