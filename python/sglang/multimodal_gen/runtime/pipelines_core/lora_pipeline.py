@@ -2,6 +2,8 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import os
+import re
+
 from collections import defaultdict
 from collections.abc import Hashable
 from typing import Any
@@ -143,6 +145,81 @@ class LoRAPipeline(ComposedPipelineBase):
         else:
             return [], f"Invalid target: {target}. Valid targets: {self.VALID_TARGETS}"
 
+    def _get_layerwise_offload_manager_for_layer(
+        self, module_name: str, layer_name: str
+    ) -> tuple[Any, int] | None:
+        """
+        Get the layerwise offload manager and layer index for a given layer.
+
+        Args:
+            module_name: The module name (e.g., "transformer", "transformer_2").
+            layer_name: The full layer name (e.g., "blocks.1.attn.to_q").
+
+        Returns:
+            A tuple of (manager, layer_idx) if found, None otherwise.
+        """
+        module = self.modules.get(module_name)
+        if module is None:
+            return None
+
+        layerwise_offload_managers = getattr(module, "layerwise_offload_managers", None)
+        if layerwise_offload_managers is None or not layerwise_offload_managers:
+            return None
+
+        for manager in layerwise_offload_managers:
+            if not manager.enabled:
+                continue
+            # Match pattern like "blocks.1." or ".blocks.1."
+            pattern = rf"(^|\.){re.escape(manager.layers_attr_str)}\.(\d+)(\.|$)"
+            match = re.search(pattern, layer_name)
+            if match:
+                try:
+                    layer_idx = int(match.group(2))
+                    if 0 <= layer_idx < manager.num_layers:
+                        return (manager, layer_idx)
+                except (ValueError, IndexError):
+                    continue
+        return None
+
+    def _temporarily_load_layer_for_conversion(
+        self, module_name: str, layer_name: str
+    ) -> tuple[bool, tuple[Any, int] | None]:
+        """
+        Temporarily load a layer from CPU to GPU if it's offloaded.
+
+        Returns:
+            A tuple of (was_offloaded, manager_info) where:
+            - was_offloaded: True if the layer was offloaded and needs to be released later
+            - manager_info: (manager, layer_idx) if found, None otherwise (cached for restore)
+        """
+        result = self._get_layerwise_offload_manager_for_layer(module_name, layer_name)
+        if result is None:
+            return False, None
+
+        manager, layer_idx = result
+        # Check if layer is currently offloaded (not in _gpu_layers)
+        was_offloaded = layer_idx not in manager._gpu_layers
+        if was_offloaded:
+            manager.prefetch_layer(layer_idx, non_blocking=False)
+        return was_offloaded, result
+
+    def _restore_layer_offload_state(
+        self, was_offloaded: bool, manager_info: tuple[Any, int] | None
+    ) -> None:
+        """
+        Restore the offload state of a layer after conversion.
+
+        Args:
+            was_offloaded: Whether the layer was offloaded
+            manager_info: Cached (manager, layer_idx) tuple
+        """
+        if not was_offloaded or manager_info is None:
+            return
+
+        manager, layer_idx = manager_info
+        if layer_idx > 0:
+            manager.release_layer(layer_idx)
+
     def convert_module_lora_layers(
         self,
         module: torch.nn.Module,
@@ -152,6 +229,7 @@ class LoRAPipeline(ComposedPipelineBase):
     ) -> int:
         """
         Convert layers in a module to LoRA layers.
+        For layerwise offload scenarios, temporarily loads each layer only when needed.
 
         Args:
             module: The module to convert.
@@ -174,6 +252,9 @@ class LoRAPipeline(ComposedPipelineBase):
                 if excluded:
                     continue
 
+            was_offloaded, manager_info = self._temporarily_load_layer_for_conversion(
+                module_name, name
+            )
             lora_layer = wrap_with_lora_layer(
                 layer,
                 lora_rank=self.lora_rank,
@@ -183,6 +264,8 @@ class LoRAPipeline(ComposedPipelineBase):
                 target_lora_layers[name] = lora_layer
                 replace_submodule(self.modules[module_name], name, lora_layer)
                 converted_count += 1
+            self._restore_layer_offload_state(was_offloaded, manager_info)
+
         return converted_count
 
     def convert_to_lora_layers(self) -> None:
@@ -237,9 +320,11 @@ class LoRAPipeline(ComposedPipelineBase):
         lora_path: str | None,
         rank: int,
         strength: float = 1.0,
+        module_name: str | None = None,
     ) -> int:
         """
         Apply LoRA weights to the given lora_layers.
+        For layerwise offload scenarios, temporarily loads each layer only when needed.
 
         Args:
             lora_layers: The dictionary of LoRA layers to apply weights to.
@@ -247,6 +332,7 @@ class LoRAPipeline(ComposedPipelineBase):
             lora_path: The path to the LoRA adapter.
             rank: The distributed rank (for logging).
             strength: LoRA strength for merge, default 1.0.
+            module_name: The module name (e.g., "transformer", "transformer_2") for layerwise offload.
 
         Returns:
             The number of layers that had LoRA weights applied.
@@ -259,6 +345,10 @@ class LoRAPipeline(ComposedPipelineBase):
                 lora_A_name in self.lora_adapters[lora_nickname]
                 and lora_B_name in self.lora_adapters[lora_nickname]
             ):
+                was_offloaded, manager_info = (
+                    self._temporarily_load_layer_for_conversion(module_name, name)
+                )
+                
                 layer.set_lora_weights(
                     self.lora_adapters[lora_nickname][lora_A_name],
                     self.lora_adapters[lora_nickname][lora_B_name],
@@ -266,6 +356,8 @@ class LoRAPipeline(ComposedPipelineBase):
                     strength=strength,
                 )
                 adapted_count += 1
+                
+                self._restore_layer_offload_state(was_offloaded, manager_info)
             else:
                 if rank == 0:
                     logger.warning(
@@ -435,7 +527,7 @@ class LoRAPipeline(ComposedPipelineBase):
         adapted_count = 0
         for module_name, lora_layers_dict in target_modules:
             count = self._apply_lora_to_layers(
-                lora_layers_dict, lora_nickname, lora_path, rank, strength
+                lora_layers_dict, lora_nickname, lora_path, rank, strength, module_name
             )
             adapted_count += count
             self.cur_adapter_name[module_name] = lora_nickname
