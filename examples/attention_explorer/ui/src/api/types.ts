@@ -44,6 +44,9 @@ export interface AttentionEntryRaw {
   layers?: Record<number, AttentionLayerRaw>;
   decode_step: number;
   think_phase: ThinkPhase;
+  // Server-side fingerprint (computed from unmasked data for privacy)
+  fingerprint?: Fingerprint;
+  manifold_zone?: ManifoldZone;
 }
 
 // ============================================================================
@@ -333,8 +336,15 @@ export function extractFingerprint(entry: AttentionEntry): Fingerprint | null {
     };
   }
 
-  // Compute fingerprint from raw attention data (client-side)
+  // For raw mode: prefer server-side fingerprint when available (security fix)
+  // Server computes fingerprint from UNMASKED data before privacy masking,
+  // ensuring accurate fingerprints even when attention data is masked.
   if (isRawMode(entry)) {
+    // Use server-provided fingerprint if available
+    if (entry.fingerprint) {
+      return entry.fingerprint;
+    }
+    // Fall back to client-side computation (for legacy server versions)
     return computeFingerprintFromRaw(entry);
   }
 
@@ -470,6 +480,25 @@ export function classifyManifold(fp: Fingerprint): ManifoldZone {
   if (fp.long_mass > 0.5) return 'long_range';
   if (fp.fft_low && fp.fft_low > 0.6) return 'structure_ripple';
   return 'diffuse';
+}
+
+/**
+ * Get manifold zone from attention entry, preferring server-side classification.
+ * This ensures accurate zone classification even when attention data is masked
+ * for privacy (server computes zone from unmasked data).
+ */
+export function getManifoldZone(entry: AttentionEntry): ManifoldZone {
+  // Prefer server-side zone when available (security fix)
+  if (isRawMode(entry) && entry.manifold_zone) {
+    return entry.manifold_zone;
+  }
+  if (isFingerprintMode(entry) && entry.manifold) {
+    return entry.manifold as ManifoldZone;
+  }
+
+  // Fall back to client-side computation
+  const fp = extractFingerprint(entry);
+  return fp ? classifyManifold(fp) : 'unknown';
 }
 
 export function getTopKForLayer(

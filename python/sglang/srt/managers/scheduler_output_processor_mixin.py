@@ -43,6 +43,143 @@ SKETCH_TOP_HUBS_K = 32  # Number of top positions to track by attention mass
 SKETCH_DIST_BINS = 16   # Number of bins for distance histogram (log scale)
 SKETCH_DIST_MAX = 20    # Max log2 distance for binning (covers 1M+ tokens)
 
+# Fingerprint configuration (matches client-side types.ts)
+FINGERPRINT_HISTOGRAM_BINS = 16
+FINGERPRINT_LOCAL_THRESHOLD = 16   # Tokens within 16 = local
+FINGERPRINT_MID_THRESHOLD = 256    # Tokens within 256 = mid-range
+
+
+def compute_fingerprint_from_raw(
+    token_positions: List[int],
+    attention_scores: List[float],
+    current_pos: int,
+    layers_data: Optional[Dict[int, Dict]] = None,
+) -> Dict:
+    """
+    Compute a fingerprint from raw attention data (server-side).
+
+    This ensures fingerprints are computed from UNMASKED data before privacy
+    masking is applied. The fingerprint can then be sent to the client alongside
+    masked attention data, preventing the security issue where clients would
+    compute incomplete fingerprints from masked data.
+
+    The fingerprint format matches the client-side extractFingerprint() function
+    in types.ts for consistency.
+
+    Args:
+        token_positions: Top-k attended positions
+        attention_scores: Corresponding attention scores
+        current_pos: Current decode position (for distance calculation)
+        layers_data: Optional multi-layer data for consensus calculation
+
+    Returns:
+        Fingerprint dictionary with histogram, mass metrics, entropy, hubness, consensus
+    """
+    if not token_positions or not attention_scores:
+        return {
+            "histogram": [0.0] * FINGERPRINT_HISTOGRAM_BINS,
+            "local_mass": 0.0,
+            "mid_mass": 0.0,
+            "long_mass": 0.0,
+            "entropy": 0.0,
+            "hubness": 0.0,
+            "consensus": 0.0,
+        }
+
+    # Compute distance histogram (log2-binned) and mass by distance
+    histogram = [0.0] * FINGERPRINT_HISTOGRAM_BINS
+    local_mass = 0.0
+    mid_mass = 0.0
+    long_mass = 0.0
+    total_mass = 0.0
+
+    for pos, score in zip(token_positions, attention_scores):
+        distance = max(0, current_pos - pos)
+        total_mass += score
+
+        # Mass by distance category
+        if distance <= FINGERPRINT_LOCAL_THRESHOLD:
+            local_mass += score
+        elif distance <= FINGERPRINT_MID_THRESHOLD:
+            mid_mass += score
+        else:
+            long_mass += score
+
+        # Log-scale histogram bin
+        bin_idx = min(FINGERPRINT_HISTOGRAM_BINS - 1, int(math.log2(max(1, distance))))
+        histogram[bin_idx] += score
+
+    # Normalize
+    if total_mass > 0:
+        local_mass /= total_mass
+        mid_mass /= total_mass
+        long_mass /= total_mass
+        histogram = [h / total_mass for h in histogram]
+
+    # Compute entropy from score distribution
+    entropy = 0.0
+    for score in attention_scores:
+        if score > 0 and total_mass > 0:
+            p = score / total_mass
+            if p > 0:
+                entropy -= p * math.log2(p)
+
+    # Compute hubness (concentration on top positions)
+    sorted_scores = sorted(attention_scores, reverse=True)
+    top3_mass = sum(sorted_scores[:3])
+    hubness = top3_mass / total_mass if total_mass > 0 else 0.0
+
+    # Compute consensus (cross-layer agreement) if multi-layer data available
+    consensus = 0.0
+    if layers_data and len(layers_data) > 1:
+        layer_topk = [
+            set(layer.get("token_positions", [])[:5])
+            for layer in layers_data.values()
+        ]
+        if len(layer_topk) >= 2:
+            overlaps = 0
+            comparisons = 0
+            for i in range(len(layer_topk)):
+                for j in range(i + 1, len(layer_topk)):
+                    intersection = len(layer_topk[i] & layer_topk[j])
+                    overlaps += intersection / 5.0
+                    comparisons += 1
+            consensus = overlaps / comparisons if comparisons > 0 else 0.0
+
+    return {
+        "histogram": [round(h, 6) for h in histogram],
+        "local_mass": round(local_mass, 4),
+        "mid_mass": round(mid_mass, 4),
+        "long_mass": round(long_mass, 4),
+        "entropy": round(entropy, 4),
+        "hubness": round(hubness, 4),
+        "consensus": round(consensus, 4),
+    }
+
+
+def classify_manifold_zone(fingerprint: Dict) -> str:
+    """
+    Classify the manifold zone based on fingerprint metrics.
+
+    Matches the client-side classifyManifold() function in types.ts.
+
+    Returns one of: syntax_floor, semantic_bridge, long_range, structure_ripple, diffuse
+    """
+    local_mass = fingerprint.get("local_mass", 0)
+    mid_mass = fingerprint.get("mid_mass", 0)
+    long_mass = fingerprint.get("long_mass", 0)
+    fft_low = fingerprint.get("fft_low")
+
+    if local_mass > 0.5:
+        return "syntax_floor"
+    if mid_mass > 0.5:
+        return "semantic_bridge"
+    if long_mass > 0.5:
+        return "long_range"
+    if fft_low is not None and fft_low > 0.6:
+        return "structure_ripple"
+    return "diffuse"
+
 
 def apply_attention_privacy_mask(
     token_positions: List[int],
@@ -803,10 +940,38 @@ class SchedulerOutputProcessorMixin:
                 if mask_prefix is None:
                     mask_prefix = 0
 
+                # Current position for distance calculations
+                current_pos = len(req.origin_input_ids) + len(req.output_ids) - 1
+
                 # Check for multi-layer attention data
                 if logits_output.attention_multi_layer:
                     # Multi-layer capture: create entry with all layers
                     layers_data = {}
+
+                    # First pass: extract UNMASKED data for fingerprint computation
+                    # This ensures fingerprints are computed from complete data before privacy masking
+                    unmasked_layers_data = {}
+                    for layer_id, (positions, scores, logits, logsumexp) in logits_output.attention_multi_layer.items():
+                        unmasked_pos = positions[i].cpu().tolist()[:req_top_k]
+                        unmasked_scores = scores[i].cpu().tolist()[:req_top_k]
+                        unmasked_layers_data[layer_id] = {
+                            "token_positions": unmasked_pos,
+                            "attention_scores": unmasked_scores,
+                        }
+
+                    # Compute fingerprint from UNMASKED data (security fix)
+                    # Use last layer positions/scores for main fingerprint
+                    last_layer_id = max(unmasked_layers_data.keys())
+                    last_layer_data = unmasked_layers_data[last_layer_id]
+                    server_fingerprint = compute_fingerprint_from_raw(
+                        last_layer_data["token_positions"],
+                        last_layer_data["attention_scores"],
+                        current_pos,
+                        unmasked_layers_data,
+                    )
+                    manifold_zone = classify_manifold_zone(server_fingerprint)
+
+                    # Second pass: apply privacy mask and build response
                     for layer_id, (positions, scores, logits, logsumexp) in logits_output.attention_multi_layer.items():
                         pos_list = positions[i].cpu().tolist()[:req_top_k]
                         score_list = scores[i].cpu().tolist()[:req_top_k]
@@ -842,6 +1007,9 @@ class SchedulerOutputProcessorMixin:
                         "layers": layers_data,
                         # Also include last layer at top level for backward compatibility
                         "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                        # Server-side fingerprint (computed from unmasked data)
+                        "fingerprint": server_fingerprint,
+                        "manifold_zone": manifold_zone,
                     }
                     # Copy last layer data to top level for backward compatibility
                     if logits_output.attention_token_positions is not None:
@@ -871,8 +1039,22 @@ class SchedulerOutputProcessorMixin:
                             attention_info["topk_mass"] = topk_mass
                 else:
                     # Single-layer capture (backward compatible format)
-                    single_pos = logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
-                    single_scores = logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
+                    # First extract UNMASKED data for fingerprint computation
+                    unmasked_pos = logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
+                    unmasked_scores = logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
+
+                    # Compute fingerprint from UNMASKED data (security fix)
+                    server_fingerprint = compute_fingerprint_from_raw(
+                        unmasked_pos,
+                        unmasked_scores,
+                        current_pos,
+                        None,  # No multi-layer data for consensus
+                    )
+                    manifold_zone = classify_manifold_zone(server_fingerprint)
+
+                    # Now apply privacy mask if needed
+                    single_pos = unmasked_pos
+                    single_scores = unmasked_scores
                     single_logits = (
                         logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
                         if logits_output.attention_topk_logits is not None else None
@@ -890,6 +1072,9 @@ class SchedulerOutputProcessorMixin:
                         "token_positions": single_pos,
                         "attention_scores": single_scores,
                         "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                        # Server-side fingerprint (computed from unmasked data)
+                        "fingerprint": server_fingerprint,
+                        "manifold_zone": manifold_zone,
                     }
                     # Add true probability info if available
                     if single_logits is not None:
