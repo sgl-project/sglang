@@ -36,7 +36,7 @@ IGNORE_PATTERNS = [
 def verify(*, model_path: str, checksums_source: str, max_workers: int = 4) -> None:
     model_path = Path(model_path).resolve()
     expected = _load_checksums(checksums_source)
-    actual = _compute_checksums(
+    actual = _compute_checksums_from_folder(
         model_path=model_path, filenames=list(expected.keys()), max_workers=max_workers
     )
     _compare_checksums(expected=expected, actual=actual)
@@ -68,7 +68,7 @@ def generate_checksums(
         files = _discover_files(model_path)
         if not files:
             raise IntegrityError(f"No model files found in {model_path}")
-        checksums = _compute_checksums(
+        checksums = _compute_checksums_from_folder(
             model_path=model_path, filenames=files, max_workers=max_workers
         )
     else:
@@ -146,7 +146,7 @@ def _get_filename_and_checksum_from_hf_file(fs, file_info):
 # ======== Compute Checksums ========
 
 
-def _compute_checksums(
+def _compute_checksums_from_folder(
     *, model_path: Path, filenames: List[str], max_workers: int
 ) -> Dict[str, str]:
     from tqdm import tqdm
