@@ -283,7 +283,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     scikit-build-core \
     nixl \
     py-spy \
-    cubloaty
+    cubloaty \
+    google-cloud-storage
 
 # Install mooncake
 RUN --mount=type=cache,target=/root/.cache/pip \
