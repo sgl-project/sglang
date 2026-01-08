@@ -113,6 +113,7 @@ class GptOssSparseMoeBlock(nn.Module):
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=True,
+            layer_id=layer_id,
         )
 
         self.top_k = config.num_experts_per_tok

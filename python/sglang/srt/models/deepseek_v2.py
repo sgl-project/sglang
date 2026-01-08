@@ -20,7 +20,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import os
-from enum import IntEnum, auto
+from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -46,6 +46,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
@@ -62,10 +63,11 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
-    enable_prefill_cp,
     is_nsa_enable_prefill_cp,
+    nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -92,7 +94,7 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -106,7 +108,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
-    is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
@@ -117,7 +118,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     inverse_transform_scale_ue8m0,
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
-    transform_scale_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
@@ -136,6 +136,24 @@ from sglang.srt.model_loader.utils import (
     should_deepgemm_weight_requant_ue8m0,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_common.attention_backend_handler import (
+    AttentionBackendRegistry,
+)
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
+    AttnForwardMethod,
+)
+from sglang.srt.models.deepseek_common.utils import (
+    _device_sm,
+    _is_cpu,
+    _is_cpu_amx_available,
+    _is_cuda,
+    _is_fp8_fnuz,
+    _is_gfx95_supported,
+    _is_hip,
+    _is_npu,
+    _use_aiter,
+    _use_aiter_gfx95,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -143,33 +161,13 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     bind_or_assign,
-    cpu_has_amx_support,
     get_bool_env_var,
-    get_device_sm,
-    get_int_env_var,
-    is_cpu,
-    is_cuda,
-    is_gfx95_supported,
-    is_hip,
     is_non_idle_and_non_empty,
-    is_npu,
     is_nvidia_cublas_cu12_version_ge_12_9,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
 )
-
-_is_hip = is_hip()
-_is_cuda = is_cuda()
-_is_npu = is_npu()
-_is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
-_device_sm = get_device_sm()
-_is_gfx95_supported = is_gfx95_supported()
-
-_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 if _use_aiter_gfx95:
 
@@ -231,11 +229,16 @@ _is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
 logger = logging.getLogger(__name__)
 
 
+# Optional quantization for DeepSeek nvfp4 checkpoint
+NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
+
+
 def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
     return (
-        quant_config is not None
+        envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get()
+        and quant_config is not None
         and quant_config.get_name() == "modelopt_fp4"
-        and get_moe_a2a_backend().is_deepep()
+        and get_moe_runner_backend().is_deep_gemm()
     )
 
 
@@ -253,195 +256,6 @@ def add_forward_absorb_core_attention_backend(backend_name):
     if backend_name not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
         FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append(backend_name)
         logger.info(f"Added {backend_name} to FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.")
-
-
-class AttnForwardMethod(IntEnum):
-    # Use multi-head attention
-    MHA = auto()
-
-    # Use absorbed multi-latent attention
-    MLA = auto()
-
-    # Use multi-head attention, but with KV cache chunked.
-    # This method can avoid OOM when prefix lengths are long.
-    MHA_CHUNKED_KV = auto()
-
-    # Use multi-head attention, execute the MHA for prefix and extended kv in one shot
-    # when the sequence lengths are below the threshold.
-    MHA_ONE_SHOT = auto()
-
-    # Use MLA but with fused RoPE
-    MLA_FUSED_ROPE = auto()
-
-    # Use MLA with fused RoPE kernel for CPU
-    MLA_FUSED_ROPE_CPU = auto()
-
-    # Use multi-head attention for NPU
-    MHA_NPU = auto()
-
-    # Use absorbed multi-latent attention for NPU
-    MLA_NPU = auto()
-
-    # Use Deepseek V3.2 sparse multi-latent attention for NPU
-    DSA_NPU = auto()
-
-
-def _dispatch_mla_subtype(attn, forward_batch):
-    if _is_hip:
-        if attn.rocm_fused_decode_mla and forward_batch.forward_mode.is_decode():
-            return AttnForwardMethod.MLA_FUSED_ROPE
-        else:
-            return AttnForwardMethod.MLA
-    else:
-        if hasattr(attn, "fused_qkv_a_proj_with_mqa") and use_intel_amx_backend(attn):
-            return AttnForwardMethod.MLA_FUSED_ROPE_CPU
-        else:
-            return AttnForwardMethod.MLA
-
-
-class AttentionBackendRegistry:
-    _handlers = {}
-
-    @classmethod
-    def register(cls, backend_name, handler_func):
-        cls._handlers[backend_name] = handler_func
-
-    @classmethod
-    def get_handler(cls, backend_name):
-        return cls._handlers.get(backend_name, cls._handlers.get("triton"))
-
-
-def handle_attention_ascend(attn, forward_batch):
-    if (
-        forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_target_verify()
-        and not forward_batch.forward_mode.is_draft_extend()
-        and not forward_batch.forward_mode.is_draft_extend_v2()
-    ):
-        if hasattr(attn, "indexer"):
-            return AttnForwardMethod.DSA_NPU
-        else:
-            return AttnForwardMethod.MHA_NPU
-    else:
-        if hasattr(attn, "indexer"):
-            return AttnForwardMethod.DSA_NPU
-        else:
-            return AttnForwardMethod.MLA_NPU
-
-
-def _get_sum_extend_prefix_lens(forward_batch):
-    return (
-        sum(forward_batch.extend_prefix_lens_cpu)
-        if forward_batch.extend_prefix_lens_cpu is not None
-        else 0
-    )
-
-
-def _support_mha_one_shot(attn: DeepseekV2AttentionMLA, forward_batch, backend_name):
-    attn_supported = backend_name in ["fa3", "flashinfer", "flashmla"]
-    sum_seq_lens = (
-        sum(forward_batch.seq_lens_cpu) if forward_batch.seq_lens_cpu is not None else 0
-    )
-    return attn_supported and sum_seq_lens <= forward_batch.get_max_chunk_capacity()
-
-
-def _handle_attention_backend(
-    attn: DeepseekV2AttentionMLA, forward_batch, backend_name
-):
-    if is_in_piecewise_cuda_graph():
-        return AttnForwardMethod.MLA
-
-    sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
-    disable_ragged = (
-        backend_name in ["flashinfer", "flashmla"]
-    ) and attn.flashinfer_mla_disable_ragged
-
-    if (
-        not disable_ragged
-        and forward_batch.forward_mode.is_extend_without_speculative()
-        and (
-            (
-                sum_extend_prefix_lens >= attn.chunked_prefix_cache_threshold
-                and not attn.disable_chunked_prefix_cache
-            )
-            or sum_extend_prefix_lens == 0
-        )
-    ):
-        if _support_mha_one_shot(attn, forward_batch, backend_name):
-            return AttnForwardMethod.MHA_ONE_SHOT
-        return AttnForwardMethod.MHA_CHUNKED_KV
-    else:
-        return _dispatch_mla_subtype(attn, forward_batch)
-
-
-def handle_attention_flashinfer(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "flashinfer")
-
-
-def handle_attention_fa3(attn, forward_batch):
-    # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
-        return _dispatch_mla_subtype(attn, forward_batch)
-    else:
-        return _handle_attention_backend(attn, forward_batch, "fa3")
-
-
-def handle_attention_flashmla(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "flashmla")
-
-
-def handle_attention_cutlass_mla(attn, forward_batch):
-    return _handle_attention_backend(attn, forward_batch, "cutlass_mla")
-
-
-def handle_attention_fa4(attn, forward_batch):
-    # TODO(cicirori): use FA4 MHA for DeepSeekV3 for now
-    return AttnForwardMethod.MHA_CHUNKED_KV
-
-
-def handle_attention_trtllm_mla(attn, forward_batch):
-    sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
-    if forward_batch.forward_mode.is_extend_without_speculative() and (
-        not attn.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
-    ):
-        return AttnForwardMethod.MHA_CHUNKED_KV
-    else:
-        return _dispatch_mla_subtype(attn, forward_batch)
-
-
-def handle_attention_aiter(attn, forward_batch):
-    if forward_batch.forward_mode.is_extend_without_speculative():
-        return AttnForwardMethod.MHA
-    else:
-        return AttnForwardMethod.MLA
-
-
-def handle_attention_nsa(attn, forward_batch):
-    """
-    Dispatch logic is centralized in NativeSparseAttnBackend.set_nsa_prefill_impl and executed
-    in init_forward_metadata. Read the decision from backend.use_mha.
-    """
-    backend = forward_batch.attn_backend
-    if hasattr(backend, "use_mha") and backend.use_mha:
-        return AttnForwardMethod.MHA_ONE_SHOT
-    return AttnForwardMethod.MLA
-
-
-def handle_attention_triton(attn, forward_batch):
-    if is_in_piecewise_cuda_graph():
-        return AttnForwardMethod.MLA
-
-    # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
-        return _dispatch_mla_subtype(attn, forward_batch)
-
-    if (
-        forward_batch.forward_mode.is_extend_without_speculative()
-        and sum(forward_batch.extend_prefix_lens_cpu) == 0
-    ):
-        return AttnForwardMethod.MHA
-    else:
-        return _dispatch_mla_subtype(attn, forward_batch)
 
 
 class DeepseekV2MLP(nn.Module):
@@ -566,9 +380,7 @@ class MoEGate(nn.Module):
         if get_global_server_args().enable_deterministic_inference:
             return F.linear(hidden_states, self.weight, None)
 
-        if forward_batch is not None and enable_prefill_cp(
-            forward_batch, self.nsa_enable_prefill_cp
-        ):
+        if forward_batch is not None and nsa_use_prefill_cp(forward_batch):
             logits = F.linear(hidden_states, self.weight, None)
         else:
             # NOTE: For some unknown reason, router_gemm seems degrade accept length.
@@ -666,6 +478,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
@@ -1457,8 +1270,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
         # TODO: Design a finer way to determine the threshold
-        self.chunked_prefix_cache_threshold = get_int_env_var(
-            "SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
+        self.chunked_prefix_cache_threshold = (
+            envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.get()
         )
 
         # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
@@ -1993,8 +1806,6 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
-            positions = cp_split_and_rebuild_position(forward_batch, positions)
         if (
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
@@ -2002,7 +1813,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+        if nsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -2665,7 +2476,10 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         Returns: (kv_a, k_pe) both in BF16
         """
-        kv_indices = forward_batch.attn_backend.forward_metadata.page_table_1_flattened
+        backend = forward_batch.attn_backend
+        if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
+            backend = backend.primary
+        kv_indices = backend.forward_metadata.page_table_1_flattened
         assert (
             kv_indices is not None
         ), "page_table_1_flattened should have been generated for FP8 MHA path"
@@ -2731,7 +2545,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
-        moe_quant_config: Optional[QuantizationConfig] = None,
+        moe_quant_config_override: Optional[QuantizationConfig] = None,
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
@@ -2784,7 +2598,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         if self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
-                quant_config=moe_quant_config or quant_config,
+                quant_config=moe_quant_config_override or quant_config,
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
@@ -3112,6 +2926,10 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+            self.enable_a2a_moe = True
+        else:
+            self.enable_a2a_moe = False
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
@@ -3161,8 +2979,10 @@ class DeepseekV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
-            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+        if nsa_use_prefill_cp(forward_batch):
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
@@ -3188,9 +3008,21 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
         for i in range(normal_start_layer, normal_end_layer):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
+            # NOTE: torch dynamo does not support graph break in context manager
+            ctx = (
+                nullcontext()
+                if get_global_server_args().enable_piecewise_cuda_graph
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
                 if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
+                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                        aux_hidden_state = tensor_model_parallel_all_gather(
+                            hidden_states + residual, dim=0
+                        )
+                        aux_hidden_states.append(aux_hidden_state)
+                    else:
+                        aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -3230,7 +3062,7 @@ class DeepseekV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+        if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
             # allgather + rerrange
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
@@ -3368,13 +3200,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.nsa_enable_prefill_cp:
-            # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
-            # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
-            # the seq data needs to be divided and recombined at twice the size of cp_size.
-            cur_cp_seq_len = len(input_ids) // (self.cp_size * 2)
-            if can_cp_split(cur_cp_seq_len, self.cp_size, self.use_nsa, forward_batch):
+            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
-                    torch.tensor(len(input_ids)),
+                    len(input_ids),
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
@@ -3604,47 +3432,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
-        if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
-            self._transform_scale_nextn_moe_ue8m0()
-
-    # TODO avoid code dup (currently combine from weight_requant_ue8m0 and transform_scale_ue8m0)
-    def _transform_scale_nextn_moe_ue8m0(self):
-        layer = self.model.decoder
-
-        shared_experts = getattr(layer.mlp, "shared_experts", None)
-        if shared_experts is not None:
-            for module in [
-                shared_experts.gate_up_proj,
-                shared_experts.down_proj,
-            ]:
-                transform_scale_ue8m0_inplace(
-                    module.weight_scale_inv, mn=module.weight.shape[-2]
-                )
-
-        experts = layer.mlp.experts
-        w13_weight_fp8 = (
-            experts.w13_weight,
-            (
-                experts.w13_weight_scale_inv
-                if hasattr(experts, "w13_weight_scale_inv")
-                else experts.w13_weight_scale
-            ),
-        )
-        w2_weight_fp8 = (
-            experts.w2_weight,
-            (
-                experts.w2_weight_scale_inv
-                if hasattr(experts, "w2_weight_scale_inv")
-                else experts.w2_weight_scale
-            ),
-        )
-        if isinstance(experts, DeepEPMoE):
-            for w in [
-                w13_weight_fp8,
-                w2_weight_fp8,
-            ]:
-                transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
         if is_nextn:
@@ -3660,12 +3447,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
-            weights = self._quant_attn_to_fp8_ue8m0(weights, is_nextn=is_nextn)
-        if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
-            weights = self._quant_nextn_moe_to_fp8_ue8m0(
-                weights, nextn_layer_id=nextn_layer_id
-            )
+        weights = self._maybe_quant_weights_to_fp8_ue8m0(
+            weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, is_nextn
+        )
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -3928,62 +3712,6 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
-    def _quant_attn_to_fp8_ue8m0(self, weights, is_nextn):
-        weights_dict = dict(weights)
-
-        # temporarily only support DeepSeek V3/R1
-        weight_block_size = [128, 128]
-
-        for layer_id in tqdm.trange(
-            self.config.num_hidden_layers + int(is_nextn),
-            desc="quant attn to fp8 ue8m0",
-        ):
-            for stem in [
-                # may put tensors like `o_proj` here for DeepSeek FP4 ckpt v1
-                "q_b_proj",
-            ]:
-                partial_name = f"model.layers.{layer_id}.self_attn.{stem}"
-                original_weight = weights_dict[f"{partial_name}.weight"]
-                out_w, out_s = quant_weight_ue8m0(
-                    original_weight, weight_block_size=weight_block_size
-                )
-                weights_dict[f"{partial_name}.weight"] = out_w
-                weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
-
-        return list(weights_dict.items())
-
-    # TODO avoid code dup
-    def _quant_nextn_moe_to_fp8_ue8m0(self, weights, nextn_layer_id: int):
-        weights_dict = dict(weights)
-
-        # temporarily only support DeepSeek V3/R1
-        weight_block_size = [128, 128]
-
-        for layer_id in [nextn_layer_id]:
-            for expert_sub_name in [
-                "shared_experts",
-                *[
-                    f"experts.{expert_id}"
-                    for expert_id in range(self.config.n_routed_experts)
-                ],
-            ]:
-                for stem in [
-                    "gate_proj",
-                    "up_proj",
-                    "down_proj",
-                ]:
-                    partial_name = (
-                        f"model.layers.{layer_id}.mlp.{expert_sub_name}.{stem}"
-                    )
-                    original_weight = weights_dict[f"{partial_name}.weight"]
-                    out_w, out_s = quant_weight_ue8m0(
-                        original_weight, weight_block_size=weight_block_size
-                    )
-                    weights_dict[f"{partial_name}.weight"] = out_w
-                    weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
-
-        return list(weights_dict.items())
-
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
@@ -4017,17 +3745,76 @@ class DeepseekV2ForCausalLM(nn.Module):
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    # Mark the ue8m0 flag of nextn moe weights as True to avoid requantization
+    def _mark_nextn_moe_weights_as_ue8m0(self):
+        experts = self.model.decoder.mlp.experts
+        w13_scale = (
+            experts.w13_weight_scale_inv
+            if hasattr(experts, "w13_weight_scale_inv")
+            else experts.w13_weight_scale
+        )
+        w2_scale = (
+            experts.w2_weight_scale_inv
+            if hasattr(experts, "w2_weight_scale_inv")
+            else experts.w2_weight_scale
+        )
+        w13_scale.format_ue8m0 = True
+        w2_scale.format_ue8m0 = True
 
-AttentionBackendRegistry.register("ascend", handle_attention_ascend)
-AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
-AttentionBackendRegistry.register("fa3", handle_attention_fa3)
-AttentionBackendRegistry.register("flashmla", handle_attention_flashmla)
-AttentionBackendRegistry.register("cutlass_mla", handle_attention_cutlass_mla)
-AttentionBackendRegistry.register("fa4", handle_attention_fa4)
-AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
-AttentionBackendRegistry.register("aiter", handle_attention_aiter)
-AttentionBackendRegistry.register("nsa", handle_attention_nsa)
-AttentionBackendRegistry.register("triton", handle_attention_triton)
+    def _maybe_quant_weights_to_fp8_ue8m0(
+        self, weights, attn_quant_modules, is_nextn=False
+    ):
+        # Quantize some weights to fp8 ue8m0 for DeepSeek nvfp4 checkpoint
+        partial_names = []
+        nextn_layer_id = (
+            0 if self.config.num_hidden_layers == 1 else self.config.num_hidden_layers
+        )
+        weights_dict = dict(weights)
+        weight_block_size = [128, 128]
+
+        if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
+            layer_ids = (
+                list(range(self.config.num_hidden_layers))
+                if not is_nextn
+                else [nextn_layer_id]
+            )
+            for layer_id in layer_ids:
+                for stem in attn_quant_modules:
+                    partial_names.append(f"model.layers.{layer_id}.self_attn.{stem}")
+
+        if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+            for expert_sub_name in [
+                "shared_experts",
+                *[
+                    f"experts.{expert_id}"
+                    for expert_id in range(self.config.n_routed_experts)
+                ],
+            ]:
+                for stem in [
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ]:
+                    partial_names.append(
+                        f"model.layers.{nextn_layer_id}.mlp.{expert_sub_name}.{stem}"
+                    )
+
+        if len(partial_names) > 0:
+            for partial_name in tqdm.tqdm(
+                partial_names,
+                desc="quant weights to fp8 ue8m0",
+            ):
+                original_weight = weights_dict[f"{partial_name}.weight"]
+                out_w, out_s = quant_weight_ue8m0(
+                    original_weight, weight_block_size=weight_block_size
+                )
+                weights_dict[f"{partial_name}.weight"] = out_w
+                weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
+
+        if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+            self._mark_nextn_moe_weights_as_ue8m0()
+
+        return list(weights_dict.items())
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
