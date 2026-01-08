@@ -1341,24 +1341,3 @@ def narrow_padded_param_and_loaded_weight(
     param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
 
     return param_data, loaded_weight
-
-
-def verify_model_files(model_path: str, checksums_source: Optional[str]) -> None:
-    """Verify model file integrity using checksums.
-
-    Args:
-        model_path: Path to the model directory
-        checksums_source: Checksums source - can be a JSON file path or HuggingFace repo ID
-
-    Raises:
-        IntegrityError: If verification fails
-    """
-    if not checksums_source:
-        return
-
-    log_info_on_rank0(
-        logger, f"Verifying model file integrity with checksums: {checksums_source}"
-    )
-    verifier = ModelFileVerifier(model_path, checksums_source)
-    verifier.verify()
-    log_info_on_rank0(logger, "Model file integrity verification passed.")
