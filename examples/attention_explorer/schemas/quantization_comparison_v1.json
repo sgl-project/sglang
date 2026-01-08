@@ -1,0 +1,458 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://sglang.ai/schemas/quantization-comparison-v1.json",
+  "title": "Quantization Comparison Schema v1",
+  "description": "Canonical schema for comparing quantized model behavior against baseline (typically BF16). Used by evaluation harness, UI, and routing config registry.",
+  "type": "object",
+  "required": ["schema_version", "comparison_id", "timestamp", "baseline", "candidate", "evaluation", "results"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0",
+      "description": "Schema version for compatibility checking"
+    },
+    "comparison_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique identifier for this comparison run"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of comparison execution"
+    },
+    "baseline": {
+      "$ref": "#/definitions/model_config",
+      "description": "Reference model configuration (typically BF16)"
+    },
+    "candidate": {
+      "$ref": "#/definitions/model_config",
+      "description": "Quantized model configuration being evaluated"
+    },
+    "evaluation": {
+      "$ref": "#/definitions/evaluation_config",
+      "description": "Evaluation parameters and capture settings"
+    },
+    "hardware": {
+      "$ref": "#/definitions/hardware_config",
+      "description": "Hardware environment metadata"
+    },
+    "results": {
+      "$ref": "#/definitions/comparison_results",
+      "description": "Comparison results and metrics"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Optional additional metadata",
+      "properties": {
+        "run_by": { "type": "string" },
+        "purpose": { "type": "string" },
+        "notes": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "definitions": {
+    "model_config": {
+      "type": "object",
+      "required": ["model_id", "dtype"],
+      "properties": {
+        "model_id": {
+          "type": "string",
+          "description": "HuggingFace model ID or local path"
+        },
+        "revision": {
+          "type": "string",
+          "description": "Git revision/commit hash of model weights"
+        },
+        "dtype": {
+          "type": "string",
+          "enum": ["bf16", "fp16", "fp32", "fp8", "int8", "int4", "int3", "int2"],
+          "description": "Base data type"
+        },
+        "quantization": {
+          "$ref": "#/definitions/quantization_config"
+        },
+        "memory_mb": {
+          "type": "number",
+          "description": "GPU memory usage in MB"
+        }
+      }
+    },
+    "quantization_config": {
+      "type": "object",
+      "description": "Quantization-specific configuration",
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": ["none", "sinq", "asinq", "awq", "gptq", "squeezellm", "fp8", "marlin"],
+          "description": "Quantization method"
+        },
+        "nbits": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16,
+          "description": "Bit width for weight quantization"
+        },
+        "group_size": {
+          "type": "integer",
+          "enum": [32, 64, 128, 256, -1],
+          "description": "Weights per quantization group (-1 = per-channel)"
+        },
+        "tiling_mode": {
+          "type": "string",
+          "enum": ["1D", "2D"],
+          "description": "Weight matrix tiling strategy"
+        },
+        "symmetric": {
+          "type": "boolean",
+          "description": "Whether quantization is symmetric"
+        },
+        "calibration": {
+          "type": "object",
+          "description": "Calibration dataset info (for AWQ/ASINQ)",
+          "properties": {
+            "dataset": { "type": "string" },
+            "num_samples": { "type": "integer" },
+            "seq_length": { "type": "integer" }
+          }
+        },
+        "kernel_path": {
+          "type": "string",
+          "description": "Path to quantized kernel implementation"
+        }
+      }
+    },
+    "evaluation_config": {
+      "type": "object",
+      "required": ["prompts", "decoding", "attention_capture"],
+      "properties": {
+        "prompts": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string",
+              "enum": ["inline", "file", "harness"],
+              "description": "Source of evaluation prompts"
+            },
+            "path": {
+              "type": "string",
+              "description": "Path to prompt file (if source=file)"
+            },
+            "harness_config": {
+              "type": "object",
+              "description": "Harness config (if source=harness)",
+              "properties": {
+                "packs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": ["json_repair", "coreference", "counting_tables", "code_editing", "reasoning", "adversarial", "natural"]
+                  }
+                },
+                "duration_minutes": { "type": "integer" }
+              }
+            },
+            "count": {
+              "type": "integer",
+              "description": "Number of prompts evaluated"
+            }
+          }
+        },
+        "decoding": {
+          "type": "object",
+          "required": ["max_tokens"],
+          "properties": {
+            "max_tokens": { "type": "integer" },
+            "temperature": { "type": "number", "default": 0.0 },
+            "top_p": { "type": "number", "default": 1.0 },
+            "top_k": { "type": "integer", "default": -1 },
+            "seed": { "type": "integer", "description": "Random seed for reproducibility" },
+            "repetition_penalty": { "type": "number", "default": 1.0 }
+          }
+        },
+        "attention_capture": {
+          "type": "object",
+          "required": ["top_k"],
+          "properties": {
+            "top_k": {
+              "type": "integer",
+              "description": "Number of top attention positions to capture"
+            },
+            "layers": {
+              "type": "array",
+              "items": { "type": "integer" },
+              "description": "Layer indices to capture (null = all)"
+            },
+            "heads": {
+              "type": "array",
+              "items": { "type": "integer" },
+              "description": "Head indices to capture (null = all)"
+            },
+            "aggregation": {
+              "type": "string",
+              "enum": ["mean", "max", "last_layer", "weighted"],
+              "default": "mean",
+              "description": "How to aggregate across layers/heads"
+            },
+            "sink_filter": {
+              "type": "object",
+              "description": "Sink token filtering configuration",
+              "properties": {
+                "enabled": { "type": "boolean", "default": true },
+                "indices": {
+                  "type": "array",
+                  "items": { "type": "integer" },
+                  "default": [0, 1, 2, 3],
+                  "description": "Token indices to filter as sinks"
+                }
+              }
+            }
+          }
+        },
+        "fingerprint": {
+          "type": "object",
+          "description": "Fingerprint computation settings",
+          "properties": {
+            "enabled": { "type": "boolean", "default": true },
+            "compute_location": {
+              "type": "string",
+              "enum": ["server", "client"],
+              "default": "server",
+              "description": "Where fingerprint is computed (server = pre-mask)"
+            },
+            "include_manifold_zone": { "type": "boolean", "default": true }
+          }
+        },
+        "privacy_masking": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "token_threshold": { "type": "number" }
+          }
+        }
+      }
+    },
+    "hardware_config": {
+      "type": "object",
+      "properties": {
+        "gpu_type": {
+          "type": "string",
+          "description": "GPU model (e.g., 'NVIDIA H100', 'AMD MI300X')"
+        },
+        "gpu_count": { "type": "integer" },
+        "gpu_memory_gb": { "type": "number" },
+        "cuda_version": { "type": "string" },
+        "driver_version": { "type": "string" },
+        "attention_backend": {
+          "type": "string",
+          "enum": ["flashinfer", "triton", "flash_attn", "xformers"]
+        },
+        "tensor_parallel": { "type": "integer", "default": 1 },
+        "pipeline_parallel": { "type": "integer", "default": 1 }
+      }
+    },
+    "comparison_results": {
+      "type": "object",
+      "required": ["summary", "per_prompt"],
+      "properties": {
+        "summary": {
+          "$ref": "#/definitions/summary_metrics"
+        },
+        "per_prompt": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/prompt_result" }
+        },
+        "manifold_analysis": {
+          "$ref": "#/definitions/manifold_analysis"
+        },
+        "performance": {
+          "$ref": "#/definitions/performance_metrics"
+        }
+      }
+    },
+    "summary_metrics": {
+      "type": "object",
+      "required": ["jaccard"],
+      "properties": {
+        "jaccard": {
+          "type": "object",
+          "description": "Jaccard similarity metrics (set overlap of top-k positions)",
+          "properties": {
+            "mean": { "type": "number", "minimum": 0, "maximum": 1 },
+            "std": { "type": "number" },
+            "min": { "type": "number" },
+            "max": { "type": "number" },
+            "median": { "type": "number" },
+            "p5": { "type": "number", "description": "5th percentile" },
+            "p95": { "type": "number", "description": "95th percentile" }
+          }
+        },
+        "weighted_jaccard": {
+          "type": "object",
+          "description": "Jaccard weighted by attention scores",
+          "properties": {
+            "mean": { "type": "number" },
+            "std": { "type": "number" }
+          }
+        },
+        "rank_correlation": {
+          "type": "object",
+          "description": "Rank correlation of top-k positions",
+          "properties": {
+            "spearman_mean": { "type": "number", "minimum": -1, "maximum": 1 },
+            "kendall_mean": { "type": "number", "minimum": -1, "maximum": 1 }
+          }
+        },
+        "mass_retained": {
+          "type": "object",
+          "description": "Fraction of baseline attention mass preserved in candidate top-k",
+          "properties": {
+            "mean": { "type": "number", "minimum": 0, "maximum": 1 },
+            "std": { "type": "number" }
+          }
+        },
+        "kl_divergence": {
+          "type": "object",
+          "description": "KL divergence on truncated attention distribution",
+          "properties": {
+            "mean": { "type": "number", "minimum": 0 },
+            "std": { "type": "number" }
+          }
+        },
+        "output_agreement": {
+          "type": "object",
+          "description": "Token-level output agreement metrics",
+          "properties": {
+            "exact_match_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+            "token_accuracy": { "type": "number", "minimum": 0, "maximum": 1 },
+            "edit_distance_mean": { "type": "number" }
+          }
+        },
+        "compression_ratio": {
+          "type": "number",
+          "description": "baseline_memory / candidate_memory"
+        },
+        "quality_tier": {
+          "type": "string",
+          "enum": ["excellent", "good", "acceptable", "degraded", "failed"],
+          "description": "Overall quality assessment"
+        }
+      }
+    },
+    "prompt_result": {
+      "type": "object",
+      "required": ["prompt_id", "jaccard"],
+      "properties": {
+        "prompt_id": {
+          "type": "string",
+          "description": "Unique identifier for the prompt"
+        },
+        "prompt_text": {
+          "type": "string",
+          "description": "Truncated prompt text (first 100 chars)"
+        },
+        "prompt_pack": {
+          "type": "string",
+          "enum": ["json_repair", "coreference", "counting_tables", "code_editing", "reasoning", "adversarial", "natural", "custom"],
+          "description": "Probe pack category (if from harness)"
+        },
+        "jaccard": { "type": "number", "minimum": 0, "maximum": 1 },
+        "weighted_jaccard": { "type": "number" },
+        "rank_correlation": {
+          "type": "object",
+          "properties": {
+            "spearman": { "type": "number" },
+            "kendall": { "type": "number" }
+          }
+        },
+        "mass_retained": { "type": "number" },
+        "kl_divergence": { "type": "number" },
+        "output_match": { "type": "boolean" },
+        "edit_distance": { "type": "integer" },
+        "baseline_zone": {
+          "type": "string",
+          "enum": ["syntax_floor", "semantic_bridge", "structure_ripple", "long_range", "diffuse", "unknown"]
+        },
+        "candidate_zone": {
+          "type": "string",
+          "enum": ["syntax_floor", "semantic_bridge", "structure_ripple", "long_range", "diffuse", "unknown"]
+        },
+        "zone_drift": { "type": "boolean" },
+        "per_step_jaccard": {
+          "type": "array",
+          "items": { "type": "number" },
+          "description": "Jaccard at each decode step"
+        },
+        "per_layer_jaccard": {
+          "type": "array",
+          "items": { "type": "number" },
+          "description": "Jaccard per layer (if captured)"
+        }
+      }
+    },
+    "manifold_analysis": {
+      "type": "object",
+      "description": "Behavioral stability analysis via manifold zones",
+      "properties": {
+        "zone_drift_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Fraction of prompts where manifold zone changed"
+        },
+        "zone_transition_matrix": {
+          "type": "object",
+          "description": "Counts of zone transitions (baseline_zone -> candidate_zone)",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": { "type": "integer" }
+          }
+        },
+        "drift_by_pack": {
+          "type": "object",
+          "description": "Zone drift rate per probe pack",
+          "additionalProperties": { "type": "number" }
+        },
+        "cluster_stability": {
+          "type": "object",
+          "properties": {
+            "baseline_cluster_count": { "type": "integer" },
+            "candidate_cluster_count": { "type": "integer" },
+            "cluster_purity": { "type": "number" },
+            "adjusted_rand_index": { "type": "number" }
+          }
+        },
+        "fingerprint_distance": {
+          "type": "object",
+          "description": "Distance metrics in fingerprint space",
+          "properties": {
+            "cosine_mean": { "type": "number" },
+            "euclidean_mean": { "type": "number" }
+          }
+        }
+      }
+    },
+    "performance_metrics": {
+      "type": "object",
+      "properties": {
+        "baseline_throughput_tps": {
+          "type": "number",
+          "description": "Baseline tokens per second"
+        },
+        "candidate_throughput_tps": {
+          "type": "number",
+          "description": "Candidate tokens per second"
+        },
+        "throughput_ratio": {
+          "type": "number",
+          "description": "candidate / baseline throughput"
+        },
+        "baseline_latency_p50_ms": { "type": "number" },
+        "candidate_latency_p50_ms": { "type": "number" },
+        "baseline_latency_p99_ms": { "type": "number" },
+        "candidate_latency_p99_ms": { "type": "number" }
+      }
+    }
+  }
+}
