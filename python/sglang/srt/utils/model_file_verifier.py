@@ -44,32 +44,14 @@ def verify(*, model_path: str, checksums_source: str, max_workers: int = 4) -> N
 
 
 def _compare_checksums(*, expected: Dict[str, str], actual: Dict[str, str]) -> None:
-    mismatches = []
-    missing = []
-
+    errors = []
     for filename, expected_hash in expected.items():
         if filename not in actual:
-            missing.append(filename)
+            errors.append(f"{filename}: missing")
         elif actual[filename] != expected_hash:
-            mismatches.append(
-                {
-                    "file": filename,
-                    "expected": expected_hash,
-                    "actual": actual[filename],
-                }
-            )
-
-    if missing or mismatches:
-        error_parts = []
-        if missing:
-            error_parts.append(f"Missing files: {missing}")
-        if mismatches:
-            mismatch_details = "; ".join(
-                f"{m['file']} (expected={m['expected'][:16]}..., actual={m['actual'][:16]}...)"
-                for m in mismatches
-            )
-            error_parts.append(f"Checksum mismatches: {mismatch_details}")
-        raise IntegrityError(" | ".join(error_parts))
+            errors.append(f"{filename}: mismatch (expected={expected_hash[:16]}..., actual={actual[filename][:16]}...)")
+    if errors:
+        raise IntegrityError("Integrity check failed: " + "; ".join(errors))
 
 
 # ======== Generate ========
