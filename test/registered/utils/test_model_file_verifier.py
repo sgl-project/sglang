@@ -45,10 +45,7 @@ class _RealModelTestCase(unittest.TestCase):
     def setUpClass(cls):
         from huggingface_hub import snapshot_download
 
-        cls.original_model_path = snapshot_download(
-            MODEL_NAME,
-            allow_patterns=["*.safetensors", "*.json"],
-        )
+        cls.original_model_path = snapshot_download(MODEL_NAME)
 
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
