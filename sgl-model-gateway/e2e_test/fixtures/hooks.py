@@ -118,8 +118,21 @@ def pytest_collection_modifyitems(
 
     for item in items:
         # Extract model from marker or use default
-        model_marker = item.get_closest_marker(PARAM_MODEL)
-        model_id = model_marker.args[0] if model_marker and model_marker.args else None
+        # First check the class directly (handles inheritance correctly)
+        model_id = None
+        if hasattr(item, "cls") and item.cls is not None:
+            for marker in (
+                item.cls.pytestmark if hasattr(item.cls, "pytestmark") else []
+            ):
+                if marker.name == PARAM_MODEL and marker.args:
+                    model_id = marker.args[0]
+                    break
+        # Fall back to get_closest_marker for method-level markers
+        if model_id is None:
+            model_marker = item.get_closest_marker(PARAM_MODEL)
+            model_id = (
+                model_marker.args[0] if model_marker and model_marker.args else None
+            )
 
         # Check parametrize for model
         if model_id is None:
@@ -269,21 +282,38 @@ def get_pool_requirements() -> list["WorkerIdentity"]:
 # ---------------------------------------------------------------------------
 
 
+def _count_gpus_without_cuda() -> int:
+    """Count available GPUs without initializing CUDA.
+
+    Uses nvidia-smi to avoid CUDA initialization, which is critical for
+    pytest-parallel compatibility. CUDA cannot be re-initialized after a fork.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return len([line for line in result.stdout.strip().split("\n") if line])
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        pass
+    return 0
+
+
 def validate_gpu_requirements() -> tuple[int, int]:
     """Check if there are enough GPUs for any single test.
+
+    Uses nvidia-smi instead of torch.cuda to avoid CUDA initialization,
+    which would break pytest-parallel (CUDA cannot be re-initialized after fork).
 
     Returns:
         Tuple of (max_required_gpus, available_gpus).
     """
-    available_gpus = 0
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            available_gpus = torch.cuda.device_count()
-    except ImportError:
-        pass
-
+    available_gpus = _count_gpus_without_cuda()
     return _max_test_gpu_requirement, available_gpus
 
 
@@ -356,3 +386,45 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "slow: mark test as slow-running",
     )
+    config.addinivalue_line(
+        "markers",
+        "thread_unsafe: mark test as incompatible with parallel thread execution",
+    )
+    config.addinivalue_line(
+        "markers",
+        "storage(backend): mark test to use a specific history storage backend "
+        "(memory, oracle). Default is memory.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parallel execution support
+# ---------------------------------------------------------------------------
+
+
+def is_parallel_execution(config: pytest.Config) -> bool:
+    """Check if tests are running in parallel mode (pytest-parallel).
+
+    Returns True if --tests-per-worker > 1, indicating concurrent thread execution.
+    """
+    # pytest-parallel adds the 'tests_per_worker' option
+    tests_per_worker = getattr(config.option, "tests_per_worker", None)
+    if tests_per_worker is None:
+        return False
+
+    if tests_per_worker == "auto":
+        return True
+
+    try:
+        return int(tests_per_worker) > 1
+    except (ValueError, TypeError):
+        return False
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Skip thread_unsafe tests when running in parallel mode."""
+    if is_parallel_execution(item.config):
+        marker = item.get_closest_marker("thread_unsafe")
+        if marker:
+            reason = marker.kwargs.get("reason", "Test is not thread-safe")
+            pytest.skip(f"Skipping in parallel mode: {reason}")

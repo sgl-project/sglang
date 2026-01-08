@@ -26,7 +26,7 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     Runtime,
     WorkerType,
 )
-from .gateway import Gateway, WorkerInfo
+from .gateway import Gateway, WorkerInfo, launch_cloud_gateway
 from .gpu_allocator import (
     GPUAllocator,
     GPUInfo,
@@ -54,6 +54,7 @@ from .model_specs import (  # Default model paths; Model groups
     FUNCTION_CALLING_MODELS,
     MODEL_SPECS,
     REASONING_MODELS,
+    THIRD_PARTY_MODELS,
 )
 from .process_utils import (
     detect_ib_device,
@@ -121,6 +122,7 @@ __all__ = [
     # Gateway
     "Gateway",
     "WorkerInfo",
+    "launch_cloud_gateway",
     # Default model paths
     "DEFAULT_MODEL_PATH",
     "DEFAULT_SMALL_MODEL_PATH",
@@ -135,6 +137,8 @@ __all__ = [
     "EMBEDDING_MODELS",
     "REASONING_MODELS",
     "FUNCTION_CALLING_MODELS",
+    # Third-party models
+    "THIRD_PARTY_MODELS",
     # Evaluation
     "run_eval",
 ]
