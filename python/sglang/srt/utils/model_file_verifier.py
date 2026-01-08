@@ -62,8 +62,12 @@ def generate_checksums(
     *, source: str, output_path: str, max_workers: int = 4
 ) -> Dict[str, str]:
     if Path(source).is_dir():
-        checksums = _generate_checksums_from_local(
-            model_path=source, max_workers=max_workers
+        model_path = Path(source).resolve()
+        files = _discover_files(model_path)
+        if not files:
+            raise IntegrityError(f"No model files found in {model_path}")
+        checksums = _compute_checksums(
+            model_path=model_path, filenames=files, max_workers=max_workers
         )
     else:
         checksums = _load_checksums_from_hf(repo_id=source)
@@ -75,20 +79,6 @@ def generate_checksums(
         f"[ModelFileVerifier] Generated checksums for {len(checksums)} files -> {output_path}"
     )
     return checksums
-
-
-def _generate_checksums_from_local(
-    *, model_path: str, max_workers: int
-) -> Dict[str, str]:
-    model_path = Path(model_path).resolve()
-    files = _discover_files(model_path)
-
-    if not files:
-        raise IntegrityError(f"No model files found in {model_path}")
-
-    return _compute_checksums(
-        model_path=model_path, filenames=files, max_workers=max_workers
-    )
 
 
 def _discover_files(model_path: Path) -> List[str]:
