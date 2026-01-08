@@ -641,13 +641,21 @@ class ModelPool:
                 instance = self.instances.get(key)
                 if instance and instance.process.stderr:
                     try:
-                        stderr = instance.process.stderr.read()
-                        if stderr:
-                            logger.error(
-                                "[%s] Last stderr output:\n%s",
-                                key,
-                                stderr.decode(errors="replace")[-3000:],
-                            )
+                        import select
+
+                        # Use select for non-blocking read with short timeout
+                        # to avoid hanging if worker is unresponsive
+                        ready, _, _ = select.select(
+                            [instance.process.stderr], [], [], 0.1
+                        )
+                        if ready:
+                            stderr = instance.process.stderr.read()
+                            if stderr:
+                                logger.error(
+                                    "[%s] Last stderr output:\n%s",
+                                    key,
+                                    stderr.decode(errors="replace")[-3000:],
+                                )
                     except Exception as e:
                         logger.error("[%s] Could not read stderr: %s", key, e)
             # Terminate failed instances and release their GPUs
