@@ -254,16 +254,18 @@ class LoRAPipeline(ComposedPipelineBase):
             was_offloaded, manager_info = self._temporarily_load_layer_for_conversion(
                 module_name, name
             )
-            lora_layer = wrap_with_lora_layer(
-                layer,
-                lora_rank=self.lora_rank,
-                lora_alpha=self.lora_alpha,
-            )
-            if lora_layer is not None:
-                target_lora_layers[name] = lora_layer
-                replace_submodule(self.modules[module_name], name, lora_layer)
-                converted_count += 1
-            self._restore_layer_offload_state(was_offloaded, manager_info)
+            try:
+                lora_layer = wrap_with_lora_layer(
+                    layer,
+                    lora_rank=self.lora_rank,
+                    lora_alpha=self.lora_alpha,
+                )
+                if lora_layer is not None:
+                    target_lora_layers[name] = lora_layer
+                    replace_submodule(self.modules[module_name], name, lora_layer)
+                    converted_count += 1
+            finally:
+                self._restore_layer_offload_state(was_offloaded, manager_info)
 
         return converted_count
 
@@ -348,15 +350,16 @@ class LoRAPipeline(ComposedPipelineBase):
                     self._temporarily_load_layer_for_conversion(module_name, name)
                 )
 
-                layer.set_lora_weights(
-                    self.lora_adapters[lora_nickname][lora_A_name],
-                    self.lora_adapters[lora_nickname][lora_B_name],
-                    lora_path=lora_path,
-                    strength=strength,
-                )
-                adapted_count += 1
-
-                self._restore_layer_offload_state(was_offloaded, manager_info)
+                try:
+                    layer.set_lora_weights(
+                        self.lora_adapters[lora_nickname][lora_A_name],
+                        self.lora_adapters[lora_nickname][lora_B_name],
+                        lora_path=lora_path,
+                        strength=strength,
+                    )
+                    adapted_count += 1
+                finally:
+                    self._restore_layer_offload_state(was_offloaded, manager_info)
             else:
                 if rank == 0:
                     logger.warning(
