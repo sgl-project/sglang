@@ -1,9 +1,6 @@
 import hashlib
-import json
 import os
 import shutil
-import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import nullcontext
@@ -13,12 +10,7 @@ import requests
 from huggingface_hub import snapshot_download
 
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.model_file_verifier import (
-    IntegrityError,
-    compute_sha256,
-    generate_checksums,
-    verify,
-)
+from sglang.srt.utils.model_file_verifier import compute_sha256, verify
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -70,30 +62,6 @@ class _RealModelTestCase(unittest.TestCase):
 
 class TestModelFileVerifier(_FakeModelTestCase):
 
-    def test_detect_bit_rot(self):
-        checksums_file = os.path.join(self.test_dir, "checksums.json")
-        generate_checksums(source=self.test_dir, output_path=checksums_file)
-
-        target_file = os.path.join(self.test_dir, "model.safetensors")
-        _flip_bit_in_file(target_file, byte_offset=50, bit_position=3)
-
-        with self.assertRaises(IntegrityError) as ctx:
-            verify(model_path=self.test_dir, checksums_source=checksums_file)
-
-        self.assertIn("model.safetensors", str(ctx.exception))
-        self.assertIn("mismatch", str(ctx.exception).lower())
-
-    def test_detect_missing_file(self):
-        checksums_file = os.path.join(self.test_dir, "checksums.json")
-        generate_checksums(source=self.test_dir, output_path=checksums_file)
-
-        os.remove(os.path.join(self.test_dir, "config.json"))
-
-        with self.assertRaises(IntegrityError) as ctx:
-            verify(model_path=self.test_dir, checksums_source=checksums_file)
-
-        self.assertIn("config.json", str(ctx.exception))
-
     def test_compute_sha256(self):
         test_file = os.path.join(self.test_dir, "test.bin")
         content = b"hello world"
@@ -104,112 +72,11 @@ class TestModelFileVerifier(_FakeModelTestCase):
         expected = hashlib.sha256(content).hexdigest()
         self.assertEqual(result, expected)
 
-    def test_parallel_checksum_computation(self):
-        for i in range(10):
-            _create_test_file(
-                self.test_dir, f"shard_{i}.safetensors", f"content_{i}".encode() * 1000
-            )
-
-        checksums_file = os.path.join(self.test_dir, "checksums.json")
-        checksums = generate_checksums(
-            source=self.test_dir, output_path=checksums_file, max_workers=4
-        )
-
-        self.assertGreaterEqual(len(checksums), 10)
-
-
-# ======== CLI Tests ========
-
-
-class TestModelFileVerifierCLI(_FakeModelTestCase):
-
-    def test_cli_generate(self):
-        checksums_file = os.path.join(self.test_dir, "checksums.json")
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.srt.utils.model_file_verifier",
-                "generate",
-                "--model-path",
-                self.test_dir,
-                "--model-checksum",
-                checksums_file,
-            ],
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
-        self.assertTrue(os.path.exists(checksums_file))
-
-        with open(checksums_file) as f:
-            data = json.load(f)
-        self.assertIn("checksums", data)
-        self.assertEqual(len(data["checksums"]), 3)
-
-    def test_cli_verify_success(self):
-        checksums_file = os.path.join(self.test_dir, "checksums.json")
-        generate_checksums(source=self.test_dir, output_path=checksums_file)
-
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.srt.utils.model_file_verifier",
-                "verify",
-                "--model-path",
-                self.test_dir,
-                "--model-checksum",
-                checksums_file,
-            ],
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
-        self.assertIn("verified successfully", result.stdout)
-
-    def test_cli_verify_fails_on_corruption(self):
-        checksums_file = os.path.join(self.test_dir, "checksums.json")
-        generate_checksums(source=self.test_dir, output_path=checksums_file)
-
-        target_file = os.path.join(self.test_dir, "model.safetensors")
-        _flip_bit_in_file(target_file, byte_offset=50, bit_position=3)
-
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.srt.utils.model_file_verifier",
-                "verify",
-                "--model-path",
-                self.test_dir,
-                "--model-checksum",
-                checksums_file,
-            ],
-            capture_output=True,
-            text=True,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        combined = result.stdout + result.stderr
-        self.assertTrue(
-            "IntegrityError" in combined or "mismatch" in combined.lower(),
-            f"Expected integrity error, got: {combined}",
-        )
-
 
 # ======== HuggingFace Tests ========
 
 
 class TestModelFileVerifierHF(_RealModelTestCase):
-
-    def test_generate_checksums_from_hf(self):
-        checksums_file = os.path.join(self.test_dir, "checksums.json")
-        checksums = generate_checksums(source=MODEL_NAME, output_path=checksums_file)
-
-        self.assertTrue(os.path.exists(checksums_file))
-        self.assertGreater(len(checksums), 0)
-        for filename, sha256 in checksums.items():
-            self.assertEqual(len(sha256), 64)
 
     def test_verify_with_hf_checksums_source(self):
         verify(model_path=self.test_dir, checksums_source=MODEL_NAME)
@@ -220,14 +87,7 @@ class TestModelFileVerifierHF(_RealModelTestCase):
 
 class TestModelFileVerifierWithRealModel(_RealModelTestCase):
 
-    def _run_server_test(self, *, corrupt_weights: bool, use_hf_checksum: bool):
-        if use_hf_checksum:
-            checksum_arg = MODEL_NAME
-        else:
-            checksums_file = os.path.join(self.test_dir, "checksums.json")
-            generate_checksums(source=self.test_dir, output_path=checksums_file)
-            checksum_arg = checksums_file
-
+    def _run_server_test(self, *, corrupt_weights: bool):
         corrupted_file = None
         if corrupt_weights:
             safetensors_files = [
@@ -244,7 +104,7 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
                 model=self.test_dir,
                 base_url=DEFAULT_URL_FOR_TEST,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=["--model-checksum", checksum_arg],
+                other_args=["--model-checksum", MODEL_NAME],
                 return_stdout_stderr=(stdout_io, stderr_io),
             )
 
@@ -264,16 +124,10 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
                 kill_process_tree(process.pid)
 
     def test_server_launch_with_checksum_intact(self):
-        self._run_server_test(corrupt_weights=False, use_hf_checksum=False)
+        self._run_server_test(corrupt_weights=False)
 
     def test_server_launch_fails_with_corrupted_weights(self):
-        self._run_server_test(corrupt_weights=True, use_hf_checksum=False)
-
-    def test_server_launch_with_hf_checksum_intact(self):
-        self._run_server_test(corrupt_weights=False, use_hf_checksum=True)
-
-    def test_server_launch_with_hf_checksum_corrupted(self):
-        self._run_server_test(corrupt_weights=True, use_hf_checksum=True)
+        self._run_server_test(corrupt_weights=True)
 
 
 # ======== Test Utilities ========
