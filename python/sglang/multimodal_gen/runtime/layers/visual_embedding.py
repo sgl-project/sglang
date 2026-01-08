@@ -21,7 +21,7 @@ except Exception as _e:
     pass
 
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 
 
@@ -219,8 +219,12 @@ class ModulateProjection(nn.Module):
         super().__init__()
         self.factor = factor
         self.hidden_size = hidden_size
-        self.linear = ReplicatedLinear(
-            hidden_size, hidden_size * factor, bias=True, params_dtype=dtype
+        self.linear = ColumnParallelLinear(
+            hidden_size,
+            hidden_size * factor,
+            bias=True,
+            gather_output=True,
+            params_dtype=dtype,
         )
         self.act = get_act_fn(act_layer)
 
