@@ -119,10 +119,11 @@ class ZImageAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
 
-        assert num_heads % get_tp_world_size() == 0, f"num_heads {num_heads} must be divisible by tp world size {get_tp_world_size()}"
-        assert num_kv_heads % get_tp_world_size() == 0, f"num_kv_heads {num_kv_heads} must be divisible by tp world size {get_tp_world_size()}"
-        self.local_num_heads = num_heads // get_tp_world_size()
-        self.local_num_kv_heads = num_kv_heads // get_tp_world_size()
+        tp_size = get_tp_world_size()
+        assert num_heads % tp_size == 0, f"num_heads {num_heads} must be divisible by tp world size {tp_size}"
+        assert num_kv_heads % tp_size == 0, f"num_kv_heads {num_kv_heads} must be divisible by tp world size {tp_size}"
+        self.local_num_heads = num_heads // tp_size
+        self.local_num_kv_heads = num_kv_heads // tp_size
 
         self.to_q = ColumnParallelLinear(dim, dim, bias=False, gather_output=False)
         self.to_k = ColumnParallelLinear(dim, self.head_dim * num_kv_heads, bias=False, gather_output=False)
