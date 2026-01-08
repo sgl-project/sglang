@@ -875,6 +875,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         # Note: only [128, 128] block size is available for now
         default_block_size = [128, 128]
 
+
+        dtype = getattr(model.config, 'dtype', getattr(model.config, 'torch_dtype', torch.bfloat16))
+
         fp8_config = Fp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="dynamic",
@@ -914,7 +917,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     continue
 
                 try:
-                    qweight, scale = scaled_fp8_blockwise(weight.to(torch.bfloat16), default_block_size)
+    
+                    qweight, scale = scaled_fp8_blockwise(weight.to(dtype), default_block_size)
                     # Scale shape is (blk_m, blk_n, 1); squeeze the last dim
                     scale = scale.squeeze(-1)
 
@@ -1248,6 +1252,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         # Store scales for later update
         quantized_scales: Dict[str, Union[torch.Tensor, Dict[Any, torch.Tensor]]] = {}
 
+
+        dtype = getattr(model.config, 'dtype', getattr(model.config, 'torch_dtype', torch.bfloat16))
+
         def quantize_weights_iterator(weights_iter):
             """Quantize individual shards before weight_loader stacks them."""
 
@@ -1268,7 +1275,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
                         try:
                             qweight, scale = scaled_fp8_blockwise(
-                                weight.to(torch.bfloat16), default_block_size
+                                weight.to(dtype), default_block_size
                             )
                             # scale shape is (blk_m, blk_n, 1), need to squeeze
                             scale = scale.squeeze(-1)
