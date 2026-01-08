@@ -111,6 +111,7 @@ test = [
   "expecttest",
   "jsonlines",
   "matplotlib",
+  "openai>=1.0.0",
   "pandas",
   "parameterized",
   "peft",

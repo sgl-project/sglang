@@ -97,6 +97,7 @@ test = [
   "gguf",
   "jsonlines",
   "matplotlib",
+  "openai>=1.0.0",
   "pandas",
   "peft",
   "pytest",
