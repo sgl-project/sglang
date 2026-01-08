@@ -195,7 +195,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
   }
 }
 
-void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s, bool use_smem_cache) {
+void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   CHECK_INPUT(output_s);
@@ -219,19 +219,18 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   // Check if shared memory can be used (similar to TensorRT-LLM logic)
   // Threshold is 48KB (48 * 1024 bytes), the default dynamic shared memory quota on NVIDIA GPUs
   // If use_smem_cache is explicitly false, disable shared memory
-  bool use_smem = use_smem_cache;
-  if (use_smem_cache) {
-    if (dynamicSmemSz >= 48 * 1024) {
-      // Try to allocate more shared memory
-      // Note: In sglang, we don't explicitly set cudaFuncSetAttribute,
-      // so we use a simpler heuristic: if smem needed >= 48KB,
-      // we check if it's reasonable based on hidden_dim size
-      // For now, we'll allow smem but with a fallback mechanism
-      // In practice, most GPUs can handle ~64KB dynamic shared memory
-      // If it fails, the kernel launch will error, so we provide a conservative default
-      use_smem = (dynamicSmemSz < 100 * 1024);  // Conservative: disable if > 100KB
-    }
+  bool use_smem = true;
+  if (dynamicSmemSz >= 48 * 1024) {
+    // Try to allocate more shared memory
+    // Note: In sglang, we don't explicitly set cudaFuncSetAttribute,
+    // so we use a simpler heuristic: if smem needed >= 48KB,
+    // we check if it's reasonable based on hidden_dim size
+    // For now, we'll allow smem but with a fallback mechanism
+    // In practice, most GPUs can handle ~64KB dynamic shared memory
+    // If it fails, the kernel launch will error, so we provide a conservative default
+    use_smem = (dynamicSmemSz < 100 * 1024);  // Conservative: disable if > 100KB
   }
+  
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
     if (use_warp_kernel) {
