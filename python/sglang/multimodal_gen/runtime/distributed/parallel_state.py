@@ -405,8 +405,8 @@ def initialize_model_parallel(
     assert _SP is None, "sequence parallel group is already initialized"
 
     try:
-        from .parallel_groups import PROCESS_GROUP as _YC_PROCESS_GROUP
         from .parallel_groups import (
+            PROCESS_GROUP as _PARALLEL_GROUPS_PG,
             set_seq_parallel_pg_by_sp_groups as _set_seq_parallel_pg_by_sp_groups,
         )
     except ImportError:
