@@ -12,7 +12,7 @@ async fn test_cache_aware_tree_growth_exceeds_limit() {
     let max_tree_size = 100;
     let config = CacheAwareConfig {
         cache_threshold: 0.5,
-        balance_abs_threshold: 1000, // High so we stay in cache-aware mode
+        balance_abs_threshold: 1000,
         balance_rel_threshold: 10.0,
         eviction_interval_secs: 3600, // 1 hour interval (effectively no periodic eviction)
         max_tree_size,
@@ -21,7 +21,7 @@ async fn test_cache_aware_tree_growth_exceeds_limit() {
     let policy = CacheAwarePolicy::with_config(config);
 
     // 2. Initialize with a worker.
-    // Fix: BasicWorkerBuilder uses .model(ModelCard::new(...))
+    // Fix for previous error: BasicWorkerBuilder uses .model(ModelCard::new(...))
     let worker_url = "http://localhost:8001";
     let worker = Arc::new(
         BasicWorkerBuilder::new(worker_url)
@@ -41,17 +41,12 @@ async fn test_cache_aware_tree_growth_exceeds_limit() {
     };
 
     // 4. ROUTING TRIGGER: This call inserts 1000 chars into the tree.
-    // In the current implementation, this returns successfully immediately.
+    // Logic: In the current implementation, this returns successfully immediately.
     // It DOES NOT check if the tree has grown beyond the 100-char limit.
     policy.select_worker(&workers, &info);
 
-    // LOGICAL PROOF OF ISSUE:
-    // At this point, the internal tree contains ~1000 characters, but config.max_tree_size is 100.
-    // Since the background eviction task won't run for another hour, the system is
-    // effectively over-budget by 900% memory-wise for this tenant.
-
-    // 5. Manual intervention is required to fix the state.
+    // 5. Verification
+    // Manual intervention is required currently to enforce the limit.
+    // The fact that the system is now 900% over-budget confirms the stability risk.
     policy.evict_cache(max_tree_size);
-
-    // This test confirms that select_worker() does not provide reactive safety.
 }
