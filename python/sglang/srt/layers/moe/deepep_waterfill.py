@@ -49,6 +49,107 @@ DEEPEP_WATERFILL_DEBUG = os.environ.get("SGLANG_DEEPEP_WATERFILL_DEBUG", "0") ==
 # Marker for local shared expert computation (won't be dispatched)
 LOCAL_SHARED_MARKER = -1
 
+# Try to import Triton for GPU-optimized kernels
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
+
+# ============== Triton Kernels (GPU-optimized) ==============
+
+
+if HAS_TRITON:
+
+    @triton.jit
+    def _assign_shared_destination_kernel(
+        topk_ids_ptr,       # [num_tokens, topk]
+        routed_counts_ptr,  # [world_size]
+        destination_ptr,    # [num_tokens] output
+        num_tokens,
+        topk,
+        experts_per_rank,
+        world_size,
+        source_rank,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """
+        Triton kernel for assigning shared expert destination using waterfill.
+        Each program instance handles one token.
+        """
+        pid = tl.program_id(0)
+        token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = token_idx < num_tokens
+        
+        # Initialize best_rank and best_count for each token
+        best_count = tl.full([BLOCK_SIZE], 2**30, dtype=tl.int64)  # INF
+        best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
+        
+        # Check source rank first
+        source_count = tl.load(routed_counts_ptr + source_rank)
+        update_mask = mask
+        best_count = tl.where(update_mask, source_count, best_count)
+        
+        # Check each routed expert
+        for k in range(topk):
+            # Load expert ID for this token
+            expert_id = tl.load(topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1)
+            valid = expert_id >= 0
+            
+            # Compute target rank
+            target_rank = expert_id // experts_per_rank
+            target_rank = tl.minimum(target_rank, world_size - 1)
+            target_rank = tl.maximum(target_rank, 0)
+            
+            # Load routed count for target rank
+            target_count = tl.load(routed_counts_ptr + target_rank, mask=mask & valid, other=2**30)
+            
+            # Update if this rank has lower count
+            better = (target_count < best_count) & valid & mask
+            best_count = tl.where(better, target_count, best_count)
+            best_rank = tl.where(better, target_rank, best_rank)
+        
+        # Store result
+        tl.store(destination_ptr + token_idx, best_rank, mask=mask)
+
+
+    def assign_shared_destination_triton(
+        topk_ids: Tensor,
+        routed_counts: Tensor,
+        num_experts: int,
+        world_size: int,
+        source_rank: int,
+    ) -> Tensor:
+        """Triton-optimized shared destination assignment."""
+        num_tokens = topk_ids.shape[0]
+        topk = topk_ids.shape[1]
+        experts_per_rank = num_experts // world_size
+        device = topk_ids.device
+        
+        if num_tokens == 0:
+            return torch.empty(0, dtype=torch.int64, device=device)
+        
+        destination = torch.empty(num_tokens, dtype=torch.int64, device=device)
+        
+        BLOCK_SIZE = 128
+        grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+        
+        _assign_shared_destination_kernel[grid](
+            topk_ids,
+            routed_counts,
+            destination,
+            num_tokens,
+            topk,
+            experts_per_rank,
+            world_size,
+            source_rank,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        
+        return destination
+
 
 # ============== PyTorch Implementation ==============
 
@@ -237,10 +338,19 @@ class DeepEPWaterfillBalancer:
     def assign_shared_destination(
         self, topk_ids: Tensor, routed_counts: Tensor
     ) -> Tensor:
-        """Assign shared expert destination for each token using waterfill."""
-        return assign_shared_destination_pytorch(
-            topk_ids, routed_counts, self.num_experts, self.world_size, self.rank
-        )
+        """Assign shared expert destination for each token using waterfill.
+        
+        Uses Triton kernel on GPU for better performance, falls back to PyTorch on CPU.
+        """
+        # Use Triton kernel on GPU if available
+        if HAS_TRITON and topk_ids.is_cuda:
+            return assign_shared_destination_triton(
+                topk_ids, routed_counts, self.num_experts, self.world_size, self.rank
+            )
+        else:
+            return assign_shared_destination_pytorch(
+                topk_ids, routed_counts, self.num_experts, self.world_size, self.rank
+            )
 
     def prepare_dispatch(
         self,
