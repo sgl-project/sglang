@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
 from contextlib import nullcontext
 from io import StringIO
 
@@ -116,6 +117,50 @@ class TestModelFileVerifier(_FakeModelTestCase):
         )
 
         self.assertGreaterEqual(len(checksums), 10)
+
+    def test_generated_json_snapshot(self):
+        checksums_file = os.path.join(self.test_dir, "checksums.json")
+        generate_checksums(source=self.test_dir, output_path=checksums_file)
+
+        with open(checksums_file) as f:
+            data = json.load(f)
+
+        expected = {
+            "files": {
+                "config.json": {
+                    "sha256": hashlib.sha256(self.FAKE_FILES["config.json"]).hexdigest(),
+                    "size": len(self.FAKE_FILES["config.json"]),
+                },
+                "model.safetensors": {
+                    "sha256": hashlib.sha256(self.FAKE_FILES["model.safetensors"]).hexdigest(),
+                    "size": len(self.FAKE_FILES["model.safetensors"]),
+                },
+                "tokenizer.json": {
+                    "sha256": hashlib.sha256(self.FAKE_FILES["tokenizer.json"]).hexdigest(),
+                    "size": len(self.FAKE_FILES["tokenizer.json"]),
+                },
+            }
+        }
+        self.assertEqual(data, expected)
+
+    def test_legacy_checksums_format_deprecated(self):
+        legacy_data = {
+            "checksums": {
+                "model.safetensors": hashlib.sha256(self.FAKE_FILES["model.safetensors"]).hexdigest(),
+                "config.json": hashlib.sha256(self.FAKE_FILES["config.json"]).hexdigest(),
+                "tokenizer.json": hashlib.sha256(self.FAKE_FILES["tokenizer.json"]).hexdigest(),
+            }
+        }
+        legacy_file = os.path.join(self.test_dir, "legacy_checksums.json")
+        with open(legacy_file, "w") as f:
+            json.dump(legacy_data, f)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            verify(model_path=self.test_dir, checksums_source=legacy_file)
+            self.assertEqual(len(w), 1)
+            self.assertTrue(issubclass(w[0].category, DeprecationWarning))
+            self.assertIn("deprecated", str(w[0].message).lower())
 
 
 # ======== CLI Tests ========
