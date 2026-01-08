@@ -197,14 +197,6 @@ class IntegrityError(Exception):
 # ======== CLI ========
 
 
-def _cli_generate(args):
-    generate_checksums(args.model_path, args.output, args.workers)
-
-
-def _cli_verify(args):
-    verify(args.model_path, args.model_checksum, args.workers)
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Model File Verifier - Verify model file integrity using SHA256 checksums"
@@ -243,6 +235,14 @@ def main():
 
     args = parser.parse_args()
     args.func(args)
+
+
+def _cli_generate(args):
+    generate_checksums(args.model_path, args.output, args.workers)
+
+
+def _cli_verify(args):
+    verify(args.model_path, args.model_checksum, args.workers)
 
 
 if __name__ == "__main__":
