@@ -682,7 +682,10 @@ def popen_launch_server(
 
     def _get_captured_output():
         if return_stdout_stderr:
-            return return_stdout_stderr[0].getvalue(), return_stdout_stderr[1].getvalue()
+            return (
+                return_stdout_stderr[0].getvalue(),
+                return_stdout_stderr[1].getvalue(),
+            )
         return None, None
 
     start_time = time.perf_counter()

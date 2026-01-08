@@ -30,7 +30,9 @@ IGNORE_PATTERNS = [
 def verify(*, model_path: str, checksums_source: str, max_workers: int = 4) -> None:
     model_path = Path(model_path).resolve()
     expected = _load_checksums(checksums_source)
-    actual = _compute_checksums(model_path=model_path, filenames=list(expected.keys()), max_workers=max_workers)
+    actual = _compute_checksums(
+        model_path=model_path, filenames=list(expected.keys()), max_workers=max_workers
+    )
     _compare_checksums(expected=expected, actual=actual)
     print(f"[ModelFileVerifier] All {len(expected)} files verified successfully.")
 
@@ -71,7 +73,9 @@ def generate_checksums(
     *, source: str, output_path: str, max_workers: int = 4
 ) -> Dict[str, str]:
     if Path(source).is_dir():
-        checksums = _generate_checksums_from_local(model_path=source, max_workers=max_workers)
+        checksums = _generate_checksums_from_local(
+            model_path=source, max_workers=max_workers
+        )
     else:
         checksums = _load_checksums_from_hf(repo_id=source)
 
@@ -93,7 +97,9 @@ def _generate_checksums_from_local(
     if not files:
         raise IntegrityError(f"No model files found in {model_path}")
 
-    return _compute_checksums(model_path=model_path, filenames=files, max_workers=max_workers)
+    return _compute_checksums(
+        model_path=model_path, filenames=files, max_workers=max_workers
+    )
 
 
 def _discover_files(model_path: Path) -> List[str]:
