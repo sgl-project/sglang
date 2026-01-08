@@ -220,7 +220,12 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
         import requests
 
         from sglang.srt.utils import kill_process_tree
-        from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
+        from sglang.test.test_utils import (
+            DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            DEFAULT_URL_FOR_TEST,
+            PopenLaunchServerError,
+            popen_launch_server,
+        )
 
         checksums_file = os.path.join(self.test_dir, "checksums.json")
         generate_checksums(source=self.test_dir, output_path=checksums_file)
@@ -233,60 +238,35 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
             target_file = os.path.join(self.test_dir, safetensors_files[0])
             _flip_bit_in_file(target_file, byte_offset=1000, bit_position=5)
 
-        _, host, port = DEFAULT_URL_FOR_TEST.split(":")
-        host = host[2:]
-
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "sglang.launch_server",
-                "--model-path",
-                self.test_dir,
-                "--host",
-                host,
-                "--port",
-                port,
-                "--model-checksum",
-                checksums_file,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        try:
-            if corrupt_weights:
-                stdout, stderr = process.communicate(timeout=60)
-                self.assertNotEqual(process.returncode, 0)
-                combined_output = stdout + stderr
-                self.assertTrue(
-                    "IntegrityError" in combined_output
-                    or "mismatch" in combined_output.lower(),
-                    f"Expected integrity error, got: {combined_output[-500:]}",
+        if corrupt_weights:
+            with self.assertRaises(PopenLaunchServerError) as ctx:
+                popen_launch_server(
+                    model=self.test_dir,
+                    base_url=DEFAULT_URL_FOR_TEST,
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    other_args=["--model-checksum", checksums_file],
                 )
-            else:
-                import time
-
-                for _ in range(60):
-                    time.sleep(1)
-                    try:
-                        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health")
-                        if response.status_code == 200:
-                            break
-                    except requests.exceptions.ConnectionError:
-                        continue
-                else:
-                    self.fail("Server did not start in time")
-
+            self.assertTrue(
+                "IntegrityError" in ctx.exception.output
+                or "mismatch" in ctx.exception.output.lower(),
+                f"Expected integrity error, got: {ctx.exception.output[-500:]}",
+            )
+        else:
+            process = popen_launch_server(
+                model=self.test_dir,
+                base_url=DEFAULT_URL_FOR_TEST,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=["--model-checksum", checksums_file],
+            )
+            try:
                 response = requests.post(
                     f"{DEFAULT_URL_FOR_TEST}/generate",
                     json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
                 )
                 self.assertEqual(response.status_code, 200)
                 self.assertIn("text", response.json())
-        finally:
-            kill_process_tree(process.pid)
+            finally:
+                kill_process_tree(process.pid)
 
     def test_server_launch_with_checksum_intact(self):
         self._run_server_test(corrupt_weights=False)
