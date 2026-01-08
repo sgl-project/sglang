@@ -16,7 +16,7 @@ export type ManifoldZone =
   | 'unknown';
 
 export type Program = 'prod' | 'debug' | 'discovery';
-export type View = 'chat' | 'inspect' | 'manifold' | 'router' | 'compare' | 'lens';
+export type View = 'chat' | 'inspect' | 'manifold' | 'router' | 'compare' | 'lens' | 'pareto';
 
 export const SCHEMA_VERSION = 1;
 

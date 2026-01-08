@@ -6,6 +6,7 @@ import { ManifoldView } from './components/views/ManifoldView';
 import { RouterView } from './components/views/RouterView';
 import { LogitLensView } from './components/views/LogitLensView';
 import { ComparisonView } from './components/comparison';
+import { ParetoView } from './components/pareto';
 import { InsightPanel } from './components/lens/InsightPanel';
 import { TokenLensDrawer } from './components/lens/TokenLensDrawer';
 import { useUIStore } from './stores/useUIStore';
@@ -27,6 +28,8 @@ export default function App() {
         return <ComparisonView />;
       case 'lens':
         return <LogitLensView />;
+      case 'pareto':
+        return <ParetoView />;
       default:
         return <ChatView />;
     }
