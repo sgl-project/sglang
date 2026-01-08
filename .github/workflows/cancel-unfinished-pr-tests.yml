@@ -91,8 +91,6 @@ jobs:
                   continue
                 fi
 
-                echo "Run $run_id is associated with PR #$pr_number (headBranch='$head_branch')"
-
                 # Check for high priority label
                 labels=$(gh pr view "$pr_number" --repo "$REPO" --json labels \
                   | jq -r '.labels[].name' 2>/dev/null || true)
