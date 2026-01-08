@@ -195,6 +195,11 @@ def test_causal_conv1d_update_with_batch_gather(
     if not torch.cuda.is_available():
         pytest.skip("CUDA device not available")
 
+    # TODO: Fix Triton kernel bug with padded batches
+    # See: https://github.com/sgl-project/sglang/issues/16711
+    if with_padding:
+        pytest.skip("Triton kernel bug with padded batches - see issue #16711")
+
     device = "cuda"
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
