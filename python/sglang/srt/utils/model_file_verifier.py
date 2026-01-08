@@ -31,7 +31,7 @@ class FileInfo:
 
     @classmethod
     def from_dict(cls, data: dict) -> "FileInfo":
-        return cls(sha256=data["sha256"], size=data.get("size", 0))
+        return cls(**data)
 
 
 @dataclass
