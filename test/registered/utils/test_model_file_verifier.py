@@ -9,7 +9,7 @@ from sglang.srt.utils.model_file_verifier import (
     ModelFileVerifier,
     compute_sha256,
 )
-
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 
@@ -347,7 +347,8 @@ class TestModelFileVerifierWithRealModel(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         combined_output = result.stdout + result.stderr
         self.assertTrue(
-            "IntegrityError" in combined_output or "mismatch" in combined_output.lower(),
+            "IntegrityError" in combined_output
+            or "mismatch" in combined_output.lower(),
             f"Expected integrity error, got: {combined_output[-500:]}",
         )
 
