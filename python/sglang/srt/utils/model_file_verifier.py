@@ -86,19 +86,18 @@ class ModelFileVerifier:
 
         print(f"[ModelFileVerifier] All {len(expected)} files verified successfully.")
 
-    def generate_checksums(self, output_path: Optional[str] = None) -> Dict[str, str]:
+    def generate_checksums(self, output_path: str) -> Dict[str, str]:
         files = self._discover_files()
         if not files:
             raise IntegrityError(f"No model files found in {self.model_path}")
 
         checksums = self._compute_checksums(files)
 
-        output = output_path or os.path.join(self.model_path, self.CHECKSUM_FILENAME)
-        with open(output, "w") as f:
+        with open(output_path, "w") as f:
             json.dump(checksums, f, indent=2, sort_keys=True)
 
         print(
-            f"[ModelFileVerifier] Generated checksums for {len(checksums)} files -> {output}"
+            f"[ModelFileVerifier] Generated checksums for {len(checksums)} files -> {output_path}"
         )
         return checksums
 
@@ -227,7 +226,7 @@ def main():
         "--model-path", required=True, help="Path to model directory"
     )
     gen_parser.add_argument(
-        "--output", help="Output path (default: <model-path>/checksums.json)"
+        "--output", required=True, help="Output path for checksums.json"
     )
     gen_parser.add_argument(
         "--workers", type=int, default=4, help="Number of parallel workers"
