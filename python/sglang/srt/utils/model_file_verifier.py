@@ -20,7 +20,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-
 # ======== Data Format ========
 
 
@@ -48,7 +47,11 @@ class ChecksumFile:
                 DeprecationWarning,
                 stacklevel=3,
             )
-            return cls(files={k: FileInfo(sha256=v, size=0) for k, v in data["checksums"].items()})
+            return cls(
+                files={
+                    k: FileInfo(sha256=v, size=0) for k, v in data["checksums"].items()
+                }
+            )
         return cls(files={k: FileInfo.from_dict(v) for k, v in data["files"].items()})
 
     def to_dict(self) -> dict:
@@ -77,7 +80,9 @@ def verify(*, model_path: str, checksums_source: str, max_workers: int = 4) -> N
     model_path = Path(model_path).resolve()
     expected = _load_checksums(checksums_source)
     actual_infos = _compute_file_infos_from_folder(
-        model_path=model_path, filenames=list(expected.files.keys()), max_workers=max_workers
+        model_path=model_path,
+        filenames=list(expected.files.keys()),
+        max_workers=max_workers,
     )
     expected_dict = {k: v.sha256 for k, v in expected.files.items()}
     actual_dict = {k: v.sha256 for k, v in actual_infos.items()}
@@ -117,7 +122,9 @@ def generate_checksums(
         file_infos = _load_file_infos_from_hf(repo_id=source)
 
     checksum_file = ChecksumFile(files=file_infos)
-    Path(output_path).write_text(json.dumps(checksum_file.to_dict(), indent=2, sort_keys=True))
+    Path(output_path).write_text(
+        json.dumps(checksum_file.to_dict(), indent=2, sort_keys=True)
+    )
 
     print(
         f"[ModelFileVerifier] Generated checksums for {len(file_infos)} files -> {output_path}"
@@ -152,9 +159,7 @@ def _load_file_infos_from_hf(*, repo_id: str) -> Dict[str, FileInfo]:
     files = fs.ls(repo_id, detail=True)
 
     file_infos = dict(
-        r
-        for r in map(lambda f: _get_filename_and_info_from_hf_file(fs, f), files)
-        if r
+        r for r in map(lambda f: _get_filename_and_info_from_hf_file(fs, f), files) if r
     )
     if not file_infos:
         raise IntegrityError(f"No files found in HF repo {repo_id}.")
@@ -181,7 +186,9 @@ def _get_filename_and_info_from_hf_file(
         return filename, FileInfo(sha256=file_info["sha256"], size=size)
 
     content = fs.read_bytes(file_info.get("name", ""))
-    return filename, FileInfo(sha256=hashlib.sha256(content).hexdigest(), size=len(content))
+    return filename, FileInfo(
+        sha256=hashlib.sha256(content).hexdigest(), size=len(content)
+    )
 
 
 # ======== Compute Checksums ========

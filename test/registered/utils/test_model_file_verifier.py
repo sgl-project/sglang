@@ -163,7 +163,6 @@ class TestModelFileVerifier(_FakeModelTestCase):
             self.assertIn("deprecated", str(w[0].message).lower())
 
 
-
 # ======== CLI Tests ========
 
 
