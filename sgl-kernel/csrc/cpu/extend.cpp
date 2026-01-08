@@ -40,7 +40,7 @@ void extend_attention_kernel_impl(
     int k_strideH,
     int v_strideN,
     int v_strideH,
-    float scaling,
+    float sm_scale,
     int max_num_reqs,
     int max_context_len,
     int max_total_num_tokens,
@@ -152,7 +152,7 @@ void extend_attention_kernel_impl(
             /* C     */ s_i);
 
         flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, scaling);
+            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
 
         // get value and pack
         pack_vnni2<scalar_t, index_t>(
@@ -219,7 +219,7 @@ void extend_attention_kernel_impl(
         }
 
         flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, scaling);
+            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
 
         // get value and pack
         pack_vnni2<scalar_t>(
