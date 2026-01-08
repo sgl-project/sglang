@@ -255,7 +255,10 @@ class ModelInstance:
         except subprocess.TimeoutExpired:
             logger.warning("%s did not terminate, killing", self.key)
             self.process.kill()
-            self.process.wait()
+            try:
+                self.process.wait(timeout=5)  # Brief timeout after kill
+            except subprocess.TimeoutExpired:
+                logger.error("%s did not die after SIGKILL, abandoning", self.key)
 
 
 class ModelPool:
@@ -594,11 +597,29 @@ class ModelPool:
                         key,
                         instance.process.pid,
                     )
-                    # Read stderr for debugging
+                    # Read stderr for debugging (non-blocking to avoid hangs)
                     if instance.process.stderr:
-                        stderr = instance.process.stderr.read()
-                        if stderr:
-                            logger.error("Stderr: %s", stderr.decode()[-2000:])
+                        try:
+                            import os
+                            import select
+
+                            # Use select for non-blocking read with short timeout
+                            # to avoid hanging if child processes keep stderr open
+                            ready, _, _ = select.select(
+                                [instance.process.stderr], [], [], 0.5
+                            )
+                            if ready:
+                                # Use os.read with limited size instead of .read()
+                                # which reads until EOF and can block if pipe stays open
+                                fd = instance.process.stderr.fileno()
+                                stderr = os.read(fd, 65536)  # Read up to 64KB
+                                if stderr:
+                                    logger.error(
+                                        "Stderr: %s",
+                                        stderr.decode(errors="replace")[-2000:],
+                                    )
+                        except Exception as e:
+                            logger.warning("Could not read stderr: %s", e)
                     # Evict dead instance and release GPUs
                     self._evict_instance(key)
                     pending.discard(key)
@@ -641,6 +662,7 @@ class ModelPool:
                 instance = self.instances.get(key)
                 if instance and instance.process.stderr:
                     try:
+                        import os
                         import select
 
                         # Use select for non-blocking read with short timeout
@@ -649,7 +671,10 @@ class ModelPool:
                             [instance.process.stderr], [], [], 0.1
                         )
                         if ready:
-                            stderr = instance.process.stderr.read()
+                            # Use os.read with limited size instead of .read()
+                            # which reads until EOF and can block if pipe stays open
+                            fd = instance.process.stderr.fileno()
+                            stderr = os.read(fd, 65536)  # Read up to 64KB
                             if stderr:
                                 logger.error(
                                     "[%s] Last stderr output:\n%s",
