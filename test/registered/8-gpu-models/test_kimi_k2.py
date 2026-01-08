@@ -12,6 +12,7 @@ register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
 KIMI_K2_THINKING_MODEL_PATH = "moonshotai/Kimi-K2-Thinking"
 
 
+@unittest.skip("Temporarily disabled to test Llama4 HF token")
 class TestKimiK2Unified(unittest.TestCase):
     """Unified test class for Kimi-K2-Thinking performance and accuracy.
 

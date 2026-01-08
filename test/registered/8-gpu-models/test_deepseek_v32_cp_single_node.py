@@ -46,6 +46,7 @@ CP_ROUND_ROBIN_ARGS = [
 ]
 
 
+@unittest.skip("Temporarily disabled to test Llama4 HF token")
 class TestDeepseekV32CPSingleNode(unittest.TestCase):
     """Test class for DeepSeek V3.2 with NSA context parallelism.
 

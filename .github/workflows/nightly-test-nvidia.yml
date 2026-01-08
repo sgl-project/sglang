@@ -52,6 +52,7 @@ env:
   SGLANG_IS_IN_CI: true
   HF_HUB_DOWNLOAD_TIMEOUT: 300
   HF_HUB_ETAG_TIMEOUT: 300
+  HF_TOKEN: ${{ secrets.CI_HF_TOKEN }}
 
 jobs:
   # General tests - 1 GPU

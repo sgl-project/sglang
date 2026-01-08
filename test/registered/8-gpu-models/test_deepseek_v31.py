@@ -12,6 +12,7 @@ register_cuda_ci(est_time=12000, suite="nightly-8-gpu-common", nightly=True)
 DEEPSEEK_V31_MODEL_PATH = "deepseek-ai/DeepSeek-V3.1"
 
 
+@unittest.skip("Temporarily disabled to test Llama4 HF token")
 class TestDeepseekV31Unified(unittest.TestCase):
     """Unified test class for DeepSeek-V3.1 performance and accuracy.
 

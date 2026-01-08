@@ -27,6 +27,7 @@ GSM8K_BASELINE = 0.935
 GPQA_BASELINE = 0.835
 
 
+@unittest.skip("Temporarily disabled to test Llama4 HF token")
 class TestDeepseekV32Unified(unittest.TestCase):
     """Unified test class for DeepSeek V3.2 performance and accuracy.
 
