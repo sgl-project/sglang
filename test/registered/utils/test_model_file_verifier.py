@@ -162,6 +162,23 @@ class TestModelFileVerifier(_FakeModelTestCase):
             self.assertTrue(issubclass(w[0].category, DeprecationWarning))
             self.assertIn("deprecated", str(w[0].message).lower())
 
+    def test_malformed_json_raises_integrity_error(self):
+        malformed_cases = [
+            ({"files": "not_a_dict"}, "files expects dict"),
+            ({"files": {"a.bin": "not_a_dict"}}, "FileInfo expects dict"),
+            ({"files": {"a.bin": {"size": 123}}}, "missing required field 'sha256'"),
+            ({"files": {"a.bin": {"sha256": 123, "size": 0}}}, "sha256 expects str"),
+            ({}, "missing 'files' or 'checksums'"),
+        ]
+        for data, expected_msg in malformed_cases:
+            malformed_file = os.path.join(self.test_dir, "malformed.json")
+            with open(malformed_file, "w") as f:
+                json.dump(data, f)
+
+            with self.assertRaises(IntegrityError) as ctx:
+                verify(model_path=self.test_dir, checksums_source=malformed_file)
+            self.assertIn(expected_msg, str(ctx.exception).lower(), f"Failed for {data}")
+
 
 # ======== CLI Tests ========
 
