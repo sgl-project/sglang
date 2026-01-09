@@ -4,7 +4,7 @@
 # Slight differences in processing chat messages
 import datetime
 from collections.abc import Iterable
-from typing import Literal, Optional, Union
+from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import orjson
 from openai.types.responses import (
@@ -24,6 +24,10 @@ from openai.types.responses.response_reasoning_item import (
     Content as ResponseReasoningTextContent,
 )
 from openai.types.responses.tool import Tool
+
+# Import ResponseTool for type checking only
+if TYPE_CHECKING:
+    from sglang.srt.entrypoints.openai.protocol import ResponseTool
 from openai_harmony import (
     Author,
     Conversation,
@@ -84,7 +88,8 @@ def get_system_message(
 
 
 def get_developer_message(
-    instructions: Optional[str] = None, tools: Optional[list[Tool]] = None
+    instructions: Optional[str] = None,
+    tools: Optional[Union[list[Tool], list["ResponseTool"]]] = None,
 ) -> Message:
     dev_msg_content = DeveloperContent.new()
     if instructions is not None:
