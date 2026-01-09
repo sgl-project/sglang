@@ -26,6 +26,8 @@ class _State:
 class _NegotiateOutput(NamedTuple):
     allow_prefill: bool
     outcome: str
+    debug_num_prefillable: int
+    debug_num_token_watermark_force_allow: int
 
 
 class PrefillDelayer:
@@ -99,15 +101,15 @@ class PrefillDelayer:
         )
 
         # Compute derived global states
-        num_prefillable = global_prefillable.sum().item()
-        num_token_watermark_force_allow = (
-            global_token_watermark_force_allow.sum().item()
-        )
         global_exists_token_watermark_force_allow = (
             global_token_watermark_force_allow.max().item() > 0
         )
         global_all_prefillable = global_prefillable.min().item() > 0
         global_all_not_prefillable = global_prefillable.max().item() == 0
+        debug_info = dict(
+            debug_num_prefillable=global_prefillable.sum().item(),
+            debug_num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
+        )
 
         # Compute outputs
 
@@ -120,18 +122,21 @@ class PrefillDelayer:
                     if exist_previous_wait
                     else "no_wait_all_prefillable"
                 ),
+                **debug_info,
             )
         elif global_all_not_prefillable:
             return None, _NegotiateOutput(
                 # It does not matter whether we allow or not, thus we allow for simplicity
                 allow_prefill=True,
                 outcome="no_prefillable",
+                **debug_info,
             )
         else:  # some ranks are prefillable, some are not
             if global_exists_token_watermark_force_allow:
                 return None, _NegotiateOutput(
                     allow_prefill=True,
                     outcome="token_watermark_force_allow",
+                    **debug_info,
                 )
 
             prev_delayed_count = prev_state.delayed_count if prev_state else 0
@@ -143,11 +148,13 @@ class PrefillDelayer:
                 return next_state, _NegotiateOutput(
                     allow_prefill=False,
                     outcome="forbid",
+                    **debug_info,
                 )
 
             return None, _NegotiateOutput(
                 allow_prefill=True,
                 outcome="wait_timeout",
+                **debug_info,
             )
 
     def _gather_info(
