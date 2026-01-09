@@ -334,6 +334,7 @@ def _run_throughput_test(
         kill_process_tree(process.pid)
 
     print(f"=== {debug_name} ({prefill_delayer=}) ===")
+    res["total_throughput"] = res["input_throughput"] + res["output_throughput"]
     print(f"Input throughput: {res['input_throughput']:.2f} token/s")
     print(f"Output throughput: {res['output_throughput']:.2f} token/s")
     print(f"Total throughput: {res['total_throughput']:.2f} token/s")
@@ -378,14 +379,14 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
     def _run(self, token_usage_low_watermark):
         model = "Qwen/Qwen3-0.6B"
         base_url = DEFAULT_URL_FOR_TEST
-        world_size = int(WORLD_SIZE)
 
         process = _launch_server(
             model=model,
             base_url=base_url,
             prefill_delayer=True,
             other_args=["--max-total-tokens", "50000"],
-            # e.g. gen throughput is 370 tok/s
+            # e.g. gen throughput is 370 tok/s on H200.
+            # Will need a different threshold on B200
             max_delay_passes=3000,
             token_usage_low_watermark=token_usage_low_watermark,
         )
@@ -431,7 +432,8 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
                 print(f"DP rank {dp_rank} req {req_idx} completed in {elapsed:.2f}s")
                 self.assertTrue(
                     (elapsed < thresh) if enabled else (elapsed > thresh),
-                    f"DP rank {dp_rank} req {req_idx}: elapsed={elapsed:.2f}s, thresh={thresh}, enabled={enabled}",
+                    f"DP rank {dp_rank} req {req_idx}: elapsed={elapsed:.2f}s, thresh={thresh}, enabled={enabled}. "
+                    f"Maybe you need a different `max_delay_passes` when using hardware other than H200.",
                 )
 
         try:
