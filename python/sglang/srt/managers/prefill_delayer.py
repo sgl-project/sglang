@@ -115,14 +115,13 @@ class PrefillDelayer:
             )
             return _NegotiateOutput(allow_prefill=True)
 
-
         if global_mixed_prefillable:
-            curr_delay_info = _DelayInfo() or prev_delay_info
-            curr_delay_info = dataclasses.replace(
-                curr_delay_info,
-                delayed_count=curr_delay_info.delayed_count + 1,
+            next_delay_info = _DelayInfo() or prev_delay_info
+            next_delay_info = dataclasses.replace(
+                next_delay_info,
+                delayed_count=next_delay_info.delayed_count + 1,
             )
-            if curr_delay_info.delayed_count < self._max_delay_passes:
+            if next_delay_info.delayed_count < self._max_delay_passes:
                 return _NegotiateOutput(allow_prefill=False)
 
         is_timeout = global_mixed_prefillable
