@@ -25,7 +25,7 @@ class _State:
 
 class _NegotiateOutput(NamedTuple):
     next_state: Optional[_State]
-    prefillable_status: str
+    input_estimation: str
     output_allow: bool
     output_reason: str
     num_prefillable: int
@@ -199,7 +199,7 @@ class PrefillDelayerSinglePassExecutor:
             self.negotiate_should_allow_prefill(local_prefillable=False)
 
         _record_single_pass_result(
-            actual_prefill=actual_prefill,
+            actual_execution=actual_prefill,
             output=self._result,
             metrics_collector=self._prefill_delayer._metrics_collector,
         )
@@ -214,7 +214,7 @@ class PrefillDelayerSinglePassExecutor:
 
 
 def _record_single_pass_result(
-    actual_prefill: bool,
+    actual_execution: bool,
     output: _NegotiateOutput,
     metrics_collector: Optional["SchedulerMetricsCollector"],
 ) -> None:
@@ -246,8 +246,8 @@ def _record_single_pass_result(
         metrics_collector.observe_prefill_delayer_outcome(
             forward_passes=forward_passes,
             wait_seconds=wait_seconds,
-            input_estimation=output.prefillable_status,
+            input_estimation=output.input_estimation,
             output_allow=output.output_allow,
             output_reason=output.output_reason,
-            actual_execution=actual_prefill,
+            actual_execution=actual_execution,
         )
