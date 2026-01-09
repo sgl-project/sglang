@@ -1858,31 +1858,6 @@ class NSATokenToKVPool(MLATokenToKVPool):
             self, buf, page_indices=page_indices, seq_len_tensor=seq_len_tensor,
             seq_len_sum=seq_len_sum, max_seq_len=max_seq_len,
         )
-    
-    def get_ks_ke_buffer(
-        self,
-        extend_sum_seq_len: int,
-        seq_lens_tensor: torch.Tensor, 
-        extend_seq_lens_tensor: torch.Tensor, 
-        seq_lens_expanded_tensor: torch.Tensor,
-    ):
-        """
-        Fused method to get both index K and scale data in a single call using Triton.
-        More efficient than calling get_index_k_continuous and get_index_k_scale_continuous separately.
-
-        :param layer_id: Layer index
-        :param seq_len: Sequence length
-        :param page_indices: Page indices tensor
-        :return: tuple of (k_fp8, k_scale) where
-                 k_fp8: (seq_len, index_head_dim), uint8
-                 k_scale: (seq_len, 4), uint8
-        """
-        return index_buf_accessor.GetKEAndKS.execute(
-            self,extend_sum_seq_len=extend_sum_seq_len,
-            seq_lens_tensor=seq_lens_tensor,
-            extend_seq_lens_tensor=extend_seq_lens_tensor,
-            seq_lens_expanded_tensor=seq_lens_expanded_tensor,
-        )
 
     def set_index_k_scale_buffer(
         self,
