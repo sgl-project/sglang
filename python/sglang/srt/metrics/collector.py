@@ -806,14 +806,19 @@ class SchedulerMetricsCollector:
         self,
         forward_passes: int,
         wait_seconds: float,
-        decision: str,
+        prefillable: str,
+        allow: bool,
+        reason: str,
         actual_prefill: bool,
     ) -> None:
         self._log_histogram(self.prefill_delayer_wait_forward_passes, forward_passes)
         self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
         TODO_counter_name
         self.prefill_delayer_decisions_total.labels(
-            **self.labels, decision=decision, actual_prefill=int(actual_prefill)
+            **self.labels,
+            prefillable=prefillable,
+            allow=str(int(allow)),
+            actual_prefill=str(int(actual_prefill)),
         ).inc(1)
 
     def increment_retracted_reqs(

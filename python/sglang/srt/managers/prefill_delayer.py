@@ -25,8 +25,8 @@ class _State:
 
 class _NegotiateOutput(NamedTuple):
     next_state: Optional[_State]
-    allow_prefill: bool
-    prefillable_status: str
+    prefillable: str
+    allow: bool
     reason: str
     num_prefillable: int
     num_token_watermark_force_allow: int
@@ -124,7 +124,7 @@ class PrefillDelayer:
             exist_previous_wait = prev_state is not None
             return _NegotiateOutput(
                 next_state=None,
-                allow_prefill=True,
+                allow=True,
                 reason="wait_success" if exist_previous_wait else "no_wait",
                 **debug_info,
             )
@@ -132,7 +132,7 @@ class PrefillDelayer:
             return _NegotiateOutput(
                 next_state=None,
                 # It does not matter whether we allow or not, thus we allow for simplicity
-                allow_prefill=True,
+                allow=True,
                 reason="",
                 **debug_info,
             )
@@ -140,7 +140,7 @@ class PrefillDelayer:
             if global_exists_token_watermark_force_allow:
                 return _NegotiateOutput(
                     next_state=None,
-                    allow_prefill=True,
+                    allow=True,
                     reason="token_watermark",
                     **debug_info,
                 )
@@ -153,14 +153,14 @@ class PrefillDelayer:
                 )
                 return _NegotiateOutput(
                     next_state=next_state,
-                    allow_prefill=False,
+                    allow=False,
                     reason="delay",
                     **debug_info,
                 )
             else:
                 return _NegotiateOutput(
                     next_state=None,
-                    allow_prefill=True,
+                    allow=True,
                     reason="wait_timeout",
                     **debug_info,
                 )
@@ -210,7 +210,7 @@ class PrefillDelayerSinglePassExecutor:
                 local_prefillable=local_prefillable,
                 token_usage=self._token_usage,
             )
-        return self._result.allow_prefill
+        return self._result.allow
 
 
 def _record_single_pass_result(
@@ -219,12 +219,12 @@ def _record_single_pass_result(
     metrics_collector: Optional["SchedulerMetricsCollector"],
 ) -> None:
     if _DEBUG_LOG:
-        if output.allow_prefill and (output.reason == "wait_timeout"):
+        if output.allow and (output.reason == "wait_timeout"):
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill "
                 f"(num_prefillable={output.num_prefillable})"
             )
-        elif output.allow_prefill and (output.reason == "token_watermark"):
+        elif output.allow and (output.reason == "token_watermark"):
             logger.info(
                 f"PrefillDelayer force allow prefill due to low watermark. "
                 f"(num_prefillable={output.num_prefillable}, "
@@ -246,8 +246,8 @@ def _record_single_pass_result(
         metrics_collector.observe_prefill_delayer_wait(
             forward_passes=forward_passes,
             wait_seconds=wait_seconds,
-            allow_prefill=output.allow_prefill,
-            prefillable_status=output.prefillable_status,
+            prefillable=output.prefillable,
+            allow=output.allow,
             reason=output.reason,
             actual_prefill=actual_prefill,
         )
