@@ -140,7 +140,7 @@ pip install -e "python[rocm700]"
 
 ## Examples
 
-### Running DeepSeek-V3
+### Run DeepSeek-V3
 
 The only difference when running DeepSeek-V3 is in how you start the server. Here's an example command:
 
@@ -160,7 +160,7 @@ drun -p 30000:30000 \
 
 [Running DeepSeek-R1 on a single NDv5 MI300X VM](https://techcommunity.microsoft.com/blog/azurehighperformancecomputingblog/running-deepseek-r1-on-a-single-ndv5-mi300x-vm/4372726) could also be a good reference.
 
-### Running Llama3.1
+### Run Llama3.1
 
 Running Llama3.1 is nearly identical to running DeepSeek-V3. The only difference is in the model specified when starting the server, shown by the following example command:
 
@@ -178,6 +178,6 @@ drun -p 30000:30000 \
     --port 30000
 ```
 
-### Warmup Step
+### Warmup
 
 When the server displays `The server is fired up and ready to roll!`, it means the startup is successful.
