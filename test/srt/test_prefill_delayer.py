@@ -182,5 +182,90 @@ def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool):
         assert "sglang:prefill_delayer_timeouts_total" in metrics_text
 
 
+class TestPrefillDelayerLowWatermark(CustomTestCase):
+    def test_low_watermark_force_prefill(self):
+        model = "Qwen/Qwen3-0.6B"
+        base_url = DEFAULT_URL_FOR_TEST
+        world_size = int(os.environ.get("SGLANG_TEST_WORLD_SIZE", "8"))
+        os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
+
+        with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
+            True
+        ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(
+            1000
+        ), envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.override(0.3):
+            process = popen_launch_server(
+                model,
+                base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--trust-remote-code",
+                    "--tp",
+                    str(world_size),
+                    "--enable-dp-attention",
+                    "--dp",
+                    str(world_size),
+                    "--chunked-prefill-size",
+                    "131072",
+                    "--mem-fraction-static",
+                    "0.6",
+                    "--enable-metrics",
+                    "--max-total-tokens",
+                    "50000",
+                ],
+            )
+
+        import openai
+        import concurrent.futures
+        import time
+
+        try:
+            client = openai.Client(base_url=f"{base_url}/v1", api_key="EMPTY")
+
+            long_prompt = "Hello " * 5000
+            blocking_future = None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=world_size + 1) as executor:
+                def send_blocking_request():
+                    return client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": long_prompt}],
+                        max_tokens=10000,
+                        extra_body={"data_parallel_rank": 0},
+                    )
+
+                blocking_future = executor.submit(send_blocking_request)
+                time.sleep(3)
+
+                def send_normal_request(dp_rank):
+                    start = time.time()
+                    resp = client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": "Say hi"}],
+                        max_tokens=10,
+                        extra_body={"data_parallel_rank": dp_rank},
+                    )
+                    elapsed = time.time() - start
+                    return dp_rank, elapsed, resp
+
+                normal_futures = [
+                    executor.submit(send_normal_request, dp_rank)
+                    for dp_rank in range(1, world_size)
+                ]
+
+                for future in concurrent.futures.as_completed(normal_futures):
+                    dp_rank, elapsed, resp = future.result()
+                    print(f"DP rank {dp_rank} completed in {elapsed:.2f}s")
+                    self.assertLess(
+                        elapsed, 30,
+                        f"Request to DP rank {dp_rank} took too long ({elapsed:.2f}s), low watermark force prefill may not be working"
+                    )
+
+            _print_prefill_delayer_metrics(base_url, expect_metrics=True)
+
+        finally:
+            kill_process_tree(process.pid)
+
+
 if __name__ == "__main__":
     unittest.main()
