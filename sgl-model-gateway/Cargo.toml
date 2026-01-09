@@ -1,6 +1,6 @@
 [package]
 name = "sgl-model-gateway"
-version = "0.2.4"
+version = "0.3.1"
 edition = "2021"
 
 [features]
@@ -14,7 +14,7 @@ vendored-openssl = ["openssl/vendored"]
 unused_qualifications = "warn"
 
 [lib]
-name = "sgl_model_gateway"
+name = "smg"
 crate-type = ["rlib"]
 
 [[bin]]
@@ -50,6 +50,8 @@ futures = "0.3"
 dashmap = "6.1.0"
 lru = "0.16.2"
 blake3 = "1.5"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+bytemuck = { version = "1.21", features = ["derive"] }
 http = "1.1.0"
 tokio = { version = "1.42.0", features = ["full"] }
 async-trait = "0.1"
@@ -97,6 +99,7 @@ rmcp = { version = "0.8.3", features = ["client", "server",
 serde_yaml = "0.9"
 oracle = { version = "0.6.3", features = ["chrono"] }
 subtle = "2.6"
+jsonwebtoken = { version = "9.3", default-features = false, features = ["use_pem"] }
 rustpython-parser = "0.4.0"
 num-traits = "0.2"
 image = { version = "0.25.4", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
@@ -104,6 +107,7 @@ ndarray = "0.16"
 base64 = "0.22"
 openai-harmony = { git = "https://github.com/openai/harmony", tag = "v0.0.4" }
 openmetrics-parser = "0.4.4"
+arc-swap = "1.7.1"
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.14.2", features = ["gzip", "transport"] }
@@ -143,6 +147,7 @@ npyz = { version = "0.8", features = ["npz"] }  # For reading numpy .npz files i
 opentelemetry-proto = { version = "0.27", features = ["gen-tonic"] }
 tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
+rsa = { version = "0.9", features = ["sha2"] }
 
 [[bench]]
 name = "request_processing"
@@ -167,6 +172,11 @@ path = "benches/tool_parser_benchmark.rs"
 name = "tree_benchmark"
 harness = false
 path = "benches/tree_benchmark.rs"
+
+[[bench]]
+name = "manual_policy_benchmark"
+harness = false
+path = "benches/manual_policy_benchmark.rs"
 
 [profile.release]
 opt-level = "z"     # Optimize for size

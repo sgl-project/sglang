@@ -17,6 +17,7 @@ repos:
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key
+        exclude: ^sgl-model-gateway/tests/.*_test\.rs$
       - id: debug-statements
       - id: no-commit-to-branch
   - repo: https://github.com/PyCQA/isort
@@ -75,3 +76,11 @@ repos:
         args:
           - '--keep-output'
           - '--extra-keys=metadata.kernelspec metadata.language_info.version'
+  - repo: local
+    hooks:
+      - id: sort-ci-permissions
+        name: sort CI_PERMISSIONS.json
+        entry: python3 .github/update_ci_permission.py --sort-only
+        language: system
+        files: ^\.github/CI_PERMISSIONS\.json$
+        pass_filenames: false
