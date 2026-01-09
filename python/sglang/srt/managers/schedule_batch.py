@@ -1311,7 +1311,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
             has_stream=any(req.stream for req in reqs),
-            has_grammar=any(req.grammar for req in reqs),
+            has_grammar=any(req.sampling_params.has_grammar_constraint for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
@@ -2039,7 +2039,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.token_ids_logprobs = None
 
         self.has_stream = any(req.stream for req in self.reqs)
-        self.has_grammar = any(req.grammar for req in self.reqs)
+        self.has_grammar = any(
+            req.sampling_params.has_grammar_constraint for req in self.reqs
+        )
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         # NOTE: spec_info filtered before batch filtering only happens in:
