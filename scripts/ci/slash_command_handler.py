@@ -177,6 +177,7 @@ def handle_rerun_stage(
         "sgl-kernel-unit-test-amd",
         "stage-a-test-1-amd",
         "stage-b-test-small-1-gpu-amd",
+        "stage-b-test-small-1-gpu-amd-mi35x",
         "stage-b-test-large-2-gpu-amd",
         "unit-test-backend-1-gpu-amd",
         "unit-test-backend-2-gpu-amd",
