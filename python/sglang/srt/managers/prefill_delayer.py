@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class _DelayInfo:
+class _State:
     delayed_count: int = 0
     start_time: float = field(default_factory=time.perf_counter)
 
@@ -55,7 +55,7 @@ class PrefillDelayer:
 
         self._metrics_collector = metrics_collector
 
-        self._curr_delay_info: Optional[_DelayInfo] = None
+        self._curr_state: Optional[_State] = None
 
         assert (
             server_args.enable_dp_attention
@@ -70,8 +70,8 @@ class PrefillDelayer:
     def _negotiate_should_allow_prefill(
             self, local_prefillable: bool, token_usage: float
     ) -> _NegotiateOutput:
-        self._curr_delay_info, out = self._negotiate_should_allow_prefill_pure(
-            prev_delay_info=self._curr_delay_info,
+        self._curr_state, out = self._negotiate_should_allow_prefill_pure(
+            prev_state=self._curr_state,
             local_prefillable=local_prefillable,
             token_usage=token_usage,
         )
@@ -80,10 +80,10 @@ class PrefillDelayer:
     # (Almost) pure function
     def _negotiate_should_allow_prefill_pure(
         self,
-        prev_delay_info: _DelayInfo,
+        prev_state: _State,
         local_prefillable: bool,
         token_usage: float,
-    ) -> Tuple[_DelayInfo, _NegotiateOutput]:
+    ) -> Tuple[_State, _NegotiateOutput]:
         # Compute local states
         local_token_watermark_force_allow = (
             local_prefillable
@@ -116,16 +116,16 @@ class PrefillDelayer:
             return _NegotiateOutput(allow_prefill=True)
 
         if global_mixed_prefillable:
-            next_delay_info = _DelayInfo() or prev_delay_info
-            next_delay_info = dataclasses.replace(
-                next_delay_info,
-                delayed_count=next_delay_info.delayed_count + 1,
+            next_state = _State() or prev_state
+            next_state = dataclasses.replace(
+                next_state,
+                delayed_count=next_state.delayed_count + 1,
             )
-            if next_delay_info.delayed_count < self._max_delay_passes:
+            if next_state.delayed_count < self._max_delay_passes:
                 return _NegotiateOutput(allow_prefill=False)
 
         is_timeout = global_mixed_prefillable
-        exist_previous_wait = prev_delay_info is not None
+        exist_previous_wait = prev_state is not None
         self._record_outcome_and_reset(
             debug_outcome=(
                 "wait_timeout"
@@ -203,7 +203,7 @@ def _record_outcome(
             }
 
     if (collector := _metrics_collector) is not None:
-        if (x := _curr_delay_info) is not None:
+        if (x := _curr_state) is not None:
             wait_seconds = time.perf_counter() - x.start_time
             forward_passes = x.delayed_count
         else:
