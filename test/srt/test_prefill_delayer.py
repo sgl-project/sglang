@@ -170,6 +170,7 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
 
         try:
             asyncio.run(run_test())
+
             metrics_text = _print_prefill_delayer_metrics(base_url, expect_metrics=True)
             if token_usage_low_watermark is not None:
                 import re
