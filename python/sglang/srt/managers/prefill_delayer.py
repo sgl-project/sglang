@@ -135,7 +135,7 @@ class PrefillDelayer:
                 )
 
             prev_delayed_count = prev_state.delayed_count if prev_state else 0
-            if global_mixed_prefillable and (prev_delayed_count < self._max_delay_passes - 1):
+            if prev_delayed_count < self._max_delay_passes - 1:
                 next_state = dataclasses.replace(
                     prev_state,
                     delayed_count=prev_state.delayed_count + 1,
@@ -145,18 +145,8 @@ class PrefillDelayer:
                     outcome="forbid",
                 )
 
-            is_timeout = global_mixed_prefillable
-            exist_previous_wait = prev_state is not None
             self._record_outcome_and_reset(
-                debug_outcome=(
-                    "wait_timeout"
-                    if is_timeout
-                    else (
-                        "wait_success_all_prefillable"
-                        if exist_previous_wait
-                        else "no_wait_all_prefillable"
-                    )
-                ),
+                debug_outcome="wait_timeout",
                 debug_num_prefillable=num_prefillable,
                 debug_num_token_watermark_force_allow=num_token_watermark_force_allow,
             )
