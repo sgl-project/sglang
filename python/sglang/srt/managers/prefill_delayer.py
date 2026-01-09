@@ -121,41 +121,6 @@ class PrefillDelayer:
         )
         return _NegotiateOutput(allow_prefill=True)
 
-    def _record_outcome_and_reset(
-        self, debug_outcome: str, debug_num_prefillable: int, debug_num_token_watermark_force_allow: int
-    ) -> None:
-        if _DEBUG_LOG:
-            if debug_outcome == "wait_timeout":
-                logger.info(
-                    f"PrefillDelayer timeout thus not forbid prefill "
-                    f"(num_prefillable={debug_num_prefillable})"
-                )
-            elif debug_outcome == "token_watermark_force_allow":
-                logger.info(
-                    f"PrefillDelayer force allow prefill due to low watermark. "
-                    f"(num_prefillable={debug_num_prefillable}, "
-                    f"num_token_watermark_force_allow={debug_num_token_watermark_force_allow})"
-                )
-            else:
-                assert debug_outcome in {
-                    "wait_success_all_prefillable",
-                    "no_wait_all_prefillable",
-                }
-
-        if (collector := self._metrics_collector) is not None:
-            if (x := self._curr_delay_info) is not None:
-                wait_seconds = time.perf_counter() - x.start_time
-                forward_passes = x.delayed_count
-            else:
-                wait_seconds = forward_passes = 0
-            collector.observe_prefill_delayer_wait(
-                forward_passes=forward_passes,
-                wait_seconds=wait_seconds,
-                outcome=debug_outcome,
-            )
-
-        self._curr_delay_info = None
-
     def _gather_info(self, local_prefillable: bool, local_token_watermark_force_allow: bool):
         local_info = torch.tensor(
             [int(local_prefillable), int(local_token_watermark_force_allow)],
@@ -194,3 +159,38 @@ class PrefillDelayerSinglePassExecutor:
                 token_usage=self._token_usage,
             )
         return self._result.allow_prefill
+
+
+def _record_outcome(
+    debug_outcome: str, debug_num_prefillable: int, debug_num_token_watermark_force_allow: int
+) -> None:
+    if _DEBUG_LOG:
+        if debug_outcome == "wait_timeout":
+            logger.info(
+                f"PrefillDelayer timeout thus not forbid prefill "
+                f"(num_prefillable={debug_num_prefillable})"
+            )
+        elif debug_outcome == "token_watermark_force_allow":
+            logger.info(
+                f"PrefillDelayer force allow prefill due to low watermark. "
+                f"(num_prefillable={debug_num_prefillable}, "
+                f"num_token_watermark_force_allow={debug_num_token_watermark_force_allow})"
+            )
+        else:
+            assert debug_outcome in {
+                "wait_success_all_prefillable",
+                "no_wait_all_prefillable",
+            }
+
+    if (collector := _metrics_collector) is not None:
+        if (x := _curr_delay_info) is not None:
+            wait_seconds = time.perf_counter() - x.start_time
+            forward_passes = x.delayed_count
+        else:
+            wait_seconds = forward_passes = 0
+        collector.observe_prefill_delayer_wait(
+            forward_passes=forward_passes,
+            wait_seconds=wait_seconds,
+            outcome=debug_outcome,
+        )
+
