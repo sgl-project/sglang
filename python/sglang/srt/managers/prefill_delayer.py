@@ -37,7 +37,7 @@ class PrefillDelayer:
         self,
         dp_size,
         attn_tp_size,
-        tp_worker,
+        cpu_group,
         server_args,
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
     ):
@@ -56,7 +56,7 @@ class PrefillDelayer:
             dtype=torch.int64,
             device="cpu",
         )
-        self._cpu_group = tp_worker.get_tp_group().cpu_group
+        self._cpu_group = cpu_group
 
         self._metrics_collector = metrics_collector
 
