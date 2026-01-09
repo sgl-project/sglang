@@ -55,8 +55,10 @@ class PrefillDelayer:
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
     def _negotiate_should_allow_prefill(
-        self, local_prefillable: bool, force_allow_prefill: bool
+        self, local_prefillable: bool, token_usage: bool
     ) -> bool:
+        force_allow_prefill = local_prefillable and ((x := self.low_watermark) is not None) and (token_usage < x)
+
         tp0_info = self._gather_info(
             local_prefillable=local_prefillable,
             force_allow_prefill=force_allow_prefill,
@@ -143,10 +145,6 @@ class PrefillDelayerSinglePassExecutor:
         if not self._called:
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
                 local_prefillable=local_prefillable,
-                force_allow_prefill=(
-                    local_prefillable
-                    and (self._prefill_delayer.low_watermark is not None)
-                    and (self._token_usage < self._prefill_delayer.low_watermark)
-                ),
+                token_usage=self._token_usage,
             )
         return self._result
