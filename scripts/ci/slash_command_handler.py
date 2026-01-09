@@ -120,11 +120,19 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
 
 
 def handle_rerun_stage(
-    gh_repo, pr, comment, user_perms, stage_name, token, react_on_success=True
+    gh_repo,
+    pr,
+    comment,
+    user_perms,
+    stage_name,
+    test_path,
+    token,
+    react_on_success=True,
 ):
     """
-    Handles the /rerun-stage <stage-name> command.
+    Handles the /rerun-stage <stage-name> [--path <path>] command.
     Triggers a workflow_dispatch to run only the specified stage, skipping dependencies.
+    Optionally filters tests to a specific directory path.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_stage", False):
@@ -140,7 +148,10 @@ def handle_rerun_stage(
         )
         return False
 
-    print(f"Permission granted. Triggering workflow_dispatch for stage '{stage_name}'.")
+    path_msg = f" with path filter '{test_path}'" if test_path else ""
+    print(
+        f"Permission granted. Triggering workflow_dispatch for stage '{stage_name}'{path_msg}."
+    )
 
     # Valid NVIDIA stage names that support target_stage
     nvidia_stages = [
@@ -251,6 +262,10 @@ def handle_rerun_stage(
             else:
                 inputs = {"version": "release", "target_stage": stage_name}
 
+        # Add test_path to inputs if provided
+        if test_path:
+            inputs["test_path"] = test_path
+
         # Use requests directly as PyGithub's create_dispatch only accepts HTTP 204
         dispatch_url = f"https://api.github.com/repos/{gh_repo.full_name}/actions/workflows/{target_workflow.id}/dispatches"
         dispatch_resp = requests.post(
@@ -269,8 +284,9 @@ def handle_rerun_stage(
             print(f"Successfully triggered workflow for stage '{stage_name}'")
             if react_on_success:
                 comment.create_reaction("+1")
+                path_info = f" with path filter `{test_path}`" if test_path else ""
                 pr.create_issue_comment(
-                    f"✅ Triggered `{stage_name}` to run independently (skipping dependencies).\n\n"
+                    f"✅ Triggered `{stage_name}` to run independently (skipping dependencies){path_info}.\n\n"
                     f"It will not be shown in this page. Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
                 )
             return True
@@ -346,10 +362,22 @@ def main():
             print("Combined command finished, but no actions were taken.")
 
     elif first_line.startswith("/rerun-stage"):
-        # Extract stage name from command
-        parts = first_line.split(maxsplit=1)
-        stage_name = parts[1].strip() if len(parts) > 1 else None
-        handle_rerun_stage(repo, pr, comment, user_perms, stage_name, token)
+        # Extract stage name and optional --path argument from command
+        # Format: /rerun-stage <stage-name> [--path <path>]
+        parts = first_line.split()
+        stage_name = None
+        test_path = None
+
+        if len(parts) >= 2:
+            stage_name = parts[1]
+
+        # Parse --path argument if present
+        if "--path" in parts:
+            path_idx = parts.index("--path")
+            if path_idx + 1 < len(parts):
+                test_path = parts[path_idx + 1]
+
+        handle_rerun_stage(repo, pr, comment, user_perms, stage_name, test_path, token)
 
     else:
         print(f"Unknown or ignored command: {first_line}")
