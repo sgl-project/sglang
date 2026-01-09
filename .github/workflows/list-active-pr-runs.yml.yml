@@ -55,7 +55,7 @@ jobs:
             active_runs=$(gh run list \
               --repo "$REPO" \
               --workflow "$workflow_file" \
-              --json databaseId,status,event,headBranch,createdAt,updatedAt,headSha,runNumber,attempt \
+              --json databaseId,status,event,headBranch,createdAt,updatedAt,headSha,number,attempt \
               --limit 500 \
               | jq -c '.[] | select(.status=="queued" or .status=="waiting" or .status=="in_progress") | select(.event=="pull_request")')
 
@@ -69,7 +69,7 @@ jobs:
               run_status=$(echo "$run" | jq -r '.status')
               created_at=$(echo "$run" | jq -r '.createdAt')
               head_sha=$(echo "$run" | jq -r '.headSha')
-              run_number=$(echo "$run" | jq -r '.runNumber')
+              run_number=$(echo "$run" | jq -r '.number')
               run_attempt=$(echo "$run" | jq -r '.attempt // 1')
 
               # Get detailed run information including jobs
