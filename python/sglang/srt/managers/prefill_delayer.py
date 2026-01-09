@@ -34,7 +34,7 @@ class PrefillDelayer:
         self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
         self.low_watermark = envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
 
-        self.global_info = torch.empty(
+        self._global_info_buffer = torch.empty(
             (dp_size, attn_tp_size, 2),
             dtype=torch.int64,
             device="cpu",
@@ -58,7 +58,7 @@ class PrefillDelayer:
     def _negotiate_should_allow_prefill(
         self, local_prefillable: bool, token_usage: bool
     ) -> bool:
-        force_allow_prefill = (
+        local_force_allow = (
             local_prefillable
             and ((x := self.low_watermark) is not None)
             and (token_usage < x)
@@ -66,7 +66,7 @@ class PrefillDelayer:
 
         tp0_info = self._gather_info(
             local_prefillable=local_prefillable,
-            force_allow_prefill=force_allow_prefill,
+            local_force_allow=local_force_allow,
         )
         global_prefillable = tp0_info[:, 0]
         global_force_allow = tp0_info[:, 1]
@@ -116,18 +116,18 @@ class PrefillDelayer:
                 is_timeout=is_timeout,
             )
 
-    def _gather_info(self, local_prefillable: bool, force_allow_prefill: bool):
+    def _gather_info(self, local_prefillable: bool, local_force_allow: bool):
         local_info = torch.tensor(
-            [int(local_prefillable), int(force_allow_prefill)],
+            [int(local_prefillable), int(local_force_allow)],
             device="cpu",
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
-            self.global_info.flatten(),
+            self._global_info_buffer.flatten(),
             local_info,
             group=self.cpu_group,
         )
-        tp0_info = self.global_info[:, 0, :]
+        tp0_info = self._global_info_buffer[:, 0, :]
         return tp0_info
 
 
