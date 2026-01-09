@@ -119,7 +119,8 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
             base_url=base_url,
             prefill_delayer=True,
             other_args=["--max-total-tokens", "50000"],
-            max_delay_passes=1000,
+            # e.g. gen throughput is 370 tok/s
+            max_delay_passes=3000,
             token_usage_low_watermark=token_usage_low_watermark,
         )
 
@@ -159,12 +160,12 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
             )
 
             enabled = token_usage_low_watermark is not None
-            thresh = 30
+            thresh = 5
             for dp_rank, req_idx, elapsed in results:
                 print(f"DP rank {dp_rank} req {req_idx} completed in {elapsed:.2f}s")
                 self.assertTrue(
                     (elapsed < thresh) if enabled else (elapsed > thresh),
-                    f"DP rank {dp_rank} req {req_idx}: elapsed={elapsed:.2f}s, thresh={thresh}",
+                    f"DP rank {dp_rank} req {req_idx}: elapsed={elapsed:.2f}s, thresh={thresh}, enabled={enabled}",
                 )
 
         try:
