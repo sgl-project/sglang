@@ -76,9 +76,12 @@ class PrefillDelayer:
         )
         return out
 
-    # (Almost) pure function to simplify state management
+    # (Almost) pure function
     def _negotiate_should_allow_prefill_pure(
-        self, local_prefillable: bool, token_usage: float
+        self,
+        prev_delay_info: _DelayInfo,
+        local_prefillable: bool,
+        token_usage: float,
     ) -> Tuple[_DelayInfo, _NegotiateOutput]:
         local_token_watermark_force_allow = (
             local_prefillable
@@ -109,14 +112,13 @@ class PrefillDelayer:
         )
 
         if global_mixed_prefillable:
-            if self._curr_delay_info is None:
-                self._curr_delay_info = _DelayInfo()
-            self._curr_delay_info.delayed_count += 1
-            if self._curr_delay_info.delayed_count < self._max_delay_passes:
+            curr_delay_info = _DelayInfo() or prev_delay_info
+            curr_delay_info.delayed_count += 1
+            if curr_delay_info.delayed_count < self._max_delay_passes:
                 return _NegotiateOutput(allow_prefill=False)
 
         is_timeout = global_mixed_prefillable
-        exist_previous_wait = self._curr_delay_info is not None
+        exist_previous_wait = prev_delay_info is not None
         self._record_outcome_and_reset(
             debug_outcome=(
                 "wait_timeout"
