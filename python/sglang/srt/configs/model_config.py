@@ -584,6 +584,7 @@ class ModelConfig:
                 try:
                     # In offline mode, skip file_exists check to avoid OfflineModeIsEnabled error
                     # Instead, directly try to download/read from cache with local_files_only
+                    file_exists = False  # Initialize to avoid UnboundLocalError
                     if not huggingface_hub.constants.HF_HUB_OFFLINE:
                         # Online mode: check if file exists before attempting download (optimization)
                         file_exists = retry(
@@ -628,7 +629,9 @@ class ModelConfig:
                     )
                 except Exception as e:
                     logger.warning(
-                        f"Failed to load hf_quant_config.json: {self.model_path} {e}"
+                        "Failed to load hf_quant_config.json for model %s: %s",
+                        self.model_path,
+                        e,
                     )
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_config_file = os.path.join(

@@ -840,15 +840,37 @@ def validate_cache_lightweight(
     if not has_tokenizer:
         return False
 
-    # Check for weight files (model.safetensors.index.json or at least one shard)
-    has_index = os.path.exists(
-        os.path.join(snapshot_dir, "model.safetensors.index.json")
-    )
-    # *.safetensors already covers model-*.safetensors pattern
-    has_shards = bool(glob_module.glob(os.path.join(snapshot_dir, "*.safetensors")))
+    # Check for weight files with index self-consistency
+    index_path = os.path.join(snapshot_dir, "model.safetensors.index.json")
+    has_index = os.path.exists(index_path)
 
-    if not has_index and not has_shards:
-        return False
+    if has_index:
+        # If index exists, validate that all shards listed in it exist
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                index_data = json.load(f)
+            weight_map = index_data.get("weight_map", {})
+            if weight_map:
+                # Check that all shard files referenced in index exist
+                required_shards = set(weight_map.values())
+                for shard_name in required_shards:
+                    shard_path = os.path.join(snapshot_dir, shard_name)
+                    if not os.path.exists(shard_path):
+                        logger.debug(
+                            "Index validation failed: missing shard %s in %s",
+                            shard_name,
+                            snapshot_dir,
+                        )
+                        return False
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            logger.debug("Failed to validate index file %s: %s", index_path, e)
+            return False
+    else:
+        # No index file, check for at least one shard
+        # *.safetensors already covers model-*.safetensors pattern
+        has_shards = bool(glob_module.glob(os.path.join(snapshot_dir, "*.safetensors")))
+        if not has_shards:
+            return False
 
     # Check hf_quant_config.json if required (for modelopt quantization)
     if requires_hf_quant_config:

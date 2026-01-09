@@ -13,6 +13,7 @@ cache state pollution.
 """
 
 import glob
+import json
 import os
 import sys
 import time
@@ -22,7 +23,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
-from sglang.srt.model_loader.ci_weight_validation import (
+from sglang.srt.model_loader.ci_weight_validation import (  # noqa: E402
     validate_cache_with_detailed_reason,
 )
 
@@ -55,7 +56,14 @@ def find_all_hf_snapshots():
             continue
 
         # models--meta-llama--Llama-2-7b-hf -> meta-llama/Llama-2-7b-hf
-        model_name = dir_name.replace("models--", "").replace("--", "/", 1)
+        # Handle multi-part names: models--a--b--c -> a/b-c (join parts 1+ with /)
+        parts = dir_name.split("--")
+        if len(parts) < 3 or parts[0] != "models":
+            # Invalid format, skip
+            continue
+        # Standard format: models--org--repo -> org/repo
+        # Extended format: models--org--repo--extra -> org/repo-extra (join with -)
+        model_name = parts[1] + "/" + "-".join(parts[2:])
 
         snapshots_dir = os.path.join(model_dir, "snapshots")
         if not os.path.isdir(snapshots_dir):
@@ -76,6 +84,110 @@ def find_all_hf_snapshots():
 
     # Return without mtime
     return [(name, path) for name, path, _ in snapshots]
+
+
+def is_transformers_text_model(snapshot_dir):
+    """
+    Check if a snapshot is a transformers text model.
+
+    Only excludes (returns False) for models with STRONG evidence of being
+    diffusers/generation pipelines. Uses conservative heuristics to avoid
+    false negatives on multimodal LLMs with tokenizers.
+
+    Args:
+        snapshot_dir: Path to snapshot directory
+
+    Returns:
+        True if this looks like a transformers text model, False otherwise (N/A)
+    """
+    # Check for diffusers pipeline markers (strong evidence)
+    diffusers_markers = [
+        "model_index.json",  # Diffusers pipeline config
+        "scheduler",  # Scheduler directory (diffusers)
+    ]
+    if any(
+        os.path.exists(os.path.join(snapshot_dir, marker))
+        for marker in diffusers_markers
+    ):
+        return False
+
+    config_path = os.path.join(snapshot_dir, "config.json")
+    if not os.path.exists(config_path):
+        # No config.json - likely not a transformers model
+        return False
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        # Check for explicit diffusers/generation model types (conservative keywords)
+        model_type = config.get("_class_name") or config.get("model_type")
+        if model_type:
+            model_type_lower = str(model_type).lower()
+            # Only exclude clear diffusion/generation models
+            if any(
+                keyword in model_type_lower
+                for keyword in [
+                    "diffusion",
+                    "unet",
+                    "vae",
+                    "controlnet",
+                    "stable-diffusion",
+                    "latent-diffusion",
+                ]
+            ):
+                return False
+
+        # Check architectures for explicit generation/diffusion classes
+        architectures = config.get("architectures", [])
+        if architectures:
+            arch_str = " ".join(architectures).lower()
+            # Conservative: only exclude obvious diffusion/generation architectures
+            # Use word boundaries to avoid false positives (e.g., "dit" in "conditional")
+            for keyword in [
+                "diffusion",
+                "unet2d",
+                "unet3d",
+                "vaedecoder",  # More specific than "vae"
+                "vaeencoder",
+                "controlnet",
+                "autoencoder",
+                "ditmodel",  # Diffusion Transformer - use more specific pattern
+                "pixart",  # PixArt diffusion model
+            ]:
+                if keyword in arch_str:
+                    return False
+
+        # Check for standalone vision encoder/image processor (no text component)
+        # Only if model name explicitly indicates non-text usage
+        model_name = config.get("_name_or_path", "").lower()
+
+        if any(
+            keyword in model_name
+            for keyword in [
+                "image-edit-",  # Pure image editing (e.g., Qwen-Image-Edit)
+                "-image-editing",
+                "dit-",  # DiT generation models
+                "pixart-",  # PixArt generation models
+            ]
+        ):
+            # Additional check: does it have tokenizer? If yes, might be multimodal LLM
+            has_tokenizer = any(
+                os.path.exists(os.path.join(snapshot_dir, fname))
+                for fname in ["tokenizer.json", "tokenizer.model", "tiktoken.model"]
+            )
+            if not has_tokenizer:
+                # Image-edit model without tokenizer -> likely pure vision pipeline
+                return False
+
+        # Default: assume it's a transformers text/multimodal model
+        # Even if it lacks tokenizer, let validation report the actual error
+        # (better false positive than false negative for text models)
+        return True
+
+    except (json.JSONDecodeError, OSError, KeyError):
+        # Can't parse config - assume it's transformers and let validation report failure
+        return True
 
 
 def scan_weight_files(snapshot_dir):
@@ -198,6 +310,7 @@ def main():
     validated_count = 0
     failed_count = 0
     skipped_count = 0
+    na_count = 0  # Non-transformers models
     processed_count = 0
 
     # In-process cache to avoid re-validating same snapshot in this run
@@ -222,11 +335,17 @@ def main():
         )
         processed_count += 1
 
+        # Check if this is a transformers text model
+        if not is_transformers_text_model(snapshot_dir):
+            print("  N/A (not a transformers text model - diffusion/vision/etc)")
+            na_count += 1
+            continue
+
         # Scan weight files (outside lock)
         weight_files = scan_weight_files(snapshot_dir)
 
         if not weight_files:
-            print(f"  No weight files found, skipping")
+            print("  SKIP (no weights) - empty or incomplete download")
             skipped_count += 1
             continue
 
@@ -237,21 +356,21 @@ def main():
             )
 
             if result is True:
-                print(f"  Validation passed")
+                print("  PASS - Cache complete & valid")
                 validated_count += 1
             elif result is False:
                 # Print detailed failure reason
                 if reason:
-                    print(f"  Validation failed: {reason}")
+                    print(f"  FAIL (incomplete) - {reason}")
                 else:
-                    print(f"  Validation failed (incomplete cache)")
+                    print("  FAIL (incomplete) - cache validation failed")
                 failed_count += 1
             else:  # None (skipped)
-                print(f"  Skipped (already validated in this run)")
+                print("  SKIP (already validated in this run)")
                 skipped_count += 1
 
         except Exception as e:
-            print(f"  Error: Validation raised exception: {e}")
+            print(f"  FAIL (error) - Validation raised exception: {e}")
             failed_count += 1
 
     elapsed_total = time.time() - start_time
@@ -259,10 +378,11 @@ def main():
     print()
     print("=" * 70)
     print(f"Validation summary (completed in {elapsed_total:.1f}s):")
-    print(f"  Complete & validated: {validated_count}")
-    print(f"  Incomplete/failed:    {failed_count}")
-    print(f"  Skipped:              {skipped_count}")
-    print(f"  Total processed:      {processed_count}/{len(snapshots)}")
+    print(f"  PASS (complete & valid):      {validated_count}")
+    print(f"  FAIL (incomplete/corrupted):  {failed_count}")
+    print(f"  SKIP (no weights/duplicate):  {skipped_count}")
+    print(f"  N/A (not transformers text):  {na_count}")
+    print(f"  Total processed:              {processed_count}/{len(snapshots)}")
     print("=" * 70)
 
 
