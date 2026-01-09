@@ -200,6 +200,12 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
                         30,
                         f"Request to DP rank {dp_rank} took too long ({elapsed:.2f}s), low watermark force prefill may not be working",
                     )
+                else:
+                    self.assertGreater(
+                        elapsed,
+                        30,
+                        f"Request to DP rank {dp_rank} completed too fast ({elapsed:.2f}s), should be blocked without low watermark",
+                    )
 
         try:
             asyncio.run(run_test())
