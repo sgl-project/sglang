@@ -127,7 +127,7 @@ class PrefillDelayer:
                 allow_prefill=True,
                 outcome="no_prefillable",
             )
-        else:
+        else:  # some ranks are prefillable, some are not
             if global_exists_token_watermark_force_allow:
                 return None, _NegotiateOutput(
                     allow_prefill=True,
