@@ -200,9 +200,7 @@ class PrefillDelayerSinglePassExecutor:
 
         _record_single_pass_result(
             actual_prefill=actual_prefill,
-            decision=self._result.decision,
-            num_prefillable=self._result.num_prefillable,
-            num_token_watermark_force_allow=self._result.num_token_watermark_force_allow,
+            negotiate_output=self._result,
             metrics_collector=self._prefill_delayer._metrics_collector,
         )
 
@@ -217,13 +215,9 @@ class PrefillDelayerSinglePassExecutor:
 
 def _record_single_pass_result(
     actual_prefill: bool,
-    decision: str,
-    num_prefillable: int,
-    num_token_watermark_force_allow: int,
+    negotiate_output: _NegotiateOutput,
     metrics_collector: Optional["SchedulerMetricsCollector"],
 ) -> None:
-    TODO_prefillable_status
-
     if _DEBUG_LOG:
         if decision == "wait_timeout_allow_mixed_prefillable":
             logger.info(
