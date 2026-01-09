@@ -3,8 +3,6 @@ import unittest
 # TODO: use interface in cpu.py
 import torch
 import torch.nn as nn
-
-from sglang.test.test_utils import CustomTestCase
 from utils import (
     MXFP4QuantizeUtil,
     convert_weight,
@@ -13,6 +11,8 @@ from utils import (
     per_token_quant_int8,
     precision,
 )
+
+from sglang.test.test_utils import CustomTestCase
 
 torch.manual_seed(1234)
 
