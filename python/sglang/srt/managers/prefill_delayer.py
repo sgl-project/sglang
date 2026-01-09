@@ -26,7 +26,7 @@ class _State:
 class _NegotiateOutput(NamedTuple):
     allow_prefill: bool
     prefillable_status: str
-    decision: str
+    reason: str
     num_prefillable: int
     num_token_watermark_force_allow: int
 
