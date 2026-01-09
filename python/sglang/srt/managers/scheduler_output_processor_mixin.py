@@ -179,7 +179,8 @@ class SchedulerOutputProcessorMixin:
                             ]
                             .cpu()
                             .clone()
-                            .tolist()
+                            .float()
+                            .numpy()
                         )
 
                     if req.grammar is not None:
@@ -444,7 +445,7 @@ class SchedulerOutputProcessorMixin:
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(
-                    logits_output.hidden_states[i].cpu().clone().tolist()
+                    logits_output.hidden_states[i].cpu().clone().float().numpy()
                 )
 
             if req.grammar is not None:

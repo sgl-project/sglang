@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import uuid
+import numpy as np
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
@@ -971,7 +972,7 @@ class BatchTokenIDOutput(
     output_token_entropy_val: List[float]
 
     # Hidden states
-    output_hidden_states: List[List[float]]
+    output_hidden_states: List[np.ndarray]
 
     # The routed experts for each output token
     output_routed_experts: List[torch.Tensor]
@@ -1058,7 +1059,7 @@ class BatchStrOutput(
     output_token_entropy_val: List[float]
 
     # Hidden states
-    output_hidden_states: List[List[float]]
+    output_hidden_states: List[np.ndarray]
 
     # The routed experts for each output token
     output_routed_experts: List[List[int]]
