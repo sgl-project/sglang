@@ -63,7 +63,7 @@ class PrefillDelayer:
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
     def _negotiate_should_allow_prefill(
-        self, local_prefillable: bool, token_usage: bool
+        self, local_prefillable: bool, token_usage: float
     ) -> bool:
         local_force_allow = (
             local_prefillable
@@ -79,7 +79,7 @@ class PrefillDelayer:
         num_force_allow = global_force_allow.sum().item()
 
         if global_force_allow.max().item() > 0:
-            self._reset(
+            self._record_outcome_and_reset(
                 debug_outcome="token_watermark_force_allow",
                 debug_num_prefillable=num_prefillable,
                 debug_num_force_allow=num_force_allow,
@@ -101,7 +101,7 @@ class PrefillDelayer:
 
         is_timeout = global_mixed_prefillable
         exist_previous_wait = self._curr_delay_info is not None
-        self._reset(
+        self._record_outcome_and_reset(
             debug_outcome=(
                 "wait_timeout"
                 if is_timeout
@@ -116,7 +116,7 @@ class PrefillDelayer:
         )
         return True
 
-    def _reset(
+    def _record_outcome_and_reset(
         self, debug_outcome: str, debug_num_prefillable: int, debug_num_force_allow: int
     ) -> None:
         if _DEBUG_LOG:
