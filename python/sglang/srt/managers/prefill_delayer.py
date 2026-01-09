@@ -114,7 +114,7 @@ class PrefillDelayer:
             global_token_watermark_force_allow.max().item() > 0
         )
         debug_info = dict(
-            prefillable_status=prefillable_status,
+            input_estimation=prefillable_status,
             num_prefillable=global_prefillable.sum().item(),
             num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
         )
