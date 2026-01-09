@@ -48,14 +48,6 @@ class NegotiateTestCase:
     expected_reason: str
 
 
-def _create_mock_server_args():
-    return SimpleNamespace(
-        enable_dp_attention=True,
-        disaggregation_mode="null",
-        disable_overlap_schedule=False,
-    )
-
-
 def _run_negotiate_test(rank, world_size, test_cases, results_queue, port):
     torch.distributed.init_process_group(
         backend="gloo",
@@ -70,7 +62,11 @@ def _run_negotiate_test(rank, world_size, test_cases, results_queue, port):
             dp_size=world_size,
             attn_tp_size=1,
             cpu_group=cpu_group,
-            server_args=_create_mock_server_args(),
+            server_args=SimpleNamespace(
+                enable_dp_attention=True,
+                disaggregation_mode="null",
+                disable_overlap_schedule=False,
+            ),
             max_delay_passes=case.max_delay_passes,
             token_usage_low_watermark=case.token_usage_low_watermark,
         )
