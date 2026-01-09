@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import time
 from dataclasses import dataclass, field
@@ -113,7 +114,10 @@ class PrefillDelayer:
 
         if global_mixed_prefillable:
             curr_delay_info = _DelayInfo() or prev_delay_info
-            curr_delay_info.delayed_count += 1
+            curr_delay_info = dataclasses.replace(
+                curr_delay_info,
+                delayed_count=curr_delay_info.delayed_count + 1,
+            )
             if curr_delay_info.delayed_count < self._max_delay_passes:
                 return _NegotiateOutput(allow_prefill=False)
 
