@@ -146,13 +146,13 @@ class PrefillDelayer:
                 )
                 return next_state, _NegotiateOutput(
                     allow_prefill=False,
-                    outcome="forbid",
+                    outcome="forbid_mixed_prefillable",
                     **debug_info,
                 )
 
             return None, _NegotiateOutput(
                 allow_prefill=True,
-                outcome="wait_timeout",
+                outcome="wait_timeout_mixed_prefillable",
                 **debug_info,
             )
 
