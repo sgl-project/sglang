@@ -243,6 +243,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -739,6 +742,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
+
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False

@@ -1466,6 +1466,7 @@ class Scheduler(
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
+                routing_key=recv_req.routing_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
             )
@@ -1921,7 +1922,7 @@ class Scheduler(
             self.tree_cache.check_hicache_events()
 
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue)
+        self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
