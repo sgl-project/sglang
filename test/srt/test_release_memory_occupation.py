@@ -29,7 +29,6 @@ import os
 import time
 import unittest
 
-import torch
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
@@ -38,6 +37,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import (
     DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -45,14 +45,13 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
     CustomTestCase,
+    empty_gpu_cache,
+    get_gpu_count,
+    get_gpu_memory_gb,
 )
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
 _DEBUG_EXTRA = False
-
-
-def get_gpu_memory_gb():
-    return torch.cuda.device_memory_used() / 1024**3
 
 
 class TestReleaseMemoryOccupation(CustomTestCase):
@@ -111,9 +110,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
     def test_release_and_resume_occupation(self):
         # Without multi-stage release and resume, we need to carefully control the memory fraction to avoid OOM
         model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        assert (
-            torch.cuda.device_count() >= 2
-        ), "Need at least 2 GPUs for tensor parallel tests"
+        assert get_gpu_count() >= 2, "Need at least 2 GPUs for tensor parallel tests"
 
         for tp_size in [1, 2]:
 
@@ -156,13 +153,13 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             hf_model_new = AutoModelForCausalLM.from_pretrained(
                 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
                 torch_dtype="bfloat16",
-                device_map="cuda",
+                device_map=get_device(),
             )
             engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
 
             # destroy the hf model
             del hf_model_new
-            torch.cuda.empty_cache()
+            empty_gpu_cache()
 
             print("generate (#2)")
             outputs = engine.generate(params["prompt"], params["sampling_params"])[
@@ -223,7 +220,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
         for tp_size in [1, 2]:
-            if tp_size == 2 and torch.cuda.device_count() < 2:
+            if tp_size == 2 and get_gpu_count() < 2:
                 continue
 
             print(f"Testing tp_size={tp_size} for test_multi_stage_release_and_resume")
@@ -311,14 +308,14 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             hf_model_new = AutoModelForCausalLM.from_pretrained(
                 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
                 torch_dtype="bfloat16",
-                device_map="cuda",
+                device_map=get_device(),
             )
             gpu_memory_usage_after_loaded_hf_model = get_gpu_memory_gb()
             engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
 
             # destroy the hf model
             del hf_model_new
-            torch.cuda.empty_cache()
+            empty_gpu_cache()
             engine.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_KV_CACHE])
 
             gpu_memory_usage_after_resume_kv_cache = get_gpu_memory_gb()
@@ -390,13 +387,13 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         hf_model_new = AutoModelForCausalLM.from_pretrained(
             DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
             torch_dtype="bfloat16",
-            device_map="cuda",
+            device_map=get_device(),
         )
         engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
 
         # destroy the hf model
         del hf_model_new
-        torch.cuda.empty_cache()
+        empty_gpu_cache()
 
         print("generate (#2)")
         outputs = engine.generate(params["prompt_moe"], params["sampling_params_moe"])[
@@ -454,7 +451,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         engine.update_weights_from_disk(model_name)
 
         # destroy the hf model
-        torch.cuda.empty_cache()
+        empty_gpu_cache()
 
         print("generate (#2)")
         outputs = engine.generate(
