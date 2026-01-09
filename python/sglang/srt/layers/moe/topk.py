@@ -57,6 +57,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
@@ -70,6 +71,7 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
@@ -80,7 +82,7 @@ if _is_cuda:
     except ImportError as e:
         pass
 
-if _is_cuda or _is_hip:
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import topk_softmax
 
     try:
@@ -255,6 +257,24 @@ class TopK(MultiPlatformOp):
         return select_experts(
             hidden_states=hidden_states,
             layer_id=self.layer_id,
+            router_logits=router_logits,
+            topk_config=self.topk_config,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
+
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        if self.topk_config.scoring_func == "sigmoid":
+            self.topk_config.torch_native = True
+        return select_experts(
+            hidden_states=hidden_states,
             router_logits=router_logits,
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
