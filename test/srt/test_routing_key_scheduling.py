@@ -51,7 +51,7 @@ class TestRoutingKeyScheduling(CustomTestCase):
 
     def test_routing_key_scheduling_order(self):
         """Verify requests with matching routing keys are prioritized.
-        
+
         Test strategy:
         1. First send 2 long-running key_a requests to occupy running batch
         2. Then send 10 key_a and 10 key_b short requests concurrently
@@ -80,11 +80,11 @@ class TestRoutingKeyScheduling(CustomTestCase):
             return routing_key, latency
 
         long_running_tasks = [
-            asyncio.create_task(send_chat_request("key_a", 8000)),
-            asyncio.create_task(send_chat_request("key_a", 8000)),
+            asyncio.create_task(send_chat_request("key_a", 20000)),
+            asyncio.create_task(send_chat_request("key_a", 20000)),
         ]
 
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(2.0)
 
         short_tasks = []
         for _ in range(10):

@@ -305,7 +305,7 @@ class SchedulePolicy:
         waiting_queue: List[Req], running_batch: ScheduleBatch
     ) -> None:
         """Sorts waiting queue by routing key frequency in running batch.
-        
+
         Requests with routing keys that appear more frequently in running batch
         are prioritized. For ties, uses lexicographic order of routing key.
         Requests without matching routing keys are deprioritized.
