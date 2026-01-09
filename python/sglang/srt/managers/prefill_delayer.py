@@ -101,18 +101,17 @@ class PrefillDelayer:
         )
 
         # Compute derived global states
+        global_all_prefillable = global_prefillable.min().item() > 0
+        global_all_not_prefillable = global_prefillable.max().item() == 0
         global_exists_token_watermark_force_allow = (
             global_token_watermark_force_allow.max().item() > 0
         )
-        global_all_prefillable = global_prefillable.min().item() > 0
-        global_all_not_prefillable = global_prefillable.max().item() == 0
         debug_info = dict(
             debug_num_prefillable=global_prefillable.sum().item(),
             debug_num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
         )
 
         # Compute outputs
-
         if global_all_prefillable:
             exist_previous_wait = prev_state is not None
             return None, _NegotiateOutput(
