@@ -182,7 +182,7 @@ def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool):
         assert "sglang:prefill_delayer_timeouts_total" in metrics_text
 
 
-class TestPrefillDelayerLowWatermark(CustomTestCase):
+class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
     def test_low_watermark_force_prefill(self):
         model = "Qwen/Qwen3-0.6B"
         base_url = DEFAULT_URL_FOR_TEST
@@ -194,7 +194,7 @@ class TestPrefillDelayerLowWatermark(CustomTestCase):
         ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(
             1000
         ), envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.override(
-            0.3
+            0.8
         ):
             process = popen_launch_server(
                 model,
