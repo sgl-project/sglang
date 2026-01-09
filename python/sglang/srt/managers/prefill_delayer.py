@@ -75,7 +75,7 @@ class PrefillDelayer:
 
         if global_force_allow.max().item() > 0:
             self._reset(
-                outcome="token_watermark_force_allow",
+                debug_outcome="token_watermark_force_allow",
                 debug_num_prefillable=num_prefillable,
                 debug_num_force_allow=num_force_allow,
             )
@@ -96,7 +96,7 @@ class PrefillDelayer:
 
         is_timeout = global_mixed_prefillable
         self._reset(
-            outcome=(
+            debug_outcome=(
                 "wait_timeout"
                 if is_timeout
                 else (
@@ -111,22 +111,22 @@ class PrefillDelayer:
         return True
 
     def _reset(
-        self, outcome: str, debug_num_prefillable: int, debug_num_force_allow: int
+        self, debug_outcome: str, debug_num_prefillable: int, debug_num_force_allow: int
     ) -> None:
         if _DEBUG_LOG:
-            if outcome == "wait_timeout":
+            if debug_outcome == "wait_timeout":
                 logger.info(
                     f"PrefillDelayer timeout thus not forbid prefill "
                     f"(num_prefillable={debug_num_prefillable})"
                 )
-            elif outcome == "token_watermark_force_allow":
+            elif debug_outcome == "token_watermark_force_allow":
                 logger.info(
                     f"PrefillDelayer force allow prefill due to low watermark. "
                     f"(num_prefillable={debug_num_prefillable}, "
                     f"num_force_allow={debug_num_force_allow})"
                 )
             else:
-                assert outcome in {"wait_success_all_prefillable", "no_wait_all_prefillable"}
+                assert debug_outcome in {"wait_success_all_prefillable", "no_wait_all_prefillable"}
 
         if (collector := self._metrics_collector) is not None:
             if (x := self._curr_delay_info) is not None:
@@ -137,7 +137,7 @@ class PrefillDelayer:
             collector.observe_prefill_delayer_wait(
                 forward_passes=forward_passes,
                 wait_seconds=wait_seconds,
-                outcome=outcome,
+                outcome=debug_outcome,
             )
 
         self._curr_delay_info = None
