@@ -379,6 +379,7 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
     def _run(self, token_usage_low_watermark):
         model = "Qwen/Qwen3-0.6B"
         base_url = DEFAULT_URL_FOR_TEST
+        world_size = int(WORLD_SIZE)
 
         process = _launch_server(
             model=model,
