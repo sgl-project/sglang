@@ -18,7 +18,7 @@ import logging
 import os
 import signal
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Union
+from typing import Dict, List, Tuple, Union
 
 import psutil
 import pybase64
@@ -176,25 +176,36 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def _grouped_batch_decode(
         self,
-        ids_list: list[list[int]],
-        skip_list: list[bool],
-        space_list: list[bool],
-    ) -> list[str]:
+        ids_list: List[List[int]],
+        skip_list: List[bool],
+        space_list: List[bool],
+    ) -> List[str]:
         """Batch decode with grouping by (skip_special_tokens, spaces_between_special_tokens)."""
 
         assert self.tokenizer is not None
 
+        # fast path
+        first_skip, first_space = skip_list[0], space_list[0]
+        if all(s == first_skip for s in skip_list) and all(
+            sp == first_space for sp in space_list
+        ):
+            return self.tokenizer.batch_decode(
+                ids_list,
+                skip_special_tokens=first_skip,
+                spaces_between_special_tokens=first_space,
+            )
+
         # Group indices by (skip, space) tuple
-        groups: dict[tuple[bool, bool], list[tuple[int, list[int]]]] = defaultdict(list)
-        for idx, (ids, skip, space) in enumerate(zip(ids_list, skip_list, space_list)):
-            groups[(skip, space)].append((idx, ids))
+        groups: Dict[Tuple[bool, bool], List[int]]
+        groups = defaultdict(list)
+        for idx, (skip, space) in enumerate(zip(skip_list, space_list)):
+            groups[(skip, space)].append(idx)
 
         # Decode each group and collect results
-        results: list[str] = [""] * len(ids_list)
-        for (skip, space), items in groups.items():
-            indices, grouped_ids = zip(*items)
+        results: List[str] = [""] * len(ids_list)
+        for (skip, space), indices in groups.items():
             decoded = self.tokenizer.batch_decode(
-                list(grouped_ids),
+                [ids_list[idx] for idx in indices],
                 skip_special_tokens=skip,
                 spaces_between_special_tokens=space,
             )
