@@ -26,6 +26,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -39,17 +40,20 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     direct_register_custom_op,
+    is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_sm100_supported,
     is_triton_kernels_available,
+    cpu_has_amx_support,
     log_info_on_rank0,
     mxfp_supported,
     next_power_of_2,
     round_up,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
@@ -72,8 +76,10 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+_is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_hip:
     # import aiter
@@ -575,6 +581,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.w2_weight_triton_tensor = w2_weight
             del layer.w13_weight
             del layer.w2_weight
+        elif _is_cpu and _is_cpu_amx_available:
+            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            if use_intel_amx_backend(layer):
+                packed_w13_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(layer.w13_weight_scale)
+                packed_w2_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(layer.w2_weight_scale)
+                layer.w13_weight_scale = Parameter(packed_w13_weight_scale, requires_grad=False)
+                layer.w2_weight_scale = Parameter(packed_w2_weight_scale, requires_grad=False)
+            return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
@@ -614,7 +628,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        if use_intel_amx_backend(layer):
+            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            x, topk_weights = apply_topk_weights_cpu(
+                self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
+            )
+            output = torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                False,  # inplace See [Note] inplace should be False in fused_experts.
+                False,  # use_int8_w8a8
+                False,  # use_fp8_w8a16
+                True,  # use_mxfp4
+                layer.w13_weight_scale,  # w1_scale
+                layer.w2_weight_scale,  # w2_scale
+                None,  # block_size
+                None,  # a1_scale
+                None,  # a2_scale
+                layer.w13_weight_bias,
+                layer.w2_weight_bias,
+                layer.moe_runner_config.gemm1_alpha,
+                layer.moe_runner_config.gemm1_clamp_limit,
+                True,  # is_vnni
+            )
+            return StandardCombineInput(hidden_states=output)
         if self.use_flashinfer:
             # When bf16 mode is enabled, we don't need to quantize the input,
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
