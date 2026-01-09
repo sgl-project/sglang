@@ -117,7 +117,7 @@ class SchedulerOutputProcessorMixin:
                         logits_output.input_token_logprobs.tolist()
                     )
 
-            if self.tp_rank == 0 and self.enable_metrics:
+            if self.enable_metrics:
                 self.iter_forward_finish_time = time.time()
                 run_batch_time = (
                     self.iter_forward_finish_time - self.iter_forward_start_time
@@ -147,7 +147,7 @@ class SchedulerOutputProcessorMixin:
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
-                        if self.tp_rank == 0 and self.enable_metrics:
+                        if self.enable_metrics:
                             self.metrics_collector.observe_request_first_token_forward_time(
                                 req.time_stats.get_request_first_token_forward_time()
                             )
