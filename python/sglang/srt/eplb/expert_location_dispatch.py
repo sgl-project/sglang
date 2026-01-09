@@ -23,13 +23,15 @@ from sglang.srt.server_args import get_global_server_args
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    ep_dispatch_algorithm: Literal["static", "random"]
+    ep_dispatch_algorithm: Literal["static", "random", "static_lp"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
     partial_logical_to_all_physical_map: torch.Tensor
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
+    # (num_logical_experts, X)
+    partial_logical_to_physical_probability: torch.Tensor
     num_physical_experts: int
 
     @classmethod
@@ -55,6 +57,9 @@ class ExpertLocationDispatchInfo:
                 layer_id, :
             ],
             partial_logical_to_all_physical_map_num_valid=expert_location_metadata.logical_to_all_physical_map_num_valid[
+                layer_id, :
+            ],
+            partial_logical_to_physical_probability=expert_location_metadata.logical_to_physical_probability[
                 layer_id, :
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
@@ -83,6 +88,8 @@ def topk_ids_logical_to_physical(
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+    if info.ep_dispatch_algorithm == "static_lp":
+        return _topk_ids_logical_to_physical_lplb(topk_ids, info)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
 
@@ -105,5 +112,21 @@ def _topk_ids_logical_to_physical_dynamic(
     )
     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
 
+    topk_ids = topk_ids.view(topk_ids_original_shape)
+    return topk_ids
+
+
+def _topk_ids_logical_to_physical_lplb(
+    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+) -> torch.Tensor:
+    topk_ids_original_shape = topk_ids.shape
+    topk_ids = topk_ids.flatten()
+
+    log2phy_map = info.partial_logical_to_all_physical_map
+    topk_probs = info.partial_logical_to_physical_probability[topk_ids]
+
+    chosen_dispatch_index = torch.multinomial(topk_probs.float(), 1).flatten()
+
+    topk_ids = log2phy_map[topk_ids, chosen_dispatch_index]
     topk_ids = topk_ids.view(topk_ids_original_shape)
     return topk_ids
