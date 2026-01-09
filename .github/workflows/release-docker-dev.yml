@@ -24,6 +24,18 @@ jobs:
             grace_blackwell: 1
             tag: dev-arm64
             version: 12.9.1
+          - runner: x64-docker-build-node
+            platform: linux/amd64
+            build_type: all
+            grace_blackwell: 0
+            tag: dev-x86-cu13
+            version: 13.0.1
+          - runner: arm-docker-build-node
+            platform: linux/arm64
+            build_type: all
+            grace_blackwell: 1
+            tag: dev-arm64-cu13
+            version: 13.0.1
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
@@ -78,6 +90,9 @@ jobs:
           - tag: dev
             x86_tag: dev-x86
             arm64_tag: dev-arm64
+          - tag: dev-cu13
+            x86_tag: dev-x86-cu13
+            arm64_tag: dev-arm64-cu13
     steps:
       - uses: docker/setup-buildx-action@v3
 
