@@ -107,6 +107,7 @@ class PrefillDelayer:
         self._curr_delay_info = None
 
     def _record_metrics(self, is_timeout: bool) -> None:
+        TODO_handle_metrics
         if self._curr_delay_info is not None and self._metrics_collector is not None:
             wait_seconds = time.perf_counter() - self._curr_delay_info.start_time
             self._metrics_collector.observe_prefill_delayer_wait(
