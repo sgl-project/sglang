@@ -4,6 +4,7 @@ use std::{
     collections::{hash_map::Entry::Vacant, HashMap},
     io,
     sync::Arc,
+    time::Instant,
 };
 
 use axum::{body::Body, http::StatusCode, response::Response};
@@ -19,6 +20,7 @@ use super::{
 };
 use crate::{
     grpc_client::sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
+    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     protocols::{
         chat::{
             ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
@@ -103,7 +105,7 @@ impl ToolCallMode {
 ///
 /// Returns an SSE stream that parses Harmony tokens incrementally and
 /// emits ChatCompletionChunk events for streaming responses.
-pub struct HarmonyStreamingProcessor;
+pub(crate) struct HarmonyStreamingProcessor;
 
 impl HarmonyStreamingProcessor {
     /// Create a new Harmony streaming processor
@@ -114,6 +116,9 @@ impl HarmonyStreamingProcessor {
     /// Process a streaming Harmony Chat Completion response
     ///
     /// Returns an SSE response with streaming token updates.
+    ///
+    /// Note: Caller should attach load guards to the returned response using
+    /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
     pub fn process_streaming_chat_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -170,6 +175,19 @@ impl HarmonyStreamingProcessor {
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
             }
+            context::ExecutionResult::Embedding { .. } => {
+                error!("Harmony streaming not supported for embeddings");
+                let error_chunk = format!(
+                    "data: {}\n\n",
+                    json!({
+                        "error": {
+                            "message": "Embeddings not supported in Harmony streaming",
+                            "type": "invalid_request_error"
+                        }
+                    })
+                );
+                let _ = tx.send(Ok(Bytes::from(error_chunk)));
+            }
         }
 
         // Return SSE response
@@ -183,6 +201,10 @@ impl HarmonyStreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
+        // Timing for metrics
+        let start_time = Instant::now();
+        let mut first_token_time: Option<Instant> = None;
+
         // Per-index state management (for n>1 support)
         let mut parsers: HashMap<u32, HarmonyParserAdapter> = HashMap::new();
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
@@ -201,6 +223,11 @@ impl HarmonyStreamingProcessor {
                 ProtoResponseVariant::Chunk(chunk_wrapper) => {
                     let chunk = chunk_wrapper.as_sglang();
                     let index = chunk.index;
+
+                    // Track first token time for TTFT metric
+                    if first_token_time.is_none() {
+                        first_token_time = Some(Instant::now());
+                    }
 
                     // Initialize parser for this index if needed
                     if let Vacant(e) = parsers.entry(index) {
@@ -285,11 +312,12 @@ impl HarmonyStreamingProcessor {
             }
         }
 
+        // Compute totals once for both usage chunk and metrics
+        let total_prompt: u32 = prompt_tokens.values().sum();
+        let total_completion: u32 = completion_tokens.values().sum();
+
         // Emit final usage if requested
         if let Some(true) = stream_options.as_ref().and_then(|so| so.include_usage) {
-            let total_prompt: u32 = prompt_tokens.values().sum();
-            let total_completion: u32 = completion_tokens.values().sum();
-
             Self::emit_usage_chunk(
                 total_prompt,
                 total_completion,
@@ -302,6 +330,18 @@ impl HarmonyStreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         grpc_stream.mark_completed();
 
+        // Record streaming metrics
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_HARMONY,
+            model_id: &original_request.model,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
+            ttft: first_token_time.map(|t| t.duration_since(start_time)),
+            generation_duration: start_time.elapsed(),
+            input_tokens: Some(total_prompt as u64),
+            output_tokens: total_completion as u64,
+        });
+
         Ok(())
     }
 
@@ -313,6 +353,10 @@ impl HarmonyStreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
+        // Timing for metrics
+        let start_time = Instant::now();
+        let mut first_token_time: Option<Instant> = None;
+
         // Phase 1: Process prefill stream (collect metadata)
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
 
@@ -341,6 +385,11 @@ impl HarmonyStreamingProcessor {
                 ProtoResponseVariant::Chunk(chunk_wrapper) => {
                     let chunk = chunk_wrapper.as_sglang();
                     let index = chunk.index;
+
+                    // Track first token time for TTFT metric
+                    if first_token_time.is_none() {
+                        first_token_time = Some(Instant::now());
+                    }
 
                     // Initialize parser for this index if needed
                     if let Vacant(e) = parsers.entry(index) {
@@ -425,11 +474,12 @@ impl HarmonyStreamingProcessor {
         // This ensures that if client disconnects during decode, BOTH streams send abort
         prefill_stream.mark_completed();
 
+        // Compute totals once for both usage chunk and metrics
+        let total_prompt: u32 = prompt_tokens.values().sum();
+        let total_completion: u32 = completion_tokens.values().sum();
+
         // Emit final usage if requested
         if let Some(true) = stream_options.as_ref().and_then(|so| so.include_usage) {
-            let total_prompt: u32 = prompt_tokens.values().sum();
-            let total_completion: u32 = completion_tokens.values().sum();
-
             Self::emit_usage_chunk(
                 total_prompt,
                 total_completion,
@@ -438,6 +488,18 @@ impl HarmonyStreamingProcessor {
                 tx,
             )?;
         }
+
+        // Record streaming metrics
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_HARMONY,
+            model_id: &original_request.model,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
+            ttft: first_token_time.map(|t| t.duration_since(start_time)),
+            generation_duration: start_time.elapsed(),
+            input_tokens: Some(total_prompt as u64),
+            output_tokens: total_completion as u64,
+        });
 
         Ok(())
     }
@@ -594,6 +656,9 @@ impl HarmonyStreamingProcessor {
                     mcp_tool_names,
                 )
                 .await
+            }
+            context::ExecutionResult::Embedding { .. } => {
+                Err("Embeddings not supported in Responses API streaming".to_string())
             }
         }
     }

@@ -1,13 +1,12 @@
 //! GLM-4 MoE Parser Integration Tests
 
-use sgl_model_gateway::tool_parser::{Glm4MoeParser, ToolParser};
+use smg::tool_parser::{Glm4MoeParser, ToolParser};
 
-mod common;
-use common::create_test_tools;
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_glm4_complete_parsing() {
-    let parser = Glm4MoeParser::new();
+    let parser = Glm4MoeParser::glm45();
 
     let input = r#"Let me search for that.
 <tool_call>get_weather
@@ -30,7 +29,7 @@ The weather will be..."#;
 
 #[tokio::test]
 async fn test_glm4_multiple_tools() {
-    let parser = Glm4MoeParser::new();
+    let parser = Glm4MoeParser::glm45();
 
     let input = r#"<tool_call>search
 <arg_key>query</arg_key>
@@ -52,7 +51,7 @@ async fn test_glm4_multiple_tools() {
 
 #[tokio::test]
 async fn test_glm4_type_conversion() {
-    let parser = Glm4MoeParser::new();
+    let parser = Glm4MoeParser::glm45();
 
     let input = r#"<tool_call>process
 <arg_key>count</arg_key>
@@ -81,7 +80,7 @@ async fn test_glm4_type_conversion() {
 
 #[tokio::test]
 async fn test_glm4_streaming() {
-    let mut parser = Glm4MoeParser::new();
+    let mut parser = Glm4MoeParser::glm45();
 
     let tools = create_test_tools();
 
@@ -114,7 +113,7 @@ async fn test_glm4_streaming() {
 
 #[test]
 fn test_glm4_format_detection() {
-    let parser = Glm4MoeParser::new();
+    let parser = Glm4MoeParser::glm45();
 
     // Should detect GLM-4 format
     assert!(parser.has_tool_markers("<tool_call>"));
@@ -128,7 +127,7 @@ fn test_glm4_format_detection() {
 
 #[tokio::test]
 async fn test_python_literals() {
-    let parser = Glm4MoeParser::new();
+    let parser = Glm4MoeParser::glm45();
 
     let input = r#"<tool_call>test_func
 <arg_key>bool_true</arg_key>
@@ -151,7 +150,7 @@ async fn test_python_literals() {
 
 #[tokio::test]
 async fn test_glm4_nested_json_in_arg_values() {
-    let parser = Glm4MoeParser::new();
+    let parser = Glm4MoeParser::glm45();
 
     let input = r#"<tool_call>process
 <arg_key>data</arg_key>

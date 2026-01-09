@@ -6,8 +6,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import torch
 from einops import rearrange
 
+<<<<<<< HEAD
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.layernorm import LayerNorm
+=======
+from sglang.srt.layers.layernorm import LayerNorm
+from sglang.srt.layers.utils import MultiPlatformOp
+>>>>>>> origin/main
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
 global _use_multi_stream
@@ -28,6 +33,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     NSA_DUAL_STREAM,
     cp_all_gather_rerange_output,
     is_nsa_enable_prefill_cp,
+<<<<<<< HEAD
+=======
+    is_nsa_prefill_cp_in_seq_split,
+>>>>>>> origin/main
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -63,6 +72,24 @@ class BaseIndexerMetadata(ABC):
         Return: (sum_extend_seq_len,) int32 tensor
         """
 
+<<<<<<< HEAD
+=======
+    def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return: (tokens, ), (tokens, ) int32, k_start and k_end in kv cache(token,xxx) for each token.
+        """
+
+    def get_indexer_seq_len_cpu(self) -> torch.Tensor:
+        """
+        Return: seq lens for each batch.
+        """
+
+    def get_token_to_batch_idx(self) -> torch.Tensor:
+        """
+        Return: batch idx for each token.
+        """
+
+>>>>>>> origin/main
     @abstractmethod
     def topk_transform(
         self,
@@ -93,7 +120,11 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+<<<<<<< HEAD
 class Indexer(CustomOp):
+=======
+class Indexer(MultiPlatformOp):
+>>>>>>> origin/main
     def __init__(
         self,
         hidden_size: int,
@@ -227,6 +258,7 @@ class Indexer(CustomOp):
         query[..., : self.rope_head_dim] = q_rope
         key[..., : self.rope_head_dim] = k_rope
 
+<<<<<<< HEAD
         # allgather+rerrange
         if forward_batch.nsa_cp_metadata is not None and self.nsa_enable_prefill_cp:
             key = cp_all_gather_rerange_output(
@@ -236,6 +268,8 @@ class Indexer(CustomOp):
                 torch.cuda.current_stream(),
             )
 
+=======
+>>>>>>> origin/main
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -248,6 +282,17 @@ class Indexer(CustomOp):
             query = rotate_activation(query)
             key = rotate_activation(key)
 
+<<<<<<< HEAD
+=======
+        # allgather+rerrange
+        if forward_batch.nsa_cp_metadata is not None and self.nsa_enable_prefill_cp:
+            key = cp_all_gather_rerange_output(
+                key.contiguous(),
+                self.cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+>>>>>>> origin/main
         return query, key
 
     def _get_k_bf16(
@@ -295,15 +340,29 @@ class Indexer(CustomOp):
         blocksize = page_size
         if (
             forward_batch.forward_mode.is_target_verify()
+<<<<<<< HEAD
             or forward_batch.forward_mode.is_draft_extend()
+=======
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+>>>>>>> origin/main
         ):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
+<<<<<<< HEAD
         # NOTE(dark): 132 is SM count on H200/B200, not magic number
         schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32, blocksize, self.sm_count
         )
+=======
+        # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
+        # otherwise fall back to computing it here.
+        schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        if schedule_metadata is None:
+            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                seqlens_32, blocksize, self.sm_count
+            )
+>>>>>>> origin/main
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
@@ -370,6 +429,7 @@ class Indexer(CustomOp):
         weights = weights.squeeze(-1)
         k_fp8_list = []
         k_scale_list = []
+<<<<<<< HEAD
         ks_list = []
         ke_list = []
         # Token-to-batch mapping for PAGED chunk alignment
@@ -379,6 +439,9 @@ class Indexer(CustomOp):
         k_offset = 0
 
         seq_lens_expanded = metadata.get_seqlens_expanded()
+=======
+
+>>>>>>> origin/main
         block_tables = metadata.get_page_table_64()
 
         assert (
@@ -386,8 +449,24 @@ class Indexer(CustomOp):
             and forward_batch.extend_seq_lens_cpu is not None
         )
 
+<<<<<<< HEAD
         for i in range(forward_batch.batch_size):
             seq_len = forward_batch.seq_lens_cpu[i].item()
+=======
+        batch_size = len(block_tables)
+        token_nums, _, _ = q_fp8.shape
+        device = q_fp8.device
+        topk_result = torch.full(
+            (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
+        )
+        if batch_size == 0:
+            return topk_result
+
+        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+        assert len(indexer_seq_lens_cpu) == batch_size
+        for i in range(batch_size):
+            seq_len = indexer_seq_lens_cpu[i].item()
+>>>>>>> origin/main
             assert isinstance(seq_len, int)
             # Use fused Triton kernel to get both K and scale in a single call
             k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
@@ -395,6 +474,7 @@ class Indexer(CustomOp):
                 seq_len,
                 block_tables[i],
             )
+<<<<<<< HEAD
             extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
             ks = torch.full(
                 (extend_seq_len,), k_offset, dtype=torch.int32, device="cuda"
@@ -408,10 +488,15 @@ class Indexer(CustomOp):
             token_to_batch_idx.extend([i] * extend_seq_len)
             q_offset += extend_seq_len
             k_offset += seq_len
+=======
+            k_fp8_list.append(k_fp8)
+            k_scale_list.append(k_scale)
+>>>>>>> origin/main
 
         k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
         k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
+<<<<<<< HEAD
         ks = torch.cat(ks_list, dim=0)
         ke = torch.cat(ke_list, dim=0)
 
@@ -431,11 +516,22 @@ class Indexer(CustomOp):
 
         token_nums, _, _ = q_fp8.shape
         device = q_fp8.device
+=======
+        ks, ke = metadata.get_indexer_kvcache_range()
+        seq_lens_expanded = metadata.get_seqlens_expanded()
+        token_to_batch_idx = metadata.get_token_to_batch_idx()
+        q_offset = ks.shape[0]
+        k_offset = k_fp8.shape[0]
+>>>>>>> origin/main
 
         # Check if we need to chunk to avoid OOM
         need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
 
         if not need_chunk:
+<<<<<<< HEAD
+=======
+            assert q_fp8[:q_offset].shape[0] != 0
+>>>>>>> origin/main
             logits = deep_gemm.fp8_mqa_logits(
                 q_fp8[:q_offset],
                 kv_fp8,
@@ -448,12 +544,15 @@ class Indexer(CustomOp):
             assert logits.shape[1] == k_offset
 
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+<<<<<<< HEAD
             topk_result = torch.full(
                 (token_nums, self.index_topk),
                 -1,
                 device=device,
                 dtype=torch.int32,
             )
+=======
+>>>>>>> origin/main
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 
@@ -474,6 +573,7 @@ class Indexer(CustomOp):
                 global_topk_offset.shape[0] >= q_offset
             ), f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
 
+<<<<<<< HEAD
         topk_result = torch.full(
             (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
         )
@@ -485,6 +585,8 @@ class Indexer(CustomOp):
                 token_to_batch_idx, dtype=torch.long, device=device
             )
 
+=======
+>>>>>>> origin/main
         start = 0
         while start < q_offset:
             end = min(start + max_rows, q_offset)
@@ -513,7 +615,11 @@ class Indexer(CustomOp):
                 cu_seqlens_q_chunk = torch.ones(
                     B_chunk, dtype=torch.int32, device=device
                 )
+<<<<<<< HEAD
                 batch_idx_chunk = token_to_batch_idx_tensor[start:end]
+=======
+                batch_idx_chunk = token_to_batch_idx[start:end]
+>>>>>>> origin/main
 
             raw_topk_chunk = metadata.topk_transform(
                 logits_chunk,
@@ -900,7 +1006,11 @@ class Indexer(CustomOp):
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
+<<<<<<< HEAD
                 or forward_batch.forward_mode.is_draft_extend()
+=======
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+>>>>>>> origin/main
             ):
                 topk_result = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
@@ -908,7 +1018,11 @@ class Indexer(CustomOp):
             else:
                 if (
                     forward_batch.nsa_cp_metadata is not None
+<<<<<<< HEAD
                     and self.nsa_enable_prefill_cp
+=======
+                    and is_nsa_prefill_cp_in_seq_split()
+>>>>>>> origin/main
                 ):
                     kv_len_prev = forward_batch.nsa_cp_metadata.kv_len_prev
                     kv_len_next = forward_batch.nsa_cp_metadata.kv_len_next

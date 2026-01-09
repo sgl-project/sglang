@@ -1,266 +1,345 @@
-//! Tokenizer Caching Layer
+//! L1 Cache: Special-token boundary prefix cache
 //!
-//! Provides a caching wrapper around any tokenizer implementation to speed up
-//! repeated tokenization of the same strings (e.g., system prompts).
+//! Caches tokenization results at ALL special token boundaries.
+//! Special tokens (like `<|im_start|>`, `<|im_end|>`) are atomic in BPE tokenizers (special: true, normalized: false),
+//! making them the ONLY safe split points that guarantee correctness.
 //!
-//! # Architecture
-//! - **L0 Cache**: Whole-string exact match (90% of wins)
-//! - **L1 Cache**: Prefix matching at fixed boundaries (future work)
+//! **Design**: Cache at every special token boundary (not at fixed granularity intervals)
+//! - Simple: No granularity parameter, no search windows
+//! - Efficient: Fewer cache entries (10 instead of 64 for typical 8KB prompt)
+//! - Natural: Aligns with actual chat template structure
 //!
-//! # Usage
-//! ```ignore
-//! let tokenizer = Arc::new(HuggingFaceTokenizer::from_file("tokenizer.json")?);
-//! let cached = Arc::new(CachedTokenizer::new(tokenizer, CacheConfig::default()));
-//! let encoding = cached.encode("Hello world")?;
-//! ```
+//! Example:
+//!
+//! Template: "<|im_start|>system\nYou are helpful.<|im_end|><|im_start|>user\n{query}<|im_end|>"
+//!
+//! Request 1: "<|im_start|>system\nYou are helpful.<|im_end|><|im_start|>user\nWhat is 2+2?<|im_end|>"
+//! Request 2: "<|im_start|>system\nYou are helpful.<|im_end|><|im_start|>user\nHello!<|im_end|>"
+//!
+//! Cache points: After each "<|im_end|>" (atomic tokens, guaranteed safe)
+//! Result: tokenize(prefix) + tokenize(suffix) == tokenize(prefix + suffix)
 
-mod fingerprint;
-mod l0;
-mod l1;
+use std::{
+    mem::size_of,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
-use std::sync::Arc;
+use blake3;
+use dashmap::DashMap;
 
-use anyhow::Result;
-pub use fingerprint::TokenizerFingerprint;
-pub use l0::{CacheStats, L0Cache};
-pub use l1::{L1Cache, L1CacheStats};
-use rayon::prelude::*;
+use super::super::traits::TokenIdType;
 
-use super::traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer};
+/// Hash type for cache keys
+type Blake3Hash = [u8; 32];
 
-/// Configuration for the tokenizer cache
+/// Number of shards for concurrent access
+const NUM_SHARDS: usize = 16;
+
+/// Find ALL special token boundaries in the text
+///
+/// **ONLY uses special tokens** - these are atomic (special: true, normalized: false) in BPE,
+/// guaranteeing: tokenize(prefix) + tokenize(suffix) == tokenize(prefix + suffix)
+///
+/// No fallback to whitespace/punctuation - better to not cache than risk corruption.
+///
+/// Common special tokens:
+/// - ChatML: `<|im_start|>`, `<|im_end|>`
+/// - Llama 3: `<|begin_of_text|>`, `<|end_of_text|>`, `<|eot_id|>`
+/// - GPT: `<|endoftext|>`
+/// - Custom: `<|reserved_special_token_N|>`
+///
+/// Returns positions immediately after each special token (where prefixes can be cached).
+fn find_special_token_boundaries(text: &str, special_tokens: &[&str]) -> Vec<usize> {
+    if special_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut boundaries = Vec::new();
+
+    // Find all special token end positions
+    for &token in special_tokens {
+        let mut start = 0;
+        while let Some(pos) = text[start..].find(token) {
+            let boundary = start + pos + token.len();
+            // Only cache boundaries that leave some suffix to tokenize
+            if boundary < text.len() {
+                boundaries.push(boundary);
+            }
+            start = boundary;
+        }
+    }
+
+    // Sort and deduplicate (in case multiple special tokens end at same position)
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    boundaries
+}
+
+/// A cached prefix entry
+/// Uses Arc<[TokenIdType]> for zero-copy access to tokens
 #[derive(Debug, Clone)]
-pub struct CacheConfig {
-    /// Enable L0 (whole-string) cache
-    pub enable_l0: bool,
-    /// Maximum number of entries in L0 cache
-    pub l0_max_entries: usize,
-    /// Enable L1 (prefix) cache
-    pub enable_l1: bool,
-    /// Maximum memory for L1 cache in bytes
-    pub l1_max_memory: usize,
+struct CachedPrefix {
+    /// The pre-computed token IDs for this prefix (Arc for zero-copy cloning)
+    tokens: Arc<[TokenIdType]>,
+    /// Last access timestamp (for LRU eviction)
+    last_accessed: Arc<AtomicU64>,
+    /// Size in bytes (for memory tracking during eviction)
+    size_bytes: usize,
 }
 
-impl Default for CacheConfig {
-    fn default() -> Self {
-        Self {
-            enable_l0: true,
-            l0_max_entries: 10_000, // ~22MB memory for typical prompts
-            enable_l1: false,       // Opt-in for now
-            l1_max_memory: 50 * 1024 * 1024, // 50MB
-        }
-    }
+/// L1 cache implementation with special-token-boundary prefix matching
+pub struct L1Cache {
+    /// Sharded maps for concurrent access
+    /// Key: Blake3 hash of bytes[0..boundary]
+    /// Value: Cached token IDs for that prefix
+    shards: Vec<Arc<DashMap<Blake3Hash, CachedPrefix>>>,
+    /// Maximum memory in bytes
+    max_memory: usize,
+    /// Current memory usage estimate
+    current_memory: AtomicU64,
+    /// Cache hit counter
+    hits: AtomicU64,
+    /// Cache miss counter
+    misses: AtomicU64,
+    /// Monotonic counter for LRU timestamps
+    access_counter: AtomicU64,
 }
 
-/// A caching wrapper around any tokenizer
-pub struct CachedTokenizer {
-    /// The underlying tokenizer
-    inner: Arc<dyn Tokenizer>,
-    /// L0 cache (whole-string exact match)
-    l0: Option<L0Cache>,
-    /// L1 cache (prefix matching at fixed boundaries)
-    l1: Option<L1Cache>,
-    /// Configuration
-    #[allow(dead_code)]
-    config: CacheConfig,
-    /// Fingerprint for cache invalidation
-    fingerprint: TokenizerFingerprint,
-    /// Cached special token strings (extracted once at construction)
-    special_token_strings: Vec<String>,
-}
-
-impl CachedTokenizer {
-    /// Create a new cached tokenizer
-    pub fn new(inner: Arc<dyn Tokenizer>, config: CacheConfig) -> Self {
-        let fingerprint = TokenizerFingerprint::from_tokenizer(inner.as_ref());
-
-        let l0 = if config.enable_l0 {
-            Some(L0Cache::new(config.l0_max_entries))
-        } else {
-            None
-        };
-
-        let l1 = if config.enable_l1 {
-            Some(L1Cache::new(config.l1_max_memory))
-        } else {
-            None
-        };
-
-        // Extract special tokens once at construction time
-        let special_token_strings = Self::extract_special_token_strings(&inner);
+impl L1Cache {
+    /// Create a new L1 cache with the specified memory limit
+    pub fn new(max_memory: usize) -> Self {
+        let shards = (0..NUM_SHARDS).map(|_| Arc::new(DashMap::new())).collect();
 
         Self {
-            inner,
-            l0,
-            l1,
-            config,
-            fingerprint,
-            special_token_strings,
+            shards,
+            max_memory,
+            current_memory: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            access_counter: AtomicU64::new(0),
         }
     }
 
-    /// Extract all special token strings from the tokenizer (called once at construction)
-    fn extract_special_token_strings(tokenizer: &Arc<dyn Tokenizer>) -> Vec<String> {
-        let special_tokens = tokenizer.get_special_tokens();
-        let mut tokens = Vec::new();
+    /// Try to find the longest prefix match at special token boundaries
+    /// Returns (cached_tokens, byte_offset) if found
+    ///
+    /// Uses pre-computed tokens cached during insertion.
+    /// Returns Vec<TokenIdType> as the caller needs to extend it with suffix tokens.
+    pub fn longest_prefix_match(
+        &self,
+        input: &str,
+        special_tokens: &[&str],
+    ) -> Option<(Vec<TokenIdType>, usize)> {
+        let boundaries = find_special_token_boundaries(input, special_tokens);
 
-        if let Some(ref token) = special_tokens.bos_token {
-            tokens.push(token.clone());
-        }
-        if let Some(ref token) = special_tokens.eos_token {
-            tokens.push(token.clone());
-        }
-        if let Some(ref token) = special_tokens.unk_token {
-            tokens.push(token.clone());
-        }
-        if let Some(ref token) = special_tokens.sep_token {
-            tokens.push(token.clone());
-        }
-        if let Some(ref token) = special_tokens.pad_token {
-            tokens.push(token.clone());
-        }
-        if let Some(ref token) = special_tokens.cls_token {
-            tokens.push(token.clone());
-        }
-        if let Some(ref token) = special_tokens.mask_token {
-            tokens.push(token.clone());
+        if boundaries.is_empty() {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
 
-        tokens.extend(special_tokens.additional_special_tokens.iter().cloned());
-        tokens
+        // Search backwards from the longest boundary to find the best match
+        for &boundary_pos in boundaries.iter().rev() {
+            let prefix = &input[0..boundary_pos];
+            let prefix_bytes = prefix.as_bytes();
+            let hash = blake3::hash(prefix_bytes);
+            let hash_bytes: Blake3Hash = *hash.as_bytes();
+
+            let shard_idx = hash_bytes[0] as usize % NUM_SHARDS;
+
+            if let Some(entry) = self.shards[shard_idx].get(&hash_bytes) {
+                // Update last accessed timestamp for LRU
+                let timestamp = self.access_counter.fetch_add(1, Ordering::Relaxed);
+                entry.last_accessed.store(timestamp, Ordering::Relaxed);
+
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                // Convert Arc<[T]> to Vec<T> - caller will extend with suffix tokens
+                return Some((entry.tokens.to_vec(), boundary_pos));
+            }
+        }
+
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        None
     }
 
-    /// Get L0 cache statistics
-    pub fn cache_stats(&self) -> Option<CacheStats> {
-        self.l0.as_ref().map(|cache| cache.stats())
+    /// Insert prefix entries at ALL special token boundaries
+    ///
+    /// Re-tokenizes each prefix to ensure correctness (BPE tokenization is not prefix-stable).
+    /// This is more expensive on cache misses but provides correct tokens for cache hits.
+    ///
+    /// Optimized for workloads with high prefix reuse (e.g., chat templates with repeated system prompts).
+    pub fn insert_at_boundaries<E: super::super::traits::Encoder + ?Sized>(
+        &self,
+        input: &str,
+        tokenizer: &E,
+        special_tokens: &[&str],
+        add_special_tokens: bool,
+    ) -> anyhow::Result<()> {
+        let boundaries = find_special_token_boundaries(input, special_tokens);
+
+        if boundaries.is_empty() {
+            return Ok(());
+        }
+
+        // Calculate how much memory we need and tokenize each prefix
+        let mut entries_to_insert = Vec::with_capacity(boundaries.len());
+        for &boundary_pos in &boundaries {
+            // Extract prefix up to this special token boundary
+            let prefix = &input[0..boundary_pos];
+            let prefix_bytes = prefix.as_bytes();
+            let hash = blake3::hash(prefix_bytes);
+            let hash_bytes: Blake3Hash = *hash.as_bytes();
+
+            // Re-tokenize the prefix for guaranteed correctness
+            // This is the only way to know the exact token boundaries
+            let prefix_encoding = tokenizer.encode(prefix, add_special_tokens)?;
+            // Convert to Arc<[TokenIdType]> for zero-copy sharing
+            let prefix_tokens: Arc<[TokenIdType]> = prefix_encoding.token_ids().into();
+
+            // Size = text bytes + token storage
+            let size_bytes = boundary_pos + prefix_tokens.len() * size_of::<TokenIdType>();
+
+            entries_to_insert.push((hash_bytes, prefix_tokens, size_bytes));
+        }
+
+        if entries_to_insert.is_empty() {
+            return Ok(());
+        }
+
+        let total_size_needed: usize = entries_to_insert.iter().map(|(_, _, size)| size).sum();
+
+        // Evict if necessary
+        let current = self.current_memory.load(Ordering::Relaxed) as usize;
+        if current + total_size_needed > self.max_memory {
+            self.evict_lru(total_size_needed);
+        }
+
+        // Insert all entries
+        let current_timestamp = self.access_counter.load(Ordering::Relaxed);
+        for (hash_bytes, prefix_tokens, size_bytes) in entries_to_insert {
+            let shard_idx = hash_bytes[0] as usize % NUM_SHARDS;
+
+            let cached = CachedPrefix {
+                tokens: prefix_tokens, // Already Arc<[TokenIdType]>
+                last_accessed: Arc::new(AtomicU64::new(current_timestamp)),
+                size_bytes,
+            };
+
+            self.shards[shard_idx].insert(hash_bytes, cached);
+            self.current_memory
+                .fetch_add(size_bytes as u64, Ordering::Relaxed);
+        }
+
+        Ok(())
     }
 
-    /// Get L1 cache statistics
-    pub fn l1_cache_stats(&self) -> Option<L1CacheStats> {
-        self.l1.as_ref().map(|cache| cache.stats())
+    /// Evict least recently used entries using approximate LRU via random sampling
+    ///
+    /// This uses an approximate LRU strategy that's much faster than true LRU:
+    /// - Samples K random entries from the cache (K=32)
+    /// - Evicts the oldest entry among the samples
+    /// - Repeats until enough space is freed
+    ///
+    /// This provides O(samples) complexity instead of O(total_entries * log(total_entries)),
+    /// avoiding latency spikes when eviction is triggered on large caches.
+    ///
+    /// The approximation is excellent in practice - sampling 32 entries from a large cache
+    /// gives high probability of finding very old entries.
+    fn evict_lru(&self, space_needed: usize) {
+        const SAMPLE_SIZE: usize = 32; // Number of entries to sample per eviction round
+        let mut freed = 0usize;
+        let mut iteration = 0usize;
+
+        // Keep evicting until we have enough space
+        while freed < space_needed {
+            // Collect samples from shards
+            let mut samples: Vec<(usize, Blake3Hash, u64, usize)> = Vec::with_capacity(SAMPLE_SIZE);
+
+            // Sample entries across different shards
+            for i in 0..SAMPLE_SIZE {
+                // Distribute samples across shards using iteration and index for variety
+                let shard_idx = (iteration * SAMPLE_SIZE + i) % NUM_SHARDS;
+
+                // Get first entry from that shard (DashMap iteration order is arbitrary)
+                if let Some(entry) = self.shards[shard_idx].iter().next() {
+                    let hash = *entry.key();
+                    let timestamp = entry.value().last_accessed.load(Ordering::Relaxed);
+                    let size = entry.value().size_bytes;
+                    samples.push((shard_idx, hash, timestamp, size));
+                }
+            }
+
+            if samples.is_empty() {
+                // Cache is empty, nothing to evict
+                break;
+            }
+
+            // Find the oldest entry among samples
+            if let Some((shard_idx, hash, _, _)) =
+                samples.iter().min_by_key(|(_, _, ts, _)| ts).copied()
+            {
+                // Remove it
+                if let Some((_, removed)) = self.shards[shard_idx].remove(&hash) {
+                    freed += removed.size_bytes;
+                    self.current_memory
+                        .fetch_sub(removed.size_bytes as u64, Ordering::Relaxed);
+                }
+            }
+
+            iteration += 1;
+        }
+    }
+
+    /// Get the number of entries in the cache
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.len()).sum()
+    }
+
+    /// Check if the cache is empty
+    pub fn is_empty(&self) -> bool {
+        self.shards.iter().all(|s| s.is_empty())
+    }
+
+    /// Get cache statistics
+    pub fn stats(&self) -> L1CacheStats {
+        let hits = self.hits.load(Ordering::Relaxed);
+        let misses = self.misses.load(Ordering::Relaxed);
+        let total_requests = hits + misses;
+
+        L1CacheStats {
+            hits,
+            misses,
+            entries: self.len(),
+            memory_bytes: self.current_memory.load(Ordering::Relaxed) as usize,
+            hit_rate: if total_requests > 0 {
+                hits as f64 / total_requests as f64
+            } else {
+                0.0
+            },
+        }
     }
 
     /// Clear the cache
-    pub fn clear_cache(&self) {
-        if let Some(l0) = &self.l0 {
-            l0.clear();
+    pub fn clear(&self) {
+        for shard in &self.shards {
+            shard.clear();
         }
-        if let Some(l1) = &self.l1 {
-            l1.clear();
-        }
-    }
-
-    /// Get the fingerprint of the underlying tokenizer
-    pub fn fingerprint(&self) -> &TokenizerFingerprint {
-        &self.fingerprint
-    }
-
-    /// Get a reference to the inner (wrapped) tokenizer
-    pub fn inner(&self) -> &Arc<dyn Tokenizer> {
-        &self.inner
+        self.current_memory.store(0, Ordering::Relaxed);
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
     }
 }
 
-impl Encoder for CachedTokenizer {
-    fn encode(&self, input: &str) -> Result<Encoding> {
-        // L0 cache lookup (exact match) - returns Arc<Encoding> for zero-copy
-        if let Some(l0) = &self.l0 {
-            if let Some(cached) = l0.get(input) {
-                // Unwrap the Arc - since Encoding is Clone, we can return the inner value
-                // For callers who need the tokens, they can access via token_ids() which is &[u32]
-                return Ok((*cached).clone());
-            }
-        }
-
-        // L1 cache lookup (prefix match at special token boundaries)
-        if let Some(l1) = &self.l1 {
-            // Use pre-computed special tokens refs (avoids allocation per call)
-            let tokens: Vec<&str> = self
-                .special_token_strings
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-
-            if let Some((prefix_tokens, prefix_len)) = l1.longest_prefix_match(input, &tokens) {
-                // We have a prefix match - tokenize the suffix
-                let suffix = &input[prefix_len..];
-                if !suffix.is_empty() {
-                    let suffix_encoding = self.inner.encode(suffix)?;
-
-                    // Merge prefix tokens + suffix tokens
-                    // Safe because we're splitting at special token boundaries
-                    let mut merged_tokens = prefix_tokens;
-                    merged_tokens.extend_from_slice(suffix_encoding.token_ids());
-
-                    let merged_encoding = Encoding::Sp(merged_tokens);
-
-                    // Cache the full result in L0
-                    if let Some(l0) = &self.l0 {
-                        l0.insert(input.to_string(), merged_encoding.clone());
-                    }
-
-                    return Ok(merged_encoding);
-                }
-            }
-        }
-
-        // Full tokenization (both L0 and L1 miss)
-        let encoding = self.inner.encode(input)?;
-
-        // Cache in L0
-        if let Some(l0) = &self.l0 {
-            l0.insert(input.to_string(), encoding.clone());
-        }
-
-        // Cache in L1 at special token boundaries
-        // Re-tokenizes prefixes for correctness (optimized for high prefix reuse)
-        if let Some(l1) = &self.l1 {
-            let tokens: Vec<&str> = self
-                .special_token_strings
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            let _ = l1.insert_at_boundaries(input, self.inner.as_ref(), &tokens);
-            // Ignore errors in cache insertion - cache is best-effort
-        }
-
-        Ok(encoding)
-    }
-
-    fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
-        // Process each input in parallel, leveraging thread-safe caches
-        // This maintains the parallelism from the underlying HuggingFaceTokenizer
-        inputs.par_iter().map(|&input| self.encode(input)).collect()
-    }
-}
-
-impl Decoder for CachedTokenizer {
-    fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
-        // Decoding is not cached (it's fast enough and rarely repeated)
-        self.inner.decode(token_ids, skip_special_tokens)
-    }
-}
-
-impl Tokenizer for CachedTokenizer {
-    fn vocab_size(&self) -> usize {
-        self.inner.vocab_size()
-    }
-
-    fn get_special_tokens(&self) -> &SpecialTokens {
-        self.inner.get_special_tokens()
-    }
-
-    fn token_to_id(&self, token: &str) -> Option<TokenIdType> {
-        self.inner.token_to_id(token)
-    }
-
-    fn id_to_token(&self, id: TokenIdType) -> Option<String> {
-        self.inner.id_to_token(id)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+#[derive(Debug, Clone)]
+pub struct L1CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub entries: usize,
+    pub memory_bytes: usize,
+    pub hit_rate: f64,
 }
 
 #[cfg(test)]
@@ -269,97 +348,164 @@ mod tests {
     use crate::tokenizer::mock::MockTokenizer;
 
     #[test]
-    fn test_cache_hit() {
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let cached = CachedTokenizer::new(tokenizer, CacheConfig::default());
+    fn test_basic_prefix_match() {
+        let cache = L1Cache::new(1024 * 1024);
+        let special_tokens = &["<|im_start|>", "<|im_end|>"];
+        let tokenizer = MockTokenizer::new();
 
-        let input = "Hello world";
+        // Realistic ChatML template with special tokens
+        let input1 = "<|im_start|>system\nYou are a helpful assistant that provides clear and detailed responses.<|im_end|><|im_start|>user\nHello there! How are you doing today?<|im_end|>";
 
-        // First call - miss
-        let result1 = cached.encode(input).unwrap();
+        // Insert at special token boundaries (re-tokenizes prefixes)
+        cache
+            .insert_at_boundaries(input1, &tokenizer, special_tokens, false)
+            .unwrap();
 
-        // Second call - hit
-        let result2 = cached.encode(input).unwrap();
+        // Should have cached at special token boundaries
+        assert!(!cache.is_empty());
 
-        // Results should be identical
-        assert_eq!(result1.token_ids(), result2.token_ids());
+        // Search with same prefix but different user query
+        let input2 = "<|im_start|>system\nYou are a helpful assistant that provides clear and detailed responses.<|im_end|><|im_start|>user\nWhat is 2+2?<|im_end|>";
+        let result = cache.longest_prefix_match(input2, special_tokens);
 
-        // Check cache stats
-        let stats = cached.cache_stats().unwrap();
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.misses, 1);
+        // Should find a match at the special token boundary (after system message)
+        assert!(result.is_some());
+        let (tokens, offset) = result.unwrap();
+        assert!(offset > 0);
+        assert!(!tokens.is_empty());
     }
 
     #[test]
-    fn test_cache_disabled() {
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let config = CacheConfig {
-            enable_l0: false,
-            l0_max_entries: 0,
-            enable_l1: false,
-            l1_max_memory: 0,
-        };
-        let cached = CachedTokenizer::new(tokenizer, config);
+    fn test_short_input_with_boundaries() {
+        let cache = L1Cache::new(1024 * 1024);
+        let special_tokens = &["<|im_start|>", "<|im_end|>"];
+        let tokenizer = MockTokenizer::new();
 
-        let input = "Hello world";
+        // Short input with special tokens
+        let input = "<|im_start|>user\nHi<|im_end|>";
 
-        // Both calls should work even without cache
-        let result1 = cached.encode(input).unwrap();
-        let result2 = cached.encode(input).unwrap();
+        cache
+            .insert_at_boundaries(input, &tokenizer, special_tokens, false)
+            .unwrap();
 
-        assert_eq!(result1.token_ids(), result2.token_ids());
+        // Should cache at <|im_start|> boundary (has suffix left)
+        assert!(!cache.is_empty());
 
-        // No cache stats available
-        assert!(cached.cache_stats().is_none());
+        // Should find a match
+        let result = cache.longest_prefix_match(input, special_tokens);
+        assert!(result.is_some());
     }
 
     #[test]
-    fn test_encode_batch() {
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let cached = CachedTokenizer::new(tokenizer, CacheConfig::default());
+    fn test_longest_match() {
+        let cache = L1Cache::new(1024 * 1024);
+        let special_tokens = &["<|im_start|>", "<|im_end|>"];
+        let tokenizer = MockTokenizer::new();
 
-        let inputs = vec!["Hello", "world", "Hello"]; // "Hello" repeated
+        // Create multi-turn conversation with multiple special token boundaries (~400 bytes)
+        let input = "<|im_start|>system\nYou are a helpful AI assistant that provides detailed and accurate responses.<|im_end|><|im_start|>user\nHello there! How are you today? Can you help me understand how tokenization works in language models?<|im_end|><|im_start|>assistant\nI'm doing well, thank you! I'd be happy to explain tokenization. Tokenization is the process of breaking text into smaller units called tokens.<|im_end|>";
 
-        let results = cached.encode_batch(&inputs).unwrap();
+        cache
+            .insert_at_boundaries(input, &tokenizer, special_tokens, false)
+            .unwrap();
 
-        assert_eq!(results.len(), 3);
+        // Should have multiple entries at special token boundaries
+        assert!(cache.len() >= 2); // At least 2 boundaries
 
-        // With parallel execution, duplicate inputs may be processed simultaneously
-        // and both see cache misses. Verify results are correct instead.
-        assert_eq!(results[0].token_ids(), results[2].token_ids()); // Both "Hello" should match
+        // Search with partial conversation - should match at a special token boundary
+        let partial_input = "<|im_start|>system\nYou are a helpful AI assistant that provides detailed and accurate responses.<|im_end|><|im_start|>user\nHello there! How are you today? Can you help me understand how tokenization works in language models?<|im_end|>";
+        let result = cache.longest_prefix_match(partial_input, special_tokens);
 
-        // After batch processing, cache should be populated
-        // Subsequent calls should hit the cache
-        let _ = cached.encode("Hello").unwrap();
-        let stats = cached.cache_stats().unwrap();
-
-        // Should have at least 1 hit from the call above (cache was populated by batch)
-        assert!(
-            stats.hits >= 1,
-            "Expected at least 1 cache hit after batch processing"
-        );
+        // Should find a match at a special token boundary
+        assert!(result.is_some());
+        let (_, offset) = result.unwrap();
+        assert!(offset > 0);
+        assert!(offset <= partial_input.len());
     }
 
     #[test]
-    fn test_decoder_passthrough() {
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let cached = CachedTokenizer::new(tokenizer, CacheConfig::default());
+    fn test_stats() {
+        let cache = L1Cache::new(1024 * 1024);
+        let special_tokens = &["<|im_start|>", "<|im_end|>"];
+        let tokenizer = MockTokenizer::new();
 
-        let tokens = vec![1, 2, 3];
-        let decoded = cached.decode(&tokens, false).unwrap();
+        // ChatML input with special tokens
+        let input = "<|im_start|>system\nYou are a helpful assistant that provides detailed answers.<|im_end|><|im_start|>user\nHello there! How are you today?<|im_end|>";
 
-        // Should just pass through to inner tokenizer
-        assert!(!decoded.is_empty());
+        cache
+            .insert_at_boundaries(input, &tokenizer, special_tokens, false)
+            .unwrap();
+
+        // Try to find match
+        let _ = cache.longest_prefix_match(input, special_tokens);
+
+        let stats = cache.stats();
+        // Should have at least one hit (the longest special token boundary should match)
+        assert!(stats.hits >= 1);
+        assert_eq!(stats.hit_rate, 1.0);
     }
 
     #[test]
-    fn test_tokenizer_trait_methods() {
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let cached = CachedTokenizer::new(tokenizer.clone(), CacheConfig::default());
+    fn test_clear() {
+        let cache = L1Cache::new(1024 * 1024);
+        let special_tokens = &["<|im_start|>", "<|im_end|>"];
+        let tokenizer = MockTokenizer::new();
 
-        // Should pass through to inner tokenizer
-        assert_eq!(cached.vocab_size(), tokenizer.vocab_size());
-        assert!(cached.token_to_id("Hello").is_some());
-        assert!(cached.id_to_token(1).is_some());
+        // ChatML input with special tokens
+        let input = "<|im_start|>system\nYou are a helpful assistant that provides clear and detailed responses.<|im_end|><|im_start|>user\nHello there!<|im_end|>";
+
+        cache
+            .insert_at_boundaries(input, &tokenizer, special_tokens, false)
+            .unwrap();
+        assert!(!cache.is_empty());
+
+        cache.clear();
+        assert!(cache.is_empty());
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+    }
+
+    #[test]
+    fn test_lru_eviction() {
+        // Create a small cache (5KB) to trigger eviction
+        let cache = L1Cache::new(5 * 1024);
+        let special_tokens = &["<|im_start|>", "<|im_end|>", "<|eot_id|>"];
+        let tokenizer = MockTokenizer::new();
+
+        // Insert first conversation
+        let input1 = "<|im_start|>system\nYou are a helpful assistant specialized in mathematics.<|im_end|><|im_start|>user\nCan you explain calculus to me?<|im_end|><|im_start|>assistant\nCertainly! Calculus is a branch of mathematics that studies continuous change.<|im_end|><|eot_id|>";
+        cache
+            .insert_at_boundaries(input1, &tokenizer, special_tokens, false)
+            .unwrap();
+
+        // Access the first entry to update its timestamp
+        let result = cache.longest_prefix_match(input1, special_tokens);
+        assert!(result.is_some());
+
+        // Insert second conversation
+        let input2 = "<|im_start|>system\nYou are a helpful assistant specialized in physics.<|im_end|><|im_start|>user\nWhat is quantum mechanics?<|im_end|><|im_start|>assistant\nQuantum mechanics is the fundamental theory describing nature at atomic and subatomic scales.<|im_end|><|eot_id|>";
+        cache
+            .insert_at_boundaries(input2, &tokenizer, special_tokens, false)
+            .unwrap();
+
+        // Access the second entry to make it more recent
+        let result = cache.longest_prefix_match(input2, special_tokens);
+        assert!(result.is_some());
+
+        // Insert third conversation (should trigger eviction of oldest)
+        let input3 = "<|im_start|>system\nYou are a helpful assistant specialized in chemistry.<|im_end|><|im_start|>user\nExplain the periodic table to me please.<|im_end|><|im_start|>assistant\nThe periodic table is a tabular arrangement of chemical elements organized by atomic number and electron configuration.<|im_end|><|eot_id|>";
+        cache
+            .insert_at_boundaries(input3, &tokenizer, special_tokens, false)
+            .unwrap();
+
+        // Verify cache didn't exceed max memory
+        let stats = cache.stats();
+        assert!(stats.memory_bytes <= 5 * 1024);
+
+        // The most recently accessed entries should still be present
+        let result = cache.longest_prefix_match(input3, special_tokens);
+        assert!(result.is_some());
     }
 }

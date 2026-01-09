@@ -54,7 +54,7 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         [b, h, s_local, d] -> [b, h_local, s_global, d]
 
     If heads are at dim=2 (input is [b, s_local, h, d]), set head_dim=2, and the
-    function returns [b, s_global, h+local, d], preserving the original
+    function returns [b, s_global, h_local, d], preserving the original
     head/sequence dim ordering.
 
     Args:
@@ -229,13 +229,13 @@ def ring_attn(
     use_segment_id = parse(torch.__version__).release >= parse("2.6.0").release
 
     attn_kwargs = dict(
-        mesh=ring_pg,
         op=attn_callable_adapter,
         dropout_p=dropout_p,
         is_causal=is_causal,
         query=query,
         key=key,
         value=value,
+        group=ring_pg,  # https://github.com/pytorch/pytorch/blob/c907c778f42ba2fdaf25b733dd25baf9779c6a12/torch/distributed/tensor/experimental/_context_parallel/_attention.py#L309
     )
 
     if use_segment_id:

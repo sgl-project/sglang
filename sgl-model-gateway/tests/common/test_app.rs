@@ -2,7 +2,7 @@ use std::sync::{Arc, OnceLock};
 
 use axum::Router;
 use reqwest::Client;
-use sgl_model_gateway::{
+use smg::{
     app_context::AppContext,
     config::RouterConfig,
     core::{
@@ -16,6 +16,7 @@ use sgl_model_gateway::{
     policies::PolicyRegistry,
     routers::RouterTrait,
     server::{build_app, AppState},
+    tokenizer::registry::TokenizerRegistry,
 };
 
 /// Create a test Axum application using the actual server's build_app function
@@ -67,7 +68,7 @@ pub fn create_test_app(
             .router_config(router_config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
-            .tokenizer(None) // tokenizer
+            .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
             .worker_registry(worker_registry)
@@ -109,6 +110,7 @@ pub fn create_test_app(
     build_app(
         app_state,
         auth_config,
+        None, // No control plane auth for tests
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
@@ -151,6 +153,7 @@ pub fn create_test_app_with_context(
     build_app(
         app_state,
         auth_config,
+        None, // No control plane auth for tests
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
@@ -195,7 +198,7 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
             .router_config(router_config)
             .client(client)
             .rate_limiter(None)
-            .tokenizer(None)
+            .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
             .reasoning_parser_factory(None)
             .tool_parser_factory(None)
             .worker_registry(worker_registry)

@@ -656,6 +656,7 @@ class ChatCompletionRequest(BaseModel):
             "skip_special_tokens": self.skip_special_tokens,
             "logit_bias": self.logit_bias,
             "custom_params": self.custom_params,
+            "sampling_seed": self.seed,
         }
 
         if self.response_format and self.response_format.type == "json_schema":

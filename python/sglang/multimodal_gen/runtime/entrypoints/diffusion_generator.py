@@ -13,36 +13,30 @@ import os
 import time
 from typing import Any
 
-import imageio
 import numpy as np
-import torch
-import torchvision
-from einops import rearrange
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    post_process_sample,
+    prepare_request,
+)
 from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.sync_scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    GREEN,
+    RESET,
     init_logger,
     log_batch_completion,
     log_generation_timer,
-    suppress_loggers,
-    suppress_other_loggers,
 )
-
-suppress_loggers(["imageio", "imageio_ffmpeg", "PIL", "PIL_Image"])
 
 logger = init_logger(__name__)
 
@@ -57,7 +51,6 @@ except RuntimeError:
     pass
 
 
-# TODO: rename
 class DiffGenerator:
     """
     A unified class for generating images/videos using diffusion models.
@@ -86,6 +79,7 @@ class DiffGenerator:
     @classmethod
     def from_pretrained(
         cls,
+        local_mode: bool = True,
         **kwargs,
     ) -> "DiffGenerator":
         """
@@ -109,10 +103,12 @@ class DiffGenerator:
         else:
             server_args = ServerArgs.from_kwargs(**kwargs)
 
-        return cls.from_server_args(server_args)
+        return cls.from_server_args(server_args, local_mode=local_mode)
 
     @classmethod
-    def from_server_args(cls, server_args: ServerArgs) -> "DiffGenerator":
+    def from_server_args(
+        cls, server_args: ServerArgs, local_mode: bool = True
+    ) -> "DiffGenerator":
         """
         Create a DiffGenerator with the specified arguments.
 
@@ -125,9 +121,8 @@ class DiffGenerator:
         instance = cls(
             server_args=server_args,
         )
-        is_local_mode = server_args.is_local_mode
-        logger.info(f"Local mode: {is_local_mode}")
-        if is_local_mode:
+        logger.info(f"Local mode: {local_mode}")
+        if local_mode:
             instance.local_scheduler_process = instance._start_local_server_if_needed()
         else:
             # In remote mode, we just need to connect and check.
@@ -154,56 +149,13 @@ class DiffGenerator:
         if not sync_scheduler_client.ping():
             raise ConnectionError(
                 f"Could not connect to remote scheduler at "
-                f"{self.server_args.scheduler_endpoint()} with `local mode` as False. "
+                f"{self.server_args.scheduler_endpoint} with `local mode` as False. "
                 "Please ensure the server is running."
             )
         logger.info(
             f"Successfully connected to remote scheduler at "
-            f"{self.server_args.scheduler_endpoint()}."
+            f"{self.server_args.scheduler_endpoint}."
         )
-
-    def post_process_sample(
-        self,
-        sample: torch.Tensor,
-        data_type: DataType,
-        fps: int,
-        save_output: bool = True,
-        save_file_path: str = None,
-    ):
-        """
-        Process a single sample output and save output if necessary
-        """
-        # Process outputs
-        if sample.dim() == 3:
-            # for images, dim t is missing
-            sample = sample.unsqueeze(1)
-        sample = rearrange(sample, "c t h w -> t c h w")
-        frames = []
-        # TODO: this can be batched
-        for x in sample:
-            x = torchvision.utils.make_grid(x, nrow=6)
-            x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
-            frames.append((x * 255).numpy().astype(np.uint8))
-
-        # Save outputs if requested
-        if save_output:
-            if save_file_path:
-                os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
-                with suppress_other_loggers():
-                    if data_type == DataType.VIDEO:
-                        imageio.mimsave(
-                            save_file_path,
-                            frames,
-                            fps=fps,
-                            format=data_type.get_default_extension(),
-                        )
-                    else:
-                        imageio.imwrite(save_file_path, frames[0])
-                logger.info("Saved output to %s", save_file_path)
-            else:
-                logger.warning("No output path provided, output not saved")
-
-        return frames
 
     def generate(
         self,
@@ -235,14 +187,13 @@ class DiffGenerator:
                 raise ValueError(f"No prompts found in file: {prompt_txt_path}")
 
             logger.info("Found %d prompts in %s", len(prompts), prompt_txt_path)
-        elif prompt is not None:
+        else:
+            if prompt is None:
+                prompt = " "
             if isinstance(prompt, str):
                 prompts.append(prompt)
             elif isinstance(prompt, list):
                 prompts.extend(prompt)
-        else:
-            raise ValueError("Either prompt or prompt_txt must be provided")
-
         sampling_params = SamplingParams.from_user_sampling_params_args(
             self.server_args.model_path,
             server_args=self.server_args,
@@ -280,10 +231,11 @@ class DiffGenerator:
                         continue
                     for output_idx, sample in enumerate(output_batch.output):
                         num_outputs = len(output_batch.output)
-                        frames = self.post_process_sample(
+                        frames = post_process_sample(
                             sample,
                             fps=req.fps,
                             save_output=req.save_output,
+                            # TODO: output file path for req should be determined
                             save_file_path=req.output_file_path(
                                 num_outputs, output_idx
                             ),
@@ -296,6 +248,7 @@ class DiffGenerator:
                             "prompts": req.prompt,
                             "size": (req.height, req.width, req.num_frames),
                             "generation_time": timer.duration,
+                            "peak_memory_mb": output_batch.peak_memory_mb,
                             "timings": (
                                 output_batch.timings.to_dict()
                                 if output_batch.timings
@@ -312,6 +265,23 @@ class DiffGenerator:
 
         total_gen_time = time.perf_counter() - total_start_time
         log_batch_completion(logger, len(results), total_gen_time)
+
+        if results:
+            if self.server_args.enable_warmup:
+                total_duration_ms = results[0]["timings"]["total_duration_ms"]
+                logger.info(
+                    f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
+                    total_duration_ms / 1000.0,
+                )
+
+            peak_memories = [r.get("peak_memory_mb", 0) for r in results]
+            if peak_memories:
+                max_peak_memory = max(peak_memories)
+                avg_peak_memory = sum(peak_memories) / len(peak_memories)
+                logger.info(
+                    f"Memory usage - Max peak: {max_peak_memory:.2f} MB, "
+                    f"Avg peak: {avg_peak_memory:.2f} MB"
+                )
 
         if len(results) == 0:
             return None
@@ -331,18 +301,18 @@ class DiffGenerator:
     # LoRA
     def _send_lora_request(self, req: Any, success_msg: str, failure_msg: str):
         response = sync_scheduler_client.forward(req)
-        if isinstance(response, dict) and response.get("status") == "ok":
+        if response.error is None:
             logger.info(success_msg)
         else:
-            error_msg = (
-                response.get("message", "Unknown error")
-                if isinstance(response, dict)
-                else "Unknown response format"
-            )
+            error_msg = response.error
             raise RuntimeError(f"{failure_msg}: {error_msg}")
 
     def set_lora(
-        self, lora_nickname: str, lora_path: str | None = None, target: str = "all"
+        self,
+        lora_nickname: str,
+        lora_path: str | None = None,
+        target: str = "all",
+        strength: float = 1.0,
     ) -> None:
         """
         Set a LoRA adapter for the specified transformer(s).
@@ -355,13 +325,17 @@ class DiffGenerator:
                 - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model
+            strength: LoRA strength for merge, default 1.0.
         """
         req = SetLoraReq(
-            lora_nickname=lora_nickname, lora_path=lora_path, target=target
+            lora_nickname=lora_nickname,
+            lora_path=lora_path,
+            target=target,
+            strength=strength,
         )
         self._send_lora_request(
             req,
-            f"Successfully set LoRA adapter: {lora_nickname} (target: {target})",
+            f"Successfully set LoRA adapter: {lora_nickname} (target: {target}, strength: {strength})",
             "Failed to set LoRA adapter",
         )
 
@@ -379,17 +353,18 @@ class DiffGenerator:
             "Failed to unmerge LoRA weights",
         )
 
-    def merge_lora_weights(self, target: str = "all") -> None:
+    def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
         """
         Merge LoRA weights into the base model.
 
         Args:
             target: Which transformer(s) to merge.
+            strength: LoRA strength for merge, default 1.0.
         """
-        req = MergeLoraWeightsReq(target=target)
+        req = MergeLoraWeightsReq(target=target, strength=strength)
         self._send_lora_request(
             req,
-            f"Successfully merged LoRA weights (target: {target})",
+            f"Successfully merged LoRA weights (target: {target}, strength: {strength})",
             "Failed to merge LoRA weights",
         )
 
@@ -435,9 +410,11 @@ class DiffGenerator:
             lora_path=lora_path, lora_nickname=lora_nickname, merge_lora=merge_lora
         )
         return self.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            **kwargs,
+            sampling_params_kwargs=dict(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                **kwargs,
+            )
         )
 
     def shutdown(self):
@@ -460,9 +437,6 @@ class DiffGenerator:
         if self.owns_scheduler_client:
             sync_scheduler_client.close()
             self.owns_scheduler_client = False
-
-    def __enter__(self):
-        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()

@@ -1,6 +1,6 @@
-# SGL Kernel
+# sgl-kernel
 
-[Kernel Library](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) for SGLang
+[Kernel Library](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) for LLM inference engines
 
 <div align="center">
 
@@ -9,7 +9,7 @@
 
 </div>
 
-SGL Kernel provides optimized compute primitives for the SGLang framework, enabling efficient inference for large language models and vision-language models through custom kernel operations.
+sgl-kernel provides optimized compute primitives for LLM inference engines, enabling efficient inference for large language models and vision-language models through custom kernel operations. It has been used by [LightLLM](https://github.com/ModelTC/LightLLM), [SGLang](https://github.com/sgl-project/sglang) and so on.
 
 ## Installation
 Requires torch == 2.9.1
@@ -32,10 +32,19 @@ Requires
 make build
 ```
 
+### Limit build resource usage (CPU / parallelism)
+
+```bash
+# Limit parallel jobs (controls both make and cmake parallelism)
+make build MAX_JOBS=2
+
+# Additionally limit NVCC internal threads (reduces CPU and peak memory)
+make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
+```
+
 ## Contribution
 
 ### Steps to add a new kernel:
-
 1. Implement the kernel in [csrc](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/csrc)
 2. Expose the interface in [include/sgl_kernel_ops.h](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/include/sgl_kernel_ops.h)
 3. Create torch extension in [csrc/common_extension.cc](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/csrc/common_extension.cc)
@@ -104,7 +113,9 @@ m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 
 ## Kernel Size Analysis
 
-Analyze CUDA kernel sizes in compiled wheel files to identify optimization opportunities:
+Analyze CUDA kernel sizes in compiled wheel files to identify oversized kernels and template-instantiation bloat:
+
+This tool requires `cubloaty` (install with `pip install cubloaty`) to work.
 
 ```bash
 # Install cubloaty
@@ -118,9 +129,9 @@ python analyze_whl_kernel_sizes.py path/to/sgl_kernel-*.whl --output my_analysis
 ```
 
 The tool generates:
-- Text report with kernel groups (by name prefix) and individual kernel sizes
-- JSON file with detailed structured data
-- Timing information for each analysis step
+- A text report with:
+  - Kernel groups (by name prefix)
+  - Individual kernel sizes (sorted by size)
 
 Use this to identify large kernels and potential template instantiation bloat.
 
