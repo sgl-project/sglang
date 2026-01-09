@@ -150,6 +150,10 @@ serial_test = "3.0"
 rsa = { version = "0.9", features = ["sha2"] }
 
 [[bench]]
+name = "wasm_middleware_latency"
+harness = false
+path = "benches/wasm_middleware_latency.rs"
+[[bench]]
 name = "request_processing"
 harness = false
 path = "benches/request_processing.rs"
