@@ -14,8 +14,13 @@
 """Sampling parameters for text generation."""
 
 import logging
-import sre_parse
 from typing import Any, Dict, List, Optional, Union
+
+# sre_parse is deprecated in Python 3.11+, use re._parser instead
+try:
+    import re._parser as sre_parse
+except ImportError:
+    import sre_parse  # Python < 3.11
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
@@ -96,6 +101,19 @@ class SamplingParams:
             self.top_k = 1
         if self.top_k == -1:
             self.top_k = TOP_K_ALL  # whole vocabulary
+
+    @property
+    def has_grammar_constraint(self) -> bool:
+        """
+        Helper property to check if any grammar constraint
+        exists for these SamplingParams.
+        """
+        return (
+            self.json_schema is not None
+            or self.regex is not None
+            or self.ebnf is not None
+            or self.structural_tag is not None
+        )
 
     def verify(self, vocab_size):
         if self.temperature < 0.0:

@@ -339,10 +339,14 @@ class ChatCompletionMessageContentTextPart(BaseModel):
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
 
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -515,6 +519,10 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
+
+    # SGLang multimodal tiling controls (extensions)
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
@@ -772,6 +780,7 @@ class ChatCompletionStreamResponse(BaseModel):
 class MultimodalEmbeddingInput(BaseModel):
     text: Optional[str] = None
     image: Optional[str] = None
+    video: Optional[str] = None
 
 
 EmbeddingInput = Union[

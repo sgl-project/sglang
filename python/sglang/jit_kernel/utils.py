@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import functools
 import pathlib
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
+
+import torch
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -53,6 +56,14 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
             return "true" if arg else "false"
         if isinstance(arg, (int, float)):
             return str(arg)
+        if isinstance(arg, torch.dtype):
+            if arg == torch.float:
+                return "float"
+            if arg == torch.float16:
+                return "__half"
+            if arg == torch.bfloat16:
+                return "nv_bfloat16"
+            raise TypeError(f"Not implement this arg wrapper yet: {arg}")
         raise TypeError(f"Unsupported argument type for cpp template: {type(arg)}")
 
     return CPPArgList(_convert(arg) for arg in args)
@@ -131,3 +142,31 @@ def load_jit(
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
     )
+
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def cache_once(fn: F) -> F:
+    """
+    NOTE: `functools.lru_cache` is not compatible with `torch.compile`
+    So we manually implement a simple cache_once decorator to replace it.
+    """
+    result_map = {}
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        key = (args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
+        if key not in result_map:
+            result_map[key] = fn(*args, **kwargs)
+        return result_map[key]
+
+    return wrapper  # type: ignore
+
+
+@cache_once
+def is_arch_support_pdl() -> bool:
+    import torch
+
+    device = torch.cuda.current_device()
+    return torch.cuda.get_device_capability(device)[0] >= 9

@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use sgl_model_gateway::*;
+use smg::*;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 
@@ -13,6 +13,8 @@ pub enum PolicyType {
     PowerOfTwo,
     Bucket,
     Manual,
+    ConsistentHashing,
+    PrefixHash,
 }
 
 #[pyclass(eq)]
@@ -310,6 +312,7 @@ struct Router {
     balance_rel_threshold: f32,
     eviction_interval_secs: u64,
     max_tree_size: usize,
+    max_idle_secs: u64,
     max_payload_size: usize,
     dp_aware: bool,
     api_key: Option<String>,
@@ -415,7 +418,15 @@ impl Router {
                     balance_rel_threshold: self.balance_rel_threshold,
                     bucket_adjust_interval_secs: self.bucket_adjust_interval_secs,
                 },
-                PolicyType::Manual => ConfigPolicyConfig::Manual,
+                PolicyType::Manual => ConfigPolicyConfig::Manual {
+                    eviction_interval_secs: self.eviction_interval_secs,
+                    max_idle_secs: self.max_idle_secs,
+                },
+                PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
+                PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
+                    prefix_token_count: 256,
+                    load_factor: 1.25,
+                },
             }
         };
 
@@ -582,6 +593,7 @@ impl Router {
         balance_rel_threshold = 1.5,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
+        max_idle_secs = 14400,
         max_payload_size = 512 * 1024 * 1024,
         dp_aware = false,
         api_key = None,
@@ -664,6 +676,7 @@ impl Router {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        max_idle_secs: u64,
         max_payload_size: usize,
         dp_aware: bool,
         api_key: Option<String>,
@@ -759,6 +772,7 @@ impl Router {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            max_idle_secs,
             max_payload_size,
             dp_aware,
             api_key,
