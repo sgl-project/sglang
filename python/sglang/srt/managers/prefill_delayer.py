@@ -108,6 +108,7 @@ class PrefillDelayer:
         )
         global_exists_not_prefillable = global_prefillable.min().item() == 0
         global_all_prefillable = global_prefillable.min().item() > 0
+        global_all_not_prefillable = global_prefillable.max().item() == 0
         global_exists_prefillable = global_prefillable.max().item() > 0
         global_mixed_prefillable = (
             global_exists_not_prefillable and global_exists_prefillable
@@ -124,6 +125,12 @@ class PrefillDelayer:
                     if exist_previous_wait
                     else "no_wait_all_prefillable"
                 ),
+            )
+        if global_all_not_prefillable:
+            return None, _NegotiateOutput(
+                # It does not matter whether we allow or not, thus we allow for simplicity
+                allow_prefill=True,
+                outcome="no_prefillable",
             )
 
         if global_exists_token_watermark_force_allow:
