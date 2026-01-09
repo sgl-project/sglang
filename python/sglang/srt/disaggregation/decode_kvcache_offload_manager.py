@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import json
 from typing import TYPE_CHECKING
 
 import torch
@@ -67,6 +68,14 @@ class DecodeKVCacheOffloadManager:
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
+        extra_config = {}
+        if server_args.hicache_storage_backend_extra_config:
+            try:
+                extra_config = json.loads(server_args.hicache_storage_backend_extra_config)
+            except Exception as e:
+                logger.error(f"Invalid hicache storage backend extra config JSON: {e}")
+                raise e
+
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             mem_pool_host=self.decode_host_mem_pool,
@@ -76,7 +85,7 @@ class DecodeKVCacheOffloadManager:
             load_cache_event=threading.Event(),
             storage_backend=server_args.hicache_storage_backend,
             model_name=server_args.served_model_name,
-            storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
+            storage_backend_extra_config=extra_config,
         )
 
         self.ongoing_offload = {}
