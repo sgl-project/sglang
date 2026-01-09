@@ -231,7 +231,7 @@ def _record_single_pass_result(
                 f"num_token_watermark_force_allow={output.num_token_watermark_force_allow})"
             )
         else:
-            assert reason in {
+            assert output.reason in {
                 "",
                 "wait_success",
                 "no_wait",
