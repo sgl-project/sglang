@@ -118,25 +118,42 @@ class Hf3fsUsrBioClient(Hf3fsClient):
     @rsynchronized()
     def batch_read(self, offsets: List[int], tensors: List[torch.Tensor]) -> List[int]:
         self.check(offsets, tensors)
-
+        results = [False] * len(offsets)
         # prepare
         current = 0
-        for offset, tensor in zip(offsets, tensors):
-            size = tensor.numel() * tensor.itemsize
-            self.ior_r.prepare(
-                self.iov_r[current : current + size], True, self.file, offset
+        try:
+            for offset, tensor in zip(offsets, tensors):
+                size = tensor.numel() * tensor.itemsize
+                self.ior_r.prepare(
+                    self.iov_r[current : current + size], True, self.file, offset
+                )
+                current += size
+        except Exception as e:
+            logger.error(
+                f"[Hf3fsUsrBioClient] ior_r.prepare failed: {e}", exc_info=True
             )
-            current += size
+            return results
 
         # submit
         ionum = len(offsets)
-        resv = self.ior_r.submit().wait(
-            min_results=ionum, timeout=datetime.timedelta(seconds=self.client_timeout)
-        )
+        try:
+            resv = self.ior_r.submit().wait(
+                min_results=ionum,
+                timeout=datetime.timedelta(seconds=self.client_timeout),
+            )
+        except Exception as e:
+            logger.error(
+                f"[Hf3fsUsrBioClient] ior_r.submit().wait failed: {e}", exc_info=True
+            )
+            return results
 
         # results
-        hf3fs_utils.read_shm(self.shm_r_tensor, tensors)
-        results = [res.result for res in resv]
+        try:
+            hf3fs_utils.read_shm(self.shm_r_tensor, tensors)
+            results = [res.result for res in resv]
+        except Exception as e:
+            logger.error(f"[Hf3fsUsrBioClient] read_shm failed: {e}", exc_info=True)
+            return results
 
         return results
 
@@ -144,24 +161,58 @@ class Hf3fsUsrBioClient(Hf3fsClient):
     def batch_write(self, offsets: List[int], tensors: List[torch.Tensor]) -> List[int]:
         self.check(offsets, tensors)
 
+        results = [False] * len(offsets)
         # prepare
-        hf3fs_utils.write_shm(tensors, self.shm_w_tensor)
-        current = 0
-        for offset, tensor in zip(offsets, tensors):
-            size = tensor.numel() * tensor.itemsize
-            self.ior_w.prepare(
-                self.iov_w[current : current + size], False, self.file, offset
+        try:
+            logger.debug(
+                f"[Hf3fsUsrBioClient] Starting write_shm for {len(tensors)} tensors"
             )
-            current += size
+            hf3fs_utils.write_shm(tensors, self.shm_w_tensor)
+            logger.debug(f"[Hf3fsUsrBioClient] write_shm completed successfully")
+        except Exception as e:
+            logger.error(f"[Hf3fsUsrBioClient] write_shm failed: {e}", exc_info=True)
+            return results
+
+        current = 0
+        try:
+            for offset, tensor in zip(offsets, tensors):
+                size = tensor.numel() * tensor.itemsize
+                logger.debug(
+                    f"[Hf3fsUsrBioClient] ior_w.prepare: offset={offset}, size={size}"
+                )
+                self.ior_w.prepare(
+                    self.iov_w[current : current + size], False, self.file, offset
+                )
+                current += size
+            logger.debug(
+                f"[Hf3fsUsrBioClient] ior_w.prepare completed for all {len(offsets)} operations"
+            )
+        except Exception as e:
+            logger.error(
+                f"[Hf3fsUsrBioClient] ior_w.prepare failed: {e}", exc_info=True
+            )
+            return results
 
         # submit
         ionum = len(offsets)
-        resv = self.ior_w.submit().wait(
-            min_results=ionum, timeout=datetime.timedelta(seconds=self.client_timeout)
-        )
-
-        # results
-        results = [res.result for res in resv]
+        try:
+            logger.debug(
+                f"[Hf3fsUsrBioClient] Starting ior_w.submit().wait for {ionum} operations, timeout={self.client_timeout}s"
+            )
+            resv = self.ior_w.submit().wait(
+                min_results=ionum,
+                timeout=datetime.timedelta(seconds=self.client_timeout),
+            )
+            # results
+            results = [res.result for res in resv]
+            logger.debug(
+                f"[Hf3fsUsrBioClient] ior_w.submit().wait completed, received {len(resv)} results"
+            )
+        except Exception as e:
+            logger.error(
+                f"[Hf3fsUsrBioClient] ior_w.submit().wait failed: {e}", exc_info=True
+            )
+            return results
 
         return results
 
