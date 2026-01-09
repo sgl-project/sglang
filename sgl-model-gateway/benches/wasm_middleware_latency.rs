@@ -15,7 +15,6 @@ use smg::{
 use tokio::runtime::Runtime;
 use tower::{Layer, Service};
 
-/// Dummy router to satisfy AppState requirements for the benchmark
 #[derive(Debug)]
 struct MockRouter;
 
