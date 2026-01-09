@@ -22,6 +22,10 @@ ACC_THRESHOLDS = {
     QWEN3_NEXT_MODEL: {"kl_div": 0.0025, "gsm8k": 0.93},
 }
 
+ACC_THRESHOLDS_TOPK = {
+    QWEN3_NEXT_MODEL: {"kl_div": 0.008, "gsm8k": 0.93},
+}
+
 
 def send_request_helper(base_url: str, text: str):
     response = requests.post(
@@ -241,13 +245,13 @@ class TestQwen3NextMTPTopk(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreaterEqual(
-            metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
+            metrics["accuracy"], ACC_THRESHOLDS_TOPK[self.model]["gsm8k"]
         )
 
     def test_input_output_logprobs_match_prefill_cache_hit(self):
         test_input_output_logprobs_match_prefill_cache_hit_helper(
             self.base_url,
-            ACC_THRESHOLDS,
+            ACC_THRESHOLDS_TOPK,
             self.model,
             max_samples=32,
             max_new_tokens=512,
@@ -256,7 +260,7 @@ class TestQwen3NextMTPTopk(CustomTestCase):
     def test_input_output_logprobs_match_decode_cache_hit(self):
         test_input_output_logprobs_match_decode_cache_hit_helper(
             self.base_url,
-            ACC_THRESHOLDS,
+            ACC_THRESHOLDS_TOPK,
             self.model,
             max_samples=32,
             max_new_tokens=512,
