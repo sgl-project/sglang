@@ -32,6 +32,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, fp8_dtype
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+from sglang.srt.layers.quantization.quark.quark_moe import QuarkW4A4MXFp4MoEMethod
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu, get_int_env_var
 
 if TYPE_CHECKING:
@@ -612,33 +613,50 @@ class MoriEPMoE(FusedMoE):
         output_dtype = hidden_states.dtype
         scale = None
 
-        #enable_fp8 = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
-
-        #if enable_fp8:
-        #    # FP8 quant
-        #    if num_token > 0:
-        #        # NOTE: aiter is able to handle token=0 case in UT. But for some reason it failed at e2e case. Root cause TBD.
-        #        hidden_states, scale = self.quant_func(hidden_states, quant_dtype=fp8_dtype)
-        #    else:
-        #        hidden_states = torch.empty(hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device)
-        #        scale = torch.empty((0, self.hidden_size // 128), dtype=torch.float32, device=hidden_states.device)
-
         # dispatch
         dispatch_output = self.dispatcher.dispatch(hidden_states, topk_output)#, scale=scale)
 
         dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights, dispatch_recv_token_num = dispatch_output
         #assert dispatch_scale is not None
-        # fused moe
+
+        is_quark_w4a4 = isinstance(self.quant_method, QuarkW4A4MXFp4MoEMethod)
+
+        w13_weight = self.w13_weight
+        w2_weight = self.w2_weight
+
+        w13_scale = None
+        w2_scale = None
+
+        quant_type = QuantType.No
+
+        if is_quark_w4a4:
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                w13_weight = self.w13_weight.view(torch.float4_e2m1fn_x2)
+                w2_weight = self.w2_weight.view(torch.float4_e2m1fn_x2)
+
+            w13_scale = self.w13_weight_scale
+            w2_scale = self.w2_weight_scale
+            quant_type = QuantType.per_1x32
+        else:
+            if hasattr(self, "w13_weight_scale_inv"):
+                w13_scale = self.w13_weight_scale_inv
+            if hasattr(self, "w13_weight_scale_inv"):
+                w2_scale = self.w2_weight_scale_inv
+
+            if w13_scale or w2_scale:
+                quant_type = QuantType.per_128x128
+
+        # [KK TODO] shoulde to call the apply of quant method to handle fused moe
         hidden_states = fused_moe(
             hidden_states=dispatch_a1,
-            w1=self.w13_weight,
-            w2=self.w2_weight,
-            w1_scale=self.w13_weight_scale_inv,
-            w2_scale=self.w2_weight_scale_inv,
+            w1=w13_weight,
+            w2=w2_weight,
+            w1_scale=w13_scale,
+            w2_scale=w2_scale,
             a1_scale=dispatch_scale,
             topk_weight=dispatch_weights,
             topk_ids=dispatch_ids,
-            quant_type=QuantType.per_128x128,
+            quant_type=quant_type,
             activation=(
                 ActivationType.Silu
                 if self.moe_runner_config.activation == "silu"
