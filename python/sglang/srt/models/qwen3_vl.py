@@ -583,20 +583,14 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
-        if not isinstance(cu_seqlens, torch.Tensor):
-            cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
-        else:
-            cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
-        cu_seqlens = cu_seqlens.contiguous()
+        cu_seqlens = cu_seqlens.to("cpu")
 
         # blocks + merger + deepstack(optional) via NPU Graph Runner
         return self.npu_graph_runner.run(
             x=x,
-            position_embeddings=None,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             cu_seqlens=cu_seqlens,
-            cu_window_seqlens=None,
             output_indices=None,
         )
 
