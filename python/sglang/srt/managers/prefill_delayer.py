@@ -246,6 +246,8 @@ def _record_single_pass_result(
         metrics_collector.observe_prefill_delayer_wait(
             forward_passes=forward_passes,
             wait_seconds=wait_seconds,
-            decision=decision,
+            allow_prefill=output.allow_prefill,
+            prefillable_status=output.prefillable_status,
+            reason=output.reason,
             actual_prefill=actual_prefill,
         )
