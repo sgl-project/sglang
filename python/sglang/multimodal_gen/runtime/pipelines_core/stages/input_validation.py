@@ -186,8 +186,12 @@ class InputValidationStage(PipelineStage):
 
         self._generate_seeds(batch, server_args)
 
-        # Ensure prompt is properly formatted
-        if batch.prompt is None and batch.prompt_embeds is None:
+        # Ensure prompt is properly formatted (I2M can be image-only)
+        if (
+            server_args.pipeline_config.task_type != ModelTaskType.I2M
+            and batch.prompt is None
+            and batch.prompt_embeds is None
+        ):
             raise ValueError("Either `prompt` or `prompt_embeds` must be provided")
 
         # Ensure negative prompt is properly formatted if using classifier-free guidance
@@ -244,9 +248,10 @@ class InputValidationStage(PipelineStage):
                 )
                 batch.original_condition_image_size = image.size
 
-            self.preprocess_condition_image(
-                batch, server_args, condition_image_width, condition_image_height
-            )
+            if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+                self.preprocess_condition_image(
+                    batch, server_args, condition_image_width, condition_image_height
+                )
 
         # if height or width is not specified at this point, set default to 720p
         default_height = 720
@@ -268,12 +273,13 @@ class InputValidationStage(PipelineStage):
         result.add_check(
             "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
         )
-        result.add_check(
-            "prompt_or_embeds",
-            None,
-            lambda _: V.string_or_list_strings(batch.prompt)
-            or V.list_not_empty(batch.prompt_embeds),
-        )
+        if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+            result.add_check(
+                "prompt_or_embeds",
+                None,
+                lambda _: V.string_or_list_strings(batch.prompt)
+                or V.list_not_empty(batch.prompt_embeds),
+            )
 
         result.add_check(
             "num_inference_steps", batch.num_inference_steps, V.positive_int

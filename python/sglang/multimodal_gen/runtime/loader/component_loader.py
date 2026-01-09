@@ -1014,6 +1014,20 @@ class Hunyuan3DShapeLoader(ComponentLoader):
             with open(config_path, "r") as f:
                 model_config = yaml.safe_load(f)
 
+            image_processor_config = model_config.get("image_processor")
+            if isinstance(image_processor_config, dict):
+                target = image_processor_config.get("target")
+                if target == "hy3dshape.preprocessors.ImageProcessorV2":
+                    image_processor_config["target"] = (
+                        "sglang.multimodal_gen.runtime.models.model_stages"
+                        ".hunyuan_image_processor.ImageProcessorV2"
+                    )
+                elif target == "hy3dshape.preprocessors.MVImageProcessorV2":
+                    image_processor_config["target"] = (
+                        "sglang.multimodal_gen.runtime.models.model_stages"
+                        ".hunyuan_image_processor.MVImageProcessorV2"
+                    )
+
             if config.shape_use_safetensors:
                 import safetensors.torch
 
