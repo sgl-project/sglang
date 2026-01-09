@@ -35,6 +35,11 @@ class PrefillDelayer:
         self._token_usage_low_watermark = (
             envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
         )
+        logger.info(
+            f"PrefillDelayer initialized with "
+            f"max_delay_passes={self._max_delay_passes} "
+            f"token_usage_low_watermark={self._token_usage_low_watermark}"
+        )
 
         self._global_info_buffer = torch.empty(
             (dp_size, attn_tp_size, 2),
