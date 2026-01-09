@@ -147,9 +147,10 @@ class PrefillDelayer:
 
             prev_delayed_count = prev_state.delayed_count if prev_state else 0
             if prev_delayed_count < self._max_delay_passes - 1:
+                next_state = prev_state or _State()
                 next_state = dataclasses.replace(
-                    prev_state,
-                    delayed_count=prev_state.delayed_count + 1,
+                    next_state,
+                    delayed_count=next_state.delayed_count + 1,
                 )
                 return _NegotiateOutput(
                     next_state=next_state,
