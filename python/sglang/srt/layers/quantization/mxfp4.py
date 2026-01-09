@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_sm90_supported,
     is_sm100_supported,
     is_triton_kernels_available,
     log_info_on_rank0,
@@ -53,6 +54,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
+_is_sm90_supported = is_cuda() and is_sm90_supported()
 has_triton_kernels = is_triton_kernels_available()
 
 
@@ -106,6 +108,11 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         constraints = {
             "is_persistent": True,
             "epilogue_subtile": 1,
+        }
+        opt_flags.update_opt_flags_constraints(constraints)
+    elif _is_sm90_supported:
+        constraints = {
+            "split_k": 1,
         }
         opt_flags.update_opt_flags_constraints(constraints)
     # transpose the tensor so that the quantization axis is on dim1
