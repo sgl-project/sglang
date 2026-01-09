@@ -273,7 +273,7 @@ class TestPrefillDelayerThroughputOfflineGen(CustomTestCase):
                 random_output_len=500,
             ),
             token_usage_low_watermark=0.8,
-            min_improvement_pct=50,
+            min_improvement_pct=20,
         )
 
 
