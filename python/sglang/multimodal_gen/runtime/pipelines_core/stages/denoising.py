@@ -618,6 +618,8 @@ class DenoisingStage(PipelineStage):
             ),
         )
 
+        print(f"621 {pos_cond_kwargs=}", flush=True)
+
         if batch.do_classifier_free_guidance:
             neg_cond_kwargs = self.prepare_extra_func_kwargs(
                 getattr(self.transformer, "forward", self.transformer),
@@ -1211,6 +1213,7 @@ class DenoisingStage(PipelineStage):
         guidance: torch.Tensor,
         **kwargs,
     ):
+        print(f"1216 {kwargs=}", flush=True)
         return current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
@@ -1343,12 +1346,12 @@ class DenoisingStage(PipelineStage):
                 noise_pred_cond - noise_pred_uncond
             )
 
-            if batch.guidance_rescale > 0.0:
-                noise_pred = self.rescale_noise_cfg(
-                    noise_pred,
-                    noise_pred_cond,
-                    guidance_rescale=batch.guidance_rescale,
-                )
+            # if batch.guidance_rescale > 0.0:
+            #     noise_pred = self.rescale_noise_cfg(
+            #         noise_pred,
+            #         noise_pred_cond,
+            #         guidance_rescale=batch.guidance_rescale,
+            #     )
             return noise_pred
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):

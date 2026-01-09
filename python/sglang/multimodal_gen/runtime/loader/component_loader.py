@@ -269,6 +269,7 @@ class ComponentLoader(ABC):
             "image_processor": (ImageProcessorLoader, "transformers"),
             "image_encoder": (ImageEncoderLoader, "transformers"),
             "processor": (AutoProcessorLoader, "transformers"),
+            "vision_language_encoder": (VisionLanguageEncoderLoader, "transformers"),
         }
 
         if module_type in module_loaders:
@@ -780,6 +781,38 @@ class GenericComponentLoader(ComponentLoader):
     def __init__(self, library="transformers") -> None:
         super().__init__()
         self.library = library
+
+
+class VisionLanguageEncoderLoader(ComponentLoader):
+    """Loader for vision language encoder (typically Causal LM or Vision2Seq)."""
+
+    def load_native(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        transformers_or_diffusers: str,
+    ) -> Any:
+        import traceback
+
+        traceback.print_stack()
+        if transformers_or_diffusers == "transformers":
+            from transformers import AutoModelForImageTextToText
+
+            config = get_hf_config(
+                component_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+            return AutoModelForImageTextToText.from_pretrained(
+                component_model_path,
+                config=config,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            ).to("cpu")
+        else:
+            raise ValueError(
+                f"Unsupported library for VisionLanguageEncoder: {transformers_or_diffusers}"
+            )
 
 
 class PipelineComponentLoader:

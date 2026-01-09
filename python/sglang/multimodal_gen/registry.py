@@ -39,6 +39,9 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
+    GlmImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlus_2511_PipelineConfig,
@@ -55,6 +58,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
 )
 from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
+from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
 from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
@@ -332,7 +336,6 @@ def get_model_info(
         if backend == Backend.AUTO:
             logger.info("Falling back to diffusers backend")
             return _get_diffusers_model_info(model_path)
-        return None
 
     pipeline_cls = _PIPELINE_REGISTRY.get(pipeline_class_name)
     if not pipeline_cls:
@@ -540,6 +543,12 @@ def _register_configs():
         sampling_param_cls=QwenImageLayeredSamplingParams,
         pipeline_config_cls=QwenImageLayeredPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Layered"],
+    )
+
+    register_configs(
+        sampling_param_cls=GlmImageSamplingParams,
+        pipeline_config_cls=GlmImagePipelineConfig,
+        model_detectors=[lambda hf_id: "glm-image" in hf_id.lower()],
     )
 
 
