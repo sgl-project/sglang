@@ -66,6 +66,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
+from sglang.srt.multimodal.mm_utils import SharedMMInputBuffer
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
@@ -95,10 +96,13 @@ def init_tokenizer_manager(
     server_args: ServerArgs,
     port_args: PortArgs,
     TokenizerManagerClass: Optional[TokenizerManager] = None,
+    shared_mm_input_buffer: SharedMMInputBuffer = None,
 ) -> Tuple[TokenizerManager, TemplateManager]:
     # Launch tokenizer process
     TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
-    tokenizer_manager = TokenizerManagerClass(server_args, port_args)
+    tokenizer_manager = TokenizerManagerClass(
+        server_args, port_args, shared_mm_input_buffer=shared_mm_input_buffer
+    )
 
     # Initialize templates
     template_manager = TemplateManager()
@@ -848,6 +852,7 @@ def _launch_scheduler_processes(
     server_args: ServerArgs,
     port_args: PortArgs,
     run_scheduler_process_func: Callable,
+    shared_mm_input_buffer=None,
 ):
     scheduler_procs = []
 
@@ -894,6 +899,7 @@ def _launch_scheduler_processes(
                             pp_rank,
                             None,
                             writer,
+                            shared_mm_input_buffer,
                         ),
                     )
                     with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
@@ -928,6 +934,7 @@ def _launch_subprocesses(
     run_scheduler_process_func: Callable,
     run_detokenizer_process_func: Callable,
     port_args: Optional[PortArgs] = None,
+    shared_mm_input_buffer=None,
 ) -> Tuple[TokenizerManager, TemplateManager, Tuple[Dict], PortArgs]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
@@ -947,6 +954,7 @@ def _launch_subprocesses(
         server_args=server_args,
         port_args=port_args,
         run_scheduler_process_func=run_scheduler_process_func,
+        shared_mm_input_buffer=shared_mm_input_buffer,
     )
 
     if server_args.node_rank >= 1:
@@ -985,7 +993,9 @@ def _launch_subprocesses(
     # Init tokenizer manager first, as the bootstrap server is initialized here
     if server_args.tokenizer_worker_num == 1:
         tokenizer_manager, template_manager = init_tokenizer_manager_func(
-            server_args, port_args
+            server_args,
+            port_args,
+            shared_mm_input_buffer=shared_mm_input_buffer,
         )
     else:
         # Launch multi-tokenizer router

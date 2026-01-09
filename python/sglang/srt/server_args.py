@@ -619,6 +619,7 @@ class ServerArgs:
     language_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
+    mm_shm_buffer_size_gb: int = 0
 
     # For model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
@@ -4443,6 +4444,13 @@ class ServerArgs:
             type=str,
             default=[],
             help="List of encoder server urls.",
+        )
+
+        parser.add_argument(
+            "--mm-shm-buffer-size-gb",
+            type=int,
+            default=0,
+            help="The size of the shared memory buffer for multi-modal inputs (in GB).",
         )
 
         # Custom weight loader

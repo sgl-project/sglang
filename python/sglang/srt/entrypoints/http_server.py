@@ -1693,12 +1693,19 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     # Launch subprocesses
+    if server_args.mm_shm_buffer_size_gb > 0:
+        from sglang.srt.multimodal.mm_utils import SharedMMInputBuffer
+
+        shared_mm_input_buffer = SharedMMInputBuffer(server_args.mm_shm_buffer_size_gb)
+    else:
+        shared_mm_input_buffer = None
     tokenizer_manager, template_manager, scheduler_infos, port_args = (
         _launch_subprocesses(
             server_args=server_args,
             init_tokenizer_manager_func=init_tokenizer_manager_func,
             run_scheduler_process_func=run_scheduler_process_func,
             run_detokenizer_process_func=run_detokenizer_process_func,
+            shared_mm_input_buffer=shared_mm_input_buffer,
         )
     )
 

@@ -80,6 +80,7 @@ from sglang.srt.managers.tokenizer_manager_multiitem_mixin import (
     TokenizerManagerMultiItemMixin,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
+from sglang.srt.multimodal.mm_utils import SharedMMInputBuffer
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
@@ -180,8 +181,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        shared_mm_input_buffer: SharedMMInputBuffer = None,
     ):
         # Parse args
+        self.shared_mm_input_buffer = shared_mm_input_buffer
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
         self.preferred_sampling_params = server_args.preferred_sampling_params
@@ -1034,6 +1037,44 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
         )
 
+    def extract_feature_tensors(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ):
+        tokenized_obj.mm_resource_handles = []
+
+        if not isinstance(tokenized_obj, TokenizedGenerateReqInput):
+            return False, []
+
+        mm_inputs = getattr(tokenized_obj, "mm_inputs", {})
+        if not mm_inputs:
+            return False, []
+
+        mm_items = mm_inputs.get("mm_items", [])
+        has_stored_in_shm = False
+
+        for idx, item in enumerate(mm_items):
+            if hasattr(item, "feature") and item.feature is not None:
+                # Attempt to save to Shared Memory
+                # manager.save_tensor will increment ref_count if successful
+                handle = self.shared_mm_input_buffer.save_tensor(item.feature)
+
+                if handle:
+                    # Store the index so we know which image this belongs to later
+                    handle["idx"] = idx
+                    tokenized_obj.mm_resource_handles.append(handle)
+
+                    # Clear the feature from the object.
+                    # This ensures ZMQ does NOT serialize the large tensor.
+                    item.feature = None
+                    has_stored_in_shm = True
+                else:
+                    # Fallback: handle is None (Buffer full & ref_count > 0).
+                    # item.feature remains intact and will be sent via ZMQ.
+                    logger.info(f"SHM full, falling back to ZMQ for item {idx}")
+
+        return has_stored_in_shm, tokenized_obj.mm_resource_handles
+
     def _send_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1042,6 +1083,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
+        if self.server_args.mm_shm_buffer_size_gb > 0:
+            self.extract_feature_tensors(tokenized_obj)
+
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         state.request_sent_to_scheduler_ts = time.time()
