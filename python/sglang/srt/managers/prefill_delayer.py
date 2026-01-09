@@ -115,14 +115,13 @@ class PrefillDelayer:
                     f"num_force_allow={debug_num_force_allow})"
                 )
 
-        TODO_should_this_info_is_not_none
-        if self._curr_delay_info is not None and self._metrics_collector is not None:
+        if (collector := self._metrics_collector) is not None:
             if (x := self._curr_delay_info) is not None:
                 wait_seconds = time.perf_counter() - x.start_time
                 forward_passes = x.delayed_count
             else:
                 wait_seconds = forward_passes = 0
-            self._metrics_collector.observe_prefill_delayer_wait(
+            collector.observe_prefill_delayer_wait(
                 forward_passes=forward_passes,
                 wait_seconds=wait_seconds,
                 outcome=outcome,
