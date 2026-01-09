@@ -3,13 +3,19 @@ import os
 import re
 import time
 import unittest
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import List, Optional
 from types import SimpleNamespace
 
 import openai
 import requests
+import torch
+import torch.multiprocessing as mp
 
 from sglang.bench_serving import run_benchmark
 from sglang.srt.environ import envs
+from sglang.srt.managers.prefill_delayer import PrefillDelayer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -24,7 +30,198 @@ from sglang.test.test_utils import (
 # ============================ Unit Tests ============================
 
 
-TODO
+@dataclass
+class NegotiateCall:
+    prefillable: List[bool]
+    token_usage: List[float]
+
+
+@dataclass
+class NegotiateTestCase:
+    name: str
+    max_delay_passes: int
+    token_usage_low_watermark: Optional[float]
+    calls: List[NegotiateCall]
+    expected_allow: bool
+    expected_reason: str
+
+
+def _create_mock_server_args():
+    return SimpleNamespace(
+        enable_dp_attention=True,
+        disaggregation_mode="null",
+        disable_overlap_schedule=False,
+    )
+
+
+def _run_negotiate_test(rank, world_size, test_cases, results_queue, port):
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        world_size=world_size,
+        rank=rank,
+    )
+    cpu_group = torch.distributed.new_group(backend="gloo")
+
+    for case in test_cases:
+        delayer = PrefillDelayer(
+            dp_size=world_size,
+            attn_tp_size=1,
+            cpu_group=cpu_group,
+            server_args=_create_mock_server_args(),
+            max_delay_passes=case.max_delay_passes,
+            token_usage_low_watermark=case.token_usage_low_watermark,
+        )
+
+        for call in case.calls:
+            result = delayer._negotiate_should_allow_prefill(
+                local_prefillable=call.prefillable[rank],
+                token_usage=call.token_usage[rank],
+            )
+
+        results_queue.put((rank, case.name, result.output_allow, result.output_reason))
+
+    torch.distributed.destroy_process_group()
+
+
+class TestPrefillDelayerNegotiate(unittest.TestCase):
+    def test_negotiate(self):
+        world_size = 4
+
+        test_cases = [
+            NegotiateTestCase(
+                name="all_prefillable",
+                max_delay_passes=100,
+                token_usage_low_watermark=0.8,
+                calls=[NegotiateCall(
+                    prefillable=[True, True, True, True],
+                    token_usage=[0.9, 0.9, 0.9, 0.9],
+                )],
+                expected_allow=True,
+                expected_reason="no_wait",
+            ),
+            NegotiateTestCase(
+                name="all_prefillable_with_previous_wait",
+                max_delay_passes=100,
+                token_usage_low_watermark=0.8,
+                calls=[
+                    NegotiateCall(
+                        prefillable=[True, False, True, False],
+                        token_usage=[0.9, 0.9, 0.9, 0.9],
+                    ),
+                    NegotiateCall(
+                        prefillable=[True, True, True, True],
+                        token_usage=[0.9, 0.9, 0.9, 0.9],
+                    ),
+                ],
+                expected_allow=True,
+                expected_reason="wait_success",
+            ),
+            NegotiateTestCase(
+                name="none_prefillable",
+                max_delay_passes=100,
+                token_usage_low_watermark=0.8,
+                calls=[NegotiateCall(
+                    prefillable=[False, False, False, False],
+                    token_usage=[0.9, 0.9, 0.9, 0.9],
+                )],
+                expected_allow=True,
+                expected_reason="",
+            ),
+            NegotiateTestCase(
+                name="mixed_delay",
+                max_delay_passes=100,
+                token_usage_low_watermark=0.8,
+                calls=[NegotiateCall(
+                    prefillable=[True, False, True, False],
+                    token_usage=[0.9, 0.9, 0.9, 0.9],
+                )],
+                expected_allow=False,
+                expected_reason="delay",
+            ),
+            NegotiateTestCase(
+                name="mixed_watermark_force_allow",
+                max_delay_passes=100,
+                token_usage_low_watermark=0.8,
+                calls=[NegotiateCall(
+                    prefillable=[True, False, True, False],
+                    token_usage=[0.5, 0.9, 0.9, 0.9],
+                )],
+                expected_allow=True,
+                expected_reason="token_watermark",
+            ),
+            NegotiateTestCase(
+                name="mixed_watermark_disabled",
+                max_delay_passes=100,
+                token_usage_low_watermark=None,
+                calls=[NegotiateCall(
+                    prefillable=[True, False, True, False],
+                    token_usage=[0.5, 0.9, 0.9, 0.9],
+                )],
+                expected_allow=False,
+                expected_reason="delay",
+            ),
+            NegotiateTestCase(
+                name="mixed_watermark_not_prefillable",
+                max_delay_passes=100,
+                token_usage_low_watermark=0.8,
+                calls=[NegotiateCall(
+                    prefillable=[False, False, True, False],
+                    token_usage=[0.5, 0.9, 0.9, 0.9],
+                )],
+                expected_allow=False,
+                expected_reason="delay",
+            ),
+            NegotiateTestCase(
+                name="mixed_timeout",
+                max_delay_passes=3,
+                token_usage_low_watermark=0.8,
+                calls=[
+                    NegotiateCall(
+                        prefillable=[True, False, True, False],
+                        token_usage=[0.9, 0.9, 0.9, 0.9],
+                    ),
+                    NegotiateCall(
+                        prefillable=[True, False, True, False],
+                        token_usage=[0.9, 0.9, 0.9, 0.9],
+                    ),
+                    NegotiateCall(
+                        prefillable=[True, False, True, False],
+                        token_usage=[0.9, 0.9, 0.9, 0.9],
+                    ),
+                ],
+                expected_allow=True,
+                expected_reason="wait_timeout",
+            ),
+        ]
+
+        results_queue = mp.Queue()
+        port = 29500 + os.getpid() % 1000
+        mp.spawn(
+            _run_negotiate_test,
+            args=(world_size, test_cases, results_queue, port),
+            nprocs=world_size,
+            join=True,
+        )
+
+        results = defaultdict(dict)
+        for _ in range(world_size * len(test_cases)):
+            rank, case_name, output_allow, output_reason = results_queue.get()
+            results[case_name][rank] = (output_allow, output_reason)
+
+        for case in test_cases:
+            for rank in range(world_size):
+                output_allow, output_reason = results[case.name][rank]
+                self.assertEqual(
+                    output_allow,
+                    case.expected_allow,
+                    f"Case {case.name} rank {rank}: expected allow={case.expected_allow}, got {output_allow}",
+                )
+                self.assertEqual(
+                    output_reason,
+                    case.expected_reason,
+                    f"Case {case.name} rank {rank}: expected reason={case.expected_reason}, got {output_reason}",
+                )
 
 
 # ============================ E2E Tests ============================
