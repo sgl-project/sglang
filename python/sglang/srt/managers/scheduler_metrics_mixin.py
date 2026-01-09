@@ -98,6 +98,8 @@ class SchedulerMetricsMixin:
                 labels=labels,
                 enable_lora=self.enable_lora,
                 prefill_delayer_max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
+                prefill_delayer_forward_passes_buckets=self.server_args.prefill_delayer_forward_passes_buckets,
+                prefill_delayer_wait_seconds_buckets=self.server_args.prefill_delayer_wait_seconds_buckets,
             )
 
             if ENABLE_METRICS_DEVICE_TIMER:
