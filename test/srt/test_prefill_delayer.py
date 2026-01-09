@@ -194,18 +194,12 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
 
             for dp_rank, elapsed in results:
                 print(f"DP rank {dp_rank} completed in {elapsed:.2f}s")
-                if token_usage_low_watermark is not None:
-                    self.assertLess(
-                        elapsed,
-                        30,
-                        f"Request to DP rank {dp_rank} took too long ({elapsed:.2f}s), low watermark force prefill may not be working",
-                    )
-                else:
-                    self.assertGreater(
-                        elapsed,
-                        30,
-                        f"Request to DP rank {dp_rank} completed too fast ({elapsed:.2f}s), should be blocked without low watermark",
-                    )
+                enabled = token_usage_low_watermark is not None
+                thresh = 30
+                self.assertTrue(
+                    (elapsed < thresh) if enabled else (elapsed > thresh),
+                    f"DP rank {dp_rank}: elapsed={elapsed:.2f}s, thresh={thresh}",
+                )
 
         try:
             asyncio.run(run_test())
