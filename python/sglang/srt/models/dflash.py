@@ -12,6 +12,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -26,24 +28,51 @@ class DFlashAttention(nn.Module):
     def __init__(self, config, layer_id: int) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
-        num_heads = int(config.num_attention_heads)
-        num_kv_heads = int(getattr(config, "num_key_value_heads", num_heads))
-        head_dim = int(getattr(config, "head_dim", hidden_size // num_heads))
+        tp_size = int(get_tensor_model_parallel_world_size())
+        total_num_heads = int(config.num_attention_heads)
+        total_num_kv_heads = int(getattr(config, "num_key_value_heads", total_num_heads))
+        head_dim = int(getattr(config, "head_dim", hidden_size // total_num_heads))
 
         self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
+        self.total_num_heads = total_num_heads
+        self.total_num_kv_heads = total_num_kv_heads
+        assert self.total_num_heads % tp_size == 0, (
+            f"DFlashAttention requires total_num_heads divisible by tp_size. "
+            f"total_num_heads={self.total_num_heads}, tp_size={tp_size}."
+        )
+        self.num_heads = self.total_num_heads // tp_size
+        if self.total_num_kv_heads >= tp_size:
+            assert self.total_num_kv_heads % tp_size == 0, (
+                f"DFlashAttention requires total_num_kv_heads divisible by tp_size when >= tp_size. "
+                f"total_num_kv_heads={self.total_num_kv_heads}, tp_size={tp_size}."
+            )
+        else:
+            assert tp_size % self.total_num_kv_heads == 0, (
+                f"DFlashAttention requires tp_size divisible by total_num_kv_heads when total_num_kv_heads < tp_size. "
+                f"total_num_kv_heads={self.total_num_kv_heads}, tp_size={tp_size}."
+            )
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = head_dim
-        self.q_size = num_heads * head_dim
-        self.kv_size = num_kv_heads * head_dim
+        self.q_size = self.num_heads * head_dim
+        self.kv_size = self.num_kv_heads * head_dim
 
         attention_bias = bool(getattr(config, "attention_bias", False))
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
-        self.q_proj = nn.Linear(hidden_size, self.q_size, bias=attention_bias)
-        self.k_proj = nn.Linear(hidden_size, self.kv_size, bias=attention_bias)
-        self.v_proj = nn.Linear(hidden_size, self.kv_size, bias=attention_bias)
-        self.o_proj = nn.Linear(self.q_size, hidden_size, bias=attention_bias)
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=hidden_size,
+            head_size=head_dim,
+            total_num_heads=self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
+            bias=attention_bias,
+            prefix="qkv_proj",
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * head_dim,
+            hidden_size,
+            bias=attention_bias,
+            prefix="o_proj",
+        )
 
         # Per-head Q/K RMSNorm, matching HF Qwen3.
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
@@ -63,10 +92,10 @@ class DFlashAttention(nn.Module):
         self.scaling = head_dim**-0.5
         # DFlash uses non-causal attention over the draft block.
         self.attn = RadixAttention(
-            num_heads=num_heads,
+            num_heads=self.num_heads,
             head_dim=head_dim,
             scaling=self.scaling,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             attn_type=AttentionType.ENCODER_ONLY,
         )
@@ -77,9 +106,8 @@ class DFlashAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q, k = apply_qk_norm(
             q=q,
@@ -91,7 +119,8 @@ class DFlashAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
-        return self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output)
+        return output
 
 
 class DFlashMLP(nn.Module):
@@ -200,11 +229,33 @@ class DFlashDraftModel(nn.Module):
         return self.norm(hidden_states)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, weight_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+        ]
+
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if name.endswith(".bias") and name not in params_dict:
                 # Some quantized checkpoints may have extra biases.
-                continue
+                # (May still be mappable to a fused/parallel param.)
+                pass
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if f".{weight_name}." not in name:
+                    continue
+                mapped_name = name.replace(weight_name, param_name)
+                param = params_dict.get(mapped_name)
+                if param is None:
+                    continue
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
             param = params_dict.get(name)
             if param is None:
                 # Ignore unexpected weights (e.g., HF rotary caches).
@@ -214,4 +265,3 @@ class DFlashDraftModel(nn.Module):
 
 
 EntryClass = DFlashDraftModel
-

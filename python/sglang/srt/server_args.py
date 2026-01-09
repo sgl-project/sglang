@@ -2043,9 +2043,9 @@ class ServerArgs:
                     "Currently DFLASH speculative decoding does not support dp attention."
                 )
 
-            if self.tp_size != 1 or self.pp_size != 1:
+            if self.pp_size != 1:
                 raise ValueError(
-                    "Currently DFLASH speculative decoding only supports tp_size == 1 and pp_size == 1."
+                    "Currently DFLASH speculative decoding only supports pp_size == 1."
                 )
 
             if self.speculative_draft_model_path is None:

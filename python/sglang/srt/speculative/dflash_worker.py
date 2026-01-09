@@ -5,9 +5,11 @@ from typing import List, Optional, Union
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -23,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class DFlashWorker:
-    """DFlash speculative decoding worker (spec-v1, tp=1/pp=1)."""
+    """DFlash speculative decoding worker (spec-v1, tp>=1/pp=1)."""
 
     def __init__(
         self,
@@ -182,7 +184,14 @@ class DFlashWorker:
         # --- 1) Append any newly committed tokens into the native draft KV cache.
         self._append_target_hidden_to_native_draft_kv(batch, draft_input)
 
-        embed_weight, head_weight = self.target_worker.model_runner.model.get_embed_and_head()
+        target_model = self.target_worker.model_runner.model
+        embed_module = target_model.get_input_embeddings()
+        lm_head = getattr(target_model, "lm_head", None)
+        if lm_head is None or not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
+            raise RuntimeError(
+                "DFLASH requires the target model to expose a vocab-parallel `lm_head` with `weight` and "
+                "`shard_indices` attributes."
+            )
 
         # --- 2) Draft a non-causal block with the native draft model.
         block_ids = torch.full(
@@ -193,7 +202,7 @@ class DFlashWorker:
         )
         block_ids[:, 0] = draft_input.verified_id.to(torch.long)
 
-        noise_embedding = F.embedding(block_ids, embed_weight)
+        noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         prefix_lens_cpu = [int(x) for x in draft_input.draft_seq_lens_cpu]
@@ -267,8 +276,10 @@ class DFlashWorker:
             allocator.restore_state(token_to_kv_pool_state_backup)
 
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_logits = F.linear(draft_hidden[:, 1:, :], head_weight)
-        draft_next = torch.argmax(draft_logits, dim=-1).to(torch.long)
+        draft_next = self._greedy_sample_from_vocab_parallel_head(
+            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+            lm_head=lm_head,
+        ).view(bs, self.block_size - 1)
         draft_tokens = torch.cat([block_ids[:, :1], draft_next], dim=1)  # [bs, block_size]
         positions = (
             batch.seq_lens.to(torch.long).unsqueeze(1)
@@ -285,6 +296,116 @@ class DFlashWorker:
         batch.forward_mode = ForwardMode.TARGET_VERIFY if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+
+    def _greedy_sample_from_vocab_parallel_head(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        lm_head,
+        chunk_size: int = 256,
+    ) -> torch.Tensor:
+        """Greedy argmax over the target LM head in a TP-safe way.
+
+        We cannot materialize full logits for large vocabularies efficiently, and with
+        TP>1 each rank only owns a shard of the LM head weight. This computes the
+        per-rank max, gathers candidates across TP ranks, and selects the global max.
+        """
+
+        if hidden_states.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
+
+        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
+            raise RuntimeError(
+                "DFLASH greedy sampling requires a vocab-parallel head with `weight` and `shard_indices`."
+            )
+
+        shard = lm_head.shard_indices
+        weight = lm_head.weight  # [local_vocab_padded, hidden]
+        weight_dtype = weight.dtype
+
+        # Valid ranges in the local shard (excluding padding):
+        #   base vocab:  [0, num_org)
+        #   added vocab: [num_org_padded, num_org_padded + num_added)
+        num_org = int(shard.num_org_elements)
+        num_org_padded = int(shard.num_org_elements_padded)
+        num_added = int(shard.num_added_elements)
+        org_vocab_start = int(shard.org_vocab_start_index)
+        added_vocab_start = int(shard.added_vocab_start_index)
+
+        num_tokens = int(hidden_states.shape[0])
+        out_token_ids = torch.empty(
+            (num_tokens,), dtype=torch.long, device=hidden_states.device
+        )
+
+        for start in range(0, num_tokens, int(chunk_size)):
+            end = min(num_tokens, start + int(chunk_size))
+            hs = hidden_states[start:end].to(weight_dtype)
+            chunk_len = int(hs.shape[0])
+
+            # Base vocab logits.
+            if num_org > 0:
+                base_logits = torch.matmul(hs, weight[:num_org].T)
+                local_max, local_arg = torch.max(base_logits, dim=-1)
+            else:
+                local_max = torch.full(
+                    (chunk_len,),
+                    torch.finfo(weight_dtype).min,
+                    dtype=weight_dtype,
+                    device=hs.device,
+                )
+                local_arg = torch.zeros(
+                    (chunk_len,), dtype=torch.int64, device=hs.device
+                )
+
+            # Added vocab logits (e.g., LoRA-added embeddings), if present.
+            if num_added > 0:
+                added_slice_start = num_org_padded
+                added_slice_end = num_org_padded + num_added
+                added_logits = torch.matmul(hs, weight[added_slice_start:added_slice_end].T)
+                added_max, added_arg = torch.max(added_logits, dim=-1)
+                use_added = added_max > local_max
+                local_max = torch.where(use_added, added_max, local_max)
+                local_arg = torch.where(
+                    use_added, added_arg.to(local_arg.dtype) + num_org_padded, local_arg
+                )
+
+            # Convert local argmax indices to global token ids.
+            global_ids = torch.empty(
+                (chunk_len,), dtype=torch.int64, device=hs.device
+            )
+            is_base = local_arg < num_org
+            global_ids[is_base] = org_vocab_start + local_arg[is_base]
+            if num_added > 0:
+                global_ids[~is_base] = added_vocab_start + (local_arg[~is_base] - num_org_padded)
+
+            if tp_size == 1:
+                out_token_ids[start:end] = global_ids.to(torch.long)
+                continue
+
+            # Gather per-rank maxima and associated global ids, then select the global max.
+            gathered_max = torch.empty(
+                (tp_size * chunk_len,),
+                dtype=local_max.dtype,
+                device=hs.device,
+            )
+            gathered_ids = torch.empty(
+                (tp_size * chunk_len,),
+                dtype=global_ids.dtype,
+                device=hs.device,
+            )
+            tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
+            tp_group.all_gather_into_tensor(gathered_ids, global_ids.contiguous())
+            gathered_max = gathered_max.view(tp_size, chunk_len)
+            gathered_ids = gathered_ids.view(tp_size, chunk_len)
+
+            best_rank = torch.argmax(gathered_max, dim=0)
+            idx = torch.arange(chunk_len, device=hs.device)
+            out_token_ids[start:end] = gathered_ids[best_rank, idx].to(torch.long)
+
+        return out_token_ids
 
     def _append_target_hidden_to_native_draft_kv(
         self,
@@ -371,11 +492,17 @@ class DFlashWorker:
 
             for layer in self.native_draft_model.layers:
                 attn = layer.self_attn
-                k = attn.k_proj(ctx_hidden)
-                v = attn.v_proj(ctx_hidden)
-                k = attn.k_norm(k.view(-1, attn.head_dim)).view_as(k)
-                dummy_q = k.new_empty((k.shape[0], attn.head_dim))
-                _, k = attn.rotary_emb(ctx_positions, dummy_q, k)
+                qkv, _ = attn.qkv_proj(ctx_hidden)
+                q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=attn.q_norm,
+                    k_norm=attn.k_norm,
+                    head_dim=attn.head_dim,
+                )
+                q, k = attn.rotary_emb(ctx_positions, q, k)
                 k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                 v = v.view(-1, attn.num_kv_heads, attn.head_dim)
                 self.native_draft_model_runner.token_to_kv_pool.set_kv_buffer(

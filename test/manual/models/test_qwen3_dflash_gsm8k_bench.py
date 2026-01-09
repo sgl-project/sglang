@@ -138,9 +138,18 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
         parallel = int(os.getenv("SGLANG_DFLASH_PARALLEL", "1"))
         num_questions = int(os.getenv("SGLANG_DFLASH_NUM_QUESTIONS", "100"))
         num_shots = int(os.getenv("SGLANG_DFLASH_NUM_SHOTS", "1"))
+        tp_size = int(os.getenv("SGLANG_DFLASH_TP_SIZE", "1"))
         disable_radix_cache = os.getenv("SGLANG_DFLASH_DISABLE_RADIX_CACHE", "1") != "0"
         prompt_style = os.getenv("SGLANG_DFLASH_PROMPT_STYLE", "fewshot_qa")
         assert_match = os.getenv("SGLANG_DFLASH_ASSERT_MATCH", "0") != "0"
+        if tp_size < 1:
+            raise ValueError(f"Invalid SGLANG_DFLASH_TP_SIZE={tp_size}; expected >= 1.")
+        if torch.cuda.device_count() < tp_size:
+            self.skipTest(
+                f"tp_size={tp_size} requires at least {tp_size} visible CUDA devices, "
+                f"but only {torch.cuda.device_count()} are available. "
+                "Set CUDA_VISIBLE_DEVICES accordingly."
+            )
 
         # Read GSM8K data (download if absent).
         data_path = os.getenv("SGLANG_DFLASH_GSM8K_PATH", "test.jsonl")
@@ -178,7 +187,7 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
             labels.append(_get_answer_value(lines[i]["answer"]))
         self.assertTrue(all(l != INVALID for l in labels), "Invalid labels in GSM8K data")
 
-        common_server_args = ["--attention-backend", attention_backend]
+        common_server_args = ["--attention-backend", attention_backend, "--tp-size", str(tp_size)]
         if disable_radix_cache:
             common_server_args.append("--disable-radix-cache")
         extra_server_args = os.getenv("SGLANG_DFLASH_EXTRA_SERVER_ARGS", "").strip()
@@ -303,6 +312,7 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
                 "parallel": parallel,
                 "num_questions": num_questions,
                 "num_shots": num_shots,
+                "tp_size": tp_size,
                 "prompt_style": prompt_style,
                 "disable_radix_cache": disable_radix_cache,
             },
@@ -344,8 +354,17 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
         num_questions = int(os.getenv("SGLANG_DFLASH_PARITY_NUM_QUESTIONS", "10"))
         max_total_tokens = int(os.getenv("SGLANG_DFLASH_PARITY_MAX_TOTAL_TOKENS", "8192"))
         num_shots = int(os.getenv("SGLANG_DFLASH_NUM_SHOTS", "1"))
+        tp_size = int(os.getenv("SGLANG_DFLASH_TP_SIZE", "1"))
         disable_radix_cache = os.getenv("SGLANG_DFLASH_DISABLE_RADIX_CACHE", "1") != "0"
         prompt_style = os.getenv("SGLANG_DFLASH_PROMPT_STYLE", "fewshot_qa")
+        if tp_size < 1:
+            raise ValueError(f"Invalid SGLANG_DFLASH_TP_SIZE={tp_size}; expected >= 1.")
+        if torch.cuda.device_count() < tp_size:
+            self.skipTest(
+                f"tp_size={tp_size} requires at least {tp_size} visible CUDA devices, "
+                f"but only {torch.cuda.device_count()} are available. "
+                "Set CUDA_VISIBLE_DEVICES accordingly."
+            )
 
         # Read GSM8K data (download if absent).
         data_path = os.getenv("SGLANG_DFLASH_GSM8K_PATH", "test.jsonl")
@@ -383,6 +402,8 @@ class TestQwen3DFlashGSM8KBench(CustomTestCase):
         common_server_args = [
             "--attention-backend",
             attention_backend,
+            "--tp-size",
+            str(tp_size),
             "--max-total-tokens",
             str(max_total_tokens),
         ]
