@@ -1,6 +1,8 @@
 name: List Active PR Runs
 
 on:
+  pull_request:
+    types: [synchronize]
   workflow_dispatch:
     inputs:
       workflows:
