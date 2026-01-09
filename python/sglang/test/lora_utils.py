@@ -710,74 +710,79 @@ def run_lora_multiple_batch_on_model_cases(
 
 def run_lora_batch_splitting_equivalence_test(
     model_cases: List[LoRAModelCase],
-    batch_size: int = 4,
-    small_max_loras_per_batch: int = 2,
     attention_backend: str = "torch_native",
     disable_cuda_graph: bool = True,
     disable_radix_cache: bool = True,
 ):
     """
-    Sanity test for whether outputs are equivalent when running with different max_loras_per_batch settings.
+    Test that SRT with batch splitting (due to max_loras_per_batch limit of 2) produces
+    outputs equivalent to HFRunner on the same microbatches, assuming that SRT processes
+    requests in a first-come-first-serve manner.
 
-    This test compares:
-    - SRT runner with max_loras_per_batch = batch_size (single batch)
-    - SRT runner with max_loras_per_batch < batch_size (multiple batches needed)
-
-    The goal is to verify that the system produces similar outputs regardless of
-    whether internal batch splitting occurs. Note that exact equivalence is not
-    expected due to numerical precision and scheduling differences.
+    When the number of distinct adapters (including None for base model) exceeds
+    max_loras_per_batch, SRT internally splits into microbatches. This test:
+    1. Runs a batch through SRT that triggers splitting
+    2. Runs HFRunner on each expected microbatch
+    3. Asserts ROUGE-L equivalence between SRT and HF outputs
 
     Args:
         model_cases: List of LoRAModelCase to test
         attention_backend: Attention backend to use
-        batch_size: Size of each batch to run (could have requests using the same adapter)
-        small_max_loras_per_batch: Max number of distinct LoRA adapters that can be applied
-            concurrently within a batch
         disable_cuda_graph: Whether to disable CUDA graph
         disable_radix_cache: Whether to disable radix cache
     """
-    assert (
-        small_max_loras_per_batch < batch_size
-    ), f"small_max_loras_per_batch ({small_max_loras_per_batch}) must be < batch_size ({batch_size})"
+    max_loras_per_batch = 2
 
     def _run_test(model_case: LoRAModelCase, torch_dtype: torch.dtype):
         lora_adapter_paths = [a.name for a in model_case.adaptors]
+        assert (
+            len(lora_adapter_paths) >= max_loras_per_batch
+        ), f"Need at least {max_loras_per_batch} adapters for this test"
+        adapter0 = lora_adapter_paths[0]
+        adapter1 = lora_adapter_paths[1]
+
+        # Use only the first 3 prompts for simplicity
+        prompts = TEST_MULTIPLE_BATCH_PROMPTS[:3]
         max_new_tokens = 32
         base_path = model_case.base
 
         print(
             f"\n========== Testing batch splitting equivalence on base '{base_path}', dtype={torch_dtype} ---"
-            f"\n  Comparing max_loras_per_batch={batch_size} vs max_loras_per_batch={small_max_loras_per_batch}"
         )
 
-        # Create test batches
-        random.seed(42)
-        test_batches = []
-
-        prompts_cycle = [
-            random.choice(TEST_MULTIPLE_BATCH_PROMPTS) for _ in range(batch_size)
+        # Define test batches with their expected microbatch splits.
+        # Each entry: (lora_paths, list_of_microbatch_indices)
+        # With max_loras_per_batch=2, batches with 3 distinct adapters (including None) will split.
+        test_cases = [
+            (
+                [None, adapter0, adapter1],
+                [[0, 1], [2]],
+            ),
+            (
+                [adapter0, None, adapter1],
+                [[0, 1], [2]],
+            ),
+            (
+                [adapter0, adapter1, None],
+                [[0, 1], [2]],
+            ),
+            (
+                [None, adapter1, None],
+                [[0, 1, 2]],
+            ),
+            (
+                [None, None, None],
+                [[0, 1, 2]],
+            ),
         ]
-        lora_paths_cycle = [
-            lora_adapter_paths[i % len(lora_adapter_paths)] for i in range(batch_size)
-        ]
-        test_batches.append((prompts_cycle, lora_paths_cycle))
-
-        mixed_lora_adapters = lora_adapter_paths + [None]
-        prompts_mixed = [
-            random.choice(TEST_MULTIPLE_BATCH_PROMPTS) for _ in range(batch_size)
-        ]
-        lora_paths_mixed = [
-            mixed_lora_adapters[i % len(mixed_lora_adapters)] for i in range(batch_size)
-        ]
-        test_batches.append((prompts_mixed, lora_paths_mixed))
 
         ensure_reproducibility()
-        srt_single_batch = SRTRunner(
+        srt_runner = SRTRunner(
             base_path,
             torch_dtype=torch_dtype,
             model_type="generation",
             lora_paths=lora_adapter_paths,
-            max_loras_per_batch=batch_size,
+            max_loras_per_batch=max_loras_per_batch,
             max_loaded_loras=model_case.max_loaded_loras,
             sleep_on_idle=True,
             attention_backend=attention_backend,
@@ -786,55 +791,54 @@ def run_lora_batch_splitting_equivalence_test(
         )
 
         ensure_reproducibility()
-        srt_multi_batch = SRTRunner(
+        hf_runner = HFRunner(
             base_path,
             torch_dtype=torch_dtype,
             model_type="generation",
-            lora_paths=lora_adapter_paths,
-            max_loras_per_batch=small_max_loras_per_batch,
-            max_loaded_loras=model_case.max_loaded_loras,
-            sleep_on_idle=True,
-            attention_backend=attention_backend,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_radix_cache=disable_radix_cache,
+            patch_model_do_sample_false=True,
         )
 
-        with srt_single_batch, srt_multi_batch:
-            for batch_idx, (prompts, lora_paths) in enumerate(test_batches):
-                print(f"\n--- Test Batch {batch_idx + 1} ---")
+        with srt_runner, hf_runner:
+            for batch_idx, (lora_paths, microbatches) in enumerate(test_cases):
+                print(f"\n--- Full batch {batch_idx + 1} ---")
+                print(f"  lora_paths: {lora_paths}")
+                print(f"  Expected microbatches (by indices): {microbatches}")
 
-                outputs_no_split = srt_single_batch.batch_forward(
+                srt_outputs = srt_runner.batch_forward(
                     prompts,
                     max_new_tokens=max_new_tokens,
                     lora_paths=lora_paths,
                 )
-                outputs_with_split = srt_multi_batch.batch_forward(
-                    prompts,
-                    max_new_tokens=max_new_tokens,
-                    lora_paths=lora_paths,
-                )
 
-                assert (
-                    len(outputs_no_split.output_strs)
-                    == len(outputs_with_split.output_strs)
-                    == batch_size
-                ), (
-                    f"Output count mismatch: no_split={len(outputs_no_split.output_strs)}, "
-                    f"with_split={len(outputs_with_split.output_strs)}, expected={batch_size}"
-                )
+                # For each microbatch, run HF and compare with corresponding SRT outputs
+                for mb_idx, indices in enumerate(microbatches):
+                    mb_prompts = [prompts[i] for i in indices]
+                    mb_lora_paths = [lora_paths[i] for i in indices]
 
-                for out_no_split, out_with_split in zip(
-                    outputs_no_split.output_strs, outputs_with_split.output_strs
-                ):
-                    str_no_split = out_no_split.strip()
-                    str_with_split = out_with_split.strip()
-                    rouge_score = calculate_rouge_l([str_no_split], [str_with_split])[0]
+                    print(f"\n  --- Microbatch {mb_idx + 1} ---")
+                    print(f"    lora_paths: {mb_lora_paths}")
 
-                    if rouge_score < model_case.rouge_l_tolerance:
-                        raise AssertionError(
-                            f"ROUGE-L score {rouge_score} below tolerance {model_case.rouge_l_tolerance} "
-                            f"for base '{base_path}', adaptor '{lora_paths}', prompt: '{prompts}...'"
-                        )
+                    hf_outputs = hf_runner.forward(
+                        mb_prompts,
+                        max_new_tokens=max_new_tokens,
+                        lora_paths=mb_lora_paths,
+                    )
+
+                    for local_idx, orig_idx in enumerate(indices):
+                        srt_str = srt_outputs.output_strs[orig_idx].strip()
+                        hf_str = hf_outputs.output_strs[local_idx].strip()
+                        rouge_score = calculate_rouge_l([srt_str], [hf_str])[0]
+
+                        if rouge_score < model_case.rouge_l_tolerance:
+                            raise AssertionError(
+                                f"ROUGE-L score {rouge_score} below tolerance {model_case.rouge_l_tolerance} "
+                                f"for base '{base_path}', adapter '{mb_lora_paths[local_idx]}', "
+                                f"prompt: '{mb_prompts[local_idx][:50]}...'"
+                            )
+
+                    print(f"  --- Microbatch {mb_idx + 1} passed ---")
+
+                print(f"--- Batch {batch_idx + 1} passed ---")
 
     for model_case in model_cases:
         for torch_dtype in TORCH_DTYPES:
