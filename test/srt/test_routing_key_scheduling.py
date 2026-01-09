@@ -5,7 +5,7 @@ from typing import Any, List, Tuple
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     STDERR_FILENAME,
@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 class TestRoutingKeyScheduling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         cls.stdout = open(STDOUT_FILENAME, "w")
