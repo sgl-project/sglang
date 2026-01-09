@@ -57,7 +57,11 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import (
+    get_dcp_rank,
+    get_dcp_world_size,
+    monkey_patch_vllm_parallel_state,
+)
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
@@ -114,6 +118,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.input_buffers import GraphInputBuffers
@@ -2142,6 +2147,142 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
 
         if not skip_attn_backend_init:
+            # TODO (augusto.yjh) prepare for dcp
+            if get_dcp_world_size() > 1:
+                # dcp_kv_buffer tokens' layout
+                # [ rank0_r1.prefix_tokens, rank0_r2.prefix_tokens,
+                #   ...,
+                #   rank8_r2.prefix_tokens, rank8_r3.prefix_tokens,
+                #   r1.extend_tokens, r2.extent_tokens, r3.extend_tokens ]
+                extend_prefix_starts = torch.zeros(
+                    len(forward_batch.seq_lens),
+                    dtype=torch.int32,
+                    device=get_global_server_args().device,
+                )
+                extend_cu_prefix_lens = torch.zeros(
+                    len(forward_batch.seq_lens) + 1,
+                    dtype=torch.int32,
+                    device=get_global_server_args().device,
+                )
+                extend_cu_prefix_lens[1:] = torch.cumsum(
+                    forward_batch.extend_prefix_lens, dim=0
+                )
+                extend_cu_prefix_lens = extend_cu_prefix_lens[:-1]
+                extend_prefix_lens_sum = sum(
+                    [i for i in forward_batch.extend_prefix_lens_cpu]
+                )
+
+                dcp_prefix_kv_indices = torch.empty(
+                    sum(forward_batch.extend_prefix_lens_cpu),
+                    dtype=torch.int32,
+                    device=get_global_server_args().device,
+                )
+                create_chunked_prefix_cache_kv_indices[(len(forward_batch.seq_lens),)](
+                    forward_batch.req_to_token_pool.req_to_token,
+                    forward_batch.req_pool_indices,
+                    extend_prefix_starts,
+                    forward_batch.extend_prefix_lens,
+                    extend_cu_prefix_lens,
+                    dcp_prefix_kv_indices,
+                    forward_batch.req_to_token_pool.req_to_token.shape[1],
+                )
+                dcp_kv_indptr = torch.zeros(
+                    len(forward_batch.seq_lens) + 1,
+                    dtype=torch.int32,
+                    device=get_global_server_args().device,
+                )
+                dcp_kv_indptr[1:] = forward_batch.seq_lens.cumsum(dim=0)
+                dcp_kv_indptr = dcp_kv_indptr[: (len(forward_batch.seq_lens) + 1)]
+                dcp_kv_indices = torch.zeros(
+                    forward_batch.seq_lens_sum,
+                    dtype=torch.int32,
+                    device=get_global_server_args().device,
+                )
+
+                extend_cu_lens = torch.zeros(
+                    len(forward_batch.seq_lens) + 1,
+                    dtype=torch.int32,
+                    device=get_global_server_args().device,
+                )
+                extend_cu_lens[1:] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
+                extend_cu_lens = extend_cu_lens[:-1]
+
+                import triton
+                import triton.language as tl
+
+                @triton.jit
+                def create_dcp_kv_indices(
+                    kv_indptr,
+                    extend_lens_ptr,
+                    extend_cu_lens_ptr,
+                    extend_prefix_lens_ptr,
+                    extend_cu_prefix_lens_ptr,
+                    kv_indices_ptr,
+                    extend_prefix_lens_sum,
+                    dcp_world_size: tl.constexpr,
+                ):
+                    BLOCK_SIZE: tl.constexpr = 512
+                    pid = tl.program_id(axis=0)
+                    prefix_len = tl.load(extend_prefix_lens_ptr + pid)
+                    local_prefix_len = prefix_len // dcp_world_size
+                    prefix_start = (
+                        tl.load(extend_cu_prefix_lens_ptr + pid) // dcp_world_size
+                    )
+                    kv_ind_start = tl.load(kv_indptr + pid)
+                    num_loop = tl.cdiv(prefix_len, BLOCK_SIZE)
+                    for i in range(num_loop):
+                        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+                        mask = offset < prefix_len
+                        data = (
+                            prefix_start
+                            + (offset % dcp_world_size)
+                            * (extend_prefix_lens_sum // dcp_world_size)
+                            + (offset // dcp_world_size % local_prefix_len)
+                        )
+                        tl.store(
+                            kv_indices_ptr + kv_ind_start + offset, data, mask=mask
+                        )
+                    extend_len = tl.load(extend_lens_ptr + pid)
+                    extend_start = tl.load(extend_cu_lens_ptr + pid)
+                    num_loop = tl.cdiv(extend_len, BLOCK_SIZE)
+                    for i in range(num_loop):
+                        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+                        mask = offset < extend_len
+                        data = extend_prefix_lens_sum + extend_start + offset
+                        tl.store(
+                            kv_indices_ptr + kv_ind_start + prefix_len + offset,
+                            data,
+                            mask=mask,
+                        )
+
+                create_dcp_kv_indices[(len(forward_batch.seq_lens),)](
+                    dcp_kv_indptr,
+                    forward_batch.extend_seq_lens,
+                    extend_cu_lens,
+                    forward_batch.extend_prefix_lens,
+                    extend_cu_prefix_lens,
+                    dcp_kv_indices,
+                    extend_prefix_lens_sum,
+                    get_dcp_world_size(),
+                )
+                forward_batch.dcp_kv_indptr = dcp_kv_indptr
+                forward_batch.dcp_local_prefix_kv_indices = (
+                    dcp_prefix_kv_indices[
+                        dcp_prefix_kv_indices % get_dcp_world_size() == get_dcp_rank()
+                    ]
+                    // get_dcp_world_size()
+                )
+                forward_batch.dcp_kv_buffer = torch.empty(
+                    (
+                        forward_batch.seq_lens_sum,
+                        *forward_batch.token_to_kv_pool.get_key_buffer(0).shape[1:],
+                    ),
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                )
+                forward_batch.dcp_kv_indices = dcp_kv_indices
+                forward_batch.dcp_extend_prefix_lens_sum = extend_prefix_lens_sum
+
             self.attn_backend.init_forward_metadata(forward_batch)
 
         return self.model.forward(

@@ -60,7 +60,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     prepare_abort,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import get_dcp_world_size, get_pp_group, get_world_group
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -365,6 +365,9 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
 
+        # Init prefill truncation_align_size for chunked prefill with dcp
+        self.init_truncation_align_size_for_dcp()
+
         # Init request dispatcher
         self.init_request_dispatcher()
 
@@ -422,6 +425,17 @@ class Scheduler(
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
+
+    def init_truncation_align_size_for_dcp(self):
+        if get_dcp_world_size() > 1:
+            if self.truncation_align_size is None:
+                self.truncation_align_size = get_dcp_world_size()
+            else:
+                import math
+
+                self.truncation_align_size = (
+                    self.truncation_align_size * get_dcp_world_size()
+                ) // (math.gcd(self.truncation_align_size, get_dcp_world_size()))
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -615,6 +629,8 @@ class Scheduler(
             chunked_prefill_size=server_args.chunked_prefill_size,
         )
 
+        if get_dcp_world_size() > 1:
+            params.page_size = params.page_size * get_dcp_world_size()
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
@@ -1920,7 +1936,9 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self.chunked_req = adder.add_chunked_req(
+                self.chunked_req, truncation_align_size=self.truncation_align_size
+            )
 
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])

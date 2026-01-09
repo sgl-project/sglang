@@ -265,7 +265,7 @@ def alloc_paged_token_slots_extend(
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
-    num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    num_tokens = extend_num_tokens + len(seq_lens_cpu) * tree_cache.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None
@@ -373,6 +373,7 @@ def alloc_for_extend(
     if batch.tree_cache.page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
+        # Since tree_cache.page_size is (page_size * get_dcp_world_size), for dcp, always use alloc_paged_token_slots_extend
         # Paged allocation - build last_loc
         last_loc = [
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
@@ -416,7 +417,7 @@ def alloc_paged_token_slots_decode(
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
     # Over estimate the number of tokens: assume each request needs a new page.
-    num_tokens = len(seq_lens) * allocator.page_size
+    num_tokens = len(seq_lens) * tree_cache.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
     out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)

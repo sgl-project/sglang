@@ -39,6 +39,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.distributed.parallel_state import (
+    get_dcp_world_size,
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
@@ -399,6 +400,13 @@ class ForwardBatch:
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
+
+    # For decode context parallel
+    dcp_kv_indptr: Optional[torch.Tensor] = None
+    dcp_kv_buffer: Optional[torch.Tensor] = None
+    dcp_kv_indices: Optional[torch.Tensor] = None
+    dcp_local_prefix_kv_indices: Optional[torch.Tensor] = None
+    dcp_extend_prefix_lens_sum: Optional[int] = None
 
     @classmethod
     def init_new(
@@ -1056,6 +1064,10 @@ class ForwardBatch:
         # chunk_capacity is the maximum number of tokens in each chunk
         chunk_capacity = self.get_max_chunk_capacity()
         self.prefix_chunk_len = chunk_capacity // self.batch_size
+        if get_dcp_world_size() > 1:
+            self.prefix_chunk_len = (
+                self.prefix_chunk_len // get_dcp_world_size() * get_dcp_world_size()
+            )
 
         self.num_prefix_chunks = (
             max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
