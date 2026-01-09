@@ -1376,7 +1376,13 @@ class ServerArgs:
                 else:
                     self.quantization = model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
-            if not self.disable_radix_cache:
+
+            if not self.disable_radix_cache and self.speculative_algorithm is not None:
+                logger.warning(
+                    "Disabling radix cache since speculative decoding for NemotronHForCausalLM is not supported with radix cache yet."
+                )
+                self.disable_radix_cache = True
+            elif not self.disable_radix_cache:
                 logger.warning(
                     "Disabling overlap schedule since MambaRadixCache is not compatible with "
                     "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
@@ -1475,7 +1481,7 @@ class ServerArgs:
                         max(FLA_CHUNK_SIZE, self.page_size)
                         % min(FLA_CHUNK_SIZE, self.page_size)
                         == 0
-                    ), f"max(FLA_CHUNK_SIZE, self.page_size) % min(FLA_CHUNK_SIZE, self.page_size) should be 0, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
+                    ), f"For SSM models with extra buffer, either FLA_CHUNK_SIZE or page_size must be divisible by the other, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
 
             elif not self.disable_radix_cache:
                 logger.warning(
@@ -4629,6 +4635,12 @@ class ServerArgs:
 
     def enable_mamba_extra_buffer(self) -> bool:
         return self.mamba_scheduler_strategy == "extra_buffer"
+
+    @property
+    def mamba_cache_chunk_size(self) -> int:
+        # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE and page_size.
+        # It is used to determine the caching point in a sequence during prefill.
+        return max(FLA_CHUNK_SIZE, self.page_size)
 
     def check_server_args(self):
         # Check parallel size constraints
