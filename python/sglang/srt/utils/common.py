@@ -3102,12 +3102,19 @@ def parse_lscpu_topology():
     except Exception as e:
         raise RuntimeError(f"Unexpected error running 'lscpu': {e}")
 
-    # Parse only data lines (skip comments)
+    # Parse only data lines (skip comments and empty lines)
+    # Note: On WSL, the Node column may be empty (e.g., "0,0,0,"), default to 0
     cpu_info = []
     for line in output.splitlines():
-        if not line.startswith("#"):
-            cpu, core, socket, node = map(int, line.strip().split(","))
-            cpu_info.append((cpu, core, socket, node))
+        line = line.strip()
+        if line and not line.startswith("#"):
+            parts = line.split(",")
+            if len(parts) >= 3:
+                cpu = int(parts[0])
+                core = int(parts[1])
+                socket = int(parts[2])
+                node = int(parts[3]) if len(parts) > 3 and parts[3].strip() else 0
+                cpu_info.append((cpu, core, socket, node))
 
     # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
     return cpu_info
