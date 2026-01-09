@@ -72,12 +72,6 @@ class PrefillDelayer:
         )
 
         if global_force_allow.max().item() > 0:
-            if _DEBUG_LOG:
-                logger.info(
-                    f"PrefillDelayer force allow prefill due to low watermark. "
-                    f"(num_prefillable={global_prefillable.sum().item()}, "
-                    f"num_force_allow={global_force_allow.sum().item()})"
-                )
             self._reset(outcome="token_usage_watermark")
             return True
 
@@ -95,15 +89,22 @@ class PrefillDelayer:
                 return False
 
         is_timeout = global_mixed_prefillable
-        if _DEBUG_LOG and is_timeout:
-            logger.info(
-                f"PrefillDelayer timeout thus not forbid prefill (num_prefillable={global_prefillable.sum()})"
-            )
-
         self._reset(outcome="timeout" if is_timeout else TODO)
         return True
 
     def _reset(self, outcome: str) -> None:
+        if _DEBUG_LOG:
+            if outcome == "timeout":
+                logger.info(
+                    f"PrefillDelayer timeout thus not forbid prefill (num_prefillable={global_prefillable.sum()})"
+                )
+            elif outcome == "token_usage_watermark":
+                logger.info(
+                    f"PrefillDelayer force allow prefill due to low watermark. "
+                    f"(num_prefillable={global_prefillable.sum().item()}, "
+                    f"num_force_allow={global_force_allow.sum().item()})"
+                )
+
         TODO_should_this_info_is_not_none
         if self._curr_delay_info is not None and self._metrics_collector is not None:
             wait_seconds = time.perf_counter() - self._curr_delay_info.start_time
