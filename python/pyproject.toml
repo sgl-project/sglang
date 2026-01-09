@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel", "grpcio-tools==1.75.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.6.post2"
+dynamic = ["version"]
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -89,7 +89,7 @@ diffusion = [
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
-  "opencv-python==4.10.0.84",
+  "opencv-python-headless==4.10.0.84",
   "remote-pdb",
   "st_attn ==0.0.7",
   "vsa==0.0.4",
@@ -167,6 +167,13 @@ exclude = [
   "scripts*",
   "tests*",
 ]
+
+[tool.setuptools_scm]
+root = ".."
+version_file = "sglang/_version.py"
+git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+# Allow editable installs even when .git metadata is not available.
+fallback_version = "0.0.0.dev0"
 
 [tool.codespell]
 ignore-words-list = "ans, als, hel, boostrap, childs, te, vas, hsa, ment"

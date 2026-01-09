@@ -16,7 +16,7 @@ import pytest
 import requests
 from openai import OpenAI
 
-from sglang.multimodal_gen.runtime.utils.common import is_hip
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
@@ -38,7 +38,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     is_image_url,
-    read_perf_logs,
     wait_for_req_perf_record,
 )
 
@@ -52,7 +51,11 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
     # which is not available on AMD. Use Ulysses parallelism instead.
-    if is_hip() and server_args.ring_degree is not None and server_args.ring_degree > 1:
+    if (
+        current_platform.is_hip()
+        and server_args.ring_degree is not None
+        and server_args.ring_degree > 1
+    ):
         pytest.skip(
             f"Skipping {case.id}: Ring Attention (ring_degree={server_args.ring_degree}) "
             "requires Flash Attention which is not available on AMD/ROCm"
@@ -70,6 +73,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.ulysses_degree is not None:
         extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
 
+    if server_args.dit_layerwise_offload:
+        extra_args += f" --dit-layerwise-offload true"
+
     if server_args.ring_degree is not None:
         extra_args += f" --ring-degree {server_args.ring_degree}"
 
@@ -77,12 +83,21 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
+    if server_args.enable_warmup:
+        extra_args += f" --enable-warmup"
+
+    # Build custom environment variables
+    env_vars = {}
+    if server_args.enable_cache_dit:
+        env_vars["SGLANG_CACHE_DIT_ENABLED"] = "true"
+
     # start server
     manager = ServerManager(
         model=server_args.model_path,
         port=port,
         wait_deadline=float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200")),
         extra_args=extra_args,
+        env_vars=env_vars,
     )
     ctx = manager.start()
 
@@ -97,35 +112,36 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             model=server_args.model_path,
             prompt=sampling_params.prompt or "A colorful raccoon icon",
             output_size=output_size,
+            output_format=sampling_params.output_format,
         )
-        warmup.run_text_warmups(server_args.warmup_text)
+        if server_args.warmup > 0:
+            if sampling_params.image_path and case.sampling_params.prompt:
+                # Handle URL or local path
+                image_path_list = sampling_params.image_path
+                if not isinstance(image_path_list, list):
+                    image_path_list = [image_path_list]
 
-        if (
-            case.server_args.warmup_edit > 0
-            and case.sampling_params.prompt
-            and sampling_params.image_path
-        ):
-            # Handle URL or local path
-            image_path_list = sampling_params.image_path
-            if not isinstance(image_path_list, list):
-                image_path_list = [image_path_list]
+                new_image_path_list = []
+                for image_path in image_path_list:
+                    if is_image_url(image_path):
+                        new_image_path_list.append(
+                            download_image_from_url(str(image_path))
+                        )
+                    else:
+                        path_obj = Path(image_path)
+                        if not path_obj.exists():
+                            pytest.skip(f"{case.id}: file missing: {image_path}")
+                        new_image_path_list.append(path_obj)
 
-            new_image_path_list = []
-            for image_path in image_path_list:
-                if is_image_url(image_path):
-                    new_image_path_list.append(download_image_from_url(str(image_path)))
-                else:
-                    new_image_path_list.append(Path(image_path))
-                    if not image_path.exists():
-                        pytest.skip(f"{case.id}: file missing: {image_path}")
+                image_path_list = new_image_path_list
 
-            image_path_list = new_image_path_list
-
-            warmup.run_edit_warmups(
-                count=server_args.warmup_edit,
-                edit_prompt=sampling_params.prompt,
-                image_path=image_path_list,
-            )
+                warmup.run_edit_warmups(
+                    count=server_args.warmup,
+                    edit_prompt=sampling_params.prompt,
+                    image_path=image_path_list,
+                )
+            else:
+                warmup.run_text_warmups(server_args.warmup)
     except Exception as exc:
         logger.error("Warm-up failed for %s: %s", case.id, exc)
         ctx.cleanup()
@@ -187,15 +203,13 @@ Consider updating perf_baselines.json with the snippets below:
     ) -> RequestPerfRecord:
         """Run generation and collect performance records."""
         log_path = ctx.perf_log_path
-        prev_len = len(read_perf_logs(log_path))
         log_wait_timeout = 30
 
         client = self._client(ctx)
         rid = generate_fn(case_id, client)
 
-        req_perf_record, _ = wait_for_req_perf_record(
+        req_perf_record = wait_for_req_perf_record(
             rid,
-            prev_len,
             log_path,
             timeout=log_wait_timeout,
         )
@@ -436,6 +450,21 @@ Consider updating perf_baselines.json with the snippets below:
         assert output_after_set is not None, "Generation after set_lora failed"
         logger.info("[LoRA E2E] Generation after set_lora succeeded")
 
+        # Test 4: list_loras - API should return the expected list of LoRA adapters
+        logger.info("[LoRA E2E] Testing list_loras for %s", case.id)
+        resp = requests.get(f"{base_url}/list_loras")
+        assert resp.status_code == 200, f"list_loras failed: {resp.text}"
+        lora_info = resp.json()
+        logger.info("[LoRA E2E] list_loras returned %s", lora_info)
+        assert (
+            isinstance(lora_info["loaded_adapters"], list)
+            and len(lora_info["loaded_adapters"]) > 0
+        ), "loaded_adapters should be a non-empty list"
+        assert any(
+            a.get("nickname") == "default" for a in lora_info["loaded_adapters"]
+        ), f"nickname 'default' not found in loaded_adapters: {lora_info['loaded_adapters']}"
+        logger.info("[LoRA E2E] list_loras returned expected LoRA adapters")
+
         logger.info("[LoRA E2E] All LoRA API E2E tests passed for %s", case.id)
 
     def _test_lora_dynamic_switch_e2e(
@@ -499,6 +528,94 @@ Consider updating perf_baselines.json with the snippets below:
             "[LoRA Switch E2E] All dynamic switch E2E tests passed for %s", case.id
         )
 
+    def _test_v1_models_endpoint(
+        self, ctx: ServerContext, case: DiffusionTestCase
+    ) -> None:
+        """
+        Test /v1/models endpoint returns OpenAI-compatible response.
+        This endpoint is required for sgl-model-gateway router compatibility.
+        """
+        base_url = f"http://localhost:{ctx.port}"
+
+        # Test GET /v1/models
+        logger.info("[Models API] Testing GET /v1/models for %s", case.id)
+        resp = requests.get(f"{base_url}/v1/models")
+        assert resp.status_code == 200, f"/v1/models failed: {resp.text}"
+
+        data = resp.json()
+        assert (
+            data["object"] == "list"
+        ), f"Expected object='list', got {data.get('object')}"
+        assert len(data["data"]) >= 1, "Expected at least one model in response"
+
+        model = data["data"][0]
+        assert "id" in model, "Model missing 'id' field"
+        assert (
+            model["object"] == "model"
+        ), f"Expected object='model', got {model.get('object')}"
+        assert (
+            model["id"] == case.server_args.model_path
+        ), f"Model ID mismatch: expected {case.server_args.model_path}, got {model['id']}"
+
+        # Verify extended diffusion-specific fields
+        assert "num_gpus" in model, "Model missing 'num_gpus' field"
+        assert "task_type" in model, "Model missing 'task_type' field"
+        assert "dit_precision" in model, "Model missing 'dit_precision' field"
+        assert "vae_precision" in model, "Model missing 'vae_precision' field"
+        assert (
+            model["num_gpus"] == case.server_args.num_gpus
+        ), f"num_gpus mismatch: expected {case.server_args.num_gpus}, got {model['num_gpus']}"
+        # Verify task_type is consistent with the modality specified in the test config.
+        # We can't access pipeline_config from test config, but we can validate against modality.
+        modality_to_valid_task_types = {
+            "image": {"T2I", "I2I", "TI2I"},
+            "video": {"T2V", "I2V", "TI2V"},
+        }
+        valid_task_types = modality_to_valid_task_types.get(
+            case.server_args.modality, set()
+        )
+        assert model["task_type"] in valid_task_types, (
+            f"task_type '{model['task_type']}' not valid for modality "
+            f"'{case.server_args.modality}'. Expected one of: {valid_task_types}"
+        )
+        logger.info(
+            "[Models API] GET /v1/models returned valid response with extended fields"
+        )
+
+        # Test GET /v1/models/{model_path}
+        model_path = model["id"]
+        logger.info("[Models API] Testing GET /v1/models/%s", model_path)
+        resp = requests.get(f"{base_url}/v1/models/{model_path}")
+        assert resp.status_code == 200, f"/v1/models/{model_path} failed: {resp.text}"
+
+        single_model = resp.json()
+        assert single_model["id"] == model_path, "Single model ID mismatch"
+        assert single_model["object"] == "model", "Single model object type mismatch"
+
+        # Verify extended fields on single model endpoint too
+        assert "num_gpus" in single_model, "Single model missing 'num_gpus' field"
+        assert "task_type" in single_model, "Single model missing 'task_type' field"
+        assert single_model["task_type"] in valid_task_types, (
+            f"Single model task_type '{single_model['task_type']}' not valid for modality "
+            f"'{case.server_args.modality}'. Expected one of: {valid_task_types}"
+        )
+        logger.info(
+            "[Models API] GET /v1/models/{model_path} returned valid response with extended fields"
+        )
+
+        # Test GET /v1/models/{non_existent_model} returns 404
+        logger.info("[Models API] Testing GET /v1/models/non_existent_model")
+        resp = requests.get(f"{base_url}/v1/models/non_existent_model")
+        assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
+        error_data = resp.json()
+        assert "error" in error_data, "404 response missing 'error' field"
+        assert (
+            error_data["error"]["code"] == "model_not_found"
+        ), f"Incorrect error code: {error_data['error'].get('code')}"
+        logger.info("[Models API] GET /v1/models/non_existent returns 404 as expected")
+
+        logger.info("[Models API] All /v1/models tests passed for %s", case.id)
+
     def test_diffusion_perf(
         self,
         case: DiffusionTestCase,
@@ -524,6 +641,9 @@ Consider updating perf_baselines.json with the snippets below:
         )
 
         self._validate_and_record(case, perf_record)
+
+        # Test /v1/models endpoint for router compatibility
+        self._test_v1_models_endpoint(diffusion_server, case)
 
         # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
         if case.server_args.lora_path:

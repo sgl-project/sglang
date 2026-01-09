@@ -20,6 +20,7 @@ import logging
 import os
 import pickle
 import signal
+import socket
 import sys
 import threading
 import time
@@ -115,6 +116,8 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
+_REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+
 logger = logging.getLogger(__name__)
 
 
@@ -184,26 +187,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
         self.enable_trace = server_args.enable_trace
-
-        # Read model args
-        self.model_path = server_args.model_path
-        self.served_model_name = server_args.served_model_name
-        self.model_config = ModelConfig.from_server_args(server_args)
-        self.is_generation = self.model_config.is_generation
-        self.is_image_gen = self.model_config.is_image_gen
-        self.context_len = self.model_config.context_len
-        self.image_token_id = self.model_config.image_token_id
-        self.max_req_input_len = None  # Will be set later in engine.py
-        speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
-        self.reserve_input_token_num = (
-            0
-            if speculative_algorithm.is_none()
-            else server_args.speculative_num_draft_tokens
-        )
-
         set_global_server_args_for_tokenizer(server_args)
+
+        # Init model config
+        self.init_model_config()
 
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
@@ -231,6 +218,33 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+    def init_model_config(self):
+        server_args = self.server_args
+        model_config_class = getattr(self, "model_config_class", ModelConfig)
+
+        # Read model args
+        self.model_path = server_args.model_path
+        self.served_model_name = server_args.served_model_name
+        self.model_config = model_config_class.from_server_args(server_args)
+        self.is_generation = self.model_config.is_generation
+        self.is_image_gen = self.model_config.is_image_gen
+        self.context_len = self.model_config.context_len
+        self.image_token_id = self.model_config.image_token_id
+        self.max_req_input_len = None  # Will be set later in engine.py
+        speculative_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+        if speculative_algorithm.is_eagle():
+            # In the current eagle implementation, we store the draft tokens in the output token slots,
+            # so we need to reserve the space for the draft tokens.
+            self.num_reserved_tokens = max(
+                server_args.speculative_eagle_topk * server_args.speculative_num_steps,
+                server_args.speculative_num_draft_tokens,
+            )
+        else:
+            self.num_reserved_tokens = 0
+        self.validate_total_tokens = True
 
     def init_tokenizer_and_processor(self):
         server_args = self.server_args
@@ -311,8 +325,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     def init_running_status(self):
         # Request states
-        self._chosen_loop = None
         self.rid_to_state: Dict[str, ReqState] = {}
+        self.event_loop = None
         self.asyncio_tasks = set()
 
         # Health check
@@ -324,12 +338,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.current_load = 0
         self.current_load_lock = asyncio.Lock()
 
+        # Session
+        self.session_futures = {}  # session_id -> asyncio event
+
     def init_request_logging_and_dumping(self):
         # Request logging
         self.request_logger = RequestLogger(
             log_requests=self.server_args.log_requests,
             log_requests_level=self.server_args.log_requests_level,
             log_requests_format=self.server_args.log_requests_format,
+            log_requests_target=self.server_args.log_requests_target,
         )
 
         # Dumping
@@ -338,6 +356,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.dump_request_list: List[Tuple] = []
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
+        self.straggler_request_list: List[Tuple] = []
 
         # Initialize performance metrics loggers with proper skip names
         _, obj_skip_names, out_skip_names = self.request_logger.metadata
@@ -350,9 +369,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.initial_weights_loaded = True
         if self.server_args.checkpoint_engine_wait_weights_before_ready:
             self.initial_weights_loaded = False
-
-        # Session
-        self.session_futures = {}  # session_id -> asyncio event
 
         # Weight updates
         # The event to notify the weight sync is finished.
@@ -417,7 +433,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         if self.server_args.gc_warning_threshold_secs > 0.0:
             configure_gc_warning(self.server_args.gc_warning_threshold_secs)
-        self.watchdog = Watchdog.create(
+        self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
             watchdog_timeout=self.server_args.soft_watchdog_timeout,
             soft=True,
@@ -449,25 +465,28 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
         self.init_communicators(self.server_args)
 
+        self.sampling_params_class = SamplingParams
+        self.signal_handler_class = SignalHandler
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
-        trace_parent: Optional[str] = None,
     ):
         created_time = obj.received_time if obj.received_time else time.time()
         self.auto_create_handle_loop()
-        obj.normalize_batch_and_arguments()
 
+        # Normalize the request
+        obj.normalize_batch_and_arguments()
         if self.enable_trace:
-            self._trace_request_start(obj, created_time, request, trace_parent)
+            self._trace_request_start(obj, created_time, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
 
         # Log the request
-        self.request_logger.log_received_request(obj, self.tokenizer)
+        self.request_logger.log_received_request(obj, self.tokenizer, request)
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
@@ -476,6 +495,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if self.server_args.enable_lora and obj.lora_path:
                 await self._resolve_lora_path(obj)
 
+            # Tokenize the request and send it to the scheduler
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 state = self._send_one_request(obj, tokenized_obj, created_time)
@@ -663,6 +683,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
+            if obj.video_data is not None and not isinstance(obj.video_data, list):
+                obj.video_data = [obj.video_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
             self._validate_mm_limits(obj)
@@ -714,9 +736,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
-
         input_token_num = len(input_ids) if input_ids is not None else 0
-        input_token_num += self.reserve_input_token_num
+        input_token_num += self.num_reserved_tokens
+
+        # Validate input length
         if input_token_num >= self.context_len:
             if self.server_args.allow_auto_truncate:
                 logger.warning(
@@ -732,16 +755,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     f"model's context length ({self.context_len} tokens)."
                 )
 
-        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
-            raise ValueError(
-                "This model does not appear to be an embedding model by default. "
-                "Please add `--is-embedding` when launching the server or try another model."
-            )
-
-        # Check total tokens (input + max_new_tokens)
+        # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
-            max_new_tokens is not None
+            self.validate_total_tokens
+            and max_new_tokens is not None
             and (max_new_tokens + input_token_num) >= _max_req_len
         ):
             if self.server_args.allow_auto_truncate:
@@ -764,10 +782,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
                 raise ValueError(error_msg)
 
-        # Matryoshka embeddings validations
+        # Validate embedding requests
+        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+            raise ValueError(
+                "This model does not appear to be an embedding model by default. "
+                "Please add `--is-embedding` when launching the server or try another model."
+            )
+
+        # Validate Matryoshka embeddings
         if isinstance(obj, EmbeddingReqInput):
             self._validate_for_matryoshka_dim(obj)
 
+        # Validate custom logit processor
         if isinstance(obj, GenerateReqInput):
             if (
                 obj.return_hidden_states
@@ -830,15 +856,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
 
     def _validate_input_ids_in_vocab(
-        self, input_ids: List[int], vocab_size: int
+        self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
     ) -> None:
-        if any(id >= vocab_size for id in input_ids):
-            raise ValueError(
-                f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
-            )
-
-    def _get_sampling_params(self, sampling_kwargs: Dict) -> SamplingParams:
-        return SamplingParams(**sampling_kwargs)
+        # Handle both single sequence and batch of sequences
+        if isinstance(input_ids[0], list):
+            # Batch of sequences
+            for seq in input_ids:
+                if any(id >= vocab_size for id in seq):
+                    raise ValueError(
+                        f"The input_ids {seq} contains values greater than the vocab size ({vocab_size})."
+                    )
+        else:
+            # Single sequence
+            if any(id >= vocab_size for id in input_ids):
+                raise ValueError(
+                    f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
+                )
 
     def _create_tokenized_object(
         self,
@@ -857,7 +890,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
-        sampling_params = self._get_sampling_params(sampling_kwargs)
+        sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
 
@@ -1052,7 +1085,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         is_stream = getattr(obj, "stream", False)
         while True:
             try:
-                await asyncio.wait_for(state.event.wait(), timeout=4)
+                await asyncio.wait_for(
+                    state.event.wait(), timeout=_REQUEST_STATE_WAIT_TIMEOUT
+                )
             except asyncio.TimeoutError:
                 if (
                     request is not None
@@ -1079,7 +1114,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         "response_sent_to_client_ts"
                     ] = state.response_sent_to_client_ts
                 self.request_logger.log_finished_request(
-                    obj, out, is_multimodal_gen=self.model_config.is_multimodal_gen
+                    obj,
+                    out,
+                    is_multimodal_gen=self.model_config.is_multimodal_gen,
+                    request=request,
                 )
 
                 if self.request_metrics_exporter_manager.exporter_enabled():
@@ -1379,195 +1417,44 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         return background_tasks
 
     def auto_create_handle_loop(self):
-        if self._chosen_loop is not None:
-            current_loop = get_or_create_event_loop()
-            assert (
-                current_loop == self._chosen_loop
-            ), f"Please ensure only one event loop is ever used with SGLang. Previous loop: {self._chosen_loop}, current loop: {current_loop}"
+        if self.event_loop is not None:
             return
 
+        # Create and start the handle_loop task
         loop = get_or_create_event_loop()
-        self._chosen_loop = loop
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
-
         self.event_loop = loop
 
-        # We cannot add signal handler when the tokenizer manager is not in
-        # the main thread due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
-            signal_handler = SignalHandler(self)
+            signal_handler = self.signal_handler_class(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
             )
         else:
+            # We cannot add signal handler when the tokenizer manager is not in
+            # the main thread due to the CPython limitation.
             logger.warning(
                 "Signal handler is not added because the tokenizer manager is "
                 "not in the main thread. This disables graceful shutdown of the "
                 "tokenizer manager when SIGTERM is received."
             )
+
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
 
-    def dump_requests_before_crash(self):
-        if self.crash_dump_performed:
-            logger.info(
-                "SIGTERM/SIGQUIT/Exception triggered, but crash dump already performed, skipping."
-            )
-            return
-
-        if not self.crash_dump_folder:
-            return
-
-        logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
-        self.crash_dump_performed = True
-
-        # Check if NFS directory is available
-        # expected_nfs_dir = "/" + self.crash_dump_folder.lstrip("/").split("/")[0]
-        # use_nfs_dir = os.path.isdir(expected_nfs_dir) and os.access(
-        #     expected_nfs_dir, os.W_OK
-        # )
-        use_nfs_dir = False
-        if not use_nfs_dir:
-            logger.error(
-                f"Expected NFS directory is not available or writable. Uploading to GCS."
-            )
-
-        data_to_dump = []
-        if self.crash_dump_request_list:
-            data_to_dump.extend(self.crash_dump_request_list)
-
-        # Add unfinished requests from rid_to_state
-        unfinished_requests = []
-        for rid, state in self.rid_to_state.items():
-            if not state.finished:
-                unfinished_requests.append(
-                    (
-                        state.obj,
-                        state.out_list[-1] if state.out_list else {},
-                        state.created_time,
-                        time.time(),
-                    )
-                )
-        if unfinished_requests:
-            data_to_dump.extend(unfinished_requests)
-
-        if not data_to_dump:
-            return
-
-        object_name = f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl'
-        filename = os.path.join(
-            self.crash_dump_folder,
-            os.getenv("HOSTNAME", None),
-            object_name,
-        )
-
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-        # Include server_args in the dump
-        data_to_dump_with_server_args = {
-            "server_args": self.server_args,
-            "requests": data_to_dump,
-        }
-        with open(filename, "wb") as f:
-            pickle.dump(data_to_dump_with_server_args, f)
-        logger.error(
-            f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
-        )
-
-        def _upload_file_to_gcs(bucket_name, source_file_path, object_name):
-            from google.cloud import storage
-
-            client = storage.Client()
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(object_name)
-            blob.upload_from_filename(source_file_path, if_generation_match=0)
-            logger.error(
-                f"Successfully uploaded {source_file_path} to gs://{bucket_name}/{object_name}"
-            )
-
-        if not use_nfs_dir:
-            _upload_file_to_gcs(
-                "sglang_crash_dump",
-                filename,
-                os.getenv("HOSTNAME", None) + "/" + object_name,
-            )
-
-    async def sigterm_watchdog(self):
-        while not self.gracefully_exit:
-            await asyncio.sleep(5)
-
-        # Drain requests
-        while True:
-            remain_num_req = len(self.rid_to_state)
-            remaining_rids = list(self.rid_to_state.keys())
-
-            if self.server_status == ServerStatus.UnHealthy:
-                # if health check failed, we should exit immediately
-                logger.error(
-                    "Signal SIGTERM received while health check failed. Force exiting."
-                )
-                self.dump_requests_before_crash()
-                self.force_exit_handler()
-                break
-
-            elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
-                # if force shutdown flag set, exit immediately
-                logger.error(
-                    "Signal SIGTERM received while force shutdown flag set. Force exiting."
-                )
-                self.force_exit_handler()
-                break
-
-            logger.info(
-                f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
-            )
-            if remain_num_req > 0:
-                await asyncio.sleep(5)
-            else:
-                self.dump_requests_before_crash()
-                break
-
-        kill_process_tree(os.getpid(), include_parent=True)
-        sys.exit(0)
-
-    def force_exit_handler(self):
-        """Put some custom force exit logic here."""
-        pass
-
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
-            with self.watchdog.disable():
+            with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
-            self.watchdog.feed()
-
-    def _add_metric_if_present(
-        self,
-        recv_obj: Any,
-        attr_name: str,
-        meta_info: Dict[str, Any],
-        index: int,
-    ) -> None:
-        """Add a metric to meta_info if it exists and is not None.
-
-        Args:
-            recv_obj: The received object that may contain the metric attribute
-            attr_name: The name of the attribute to check
-            meta_info: The dictionary to add the metric to
-            index: The index to access the metric value in the attribute list
-        """
-        if (
-            hasattr(recv_obj, attr_name)
-            and getattr(recv_obj, attr_name)
-            and getattr(recv_obj, attr_name)[index] is not None
-        ):
-            meta_info[attr_name] = getattr(recv_obj, attr_name)[index]
+            self.soft_watchdog.feed()
 
     def _handle_batch_output(
         self,
@@ -1629,9 +1516,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
-
             if getattr(recv_obj, "output_routed_experts", None):
                 meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
+            if getattr(recv_obj, "customized_info", None):
+                for k, v in recv_obj.customized_info.items():
+                    meta_info[k] = v[i]
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
@@ -1676,12 +1565,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
-                if self.server_args.speculative_algorithm:
-                    self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
                 state.finished_time = time.time()
                 state.finished_time_perf = time.perf_counter()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
+                if self.server_args.speculative_algorithm:
+                    self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
                 if self.enable_metrics:
                     self._calculate_timing_metrics(meta_info, state, recv_obj, i)
 
@@ -1706,9 +1595,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # When skip_tokenizer_init is enabled, tokensizer_manager receives
         # BatchTokenIDOutput.
-        if self.server_args.dp_size > 1 and (
-            isinstance(recv_obj, BatchStrOutput)
-            or isinstance(recv_obj, BatchTokenIDOutput)
+        if (
+            self.server_args.dp_size > 1
+            and isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
+            and recv_obj.load is not None
         ):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
             self.send_to_scheduler.send_pyobj(load_update_req)
@@ -1771,7 +1661,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if recv_obj.input_token_logprobs_val is None:
             return
 
-        if len(recv_obj.input_token_logprobs_val) > 0:
+        if (
+            len(recv_obj.input_token_logprobs_val) > 0
+            and recv_obj.input_token_logprobs_val[recv_obj_index] is not None
+        ):
             state.input_token_logprobs_val.extend(
                 recv_obj.input_token_logprobs_val[recv_obj_index]
             )
@@ -1871,21 +1764,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         i: int,
     ) -> None:
         """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
-        meta_info["spec_accept_rate"] = 0.0
-        meta_info["spec_accept_length"] = 0
-        meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
-
-        # The draft tokens per speculative step (excluding the target-sampled token).
-        num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
-
         if (
-            recv_obj.spec_verify_ct[i] > 0
-            and num_guess_tokens is not None
-            and not isinstance(recv_obj, BatchEmbeddingOutput)
+            hasattr(recv_obj, "spec_verify_ct")
+            and recv_obj.spec_verify_ct[i] > 0
             and hasattr(recv_obj, "spec_accepted_tokens")
-            # Checks that `spec_accepted_tokens[i]` will exist.
             and len(recv_obj.spec_accepted_tokens) > i
         ):
+            # The draft tokens per speculative step (excluding the target-sampled token).
+            num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
             total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
             accepted_tokens = recv_obj.spec_accepted_tokens[i]
 
@@ -1946,6 +1832,36 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             completion_tokens = recv_obj.completion_tokens[i]
             meta_info["decode_throughput"] = completion_tokens / decode_time
 
+    def _add_metric_if_present(
+        self,
+        recv_obj: Any,
+        attr_name: str,
+        meta_info: Dict[str, Any],
+        index: int,
+    ) -> None:
+        """Add a metric to meta_info if it exists and is not None.
+
+        Args:
+            recv_obj: The received object that may contain the metric attribute
+            attr_name: The name of the attribute to check
+            meta_info: The dictionary to add the metric to
+            index: The index to access the metric value in the attribute list
+        """
+        if (
+            hasattr(recv_obj, attr_name)
+            and getattr(recv_obj, attr_name)
+            and getattr(recv_obj, attr_name)[index] is not None
+        ):
+            meta_info[attr_name] = getattr(recv_obj, attr_name)[index]
+
+    def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
+        return (
+            obj.sampling_params.get("json_schema", None)
+            or obj.sampling_params.get("regex", None)
+            or obj.sampling_params.get("ebnf", None)
+            or obj.sampling_params.get("structural_tag", None)
+        )
+
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (
             recv_obj.completion_tokens[i]
@@ -1983,13 +1899,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
-            has_grammar = (
-                state.obj.sampling_params.get("json_schema", None)
-                or state.obj.sampling_params.get("regex", None)
-                or state.obj.sampling_params.get("ebnf", None)
-                or state.obj.sampling_params.get("structural_tag", None)
-            )
-
             retraction_count = (
                 recv_obj.retraction_counts[i]
                 if getattr(recv_obj, "retraction_counts", None)
@@ -2003,7 +1912,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 completion_tokens,
                 recv_obj.cached_tokens[i],
                 state.finished_time - state.created_time,
-                has_grammar,
+                self._request_has_grammar(state.obj),
                 retraction_count,
             )
 
@@ -2051,6 +1960,107 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 pickle.dump(to_dump_with_server_args, f)
 
         asyncio.create_task(asyncio.to_thread(background_task))
+
+    def dump_requests_before_crash(
+        self, hostname: str = os.getenv("HOSTNAME", socket.gethostname())
+    ):
+        if not self.crash_dump_folder:
+            return
+
+        if self.crash_dump_performed:
+            logger.info(
+                "SIGTERM/SIGQUIT/Exception triggered, but crash dump already performed, skipping."
+            )
+            return
+        else:
+            self.crash_dump_performed = True
+
+        logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
+
+        # Add finished requests from crash_dump_request_list
+        data_to_dump = []
+        if self.crash_dump_request_list:
+            data_to_dump.extend(self.crash_dump_request_list)
+
+        # Add unfinished requests from rid_to_state
+        unfinished_requests = []
+        for rid, state in self.rid_to_state.items():
+            if not state.finished:
+                unfinished_requests.append(
+                    (
+                        state.obj,
+                        state.out_list[-1] if state.out_list else {},
+                        state.created_time,
+                        time.time(),
+                    )
+                )
+        if unfinished_requests:
+            data_to_dump.extend(unfinished_requests)
+
+        if not data_to_dump:
+            return
+
+        # Create a file
+        filename = os.path.join(
+            self.crash_dump_folder,
+            hostname,
+            f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
+        )
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+
+        # Write the data to the file
+        data_to_dump_with_server_args = {
+            "server_args": self.server_args,  # Include server_args in the dump
+            "requests": data_to_dump,
+        }
+        with open(filename, "wb") as f:
+            pickle.dump(data_to_dump_with_server_args, f)
+        logger.error(
+            f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
+        )
+        return filename
+
+    async def sigterm_watchdog(self):
+        while not self.gracefully_exit:
+            await asyncio.sleep(5)
+
+        # Drain requests
+        while True:
+            remain_num_req = len(self.rid_to_state)
+            remaining_rids = list(self.rid_to_state.keys())
+
+            if self.server_status == ServerStatus.UnHealthy:
+                # if health check failed, we should exit immediately
+                logger.error(
+                    "Signal SIGTERM received while health check failed. Force exiting."
+                )
+                self.dump_requests_before_crash()
+                self.force_exit_handler()
+                break
+
+            elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
+                # if force shutdown flag set, exit immediately
+                logger.error(
+                    "Signal SIGTERM received while force shutdown flag set. Force exiting."
+                )
+                self.force_exit_handler()
+                break
+
+            logger.info(
+                f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
+            )
+            if remain_num_req > 0:
+                await asyncio.sleep(5)
+            else:
+                self.dump_requests_before_crash()
+                break
+
+        kill_process_tree(os.getpid(), include_parent=True)
+        sys.exit(0)
+
+    def force_exit_handler(self):
+        """Put some custom force exit logic here."""
+        pass
 
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
@@ -2102,26 +2112,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # set future if the all results are received
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
-
-    def _extract_logprobs_for_tokens(
-        self, logprobs_data: List, label_token_ids: List[int]
-    ) -> Dict[int, float]:
-        """
-        Extract logprobs for specified token IDs from logprobs data.
-
-        Args:
-            logprobs_data: List of (logprob, token_id, text) tuples
-            label_token_ids: Token IDs to extract logprobs for
-
-        Returns:
-            Dictionary mapping token_id to logprob
-        """
-        logprobs = {}
-        if logprobs_data:
-            for logprob, token_id, _ in logprobs_data:
-                if token_id in label_token_ids:
-                    logprobs[token_id] = logprob
-        return logprobs
 
     async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         if isinstance(obj.lora_path, str):
@@ -2177,7 +2167,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         created_time: Optional[float] = None,
         request: Optional[fastapi.Request] = None,
-        trace_parent: Optional[str] = None,
     ):
         external_trace_header = None
         if request:
@@ -2185,11 +2174,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 trace_set_remote_propagate_context(request.headers["trace_context"])
             else:
                 external_trace_header = extract_trace_headers(request.headers)
-        elif trace_parent:
-            # When the request comes form the rust grpc server there isn't a
-            # real request object but we still need to propagate the traceparent from
-            # the traceparent that is explicitly passed in
-            external_trace_header = {"trace_parent": trace_parent}
+        elif obj.external_trace_header:
+            # When the request comes form the rust grpc server or Engine there isn't a
+            # real request object but we still need to propagate the trace context from
+            # the trace context that is explicitly passed in
+            external_trace_header = obj.external_trace_header
 
         if obj.is_single:
             bootstrap_room = (
