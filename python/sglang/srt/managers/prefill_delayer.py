@@ -69,25 +69,25 @@ class PrefillDelayer:
     def _negotiate_should_allow_prefill(
         self, local_prefillable: bool, token_usage: float
     ) -> _NegotiateOutput:
-        local_force_allow = (
+        local_token_watermark_force_allow = (
             local_prefillable
             and ((x := self._token_usage_low_watermark) is not None)
             and (token_usage < x)
         )
 
-        global_prefillable, global_force_allow = self._gather_info(
+        global_prefillable, global_token_watermark_force_allow = self._gather_info(
             local_prefillable=local_prefillable,
-            local_force_allow=local_force_allow,
+            local_token_watermark_force_allow=local_token_watermark_force_allow,
         )
         num_prefillable = global_prefillable.sum().item()
-        num_force_allow = global_force_allow.sum().item()
+        num_token_watermark_force_allow = global_token_watermark_force_allow.sum().item()
 
-        global_exists_force_allow = global_force_allow.max().item() > 0
+        global_exists_force_allow = global_token_watermark_force_allow.max().item() > 0
         if global_exists_force_allow:
             self._record_outcome_and_reset(
                 debug_outcome="token_watermark_force_allow",
                 debug_num_prefillable=num_prefillable,
-                debug_num_force_allow=num_force_allow,
+                debug_num_token_watermark_force_allow=num_token_watermark_force_allow,
             )
             return _NegotiateOutput(allow_prefill=True)
 
@@ -117,12 +117,12 @@ class PrefillDelayer:
                 )
             ),
             debug_num_prefillable=num_prefillable,
-            debug_num_force_allow=num_force_allow,
+            debug_num_token_watermark_force_allow=num_token_watermark_force_allow,
         )
         return _NegotiateOutput(allow_prefill=True)
 
     def _record_outcome_and_reset(
-        self, debug_outcome: str, debug_num_prefillable: int, debug_num_force_allow: int
+        self, debug_outcome: str, debug_num_prefillable: int, debug_num_token_watermark_force_allow: int
     ) -> None:
         if _DEBUG_LOG:
             if debug_outcome == "wait_timeout":
@@ -134,7 +134,7 @@ class PrefillDelayer:
                 logger.info(
                     f"PrefillDelayer force allow prefill due to low watermark. "
                     f"(num_prefillable={debug_num_prefillable}, "
-                    f"num_force_allow={debug_num_force_allow})"
+                    f"num_token_watermark_force_allow={debug_num_token_watermark_force_allow})"
                 )
             else:
                 assert debug_outcome in {
@@ -156,9 +156,9 @@ class PrefillDelayer:
 
         self._curr_delay_info = None
 
-    def _gather_info(self, local_prefillable: bool, local_force_allow: bool):
+    def _gather_info(self, local_prefillable: bool, local_token_watermark_force_allow: bool):
         local_info = torch.tensor(
-            [int(local_prefillable), int(local_force_allow)],
+            [int(local_prefillable), int(local_token_watermark_force_allow)],
             device="cpu",
             dtype=torch.int64,
         )
