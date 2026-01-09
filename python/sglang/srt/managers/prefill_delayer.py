@@ -82,7 +82,8 @@ class PrefillDelayer:
         num_prefillable = global_prefillable.sum().item()
         num_force_allow = global_force_allow.sum().item()
 
-        if global_force_allow.max().item() > 0:
+        global_exists_force_allow = global_force_allow.max().item() > 0
+        if global_exists_force_allow:
             self._record_outcome_and_reset(
                 debug_outcome="token_watermark_force_allow",
                 debug_num_prefillable=num_prefillable,
