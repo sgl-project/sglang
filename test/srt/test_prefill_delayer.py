@@ -237,51 +237,73 @@ class TestPrefillDelayerNegotiate(unittest.TestCase):
 
 
 class TestPrefillDelayerThroughputOnlineServing(CustomTestCase):
-    def test_1_has_prefill_delayer(self):
-        self._run(prefill_delayer=True)
+    def test_throughput_comparison(self):
+        other_launch_args = [
+            "--schedule-policy",
+            "lpm",
+        ]
+        other_benchmark_args = dict(
+            num_prompts=500,
+            random_input_len=30000,
+            random_output_len=256,
+            request_rate=32,
+        )
 
-    def test_2_no_prefill_delayer(self):
-        self._run(prefill_delayer=False)
+        res_enabled = _run_throughput_test(
+            debug_name="online_serving (prefill_delayer=True)",
+            prefill_delayer=True,
+            other_launch_args=other_launch_args,
+            other_benchmark_args=other_benchmark_args,
+        )
+        res_disabled = _run_throughput_test(
+            debug_name="online_serving (prefill_delayer=False)",
+            prefill_delayer=False,
+            other_launch_args=other_launch_args,
+            other_benchmark_args=other_benchmark_args,
+        )
 
-    def _run(self, prefill_delayer: bool):
-        _run_throughput_test(
-            debug_name=f"online_serving ({prefill_delayer=})",
-            prefill_delayer=prefill_delayer,
-            other_launch_args=[
-                # Not really needed, only to test support non-FCFS algorithms
-                "--schedule-policy",
-                "lpm",
-            ],
-            other_benchmark_args=dict(
-                num_prompts=500,
-                random_input_len=30000,
-                random_output_len=256,
-                request_rate=32,
-            ),
+        _assert_throughput_improvement(
+            self,
+            test_name="online_serving",
+            res_enabled=res_enabled,
+            res_disabled=res_disabled,
+            min_improvement_pct=-5,
         )
 
 
 class TestPrefillDelayerThroughputOfflineGen(CustomTestCase):
-    def test_1_has_prefill_delayer(self):
-        self._run(prefill_delayer=True)
+    def test_throughput_comparison(self):
+        other_launch_args = [
+            "--max-total-tokens",
+            "200000",
+        ]
+        other_benchmark_args = dict(
+            num_prompts=800,
+            random_input_len=30000,
+            random_output_len=500,
+        )
 
-    def test_2_no_prefill_delayer(self):
-        self._run(prefill_delayer=False)
-
-    def _run(self, prefill_delayer: bool):
-        _run_throughput_test(
-            debug_name=f"offline_gen ({prefill_delayer=})",
-            prefill_delayer=prefill_delayer,
-            other_benchmark_args=dict(
-                num_prompts=800,
-                random_input_len=30000,
-                random_output_len=500,
-            ),
-            other_launch_args=[
-                "--max-total-tokens",
-                "200000",
-            ],
+        res_enabled = _run_throughput_test(
+            debug_name="offline_gen (prefill_delayer=True)",
+            prefill_delayer=True,
+            other_launch_args=other_launch_args,
+            other_benchmark_args=other_benchmark_args,
             token_usage_low_watermark=0.8,
+        )
+        res_disabled = _run_throughput_test(
+            debug_name="offline_gen (prefill_delayer=False)",
+            prefill_delayer=False,
+            other_launch_args=other_launch_args,
+            other_benchmark_args=other_benchmark_args,
+            token_usage_low_watermark=0.8,
+        )
+
+        _assert_throughput_improvement(
+            self,
+            test_name="offline_gen",
+            res_enabled=res_enabled,
+            res_disabled=res_disabled,
+            min_improvement_pct=-5,
         )
 
 
@@ -318,6 +340,39 @@ def _run_throughput_test(
     print(f"=== {debug_name} ===")
     print(f"Input throughput: {res['input_throughput']:.2f} token/s")
     print(f"Output throughput: {res['output_throughput']:.2f} token/s")
+
+    return res
+
+
+def _assert_throughput_improvement(
+    test_case,
+    test_name: str,
+    res_enabled: dict,
+    res_disabled: dict,
+    min_improvement_pct: float,
+):
+    input_enabled = res_enabled["input_throughput"]
+    input_disabled = res_disabled["input_throughput"]
+    output_enabled = res_enabled["output_throughput"]
+    output_disabled = res_disabled["output_throughput"]
+
+    input_improvement_pct = (input_enabled - input_disabled) / input_disabled * 100
+    output_improvement_pct = (output_enabled - output_disabled) / output_disabled * 100
+
+    print(f"\n=== {test_name} Throughput Comparison ===")
+    print(f"Input:  enabled={input_enabled:.2f}, disabled={input_disabled:.2f}, improvement={input_improvement_pct:.2f}%")
+    print(f"Output: enabled={output_enabled:.2f}, disabled={output_disabled:.2f}, improvement={output_improvement_pct:.2f}%")
+
+    test_case.assertGreaterEqual(
+        input_improvement_pct,
+        min_improvement_pct,
+        f"{test_name}: Input throughput improvement ({input_improvement_pct:.2f}%) < {min_improvement_pct}%",
+    )
+    test_case.assertGreaterEqual(
+        output_improvement_pct,
+        min_improvement_pct,
+        f"{test_name}: Output throughput improvement ({output_improvement_pct:.2f}%) < {min_improvement_pct}%",
+    )
 
 
 class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
