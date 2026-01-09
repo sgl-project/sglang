@@ -118,11 +118,7 @@ class PrefillDelayer:
             return None, _NegotiateOutput(
                 allow_prefill=True,
                 prefillable_status="all",
-                decision=(
-                    "wait_success"
-                    if exist_previous_wait
-                    else "no_wait"
-                ),
+                decision="wait_success" if exist_previous_wait else "no_wait",
                 **debug_info,
             )
         elif global_all_not_prefillable:
@@ -134,10 +130,12 @@ class PrefillDelayer:
                 **debug_info,
             )
         else:  # some ranks are prefillable, some are not
+            prefillable_status = "mixed"
+
             if global_exists_token_watermark_force_allow:
                 return None, _NegotiateOutput(
                     allow_prefill=True,
-                    prefillable_status="mixed",
+                    prefillable_status=prefillable_status,
                     decision="token_watermark_allow",
                     **debug_info,
                 )
@@ -150,14 +148,14 @@ class PrefillDelayer:
                 )
                 return next_state, _NegotiateOutput(
                     allow_prefill=False,
-                    prefillable_status="mixed",
+                    prefillable_status=prefillable_status,
                     decision="forbid",
                     **debug_info,
                 )
             else:
                 return None, _NegotiateOutput(
                     allow_prefill=True,
-                    prefillable_status="mixed",
+                    prefillable_status=prefillable_status,
                     decision="wait_timeout_allow",
                     **debug_info,
                 )
