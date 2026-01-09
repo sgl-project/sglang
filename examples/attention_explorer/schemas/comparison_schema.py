@@ -18,6 +18,19 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from scipy import stats
 
+# Import manifest module for comprehensive experiment tracking
+try:
+    from .manifest import (
+        ExperimentManifest,
+        RunType,
+        get_git_info,
+        get_gpu_info,
+        get_hardware_info,
+    )
+    HAS_MANIFEST = True
+except ImportError:
+    HAS_MANIFEST = False
+
 
 # =============================================================================
 # Enums
@@ -193,6 +206,57 @@ def compute_kl_divergence(
     q = q / q.sum()
 
     return float(stats.entropy(p, q))
+
+
+def compute_bootstrap_ci(
+    values: List[float],
+    confidence: float = 0.95,
+    n_bootstrap: int = 1000,
+    statistic: str = "mean",
+) -> Tuple[float, float]:
+    """
+    Compute bootstrap confidence interval for a statistic.
+
+    Args:
+        values: List of observed values
+        confidence: Confidence level (default 0.95 for 95% CI)
+        n_bootstrap: Number of bootstrap resamples
+        statistic: Statistic to compute ("mean", "median", "std")
+
+    Returns:
+        Tuple of (lower_bound, upper_bound)
+    """
+    if not values or len(values) < 2:
+        return (float('nan'), float('nan'))
+
+    values_arr = np.array(values)
+    n = len(values_arr)
+
+    # Compute bootstrap distribution
+    bootstrap_stats = []
+    rng = np.random.default_rng()
+
+    for _ in range(n_bootstrap):
+        # Resample with replacement
+        resample = values_arr[rng.integers(0, n, size=n)]
+
+        if statistic == "mean":
+            bootstrap_stats.append(np.mean(resample))
+        elif statistic == "median":
+            bootstrap_stats.append(np.median(resample))
+        elif statistic == "std":
+            bootstrap_stats.append(np.std(resample))
+        else:
+            bootstrap_stats.append(np.mean(resample))
+
+    bootstrap_stats = np.array(bootstrap_stats)
+
+    # Compute percentile-based confidence interval
+    alpha = 1 - confidence
+    lower = float(np.percentile(bootstrap_stats, 100 * alpha / 2))
+    upper = float(np.percentile(bootstrap_stats, 100 * (1 - alpha / 2)))
+
+    return (lower, upper)
 
 
 def classify_quality_tier(mean_jaccard: float) -> QualityTier:
@@ -404,6 +468,43 @@ class HardwareConfig:
         d["pipeline_parallel"] = self.pipeline_parallel
         return d
 
+    @classmethod
+    def auto_detect(
+        cls,
+        attention_backend: Optional[str] = None,
+        tensor_parallel: int = 1,
+        pipeline_parallel: int = 1,
+    ) -> "HardwareConfig":
+        """
+        Auto-detect hardware configuration from the system.
+
+        Args:
+            attention_backend: Override attention backend name
+            tensor_parallel: Tensor parallel degree
+            pipeline_parallel: Pipeline parallel degree
+
+        Returns:
+            HardwareConfig with detected values
+        """
+        config = cls(
+            attention_backend=attention_backend,
+            tensor_parallel=tensor_parallel,
+            pipeline_parallel=pipeline_parallel,
+        )
+
+        if HAS_MANIFEST:
+            gpus = get_gpu_info()
+            if gpus:
+                config.gpu_count = len(gpus)
+                config.gpu_type = gpus[0].get("name")
+                memory_mb = gpus[0].get("memory_mb", 0)
+                if memory_mb:
+                    config.gpu_memory_gb = round(memory_mb / 1024, 1)
+                config.cuda_version = gpus[0].get("cuda_version")
+                config.driver_version = gpus[0].get("driver_version")
+
+        return config
+
 
 # =============================================================================
 # Comparison Report Builder
@@ -429,9 +530,18 @@ class ComparisonReportBuilder:
 
     SCHEMA_VERSION = "1.0.0"
 
-    def __init__(self):
+    def __init__(self, auto_detect_hardware: bool = False, capture_git: bool = False):
+        """
+        Initialize the comparison report builder.
+
+        Args:
+            auto_detect_hardware: If True, auto-detect GPU/hardware info
+            capture_git: If True, capture git SHA/branch info
+        """
+        import time
         self.comparison_id = str(uuid.uuid4())
         self.timestamp = datetime.utcnow().isoformat() + "Z"
+        self._start_time = time.time()
         self.baseline: Optional[ModelConfig] = None
         self.candidate: Optional[ModelConfig] = None
         self.decoding: Optional[DecodingConfig] = None
@@ -441,6 +551,7 @@ class ComparisonReportBuilder:
         self.prompt_path: Optional[str] = None
         self.harness_packs: Optional[List[PromptPack]] = None
         self.harness_duration: Optional[int] = None
+        self.harness_seed: Optional[int] = None
         self.fingerprint_enabled: bool = True
         self.fingerprint_location: str = "server"
         self.privacy_masking_enabled: bool = False
@@ -452,6 +563,13 @@ class ComparisonReportBuilder:
         self.performance_baseline_p99: Optional[float] = None
         self.performance_candidate_p99: Optional[float] = None
         self.metadata: Dict[str, Any] = {}
+        self.git_info: Optional[Dict[str, Any]] = None
+
+        if auto_detect_hardware:
+            self.hardware = HardwareConfig.auto_detect()
+
+        if capture_git and HAS_MANIFEST:
+            self.git_info = {"server": get_git_info()}
 
     def set_baseline(self, config: ModelConfig) -> "ComparisonReportBuilder":
         self.baseline = config
@@ -479,11 +597,13 @@ class ComparisonReportBuilder:
         path: Optional[str] = None,
         packs: Optional[List[PromptPack]] = None,
         duration: Optional[int] = None,
+        seed: Optional[int] = None,
     ) -> "ComparisonReportBuilder":
         self.prompt_source = source
         self.prompt_path = path
         self.harness_packs = packs
         self.harness_duration = duration
+        self.harness_seed = seed
         return self
 
     def set_performance(
@@ -587,12 +707,23 @@ class ComparisonReportBuilder:
         self.prompt_results.append(result)
         return self
 
-    def _compute_summary_metrics(self) -> Dict:
-        """Compute aggregate metrics from all prompt results."""
+    def _compute_summary_metrics(self, compute_ci: bool = True) -> Dict:
+        """
+        Compute aggregate metrics from all prompt results.
+
+        Args:
+            compute_ci: Whether to compute bootstrap confidence intervals
+                        (can be slow for large sample sizes)
+        """
         if not self.prompt_results:
             return {}
 
         jaccards = [r.jaccard for r in self.prompt_results]
+
+        # Compute bootstrap 95% confidence interval for mean Jaccard
+        ci_lower, ci_upper = (float('nan'), float('nan'))
+        if compute_ci and len(jaccards) >= 3:
+            ci_lower, ci_upper = compute_bootstrap_ci(jaccards, confidence=0.95)
 
         summary = {
             "jaccard": {
@@ -603,6 +734,9 @@ class ComparisonReportBuilder:
                 "median": float(np.median(jaccards)),
                 "p5": float(np.percentile(jaccards, 5)),
                 "p95": float(np.percentile(jaccards, 95)),
+                "ci_95_lower": ci_lower,
+                "ci_95_upper": ci_upper,
+                "sample_size": len(jaccards),
             }
         }
 
@@ -657,8 +791,13 @@ class ComparisonReportBuilder:
 
         return summary
 
-    def _compute_manifold_analysis(self) -> Optional[Dict]:
-        """Compute manifold/zone drift analysis."""
+    def _compute_manifold_analysis(self, compute_ci: bool = True) -> Optional[Dict]:
+        """
+        Compute manifold/zone drift analysis.
+
+        Args:
+            compute_ci: Whether to compute bootstrap confidence intervals
+        """
         results_with_zones = [
             r for r in self.prompt_results
             if r.baseline_zone and r.candidate_zone
@@ -667,9 +806,15 @@ class ComparisonReportBuilder:
         if not results_with_zones:
             return None
 
-        # Zone drift rate
-        drifts = [r.zone_drift for r in results_with_zones]
+        # Zone drift rate with confidence interval
+        # Convert bool to float for bootstrap
+        drifts = [float(r.zone_drift) for r in results_with_zones]
         zone_drift_rate = sum(drifts) / len(drifts)
+
+        # Compute CI for drift rate (treating as proportion)
+        drift_ci_lower, drift_ci_upper = (float('nan'), float('nan'))
+        if compute_ci and len(drifts) >= 3:
+            drift_ci_lower, drift_ci_upper = compute_bootstrap_ci(drifts, confidence=0.95)
 
         # Zone transition matrix
         transition_matrix: Dict[str, Dict[str, int]] = {}
@@ -685,12 +830,15 @@ class ComparisonReportBuilder:
         for pack in PromptPack:
             pack_results = [r for r in results_with_zones if r.prompt_pack == pack]
             if pack_results:
-                drift_by_pack[pack.value] = sum(r.zone_drift for r in pack_results) / len(pack_results)
+                drift_by_pack[pack.value] = sum(float(r.zone_drift) for r in pack_results) / len(pack_results)
 
         return {
             "zone_drift_rate": zone_drift_rate,
+            "zone_drift_ci_95_lower": drift_ci_lower,
+            "zone_drift_ci_95_upper": drift_ci_upper,
             "zone_transition_matrix": transition_matrix,
             "drift_by_pack": drift_by_pack if drift_by_pack else None,
+            "sample_size": len(results_with_zones),
         }
 
     def _build_performance_metrics(self) -> Optional[Dict]:

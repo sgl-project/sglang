@@ -61,8 +61,10 @@ Alternative HTTP-only mode (for debugging):
 import argparse
 import json
 import os
+import shutil
 import sqlite3
 import struct
+import tempfile
 import time
 import threading
 from collections import deque
@@ -71,6 +73,20 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 from dataclasses import dataclass, asdict, field
 from enum import Enum
+
+# Import manifest for git/hardware info in /version endpoint
+try:
+    from schemas.manifest import get_git_sha, get_git_branch
+    HAS_MANIFEST = True
+except ImportError:
+    HAS_MANIFEST = False
+    def get_git_sha():
+        return None
+    def get_git_branch():
+        return None
+
+# Sidecar version
+SIDECAR_VERSION = "1.0.0"
 
 # Try to import discovery classifier
 try:
@@ -398,16 +414,42 @@ class BlessedConfigStorage:
             self._configs = {}
 
     def _save(self):
-        """Save configs to JSON file."""
+        """Save configs to JSON file with atomic write (temp file + rename)."""
+        temp_fd = None
+        temp_path = None
         try:
             self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.storage_path, "w") as f:
+
+            # Write to temporary file first
+            temp_fd, temp_path = tempfile.mkstemp(
+                dir=self.storage_path.parent,
+                prefix=".blessed_configs_",
+                suffix=".tmp"
+            )
+            with os.fdopen(temp_fd, 'w') as f:
+                temp_fd = None  # Prevent double-close
                 json.dump({
                     "configs": list(self._configs.values()),
                     "updated_at": time.time(),
                 }, f, indent=2)
+
+            # Atomic rename (on POSIX systems)
+            shutil.move(temp_path, self.storage_path)
+            temp_path = None  # Success, don't delete
         except Exception as e:
             print(f"Warning: Failed to save blessed configs: {e}")
+        finally:
+            # Clean up temp file on failure
+            if temp_fd is not None:
+                try:
+                    os.close(temp_fd)
+                except Exception:
+                    pass
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
 
     def get_all(self) -> List[Dict]:
         """Get all blessed configs."""
@@ -1117,6 +1159,22 @@ class SidecarHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/health":
             self._send_json({"status": "ok"})
 
+        elif parsed.path == "/healthz":
+            # Kubernetes-style health check alias
+            self._send_json({"status": "ok"})
+
+        elif parsed.path == "/version":
+            # Version info with git SHA for reproducibility
+            self._send_json({
+                "version": SIDECAR_VERSION,
+                "git_sha": get_git_sha(),
+                "git_branch": get_git_branch(),
+                "backend": self.sidecar.backend.value,
+                "has_discovery": self.sidecar._discovery is not None,
+                "has_storage": self.sidecar._storage is not None,
+                "has_blessed_configs": self.sidecar._blessed_storage is not None,
+            })
+
         elif parsed.path == "/discovery/status":
             # Get discovery integration status
             data = self.sidecar.get_discovery_status()
@@ -1208,10 +1266,21 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self._send_json({"status": "storage_disabled"})
 
         elif parsed.path == "/blessed-configs":
-            # Add or update a blessed config
+            # Add or update a blessed config with schema validation
             content_len = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_len)
-            data = json.loads(body)
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                self.send_error(400, f"Invalid JSON: {e}")
+                return
+
+            # Schema validation for blessed configs
+            errors = self._validate_blessed_config(data)
+            if errors:
+                self._send_json_error(400, f"Validation failed: {'; '.join(errors)}")
+                return
 
             success = self.sidecar.add_blessed_config(data)
             if success:
@@ -1220,7 +1289,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                     "config_id": data.get("id"),
                 })
             else:
-                self.send_error(400, "Failed to save config (missing 'id' or storage disabled)")
+                self._send_json_error(400, "Storage disabled or write failed")
 
         else:
             self.send_error(404)
@@ -1246,6 +1315,62 @@ class SidecarHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', len(response))
         self.end_headers()
         self.wfile.write(response)
+
+    def _send_json_error(self, status_code: int, message: str):
+        """Send a JSON error response."""
+        response = json.dumps({"error": message}).encode()
+        self.send_response(status_code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(response))
+        self.end_headers()
+        self.wfile.write(response)
+
+    def _validate_blessed_config(self, config: Dict) -> List[str]:
+        """
+        Validate a blessed config against expected schema.
+
+        Required fields:
+        - id: string (unique identifier)
+        - model_id: string (model identifier)
+        - quantization: dict with at least 'method' field
+
+        Returns list of validation errors (empty if valid).
+        """
+        errors = []
+
+        # Check required top-level fields
+        if not isinstance(config, dict):
+            return ["Config must be a JSON object"]
+
+        if "id" not in config:
+            errors.append("Missing required field 'id'")
+        elif not isinstance(config["id"], str) or not config["id"].strip():
+            errors.append("'id' must be a non-empty string")
+
+        if "model_id" not in config:
+            errors.append("Missing required field 'model_id'")
+        elif not isinstance(config["model_id"], str):
+            errors.append("'model_id' must be a string")
+
+        # Validate quantization config
+        if "quantization" not in config:
+            errors.append("Missing required field 'quantization'")
+        elif not isinstance(config["quantization"], dict):
+            errors.append("'quantization' must be an object")
+        else:
+            quant = config["quantization"]
+            if "method" not in quant:
+                errors.append("quantization missing required field 'method'")
+            elif quant["method"] not in ["none", "sinq", "asinq", "awq", "gptq", "squeezellm", "fp8", "marlin"]:
+                errors.append(f"quantization.method '{quant['method']}' is not a recognized method")
+
+            # Validate optional numeric fields
+            if "nbits" in quant and not isinstance(quant["nbits"], int):
+                errors.append("quantization.nbits must be an integer")
+            if "group_size" in quant and not isinstance(quant["group_size"], int):
+                errors.append("quantization.group_size must be an integer")
+
+        return errors
 
     def log_message(self, format, *args):
         pass  # Suppress logging

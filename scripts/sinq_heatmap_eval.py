@@ -50,6 +50,15 @@ import seaborn as sns
 # Model loading
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# Import manifest module for reproducibility layer
+try:
+    # Try to import from attention_explorer schemas
+    sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "attention_explorer"))
+    from schemas.manifest import ExperimentManifest, RunType
+    HAS_MANIFEST = True
+except ImportError:
+    HAS_MANIFEST = False
+
 
 # ============================================================================
 # CONFIGURATION
@@ -991,8 +1000,14 @@ def main():
     parser.add_argument("--methods", nargs="+", choices=["sinq", "asinq"], help="Specific methods")
     parser.add_argument("--max-tokens", type=int, default=64, help="Max tokens to generate")
     parser.add_argument("--schema-v1", action="store_true", help="Export in Quantization Comparison Schema v1 format")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
 
     args = parser.parse_args()
+
+    # Set random seed if provided
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
 
     # Setup output directory
     output_dir = Path(args.output)
@@ -1016,6 +1031,33 @@ def main():
                         group_size=group_size,
                         method=method,
                     ))
+
+    # Create experiment manifest for reproducibility
+    manifest = None
+    run_id = datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
+    if HAS_MANIFEST:
+        manifest = ExperimentManifest.create(
+            run_type=RunType.EVALUATION,
+            run_id=run_id,
+            model_id=args.model,
+            capture_git=True,
+            capture_hardware=True,
+        )
+        manifest.set_decoding(
+            max_tokens=args.max_tokens,
+            temperature=0.0,  # Greedy for reproducibility
+            seed=args.seed,
+        )
+        manifest.set_parameters({
+            "quick_mode": args.quick,
+            "prompt_count": len(prompts),
+            "config_count": len(configs),
+            "nbits_tested": nbits_to_test,
+            "methods_tested": methods_to_test,
+            "tiling_modes": TILING_OPTIONS,
+            "group_sizes": GROUP_SIZE_OPTIONS,
+        })
+        print(f"Manifest created for run: {run_id}")
 
     print(f"\n{'='*60}")
     print(f"SINQ COMPREHENSIVE EVALUATION")
@@ -1066,6 +1108,38 @@ def main():
     # Export Schema v1 if requested
     if args.schema_v1:
         export_all_schema_v1(results, args.model, prompts, output_dir)
+
+    # Finalize and save experiment manifest
+    if HAS_MANIFEST and manifest:
+        # Compute aggregate statistics across all configs
+        mean_jaccards = [r.mean_jaccard for r in results if r.mean_jaccard is not None]
+        best_config = max(results, key=lambda r: r.mean_jaccard if r.mean_jaccard else 0)
+
+        manifest.set_statistics({
+            "total_configs_tested": len(configs),
+            "successful_configs": len([r for r in results if r.mean_jaccard is not None]),
+            "total_duration_seconds": total_time,
+            "overall_mean_jaccard": np.mean(mean_jaccards) if mean_jaccards else None,
+            "overall_std_jaccard": np.std(mean_jaccards) if mean_jaccards else None,
+            "best_config": {
+                "name": best_config.config.name,
+                "mean_jaccard": best_config.mean_jaccard,
+                "zone_drift_rate": best_config.zone_drift_rate,
+                "compression_ratio": best_config.compression_ratio,
+            } if best_config.mean_jaccard else None,
+        })
+
+        # Add artifact references
+        manifest.add_artifact("results_json", str(output_dir / "results.json"))
+        manifest.add_artifact("heatmap_jaccard", str(output_dir / "heatmap_jaccard.png"))
+        manifest.add_artifact("heatmap_zone_drift", str(output_dir / "heatmap_zone_drift.png"))
+        manifest.add_artifact("pareto_plot", str(output_dir / "pareto_compression_vs_quality.png"))
+
+        # Finalize and save
+        manifest.finalize()
+        manifest_path = output_dir / "manifest.json"
+        manifest.save(str(manifest_path))
+        print(f"\nManifest saved to: {manifest_path}")
 
     return 0
 
