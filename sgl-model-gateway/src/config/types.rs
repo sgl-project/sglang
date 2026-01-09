@@ -341,8 +341,16 @@ pub enum PolicyConfig {
     /// - X-SMG-Routing-Key: Routes to a cached worker or assigns a new one
     /// - Provides true sticky sessions with zero key redistribution on worker add
     /// - Falls back to random selection if no routing key is provided
+    /// - Supports LRU eviction when cache size exceeds max_entries
     #[serde(rename = "manual")]
-    Manual,
+    Manual {
+        /// Interval between TTL eviction cycles (seconds, default: 60)
+        #[serde(default = "default_manual_eviction_interval_secs")]
+        eviction_interval_secs: u64,
+        /// Maximum idle time before eviction (seconds, default: 14400 = 4 hours)
+        #[serde(default = "default_manual_max_idle_secs")]
+        max_idle_secs: u64,
+    },
 
     /// Consistent hashing policy using hash ring for session affinity:
     /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
@@ -350,6 +358,38 @@ pub enum PolicyConfig {
     /// - Provides O(log n) lookup with minimal redistribution (~1/N keys) on topology change
     #[serde(rename = "consistent_hashing")]
     ConsistentHashing,
+
+    /// Prefix hash policy for KV cache-aware load balancing.
+    /// A lightweight alternative to cache_aware radix tree.
+    /// Routes requests based on prefix token hash for cache locality.
+    /// - Uses consistent hash ring with bounded load balancing
+    /// - Walks ring if worker is overloaded (load > avg * load_factor)
+    /// - O(log n) lookup instead of O(prefix_len) radix tree traversal
+    #[serde(rename = "prefix_hash")]
+    PrefixHash {
+        /// Number of prefix tokens to hash (default: 256)
+        #[serde(default = "default_prefix_token_count")]
+        prefix_token_count: usize,
+        /// Load factor threshold - walk ring if load > avg * factor (default: 1.25)
+        #[serde(default = "default_load_factor")]
+        load_factor: f64,
+    },
+}
+
+fn default_prefix_token_count() -> usize {
+    256
+}
+
+fn default_load_factor() -> f64 {
+    1.25
+}
+
+fn default_manual_eviction_interval_secs() -> u64 {
+    60
+}
+
+fn default_manual_max_idle_secs() -> u64 {
+    4 * 3600
 }
 
 impl PolicyConfig {
@@ -360,8 +400,9 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::Bucket { .. } => "bucket",
-            PolicyConfig::Manual => "manual",
+            PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
+            PolicyConfig::PrefixHash { .. } => "prefix_hash",
         }
     }
 }

@@ -565,9 +565,10 @@ impl PDRouter {
         );
 
         // Send both requests concurrently and wait for both
+        // Note: Using borrowed references avoids heap allocation
         events::RequestPDSentEvent {
-            prefill_url: prefill.url().to_string(),
-            decode_url: decode.url().to_string(),
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
         }
         .emit();
 
@@ -709,7 +710,7 @@ impl PDRouter {
 
         let prefill_workers = if let Some(model) = effective_model_id {
             self.worker_registry
-                .get_by_model_fast(model)
+                .get_by_model(model)
                 .iter()
                 .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
                 .cloned()
@@ -720,7 +721,7 @@ impl PDRouter {
 
         let decode_workers = if let Some(model) = effective_model_id {
             self.worker_registry
-                .get_by_model_fast(model)
+                .get_by_model(model)
                 .iter()
                 .filter(|w| matches!(w.worker_type(), WorkerType::Decode))
                 .cloned()
@@ -806,6 +807,7 @@ impl PDRouter {
                 &available_workers,
                 &SelectWorkerInfo {
                     request_text,
+                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
                     headers,
                     hash_ring,
                 },
@@ -833,7 +835,7 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
-        use crate::core::attach_guards_to_response;
+        use crate::core::AttachedBody;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -883,7 +885,7 @@ impl PDRouter {
         // Attach load guards to response body for proper RAII lifecycle
         // Guards are dropped when response body is consumed or client disconnects
         let guards = vec![WorkerLoadGuard::new(prefill), WorkerLoadGuard::new(decode)];
-        attach_guards_to_response(guards, response)
+        AttachedBody::wrap_response(response, guards)
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -1043,17 +1045,7 @@ impl PDRouter {
         }
         if let Some(headers) = headers {
             for (name, value) in headers.iter() {
-                let name_lc = name.as_str().to_ascii_lowercase();
-                // Whitelist important end-to-end headers, skip hop-by-hop
-                let forward = matches!(
-                    name_lc.as_str(),
-                    "authorization"
-                    | "x-request-id"
-                    | "x-correlation-id"
-                    | "traceparent"      // W3C Trace Context
-                    | "tracestate" // W3C Trace Context
-                ) || name_lc.starts_with("x-request-id-");
-                if forward {
+                if header_utils::should_forward_request_header(name.as_str()) {
                     if let Ok(val) = value.to_str() {
                         request = request.header(name, val);
                     }
