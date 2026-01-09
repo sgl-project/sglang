@@ -501,11 +501,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self._attach_multi_http_worker_info(obj)
 
         # Log the request
-<<<<<<< HEAD
         self.request_logger.log_received_request(obj, self.tokenizer, request)
-=======
-        self.request_logger.log_received_request(obj, self.tokenizer)
->>>>>>> f9d658354 (clean)
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
