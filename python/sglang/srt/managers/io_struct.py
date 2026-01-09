@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import copy
 import uuid
-import numpy as np
+
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
+import numpy as np
 import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
