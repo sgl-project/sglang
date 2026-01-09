@@ -64,12 +64,10 @@ class PrefillDelayer:
             and (token_usage < x)
         )
 
-        tp0_info = self._gather_info(
+        global_prefillable, global_force_allow = self._gather_info(
             local_prefillable=local_prefillable,
             local_force_allow=local_force_allow,
         )
-        global_prefillable = tp0_info[:, 0]
-        global_force_allow = tp0_info[:, 1]
 
         if global_force_allow.max().item() > 0:
             if _DEBUG_LOG:
@@ -128,7 +126,7 @@ class PrefillDelayer:
             group=self.cpu_group,
         )
         tp0_info = self._global_info_buffer[:, 0, :]
-        return tp0_info
+        return tp0_info[:, 0], tp0_info[:, 1]
 
 
 class PrefillDelayerSinglePassExecutor:
