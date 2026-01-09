@@ -97,7 +97,9 @@ class PrefillDelayer:
         is_timeout = global_mixed_prefillable
         self._reset(
             outcome=(
-                "wait_timeout" if is_timeout else (
+                "wait_timeout"
+                if is_timeout
+                else (
                     "wait_success_all_prefillable"
                     if self._curr_delay_info is not None
                     else "no_wait_all_prefillable"
@@ -108,7 +110,9 @@ class PrefillDelayer:
         )
         return True
 
-    def _reset(self, outcome: str, debug_num_prefillable: int, debug_num_force_allow: int) -> None:
+    def _reset(
+        self, outcome: str, debug_num_prefillable: int, debug_num_force_allow: int
+    ) -> None:
         if _DEBUG_LOG:
             if outcome == "timeout":
                 logger.info(
