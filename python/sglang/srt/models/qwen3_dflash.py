@@ -478,10 +478,6 @@ class Qwen3ForCausalLMDFlash(nn.Module):
         
         params_dict = dict(self.named_parameters())
         
-        # #region agent log
-        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "K", "location": "qwen3_dflash.py:load_weights", "message": "Weight loading started", "data": {"num_params": len(params_dict), "sample_param_keys": list(params_dict.keys())[:10]}, "timestamp": __import__('time').time()}) + '\n')
-        # #endregion
-        
         loaded_count = 0
         skipped_weights = []
         
@@ -546,14 +542,6 @@ class Qwen3ForCausalLMDFlash(nn.Module):
                     loaded_count += 1
                 else:
                     skipped_weights.append({"param": param_name, "reason": "incomplete stacked weights"})
-        
-        # #region agent log
-        # Log final param norms to verify loading
-        param_norms = {}
-        for pname in list(params_dict.keys())[:15]:  # First 15 params
-            param_norms[pname] = float(params_dict[pname].data.norm().cpu())
-        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "K", "location": "qwen3_dflash.py:load_weights", "message": "Weight loading complete", "data": {"loaded_count": loaded_count, "skipped_count": len(skipped_weights), "skipped_samples": skipped_weights[:20], "stacked_buffer_keys": list(stacked_weight_buffer.keys()), "param_norms": param_norms}, "timestamp": __import__('time').time()}) + '\n')
-        # #endregion
 
 
 # Backward compatibility alias

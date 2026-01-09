@@ -78,9 +78,6 @@ class DFlashWorker:
         if hasattr(target_model, 'set_eagle3_layers_to_capture'):
             logger.info(f"DFlash target_layer_ids: {self.target_layer_ids}")
             target_model.set_eagle3_layers_to_capture(self.target_layer_ids)
-            # #region agent log
-            import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "O", "location": "dflash_worker.py:80", "message": "Configured target model for aux_hidden_states", "data": {"target_layer_ids": self.target_layer_ids, "capture_aux_hidden_states": getattr(target_model, 'capture_aux_hidden_states', None), "layers_to_capture": getattr(target_model.model, 'layers_to_capture', None) if hasattr(target_model, 'model') else None}, "timestamp": __import__('time').time()}) + '\n')
-            # #endregion
 
         # Per-request state for hidden states and metadata
         self._request_state: Dict[str, dict] = {}
@@ -248,10 +245,6 @@ class DFlashWorker:
         next_token_ids = batch_result.next_token_ids
         hidden_states = logits_output.hidden_states
         
-        # #region agent log
-        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "P", "location": "dflash_worker.py:225", "message": "Prefill hidden states", "data": {"has_hidden_states": hidden_states is not None, "hidden_states_shape": list(hidden_states.shape) if hidden_states is not None else None, "hidden_states_dim": hidden_states.shape[-1] if hidden_states is not None else None, "expected_dim": 5 * 2560}, "timestamp": __import__('time').time()}) + '\n')
-        # #endregion
-        
         # Store hidden states per request
         token_offset = 0
         
@@ -352,10 +345,6 @@ class DFlashWorker:
         # ===== Step 4: Update state and evict rejected cache =====
         accept_length_list = verify_input.accept_length.cpu().tolist()
         new_hidden_states = logits_output.hidden_states
-        
-        # #region agent log
-        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "O", "location": "dflash_worker.py:323", "message": "Hidden states from verification", "data": {"has_hidden_states": new_hidden_states is not None, "hidden_states_shape": list(new_hidden_states.shape) if new_hidden_states is not None else None, "hidden_states_dim": new_hidden_states.shape[-1] if new_hidden_states is not None else None, "expected_dim": 5 * 2560}, "timestamp": __import__('time').time()}) + '\n')
-        # #endregion
         
         for i, req in enumerate(batch.reqs):
             state = self._get_request_state(req.rid)
@@ -750,29 +739,11 @@ class DFlashWorker:
             
             noise_embedding = self.embed_tokens(block_output_ids)  # [1, block_size, hidden]
             
-            # #region agent log
-            if i == 0:
-                import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "R", "location": "dflash_worker.py:458", "message": "Noise embedding", "data": {"noise_embedding_shape": list(noise_embedding.shape), "noise_embedding_norm": float(noise_embedding.norm().cpu()), "block_output_ids": block_output_ids.tolist(), "first_token_embed_norm": float(noise_embedding[0, 0].norm().cpu()), "mask_token_embed_norm": float(noise_embedding[0, 1].norm().cpu())}, "timestamp": __import__('time').time()}) + '\n')
-            # #endregion
-            
             # Project and normalize target hidden
             hidden_size = self.draft_model.model.hidden_size
-            # #region agent log
-            if i == 0:
-                import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "N", "location": "dflash_worker.py:452", "message": "Before fc projection", "data": {"target_hidden_shape": list(target_hidden.shape), "hidden_size": hidden_size, "needs_projection": target_hidden.shape[-1] != hidden_size, "target_hidden_last_dim": target_hidden.shape[-1]}, "timestamp": __import__('time').time()}) + '\n')
-            # #endregion
             if target_hidden.shape[-1] != hidden_size:
                 target_hidden = self.draft_model.model.fc(target_hidden)
-                # #region agent log
-                if i == 0:
-                    import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "N", "location": "dflash_worker.py:456", "message": "After fc projection", "data": {"target_hidden_shape": list(target_hidden.shape), "target_hidden_norm": float(target_hidden.norm().cpu())}, "timestamp": __import__('time').time()}) + '\n')
-                # #endregion
             target_hidden = self.draft_model.model.hidden_norm(target_hidden)
-            
-            # #region agent log
-            if i == 0:
-                import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "Q", "location": "dflash_worker.py:474", "message": "DFlash input tensors (req 0)", "data": {"target_hidden_shape": list(target_hidden.shape), "noise_embedding_shape": list(noise_embedding.shape), "ctx_len": ctx_len, "block_size": block_size, "target_hidden_norm": float(target_hidden.norm().cpu()), "noise_embedding_norm": float(noise_embedding.norm().cpu())}, "timestamp": __import__('time').time()}) + '\n')
-            # #endregion
             
             # ORIGINAL DFLASH ATTENTION PATTERN:
             # Q: from noise only
@@ -835,10 +806,6 @@ class DFlashWorker:
                     k = k.view(total_len, num_kv_heads, head_dim)
                     v = v.view(total_len, num_kv_heads, head_dim)
                     
-                    # #region agent log - Compare step by step
-                    if layer_idx == 0 and i == 0:
-                        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "T", "location": "step1_view", "message": "After view to 3D", "data": {"q_shape": list(q.shape), "k_shape": list(k.shape), "v_shape": list(v.shape), "q_norm": float(q.norm().cpu()), "k_norm": float(k.norm().cpu())}, "timestamp": __import__('time').time()}) + '\n')
-                    # #endregion
                     
                     # Step 2: Apply Q/K normalization
                     # SGLang RMSNorm kernel requires 2D input, so reshape: [seq, heads, dim] -> [seq*heads, dim]
@@ -850,20 +817,10 @@ class DFlashWorker:
                     q = q_2d.view(block_size, num_heads, head_dim)
                     k = k_2d.view(total_len, num_kv_heads, head_dim)
                     
-                    # #region agent log
-                    if layer_idx == 0 and i == 0:
-                        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "T", "location": "step2_norm", "message": "After Q/K norm (ORIGINAL: Q=378, K=210)", "data": {"q_shape": list(q.shape), "q_norm": float(q.norm().cpu()), "k_norm": float(k.norm().cpu()), "v_norm": float(v.norm().cpu()), "EXPECT_Q": 378.0, "EXPECT_K": 210.0, "EXPECT_V": 324.0}, "timestamp": __import__('time').time()}) + '\n')
-                    # #endregion
-                    
                     # Step 3: Transpose to [heads, seq, head_dim] (BEFORE rotary, like original)
                     q = q.transpose(0, 1)  # [num_heads, block_size, head_dim]
                     k = k.transpose(0, 1)  # [num_kv_heads, total_len, head_dim]
                     v = v.transpose(0, 1)  # [num_kv_heads, total_len, head_dim]
-                    
-                    # #region agent log
-                    if layer_idx == 0 and i == 0:
-                        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "T", "location": "step3_transpose", "message": "After transpose", "data": {"q_shape": list(q.shape), "k_shape": list(k.shape)}, "timestamp": __import__('time').time()}) + '\n')
-                    # #endregion
                     
                     # Step 4: Apply rotary embeddings (on transposed tensors)
                     if layer.self_attn.rotary_emb.cos_sin_cache.dtype != torch.float32:
@@ -871,12 +828,6 @@ class DFlashWorker:
                     
                     cos_sin_cache = layer.self_attn.rotary_emb.cos_sin_cache
                     rotary_dim = cos_sin_cache.shape[-1] // 2
-                    
-                    # #region agent log
-                    if layer_idx == 0 and i == 0:
-                        # Check actual rotary config
-                        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "T", "location": "rotary_config", "message": "Rotary embedding config", "data": {"cos_sin_cache_shape": list(cos_sin_cache.shape), "computed_rotary_dim": rotary_dim, "head_dim": head_dim, "rotary_emb_rotary_dim": getattr(layer.self_attn.rotary_emb, 'rotary_dim', 'N/A'), "rotary_emb_head_size": getattr(layer.self_attn.rotary_emb, 'head_size', 'N/A')}, "timestamp": __import__('time').time()}) + '\n')
-                    # #endregion
                     
                     # Get cos/sin for Q (noise positions) and K (all positions)
                     cos_sin_q = cos_sin_cache.index_select(0, noise_positions)  # [block_size, rotary_dim*2]
@@ -915,11 +866,6 @@ class DFlashWorker:
                     k_o2 = k2 * cos_k_bc + k1 * sin_k_bc
                     k = torch.cat((k_o1, k_o2), dim=-1)  # [num_kv_heads, total_len, 128]
                     
-                    # #region agent log
-                    if layer_idx == 0 and i == 0:
-                        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "T", "location": "step4_rotary", "message": "After rotary", "data": {"q_shape": list(q.shape), "k_shape": list(k.shape), "q_norm": float(q.norm().cpu()), "k_norm": float(k.norm().cpu()), "rotary_dim": rotary_dim}, "timestamp": __import__('time').time()}) + '\n')
-                    # #endregion
-                    
                     # Expand KV for GQA
                     num_kv_groups = layer.self_attn.num_heads // layer.self_attn.num_kv_heads
                     if num_kv_groups > 1:
@@ -935,27 +881,7 @@ class DFlashWorker:
                     attn_weights = torch.matmul(q, k.transpose(-2, -1)) * layer.self_attn.scaling
                     attn_weights = torch.softmax(attn_weights, dim=-1)
                     
-                    # #region agent log
-                    if layer_idx == 0 and i == 0:
-                        # Check attention distribution for first layer, first request
-                        # attn_weights: [num_heads, block_size, total_len]
-                        avg_attn = attn_weights.mean(dim=0)  # [block_size, total_len]
-                        # Check where position 1 (second noise token) is attending
-                        pos1_attn = avg_attn[1]  # [total_len]
-                        max_attn_pos = pos1_attn.argmax().item()
-                        max_attn_val = pos1_attn.max().item()
-                        # Check attention to different regions
-                        attn_to_target = pos1_attn[:ctx_len].sum().item()
-                        attn_to_noise = pos1_attn[ctx_len:].sum().item()
-                        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "S", "location": "dflash_worker.py:attn", "message": "Attention distribution (layer 0, pos 1)", "data": {"total_len": total_len, "ctx_len": ctx_len, "max_attn_pos": max_attn_pos, "max_attn_val": max_attn_val, "attn_to_target": attn_to_target, "attn_to_noise": attn_to_noise, "scaling": layer.self_attn.scaling, "q_norm": float(q.norm().cpu()), "k_norm": float(k.norm().cpu())}, "timestamp": __import__('time').time()}) + '\n')
-                    # #endregion
-                    
                     attn_output = torch.matmul(attn_weights, v)
-                    
-                    # #region agent log
-                    if layer_idx == 0 and i == 0:
-                        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "T", "location": "step6_attn_out", "message": "Attn output (ORIGINAL: 378)", "data": {"attn_output_shape": list(attn_output.shape), "attn_output_norm": float(attn_output.norm().cpu()), "EXPECT": 378.0}, "timestamp": __import__('time').time()}) + '\n')
-                    # #endregion
                     
                     # Reshape and project: [num_heads, block_size, head_dim] -> [block_size, hidden]
                     attn_output = attn_output.transpose(0, 1).contiguous().view(block_size, -1)
@@ -971,38 +897,16 @@ class DFlashWorker:
                     residual = noise_hidden
                     mlp_input = layer.post_attention_layernorm(noise_hidden)
                     mlp_output = layer.mlp(mlp_input)
-                    
-                    # #region agent log
-                    if layer_idx == 0 and i == 0:
-                        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "T", "location": "step7_after_mlp", "message": "After MLP (noise_hidden + mlp_output)", "data": {"noise_hidden_pre_mlp_norm": float(residual.norm().cpu()), "mlp_output_norm": float(mlp_output.norm().cpu())}, "timestamp": __import__('time').time()}) + '\n')
-                    # #endregion
                     noise_hidden = residual + mlp_output
-                    
-                    # #region agent log
-                    if layer_idx == 0 and i == 0:
-                        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "T", "location": "step8_layer_out", "message": "Layer 0 output (ORIGINAL: 8704)", "data": {"layer_output_norm": float(noise_hidden.norm().cpu()), "EXPECT": 8704.0}, "timestamp": __import__('time').time()}) + '\n')
-                    # #endregion
                 
                 # Final norm
                 draft_hidden = self.draft_model.model.norm(noise_hidden)  # [block_size, hidden]
-            
-            # #region agent log
-            import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "Q", "location": "dflash_worker.py:574", "message": "Draft output (original DFlash attention)", "data": {"draft_hidden_shape": list(draft_hidden.shape), "block_size": block_size, "total_len": total_len, "ctx_len": ctx_len, "draft_hidden_norm": float(draft_hidden.norm().cpu())}, "timestamp": __import__('time').time()}) + '\n')
-            # #endregion
             
             # Get draft logits
             draft_hidden_for_logits = draft_hidden[1:, :]  # Skip first position
             draft_logits = torch.matmul(draft_hidden_for_logits, self.lm_head_weight.t())
             
-            # #region agent log
-            import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "M", "location": "dflash_worker.py:549", "message": "Draft logits computed", "data": {"draft_logits_shape": list(draft_logits.shape), "draft_logits_max": float(draft_logits.max().cpu()), "draft_logits_min": float(draft_logits.min().cpu()), "lm_head_shape": list(self.lm_head_weight.shape)}, "timestamp": __import__('time').time()}) + '\n')
-            # #endregion
-            
             block_output_ids[:, 1:] = torch.argmax(draft_logits, dim=-1)
-            
-            # #region agent log
-            import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "ALL", "location": "dflash_worker.py:553", "message": "Draft tokens generated", "data": {"block_output_ids": block_output_ids.tolist(), "verified_id_used": verified_id.item() if isinstance(verified_id, torch.Tensor) else verified_id}, "timestamp": __import__('time').time()}) + '\n')
-            # #endregion
             
             all_draft_tokens.append(block_output_ids.flatten())
             current_seq_len = batch.seq_lens[i].item()
@@ -1012,10 +916,6 @@ class DFlashWorker:
         
         draft_tokens = torch.cat(all_draft_tokens, dim=0)
         positions = torch.cat(all_positions, dim=0)
-        
-        # #region agent log
-        import json as _json; open('/sgl-workspace/.cursor/debug.log', 'a').write(_json.dumps({"hypothesisId": "ALL", "location": "dflash_worker.py:557", "message": "Sequential draft forward COMPLETE", "data": {"draft_tokens_shape": list(draft_tokens.shape), "positions_shape": list(positions.shape), "num_requests": len(batch.reqs)}, "timestamp": __import__('time').time()}) + '\n')
-        # #endregion
         
         return draft_tokens, positions
 
