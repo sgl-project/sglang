@@ -134,7 +134,7 @@ class PrefillDelayer:
             if global_exists_token_watermark_force_allow:
                 return None, _NegotiateOutput(
                     allow_prefill=True,
-                    outcome="token_watermark_force_allow",
+                    outcome="token_watermark_allow_mixed_prefillable",
                     **debug_info,
                 )
 
@@ -152,7 +152,7 @@ class PrefillDelayer:
 
             return None, _NegotiateOutput(
                 allow_prefill=True,
-                outcome="wait_timeout_mixed_prefillable",
+                outcome="wait_timeout_allow_mixed_prefillable",
                 **debug_info,
             )
 
