@@ -188,7 +188,7 @@ class PrefillDelayerSinglePassExecutor:
             self.negotiate_should_allow_prefill(local_prefillable=False)
 
         _record_single_pass_result(
-            actual_prefill=TODO,
+            actual_prefill=actual_prefill,
             decision=self._result.decision,
             num_prefillable=self._result.num_prefillable,
             num_token_watermark_force_allow=self._result.num_token_watermark_force_allow,
@@ -205,6 +205,7 @@ class PrefillDelayerSinglePassExecutor:
 
 
 def _record_single_pass_result(
+    actual_prefill: bool,
     decision: str,
     num_prefillable: int,
     num_token_watermark_force_allow: int,
@@ -239,4 +240,5 @@ def _record_single_pass_result(
             forward_passes=forward_passes,
             wait_seconds=wait_seconds,
             decision=decision,
+            actual_prefill=actual_prefill,
         )

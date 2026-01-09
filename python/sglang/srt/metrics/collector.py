@@ -779,7 +779,7 @@ class SchedulerMetricsCollector:
         self.prefill_delayer_decisions_total = Counter(
             name="sglang:prefill_delayer_decisions_total",
             documentation="Prefill delayer decision counts.",
-            labelnames=[*labels.keys(), "decision"],
+            labelnames=[*labels.keys(), "decision", "actual_prefill"],
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
@@ -803,11 +803,11 @@ class SchedulerMetricsCollector:
         self._log_histogram(self.queue_time, latency)
 
     def observe_prefill_delayer_wait(
-        self, forward_passes: int, wait_seconds: float, decision: str
+        self, forward_passes: int, wait_seconds: float, decision: str, actual_prefill: bool,
     ) -> None:
         self._log_histogram(self.prefill_delayer_wait_forward_passes, forward_passes)
         self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
-        self.prefill_delayer_decisions_total.labels(**self.labels, decision=decision).inc(
+        self.prefill_delayer_decisions_total.labels(**self.labels, decision=decision, actual_prefill=int(actual_prefill)).inc(
             1
         )
 
