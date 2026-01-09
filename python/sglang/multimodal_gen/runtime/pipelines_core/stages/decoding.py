@@ -54,6 +54,24 @@ def _ensure_tensor_decode_output(decode_output):
     return decode_output
 
 
+def _post_process_decoded_output(decode_output: torch.Tensor) -> torch.Tensor:
+    """
+    Post-process decoded output from VAE.
+
+    This includes scaling the output to [0, 1] range and moving it to CPU.
+
+    Args:
+        decode_output: Decoded output tensor from VAE
+
+    Returns:
+        torch.Tensor: Post-processed tensor in [0, 1] range on CPU
+    """
+
+    frame = _ensure_tensor_decode_output(decode_output)
+    frame = (frame / 2 + 0.5).clamp(0, 1)
+    return frame.cpu()
+
+
 class DecodingStage(PipelineStage):
     """
     Stage for decoding latent representations into pixel space.
@@ -109,7 +127,12 @@ class DecodingStage(PipelineStage):
         return latents
 
     @torch.no_grad()
-    def decode(self, latents: torch.Tensor, sampling_params: SamplingParams, server_args: ServerArgs) -> torch.Tensor:
+    def decode(
+        self,
+        latents: torch.Tensor,
+        sampling_params: SamplingParams,
+        server_args: ServerArgs,
+    ) -> torch.Tensor:
         """
         Decode latent representations into pixel space using VAE.
 
@@ -154,69 +177,78 @@ class DecodingStage(PipelineStage):
                 pass
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
-            frame_slices = []
+
             if latents.dim() == 5:
                 # Decode video frames in chunks to avoid out of memory errors.
-                batch_size, num_channels, num_frames, _, _  = latents.shape
+                batch_size, num_channels, num_frames, _, _ = latents.shape
                 num_sample_frames = num_frames * self.vae.temporal_compression_ratio
                 gpu_mem_before_decoding = current_platform.get_available_gpu_memory()
 
                 # Estimated memory needed per frame
                 # TODO: Need to consider parallel / tiling
-                output_frame_size = (sampling_params.height * sampling_params.width * num_channels * latents.element_size())
+                output_frame_size = (
+                    sampling_params.height
+                    * sampling_params.width
+                    * num_channels
+                    * latents.element_size()
+                )
 
-                num_sample_frames_per_chunk = int(gpu_mem_before_decoding // (output_frame_size / (1 << 30)) // batch_size)
-                tile_latent_stride_num_frames = num_sample_frames_per_chunk // self.vae.temporal_compression_ratio
+                num_sample_frames_per_chunk = int(
+                    gpu_mem_before_decoding
+                    // (output_frame_size / (1 << 30))
+                    // batch_size
+                )
+                tile_latent_stride_num_frames = (
+                    num_sample_frames_per_chunk // self.vae.temporal_compression_ratio
+                )
 
                 # Decode all frames at once
                 if num_frames <= tile_latent_stride_num_frames:
                     decode_output = self.vae.decode(latents)
-                    frame = _ensure_tensor_decode_output(decode_output)
-                    frame = (frame / 2 + 0.5).clamp(0, 1)
-                    frames = frame.cpu()
-                    return frames
+                    frames = _post_process_decoded_output(decode_output)
+                else:
+                    # Decode in chunks
+                    overlap_sample_frames = (
+                        self.vae.config.temporal_tiling_num_overlap_latent_frames
+                        * self.vae.temporal_compression_ratio
+                    )
+                    frame_slices = []
+                    with self.progress_bar(total=num_sample_frames) as progress_bar:
+                        for i in range(0, num_frames, tile_latent_stride_num_frames):
+                            latent_step = min(
+                                tile_latent_stride_num_frames,
+                                num_frames - i,
+                            )
+                            sample_frame_step = (
+                                latent_step * self.vae.temporal_compression_ratio
+                            )
+                            latent_step_with_overlap = (
+                                latent_step
+                                + self.vae.config.temporal_tiling_num_overlap_latent_frames
+                            )
 
+                            decode_output = self.vae.decode(
+                                latents[
+                                    :, :, i : i + latent_step_with_overlap + 1, :, :
+                                ]
+                            )
+                            if i > 0:
+                                decode_output = decode_output[
+                                    :, :, overlap_sample_frames + 1 :, :, :
+                                ]
 
-                # Decode in chunks
-                overlap_sample_frames = (
-                    self.vae.config.temporal_tiling_num_overlap_latent_frames
-                    * self.vae.temporal_compression_ratio
-                )
-                with self.progress_bar(total=num_sample_frames) as progress_bar:
-                    for i in range(0, num_frames, tile_latent_stride_num_frames):
-                        latent_step = min(
-                            tile_latent_stride_num_frames,
-                            num_frames - i,
-                        )
-                        sample_frame_step = (
-                            latent_step * self.vae.temporal_compression_ratio
-                        )
-                        latent_step_with_overlap = (
-                            latent_step
-                            + self.vae.config.temporal_tiling_num_overlap_latent_frames
-                        )
+                            frame = _post_process_decoded_output(decode_output)
+                            frame_slices.append(frame)
 
-                        decode_output = self.vae.decode(
-                            latents[:, :, i : i + latent_step_with_overlap + 1, :, :]
-                        )
-                        if i > 0:
-                            decode_output = decode_output[
-                                :, :, overlap_sample_frames + 1 :, :, :
-                            ]
-
-                        frame = _ensure_tensor_decode_output(decode_output)
-                        frame = (frame / 2 + 0.5).clamp(0, 1)
-                        frame_slices.append(frame.cpu())
-
-                        if progress_bar is not None:
-                            progress_bar.update(sample_frame_step)
-                    frames = torch.cat(frame_slices, dim=2)[:, :, :num_sample_frames]
+                            if progress_bar is not None:
+                                progress_bar.update(sample_frame_step)
+                        frames = torch.cat(frame_slices, dim=2)[
+                            :, :, :num_sample_frames
+                        ]
             else:
                 # Decode image
                 decode_output = self.vae.decode(latents)
-                frame = _ensure_tensor_decode_output(decode_output)
-                frame = (frame / 2 + 0.5).clamp(0, 1)
-                frames = frame.cpu()
+                frames = _post_process_decoded_output(decode_output)
             return frames
 
     def load_model(self):
