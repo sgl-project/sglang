@@ -25,6 +25,7 @@ class _State:
 
 class _NegotiateOutput(NamedTuple):
     allow_prefill: bool
+    prefillable_status: str
     decision: str
     num_prefillable: int
     num_token_watermark_force_allow: int
@@ -116,10 +117,11 @@ class PrefillDelayer:
             exist_previous_wait = prev_state is not None
             return None, _NegotiateOutput(
                 allow_prefill=True,
+                prefillable_status="all",
                 decision=(
-                    "wait_success_all_prefillable"
+                    "wait_success"
                     if exist_previous_wait
-                    else "no_wait_all_prefillable"
+                    else "no_wait"
                 ),
                 **debug_info,
             )
@@ -127,14 +129,16 @@ class PrefillDelayer:
             return None, _NegotiateOutput(
                 # It does not matter whether we allow or not, thus we allow for simplicity
                 allow_prefill=True,
-                decision="no_prefillable",
+                prefillable_status="none",
+                decision="default",
                 **debug_info,
             )
         else:  # some ranks are prefillable, some are not
             if global_exists_token_watermark_force_allow:
                 return None, _NegotiateOutput(
                     allow_prefill=True,
-                    decision="token_watermark_allow_mixed_prefillable",
+                    prefillable_status="mixed",
+                    decision="token_watermark_allow",
                     **debug_info,
                 )
 
@@ -146,13 +150,15 @@ class PrefillDelayer:
                 )
                 return next_state, _NegotiateOutput(
                     allow_prefill=False,
-                    decision="forbid_mixed_prefillable",
+                    prefillable_status="mixed",
+                    decision="forbid",
                     **debug_info,
                 )
             else:
                 return None, _NegotiateOutput(
                     allow_prefill=True,
-                    decision="wait_timeout_allow_mixed_prefillable",
+                    prefillable_status="mixed",
+                    decision="wait_timeout_allow",
                     **debug_info,
                 )
 
@@ -211,6 +217,8 @@ def _record_single_pass_result(
     num_token_watermark_force_allow: int,
     metrics_collector: Optional["SchedulerMetricsCollector"],
 ) -> None:
+    TODO_prefillable_status
+
     if _DEBUG_LOG:
         if decision == "wait_timeout_allow_mixed_prefillable":
             logger.info(
