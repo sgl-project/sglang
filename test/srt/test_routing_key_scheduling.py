@@ -68,12 +68,14 @@ class TestRoutingKeyScheduling(CustomTestCase):
                 "messages": [{"role": "user", "content": "What is 1+1?"}],
                 "max_tokens": max_tokens,
                 "temperature": 0,
-                "routing_key": routing_key,
             }
+            headers = {"x-smg-routing-key": routing_key}
             start_time = time.perf_counter()
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    f"{self.base_url}/v1/chat/completions", json=payload
+                    f"{self.base_url}/v1/chat/completions",
+                    json=payload,
+                    headers=headers,
                 ) as resp:
                     await resp.json()
             latency = time.perf_counter() - start_time
