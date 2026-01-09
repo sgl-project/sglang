@@ -132,17 +132,13 @@ class PrefillDelayer:
                 outcome="token_watermark_force_allow",
             )
 
-        next_state = prev_state or _State()
-        if global_mixed_prefillable:
+        prev_delayed_count = prev_state.delayed_count if prev_state else 0
+        if global_mixed_prefillable and (prev_delayed_count < self._max_delay_passes - 1):
             next_state = dataclasses.replace(
-                next_state,
-                delayed_count=next_state.delayed_count + 1,
+                prev_state,
+                delayed_count=prev_state.delayed_count + 1,
             )
-
-        if global_mixed_prefillable and (
-            next_state.delayed_count < self._max_delay_passes
-        ):
-            return _NegotiateOutput(
+            return next_state, _NegotiateOutput(
                 allow_prefill=False,
                 outcome="forbid",
             )
