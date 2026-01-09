@@ -16,7 +16,7 @@
 
 import dataclasses
 import logging
-from enum import auto
+from enum import Enum, auto
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 completion_template_name = None
 
 
-class FimPosition:
+class FimPosition(Enum):
     """Position of fim middle token."""
 
     MIDDLE = auto()
