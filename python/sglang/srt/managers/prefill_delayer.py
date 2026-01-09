@@ -122,21 +122,21 @@ class PrefillDelayer:
             exist_previous_wait = prev_state is not None
             return None, _NegotiateOutput(
                 allow_prefill=True,
-                decision="wait_success" if exist_previous_wait else "no_wait",
+                reason="wait_success" if exist_previous_wait else "no_wait",
                 **debug_info,
             )
         elif prefillable_status == "none":
             return None, _NegotiateOutput(
                 # It does not matter whether we allow or not, thus we allow for simplicity
                 allow_prefill=True,
-                decision="default",
+                reason="allow",
                 **debug_info,
             )
         elif prefillable_status == "mixed":
             if global_exists_token_watermark_force_allow:
                 return None, _NegotiateOutput(
                     allow_prefill=True,
-                    decision="token_watermark_allow",
+                    reason="token_watermark",
                     **debug_info,
                 )
 
@@ -148,13 +148,13 @@ class PrefillDelayer:
                 )
                 return next_state, _NegotiateOutput(
                     allow_prefill=False,
-                    decision="forbid",
+                    reason="delay",
                     **debug_info,
                 )
             else:
                 return None, _NegotiateOutput(
                     allow_prefill=True,
-                    decision="wait_timeout_allow",
+                    reason="wait_timeout",
                     **debug_info,
                 )
         else:
