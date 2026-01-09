@@ -127,6 +127,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
+            deepep_mode=get_deepep_mode(),
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
