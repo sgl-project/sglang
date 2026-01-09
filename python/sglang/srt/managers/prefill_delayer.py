@@ -132,7 +132,10 @@ class PrefillDelayer:
                     f"num_force_allow={debug_num_force_allow})"
                 )
             else:
-                assert debug_outcome in {"wait_success_all_prefillable", "no_wait_all_prefillable"}
+                assert debug_outcome in {
+                    "wait_success_all_prefillable",
+                    "no_wait_all_prefillable",
+                }
 
         if (collector := self._metrics_collector) is not None:
             if (x := self._curr_delay_info) is not None:
