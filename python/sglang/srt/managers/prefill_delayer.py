@@ -44,7 +44,9 @@ class PrefillDelayer:
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
     ):
         self._max_delay_passes = max_delay_passes
-        logger.info(f"PrefillDelayer initialized with max_delay_passes={self._max_delay_passes}")
+        logger.info(
+            f"PrefillDelayer initialized with max_delay_passes={self._max_delay_passes}"
+        )
 
         self._global_info_buffer = torch.empty(
             (dp_size, attn_tp_size, 1),
@@ -67,7 +69,9 @@ class PrefillDelayer:
             not server_args.disable_overlap_schedule
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
-    def _negotiate_should_allow_prefill(self, local_prefillable: bool) -> _NegotiateOutput:
+    def _negotiate_should_allow_prefill(
+        self, local_prefillable: bool
+    ) -> _NegotiateOutput:
         out = self._negotiate_should_allow_prefill_pure(
             prev_state=self._curr_state,
             local_prefillable=local_prefillable,
