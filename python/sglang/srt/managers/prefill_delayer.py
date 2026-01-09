@@ -35,8 +35,8 @@ class _NegotiateOutput(NamedTuple):
 class PrefillDelayer:
     def __init__(
         self,
-        dp_size,
-        attn_tp_size,
+        dp_size: int,
+        attn_tp_size: int,
         cpu_group,
         server_args,
         max_delay_passes: int,
