@@ -184,7 +184,7 @@ class PrefillDelayerSinglePassExecutor:
         if not self._called:
             self.negotiate_should_allow_prefill(local_prefillable=False)
 
-        TODO
+        TODO_report_metrics
 
     def negotiate_should_allow_prefill(self, local_prefillable: bool) -> bool:
         if not self._called:
