@@ -123,7 +123,23 @@ class AttentionBackendEnum(enum.Enum):
         log_msg="Using Torch SDPA backend.",
     )
 
-    FA = AttentionBackendSpec()
+    FA = AttentionBackendSpec(
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend",
+        log_msg="Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend",
+        fallback="torch_sdpa",
+        fallback_msg=(
+            "Cannot use FlashAttention backend because the "
+            "flash_attn package is not found. "
+            "Make sure that flash_attn was built and installed "
+            "(on by default)."
+        ),
+        imports=[
+            (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn",
+                "FlashAttentionBackend",
+            ),
+        ],
+    )
     FA2 = AttentionBackendSpec()
     NO_ATTENTION = AttentionBackendSpec()
 
