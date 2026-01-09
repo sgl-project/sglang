@@ -1,11 +1,18 @@
 import os
+import re
 import unittest
+from collections import defaultdict
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import List
 
 import requests
+import torch
+import torch.multiprocessing as mp
 
 from sglang.bench_serving import run_benchmark
 from sglang.srt.environ import envs
+from sglang.srt.managers.prefill_delayer import PrefillDelayer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -17,20 +24,154 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+WORLD_SIZE = os.environ.get("SGLANG_TEST_WORLD_SIZE", "8")
+
+# ============================ Unit Tests ============================
+
+
+@dataclass
+class NegotiateCall:
+    prefillable: List[bool]
+
+
+@dataclass
+class NegotiateTestCase:
+    name: str
+    max_delay_passes: int
+    calls: List[NegotiateCall]
+    expected_allow: bool
+    expected_reason: str
+
+
+def _run_negotiate_test(rank, world_size, test_cases, results_queue, port):
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        world_size=world_size,
+        rank=rank,
+    )
+    cpu_group = torch.distributed.new_group(backend="gloo")
+
+    for case in test_cases:
+        delayer = PrefillDelayer(
+            dp_size=world_size,
+            attn_tp_size=1,
+            cpu_group=cpu_group,
+            server_args=SimpleNamespace(
+                enable_dp_attention=True,
+                disaggregation_mode="null",
+                disable_overlap_schedule=False,
+            ),
+            max_delay_passes=case.max_delay_passes,
+        )
+
+        for call in case.calls:
+            result = delayer._negotiate_should_allow_prefill(
+                local_prefillable=call.prefillable[rank],
+            )
+
+        results_queue.put((rank, case.name, result.output_allow, result.output_reason))
+
+    torch.distributed.destroy_process_group()
+
+
+_NEGOTIATE_TEST_CASES = [
+    NegotiateTestCase(
+        name="all_prefillable",
+        max_delay_passes=100,
+        calls=[
+            NegotiateCall(prefillable=[True, True, True, True]),
+        ],
+        expected_allow=True,
+        expected_reason="no_wait",
+    ),
+    NegotiateTestCase(
+        name="all_prefillable_with_previous_wait",
+        max_delay_passes=100,
+        calls=[
+            NegotiateCall(prefillable=[True, False, True, False]),
+            NegotiateCall(prefillable=[True, True, True, True]),
+        ],
+        expected_allow=True,
+        expected_reason="wait_success",
+    ),
+    NegotiateTestCase(
+        name="none_prefillable",
+        max_delay_passes=100,
+        calls=[
+            NegotiateCall(prefillable=[False, False, False, False]),
+        ],
+        expected_allow=True,
+        expected_reason="",
+    ),
+    NegotiateTestCase(
+        name="mixed_delay",
+        max_delay_passes=100,
+        calls=[
+            NegotiateCall(prefillable=[True, False, True, False]),
+        ],
+        expected_allow=False,
+        expected_reason="delay",
+    ),
+    NegotiateTestCase(
+        name="mixed_timeout",
+        max_delay_passes=3,
+        calls=[
+            NegotiateCall(prefillable=[True, False, True, False]),
+            NegotiateCall(prefillable=[True, False, True, False]),
+            NegotiateCall(prefillable=[True, False, True, False]),
+        ],
+        expected_allow=True,
+        expected_reason="wait_timeout",
+    ),
+]
+
+
+class TestPrefillDelayerNegotiate(unittest.TestCase):
+    def test_negotiate(self):
+        world_size = 4
+        test_cases = _NEGOTIATE_TEST_CASES
+
+        ctx = mp.get_context("spawn")
+        results_queue = ctx.Queue()
+        port = 29500 + os.getpid() % 1000
+
+        processes = []
+        for rank in range(world_size):
+            p = ctx.Process(
+                target=_run_negotiate_test,
+                args=(rank, world_size, test_cases, results_queue, port),
+            )
+            p.start()
+            processes.append(p)
+
+        for p in processes:
+            p.join()
+
+        results = defaultdict(dict)
+        for _ in range(world_size * len(test_cases)):
+            rank, case_name, output_allow, output_reason = results_queue.get()
+            results[case_name][rank] = (output_allow, output_reason)
+
+        for case in test_cases:
+            for rank in range(world_size):
+                output_allow, output_reason = results[case.name][rank]
+                self.assertEqual(
+                    (output_allow, output_reason),
+                    (case.expected_allow, case.expected_reason),
+                    f"Case {case.name} rank {rank}",
+                )
+
+
+# ============================ E2E Tests ============================
+
 
 class TestPrefillDelayerThroughputOnlineServing(CustomTestCase):
-    def test_1_has_prefill_delayer(self):
-        self._run(prefill_delayer=True)
-
-    def test_2_no_prefill_delayer(self):
-        self._run(prefill_delayer=False)
-
-    def _run(self, prefill_delayer: bool):
-        _run_throughput_test(
-            debug_name=f"online_serving ({prefill_delayer=})",
-            prefill_delayer=prefill_delayer,
+    def test_throughput_comparison(self):
+        _run_throughput_comparison(
+            self,
+            test_name="online_serving",
             other_launch_args=[
-                # Not really needed, only to test support non-FCFS algorithms
                 "--schedule-policy",
                 "lpm",
             ],
@@ -40,30 +181,47 @@ class TestPrefillDelayerThroughputOnlineServing(CustomTestCase):
                 random_output_len=256,
                 request_rate=32,
             ),
+            min_improvement_pct=5,
         )
 
 
 class TestPrefillDelayerThroughputOfflineGen(CustomTestCase):
-    def test_1_has_prefill_delayer(self):
-        self._run(prefill_delayer=True)
-
-    def test_2_no_prefill_delayer(self):
-        self._run(prefill_delayer=False)
-
-    def _run(self, prefill_delayer: bool):
-        _run_throughput_test(
-            debug_name=f"offline_gen ({prefill_delayer=})",
-            prefill_delayer=prefill_delayer,
+    def test_throughput_comparison(self):
+        _run_throughput_comparison(
+            self,
+            test_name="offline_gen",
+            other_launch_args=["--max-total-tokens", "200000"],
             other_benchmark_args=dict(
                 num_prompts=800,
                 random_input_len=30000,
                 random_output_len=500,
             ),
-            other_launch_args=[
-                "--max-total-tokens",
-                "200000",
-            ],
+            min_improvement_pct=20,
         )
+
+
+def _run_throughput_comparison(
+    test_case,
+    test_name: str,
+    other_launch_args,
+    other_benchmark_args,
+    min_improvement_pct: float,
+):
+    common_kwargs = dict(
+        debug_name=test_name,
+        other_launch_args=other_launch_args,
+        other_benchmark_args=other_benchmark_args,
+    )
+    res_enabled = _run_throughput_test(prefill_delayer=True, **common_kwargs)
+    res_disabled = _run_throughput_test(prefill_delayer=False, **common_kwargs)
+
+    _assert_throughput_improvement(
+        test_case,
+        test_name=test_name,
+        res_enabled=res_enabled,
+        res_disabled=res_disabled,
+        min_improvement_pct=min_improvement_pct,
+    )
 
 
 def _run_throughput_test(
@@ -76,10 +234,10 @@ def _run_throughput_test(
     base_url = DEFAULT_URL_FOR_TEST
 
     process = _launch_server(
-        prefill_delayer=prefill_delayer,
         model=model,
         base_url=base_url,
         other_args=other_launch_args,
+        prefill_delayer=prefill_delayer,
     )
 
     try:
@@ -94,9 +252,42 @@ def _run_throughput_test(
     finally:
         kill_process_tree(process.pid)
 
-    print(f"=== {debug_name} ===")
+    print(f"=== {debug_name} ({prefill_delayer=}) ===")
+    res["total_throughput"] = res["input_throughput"] + res["output_throughput"]
     print(f"Input throughput: {res['input_throughput']:.2f} token/s")
     print(f"Output throughput: {res['output_throughput']:.2f} token/s")
+    print(f"Total throughput: {res['total_throughput']:.2f} token/s")
+
+    return res
+
+
+def _assert_throughput_improvement(
+    test_case,
+    test_name: str,
+    res_enabled: dict,
+    res_disabled: dict,
+    min_improvement_pct: float,
+):
+    test_case.assertEqual(
+        WORLD_SIZE,
+        "8",
+        f"This test requires 8 GPUs to properly measure throughput improvement, got {WORLD_SIZE}",
+    )
+
+    enabled = res_enabled["total_throughput"]
+    disabled = res_disabled["total_throughput"]
+    improvement_pct = (enabled - disabled) / disabled * 100
+
+    print(f"\n=== {test_name} Throughput Comparison ===")
+    print(
+        f"Total: enabled={enabled:.2f}, disabled={disabled:.2f}, improvement={improvement_pct:.2f}%"
+    )
+
+    test_case.assertGreaterEqual(
+        improvement_pct,
+        min_improvement_pct,
+        f"{test_name}: Throughput improvement ({improvement_pct:.2f}%) < {min_improvement_pct}%",
+    )
 
 
 class TestPrefillDelayerAccuracy(CustomTestCase):
@@ -114,10 +305,8 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
             model=model,
             base_url=base_url,
             other_args=[
-                # Not really needed, only to test support non-FCFS algorithms
                 "--schedule-policy",
                 "lpm",
-                # Use this to ensure prefill delayer will be run
                 "--max-total-tokens",
                 "4096",
             ],
@@ -138,13 +327,19 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
             kill_process_tree(process.pid)
 
 
-def _launch_server(*, model, base_url, prefill_delayer: bool, other_args):
+def _launch_server(
+    *,
+    model,
+    base_url,
+    prefill_delayer: bool,
+    other_args,
+    max_delay_passes: int = 100,
+):
     os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
-    world_size = os.environ.get("SGLANG_TEST_WORLD_SIZE", "8")
 
     with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
         prefill_delayer
-    ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
+    ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(max_delay_passes):
         return popen_launch_server(
             model,
             base_url,
@@ -152,10 +347,10 @@ def _launch_server(*, model, base_url, prefill_delayer: bool, other_args):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                world_size,
+                WORLD_SIZE,
                 "--enable-dp-attention",
                 "--dp",
-                world_size,
+                WORLD_SIZE,
                 "--chunked-prefill-size",
                 "131072",
                 "--mem-fraction-static",
@@ -166,7 +361,7 @@ def _launch_server(*, model, base_url, prefill_delayer: bool, other_args):
         )
 
 
-def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool):
+def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool) -> str:
     metrics_response = requests.get(f"{base_url}/metrics")
     assert metrics_response.status_code == 200
     metrics_text = metrics_response.text
@@ -179,7 +374,13 @@ def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool):
     if expect_metrics:
         assert "sglang:prefill_delayer_wait_forward_passes" in metrics_text
         assert "sglang:prefill_delayer_wait_seconds" in metrics_text
-        assert "sglang:prefill_delayer_timeouts_total" in metrics_text
+        assert "sglang:prefill_delayer_outcomes_total" in metrics_text
+    return metrics_text
+
+
+def _sum_prometheus_metric_values(metrics_text: str, label_value: str) -> int:
+    matches = re.findall(rf'{label_value}".*?\}} (\d+)', metrics_text)
+    return sum(int(m) for m in matches)
 
 
 if __name__ == "__main__":
