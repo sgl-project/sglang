@@ -186,6 +186,15 @@ class InputValidationStage(PipelineStage):
 
         self._generate_seeds(batch, server_args)
 
+        if (
+            server_args.pipeline_config.task_type == ModelTaskType.I2M
+            and batch.num_inference_steps is None
+            and hasattr(server_args.pipeline_config, "shape_num_inference_steps")
+        ):
+            batch.num_inference_steps = (
+                server_args.pipeline_config.shape_num_inference_steps
+            )
+
         # Ensure prompt is properly formatted (I2M can be image-only)
         if (
             server_args.pipeline_config.task_type != ModelTaskType.I2M
@@ -281,9 +290,16 @@ class InputValidationStage(PipelineStage):
                 or V.list_not_empty(batch.prompt_embeds),
             )
 
-        result.add_check(
-            "num_inference_steps", batch.num_inference_steps, V.positive_int
-        )
+        if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+            result.add_check(
+                "num_inference_steps", batch.num_inference_steps, V.positive_int
+            )
+        else:
+            result.add_check(
+                "num_inference_steps",
+                batch.num_inference_steps,
+                lambda x: x is None or V.positive_int(x),
+            )
         result.add_check(
             "guidance_scale",
             batch.guidance_scale,
