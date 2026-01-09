@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import random
 import sqlite3
 import time
@@ -38,6 +39,16 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field, asdict
 import aiohttp
+
+# Import manifest module for reproducibility layer
+try:
+    import sys
+    # Add parent directory for schemas import
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from schemas.manifest import ExperimentManifest, RunType
+    HAS_MANIFEST = True
+except ImportError:
+    HAS_MANIFEST = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -225,13 +236,20 @@ class ManifoldHarness:
         server_url: str,
         db_path: str = "fingerprints.db",
         concurrency: int = 1,
+        seed: Optional[int] = None,
     ):
         self.server_url = server_url.rstrip('/')
         self.db_path = Path(db_path)
         self.concurrency = concurrency
+        self.seed = seed
         self.probe_packs = get_all_probe_packs()
         self.results: List[ProbeResult] = []
+        self._manifest: Optional['ExperimentManifest'] = None
         self._init_db()
+
+        # Set random seed for reproducibility
+        if seed is not None:
+            random.seed(seed)
 
     def _init_db(self):
         """Initialize SQLite database for storing results."""
@@ -383,6 +401,9 @@ class ManifoldHarness:
         Args:
             duration_minutes: How long to run
             probe_mix: Optional weights for probe packs (default: equal weight)
+
+        Returns:
+            List of ProbeResult objects
         """
         if probe_mix is None:
             # Default: 70% structured probes, 30% natural
@@ -395,6 +416,26 @@ class ManifoldHarness:
                 'adversarial': 0.10,
                 'natural': 0.30,
             }
+
+        # Create experiment manifest for reproducibility
+        run_id = datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
+        if HAS_MANIFEST:
+            self._manifest = ExperimentManifest.create(
+                run_type=RunType.PROBE_HARNESS,
+                run_id=run_id,
+                capture_git=True,
+                capture_hardware=True,
+            )
+            self._manifest.set_probes(
+                packs=list(probe_mix.keys()),
+                mix_weights=probe_mix,
+                duration_minutes=duration_minutes,
+                seed=self.seed,
+            )
+            self._manifest.set_source(database_path=str(self.db_path))
+            self._manifest.add_parameter("server_url", self.server_url)
+            self._manifest.add_parameter("concurrency", self.concurrency)
+            logger.info(f"Manifest created for run: {run_id}")
 
         # Build weighted probe list
         all_probes = []
@@ -417,6 +458,8 @@ class ManifoldHarness:
 
         semaphore = asyncio.Semaphore(self.concurrency)
         probes_run = 0
+        errors = 0
+        zone_counts: Dict[str, int] = {}
 
         async with aiohttp.ClientSession() as session:
             while time.time() < end_time:
@@ -434,6 +477,12 @@ class ManifoldHarness:
                 self.results.append(result)
                 probes_run += 1
 
+                # Track statistics for manifest
+                if result.error:
+                    errors += 1
+                if result.manifold_zone:
+                    zone_counts[result.manifold_zone] = zone_counts.get(result.manifold_zone, 0) + 1
+
                 # Progress update every 10 probes
                 if probes_run % 10 == 0:
                     elapsed = (time.time() - start_time) / 60
@@ -446,8 +495,47 @@ class ManifoldHarness:
                 # Small delay to avoid overwhelming server
                 await asyncio.sleep(0.1)
 
+        # Finalize manifest with statistics
+        if HAS_MANIFEST and self._manifest:
+            self._manifest.set_statistics({
+                "probes_run": probes_run,
+                "errors": errors,
+                "error_rate": errors / probes_run if probes_run > 0 else 0.0,
+                "zone_distribution": zone_counts,
+                "unique_probes": len(all_probes),
+            })
+            self._manifest.add_artifact("database", str(self.db_path))
+            self._manifest.finalize()
+            logger.info(f"Manifest finalized: {probes_run} probes, {errors} errors")
+
         logger.info(f"Discovery complete. Total probes: {probes_run}")
         return self.results
+
+    def save_manifest(self, output_path: str) -> Optional[str]:
+        """
+        Save the experiment manifest to a JSON file.
+
+        Args:
+            output_path: Path to save the manifest JSON
+
+        Returns:
+            Path where manifest was saved, or None if manifest not available
+        """
+        if not HAS_MANIFEST or not self._manifest:
+            logger.warning("Manifest not available (run discovery first or install manifest module)")
+            return None
+
+        manifest_path = Path(output_path)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        self._manifest.save(str(manifest_path))
+        logger.info(f"Manifest saved to: {manifest_path}")
+        return str(manifest_path)
+
+    def get_manifest_dict(self) -> Optional[Dict]:
+        """Get the experiment manifest as a dictionary."""
+        if not HAS_MANIFEST or not self._manifest:
+            return None
+        return self._manifest.to_dict()
 
 
 # ============================================================================
@@ -620,6 +708,17 @@ Examples:
         action="store_true",
         help="Generate report from existing data instead of running probes"
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility (default: None)"
+    )
+    parser.add_argument(
+        "--output-dir", "-o",
+        default=None,
+        help="Output directory for manifest and report (default: same as db)"
+    )
 
     args = parser.parse_args()
 
@@ -638,11 +737,16 @@ Examples:
         print(f"\nReport saved to: {report_path}")
         return 0
 
+    # Determine output directory
+    output_dir = Path(args.output_dir) if args.output_dir else Path(args.db).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     # Run discovery
     harness = ManifoldHarness(
         server_url=args.server,
         db_path=args.db,
         concurrency=args.concurrency,
+        seed=args.seed,
     )
 
     asyncio.run(harness.run_discovery(args.duration))
@@ -650,6 +754,17 @@ Examples:
     # Generate and print summary report
     report = generate_report(args.db)
     print("\n" + report)
+
+    # Save report to file
+    report_path = output_dir / Path(args.db).with_suffix('.report.txt').name
+    report_path.write_text(report)
+    print(f"\nReport saved to: {report_path}")
+
+    # Save manifest for reproducibility
+    manifest_path = output_dir / Path(args.db).with_suffix('.manifest.json').name
+    saved_path = harness.save_manifest(str(manifest_path))
+    if saved_path:
+        print(f"Manifest saved to: {saved_path}")
 
     return 0
 
