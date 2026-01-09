@@ -771,10 +771,10 @@ class Scheduler(
                 attn_tp_size=self.attn_tp_size,
                 cpu_group=self.tp_worker.get_tp_group().cpu_group,
                 server_args=self.server_args,
-                max_delay_passes=envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get(),
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
+                max_delay_passes=envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get(),
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
