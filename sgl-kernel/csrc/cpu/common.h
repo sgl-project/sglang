@@ -22,7 +22,6 @@ namespace {
     }                                            \
   }()
 
-
 #define AT_DISPATCH_BOOL2(BOOL_V1, BOOL_NAME1, BOOL_V2, BOOL_NAME2, ...) \
   [&] {                                                                  \
     if (BOOL_V1) {                                                       \

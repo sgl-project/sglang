@@ -228,7 +228,6 @@ void tinygemm_kernel(
     int64_t block_size_K,
     bool do_unpack = true);
 
-    
 template <typename scalar_t>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A,
@@ -245,7 +244,6 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K,
     bool do_unpack = true);
-
 
 // mxfp4
 template <typename scalar_t>
