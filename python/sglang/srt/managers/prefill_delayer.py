@@ -32,9 +32,8 @@ class PrefillDelayer:
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
     ):
         self.low_watermark = envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
-        info_size = 2 if self.low_watermark is not None else 1
         self.global_info = torch.empty(
-            (dp_size, attn_tp_size, info_size),
+            (dp_size, attn_tp_size, 2),
             dtype=torch.int64,
             device="cpu",
         )
@@ -108,18 +107,11 @@ class PrefillDelayer:
             )
 
     def _gather_info(self, local_prefillable: bool, force_allow_prefill: bool):
-        if self.low_watermark is not None:
-            local_info = torch.tensor(
-                [int(local_prefillable), int(force_allow_prefill)],
-                device="cpu",
-                dtype=torch.int64,
-            )
-        else:
-            local_info = torch.tensor(
-                [int(local_prefillable)],
-                device="cpu",
-                dtype=torch.int64,
-            )
+        local_info = torch.tensor(
+            [int(local_prefillable), int(force_allow_prefill)],
+            device="cpu",
+            dtype=torch.int64,
+        )
         torch.distributed.all_gather_into_tensor(
             self.global_info.flatten(),
             local_info,
