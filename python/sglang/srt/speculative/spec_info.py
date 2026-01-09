@@ -1,320 +1,108 @@
 from __future__ import annotations
 
-import threading
 from abc import ABC, abstractmethod
-from collections import defaultdict
-from enum import IntEnum, auto
-from typing import (
-    Any,
-    Callable,
-    DefaultDict,
-    Dict,
-    Iterable,
-    Iterator,
-    List,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-    Union,
-)
+from enum import Enum, IntEnum, auto
+from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
-
-DraftWorkerClass = Callable[..., Any]
-DraftWorkerFactory = Callable[..., Any]
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+    from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+    from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
 
-class _SpeculativeAlgorithmMeta(type):
-    def __iter__(cls) -> Iterator["SpeculativeAlgorithm"]:
-        return iter(cls._registration_order)
+class SpeculativeAlgorithm(Enum):
+    """Enumeration of speculative decoding algorithms."""
 
-
-class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
-    """Registry-backed representation of speculative decoding algorithms."""
-
-    __slots__ = ("name", "value", "_draft_worker_factory")
-
-    _registry_by_name: Dict[str, "SpeculativeAlgorithm"] = {}
-    _registry_by_value: Dict[int, "SpeculativeAlgorithm"] = {}
-    _registration_order: List["SpeculativeAlgorithm"] = []
-    _flags: DefaultDict[str, Set[int]] = defaultdict(set)
-    _next_value: int = 0
-
-    def __init__(
-        self,
-        name: str,
-        value: int,
-        draft_worker_factory: Optional[DraftWorkerFactory] = None,
-    ):
-        self.name = name
-        self.value = value
-        self._draft_worker_factory = draft_worker_factory
-
-    def __repr__(self) -> str:  # pragma: no cover - trivial
-        return f"SpeculativeAlgorithm.{self.name}"
-
-    def __str__(self) -> str:  # pragma: no cover - trivial
-        return self.name
-
-    def __hash__(self) -> int:
-        return hash(self.value)
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, SpeculativeAlgorithm):
-            return self.value == other.value
-        return NotImplemented
-
-    def __int__(self) -> int:
-        return self.value
-
-    @classmethod
-    def register(
-        cls,
-        name: str,
-        *,
-        aliases: Optional[Sequence[str]] = None,
-        value: Optional[int] = None,
-        draft_worker_factory: Optional[DraftWorkerFactory] = None,
-    ) -> SpeculativeAlgorithm:
-        normalized_name = name.upper()
-        if normalized_name in cls._registry_by_name:
-            raise ValueError(
-                f"SpeculativeAlgorithm '{normalized_name}' already registered"
-            )
-
-        if value is None:
-            value = cls._next_value
-        cls._next_value = max(cls._next_value, value + 1)
-
-        algorithm = cls(
-            normalized_name,
-            value,
-            draft_worker_factory=draft_worker_factory,
-        )
-
-        cls._registry_by_name[normalized_name] = algorithm
-        cls._registry_by_value[value] = algorithm
-        cls._registration_order.append(algorithm)
-        setattr(cls, normalized_name, algorithm)
-
-        if aliases:
-            cls.register_aliases(algorithm, *aliases)
-
-        return algorithm
-
-    @classmethod
-    def register_aliases(cls, algorithm: SpeculativeAlgorithm, *aliases: str) -> None:
-        for alias in aliases:
-            cls._registry_by_name[alias.upper()] = algorithm
-
-    @classmethod
-    def register_draft_worker(
-        cls,
-        algorithm: SpeculativeAlgorithm | str,
-        factory: DraftWorkerFactory,
-    ) -> None:
-        algo = cls._ensure_algorithm(algorithm)
-        algo._draft_worker_factory = factory
-
-    @classmethod
-    def _ensure_algorithm(
-        cls, algorithm: SpeculativeAlgorithm | str
-    ) -> SpeculativeAlgorithm:
-        if isinstance(algorithm, SpeculativeAlgorithm):
-            return algorithm
-        if isinstance(algorithm, str):
-            return cls.from_string(algorithm)
-        raise TypeError(f"Unsupported algorithm identifier: {algorithm!r}")
-
-    @classmethod
-    def _add_flag(
-        cls, flag: str | Sequence[str], algorithm: SpeculativeAlgorithm | str
-    ) -> None:
-        algo = cls._ensure_algorithm(algorithm)
-        if isinstance(flag, str):
-            flag_iter = (flag,)
-        else:
-            flag_iter = flag
-        for flag_name in flag_iter:
-            cls._flags[flag_name.upper()].add(algo.value)
+    EAGLE = auto()
+    EAGLE3 = auto()
+    STANDALONE = auto()
+    NGRAM = auto()
+    NONE = auto()
 
     @classmethod
     def from_string(cls, name: Optional[str]) -> SpeculativeAlgorithm:
         if name is None:
             return cls.NONE
         try:
-            return cls._registry_by_name[name.upper()]
-        except KeyError as exc:
-            raise ValueError(f"Unknown speculative algorithm '{name}'") from exc
-
-    @classmethod
-    def from_value(cls, value: int) -> SpeculativeAlgorithm:
-        try:
-            return cls._registry_by_value[value]
-        except KeyError as exc:
-            raise ValueError(f"Unknown speculative algorithm id {value}") from exc
-
-    def _has_flag(self, flag: str) -> bool:
-        return self.value in type(self)._flags.get(flag.upper(), set())
+            return cls[name.upper()]
+        except KeyError:
+            raise ValueError(f"Unknown speculative algorithm name: {name}")
 
     def is_none(self) -> bool:
-        return self is SpeculativeAlgorithm.NONE
+        return self == SpeculativeAlgorithm.NONE
 
     def is_eagle(self) -> bool:
-        return self._has_flag("EAGLE")
+        # NOTE: EAGLE3 is a variant of EAGLE
+        return self == SpeculativeAlgorithm.EAGLE or self == SpeculativeAlgorithm.EAGLE3
 
     def is_eagle3(self) -> bool:
-        return self._has_flag("EAGLE3")
+        return self == SpeculativeAlgorithm.EAGLE3
 
     def is_standalone(self) -> bool:
-        return self._has_flag("STANDALONE")
+        return self == SpeculativeAlgorithm.STANDALONE
 
     def is_ngram(self) -> bool:
-        return self._has_flag("NGRAM")
+        return self == SpeculativeAlgorithm.NGRAM
 
-    def create_draft_worker(self, **factory_kwargs: Any) -> Any:
-        if self._draft_worker_factory is None:
-            return None
-        return self._draft_worker_factory(self, **factory_kwargs)
+    def supports_spec_v2(self) -> bool:
+        return self.is_eagle() or self.is_standalone()
 
+    def create_worker(
+        self, server_args: ServerArgs
+    ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
+        assert (
+            not self.is_none()
+        ), "Cannot create worker for NONE speculative algorithm."
 
-# Registry helpers backed by `SpeculativeAlgorithm`.
-_LOCK = threading.RLock()
-_REGISTERED_WORKERS: Dict[SpeculativeAlgorithm, DraftWorkerClass] = {}
-_FLAG_MARKERS: Dict[str, Callable[[Union[SpeculativeAlgorithm, str]], None]] = {
-    "EAGLE": lambda algorithm: SpeculativeAlgorithm._add_flag("EAGLE", algorithm),
-    "EAGLE3": lambda algorithm: SpeculativeAlgorithm._add_flag("EAGLE3", algorithm),
-    "STANDALONE": lambda algorithm: SpeculativeAlgorithm._add_flag(
-        "STANDALONE", algorithm
-    ),
-    "NGRAM": lambda algorithm: SpeculativeAlgorithm._add_flag("NGRAM", algorithm),
-}
-
-
-def _wrap_worker_class(worker_cls: DraftWorkerClass) -> DraftWorkerFactory:
-    def _factory(_: SpeculativeAlgorithm, **kwargs: Any) -> Any:
-        return worker_cls(**kwargs)
-
-    return _factory
-
-
-def register_speculative_algorithm(
-    name: str,
-    worker_cls: DraftWorkerClass,
-    *,
-    aliases: Optional[Sequence[str]] = None,
-    flags: Optional[Iterable[str]] = None,
-    value: Optional[int] = None,
-    override_worker: bool = False,
-) -> SpeculativeAlgorithm:
-    """Register a speculative algorithm and the associated draft worker class.
-
-    Example:
-        >>> from sglang.srt.speculative.spec_info import register_speculative_algorithm
-        >>> register_speculative_algorithm("MY_ALGO", MyDraftWorker, flags=("EAGLE",))
-    """
-
-    name_upper = name.upper()
-    with _LOCK:
-        try:
-            algorithm = SpeculativeAlgorithm.from_string(name_upper)
-            exists = True
-        except ValueError:
-            algorithm = SpeculativeAlgorithm.register(
-                name_upper,
-                aliases=aliases,
-                value=value,
-            )
-            SpeculativeAlgorithm.register_draft_worker(
-                algorithm, _wrap_worker_class(worker_cls)
-            )
-            exists = False
-
-        if exists:
-            if aliases:
-                SpeculativeAlgorithm.register_aliases(algorithm, *aliases)
-            if not override_worker and algorithm in _REGISTERED_WORKERS:
-                raise ValueError(
-                    f"Worker already registered for {algorithm!r}. "
-                    "Pass override_worker=True to replace it."
+        enable_overlap = not server_args.disable_overlap_schedule
+        if self.is_eagle() and server_args.enable_multi_layer_eagle:
+            # FIXME: migrate to EagleWorker
+            if enable_overlap:
+                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+                    MultiLayerEagleWorkerV2,
                 )
-            SpeculativeAlgorithm.register_draft_worker(
-                algorithm, _wrap_worker_class(worker_cls)
+
+                return MultiLayerEagleWorkerV2
+
+            from sglang.srt.speculative.multi_layer_eagle_worker import (
+                MultiLayerEagleWorker,
             )
 
-        _REGISTERED_WORKERS[algorithm] = worker_cls
+            return MultiLayerEagleWorker
 
-        if flags:
-            for flag in flags:
-                marker = _FLAG_MARKERS.get(flag.upper())
-                if marker is None:
-                    raise ValueError(f"Unsupported flag '{flag}'")
-                marker(algorithm)
+        elif self.is_eagle():
+            if enable_overlap:
+                from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
-        return algorithm
+                return EAGLEWorkerV2
 
+            from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
-def list_registered_workers() -> Dict[str, DraftWorkerClass]:
-    """Return a snapshot of registered speculative worker classes keyed by algorithm name."""
-    with _LOCK:
-        return {algo.name: cls for algo, cls in _REGISTERED_WORKERS.items()}
+            return EAGLEWorker
+        elif self.is_standalone():
+            if enable_overlap:
+                from sglang.srt.speculative.standalone_worker_v2 import (
+                    StandaloneWorkerV2,
+                )
 
+                return StandaloneWorkerV2
 
-def _create_eagle_worker(**kwargs: Any) -> Any:
-    enable_overlap = kwargs.pop("enable_overlap", False)
-    if enable_overlap:
-        from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+            from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
-        return EAGLEWorkerV2(**kwargs)
+            return StandaloneWorker
+        elif self.is_ngram():
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
 
-    from sglang.srt.speculative.eagle_worker import EAGLEWorker
+            from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
-    return EAGLEWorker(**kwargs)
+            return NGRAMWorker
 
-
-def _create_standalone_worker(**kwargs: Any) -> Any:
-    from sglang.srt.speculative.standalone_worker import StandaloneWorker
-
-    return StandaloneWorker(**kwargs)
-
-
-def _create_ngram_worker(**kwargs: Any) -> Any:
-    from sglang.srt.speculative.ngram_worker import NGRAMWorker
-
-    return NGRAMWorker(**kwargs)
-
-
-# Register built-in algorithms.
-# Third-party integrations should import `SpeculativeAlgorithm` and either
-# call `register_speculative_algorithm` or use the helpers below to attach
-# additional draft workers.
-SpeculativeAlgorithm.register("NONE")
-
-register_speculative_algorithm(
-    "EAGLE",
-    aliases=("NEXTN",),
-    worker_cls=_create_eagle_worker,
-    flags=("EAGLE",),
-)
-
-register_speculative_algorithm(
-    "EAGLE3",
-    worker_cls=_create_eagle_worker,
-    flags=("EAGLE", "EAGLE3"),
-)
-
-register_speculative_algorithm(
-    "STANDALONE",
-    worker_cls=_create_standalone_worker,
-    flags=("STANDALONE",),
-)
-
-register_speculative_algorithm(
-    "NGRAM",
-    worker_cls=_create_ngram_worker,
-    flags=("NGRAM",),
-)
+        raise ValueError("Unreachable code path in create_worker.")
 
 
 class SpecInputType(IntEnum):
