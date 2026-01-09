@@ -238,9 +238,9 @@ def _record_single_pass_result(
             }
 
     if metrics_collector is not None:
-        if (x := _curr_state) is not None:
-            wait_seconds = time.perf_counter() - x.start_time
-            forward_passes = x.delayed_count
+        if (s := output.next_state) is not None:
+            wait_seconds = time.perf_counter() - s.start_time
+            forward_passes = s.delayed_count
         else:
             wait_seconds = forward_passes = 0
         metrics_collector.observe_prefill_delayer_wait(
