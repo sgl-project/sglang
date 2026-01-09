@@ -198,7 +198,13 @@ def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool):
 
 
 class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
-    def test_low_watermark_force_prefill(self):
+    def test_1_with_low_watermark(self):
+        self._run(token_usage_low_watermark=0.8)
+
+    def test_2_without_low_watermark(self):
+        self._run(token_usage_low_watermark=None)
+
+    def _run(self, token_usage_low_watermark):
         model = "Qwen/Qwen3-0.6B"
         base_url = DEFAULT_URL_FOR_TEST
         world_size = int(os.environ.get("SGLANG_TEST_WORLD_SIZE", "8"))
@@ -209,7 +215,7 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
             prefill_delayer=True,
             other_args=["--max-total-tokens", "50000"],
             max_delay_passes=1000,
-            token_usage_low_watermark=0.8,
+            token_usage_low_watermark=token_usage_low_watermark,
         )
 
         async def run_test():
@@ -244,11 +250,12 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
 
             for dp_rank, elapsed in results:
                 print(f"DP rank {dp_rank} completed in {elapsed:.2f}s")
-                self.assertLess(
-                    elapsed,
-                    30,
-                    f"Request to DP rank {dp_rank} took too long ({elapsed:.2f}s), low watermark force prefill may not be working",
-                )
+                if token_usage_low_watermark is not None:
+                    self.assertLess(
+                        elapsed,
+                        30,
+                        f"Request to DP rank {dp_rank} took too long ({elapsed:.2f}s), low watermark force prefill may not be working",
+                    )
 
         try:
             asyncio.run(run_test())
