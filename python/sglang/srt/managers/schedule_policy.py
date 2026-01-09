@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import logging
+
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+from sglang.srt.utils import get_bool_env_var
+
+_ROUTING_KEY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_DEBUG_LOG")
+_logger = logging.getLogger(__name__)
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -308,6 +314,13 @@ class SchedulePolicy:
             r.routing_key for r in running_batch.reqs if r.routing_key
         )
 
+        if _ROUTING_KEY_DEBUG_LOG:
+            waiting_keys_before = [r.routing_key for r in waiting_queue]
+            _logger.info(
+                f"routing_key_counts={dict(routing_key_counts)}, "
+                f"waiting_keys_before={waiting_keys_before}"
+            )
+
         if not routing_key_counts:
             return
 
@@ -320,6 +333,10 @@ class SchedulePolicy:
                 return (1, 0, key or "")
 
         waiting_queue.sort(key=sort_key)
+
+        if _ROUTING_KEY_DEBUG_LOG:
+            waiting_keys_after = [r.routing_key for r in waiting_queue]
+            _logger.info(f"waiting_keys_after={waiting_keys_after}")
 
     @staticmethod
     def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:
