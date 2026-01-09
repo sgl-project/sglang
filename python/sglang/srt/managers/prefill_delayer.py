@@ -104,10 +104,6 @@ class PrefillDelayer:
         return True
 
     def _reset(self, outcome: str) -> None:
-        self._record_metrics(outcome=outcome)
-        self._curr_delay_info = None
-
-    def _record_metrics(self, outcome: str) -> None:
         if self._curr_delay_info is not None and self._metrics_collector is not None:
             wait_seconds = time.perf_counter() - self._curr_delay_info.start_time
             self._metrics_collector.observe_prefill_delayer_wait(
@@ -115,6 +111,8 @@ class PrefillDelayer:
                 wait_seconds=wait_seconds,
                 outcome=outcome,
             )
+
+        self._curr_delay_info = None
 
     def _gather_info(self, local_prefillable: bool, local_force_allow: bool):
         local_info = torch.tensor(
