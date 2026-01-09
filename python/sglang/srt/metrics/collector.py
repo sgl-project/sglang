@@ -766,18 +766,26 @@ class SchedulerMetricsCollector:
             name="sglang:prefill_delayer_wait_forward_passes",
             documentation="Histogram of forward passes waited by prefill delayer.",
             labelnames=labels.keys(),
-            buckets=[5, 20, max_delay_passes - 1],
+            # Need bucket "<=0" for zero-delay cases
+            buckets=[0, 5, 20, max_delay_passes - 1],
         )
         self.prefill_delayer_wait_seconds = Histogram(
             name="sglang:prefill_delayer_wait_seconds",
             documentation="Histogram of wait time in seconds by prefill delayer.",
             labelnames=labels.keys(),
-            buckets=[5, 20, 100, 500],
+            # Need bucket "<=0" for zero-delay cases
+            buckets=[0, 5, 20, 100, 500],
         )
-        self.prefill_delayer_timeouts_total = Counter(
-            name="sglang:prefill_delayer_timeouts_total",
-            documentation="Total number of prefill delayer timeouts.",
-            labelnames=labels.keys(),
+        self.prefill_delayer_outcomes_total = Counter(
+            name="sglang:prefill_delayer_outcomes_total",
+            documentation="Prefill delayer outcome counts.",
+            labelnames=[
+                *labels.keys(),
+                "input_estimation",
+                "output_allow",
+                "output_reason",
+                "actual_execution",
+            ],
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
@@ -800,13 +808,28 @@ class SchedulerMetricsCollector:
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
-    def observe_prefill_delayer_wait(
-        self, forward_passes: int, wait_seconds: float, is_timeout: bool
+    def observe_prefill_delayer_outcome(
+        self,
+        forward_passes: int,
+        wait_seconds: float,
+        input_estimation: str,
+        output_allow: bool,
+        output_reason: str,
+        actual_execution: bool,
     ) -> None:
-        self._log_histogram(self.prefill_delayer_wait_forward_passes, forward_passes)
-        self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
-        if is_timeout:
-            self.prefill_delayer_timeouts_total.labels(**self.labels).inc(1)
+        if output_allow and actual_execution:
+            self._log_histogram(
+                self.prefill_delayer_wait_forward_passes, forward_passes
+            )
+            self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
+
+        self.prefill_delayer_outcomes_total.labels(
+            **self.labels,
+            input_estimation=input_estimation,
+            output_allow=str(int(output_allow)),
+            output_reason=output_reason,
+            actual_execution=str(int(actual_execution)),
+        ).inc(1)
 
     def increment_retracted_reqs(
         self,
