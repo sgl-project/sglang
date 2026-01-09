@@ -77,6 +77,10 @@ class TestPrefillAdder(CustomTestCase):
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+        req.estimate_remain_tokens = min(
+            max(max_new_tokens - output_len, 0),
+            4096,
+        )
         return req
 
     def create_adder(self, running_batch):

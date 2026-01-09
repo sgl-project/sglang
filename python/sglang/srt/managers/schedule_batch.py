@@ -39,6 +39,7 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 import copy
 import dataclasses
 import logging
+import os
 import re
 import time
 from enum import Enum, auto
@@ -92,6 +93,14 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+
+# Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
+# This can prevent the server from being too conservative.
+# Note that this only clips the estimation in the scheduler but does not change the stop
+# condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
+CLIP_MAX_NEW_TOKENS = int(
+    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
+)
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -794,6 +803,13 @@ class Req:
         if self.finished_len is not None:
             return self.output_ids[: self.finished_len]
         return self.output_ids
+
+    @property
+    def estimate_remain_tokens(self) -> int:
+        return min(
+            max(self.sampling_params.max_new_tokens - len(self.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
+        )
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""

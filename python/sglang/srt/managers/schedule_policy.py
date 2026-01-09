@@ -44,14 +44,6 @@ from sglang.srt.server_args import ServerArgs
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
-# Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
-# This can prevent the server from being too conservative.
-# Note that this only clips the estimation in the scheduler but does not change the stop
-# condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
-CLIP_MAX_NEW_TOKENS = int(
-    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
-)
-
 # Threshold for in-batch prefix cache.
 # If a request has a matched prefix length (against existing cache) less than this value,
 # the scheduler runs the in-batch prefix caching check for this request.
@@ -417,13 +409,7 @@ class PrefillAdder:
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
-        return (
-            min(
-                (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                CLIP_MAX_NEW_TOKENS,
-            )
-            * self.new_token_ratio
-        )
+        return req.estimate_remain_tokens * self.new_token_ratio
 
     @property
     def rem_total_tokens(self):
@@ -510,11 +496,7 @@ class PrefillAdder:
         self._update_prefill_budget(
             0,
             req.extend_input_len,
-            (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                if not truncated
-                else 0
-            ),
+            (req.estimate_remain_tokens if not truncated else 0),
         )
 
         # Return if chunked prefill not finished
@@ -596,7 +578,7 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                req.estimate_remain_tokens,
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -628,10 +610,7 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        total_tokens = req.extend_input_len + min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
-        )
+        total_tokens = req.extend_input_len + req.estimate_remain_tokens
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length
@@ -681,10 +660,7 @@ class PrefillAdder:
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS,
-                    ),
+                    req.estimate_remain_tokens,
                 )
             else:
                 # Make sure at least one page is available
@@ -740,9 +716,7 @@ class PrefillAdder:
 
         preemptible_reqs = []
         min_tokens_to_remove = (
-            req.extend_input_len
-            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-            - self.rem_total_tokens
+            req.extend_input_len + req.estimate_remain_tokens - self.rem_total_tokens
         )
         for running_req in sorted_valid_running_reqs:
             # Priority difference needs to meet the threshold to be preemptible.
