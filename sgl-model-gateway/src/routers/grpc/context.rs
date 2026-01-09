@@ -13,7 +13,7 @@ use super::{
     proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
 };
 use crate::{
-    core::{attach_guards_to_response, Worker, WorkerLoadGuard},
+    core::{Worker, WorkerLoadGuard},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         classify::{ClassifyRequest, ClassifyResponse},
@@ -153,51 +153,31 @@ pub(crate) struct DispatchMetadata {
     pub model: String,
     pub created: u64,
     pub weight_version: Option<String>,
-    #[allow(dead_code)]
-    pub is_streaming: bool,
 }
 
 /// Load guards for worker load tracking
 /// Automatically decrements load when dropped
 pub(crate) enum LoadGuards {
-    Single(WorkerLoadGuard),
+    Single {
+        _guard: WorkerLoadGuard,
+    },
     Dual {
-        prefill: WorkerLoadGuard,
-        decode: WorkerLoadGuard,
+        _prefill: WorkerLoadGuard,
+        _decode: WorkerLoadGuard,
     },
 }
 
 impl From<&WorkerSelection> for LoadGuards {
     fn from(selection: &WorkerSelection) -> Self {
         match selection {
-            WorkerSelection::Single { worker } => {
-                LoadGuards::Single(WorkerLoadGuard::new(worker.clone()))
-            }
+            WorkerSelection::Single { worker } => LoadGuards::Single {
+                _guard: WorkerLoadGuard::new(worker.clone()),
+            },
             WorkerSelection::Dual { prefill, decode } => LoadGuards::Dual {
-                prefill: WorkerLoadGuard::new(prefill.clone()),
-                decode: WorkerLoadGuard::new(decode.clone()),
+                _prefill: WorkerLoadGuard::new(prefill.clone()),
+                _decode: WorkerLoadGuard::new(decode.clone()),
             },
         }
-    }
-}
-
-impl LoadGuards {
-    /// Attach these load guards to a Response, tying their lifetime to the response body.
-    ///
-    /// When the response body is fully consumed or dropped (e.g., client disconnects),
-    /// the guards are dropped and worker load is decremented automatically.
-    ///
-    /// This is the proper RAII pattern for SSE/streaming responses.
-    pub fn attach_to_response(
-        self,
-        response: axum::response::Response,
-    ) -> axum::response::Response {
-        let guards = match self {
-            LoadGuards::Single(guard) => vec![guard],
-            LoadGuards::Dual { prefill, decode } => vec![prefill, decode],
-        };
-
-        attach_guards_to_response(guards, response)
     }
 }
 
@@ -368,13 +348,13 @@ impl RequestContext {
     }
 }
 
+/// Some methods are kept for API completeness even if currently unused.
+#[allow(dead_code)]
 impl WorkerSelection {
-    #[allow(dead_code)]
     pub fn is_dual(&self) -> bool {
         matches!(self, Self::Dual { .. })
     }
 
-    #[allow(dead_code)]
     pub fn single(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Single { worker } => Some(worker),
@@ -401,7 +381,6 @@ impl WorkerSelection {
         }
     }
 
-    #[allow(dead_code)]
     #[allow(clippy::type_complexity)]
     pub fn dual(&self) -> Option<(&Arc<dyn Worker>, &Arc<dyn Worker>)> {
         match self {
@@ -410,7 +389,6 @@ impl WorkerSelection {
         }
     }
 
-    #[allow(dead_code)]
     pub fn prefill_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Dual { prefill, .. } => Some(prefill),
@@ -418,7 +396,6 @@ impl WorkerSelection {
         }
     }
 
-    #[allow(dead_code)]
     pub fn decode_worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Dual { decode, .. } => Some(decode),
@@ -427,12 +404,9 @@ impl WorkerSelection {
     }
 }
 
+/// Some methods are kept for API completeness even if currently unused.
+#[allow(dead_code)]
 impl ClientSelection {
-    #[allow(dead_code)]
-    pub fn is_dual(&self) -> bool {
-        matches!(self, Self::Dual { .. })
-    }
-
     pub fn single(&self) -> Option<&GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
@@ -447,14 +421,6 @@ impl ClientSelection {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn dual(&self) -> Option<(&GrpcClient, &GrpcClient)> {
-        match self {
-            Self::Dual { prefill, decode } => Some((prefill, decode)),
-            _ => None,
-        }
-    }
-
     pub fn dual_mut(&mut self) -> Option<(&mut GrpcClient, &mut GrpcClient)> {
         match self {
             Self::Dual { prefill, decode } => Some((prefill, decode)),
@@ -462,7 +428,6 @@ impl ClientSelection {
         }
     }
 
-    #[allow(dead_code)]
     pub fn prefill_client(&self) -> Option<&GrpcClient> {
         match self {
             Self::Dual { prefill, .. } => Some(prefill),
@@ -470,7 +435,6 @@ impl ClientSelection {
         }
     }
 
-    #[allow(dead_code)]
     pub fn prefill_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
             Self::Dual { prefill, .. } => Some(prefill),
@@ -478,7 +442,6 @@ impl ClientSelection {
         }
     }
 
-    #[allow(dead_code)]
     pub fn decode_client(&self) -> Option<&GrpcClient> {
         match self {
             Self::Dual { decode, .. } => Some(decode),
@@ -486,7 +449,6 @@ impl ClientSelection {
         }
     }
 
-    #[allow(dead_code)]
     pub fn decode_client_mut(&mut self) -> Option<&mut GrpcClient> {
         match self {
             Self::Dual { decode, .. } => Some(decode),
