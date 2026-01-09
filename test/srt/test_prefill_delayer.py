@@ -332,8 +332,10 @@ def _run_throughput_test(
         kill_process_tree(process.pid)
 
     print(f"=== {debug_name} ({prefill_delayer=}) ===")
+    res["total_throughput"] = res["input_throughput"] + res["output_throughput"]
     print(f"Input throughput: {res['input_throughput']:.2f} token/s")
     print(f"Output throughput: {res['output_throughput']:.2f} token/s")
+    print(f"Total throughput: {res['total_throughput']:.2f} token/s")
 
     return res
 
