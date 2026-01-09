@@ -327,6 +327,7 @@ class ServerArgs:
     soft_watchdog_timeout: Optional[float] = None
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
+    model_checksum: Optional[str] = None
     base_gpu_id: int = 0
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
@@ -2962,6 +2963,14 @@ class ServerArgs:
             type=str,
             default=ServerArgs.download_dir,
             help="Model download directory for huggingface.",
+        )
+        parser.add_argument(
+            "--model-checksum",
+            type=str,
+            nargs="?",
+            const="",
+            default=None,
+            help="Model file integrity verification. If provided without value, uses model-path as HF repo ID. Otherwise, provide checksums JSON file path or HuggingFace repo ID.",
         )
         parser.add_argument(
             "--base-gpu-id",
