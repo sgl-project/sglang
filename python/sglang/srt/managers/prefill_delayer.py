@@ -25,7 +25,7 @@ class _State:
 
 class _NegotiateOutput(NamedTuple):
     allow_prefill: bool
-    outcome: str
+    decision: str
     num_prefillable: int
     num_token_watermark_force_allow: int
 
@@ -116,7 +116,7 @@ class PrefillDelayer:
             exist_previous_wait = prev_state is not None
             return None, _NegotiateOutput(
                 allow_prefill=True,
-                outcome=(
+                decision=(
                     "wait_success_all_prefillable"
                     if exist_previous_wait
                     else "no_wait_all_prefillable"
@@ -127,14 +127,14 @@ class PrefillDelayer:
             return None, _NegotiateOutput(
                 # It does not matter whether we allow or not, thus we allow for simplicity
                 allow_prefill=True,
-                outcome="no_prefillable",
+                decision="no_prefillable",
                 **debug_info,
             )
         else:  # some ranks are prefillable, some are not
             if global_exists_token_watermark_force_allow:
                 return None, _NegotiateOutput(
                     allow_prefill=True,
-                    outcome="token_watermark_allow_mixed_prefillable",
+                    decision="token_watermark_allow_mixed_prefillable",
                     **debug_info,
                 )
 
@@ -146,13 +146,13 @@ class PrefillDelayer:
                 )
                 return next_state, _NegotiateOutput(
                     allow_prefill=False,
-                    outcome="forbid_mixed_prefillable",
+                    decision="forbid_mixed_prefillable",
                     **debug_info,
                 )
             else:
                 return None, _NegotiateOutput(
                     allow_prefill=True,
-                    outcome="wait_timeout_allow_mixed_prefillable",
+                    decision="wait_timeout_allow_mixed_prefillable",
                     **debug_info,
                 )
 
@@ -187,8 +187,9 @@ class PrefillDelayerSinglePassExecutor:
         if not self._called:
             self.negotiate_should_allow_prefill(local_prefillable=False)
 
-        _record_outcome(
-            outcome=self._result.outcome,
+        _record_single_pass_result(
+            actual_prefill=TODO,
+            decision=self._result.decision,
             num_prefillable=self._result.num_prefillable,
             num_token_watermark_force_allow=self._result.num_token_watermark_force_allow,
             metrics_collector=self._prefill_delayer._metrics_collector,
@@ -203,26 +204,26 @@ class PrefillDelayerSinglePassExecutor:
         return self._result.allow_prefill
 
 
-def _record_outcome(
-    outcome: str,
+def _record_single_pass_result(
+    decision: str,
     num_prefillable: int,
     num_token_watermark_force_allow: int,
     metrics_collector: Optional["SchedulerMetricsCollector"],
 ) -> None:
     if _DEBUG_LOG:
-        if outcome == "wait_timeout_allow_mixed_prefillable":
+        if decision == "wait_timeout_allow_mixed_prefillable":
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill "
                 f"(num_prefillable={num_prefillable})"
             )
-        elif outcome == "token_watermark_allow_mixed_prefillable":
+        elif decision == "token_watermark_allow_mixed_prefillable":
             logger.info(
                 f"PrefillDelayer force allow prefill due to low watermark. "
                 f"(num_prefillable={num_prefillable}, "
                 f"num_token_watermark_force_allow={num_token_watermark_force_allow})"
             )
         else:
-            assert outcome in {
+            assert decision in {
                 "wait_success_all_prefillable",
                 "no_wait_all_prefillable",
                 "no_prefillable",
@@ -237,5 +238,5 @@ def _record_outcome(
         metrics_collector.observe_prefill_delayer_wait(
             forward_passes=forward_passes,
             wait_seconds=wait_seconds,
-            outcome=outcome,
+            decision=decision,
         )
