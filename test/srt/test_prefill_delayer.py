@@ -174,7 +174,7 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
                     extra_body={"data_parallel_rank": 0},
                 )
 
-            async def send_normal_request(dp_rank):
+            async def send_normal_request(dp_rank, req_idx):
                 start = time.time()
                 await client.chat.completions.create(
                     model=model,
@@ -183,22 +183,27 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
                     extra_body={"data_parallel_rank": dp_rank},
                 )
                 elapsed = time.time() - start
-                return dp_rank, elapsed
+                return dp_rank, req_idx, elapsed
 
             asyncio.create_task(send_blocking_request())
             await asyncio.sleep(3)
 
+            num_reqs_per_rank = 10
             results = await asyncio.gather(
-                *[send_normal_request(dp_rank) for dp_rank in range(1, world_size)]
+                *[
+                    send_normal_request(dp_rank, req_idx)
+                    for dp_rank in range(1, world_size)
+                    for req_idx in range(num_reqs_per_rank)
+                ]
             )
 
-            for dp_rank, elapsed in results:
-                print(f"DP rank {dp_rank} completed in {elapsed:.2f}s")
-                enabled = token_usage_low_watermark is not None
-                thresh = 30
+            enabled = token_usage_low_watermark is not None
+            thresh = 30
+            for dp_rank, req_idx, elapsed in results:
+                print(f"DP rank {dp_rank} req {req_idx} completed in {elapsed:.2f}s")
                 self.assertTrue(
                     (elapsed < thresh) if enabled else (elapsed > thresh),
-                    f"DP rank {dp_rank}: elapsed={elapsed:.2f}s, thresh={thresh}",
+                    f"DP rank {dp_rank} req {req_idx}: elapsed={elapsed:.2f}s, thresh={thresh}",
                 )
 
         try:
