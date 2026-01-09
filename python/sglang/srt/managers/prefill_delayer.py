@@ -106,13 +106,8 @@ class PrefillDelayer:
         global_exists_token_watermark_force_allow = (
             global_token_watermark_force_allow.max().item() > 0
         )
-        global_exists_not_prefillable = global_prefillable.min().item() == 0
         global_all_prefillable = global_prefillable.min().item() > 0
         global_all_not_prefillable = global_prefillable.max().item() == 0
-        global_exists_prefillable = global_prefillable.max().item() > 0
-        global_mixed_prefillable = (
-            global_exists_not_prefillable and global_exists_prefillable
-        )
 
         # Compute outputs
 
@@ -126,46 +121,46 @@ class PrefillDelayer:
                     else "no_wait_all_prefillable"
                 ),
             )
-        if global_all_not_prefillable:
+        elif global_all_not_prefillable:
             return None, _NegotiateOutput(
                 # It does not matter whether we allow or not, thus we allow for simplicity
                 allow_prefill=True,
                 outcome="no_prefillable",
             )
-
-        if global_exists_token_watermark_force_allow:
-            return None, _NegotiateOutput(
-                allow_prefill=True,
-                outcome="token_watermark_force_allow",
-            )
-
-        prev_delayed_count = prev_state.delayed_count if prev_state else 0
-        if global_mixed_prefillable and (prev_delayed_count < self._max_delay_passes - 1):
-            next_state = dataclasses.replace(
-                prev_state,
-                delayed_count=prev_state.delayed_count + 1,
-            )
-            return next_state, _NegotiateOutput(
-                allow_prefill=False,
-                outcome="forbid",
-            )
-
-        is_timeout = global_mixed_prefillable
-        exist_previous_wait = prev_state is not None
-        self._record_outcome_and_reset(
-            debug_outcome=(
-                "wait_timeout"
-                if is_timeout
-                else (
-                    "wait_success_all_prefillable"
-                    if exist_previous_wait
-                    else "no_wait_all_prefillable"
+        else:
+            if global_exists_token_watermark_force_allow:
+                return None, _NegotiateOutput(
+                    allow_prefill=True,
+                    outcome="token_watermark_force_allow",
                 )
-            ),
-            debug_num_prefillable=num_prefillable,
-            debug_num_token_watermark_force_allow=num_token_watermark_force_allow,
-        )
-        return _NegotiateOutput(allow_prefill=True)
+
+            prev_delayed_count = prev_state.delayed_count if prev_state else 0
+            if global_mixed_prefillable and (prev_delayed_count < self._max_delay_passes - 1):
+                next_state = dataclasses.replace(
+                    prev_state,
+                    delayed_count=prev_state.delayed_count + 1,
+                )
+                return next_state, _NegotiateOutput(
+                    allow_prefill=False,
+                    outcome="forbid",
+                )
+
+            is_timeout = global_mixed_prefillable
+            exist_previous_wait = prev_state is not None
+            self._record_outcome_and_reset(
+                debug_outcome=(
+                    "wait_timeout"
+                    if is_timeout
+                    else (
+                        "wait_success_all_prefillable"
+                        if exist_previous_wait
+                        else "no_wait_all_prefillable"
+                    )
+                ),
+                debug_num_prefillable=num_prefillable,
+                debug_num_token_watermark_force_allow=num_token_watermark_force_allow,
+            )
+            return _NegotiateOutput(allow_prefill=True)
 
     def _gather_info(
         self, local_prefillable: bool, local_token_watermark_force_allow: bool
