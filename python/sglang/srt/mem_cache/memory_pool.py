@@ -36,7 +36,6 @@ KVCache actually holds the physical kv cache.
 
 import abc
 import logging
-import os
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
@@ -75,7 +74,6 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
-
 
 
 class ReqToTokenPool:
