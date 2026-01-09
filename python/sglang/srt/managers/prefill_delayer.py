@@ -23,12 +23,9 @@ class _State:
     start_time: float = field(default_factory=time.perf_counter)
 
 
-_Outcome = Literal["forbid", "token_watermark_force_allow"]
-
-
 class _NegotiateOutput(NamedTuple):
     allow_prefill: bool
-    outcome: _Outcome
+    outcome: str
 
 
 class PrefillDelayer:
@@ -106,10 +103,22 @@ class PrefillDelayer:
         num_token_watermark_force_allow = global_token_watermark_force_allow.sum().item()
         global_exists_force_allow = global_token_watermark_force_allow.max().item() > 0
         global_exists_not_prefillable = global_prefillable.min().item() == 0
+        global_all_prefillable = global_prefillable.min().item() > 0
         global_exists_prefillable = global_prefillable.max().item() > 0
         global_mixed_prefillable = (
             global_exists_not_prefillable and global_exists_prefillable
         )
+
+        if global_all_prefillable:
+            exist_previous_wait = prev_state is not None
+            return _NegotiateOutput(
+                allow_prefill=True,
+                outcome=(
+                    "wait_success_all_prefillable"
+                    if exist_previous_wait
+                    else "no_wait_all_prefillable"
+                ),
+            )
 
         if global_exists_force_allow:
             self._record_outcome_and_reset(
