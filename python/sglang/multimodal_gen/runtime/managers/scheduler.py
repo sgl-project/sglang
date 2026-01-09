@@ -91,6 +91,10 @@ class Scheduler:
 
         self.prepare_server_warmup_reqs()
 
+        # Maximum consecutive errors before terminating the event loop
+        self._max_consecutive_errors = 3
+        self._consecutive_error_count = 0
+
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status
         # TODO: return with SetLoRAResponse or something more appropriate
@@ -252,11 +256,24 @@ class Scheduler:
                 new_reqs = self.recv_reqs()
                 new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
                 self.waiting_queue.extend(new_reqs)
+                # Reset error count on success
+                self._consecutive_error_count = 0
             except Exception as e:
+                self._consecutive_error_count += 1
                 logger.error(
-                    f"Error receiving requests in scheduler event loop: {e}",
+                    f"Error receiving requests in scheduler event loop "
+                    f"(attempt {self._consecutive_error_count}/{self._max_consecutive_errors}): {e}",
                     exc_info=True,
                 )
+                if self._consecutive_error_count >= self._max_consecutive_errors:
+                    logger.error(
+                        f"Maximum consecutive errors ({self._max_consecutive_errors}) reached. "
+                        "Terminating scheduler event loop."
+                    )
+                    raise RuntimeError(
+                        f"Scheduler terminated after {self._max_consecutive_errors} "
+                        f"consecutive errors. Last error: {e}"
+                    ) from e
                 continue
 
             # 2: execute, make sure a reply is always sent
