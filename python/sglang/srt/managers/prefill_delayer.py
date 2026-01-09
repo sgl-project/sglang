@@ -114,16 +114,18 @@ class PrefillDelayer:
         self, outcome: str, debug_num_prefillable: int, debug_num_force_allow: int
     ) -> None:
         if _DEBUG_LOG:
-            if outcome == "timeout":
+            if outcome == "wait_timeout":
                 logger.info(
                     f"PrefillDelayer timeout thus not forbid prefill (num_prefillable={debug_num_prefillable})"
                 )
-            elif outcome == "token_usage_watermark":
+            elif outcome == "token_watermark_force_allow":
                 logger.info(
                     f"PrefillDelayer force allow prefill due to low watermark. "
                     f"(num_prefillable={debug_num_prefillable}, "
                     f"num_force_allow={debug_num_force_allow})"
                 )
+            else:
+                assert outcome in {"wait_success_all_prefillable", "no_wait_all_prefillable"}
 
         if (collector := self._metrics_collector) is not None:
             if (x := self._curr_delay_info) is not None:
