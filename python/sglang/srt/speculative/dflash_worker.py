@@ -179,100 +179,10 @@ class DFlashWorker:
         bs = batch.batch_size()
         device = self.model_runner.device
 
-        if draft_input.target_hidden is None:
-            raise RuntimeError("DFLASH draft state missing target_hidden context features.")
-        if len(draft_input.ctx_lens_cpu) != bs:
-            raise RuntimeError(
-                f"DFLASH ctx_lens_cpu length mismatch: got {len(draft_input.ctx_lens_cpu)} for bs={bs}."
-            )
-        if len(draft_input.draft_seq_lens_cpu) != bs:
-            raise RuntimeError(
-                "DFLASH draft_seq_lens_cpu length mismatch: "
-                f"got {len(draft_input.draft_seq_lens_cpu)} for bs={bs}."
-            )
+        # --- 1) Append any newly committed tokens into the native draft KV cache.
+        self._append_target_hidden_to_native_draft_kv(batch, draft_input)
 
         embed_weight, head_weight = self.target_worker.model_runner.model.get_embed_and_head()
-
-        # --- 1) Append new context tokens into the native draft KV cache.
-        start_pos_cpu = batch.seq_lens_cpu.tolist()
-        for cache_len, ctx_len, start_pos in zip(
-            draft_input.draft_seq_lens_cpu,
-            draft_input.ctx_lens_cpu,
-            start_pos_cpu,
-            strict=True,
-        ):
-            if int(cache_len) + int(ctx_len) != int(start_pos):
-                raise RuntimeError(
-                    "DFLASH native draft cache length mismatch. "
-                    f"cache_len={int(cache_len)}, ctx_len={int(ctx_len)}, start_pos={int(start_pos)}. "
-                    "This can happen if prefix caching is enabled; start with `--disable-radix-cache` for now."
-                )
-
-        total_ctx = int(sum(int(x) for x in draft_input.ctx_lens_cpu))
-        if total_ctx > 0:
-            req_to_token = self.native_draft_model_runner.req_to_token_pool.req_to_token
-            req_pool_indices_cpu = batch.req_pool_indices.tolist()
-
-            ctx_cache_loc_chunks: List[torch.Tensor] = []
-            ctx_positions_chunks: List[torch.Tensor] = []
-            new_draft_seq_lens_cpu: List[int] = []
-            for req_pool_idx, cache_len, ctx_len in zip(
-                req_pool_indices_cpu,
-                draft_input.draft_seq_lens_cpu,
-                draft_input.ctx_lens_cpu,
-                strict=True,
-            ):
-                cache_len_i = int(cache_len)
-                ctx_len_i = int(ctx_len)
-                new_draft_seq_lens_cpu.append(cache_len_i + ctx_len_i)
-                if ctx_len_i <= 0:
-                    continue
-                s = cache_len_i
-                e = cache_len_i + ctx_len_i
-                ctx_cache_loc_chunks.append(
-                    req_to_token[req_pool_idx, s:e].to(torch.int64)
-                )
-                ctx_positions_chunks.append(
-                    torch.arange(s, e, device=device, dtype=torch.int64)
-                )
-            ctx_cache_loc = (
-                torch.cat(ctx_cache_loc_chunks, dim=0)
-                if ctx_cache_loc_chunks
-                else torch.empty((0,), dtype=torch.int64, device=device)
-            )
-
-            ctx_positions = (
-                torch.cat(ctx_positions_chunks, dim=0)
-                if ctx_positions_chunks
-                else torch.empty((0,), dtype=torch.int64, device=device)
-            )
-
-            with torch.inference_mode():
-                ctx_hidden = self.native_draft_model.project_target_hidden(
-                    draft_input.target_hidden
-                )  # [sum(ctx), hidden]
-
-                for layer in self.native_draft_model.layers:
-                    attn = layer.self_attn
-                    k = attn.k_proj(ctx_hidden)
-                    v = attn.v_proj(ctx_hidden)
-                    k = attn.k_norm(k.view(-1, attn.head_dim)).view_as(k)
-                    dummy_q = k.new_empty((k.shape[0], attn.head_dim))
-                    _, k = attn.rotary_emb(ctx_positions, dummy_q, k)
-                    k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-                    v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-                    self.native_draft_model_runner.token_to_kv_pool.set_kv_buffer(
-                        attn.attn,
-                        ctx_cache_loc,
-                        k,
-                        v,
-                        attn.attn.k_scale,
-                        attn.attn.v_scale,
-                    )
-
-            draft_input.draft_seq_lens_cpu = new_draft_seq_lens_cpu
-            draft_input.ctx_lens_cpu = [0] * bs
-            draft_input.target_hidden = draft_input.target_hidden[:0]
 
         # --- 2) Draft a non-causal block with the native draft model.
         block_ids = torch.full(
@@ -376,6 +286,111 @@ class DFlashWorker:
         batch.spec_info = verify_input
         batch.return_hidden_states = False
 
+    def _append_target_hidden_to_native_draft_kv(
+        self,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInput,
+    ) -> None:
+        """Materialize the target hidden-state features into the native draft KV cache.
+
+        This must be run before exposing new tokens to radix cache (prefix hits), otherwise
+        another request could reuse target KV indices without having draft KV values.
+        """
+
+        bs = batch.batch_size()
+        device = self.model_runner.device
+
+        if draft_input.target_hidden is None:
+            raise RuntimeError("DFLASH draft state missing target_hidden context features.")
+        if len(draft_input.ctx_lens_cpu) != bs:
+            raise RuntimeError(
+                f"DFLASH ctx_lens_cpu length mismatch: got {len(draft_input.ctx_lens_cpu)} for bs={bs}."
+            )
+        if len(draft_input.draft_seq_lens_cpu) != bs:
+            raise RuntimeError(
+                "DFLASH draft_seq_lens_cpu length mismatch: "
+                f"got {len(draft_input.draft_seq_lens_cpu)} for bs={bs}."
+            )
+
+        # Invariant: draft_seq_len + ctx_len == current target prefix length.
+        start_pos_cpu = batch.seq_lens_cpu.tolist()
+        for cache_len, ctx_len, start_pos in zip(
+            draft_input.draft_seq_lens_cpu,
+            draft_input.ctx_lens_cpu,
+            start_pos_cpu,
+            strict=True,
+        ):
+            if int(cache_len) + int(ctx_len) != int(start_pos):
+                raise RuntimeError(
+                    "DFLASH native draft cache length mismatch. "
+                    f"cache_len={int(cache_len)}, ctx_len={int(ctx_len)}, start_pos={int(start_pos)}."
+                )
+
+        total_ctx = int(sum(int(x) for x in draft_input.ctx_lens_cpu))
+        if total_ctx <= 0:
+            return
+
+        req_to_token = self.native_draft_model_runner.req_to_token_pool.req_to_token
+        req_pool_indices_cpu = batch.req_pool_indices.tolist()
+
+        ctx_cache_loc_chunks: List[torch.Tensor] = []
+        ctx_positions_chunks: List[torch.Tensor] = []
+        new_draft_seq_lens_cpu: List[int] = []
+        for req_pool_idx, cache_len, ctx_len in zip(
+            req_pool_indices_cpu,
+            draft_input.draft_seq_lens_cpu,
+            draft_input.ctx_lens_cpu,
+            strict=True,
+        ):
+            cache_len_i = int(cache_len)
+            ctx_len_i = int(ctx_len)
+            new_draft_seq_lens_cpu.append(cache_len_i + ctx_len_i)
+            if ctx_len_i <= 0:
+                continue
+            s = cache_len_i
+            e = cache_len_i + ctx_len_i
+            ctx_cache_loc_chunks.append(req_to_token[req_pool_idx, s:e].to(torch.int64))
+            ctx_positions_chunks.append(torch.arange(s, e, device=device, dtype=torch.int64))
+
+        ctx_cache_loc = (
+            torch.cat(ctx_cache_loc_chunks, dim=0)
+            if ctx_cache_loc_chunks
+            else torch.empty((0,), dtype=torch.int64, device=device)
+        )
+
+        ctx_positions = (
+            torch.cat(ctx_positions_chunks, dim=0)
+            if ctx_positions_chunks
+            else torch.empty((0,), dtype=torch.int64, device=device)
+        )
+
+        with torch.inference_mode():
+            ctx_hidden = self.native_draft_model.project_target_hidden(
+                draft_input.target_hidden
+            )  # [sum(ctx), hidden]
+
+            for layer in self.native_draft_model.layers:
+                attn = layer.self_attn
+                k = attn.k_proj(ctx_hidden)
+                v = attn.v_proj(ctx_hidden)
+                k = attn.k_norm(k.view(-1, attn.head_dim)).view_as(k)
+                dummy_q = k.new_empty((k.shape[0], attn.head_dim))
+                _, k = attn.rotary_emb(ctx_positions, dummy_q, k)
+                k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+                v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+                self.native_draft_model_runner.token_to_kv_pool.set_kv_buffer(
+                    attn.attn,
+                    ctx_cache_loc,
+                    k,
+                    v,
+                    attn.attn.k_scale,
+                    attn.attn.v_scale,
+                )
+
+        draft_input.draft_seq_lens_cpu = new_draft_seq_lens_cpu
+        draft_input.ctx_lens_cpu = [0] * bs
+        draft_input.target_hidden = draft_input.target_hidden[:0]
+
     def forward_batch_generation(
         self,
         batch: Union[ScheduleBatch, ModelWorkerBatch],
@@ -389,12 +404,6 @@ class DFlashWorker:
             return self.target_worker.forward_batch_generation(batch, **kwargs)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            if any(len(req.prefix_indices) > 0 for req in batch.reqs):
-                raise ValueError(
-                    "DFLASH currently does not support radix/prefix cache hits (prefix_indices != 0). "
-                    "Start with `--disable-radix-cache` for now."
-                )
-
             model_worker_batch = batch.get_model_worker_batch()
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
@@ -411,16 +420,23 @@ class DFlashWorker:
                     "Make sure the target model has DFlash layers-to-capture configured."
                 )
 
-            ctx_lens_cpu = model_worker_batch.seq_lens_cpu.tolist()
+            if model_worker_batch.extend_seq_lens is None or model_worker_batch.extend_prefix_lens is None:
+                raise RuntimeError(
+                    "DFLASH expected extend_seq_lens / extend_prefix_lens to be populated in extend mode, but got None."
+                )
 
-            batch.spec_info = DFlashDraftInput(
+            # Materialize the prompt tokens into the draft KV cache immediately. This is required
+            # for radix cache support, since the scheduler may update radix after prefill returns.
+            draft_input = DFlashDraftInput(
                 verified_id=next_token_ids.to(torch.int64),
                 target_hidden=logits_output.hidden_states,
-                ctx_lens_cpu=ctx_lens_cpu,
-                draft_seq_lens_cpu=[0] * len(ctx_lens_cpu),
+                ctx_lens_cpu=[int(x) for x in model_worker_batch.extend_seq_lens],
+                draft_seq_lens_cpu=[int(x) for x in model_worker_batch.extend_prefix_lens],
             )
-            for req in batch.reqs:
-                req.dflash_draft_seq_len = 0
+            self._append_target_hidden_to_native_draft_kv(batch, draft_input)
+            batch.spec_info = draft_input
+            for req, draft_len in zip(batch.reqs, draft_input.draft_seq_lens_cpu, strict=True):
+                req.dflash_draft_seq_len = int(draft_len)
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -463,10 +479,12 @@ class DFlashWorker:
             page_size=self.page_size,
         )
 
-        # Update draft state for the next iteration.
+        # Update draft state for the next iteration. Also materialize the committed verify tokens
+        # into the draft KV cache immediately so radix cache entries are safe to reuse.
         draft_input.verified_id = new_verified_id
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens_cpu = commit_lens.cpu().tolist()
+        self._append_target_hidden_to_native_draft_kv(batch, draft_input)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
