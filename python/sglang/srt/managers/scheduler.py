@@ -650,6 +650,7 @@ class Scheduler(
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            chunked_prefill_size=server_args.chunked_prefill_size,
         )
 
         if (
@@ -809,6 +810,9 @@ class Scheduler(
                 attn_tp_size=self.attn_tp_size,
                 tp_worker=self.tp_worker,
                 server_args=self.server_args,
+                metrics_collector=(
+                    self.metrics_collector if self.enable_metrics else None
+                ),
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
