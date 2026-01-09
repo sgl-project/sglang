@@ -31,7 +31,9 @@ class PrefillDelayer:
         server_args,
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
     ):
+        self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
         self.low_watermark = envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
+
         self.global_info = torch.empty(
             (dp_size, attn_tp_size, 2),
             dtype=torch.int64,
@@ -39,7 +41,6 @@ class PrefillDelayer:
         )
         self.cpu_group = tp_worker.get_tp_group().cpu_group
 
-        self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
         self._metrics_collector = metrics_collector
 
         self._curr_delay_info: Optional[_DelayInfo] = None
