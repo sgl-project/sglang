@@ -170,7 +170,20 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
 
         try:
             asyncio.run(run_test())
-            _print_prefill_delayer_metrics(base_url, expect_metrics=True)
+            metrics_text = _print_prefill_delayer_metrics(base_url, expect_metrics=True)
+            if token_usage_low_watermark is not None:
+                import re
+
+                matches = re.findall(
+                    r'outcome="token_watermark_force_allow".*?\} (\d+)', metrics_text
+                )
+                total_force_allow = sum(int(m) for m in matches)
+                self.assertGreater(
+                    total_force_allow,
+                    0,
+                    "Expected token_watermark_force_allow > 0 when low watermark is enabled",
+                )
+                print(f"total token_watermark_force_allow: {total_force_allow}")
         finally:
             kill_process_tree(process.pid)
 
@@ -254,7 +267,7 @@ def _launch_server(
         )
 
 
-def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool):
+def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool) -> str:
     metrics_response = requests.get(f"{base_url}/metrics")
     assert metrics_response.status_code == 200
     metrics_text = metrics_response.text
@@ -268,6 +281,7 @@ def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool):
         assert "sglang:prefill_delayer_wait_forward_passes" in metrics_text
         assert "sglang:prefill_delayer_wait_seconds" in metrics_text
         assert "sglang:prefill_delayer_outcomes_total" in metrics_text
+    return metrics_text
 
 
 if __name__ == "__main__":
