@@ -39,12 +39,12 @@ class PrefillDelayer:
         attn_tp_size,
         cpu_group,
         server_args,
+        max_delay_passes: int,
+        token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
     ):
-        self._max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
-        self._token_usage_low_watermark = (
-            envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
-        )
+        self._max_delay_passes = max_delay_passes
+        self._token_usage_low_watermark = token_usage_low_watermark
         logger.info(
             f"PrefillDelayer initialized with "
             f"max_delay_passes={self._max_delay_passes} "

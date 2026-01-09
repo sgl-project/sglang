@@ -774,6 +774,10 @@ class Scheduler(
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
+                max_delay_passes=envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get(),
+                token_usage_low_watermark=(
+                    envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
+                ),
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
