@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.sparsity import get_sparse_coordinator
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
 from sglang.srt.utils import get_int_env_var
@@ -1021,4 +1022,11 @@ class SchedulerDisaggregationDecodeMixin:
             alloc_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
+
+            sparse_coordinator = get_sparse_coordinator()
+            if sparse_coordinator is not None:
+                for req in alloc_reqs:
+                    sparse_coordinator.on_request_begin(req)
+                    sparse_coordinator.trigger_async_offload_prompt_cache(req)
+
             self.waiting_queue.extend(alloc_reqs)

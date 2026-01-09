@@ -11,6 +11,7 @@ import triton.language as tl
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.sparsity import get_sparse_coordinator
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
@@ -377,6 +378,8 @@ class FlashAttentionBackend(AttentionBackend):
         self.num_splits = (
             1 if model_runner.server_args.enable_deterministic_inference else 0
         )
+        # Sparse attention coordinator
+        self.sparse_coordinator = get_sparse_coordinator()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -1078,6 +1081,18 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
+
+        # Apply sparse attention
+        if self.sparse_coordinator is not None:
+            self.sparse_coordinator.attention_begin(
+                query=q,
+                key=k,
+                value=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                attn_metadata=metadata,
+            )
+
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
         use_local_attn = (
             self.has_local_attention
@@ -1318,6 +1333,13 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 o = result
+
+        if self.sparse_coordinator is not None:
+            self.sparse_coordinator.attention_end(
+                output=o,
+                layer=layer,
+                forward_batch=forward_batch,
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

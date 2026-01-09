@@ -11,6 +11,10 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.sparsity.factory import (
+    get_sparse_coordinator,
+    is_hierarchical_sparse_attention_enabled,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
@@ -442,6 +446,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     Returns:
         out_cache_loc: allocated cache locations
     """
+    if is_hierarchical_sparse_attention_enabled():
+        return alloc_for_hierarchical_sparse_decode(batch, token_per_req)
+
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req in batch.reqs:
             # We set evict_swa condition here with two reasons:
@@ -479,6 +486,79 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
 
+    return out_cache_loc
+
+
+def alloc_for_hierarchical_sparse_decode(
+    batch: ScheduleBatch, token_per_req: int
+) -> torch.Tensor:
+    """
+    Allocate KV cache for hierarchical sparse decode batch and write to req_to_token_pool.
+    """
+    bs = batch.seq_lens.shape[0]
+    seq_lens_next = batch.seq_lens + token_per_req
+    page_size = batch.tree_cache.page_size
+    req_pool_indices = batch.req_pool_indices
+    sparse_coordinator = get_sparse_coordinator()
+
+    if batch.model_config.is_encoder_decoder:
+        locs = batch.encoder_lens + batch.seq_lens
+    else:
+        locs = batch.seq_lens.clone()
+
+    # Find truncated and non-truncated requests
+    kv_truncated_len = sparse_coordinator.get_hierarchical_sparse_truncated_len()
+    truncated_mask = sparse_coordinator.get_reqs_offloaded_and_truncated_mask(
+        req_pool_indices
+    )
+    out_cache_loc = torch.empty(bs, dtype=torch.int32, device=batch.device)
+
+    num_truncated = truncated_mask.sum().item()
+    # Handle truncated requests: reuse a pre-allocated rolling page per request
+    if truncated_mask.any():
+        truncated_indices = truncated_mask.nonzero(as_tuple=True)[0]
+        # Map logical decode positions onto the reserved rolling page in a round-robin way
+        decode_offsets = locs[truncated_indices]
+        rolling_positions = (kv_truncated_len - page_size) + (
+            decode_offsets % page_size
+        )
+        out_cache_loc[truncated_indices] = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices[truncated_indices],
+            rolling_positions,
+        ]
+        logger.info(
+            f"Allocated {num_truncated} truncated sparse decode, rolling positions:{rolling_positions.tolist()}, out_cache_loc:{out_cache_loc[truncated_indices].tolist()}"
+        )
+
+    # Handle non-truncated requests: allocate normally
+    if (~truncated_mask).any():
+        non_truncated_indices = (~truncated_mask).nonzero(as_tuple=True)[0]
+        if batch.tree_cache.page_size == 1:
+            non_truncated_out = alloc_token_slots(
+                batch.tree_cache, len(non_truncated_indices) * token_per_req
+            )
+        else:
+            non_truncated_last_loc = batch.req_to_token_pool.req_to_token[
+                batch.req_pool_indices[non_truncated_indices],
+                batch.seq_lens[non_truncated_indices] - 1,
+            ]
+            non_truncated_out = alloc_paged_token_slots_decode(
+                tree_cache=batch.tree_cache,
+                seq_lens=seq_lens_next[non_truncated_indices],
+                seq_lens_cpu=batch.seq_lens_cpu[non_truncated_indices.cpu()]
+                + token_per_req,
+                last_loc=non_truncated_last_loc,
+                token_per_req=token_per_req,
+            )
+
+        out_cache_loc[non_truncated_indices] = non_truncated_out.to(torch.int32)
+        batch.req_to_token_pool.write(
+            (
+                batch.req_pool_indices[non_truncated_indices],
+                locs[non_truncated_indices],
+            ),
+            out_cache_loc[non_truncated_indices],
+        )
     return out_cache_loc
 
 
