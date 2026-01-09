@@ -27,6 +27,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+WORLD_SIZE = os.environ.get("SGLANG_TEST_WORLD_SIZE", "8")
+
 # ============================ Unit Tests ============================
 
 
@@ -354,6 +356,12 @@ def _assert_throughput_improvement(
     res_disabled: dict,
     min_improvement_pct: float,
 ):
+    test_case.assertEqual(
+        WORLD_SIZE,
+        "8",
+        f"This test requires 8 GPUs to properly measure throughput improvement, got {WORLD_SIZE}",
+    )
+
     input_enabled = res_enabled["input_throughput"]
     input_disabled = res_disabled["input_throughput"]
     output_enabled = res_enabled["output_throughput"]
@@ -392,7 +400,7 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
     def _run(self, token_usage_low_watermark):
         model = "Qwen/Qwen3-0.6B"
         base_url = DEFAULT_URL_FOR_TEST
-        world_size = int(os.environ.get("SGLANG_TEST_WORLD_SIZE", "8"))
+        world_size = int(WORLD_SIZE)
 
         process = _launch_server(
             model=model,
@@ -516,7 +524,6 @@ def _launch_server(
     token_usage_low_watermark: float = None,
 ):
     os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
-    world_size = os.environ.get("SGLANG_TEST_WORLD_SIZE", "8")
 
     with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
         prefill_delayer
@@ -532,10 +539,10 @@ def _launch_server(
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                world_size,
+                WORLD_SIZE,
                 "--enable-dp-attention",
                 "--dp",
-                world_size,
+                WORLD_SIZE,
                 "--chunked-prefill-size",
                 "131072",
                 "--mem-fraction-static",
