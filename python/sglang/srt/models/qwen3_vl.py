@@ -943,6 +943,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        # Track if lm_head.weight was loaded from checkpoint to avoid overwriting
+        lm_head_loaded = False
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -950,8 +952,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             layer_id = get_layer_id(name)
 
-            if self.pp_group.is_last_rank and "model.embed_tokens.weight" in name:
-                if "lm_head.weight" in params_dict:
+            if (
+                self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+                and self.config.tie_word_embeddings
+            ):
+                # Only copy embed_tokens to lm_head if:
+                # 1. tie_word_embeddings is enabled
+                # 2. lm_head.weight parameter exists
+                # 3. lm_head.weight was NOT already loaded from checkpoint
+                if "lm_head.weight" in params_dict and not lm_head_loaded:
                     lm_head_param = params_dict["lm_head.weight"]
                     weight_loader = getattr(
                         lm_head_param, "weight_loader", default_weight_loader
@@ -1002,6 +1012,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                         continue
                     if name in params_dict.keys():
                         param = params_dict[name]
+                        # Track if lm_head.weight was loaded from checkpoint
+                        if name == "lm_head.weight":
+                            lm_head_loaded = True
                     else:
                         continue
 
