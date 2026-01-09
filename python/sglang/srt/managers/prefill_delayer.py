@@ -22,6 +22,9 @@ class _State:
     delayed_count: int = 0
     start_time: float = field(default_factory=time.perf_counter)
 
+    def bump_delayed_count(self) -> "_State":
+        return dataclasses.replace(self, delayed_count=self.delayed_count + 1)
+
 
 class _NegotiateOutput(NamedTuple):
     next_state: Optional[_State]
@@ -148,10 +151,7 @@ class PrefillDelayer:
             prev_delayed_count = prev_state.delayed_count if prev_state else 0
             if prev_delayed_count < self._max_delay_passes - 1:
                 next_state = prev_state or _State()
-                next_state = dataclasses.replace(
-                    next_state,
-                    delayed_count=next_state.delayed_count + 1,
-                )
+                next_state = next_state.bump_delayed_count()
                 return _NegotiateOutput(
                     next_state=next_state,
                     output_allow=False,
