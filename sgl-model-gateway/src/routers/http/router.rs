@@ -294,7 +294,7 @@ impl Router {
         };
 
         let load_guard =
-            (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
+            (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone(), headers));
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
