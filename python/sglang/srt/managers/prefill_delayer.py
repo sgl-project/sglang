@@ -149,12 +149,12 @@ class PrefillDelayer:
                     outcome="forbid_mixed_prefillable",
                     **debug_info,
                 )
-
-            return None, _NegotiateOutput(
-                allow_prefill=True,
-                outcome="wait_timeout_allow_mixed_prefillable",
-                **debug_info,
-            )
+            else:
+                return None, _NegotiateOutput(
+                    allow_prefill=True,
+                    outcome="wait_timeout_allow_mixed_prefillable",
+                    **debug_info,
+                )
 
     def _gather_info(
         self, local_prefillable: bool, local_token_watermark_force_allow: bool
