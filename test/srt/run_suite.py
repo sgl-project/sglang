@@ -10,11 +10,7 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 suites = {
     "per-commit-1-gpu": [
         TestFile("test_evs.py", 20),
-        TestFile("test_external_models.py", 30),
-        TestFile("test_modelopt_loader.py", 11),
-        TestFile("test_utils_update_weights.py", 29),
         TestFile("test_video_utils.py", 5),
-        TestFile("test_modelopt_export.py", 9),
     ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 650),
@@ -92,7 +88,6 @@ suite_amd = {
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_bench_typebaseddispatcher.py", 10),
-        TestFile("test_external_models.py", 45),
         TestFile("test_rope_rocm.py", 3),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_type_based_dispatcher.py", 10),
