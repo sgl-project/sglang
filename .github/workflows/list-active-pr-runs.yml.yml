@@ -9,7 +9,7 @@ on:
         description: 'Space-separated list of workflow filenames to check (empty for all)'
         required: false
         type: string
-        default: ''
+        default: 'pr-test.yml'
 
 permissions:
   actions: read
