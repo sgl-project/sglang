@@ -78,15 +78,18 @@ async def async_request_openai_completions(
     ), "OpenAI Completions API URL must end with 'completions'."
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        stream = not args.disable_stream
         payload = {
             "model": request_func_input.model,
             "temperature": 0.0,
             "best_of": 1,
-            "stream": not args.disable_stream,
-            "stream_options": {"include_usage": True},
+            "stream": stream,
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
+        # stream_options is only allowed when stream is True
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
