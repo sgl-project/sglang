@@ -122,8 +122,7 @@ class PrefillDelayer:
                 next_state,
                 delayed_count=next_state.delayed_count + 1,
             )
-            if next_state.delayed_count < self._max_delay_passes:
-                return _NegotiateOutput(allow_prefill=False)
+            return _NegotiateOutput(allow_prefill=False)
 
         is_timeout = global_mixed_prefillable
         exist_previous_wait = prev_state is not None
