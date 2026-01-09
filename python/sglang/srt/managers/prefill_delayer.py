@@ -115,7 +115,8 @@ class PrefillDelayer:
             )
             return _NegotiateOutput(allow_prefill=True)
 
-        if global_mixed_prefillable:
+        prev_delayed_count = prev_state.delayed_count if prev_state else 0
+        if global_mixed_prefillable and prev_delayed_count < self._max_delay_passes - 1:
             next_state = _State() or prev_state
             next_state = dataclasses.replace(
                 next_state,
