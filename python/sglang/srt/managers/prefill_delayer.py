@@ -102,40 +102,40 @@ class PrefillDelayer:
         )
 
         # Compute derived global states
-        global_all_prefillable = global_prefillable.min().item() > 0
-        global_all_not_prefillable = global_prefillable.max().item() == 0
+        if global_prefillable.min().item() > 0:
+            prefillable_status = "all"
+        elif global_prefillable.max().item() == 0:
+            prefillable_status = "none"
+        else:
+            prefillable_status = "mixed"
         global_exists_token_watermark_force_allow = (
             global_token_watermark_force_allow.max().item() > 0
         )
         debug_info = dict(
+            prefillable_status=prefillable_status,
             num_prefillable=global_prefillable.sum().item(),
             num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
         )
 
         # Compute outputs
-        if global_all_prefillable:
+        if prefillable_status == "all":
             exist_previous_wait = prev_state is not None
             return None, _NegotiateOutput(
                 allow_prefill=True,
-                prefillable_status="all",
                 decision="wait_success" if exist_previous_wait else "no_wait",
                 **debug_info,
             )
-        elif global_all_not_prefillable:
+        elif prefillable_status == "none":
             return None, _NegotiateOutput(
                 # It does not matter whether we allow or not, thus we allow for simplicity
                 allow_prefill=True,
-                prefillable_status="none",
                 decision="default",
                 **debug_info,
             )
-        else:  # some ranks are prefillable, some are not
-            prefillable_status = "mixed"
-
+        elif prefillable_status == "mixed":
             if global_exists_token_watermark_force_allow:
                 return None, _NegotiateOutput(
                     allow_prefill=True,
-                    prefillable_status=prefillable_status,
                     decision="token_watermark_allow",
                     **debug_info,
                 )
@@ -148,17 +148,17 @@ class PrefillDelayer:
                 )
                 return next_state, _NegotiateOutput(
                     allow_prefill=False,
-                    prefillable_status=prefillable_status,
                     decision="forbid",
                     **debug_info,
                 )
             else:
                 return None, _NegotiateOutput(
                     allow_prefill=True,
-                    prefillable_status=prefillable_status,
                     decision="wait_timeout_allow",
                     **debug_info,
                 )
+        else:
+            raise NotImplementedError
 
     def _gather_info(
         self, local_prefillable: bool, local_token_watermark_force_allow: bool
