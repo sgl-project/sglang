@@ -11,7 +11,12 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.pooler import CrossEncodingPooler, Pooler, PoolingType
+from sglang.srt.layers.pooler import (
+    CrossEncodingPooler,
+    EmbeddingPoolerOutput,
+    Pooler,
+    PoolingType,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -395,6 +400,7 @@ class BertModel(nn.Module):
         if get_global_server_args().is_embedding:
             hidden_states = hidden_states[0:1]
             hidden_states = torch.nn.functional.normalize(hidden_states, p=2, dim=1)
+            hidden_states = EmbeddingPoolerOutput(embeddings=hidden_states)
         elif not self.use_bert_pooler:
             hidden_states = self.pooler(hidden_states, forward_batch)
 
