@@ -768,7 +768,7 @@ void fused_experts_kernel_impl(
       const int64_t offset = offsets[mb];
       if (act_func == CPUAcTMethod::silu_and_mul && use_brgemm) {
         silu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N);
-      } else {
+      } else if (act_func == CPUAcTMethod::swiglu) {
         clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N, C0, m_size, N, alpha, limit, 0 + nb * BLOCK_N / 2);
         clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(
             ic1 + offset * N, C1, m_size, N, alpha, limit, N / 2 + nb * BLOCK_N / 2);
@@ -779,7 +779,6 @@ void fused_experts_kernel_impl(
       at::native::cpublas::brgemm_release();
     }
   });
-
   // stage 2: intermediate_cache2 = intermediate_cache1 @ w2
   //   w2 : [E, K, N] as [E, OC, IC]
   const int64_t OC = K;  // rename K as OC
@@ -1192,7 +1191,7 @@ at::Tensor fused_experts_cpu(
   //
   // for fp8 w8a16:
   //   7. intermediate_cache0 : [M * topk, 2N]
-  //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
+  //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, 2 * N + K]
   //
   int64_t buffer_size_nbytes = M * topk * N * 2 + M * topk * K * 2 +
                                num_threads * BLOCK_M * K * (use_int8_w8a8 ? 1 : 2) +
@@ -1202,7 +1201,7 @@ at::Tensor fused_experts_cpu(
     buffer_size_nbytes += std::max(M * K, M * topk * N) + M * topk * sizeof(float);
   }
   if (use_fp8_w8a16 || use_mxfp4) {
-    buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N) * 2;
+    buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * (K + 2 * N) * 2;
   }
 
   auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
@@ -1436,7 +1435,7 @@ at::Tensor shared_expert_cpu(
   //
   // for fp8 w8a16:
   //   5. intermediate_cache0 : [M, 2N]
-  //   6. B_tmp: [T, MAX_CACHE_BLOCK_SIZE, BLOCK_M, max(K, N)]
+  //   6. B_tmp: [T, MAX_CACHE_BLOCK_SIZE, BLOCK_M, K + 2 * N]
   //
   int num_threads = at::get_num_threads();
   int64_t buffer_size_nbytes = M * N * 2 + num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
@@ -1445,7 +1444,7 @@ at::Tensor shared_expert_cpu(
     buffer_size_nbytes += std::max(M * K, M * N) + M * sizeof(float);
   }
   if (use_fp8_w8a16) {
-    buffer_size_nbytes += M * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_M * std::max(K, N) * 2;
+    buffer_size_nbytes += M * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_M * (K + 2 * N) * 2;
   }
 
   auto buffer = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));

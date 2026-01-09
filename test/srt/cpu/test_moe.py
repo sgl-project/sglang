@@ -362,8 +362,8 @@ class TestFusedExperts(CustomTestCase):
             None,  # block_size
             None,  # a1_scale
             None,  # a2_scale
-            w1_b.to(torch.bfloat16),
-            w2_b.to(torch.bfloat16),
+            w1_b,
+            w2_b,
             alpha,
             limit,
             True,  # is_vnni
