@@ -304,8 +304,17 @@ class MambaPool:
         return dst_index
 
     def get_contiguous_buf_infos(self):
+        """
+        Get buffer info for RDMA registration.
+        Only returns conv and temporal state buffers, excluding intermediate buffers
+        used for speculative decoding (intermediate_ssm, intermediate_conv_window).
+        """
         state_tensors = []
         for field in vars(self.mamba_cache):
+            # Skip intermediate buffers used only for speculative decoding
+            # These buffers have different size (spec_state_size + 1) and should not be transferred
+            if field in ("intermediate_ssm", "intermediate_conv_window"):
+                continue
             value = getattr(self.mamba_cache, field)
             if isinstance(value, list):
                 state_tensors.extend(value)

@@ -6,7 +6,7 @@ import requests
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=32, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=32, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=32, suite="stage-b-test-small-1-gpu-amd")
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
@@ -101,6 +101,16 @@ class TestEnableMetrics(CustomTestCase):
             for _ in response.iter_lines(decode_unicode=False):
                 pass
 
+            response = requests.post(
+                f"{DEFAULT_URL_FOR_TEST}/generate",
+                json={
+                    "text": "Hello",
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 5},
+                },
+                headers={"x-smg-routing-key": "test-key"},
+            )
+            self.assertEqual(response.status_code, 200)
+
             # Get metrics
             metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
             self.assertEqual(metrics_response.status_code, 200)
@@ -133,6 +143,7 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:inter_token_latency_seconds",
             "sglang:e2e_request_latency_seconds",
             "sglang:http_requests_active",
+            "sglang:routing_keys_active",
         ]
         for metric in essential_metrics:
             self.assertIn(metric, metrics_text, f"Missing metric: {metric}")

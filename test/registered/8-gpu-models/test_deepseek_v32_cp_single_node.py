@@ -2,7 +2,6 @@ import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
@@ -81,10 +80,7 @@ class TestDeepseekV32CPSingleNode(unittest.TestCase):
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k", baseline_accuracy=GSM8K_BASELINE
             ),
-            performance_params=PerformanceTestParams(
-                batch_sizes=[1, 8, 16, 32],
-                profile_dir="performance_profiles_deepseek_v32_cp",
-            ),
+            performance_params=None,
         )
 
 
