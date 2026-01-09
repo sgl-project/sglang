@@ -809,7 +809,7 @@ class SchedulerMetricsCollector:
         prefillable: str,
         allow: bool,
         reason: str,
-        actual_prefill: bool,
+        actual: bool,
     ) -> None:
         self._log_histogram(self.prefill_delayer_wait_forward_passes, forward_passes)
         self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
@@ -818,7 +818,7 @@ class SchedulerMetricsCollector:
             prefillable=prefillable,
             allow=str(int(allow)),
             reason=reason,
-            actual_prefill=str(int(actual_prefill)),
+            actual=str(int(actual)),
         ).inc(1)
 
     def increment_retracted_reqs(

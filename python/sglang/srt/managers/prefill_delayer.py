@@ -250,5 +250,5 @@ def _record_single_pass_result(
             prefillable=output.prefillable,
             allow=output.allow,
             reason=output.reason,
-            actual_prefill=actual_prefill,
+            actual=actual_prefill,
         )
