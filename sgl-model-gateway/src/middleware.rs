@@ -772,6 +772,11 @@ pub async fn wasm_middleware(
                 return Ok(next.run(request).await);
             }
         };
+    if modules_on_request.is_empty() {
+        let response = next.run(request).await;
+        return self::wasm_middleware_response_phase(app_state, response, wasm_manager, request_id)
+            .await;
+    }
 
     // Extract request body once before processing modules
     let method = request.method().clone();
@@ -875,7 +880,9 @@ pub async fn wasm_middleware(
                 return Ok(response);
             }
         };
-
+    if modules_on_response.is_empty() {
+        return Ok(response);
+    }
     // Extract response data once before processing modules
     let mut status = response.status();
     let mut headers = response.headers().clone();
