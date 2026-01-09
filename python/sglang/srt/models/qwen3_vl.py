@@ -405,8 +405,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         for t, h, w in zip(grid_ts, grid_hs, grid_ws):
             if self.align_corners:
-                h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
-                w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
+                h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h, device=device)
+                w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w, device=device)
             else:
                 h_idxs = (torch.arange(h, device=device) + 0.5) * (
                     self.num_grid_per_side / h
@@ -419,8 +419,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
             h_idxs_floor = h_idxs.int()
             w_idxs_floor = w_idxs.int()
-            h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
-            w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+            h_idxs_ceil = (h_idxs_floor + 1).clip(max=self.num_grid_per_side - 1)
+            w_idxs_ceil = (w_idxs_floor + 1).clip(max=self.num_grid_per_side - 1)
 
             dh = h_idxs - h_idxs_floor
             dw = w_idxs - w_idxs_floor
@@ -443,12 +443,12 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             ]
 
             for i in range(4):
-                idx_list[i].extend(indices[i].tolist())
-                weight_list[i].extend(weights[i].tolist())
+                idx_list[i].append(indices[i])
+                weight_list[i].append(weights[i])
 
-        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
-        weight_tensor = torch.tensor(
-            weight_list, dtype=self.pos_embed.weight.dtype, device=device
+        idx_tensor = torch.stack([torch.cat(l) for l in idx_list]).long()
+        weight_tensor = torch.stack([torch.cat(l) for l in weight_list]).to(
+            self.pos_embed.weight.dtype
         )
         pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
