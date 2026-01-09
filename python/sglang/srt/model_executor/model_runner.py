@@ -544,18 +544,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
-        gc.collect()
-        # torch.cuda.empty_cache()
-        # torch.cuda.reset_peak_memory_stats()
-        peak_bytes = torch.cuda.max_memory_allocated()
-        unalloc_bytes = torch.cuda.memory_reserved() - torch.cuda.max_memory_allocated()
-        stats = torch.cuda.memory_stats()
-        private_pool_bytes = stats.get("extra_state.active_bytes.all.current", 0)
-        log_info_on_rank0(
-            logger,
-            f"Peak memory allocated before cg: {peak_bytes / 1024 / 1024:.2f} MB, Unallocated memory: {unalloc_bytes / 1024 / 1024:.2f} MB, Private pool: {private_pool_bytes / 1024 / 1024:.2f} MB",
-        )
-
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
@@ -568,18 +556,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.graph_runner = None
             self.graph_mem_usage = 0
             self.init_attention_backend()
-
-        gc.collect()
-        # torch.cuda.empty_cache()
-        # torch.cuda.reset_peak_memory_stats()
-        peak_bytes = torch.cuda.max_memory_allocated()
-        unalloc_bytes = torch.cuda.memory_reserved() - torch.cuda.max_memory_allocated()
-        stats = torch.cuda.memory_stats()
-        private_pool_bytes = stats.get("extra_state.active_bytes.all.current", 0)
-        log_info_on_rank0(
-            logger,
-            f"Peak memory allocated after cg: {peak_bytes / 1024 / 1024:.2f} MB, Unallocated memory: {unalloc_bytes / 1024 / 1024:.2f} MB, Private pool: {private_pool_bytes / 1024 / 1024:.2f} MB",
-        )
 
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
@@ -609,29 +585,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
         # Initialize piecewise CUDA graph
-        gc.collect()
-        # torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        peak_bytes = torch.cuda.max_memory_allocated()
-        unalloc_bytes = torch.cuda.memory_reserved() - torch.cuda.max_memory_allocated()
-        stats = torch.cuda.memory_stats()
-        private_pool_bytes = stats.get("extra_state.active_bytes.all.current", 0)
-        log_info_on_rank0(
-            logger,
-            f"Peak memory allocated before piecewise cg init: {peak_bytes / 1024 / 1024:.2f} MB, Unallocated memory: {unalloc_bytes / 1024 / 1024:.2f} MB, Private pool: {private_pool_bytes / 1024 / 1024:.2f} MB",
-        )
         self.init_piecewise_cuda_graphs()
-        gc.collect()
-        # torch.cuda.empty_cache()
-        # torch.cuda.reset_peak_memory_stats()
-        peak_bytes = torch.cuda.max_memory_allocated()
-        unalloc_bytes = torch.cuda.memory_reserved() - torch.cuda.max_memory_allocated()
-        stats = torch.cuda.memory_stats()
-        private_pool_bytes = stats.get("extra_state.active_bytes.all.current", 0)
-        log_info_on_rank0(
-            logger,
-            f"Peak memory allocated after piecewise cg init: {peak_bytes / 1024 / 1024:.2f} MB, Unallocated memory: {unalloc_bytes / 1024 / 1024:.2f} MB, Private pool: {private_pool_bytes / 1024 / 1024:.2f} MB",
-        )
 
     def init_routed_experts_capturer(self):
         # TODO: the redundant logic with TpModelWorker
@@ -2251,21 +2205,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        log_info_on_rank0(
-            logger,
-            f"Forward size: {forward_batch.input_ids.shape[0]}",
-        )
-        gc.collect()
-        # torch.cuda.empty_cache()
-        # torch.cuda.reset_peak_memory_stats()
-        peak_bytes = torch.cuda.max_memory_allocated()
-        unalloc_bytes = torch.cuda.memory_reserved() - torch.cuda.max_memory_allocated()
-        stats = torch.cuda.memory_stats()
-        private_pool_bytes = stats.get("extra_state.active_bytes.all.current", 0)
-        log_info_on_rank0(
-            logger,
-            f"Peak memory allocated before forward pass: {peak_bytes / 1024 / 1024:.2f} MB, Unallocated memory: {unalloc_bytes / 1024 / 1024:.2f} MB, Private pool: {private_pool_bytes / 1024 / 1024:.2f} MB",
-        )
         self.forward_pass_id += 1
 
         with get_global_expert_distribution_recorder().with_forward_pass(
@@ -2291,17 +2230,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
 
-        gc.collect()
-        # torch.cuda.empty_cache()
-        # torch.cuda.reset_peak_memory_stats()
-        peak_bytes = torch.cuda.max_memory_allocated()
-        unalloc_bytes = torch.cuda.memory_reserved() - torch.cuda.max_memory_allocated()
-        stats = torch.cuda.memory_stats()
-        private_pool_bytes = stats.get("extra_state.active_bytes.all.current", 0)
-        log_info_on_rank0(
-            logger,
-            f"Peak memory allocated after forward pass: {peak_bytes / 1024 / 1024:.2f} MB, Unallocated memory: {unalloc_bytes / 1024 / 1024:.2f} MB, Private pool: {private_pool_bytes / 1024 / 1024:.2f} MB",
-        )
         return output
 
     def _forward_raw(

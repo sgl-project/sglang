@@ -895,14 +895,12 @@ class ServerArgs:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
         if self.piecewise_cuda_graph_max_tokens is None:
-            # Reduce the capture size to 1024 and 2048 due to:
-            # 1. Piecewise cuda graph achieve little performance improvement when the capture size is large
-            # 2. Memory overhead of piecewise cuda graph is related to the number of capture sizes, a smaller capture
-            # range can reduce the cuda graph metadata memory overhead.
-            if self.tp_size < 4:
-                self.piecewise_cuda_graph_max_tokens = 1024
-            else:
+            # Refer to pr #15927, by default we set the piecewise cuda graph max tokens to the chunked prefill size by default.
+            # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode. To avoid the performance regression, we set the max tokens to 2048 by default.
+            if self.use_mla_backend():
                 self.piecewise_cuda_graph_max_tokens = 2048
+            else:
+                self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
 
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
@@ -933,14 +931,9 @@ class ServerArgs:
                     reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
 
             # For piecewise cuda graphs
-            # if self.enable_piecewise_cuda_graph:
-            #     # Piecewise cuda graph memory overhead is constructed by the max capture size and the number of capture ranges.
-            #     if self.piecewise_cuda_graph_max_tokens <= 1024:
-            #         reserved_mem += 1024 + 8 * len(self.piecewise_cuda_graph_tokens)
-            #     else:
-            #         reserved_mem += 1024 * 1.5 + 8 * len(
-            #             self.piecewise_cuda_graph_tokens
-            #         )
+            if self.enable_piecewise_cuda_graph:
+                # Only calculate the memory overhead for Non-Torch Memory use since the Torch Memory can be reused with Cuda Graph Capture
+                reserved_mem += len(self.piecewise_cuda_graph_tokens) * 8
 
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
