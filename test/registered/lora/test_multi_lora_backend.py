@@ -20,12 +20,13 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
     ALL_OTHER_MULTI_LORA_MODELS,
     CI_MULTI_LORA_MODELS,
+    run_lora_batch_splitting_equivalence_test,
     run_lora_multiple_batch_on_model_cases,
 )
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
-register_cuda_ci(est_time=60, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=60, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=100, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=100, suite="stage-b-test-small-1-gpu-amd")
 
 # All prompts are used at once in a batch.
 PROMPTS = [
@@ -43,11 +44,11 @@ PROMPTS = [
 
 
 class TestMultiLoRABackend(CustomTestCase):
-    def test_ci_lora_models(self):
-        for max_loras_batch_sz in [1, 2, 3]:
-            run_lora_multiple_batch_on_model_cases(
-                CI_MULTI_LORA_MODELS, max_loras_per_batch_override=max_loras_batch_sz
-            )
+    def test_ci_lora_models_batch_splitting(self):
+        run_lora_batch_splitting_equivalence_test(CI_MULTI_LORA_MODELS)
+
+    def test_ci_lora_models_multi_batch(self):
+        run_lora_multiple_batch_on_model_cases(CI_MULTI_LORA_MODELS)
 
     def test_all_lora_models(self):
         if is_in_ci():
