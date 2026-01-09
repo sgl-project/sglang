@@ -80,7 +80,7 @@ class PrefillDelayer:
         )
         return out
 
-    # (Almost) pure function
+    # (Almost) pure function, do not modify self state
     def _negotiate_should_allow_prefill_pure(
         self,
         prev_state: Optional[_State],
