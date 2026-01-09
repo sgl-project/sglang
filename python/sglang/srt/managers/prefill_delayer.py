@@ -75,7 +75,7 @@ class PrefillDelayer:
 
         if global_force_allow.max().item() > 0:
             self._reset(
-                outcome="token_usage_watermark",
+                outcome="token_watermark_force_allow",
                 debug_num_prefillable=num_prefillable,
                 debug_num_force_allow=num_force_allow,
             )
@@ -97,10 +97,10 @@ class PrefillDelayer:
         is_timeout = global_mixed_prefillable
         self._reset(
             outcome=(
-                "timeout" if is_timeout else (
-                    "all_prefillable"
-                    if TODO
-                    else TODO
+                "wait_timeout" if is_timeout else (
+                    "wait_success_all_prefillable"
+                    if self._curr_delay_info is not None
+                    else "no_wait_all_prefillable"
                 )
             ),
             debug_num_prefillable=num_prefillable,
