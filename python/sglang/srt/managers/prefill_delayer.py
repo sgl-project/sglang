@@ -96,7 +96,13 @@ class PrefillDelayer:
 
         is_timeout = global_mixed_prefillable
         self._reset(
-            outcome="timeout" if is_timeout else TODO,
+            outcome=(
+                "timeout" if is_timeout else (
+                    "all_prefillable"
+                    if TODO
+                    else TODO
+                )
+            ),
             debug_num_prefillable=num_prefillable,
             debug_num_force_allow=num_force_allow,
         )
