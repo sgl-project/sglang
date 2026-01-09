@@ -113,6 +113,8 @@ class PrefillDelayer:
             global_exists_not_prefillable and global_exists_prefillable
         )
 
+        # Compute outputs
+
         if global_all_prefillable:
             exist_previous_wait = prev_state is not None
             return None, _NegotiateOutput(
