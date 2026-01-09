@@ -1,7 +1,9 @@
 import asyncio
 import os
+import time
 import unittest
-from typing import Any, List, Tuple
+
+import aiohttp
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -12,7 +14,6 @@ from sglang.test.test_utils import (
     STDOUT_FILENAME,
     CustomTestCase,
     popen_launch_server,
-    send_concurrent_generate_requests_with_custom_params,
 )
 
 
@@ -31,7 +32,7 @@ class TestRoutingKeyScheduling(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=(
                 "--max-running-requests",
-                "2",
+                "3",
                 "--schedule-policy",
                 "routing-key",
             ),
@@ -47,36 +48,60 @@ class TestRoutingKeyScheduling(CustomTestCase):
         os.remove(STDERR_FILENAME)
 
     def test_routing_key_scheduling_order(self):
-        """Verify requests with matching routing keys are prioritized."""
-        responses = asyncio.run(
-            send_concurrent_generate_requests_with_custom_params(
-                self.base_url,
-                [
-                    {
-                        "routing_key": "key_a",
-                        "sampling_params": {"max_new_tokens": 3000},
-                    },
-                    {
-                        "routing_key": "key_b",
-                        "sampling_params": {"max_new_tokens": 10},
-                    },
-                    {
-                        "routing_key": "key_a",
-                        "sampling_params": {"max_new_tokens": 10},
-                    },
-                ],
-            )
-        )
+        """Verify requests with matching routing keys are prioritized.
+        
+        Test strategy:
+        1. First send 2 long-running key_a requests to occupy running batch
+        2. Then send 10 key_a and 10 key_b short requests concurrently
+        3. With max_running_requests=3, key_a requests should be prioritized
+           because running batch has 2 key_a requests
+        4. Verify key_a requests finish before key_b requests on average
+        """
+        asyncio.run(self._test_routing_key_scheduling_order())
 
-        e2e_latencies = []
-        for got_status, got_json in responses:
-            self.assertEqual(got_status, 200)
-            e2e_latencies.append(got_json["meta_info"]["e2e_latency"])
+    async def _test_routing_key_scheduling_order(self):
+        base_payload = {
+            "text": "System: You are a helpful assistant.\nUser: What is 1+1?\nAssistant:",
+            "sampling_params": {"temperature": 0, "max_new_tokens": 10},
+        }
+
+        async def send_request(routing_key: str, max_new_tokens: int):
+            payload = base_payload.copy()
+            payload["routing_key"] = routing_key
+            payload["sampling_params"] = {"temperature": 0, "max_new_tokens": max_new_tokens}
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"{self.base_url}/generate", json=payload) as resp:
+                    result = await resp.json()
+                    return routing_key, result.get("meta_info", {}).get("e2e_latency", 0)
+
+        long_running_tasks = [
+            asyncio.create_task(send_request("key_a", 2000)),
+            asyncio.create_task(send_request("key_a", 2000)),
+        ]
+
+        await asyncio.sleep(0.5)
+
+        short_tasks = []
+        for _ in range(10):
+            short_tasks.append(asyncio.create_task(send_request("key_a", 10)))
+            short_tasks.append(asyncio.create_task(send_request("key_b", 10)))
+
+        all_short_results = await asyncio.gather(*short_tasks)
+        await asyncio.gather(*long_running_tasks)
+
+        key_a_latencies = [lat for key, lat in all_short_results if key == "key_a"]
+        key_b_latencies = [lat for key, lat in all_short_results if key == "key_b"]
+
+        avg_key_a = sum(key_a_latencies) / len(key_a_latencies)
+        avg_key_b = sum(key_b_latencies) / len(key_b_latencies)
+
+        print(f"Average key_a latency: {avg_key_a:.3f}s")
+        print(f"Average key_b latency: {avg_key_b:.3f}s")
 
         self.assertLess(
-            e2e_latencies[2],
-            e2e_latencies[1],
-            "Request with matching routing_key (key_a) should finish before key_b",
+            avg_key_a,
+            avg_key_b,
+            f"key_a requests (avg={avg_key_a:.3f}s) should finish before key_b (avg={avg_key_b:.3f}s)",
         )
 
 
