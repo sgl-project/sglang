@@ -132,7 +132,7 @@ class PrefillDelayer:
                 outcome="token_watermark_force_allow",
             )
 
-        next_state = _State() or prev_state
+        next_state = prev_state or _State()
         if global_mixed_prefillable:
             next_state = dataclasses.replace(
                 next_state,
