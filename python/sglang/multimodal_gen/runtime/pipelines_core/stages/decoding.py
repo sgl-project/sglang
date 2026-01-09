@@ -166,9 +166,19 @@ class DecodingStage(PipelineStage):
                 output_frame_size = (sampling_params.height * sampling_params.width * num_channels * latents.element_size())
 
                 num_sample_frames_per_chunk = int(gpu_mem_before_decoding // (output_frame_size / (1 << 30)) // batch_size)
-                tile_latent_stride_num_frames = min(num_sample_frames_per_chunk // self.vae.temporal_compression_ratio, num_frames)
+                tile_latent_stride_num_frames = num_sample_frames_per_chunk // self.vae.temporal_compression_ratio
 
-                sample_overlap_frames = (
+                # Decode all frames at once
+                if num_frames <= tile_latent_stride_num_frames:
+                    decode_output = self.vae.decode(latents)
+                    frame = _ensure_tensor_decode_output(decode_output)
+                    frame = (frame / 2 + 0.5).clamp(0, 1)
+                    frames = frame.cpu()
+                    return frames
+
+
+                # Decode in chunks
+                overlap_sample_frames = (
                     self.vae.config.temporal_tiling_num_overlap_latent_frames
                     * self.vae.temporal_compression_ratio
                 )
@@ -191,7 +201,7 @@ class DecodingStage(PipelineStage):
                         )
                         if i > 0:
                             decode_output = decode_output[
-                                :, :, sample_overlap_frames + 1 :, :, :
+                                :, :, overlap_sample_frames + 1 :, :, :
                             ]
 
                         frame = _ensure_tensor_decode_output(decode_output)
