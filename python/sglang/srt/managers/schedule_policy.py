@@ -466,7 +466,10 @@ class PrefillAdder:
             0,
             req.extend_input_len,
             (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                min(
+                    req.sampling_params.max_new_tokens - len(req.output_ids),
+                    CLIP_MAX_NEW_TOKENS,
+                )
                 if not truncated
                 else 0
             ),
@@ -551,7 +554,10 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                min(
+                    req.sampling_params.max_new_tokens - len(req.output_ids),
+                    CLIP_MAX_NEW_TOKENS,
+                ),
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -637,7 +643,7 @@ class PrefillAdder:
                     prefix_len,
                     input_tokens,
                     min(
-                        req.sampling_params.max_new_tokens,
+                        req.sampling_params.max_new_tokens - len(req.output_ids),
                         CLIP_MAX_NEW_TOKENS,
                     ),
                 )
@@ -696,7 +702,10 @@ class PrefillAdder:
         preemptible_reqs = []
         min_tokens_to_remove = (
             req.extend_input_len
-            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            + min(
+                req.sampling_params.max_new_tokens - len(req.output_ids),
+                CLIP_MAX_NEW_TOKENS,
+            )
             - self.rem_total_tokens
         )
         for running_req in sorted_valid_running_reqs:
