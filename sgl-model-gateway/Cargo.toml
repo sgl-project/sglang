@@ -1,6 +1,6 @@
 [package]
 name = "sgl-model-gateway"
-version = "0.2.3"
+version = "0.3.1"
 edition = "2021"
 
 [features]
@@ -14,7 +14,7 @@ vendored-openssl = ["openssl/vendored"]
 unused_qualifications = "warn"
 
 [lib]
-name = "sgl_model_gateway"
+name = "smg"
 crate-type = ["rlib"]
 
 [[bin]]
@@ -31,7 +31,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
-axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
+axum = { version = "0.8.6", features = ["macros", "ws", "tracing"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -41,6 +42,7 @@ serde_json = { version = "1.0", default-features = false, features = [
 ] }
 serde_bytes = "0.11"
 bytes = "1.8.0"
+http-body = "1.0"
 rand = "0.9.2"
 reqwest = { version = "0.12.8", features = ["stream", "blocking", "json", "rustls-tls"], default-features = false }
 futures-util = "0.3"
@@ -48,6 +50,8 @@ futures = "0.3"
 dashmap = "6.1.0"
 lru = "0.16.2"
 blake3 = "1.5"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+bytemuck = { version = "1.21", features = ["derive"] }
 http = "1.1.0"
 tokio = { version = "1.42.0", features = ["full"] }
 async-trait = "0.1"
@@ -70,6 +74,7 @@ parking_lot = "0.12.4"
 rayon = "1.10"
 thiserror = "2.0.12"
 regex = "1.10"
+memchr = "2.7"  # SIMD-optimized byte pattern searching
 url = "2.5.4"
 validator = { version = "0.20.0", features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -79,6 +84,8 @@ tiktoken-rs = { version = "0.7.0" }
 minijinja = { version = "2.0", features = ["unstable_machinery", "json", "builtins"] }
 minijinja-contrib = { version = "2.0", features = ["pycompat"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2.2"
 openssl = "0.10.73"
 hf-hub = { version = "0.4.3", features = ["tokio"] }
 rmcp = { version = "0.8.3", features = ["client", "server",
@@ -92,6 +99,7 @@ rmcp = { version = "0.8.3", features = ["client", "server",
 serde_yaml = "0.9"
 oracle = { version = "0.6.3", features = ["chrono"] }
 subtle = "2.6"
+jsonwebtoken = { version = "9.3", default-features = false, features = ["use_pem"] }
 rustpython-parser = "0.4.0"
 num-traits = "0.2"
 image = { version = "0.25.4", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
@@ -99,6 +107,7 @@ ndarray = "0.16"
 base64 = "0.22"
 openai-harmony = { git = "https://github.com/openai/harmony", tag = "v0.0.4" }
 openmetrics-parser = "0.4.4"
+arc-swap = "1.7.1"
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.14.2", features = ["gzip", "transport"] }
@@ -138,11 +147,16 @@ npyz = { version = "0.8", features = ["npz"] }  # For reading numpy .npz files i
 opentelemetry-proto = { version = "0.27", features = ["gen-tonic"] }
 tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
+rsa = { version = "0.9", features = ["sha2"] }
 
 [[bench]]
 name = "request_processing"
 harness = false
 path = "benches/request_processing.rs"
+
+[[bench]]
+name = "router_registry_bench"
+harness = false
 
 [[bench]]
 name = "tokenizer_benchmark"
@@ -153,6 +167,16 @@ path = "benches/tokenizer_benchmark.rs"
 name = "tool_parser_benchmark"
 harness = false
 path = "benches/tool_parser_benchmark.rs"
+
+[[bench]]
+name = "tree_benchmark"
+harness = false
+path = "benches/tree_benchmark.rs"
+
+[[bench]]
+name = "manual_policy_benchmark"
+harness = false
+path = "benches/manual_policy_benchmark.rs"
 
 [profile.release]
 opt-level = "z"     # Optimize for size

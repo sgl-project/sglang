@@ -1,7 +1,9 @@
 import json
 import os
 import sys
+import time
 
+import requests
 from github import Auth, Github
 
 # Configuration
@@ -118,7 +120,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
 
 
 def handle_rerun_stage(
-    gh_repo, pr, comment, user_perms, stage_name, react_on_success=True
+    gh_repo, pr, comment, user_perms, stage_name, token, react_on_success=True
 ):
     """
     Handles the /rerun-stage <stage-name> command.
@@ -143,11 +145,17 @@ def handle_rerun_stage(
     # Valid NVIDIA stage names that support target_stage
     nvidia_stages = [
         "stage-a-test-1",
+        "stage-a-cpu-only",
+        "stage-b-test-small-1-gpu",
+        "stage-b-test-large-1-gpu",
+        "stage-b-test-large-2-gpu",
+        "stage-c-test-large-4-gpu",
+        "stage-c-test-large-4-gpu-b200",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
         "quantization-test",
         "unit-test-backend-1-gpu",
-        "unit-test-backend-2-gpu",
+        "stage-b-test-4-gpu-b200",
         "unit-test-backend-4-gpu",
         "unit-test-backend-8-gpu-h200",
         "unit-test-backend-8-gpu-h20",
@@ -168,6 +176,9 @@ def handle_rerun_stage(
     amd_stages = [
         "sgl-kernel-unit-test-amd",
         "stage-a-test-1-amd",
+        "stage-b-test-small-1-gpu-amd",
+        "stage-b-test-small-1-gpu-amd-mi35x",
+        "stage-b-test-large-2-gpu-amd",
         "unit-test-backend-1-gpu-amd",
         "unit-test-backend-2-gpu-amd",
         "unit-test-backend-8-gpu-amd",
@@ -207,20 +218,52 @@ def handle_rerun_stage(
             print(f"Error: {workflow_name} workflow not found")
             return False
 
-        # Trigger workflow_dispatch on the PR's head branch
-        ref = pr.head.ref
-        print(f"Triggering {workflow_name} workflow on branch: {ref}")
-
-        # AMD workflow doesn't have version input, only target_stage
-        if is_amd_stage:
-            inputs = {"target_stage": stage_name}
-        else:
-            inputs = {"version": "release", "target_stage": stage_name}
-
-        success = target_workflow.create_dispatch(
-            ref=ref,
-            inputs=inputs,
+        # Check if PR is from a fork by comparing repo owners
+        # Handle case where fork repo may have been deleted (pr.head.repo is None)
+        is_fork = (
+            pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
         )
+        print(f"PR is from fork: {is_fork}")
+
+        if is_fork:
+            # For fork PRs: dispatch on main and pass SHA as input
+            # This is needed because fork branch names don't exist in the main repo
+            ref = "main"
+            pr_head_sha = pr.head.sha
+            print(
+                f"Triggering {workflow_name} workflow on ref: {ref}, PR head SHA: {pr_head_sha}"
+            )
+            if is_amd_stage:
+                inputs = {"target_stage": stage_name, "pr_head_sha": pr_head_sha}
+            else:
+                inputs = {
+                    "version": "release",
+                    "target_stage": stage_name,
+                    "pr_head_sha": pr_head_sha,
+                }
+        else:
+            # For non-fork PRs: dispatch on the PR branch directly
+            # This allows testing workflow changes before merge
+            ref = pr.head.ref
+            print(f"Triggering {workflow_name} workflow on branch: {ref}")
+            if is_amd_stage:
+                inputs = {"target_stage": stage_name}
+            else:
+                inputs = {"version": "release", "target_stage": stage_name}
+
+        # Use requests directly as PyGithub's create_dispatch only accepts HTTP 204
+        dispatch_url = f"https://api.github.com/repos/{gh_repo.full_name}/actions/workflows/{target_workflow.id}/dispatches"
+        dispatch_resp = requests.post(
+            dispatch_url,
+            json={"ref": ref, "inputs": inputs},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        success = dispatch_resp.status_code in (200, 204)
+        if not success:
+            print(f"Dispatch failed: {dispatch_resp.status_code} {dispatch_resp.text}")
 
         if success:
             print(f"Successfully triggered workflow for stage '{stage_name}'")
@@ -228,7 +271,7 @@ def handle_rerun_stage(
                 comment.create_reaction("+1")
                 pr.create_issue_comment(
                     f"✅ Triggered `{stage_name}` to run independently (skipping dependencies).\n\n"
-                    f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
+                    f"It will not be shown in this page. Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
                 )
             return True
         else:
@@ -285,6 +328,12 @@ def main():
         tagged = handle_tag_run_ci(
             repo, pr, comment, user_perms, react_on_success=False
         )
+
+        # Wait for the label to propagate before triggering rerun
+        if tagged:
+            print("Waiting 5 seconds for label to propagate...")
+            time.sleep(5)
+
         rerun = handle_rerun_failed_ci(
             repo, pr, comment, user_perms, react_on_success=False
         )
@@ -300,7 +349,7 @@ def main():
         # Extract stage name from command
         parts = first_line.split(maxsplit=1)
         stage_name = parts[1].strip() if len(parts) > 1 else None
-        handle_rerun_stage(repo, pr, comment, user_perms, stage_name)
+        handle_rerun_stage(repo, pr, comment, user_perms, stage_name, token)
 
     else:
         print(f"Unknown or ignored command: {first_line}")

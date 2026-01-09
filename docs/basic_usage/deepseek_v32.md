@@ -56,7 +56,7 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
   - `flashmla_kv`: `flash_mla_with_kvcache` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, fp8 k_cache inputs.
   - `fa3`: `flash_attn_with_kvcache` kernel from `flash_attn` library. Can only run on Hopper GPUs. It requires bf16 q, kv inputs.
   - `tilelang`: `tilelang` implementation that can run on GPU, HPU and NPU.
-  - `alter`: Alter kernel on AMD HPUs. Can only be used as decode kernel.
+  - `aiter`: Aiter kernel on AMD HPUs. Can only be used as decode kernel.
 - On the basis of performance benchmarks, the default configuration on H200 and B200 are set as follows :
   - H200: `flashmla_sparse` prefill attention (short-seq prefill uses MHA via FlashAttention varlen), `fa3` decode attention, `bf16` kv cache dtype.
   - B200: `flashmla_auto` prefill attention (short-seq prefill uses MHA via TRT-LLM ragged), `flashmla_kv` decode attention, `fp8_e4m3` kv cache dtype. `flashmla_auto` enables automatic selection of either `flashmla_sparse` or `flashmla_kv` kernel for prefill based on KV cache dtype, hardware, and heuristics. When FP8 KV cache is enabled and `total_kv_tokens < total_q_tokens * 512`, it uses the `flashmla_sparse` kernel; otherwise, it falls back to the `flashmla_kv` kernel. The heuristics may need to be tuned if the performance of either the `flashmla_sparse` or `flashmla_kv` kernel changes significantly.
@@ -64,12 +64,22 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
 ## Multi-token Prediction
 SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes. Please look at [this PR](https://github.com/sgl-project/sglang/pull/11652) for more information.
 
-Example usage:
+Example usage with DP Attention:
 ```bash
 python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 --enable-dp-attention --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
 ```
+
+Example usage with Pure TP:
+```bash
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+```
+
 - The best configuration for `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` can be searched with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py) script for given batch size. The minimum configuration is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`, which can achieve speedup for larger batch sizes.
 - The default value of  `--max-running-requests` is set to `48` for MTP. For larger batch sizes, this value should be increased beyond the default value.
+
+```{tip}
+To enable the experimental overlap scheduler for EAGLE speculative decoding, set the environment variable `SGLANG_ENABLE_SPEC_V2=1`. This can improve performance by enabling overlap scheduling between draft and verification stages.
+```
 
 
 ## Function Calling and Reasoning Parser
@@ -264,19 +274,40 @@ DeepSeek-V3.2-Speciale:
 
 ## DSA long sequence context parallel optimization(experimental)
 
-Accuracy benchmark on long context can be tested on GPQA-diamond dataset with long output tokens and thinking enabled:
+**Note: This feature is only verified on Hopper machines**
+
+For context parallel in DeepSeek V3.2 model, we provide two different modes of splitting tokens, which can be controlled with argument `--nsa-prefill-cp-mode`.
+
+### In sequence splitting (default setting)
+
+The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of sharded sequence, and collects the whole kv cache through all gather operator.
+
+The communication group for context parallel reuses the one for attention tp, thus `cp_size` equals `atten_tp_size = tp_size / dp_size`.
+
+Note that in sequence splitting mode has the following restrictions:
+- The batch size is restricted to 1 for prefill batches
+- Multi-node/PD disaggregation is still not supported
+- `moe_dense_tp_size=1`, `kv_cache_dtype = "bf16"`, `moe_a2a_backend = "deepep"`
+- To ensure `cp_size > 1`, the passed in `tp_size` must be larger than `dp_size`
+
+For more details, please refer to PR https://github.com/sgl-project/sglang/pull/12065.
+
+Example:
+```bash
+# In-seq splitting mode launched with EP + DP
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --ep 8 --dp 2 --enable-dp-attention --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode in-seq-split --max-running-requests 32
+```
+
+### Round robin splitting
+
+This mode can be enabled by specifying the parameter `--nsa-prefill-cp-mode round-robin-split`, which distributes tokens across ranks based on `token_idx % cp_size`.
+
+In this scenario, compared with the aforementioned method, it additionally supports the fused MoE backend (the fused MoE backend may deliver better performance than DeepEP in single-machine scenarios), FP8 KV-cache, and multi-batch prefill inference. But it cannot be enabled with dp attention together.
+
+For more details, please refer to PR https://github.com/sgl-project/sglang/pull/13959.
 
 Example usage:
 ```bash
-# Launch with EP + DP
-python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --ep 8 --dp 2 --enable-dp-attention --enable-nsa-prefill-context-parallel --max-running-requests 32
+# Launch with FusedMoe + CP8
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode round-robin-split --max-running-requests 32
 ```
-### Context-parallel Tips
-`CP_size` reuses `atten_tp_size`, which is equal to `TP_size` / `DP_size`.
-Some features are still not supported at present.
-- **Multi-batch prefill**: Currently, only single-request processing is supported during the prefill process.
-- **disaggregation**: P/D disaggregation.
-- **Cross-machine support**: - Currently only tested on a single machine (TP=8,EP=8).
-- **Other Args**: Currently only supports moe_dense_tp_size=1, kv_cache_dtype = "bf16", moe_a2a_backend = "deepep",
-- **DP_size**: `CP_size` reuses `atten_tp_size`, which is equal to `TP_size` / `DP_size`. For the cp function to work correctly, `TP_size` must be divisible by `DP_size`, and TP_size / DP_size > 1 (to ensure CP_size > 1).
-- **Detailed design reference**: https://github.com/sgl-project/sglang/pull/12065

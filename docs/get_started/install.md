@@ -12,7 +12,13 @@ It is recommended to use uv for faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install "sglang" --prerelease=allow
+uv pip install "sglang"
+```
+
+For different CUDA versions, you can try to add `--extra-index-url` to find the correct [PyTorch](https://pytorch.org/get-started/locally/) wheel.
+For example, on GB200, you will need to do the following. Otherwise, it will install the CPU version of PyTorch.
+```
+uv pip install "sglang" --extra-index-url https://download.pytorch.org/whl/cu129
 ```
 
 **Quick fixes to common problems**
@@ -25,7 +31,7 @@ uv pip install "sglang" --prerelease=allow
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.6 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.6.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages
@@ -147,6 +153,8 @@ sky status --endpoint 30000 sglang
 <summary>More</summary>
 
 To deploy on SGLang on AWS SageMaker, check out [AWS SageMaker Inference](https://aws.amazon.com/sagemaker/ai/deploy)
+
+Amazon Web Services provide supports for SGLang containers along with routine security patching. For available SGLang containers, check out [AWS SGLang DLCs](https://github.com/aws/deep-learning-containers/blob/master/available_images.md#sglang-containers)
 
 To host a model with your own container, follow the following steps:
 

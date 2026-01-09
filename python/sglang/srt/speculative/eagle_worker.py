@@ -14,11 +14,12 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
-from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -53,6 +54,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
+    get_last_loc_large_page_size_large_top_k,
     load_token_map,
     select_top_k_tokens,
 )
@@ -60,7 +62,6 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     empty_context,
     get_available_gpu_memory,
-    get_bool_env_var,
     is_cuda,
     is_npu,
     next_power_of_2,
@@ -73,7 +74,6 @@ if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
 
 logger = logging.getLogger(__name__)
-SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 
 
 class EAGLEWorker(TpModelWorker):
@@ -186,6 +186,15 @@ class EAGLEWorker(TpModelWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
+        self.eagle_use_aux_hidden_state = False
+        if self.speculative_algorithm.is_eagle3():
+            self.eagle_use_aux_hidden_state = True
+            eagle_config = getattr(
+                self.draft_model_runner.model_config.hf_config, "eagle_config", {}
+            )
+            self.eagle_use_aux_hidden_state = eagle_config.get(
+                "use_aux_hidden_state", True
+            )
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -316,6 +325,7 @@ class EAGLEWorker(TpModelWorker):
                 logits_output=logits_output,
                 next_token_ids=verify_output.verified_id,
                 num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
+                accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
@@ -365,6 +375,10 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
+        if isinstance(batch.tree_cache, SWAChunkCache):
+            for req in batch.reqs:
+                batch.tree_cache.evict_swa(req, req.seqlen - 1)
+
         # Parse args
         num_seqs = batch.batch_size()
         spec_info = batch.spec_info
@@ -381,8 +395,6 @@ class EAGLEWorker(TpModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
-            for req in batch.reqs:
-                req.kv_allocated_len += self.speculative_num_steps * self.topk
             # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
             out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
                 batch.tree_cache,
@@ -647,9 +659,9 @@ class EAGLEWorker(TpModelWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output, _ = self.draft_model_runner.forward(
+            logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            )
+            ).logits_output
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -669,6 +681,7 @@ class EAGLEWorker(TpModelWorker):
         pass
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
         batch.return_hidden_states = False
@@ -743,48 +756,12 @@ class EAGLEWorker(TpModelWorker):
             self.target_worker.model_runner.hybrid_gdn_config is not None
             or self.target_worker.model_runner.mamba2_config is not None
         ):
-            accepted_length = (
-                torch.tensor(
-                    res.accept_length_per_req_cpu,
-                    device=logits_output.hidden_states.device,
-                    dtype=torch.int64,
-                )
-                + 1
-            )
-
-            # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-            # res.accepted_indices.shape[0] > 0 skips DP attn idle batch
-            if spec_info.topk > 1 and res.accepted_indices.shape[0] > 0:
-                # accepted_indices=[0,2,3,4,5,7,9,10,11], accepted_length=[4, 3, 2], cumulative_accepted_lengths=[4, 7, 9]
-                # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_accepted_lengths[:-1]]) = [0, 5, 10]
-                # last_token_indices_per_req=accepted_indices[cumulative_accepted_lengths - 1] = [4, 9, 11] (last token ID of each req)
-                # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
-                cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
-                req_start_positions = torch.cat(
-                    [
-                        torch.zeros(
-                            1,
-                            dtype=cumulative_accepted_lengths.dtype,
-                            device=cumulative_accepted_lengths.device,
-                        ),
-                        cumulative_accepted_lengths[:-1],
-                    ]
-                )
-                first_token_indices_per_req = res.accepted_indices[req_start_positions]
-                last_token_indices_per_req = res.accepted_indices[
-                    cumulative_accepted_lengths - 1
-                ]
-                max_relative_indices_per_req = (
-                    last_token_indices_per_req - first_token_indices_per_req
-                )
-            else:
-                max_relative_indices_per_req = accepted_length - 1
-            self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                max_relative_indices_per_req, self.target_worker.model_runner.model
+            self._mamba_verify_update(
+                batch, res, logits_output, spec_info, seq_lens_pre_verify
             )
 
         if batch.return_logprob:
-            self.add_logprob_values(batch, res, logits_output)
+            add_output_logprobs_for_spec_v1(batch, res, logits_output)
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
@@ -794,84 +771,84 @@ class EAGLEWorker(TpModelWorker):
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
-    def add_logprob_values(
+    def _mamba_verify_update(
         self,
         batch: ScheduleBatch,
         res: EagleVerifyOutput,
         logits_output: LogitsProcessorOutput,
+        spec_info: EagleVerifyInput,
+        seq_lens_pre_verify: torch.Tensor,
     ):
-        # Extract args
-        logits_output = res.logits_output
-        top_logprobs_nums = batch.top_logprobs_nums
-        token_ids_logprobs = batch.token_ids_logprobs
-        accepted_indices = res.accepted_indices
-        assert len(accepted_indices) == len(logits_output.next_token_logits)
+        accepted_length = (
+            torch.tensor(
+                res.accept_length_per_req_cpu,
+                device=logits_output.hidden_states.device,
+                dtype=torch.int64,
+            )
+            + 1
+        )
+        cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
+        # prepend 0 to the cumulative_accepted_lengths
+        accepted_indices_start = torch.cat(
+            [
+                torch.zeros(
+                    1,
+                    dtype=cumulative_accepted_lengths.dtype,
+                    device=cumulative_accepted_lengths.device,
+                ),
+                cumulative_accepted_lengths[:-1],
+            ]
+        )
+        accepted_indices_offset = torch.arange(
+            0,
+            len(batch.seq_lens) * batch.spec_info.draft_token_num,
+            step=batch.spec_info.draft_token_num,
+            dtype=accepted_indices_start.dtype,
+            device=accepted_indices_start.device,
+        )
 
-        temperatures = batch.sampling_info.temperatures
-        num_draft_tokens = batch.spec_info.draft_token_num
-        # acceptance indices are the indices in a "flattened" batch.
-        # dividing it to num_draft_tokens will yield the actual batch index.
-        temperatures = temperatures[accepted_indices // num_draft_tokens]
-        if SGLANG_RETURN_ORIGINAL_LOGPROB:
-            logprobs = torch.nn.functional.log_softmax(
-                logits_output.next_token_logits, dim=-1
+        # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
+        # res.accepted_indices.shape[0] > 0 skips DP attn idle batch
+        if spec_info.topk > 1 and res.accepted_indices.shape[0] > 0:
+            # accepted_indices=[0,2,3,4,5,7,9,10,11], accepted_length=[4, 3, 2], cumulative_accepted_lengths=[4, 7, 9]
+            # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_accepted_lengths[:-1]]) = [0, 5, 10]
+            # last_token_indices_per_req=accepted_indices[cumulative_accepted_lengths - 1] = [4, 9, 11] (last token ID of each req)
+            # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
+            # first_token_indices_per_req = res.accepted_indices[accepted_indices_start]
+            accepted_steps = (
+                res.accepted_indices[cumulative_accepted_lengths - 1]
+                - accepted_indices_offset
             )
         else:
-            logprobs = torch.nn.functional.log_softmax(
-                logits_output.next_token_logits / temperatures, dim=-1
+            accepted_steps = accepted_length - 1
+
+        if batch.mamba_track_indices is not None:
+            # If after verify, the request's seq_lens has crossed a mamba track interval,
+            # we need to update the mamba state for the request at the crossing point.
+            mamba_track_interval = self.server_args.mamba_track_interval
+            to_track_mask = (
+                seq_lens_pre_verify // mamba_track_interval
+                != batch.seq_lens // mamba_track_interval
             )
-        batch_next_token_ids = res.verified_id
-        num_tokens_per_req = [accept + 1 for accept in res.accept_length_per_req_cpu]
-
-        # We should repeat top_logprobs_nums to match num_tokens_per_req.
-        top_logprobs_nums_repeat_interleaved = []
-        token_ids_logprobs_repeat_interleaved = []
-        for num, num_tokens in zip(top_logprobs_nums, num_tokens_per_req):
-            top_logprobs_nums_repeat_interleaved.extend([num] * num_tokens)
-        for token_ids, num_tokens in zip(token_ids_logprobs, num_tokens_per_req):
-            token_ids_logprobs_repeat_interleaved.extend([token_ids] * num_tokens)
-
-        # Extract logprobs
-        if any(x > 0 for x in top_logprobs_nums):
-            (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(
-                logprobs,
-                top_logprobs_nums_repeat_interleaved,
+            tracking_point = (
+                batch.seq_lens // mamba_track_interval * mamba_track_interval
             )
-
-        if any(x is not None for x in token_ids_logprobs):
-            (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(
-                logprobs,
-                token_ids_logprobs_repeat_interleaved,
+            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
+            mamba_steps_to_track = torch.where(
+                to_track_mask,
+                res.accepted_indices[to_track_ith + accepted_indices_start]
+                - accepted_indices_offset,
+                -1,
             )
+        else:
+            mamba_steps_to_track = None
 
-        logits_output.next_token_logprobs = logprobs[
-            torch.arange(len(batch_next_token_ids), device=batch.sampling_info.device),
-            batch_next_token_ids,
-        ]
-
-        # Add output logprobs to the request
-        pt = 0
-        next_token_logprobs = logits_output.next_token_logprobs.tolist()
-        verified_ids = batch_next_token_ids.tolist()
-        for req, num_tokens in zip(batch.reqs, num_tokens_per_req, strict=True):
-            for _ in range(num_tokens):
-                if req.return_logprob:
-                    req.output_token_logprobs_val.append(next_token_logprobs[pt])
-                    req.output_token_logprobs_idx.append(verified_ids[pt])
-                    if req.top_logprobs_num > 0:
-                        req.output_top_logprobs_val.append(
-                            res.logits_output.next_token_top_logprobs_val[pt]
-                        )
-                        req.output_top_logprobs_idx.append(
-                            res.logits_output.next_token_top_logprobs_idx[pt]
-                        )
-                pt += 1
+        self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+            accepted_steps=accepted_steps,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=self.target_worker.model_runner.model,
+        )
 
     def forward_draft_extend(
         self,
@@ -903,27 +880,12 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         forward_batch.return_logprob = False
-        logits_output, _ = self.draft_model_runner.forward(forward_batch)
+        logits_output = self.draft_model_runner.forward(forward_batch).logits_output
         if self.enable_nan_detection:
             detect_nan(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
-        has_finished, unfinished_req_index = False, []
-        for i, req in enumerate(batch.reqs):
-            if req.finished():
-                has_finished = True
-            else:
-                unfinished_req_index.append(i)
-        if has_finished:
-            unfinished_index_device = torch.tensor(
-                unfinished_req_index,
-                dtype=torch.int64,
-                device=batch.spec_info.topk_p.device,
-            )
-            batch.spec_info.filter_batch(
-                unfinished_index_device, has_been_filtered=False
-            )
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)
@@ -942,6 +904,7 @@ class EAGLEWorker(TpModelWorker):
             hidden_size = (
                 self.model_config.hidden_size * 3
                 if self.speculative_algorithm.is_eagle3()
+                and self.eagle_use_aux_hidden_state
                 else self.model_config.hidden_size
             )
             batch.spec_info = EagleDraftInput.create_idle_input(
@@ -995,9 +958,9 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.attn_backend.init_forward_metadata(
                     forward_batch
                 )
-            logits_output, _ = self.draft_model_runner.forward(
+            logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            )
+            ).logits_output
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 
         if self.enable_nan_detection:
@@ -1055,39 +1018,3 @@ def get_last_loc_large_page_size_top_k_1(
         prefix_lens,
     )
     return prefix_lens, seq_lens, last_loc
-
-
-# Disable torch.compile for this function because it will be
-# even slower.
-# @torch.compile(dynamic=True)
-def get_last_loc_large_page_size_large_top_k(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    speculative_num_steps: int,
-    topk: int,
-    page_size: int,
-):
-    prefix_lens = seq_lens
-    last_page_lens = prefix_lens % page_size
-    num_new_pages_per_topk = (
-        last_page_lens + speculative_num_steps + page_size - 1
-    ) // page_size
-    seq_lens = prefix_lens // page_size * page_size + num_new_pages_per_topk * (
-        page_size * topk
-    )
-    extend_lens = seq_lens - prefix_lens
-    last_loc = get_last_loc(
-        req_to_token,
-        req_pool_indices,
-        prefix_lens,
-    )
-
-    return (
-        prefix_lens,
-        seq_lens,
-        last_loc,
-        num_new_pages_per_topk,
-        extend_lens,
-        last_page_lens,
-    )

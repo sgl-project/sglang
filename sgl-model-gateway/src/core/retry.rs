@@ -27,10 +27,7 @@ impl BackoffCalculator {
     /// Calculate backoff delay for a given attempt index (0-based).
     pub fn calculate_delay(config: &RetryConfig, attempt: u32) -> Duration {
         let pow = config.backoff_multiplier.powi(attempt as i32);
-        let mut delay_ms = (config.initial_backoff_ms as f32 * pow) as u64;
-        if delay_ms > config.max_backoff_ms {
-            delay_ms = config.max_backoff_ms;
-        }
+        let delay_ms = ((config.initial_backoff_ms as f32 * pow) as u64).min(config.max_backoff_ms);
 
         let jitter = config.jitter_factor.clamp(0.0, 1.0);
         if jitter > 0.0 {
@@ -111,8 +108,8 @@ impl RetryExecutor {
     ///         resp
     ///     },
     ///     |res, _| matches!(res.status(), StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS | StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT),
-    ///     |delay, attempt| RouterMetrics::record_retry_backoff_duration(delay, attempt),
-    ///     || RouterMetrics::record_retries_exhausted("/route"),
+    ///     |delay, _attempt| { /* record backoff metrics */ },
+    ///     || { /* record retries exhausted */ },
     /// ).await;
     /// ```
     pub async fn execute_response_with_retry<Op, Fut, ShouldRetry, OnBackoff, OnExhausted>(

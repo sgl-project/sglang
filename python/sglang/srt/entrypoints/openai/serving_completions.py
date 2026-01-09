@@ -116,6 +116,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
+            data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
@@ -151,6 +152,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,
+            "sampling_seed": request.seed,
         }
 
         # Handle response_format constraints
@@ -240,9 +242,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         output_token_logprobs=content["meta_info"][
                             "output_token_logprobs"
                         ][n_prev_token:],
-                        output_top_logprobs=content["meta_info"]["output_top_logprobs"][
-                            n_prev_token:
-                        ],
+                        output_top_logprobs=content["meta_info"].get(
+                            "output_top_logprobs", []
+                        )[n_prev_token:],
                     )
                     n_prev_tokens[index] = len(
                         content["meta_info"]["output_token_logprobs"]
@@ -396,10 +398,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 logprobs = to_openai_style_logprobs(
                     input_token_logprobs=input_token_logprobs,
                     input_top_logprobs=input_top_logprobs,
-                    output_token_logprobs=ret_item["meta_info"][
-                        "output_token_logprobs"
-                    ],
-                    output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
+                    output_token_logprobs=ret_item["meta_info"].get(
+                        "output_token_logprobs", []
+                    ),
+                    output_top_logprobs=ret_item["meta_info"].get(
+                        "output_top_logprobs", []
+                    ),
                 )
 
             # Handle hidden states
