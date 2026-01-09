@@ -44,9 +44,7 @@ class PrefillDelayer:
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
     ):
         self._max_delay_passes = max_delay_passes
-        logger.info(
-            f"PrefillDelayer initialized with max_delay_passes={self._max_delay_passes}"
-        )
+        logger.info(f"PrefillDelayer initialized with max_delay_passes={self._max_delay_passes}")
 
         self._global_info_buffer = torch.empty(
             (dp_size, attn_tp_size, 1),
@@ -69,9 +67,7 @@ class PrefillDelayer:
             not server_args.disable_overlap_schedule
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
-    def _negotiate_should_allow_prefill(
-        self, local_prefillable: bool
-    ) -> _NegotiateOutput:
+    def _negotiate_should_allow_prefill(self, local_prefillable: bool) -> _NegotiateOutput:
         out = self._negotiate_should_allow_prefill_pure(
             prev_state=self._curr_state,
             local_prefillable=local_prefillable,
@@ -161,30 +157,48 @@ class PrefillDelayerSinglePassExecutor:
         if not self._called:
             self.negotiate_should_allow_prefill(local_prefillable=False)
 
-        result = self._result
-        if _DEBUG_LOG and result.output_reason:
-            logger.info(
-                f"PrefillDelayer {result.output_reason} "
-                f"(num_prefillable={result.num_prefillable}, actual_execution={actual_prefill})"
-            )
-        self._record_metrics(actual_prefill=actual_prefill)
-
-    def _record_metrics(self, actual_prefill: bool) -> None:
-        result = self._result
-        state = self._prefill_delayer._curr_state
-        metrics = self._prefill_delayer._metrics_collector
-        if metrics is not None:
-            forward_passes = state.delayed_count if state else 0
-            wait_seconds = (time.perf_counter() - state.start_time) if state else 0
-            metrics.observe_prefill_delayer_wait(
-                forward_passes=forward_passes,
-                wait_seconds=wait_seconds,
-                is_timeout=(result.output_reason == "wait_timeout"),
-            )
+        _record_single_pass_result(
+            actual_execution=actual_prefill,
+            output=self._result,
+            metrics_collector=self._prefill_delayer._metrics_collector,
+        )
 
     def negotiate_should_allow_prefill(self, local_prefillable: bool) -> bool:
         if not self._called:
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
-                local_prefillable=local_prefillable
+                local_prefillable=local_prefillable,
             )
         return self._result.output_allow
+
+
+def _record_single_pass_result(
+    actual_execution: bool,
+    output: _NegotiateOutput,
+    metrics_collector: Optional["SchedulerMetricsCollector"],
+) -> None:
+    if _DEBUG_LOG:
+        if output.output_allow and (output.output_reason == "wait_timeout"):
+            logger.info(
+                f"PrefillDelayer timeout thus not forbid prefill "
+                f"(num_prefillable={output.num_prefillable}, "
+                f"actual_execution={actual_execution})"
+            )
+        else:
+            assert output.output_reason in {
+                "",
+                "wait_success",
+                "no_wait",
+                "delay",
+            }
+
+    if metrics_collector is not None:
+        if (s := output.next_state) is not None:
+            wait_seconds = time.perf_counter() - s.start_time
+            forward_passes = s.delayed_count
+        else:
+            wait_seconds = forward_passes = 0
+        metrics_collector.observe_prefill_delayer_wait(
+            forward_passes=forward_passes,
+            wait_seconds=wait_seconds,
+            is_timeout=(output.output_reason == "wait_timeout"),
+        )
