@@ -577,6 +577,8 @@ class MllamaTextCrossAttention(nn.Module):
         q = self.q_norm(q)
 
         output = self.attn(q, k, v, forward_batch)
+        if output.shape[-1] != self.num_heads * self.head_dim:
+            output = output[-1, :self.num_heads * self.head_dim]
         out, _ = self.o_proj(output)
         return out
 
