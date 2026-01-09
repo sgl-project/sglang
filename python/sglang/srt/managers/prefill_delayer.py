@@ -200,7 +200,7 @@ class PrefillDelayerSinglePassExecutor:
 
         _record_single_pass_result(
             actual_prefill=actual_prefill,
-            negotiate_output=self._result,
+            output=self._result,
             metrics_collector=self._prefill_delayer._metrics_collector,
         )
 
