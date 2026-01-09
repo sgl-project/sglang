@@ -65,7 +65,7 @@ class SamplingParams:
         logit_bias: Optional[Dict[str, float]] = None,
         sampling_seed: Optional[int] = None,
     ) -> None:
-        self.max_new_tokens = max_new_tokens
+        self.max_new_tokens = 128 if max_new_tokens is None else max_new_tokens
         self.stop_strs = stop
         if stop_token_ids:
             self.stop_token_ids = set(stop_token_ids)
