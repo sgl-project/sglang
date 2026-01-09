@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import time
 import unittest
 from types import SimpleNamespace
@@ -173,8 +174,6 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
 
             metrics_text = _print_prefill_delayer_metrics(base_url, expect_metrics=True)
             if token_usage_low_watermark is not None:
-                import re
-
                 matches = re.findall(
                     r'outcome="token_watermark_force_allow".*?\} (\d+)', metrics_text
                 )
