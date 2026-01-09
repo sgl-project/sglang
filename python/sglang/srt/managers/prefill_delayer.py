@@ -235,6 +235,7 @@ def _record_single_pass_result(
                 "",
                 "wait_success",
                 "no_wait",
+                "delay",
             }
 
     if metrics_collector is not None:
