@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/impl/norm.cuh>
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tile.cuh>
@@ -12,7 +13,6 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <cstddef>
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -33,52 +33,13 @@ struct QKNormParams {
   uint32_t num_tokens;
 };
 
-template <int64_t kHeadDim, typename PackedFloat>
-__always_inline __device__ void apply_norm(void* __restrict__ input, const void* __restrict__ weight, float eps) {
-  using namespace device;
-
-  constexpr std::size_t kLoopCount = kHeadDim / (kWarpThreads * 2);
-  static_assert(kHeadDim % (kWarpThreads * 2) == 0);
-
-  float sum_of_squares = 0.0f;
-
-  using vec_t = AlignedVector<PackedFloat, kLoopCount>;
-  const auto gmem = tile::Memory<vec_t>::warp();
-  const auto input_vec = gmem.load(input);
-
-#pragma unroll
-  for (auto i = 0u; i < kLoopCount; ++i) {
-    const auto fp16_input = input_vec[i];
-    const auto fp32_input = cast<fp32x2_t>(fp16_input);
-    sum_of_squares += fp32_input.x * fp32_input.x;
-    sum_of_squares += fp32_input.y * fp32_input.y;
-  }
-
-  sum_of_squares = warp::reduce_sum(sum_of_squares);
-  const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + eps);
-  const auto weight_vec = gmem.load(weight);
-  vec_t output_vec;
-
-#pragma unroll
-  for (auto i = 0u; i < kLoopCount; ++i) {
-    const auto fp32_input = cast<fp32x2_t>(input_vec[i]);
-    const auto fp32_weight = cast<fp32x2_t>(weight_vec[i]);
-    output_vec[i] = cast<PackedFloat, fp32x2_t>({
-        fp32_input.x * norm_factor * fp32_weight.x,
-        fp32_input.y * norm_factor * fp32_weight.y,
-    });
-  }
-
-  gmem.store(input, output_vec);
-}
-
 constexpr uint32_t kWarpsPerBlock = 4;
 constexpr uint32_t kThreadsPerBlock = kWarpsPerBlock * device::kWarpThreads;
 
 template <int64_t kHeadDim, bool kUsePDL, typename Float>
 __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
   using namespace device;
-  using PackedFloat = packed_t<Float>;  // pack2 fp16
+  using Storage = norm::StorageType<Float, kHeadDim>;
 
   static_assert(sizeof(Float) == 2, "Only support FP16/BF16");
   const auto& [q, k, q_stride, k_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] = params;
@@ -88,6 +49,7 @@ __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
   const auto num_q_and_k_heads = num_qo_heads + num_kv_heads;
   const auto num_works = num_q_and_k_heads * num_tokens;
   const auto start_worker_id = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarpThreads;
+  const auto gmem = tile::Memory<Storage>::warp();
 
   PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
 
@@ -98,7 +60,10 @@ __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
     const auto input = load_q ? pointer::offset(q, 2 * (token_id * q_stride + head_id * kHeadDim))
                               : pointer::offset(k, 2 * (token_id * k_stride + head_id * kHeadDim));
     const auto weight = load_q ? q_weight : k_weight;
-    apply_norm<kHeadDim, PackedFloat>(input, weight, eps);
+    const auto input_vec = gmem.load(input);
+    const auto weight_vec = gmem.load(weight);
+    const auto output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, eps);
+    gmem.store(input, output_vec);
   }
 
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
@@ -107,6 +72,7 @@ __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
 template <int64_t kHeadDim, bool kUsePDL, typename DType>
 struct QKNormKernel {
   static_assert(std::is_same_v<DType, fp16_t> || std::is_same_v<DType, bf16_t>);
+  static_assert(!host::norm::should_use_cta<DType, kHeadDim>(), "Head dim too large for QKNorm");
   static constexpr auto kernel = fused_qknorm<kHeadDim, kUsePDL, DType>;
 
   static void
