@@ -77,7 +77,7 @@ class PrefillDelayer:
                     f"PrefillDelayer force allow prefill due to low watermark "
                     f"(num_force_allow={global_force_allow.sum().item()}, num_prefillable={global_prefillable.sum().item()})"
                 )
-            self._record_metrics_and_reset(is_timeout=is_timeout)
+            self._record_metrics_and_reset(is_timeout=False)
             return True
 
         global_exists_not_prefillable = global_prefillable.min().item() == 0
