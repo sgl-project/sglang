@@ -27,7 +27,7 @@ class _NegotiateOutput(NamedTuple):
     next_state: Optional[_State]
     allow_prefill: bool
     prefillable_status: str
-    remark: str
+    reason: str
     num_prefillable: int
     num_token_watermark_force_allow: int
 
@@ -125,7 +125,7 @@ class PrefillDelayer:
             return _NegotiateOutput(
                 next_state=None,
                 allow_prefill=True,
-                remark="wait_success" if exist_previous_wait else "no_wait",
+                reason="wait_success" if exist_previous_wait else "no_wait",
                 **debug_info,
             )
         elif prefillable_status == "none":
@@ -133,7 +133,7 @@ class PrefillDelayer:
                 next_state=None,
                 # It does not matter whether we allow or not, thus we allow for simplicity
                 allow_prefill=True,
-                remark="",
+                reason="",
                 **debug_info,
             )
         elif prefillable_status == "mixed":
@@ -141,7 +141,7 @@ class PrefillDelayer:
                 return _NegotiateOutput(
                     next_state=None,
                     allow_prefill=True,
-                    remark="token_watermark",
+                    reason="token_watermark",
                     **debug_info,
                 )
 
@@ -154,14 +154,14 @@ class PrefillDelayer:
                 return _NegotiateOutput(
                     next_state=next_state,
                     allow_prefill=False,
-                    remark="delay",
+                    reason="delay",
                     **debug_info,
                 )
             else:
                 return _NegotiateOutput(
                     next_state=None,
                     allow_prefill=True,
-                    remark="wait_timeout",
+                    reason="wait_timeout",
                     **debug_info,
                 )
         else:
