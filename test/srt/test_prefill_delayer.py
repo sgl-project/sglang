@@ -257,6 +257,7 @@ class TestPrefillDelayerThroughputOnlineServing(CustomTestCase):
                 random_output_len=256,
                 request_rate=32,
             ),
+            min_improvement_pct=5,
         )
 
 
@@ -272,6 +273,7 @@ class TestPrefillDelayerThroughputOfflineGen(CustomTestCase):
                 random_output_len=500,
             ),
             token_usage_low_watermark=0.8,
+            min_improvement_pct=50,
         )
 
 
@@ -280,8 +282,8 @@ def _run_throughput_comparison(
     test_name: str,
     other_launch_args,
     other_benchmark_args,
+    min_improvement_pct: float,
     token_usage_low_watermark: float = None,
-    min_improvement_pct: float = -5,
 ):
     common_kwargs = dict(
         debug_name=test_name,
