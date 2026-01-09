@@ -1,4 +1,4 @@
-import concurrent.futures
+import asyncio
 import os
 import time
 import unittest
@@ -212,53 +212,47 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
             token_usage_low_watermark=0.8,
         )
 
-        try:
-            client = openai.Client(base_url=f"{base_url}/v1", api_key="EMPTY")
-
+        async def run_test():
+            client = openai.AsyncClient(base_url=f"{base_url}/v1", api_key="EMPTY")
             long_prompt = "Hello " * 5000
 
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=world_size + 1
-            ) as executor:
+            async def send_blocking_request():
+                return await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": long_prompt}],
+                    max_tokens=10000,
+                    extra_body={"data_parallel_rank": 0},
+                )
 
-                def send_blocking_request():
-                    return client.chat.completions.create(
-                        model=model,
-                        messages=[{"role": "user", "content": long_prompt}],
-                        max_tokens=10000,
-                        extra_body={"data_parallel_rank": 0},
-                    )
+            async def send_normal_request(dp_rank):
+                start = time.time()
+                await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "Say hi"}],
+                    max_tokens=10,
+                    extra_body={"data_parallel_rank": dp_rank},
+                )
+                elapsed = time.time() - start
+                return dp_rank, elapsed
 
-                executor.submit(send_blocking_request)
-                time.sleep(3)
+            asyncio.create_task(send_blocking_request())
+            await asyncio.sleep(3)
 
-                def send_normal_request(dp_rank):
-                    start = time.time()
-                    client.chat.completions.create(
-                        model=model,
-                        messages=[{"role": "user", "content": "Say hi"}],
-                        max_tokens=10,
-                        extra_body={"data_parallel_rank": dp_rank},
-                    )
-                    elapsed = time.time() - start
-                    return dp_rank, elapsed
+            results = await asyncio.gather(
+                *[send_normal_request(dp_rank) for dp_rank in range(1, world_size)]
+            )
 
-                normal_futures = [
-                    executor.submit(send_normal_request, dp_rank)
-                    for dp_rank in range(1, world_size)
-                ]
+            for dp_rank, elapsed in results:
+                print(f"DP rank {dp_rank} completed in {elapsed:.2f}s")
+                self.assertLess(
+                    elapsed,
+                    30,
+                    f"Request to DP rank {dp_rank} took too long ({elapsed:.2f}s), low watermark force prefill may not be working",
+                )
 
-                for future in concurrent.futures.as_completed(normal_futures):
-                    dp_rank, elapsed = future.result()
-                    print(f"DP rank {dp_rank} completed in {elapsed:.2f}s")
-                    self.assertLess(
-                        elapsed,
-                        30,
-                        f"Request to DP rank {dp_rank} took too long ({elapsed:.2f}s), low watermark force prefill may not be working",
-                    )
-
+        try:
+            asyncio.run(run_test())
             _print_prefill_delayer_metrics(base_url, expect_metrics=True)
-
         finally:
             kill_process_tree(process.pid)
 
