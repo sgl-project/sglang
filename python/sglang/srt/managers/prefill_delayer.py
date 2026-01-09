@@ -201,8 +201,11 @@ def _record_single_pass_result(
             forward_passes = s.delayed_count
         else:
             wait_seconds = forward_passes = 0
-        metrics_collector.observe_prefill_delayer_wait(
+        metrics_collector.observe_prefill_delayer_outcome(
             forward_passes=forward_passes,
             wait_seconds=wait_seconds,
-            is_timeout=(output.output_reason == "wait_timeout"),
+            input_estimation=output.input_estimation,
+            output_allow=output.output_allow,
+            output_reason=output.output_reason,
+            actual_execution=actual_execution,
         )
