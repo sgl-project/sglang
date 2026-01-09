@@ -1,7 +1,7 @@
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple, NamedTuple
 
 import torch
 
@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 class _DelayInfo:
     delayed_count: int = 0
     start_time: float = field(default_factory=time.perf_counter)
+
+
+class _NegotiateOutput(NamedTuple):
+    allow: bool
 
 
 class PrefillDelayer:
@@ -64,7 +68,7 @@ class PrefillDelayer:
 
     def _negotiate_should_allow_prefill(
         self, local_prefillable: bool, token_usage: float
-    ) -> bool:
+    ) -> _NegotiateOutput:
         local_force_allow = (
             local_prefillable
             and ((x := self._token_usage_low_watermark) is not None)
@@ -84,7 +88,7 @@ class PrefillDelayer:
                 debug_num_prefillable=num_prefillable,
                 debug_num_force_allow=num_force_allow,
             )
-            return True
+            return _NegotiateOutput(allow=True)
 
         global_exists_not_prefillable = global_prefillable.min().item() == 0
         global_exists_prefillable = global_prefillable.max().item() > 0
@@ -97,7 +101,7 @@ class PrefillDelayer:
                 self._curr_delay_info = _DelayInfo()
             self._curr_delay_info.delayed_count += 1
             if self._curr_delay_info.delayed_count < self._max_delay_passes:
-                return False
+                return _NegotiateOutput(allow=False)
 
         is_timeout = global_mixed_prefillable
         exist_previous_wait = self._curr_delay_info is not None
@@ -114,7 +118,7 @@ class PrefillDelayer:
             debug_num_prefillable=num_prefillable,
             debug_num_force_allow=num_force_allow,
         )
-        return True
+        return _NegotiateOutput(allow=True)
 
     def _record_outcome_and_reset(
         self, debug_outcome: str, debug_num_prefillable: int, debug_num_force_allow: int
