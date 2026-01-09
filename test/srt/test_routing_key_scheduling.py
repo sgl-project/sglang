@@ -1,6 +1,5 @@
 import asyncio
 import os
-import time
 import unittest
 
 import aiohttp
@@ -60,31 +59,35 @@ class TestRoutingKeyScheduling(CustomTestCase):
         asyncio.run(self._test_routing_key_scheduling_order())
 
     async def _test_routing_key_scheduling_order(self):
-        base_payload = {
-            "text": "System: You are a helpful assistant.\nUser: What is 1+1?\nAssistant:",
-            "sampling_params": {"temperature": 0, "max_new_tokens": 10},
-        }
-
-        async def send_request(routing_key: str, max_new_tokens: int):
-            payload = base_payload.copy()
-            payload["routing_key"] = routing_key
-            payload["sampling_params"] = {"temperature": 0, "max_new_tokens": max_new_tokens}
+        async def send_chat_request(routing_key: str, max_tokens: int):
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": "What is 1+1?"}],
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "routing_key": routing_key,
+            }
             async with aiohttp.ClientSession() as session:
-                async with session.post(f"{self.base_url}/generate", json=payload) as resp:
+                async with session.post(
+                    f"{self.base_url}/v1/chat/completions", json=payload
+                ) as resp:
                     result = await resp.json()
-                    return routing_key, result.get("meta_info", {}).get("e2e_latency", 0)
+                    e2e_latency = result.get("usage", {}).get("e2e_latency", 0)
+                    if e2e_latency == 0:
+                        e2e_latency = result.get("timings", {}).get("e2e_latency", 0)
+                    return routing_key, e2e_latency
 
         long_running_tasks = [
-            asyncio.create_task(send_request("key_a", 2000)),
-            asyncio.create_task(send_request("key_a", 2000)),
+            asyncio.create_task(send_chat_request("key_a", 2000)),
+            asyncio.create_task(send_chat_request("key_a", 2000)),
         ]
 
         await asyncio.sleep(0.5)
 
         short_tasks = []
         for _ in range(10):
-            short_tasks.append(asyncio.create_task(send_request("key_a", 10)))
-            short_tasks.append(asyncio.create_task(send_request("key_b", 10)))
+            short_tasks.append(asyncio.create_task(send_chat_request("key_a", 10)))
+            short_tasks.append(asyncio.create_task(send_chat_request("key_b", 10)))
 
         all_short_results = await asyncio.gather(*short_tasks)
         await asyncio.gather(*long_running_tasks)

@@ -268,6 +268,8 @@ class CompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
@@ -536,6 +538,8 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
