@@ -149,8 +149,12 @@ class DiffusionServerArgs:
     ulysses_degree: int | None = None
     ring_degree: int | None = None
     # LoRA
-    lora_path: str | None = None  # LoRA adapter path (HF repo or local path, loaded at startup)
-    dynamic_lora_path: str | None = None  # LoRA path for dynamic loading test (loaded via set_lora after startup)
+    lora_path: str | None = (
+        None  # LoRA adapter path (HF repo or local path, loaded at startup)
+    )
+    dynamic_lora_path: str | None = (
+        None  # LoRA path for dynamic loading test (loaded via set_lora after startup)
+    )
     # misc
     enable_warmup: bool = False
 
