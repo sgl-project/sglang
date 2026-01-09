@@ -238,7 +238,8 @@ class TestPrefillDelayerNegotiate(unittest.TestCase):
 
 class TestPrefillDelayerThroughputOnlineServing(CustomTestCase):
     def test_throughput_comparison(self):
-        kwargs = dict(
+        _run_throughput_comparison(
+            self,
             test_name="online_serving",
             other_launch_args=["--schedule-policy", "lpm"],
             other_benchmark_args=dict(
@@ -248,12 +249,12 @@ class TestPrefillDelayerThroughputOnlineServing(CustomTestCase):
                 request_rate=32,
             ),
         )
-        _run_throughput_comparison(self, **kwargs)
 
 
 class TestPrefillDelayerThroughputOfflineGen(CustomTestCase):
     def test_throughput_comparison(self):
-        kwargs = dict(
+        _run_throughput_comparison(
+            self,
             test_name="offline_gen",
             other_launch_args=["--max-total-tokens", "200000"],
             other_benchmark_args=dict(
@@ -263,7 +264,6 @@ class TestPrefillDelayerThroughputOfflineGen(CustomTestCase):
             ),
             token_usage_low_watermark=0.8,
         )
-        _run_throughput_comparison(self, **kwargs)
 
 
 def _run_throughput_comparison(
