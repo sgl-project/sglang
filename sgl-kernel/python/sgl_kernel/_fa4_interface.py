@@ -9,7 +9,7 @@ import gc
 import logging
 import math
 import os
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ torch2cute_dtype_map = {
 }
 
 
-def _flash_attn_fwd(
+def create_out_and_lse(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -44,27 +44,10 @@ def _flash_attn_fwd(
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    softcap: Optional[float] = None,
-    window_size_left: Optional[int] = None,
-    window_size_right: Optional[int] = None,
-    learnable_sink: Optional[torch.Tensor] = None,
-    # m_block_size: int = 128,
-    # n_block_size: int = 64,
-    # num_threads: int = 128,
-    m_block_size: int = 128,
-    n_block_size: int = 128,
-    num_threads: int = 384,
-    pack_gqa: Optional[bool] = None,
-    _compute_capability: Optional[int] = None,
-    score_mod: Callable | None = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
-    buffers: Optional[list[torch.Tensor]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+):
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
@@ -124,35 +107,12 @@ def _flash_attn_fwd(
             assert (
                 t.stride(0) == 1
             ), "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be contiguous"
-    if learnable_sink is not None:
-        assert learnable_sink.shape == (num_head,)
-        assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
-    assert all(
-        t is None or t.is_cuda
-        for t in (
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            page_table,
-            learnable_sink,
-        )
-    ), "inputs must be on CUDA device"
+
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
     alignment = 16 // q.element_size()
     assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
-    if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(head_dim)
-    if softcap == 0.0:
-        softcap = None
-    qhead_per_kvhead = num_head // num_head_kv
-    if pack_gqa is None:
-        pack_gqa = qhead_per_kvhead > 1
 
     out_torch_dtype = q.dtype
     device = q.device
@@ -165,7 +125,6 @@ def _flash_attn_fwd(
         else (num_head, total_q)
     )
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
-
     if out is None:
         out = torch.empty(
             *q_batch_seqlen_shape,
@@ -204,6 +163,84 @@ def _flash_attn_fwd(
             lse.device == device
         ), f"lse tensor device {lse.device} does not match input device {device}"
         assert lse.is_cuda, "lse tensor must be on CUDA device"
+    return out, lse
+
+
+def _flash_attn_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: Optional[float] = None,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    learnable_sink: Optional[torch.Tensor] = None,
+    # m_block_size: int = 128,
+    # n_block_size: int = 64,
+    # num_threads: int = 128,
+    m_block_size: int = 128,
+    n_block_size: int = 128,
+    num_threads: int = 384,
+    pack_gqa: Optional[bool] = None,
+    _compute_capability: Optional[int] = None,
+    score_mod: Callable | None = None,
+    return_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    buffers: Optional[list[torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+    num_head_kv = k.shape[-2]
+    head_dim_v = v.shape[-1]
+    out, lse = create_out_and_lse(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        page_table,
+        return_lse,
+        out,
+        lse,
+    )
+    if page_table is not None:
+        _, page_size = k.shape[:2]
+    else:
+        page_size = None
+    num_head, head_dim = q.shape[-2:]
+    if learnable_sink is not None:
+        assert learnable_sink.shape == (num_head,)
+        assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
+    assert all(
+        t is None or t.is_cuda
+        for t in (
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            page_table,
+            learnable_sink,
+        )
+    ), "inputs must be on CUDA device"
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+    if softcap == 0.0:
+        softcap = None
+    qhead_per_kvhead = num_head // num_head_kv
+    if pack_gqa is None:
+        pack_gqa = qhead_per_kvhead > 1
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -523,6 +560,116 @@ def warmup_flash_attn(f):
 
 
 @warmup_flash_attn
+def flash_attn_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Optional[List[int]] = None,
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
+    pack_gqa: Optional[bool] = None,
+    return_softmax_lse: Optional[bool] = False,
+) -> List[torch.Tensor]:
+    out, lse = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        page_table=page_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=window_size[0] if window_size else None,
+        window_size_right=window_size[1] if window_size else None,
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        pack_gqa=pack_gqa,
+        return_lse=return_softmax_lse,
+    )
+    return [out, lse] if return_softmax_lse else [out]
+
+
+@torch.library.custom_op("sgl_kernel::flash_attn_varlen_op", mutates_args=())
+def flash_attn_varlen_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Optional[List[int]] = None,
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
+    pack_gqa: Optional[bool] = None,
+    return_softmax_lse: Optional[bool] = False,
+) -> List[torch.Tensor]:
+    return flash_attn_varlen(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        page_table=page_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=(window_size[0], window_size[1]) if window_size else (None, None),
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        pack_gqa=pack_gqa,
+        return_softmax_lse=return_softmax_lse,
+    )
+
+
+@flash_attn_varlen_op.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Optional[List[int]] = None,
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
+    pack_gqa: Optional[bool] = None,
+    return_softmax_lse: Optional[bool] = False,
+) -> List[torch.Tensor]:
+    q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+    out, lse = create_out_and_lse(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        page_table,
+        return_softmax_lse,
+    )
+    return [out, lse] if return_softmax_lse else [out]
+
+
+@torch.no_grad()
+@torch._dynamo.allow_in_graph
 def flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -540,7 +687,10 @@ def flash_attn_varlen_func(
     pack_gqa: Optional[bool] = None,
     return_softmax_lse: Optional[bool] = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    out, lse = _flash_attn_fwd(
+    processed_window_size = None
+    if window_size != (None, None):
+        processed_window_size = [window_size[0], window_size[1]]
+    output = torch.ops.sgl_kernel.flash_attn_varlen_op(
         q,
         k,
         v,
@@ -551,12 +701,14 @@ def flash_attn_varlen_func(
         page_table=page_table,
         softmax_scale=softmax_scale,
         causal=causal,
-        window_size_left=window_size[0],
-        window_size_right=window_size[1],
+        window_size=(
+            [processed_window_size[0], processed_window_size[1]]
+            if processed_window_size
+            else None
+        ),
         learnable_sink=learnable_sink,
         softcap=softcap,
         pack_gqa=pack_gqa,
-        return_lse=return_softmax_lse,
+        return_softmax_lse=return_softmax_lse,
     )
-
-    return (out, lse) if return_softmax_lse else out
+    return tuple(output) if return_softmax_lse else output[0]
