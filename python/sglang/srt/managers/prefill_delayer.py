@@ -215,26 +215,26 @@ class PrefillDelayerSinglePassExecutor:
 
 def _record_single_pass_result(
     actual_prefill: bool,
-    negotiate_output: _NegotiateOutput,
+    output: _NegotiateOutput,
     metrics_collector: Optional["SchedulerMetricsCollector"],
 ) -> None:
     if _DEBUG_LOG:
-        if decision == "wait_timeout_allow_mixed_prefillable":
+        if output.allow_prefill and (output.reason == "wait_timeout"):
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill "
-                f"(num_prefillable={num_prefillable})"
+                f"(num_prefillable={output.num_prefillable})"
             )
-        elif decision == "token_watermark_allow_mixed_prefillable":
+        elif output.allow_prefill and (output.reason == "token_watermark"):
             logger.info(
                 f"PrefillDelayer force allow prefill due to low watermark. "
-                f"(num_prefillable={num_prefillable}, "
-                f"num_token_watermark_force_allow={num_token_watermark_force_allow})"
+                f"(num_prefillable={output.num_prefillable}, "
+                f"num_token_watermark_force_allow={output.num_token_watermark_force_allow})"
             )
         else:
-            assert decision in {
-                "wait_success_all_prefillable",
-                "no_wait_all_prefillable",
-                "no_prefillable",
+            assert reason in {
+                "",
+                "wait_success",
+                "no_wait",
             }
 
     if metrics_collector is not None:
