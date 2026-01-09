@@ -916,7 +916,9 @@ pub async fn wasm_middleware(
 
         // Process action - apply modifications incrementally
         match action {
-            Action::Continue => {}
+            Action::Continue => {
+                // Continue to next module
+            }
             Action::Reject(status_code) => {
                 // Override response status
                 status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_REQUEST);
