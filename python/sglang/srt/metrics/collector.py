@@ -774,10 +774,10 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             buckets=[5, 20, 100, 500],
         )
-        self.prefill_delayer_timeouts_total = Counter(
-            name="sglang:prefill_delayer_timeouts_total",
-            documentation="Total number of prefill delayer timeouts.",
-            labelnames=labels.keys(),
+        self.prefill_delayer_outcomes_total = Counter(
+            name="sglang:prefill_delayer_outcomes_total",
+            documentation="Prefill delayer outcome counts.",
+            labelnames=[*labels.keys(), "outcome"],
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
@@ -801,12 +801,11 @@ class SchedulerMetricsCollector:
         self._log_histogram(self.queue_time, latency)
 
     def observe_prefill_delayer_wait(
-        self, forward_passes: int, wait_seconds: float, is_timeout: bool
+        self, forward_passes: int, wait_seconds: float, outcome: str
     ) -> None:
         self._log_histogram(self.prefill_delayer_wait_forward_passes, forward_passes)
         self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
-        if is_timeout:
-            self.prefill_delayer_timeouts_total.labels(**self.labels).inc(1)
+        self.prefill_delayer_outcomes_total.labels(**self.labels, outcome=outcome).inc(1)
 
     def increment_retracted_reqs(
         self,
