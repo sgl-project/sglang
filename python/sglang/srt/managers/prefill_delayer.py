@@ -189,6 +189,8 @@ class PrefillDelayerSinglePassExecutor:
 
         _record_outcome(
             outcome=self._result.outcome,
+            num_prefillable=self._result.num_prefillable,
+            num_token_watermark_force_allow=self._result.num_token_watermark_force_allow,
         )
         TODO_report_metrics
 
@@ -207,12 +209,12 @@ def _record_outcome(
     num_token_watermark_force_allow: int,
 ) -> None:
     if _DEBUG_LOG:
-        if outcome == "wait_timeout":
+        if outcome == "wait_timeout_allow_mixed_prefillable":
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill "
                 f"(num_prefillable={num_prefillable})"
             )
-        elif outcome == "token_watermark_force_allow":
+        elif outcome == "token_watermark_allow_mixed_prefillable":
             logger.info(
                 f"PrefillDelayer force allow prefill due to low watermark. "
                 f"(num_prefillable={num_prefillable}, "
@@ -222,6 +224,7 @@ def _record_outcome(
             assert outcome in {
                 "wait_success_all_prefillable",
                 "no_wait_all_prefillable",
+                "no_prefillable",
             }
 
     if (collector := _metrics_collector) is not None:
