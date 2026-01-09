@@ -81,10 +81,10 @@ class PrefillDelayer:
     # (Almost) pure function
     def _negotiate_should_allow_prefill_pure(
         self,
-        prev_state: _State,
+        prev_state: Optional[_State],
         local_prefillable: bool,
         token_usage: float,
-    ) -> Tuple[_State, _NegotiateOutput]:
+    ) -> Tuple[Optional[_State], _NegotiateOutput]:
         # Compute local states
         local_token_watermark_force_allow = (
             local_prefillable
@@ -111,7 +111,7 @@ class PrefillDelayer:
 
         if global_all_prefillable:
             exist_previous_wait = prev_state is not None
-            return _NegotiateOutput(
+            return None, _NegotiateOutput(
                 allow_prefill=True,
                 outcome=(
                     "wait_success_all_prefillable"
@@ -121,11 +121,7 @@ class PrefillDelayer:
             )
 
         if global_exists_token_watermark_force_allow:
-            self._record_outcome_and_reset(
-                debug_num_prefillable=num_prefillable,
-                debug_num_token_watermark_force_allow=num_token_watermark_force_allow,
-            )
-            return _NegotiateOutput(
+            return None, _NegotiateOutput(
                 allow_prefill=True,
                 outcome="token_watermark_force_allow",
             )
