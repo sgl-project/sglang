@@ -120,6 +120,49 @@ def test_function_tool_with_full_schema():
     assert request.tools[0].parameters["required"] == ["location"]
 
 
+def test_harmony_utils_tool_handling():
+    """Test that harmony_utils.get_developer_message handles both tool structures."""
+    import sys
+    from unittest.mock import MagicMock
+
+    # Mock triton if it's missing, as it's required by sglang.srt.utils -> common
+    if "triton" not in sys.modules:
+        sys.modules["triton"] = MagicMock()
+
+    from sglang.srt.entrypoints.harmony_utils import get_developer_message
+    from sglang.srt.entrypoints.openai.protocol import ResponseFunctionTool
+
+    # 1. Test with ResponseFunctionTool (flat structure)
+    flat_tool = ResponseFunctionTool(
+        type="function",
+        name="flat_func",
+        description="Flat description",
+        parameters={"param": "value"},
+    )
+
+    msg_flat = get_developer_message(tools=[flat_tool])
+    # Verify parsing didn't crash and we got a message
+    assert msg_flat is not None
+    # We can't easily inspect the internal C++ object (Message), but if it didn't raise AttributeError, that's good.
+
+    # 2. Test with simulated openai.Tool (nested structure)
+    # Mocking the structure: tool.function.name
+    nested_tool = MagicMock()
+    nested_tool.type = "function"
+    nested_tool.function.name = "nested_func"
+    nested_tool.function.description = "Nested description"
+    nested_tool.function.parameters = {"param": "nested"}
+    # Ensure it doesn't have direct attributes to test the fallback
+    del nested_tool.name
+
+    msg_nested = get_developer_message(tools=[nested_tool])
+    assert msg_nested is not None
+
+    # 3. Test with mixed list
+    msg_mixed = get_developer_message(tools=[flat_tool, nested_tool])
+    assert msg_mixed is not None
+
+
 if __name__ == "__main__":
     # Run tests manually
     pytest.main([__file__, "-v"])
