@@ -138,13 +138,25 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
             kill_process_tree(process.pid)
 
 
-def _launch_server(*, model, base_url, prefill_delayer: bool, other_args):
+def _launch_server(
+    *,
+    model,
+    base_url,
+    prefill_delayer: bool,
+    other_args,
+    max_delay_passes: int = 100,
+    token_usage_low_watermark: float = None,
+):
     os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
     world_size = os.environ.get("SGLANG_TEST_WORLD_SIZE", "8")
 
     with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
         prefill_delayer
-    ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(100):
+    ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(
+        max_delay_passes
+    ), envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.override(
+        token_usage_low_watermark
+    ):
         return popen_launch_server(
             model,
             base_url,
@@ -184,49 +196,28 @@ def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool):
 
 class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
     def test_low_watermark_force_prefill(self):
-        model = "Qwen/Qwen3-0.6B"
-        base_url = DEFAULT_URL_FOR_TEST
-        world_size = int(os.environ.get("SGLANG_TEST_WORLD_SIZE", "8"))
-        os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
-
-        with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
-            True
-        ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(
-            1000
-        ), envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.override(
-            0.8
-        ):
-            process = popen_launch_server(
-                model,
-                base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--trust-remote-code",
-                    "--tp",
-                    str(world_size),
-                    "--enable-dp-attention",
-                    "--dp",
-                    str(world_size),
-                    "--chunked-prefill-size",
-                    "131072",
-                    "--mem-fraction-static",
-                    "0.6",
-                    "--enable-metrics",
-                    "--max-total-tokens",
-                    "50000",
-                ],
-            )
-
         import concurrent.futures
         import time
 
         import openai
 
+        model = "Qwen/Qwen3-0.6B"
+        base_url = DEFAULT_URL_FOR_TEST
+        world_size = int(os.environ.get("SGLANG_TEST_WORLD_SIZE", "8"))
+
+        process = _launch_server(
+            model=model,
+            base_url=base_url,
+            prefill_delayer=True,
+            other_args=["--max-total-tokens", "50000"],
+            max_delay_passes=1000,
+            token_usage_low_watermark=0.8,
+        )
+
         try:
             client = openai.Client(base_url=f"{base_url}/v1", api_key="EMPTY")
 
             long_prompt = "Hello " * 5000
-            blocking_future = None
 
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=world_size + 1
@@ -240,19 +231,19 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
                         extra_body={"data_parallel_rank": 0},
                     )
 
-                blocking_future = executor.submit(send_blocking_request)
+                executor.submit(send_blocking_request)
                 time.sleep(3)
 
                 def send_normal_request(dp_rank):
                     start = time.time()
-                    resp = client.chat.completions.create(
+                    client.chat.completions.create(
                         model=model,
                         messages=[{"role": "user", "content": "Say hi"}],
                         max_tokens=10,
                         extra_body={"data_parallel_rank": dp_rank},
                     )
                     elapsed = time.time() - start
-                    return dp_rank, elapsed, resp
+                    return dp_rank, elapsed
 
                 normal_futures = [
                     executor.submit(send_normal_request, dp_rank)
@@ -260,7 +251,7 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
                 ]
 
                 for future in concurrent.futures.as_completed(normal_futures):
-                    dp_rank, elapsed, resp = future.result()
+                    dp_rank, elapsed = future.result()
                     print(f"DP rank {dp_rank} completed in {elapsed:.2f}s")
                     self.assertLess(
                         elapsed,
