@@ -232,14 +232,9 @@ class TestPrefillDelayerNegotiate(unittest.TestCase):
             for rank in range(world_size):
                 output_allow, output_reason = results[case.name][rank]
                 self.assertEqual(
-                    output_allow,
-                    case.expected_allow,
-                    f"Case {case.name} rank {rank}: expected allow={case.expected_allow}, got {output_allow}",
-                )
-                self.assertEqual(
-                    output_reason,
-                    case.expected_reason,
-                    f"Case {case.name} rank {rank}: expected reason={case.expected_reason}, got {output_reason}",
+                    (output_allow, output_reason),
+                    (case.expected_allow, case.expected_reason),
+                    f"Case {case.name} rank {rank}",
                 )
 
 
@@ -356,31 +351,17 @@ def _assert_throughput_improvement(
         f"This test requires 8 GPUs to properly measure throughput improvement, got {WORLD_SIZE}",
     )
 
-    input_enabled = res_enabled["input_throughput"]
-    input_disabled = res_disabled["input_throughput"]
-    output_enabled = res_enabled["output_throughput"]
-    output_disabled = res_disabled["output_throughput"]
-
-    input_improvement_pct = (input_enabled - input_disabled) / input_disabled * 100
-    output_improvement_pct = (output_enabled - output_disabled) / output_disabled * 100
+    enabled = res_enabled["total_throughput"]
+    disabled = res_disabled["total_throughput"]
+    improvement_pct = (enabled - disabled) / disabled * 100
 
     print(f"\n=== {test_name} Throughput Comparison ===")
-    print(
-        f"Input:  enabled={input_enabled:.2f}, disabled={input_disabled:.2f}, improvement={input_improvement_pct:.2f}%"
-    )
-    print(
-        f"Output: enabled={output_enabled:.2f}, disabled={output_disabled:.2f}, improvement={output_improvement_pct:.2f}%"
-    )
+    print(f"Total: enabled={enabled:.2f}, disabled={disabled:.2f}, improvement={improvement_pct:.2f}%")
 
     test_case.assertGreaterEqual(
-        input_improvement_pct,
+        improvement_pct,
         min_improvement_pct,
-        f"{test_name}: Input throughput improvement ({input_improvement_pct:.2f}%) < {min_improvement_pct}%",
-    )
-    test_case.assertGreaterEqual(
-        output_improvement_pct,
-        min_improvement_pct,
-        f"{test_name}: Output throughput improvement ({output_improvement_pct:.2f}%) < {min_improvement_pct}%",
+        f"{test_name}: Throughput improvement ({improvement_pct:.2f}%) < {min_improvement_pct}%",
     )
 
 
