@@ -238,73 +238,64 @@ class TestPrefillDelayerNegotiate(unittest.TestCase):
 
 class TestPrefillDelayerThroughputOnlineServing(CustomTestCase):
     def test_throughput_comparison(self):
-        other_launch_args = [
-            "--schedule-policy",
-            "lpm",
-        ]
-        other_benchmark_args = dict(
-            num_prompts=500,
-            random_input_len=30000,
-            random_output_len=256,
-            request_rate=32,
-        )
-
-        res_enabled = _run_throughput_test(
-            debug_name="online_serving (prefill_delayer=True)",
-            prefill_delayer=True,
-            other_launch_args=other_launch_args,
-            other_benchmark_args=other_benchmark_args,
-        )
-        res_disabled = _run_throughput_test(
-            debug_name="online_serving (prefill_delayer=False)",
-            prefill_delayer=False,
-            other_launch_args=other_launch_args,
-            other_benchmark_args=other_benchmark_args,
-        )
-
-        _assert_throughput_improvement(
-            self,
+        kwargs = dict(
             test_name="online_serving",
-            res_enabled=res_enabled,
-            res_disabled=res_disabled,
-            min_improvement_pct=-5,
+            other_launch_args=["--schedule-policy", "lpm"],
+            other_benchmark_args=dict(
+                num_prompts=500,
+                random_input_len=30000,
+                random_output_len=256,
+                request_rate=32,
+            ),
         )
+        _run_throughput_comparison(self, **kwargs)
 
 
 class TestPrefillDelayerThroughputOfflineGen(CustomTestCase):
     def test_throughput_comparison(self):
-        other_launch_args = [
-            "--max-total-tokens",
-            "200000",
-        ]
-        other_benchmark_args = dict(
-            num_prompts=800,
-            random_input_len=30000,
-            random_output_len=500,
-        )
-
-        res_enabled = _run_throughput_test(
-            debug_name="offline_gen (prefill_delayer=True)",
-            prefill_delayer=True,
-            other_launch_args=other_launch_args,
-            other_benchmark_args=other_benchmark_args,
-            token_usage_low_watermark=0.8,
-        )
-        res_disabled = _run_throughput_test(
-            debug_name="offline_gen (prefill_delayer=False)",
-            prefill_delayer=False,
-            other_launch_args=other_launch_args,
-            other_benchmark_args=other_benchmark_args,
-            token_usage_low_watermark=0.8,
-        )
-
-        _assert_throughput_improvement(
-            self,
+        kwargs = dict(
             test_name="offline_gen",
-            res_enabled=res_enabled,
-            res_disabled=res_disabled,
-            min_improvement_pct=-5,
+            other_launch_args=["--max-total-tokens", "200000"],
+            other_benchmark_args=dict(
+                num_prompts=800,
+                random_input_len=30000,
+                random_output_len=500,
+            ),
+            token_usage_low_watermark=0.8,
         )
+        _run_throughput_comparison(self, **kwargs)
+
+
+def _run_throughput_comparison(
+    test_case,
+    test_name: str,
+    other_launch_args,
+    other_benchmark_args,
+    token_usage_low_watermark: float = None,
+    min_improvement_pct: float = -5,
+):
+    res_enabled = _run_throughput_test(
+        debug_name=f"{test_name} (prefill_delayer=True)",
+        prefill_delayer=True,
+        other_launch_args=other_launch_args,
+        other_benchmark_args=other_benchmark_args,
+        token_usage_low_watermark=token_usage_low_watermark,
+    )
+    res_disabled = _run_throughput_test(
+        debug_name=f"{test_name} (prefill_delayer=False)",
+        prefill_delayer=False,
+        other_launch_args=other_launch_args,
+        other_benchmark_args=other_benchmark_args,
+        token_usage_low_watermark=token_usage_low_watermark,
+    )
+
+    _assert_throughput_improvement(
+        test_case,
+        test_name=test_name,
+        res_enabled=res_enabled,
+        res_disabled=res_disabled,
+        min_improvement_pct=min_improvement_pct,
+    )
 
 
 def _run_throughput_test(
