@@ -230,6 +230,20 @@ class PiecewiseCudaGraphRunner:
                 self.mrope_positions = torch.zeros(
                     (3, self.max_num_tokens), dtype=torch.int64
                 )
+                deepstack_slots = 3
+                try:
+                    deepstack_slots = getattr(
+                        self.model_runner.model.model, "num_deepstack_embeddings", 3
+                    )
+                except Exception:
+                    deepstack_slots = 3
+                self.input_deepstack_embeds = torch.zeros(
+                    (
+                        self.max_num_tokens,
+                        self.model_runner.model_config.hidden_size * deepstack_slots,
+                    ),
+                    dtype=self.model_runner.dtype,
+                )
 
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
@@ -357,11 +371,16 @@ class PiecewiseCudaGraphRunner:
         with set_forward_context(
             forward_batch, self.attention_layers, self.quant_config, self.moe_layers
         ):
-            _ = self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-            )
+            kwargs = {}
+            if self.is_multimodal and hasattr(self, "input_deepstack_embeds"):
+                kwargs["input_deepstack_embeds"] = self.input_deepstack_embeds[:num_tokens]
+            with torch.no_grad():
+                _ = self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
@@ -516,15 +535,20 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
+            if self.is_multimodal and hasattr(self, "input_deepstack_embeds"):
+                kwargs["input_deepstack_embeds"] = self.input_deepstack_embeds[
+                    :num_tokens
+                ]
             with set_forward_context(
                 forward_batch, self.attention_layers, self.quant_config, self.moe_layers
             ):
-                self.model_runner.model.forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                    **kwargs,
-                )
+                with torch.no_grad():
+                    self.model_runner.model.forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    )
             return
 
         # run twice for warmup at the first time and cuda graph capture at the second time
@@ -683,12 +707,17 @@ class PiecewiseCudaGraphRunner:
                 self.moe_layers,
             ):
                 with set_compiled(True):
-                    output = self.model_runner.model.forward(
-                        static_forward_batch.input_ids,
-                        static_forward_batch.positions,
-                        static_forward_batch,
-                        **kwargs,
-                    )
+                    call_kwargs = {}
+                    if self.is_multimodal and hasattr(self, "input_deepstack_embeds"):
+                        static_num_tokens = len(static_forward_batch.input_ids)
+                        call_kwargs["input_deepstack_embeds"] = self.input_deepstack_embeds[:static_num_tokens]
+                    with torch.no_grad():
+                        output = self.model_runner.model.forward(
+                            static_forward_batch.input_ids,
+                            static_forward_batch.positions,
+                            static_forward_batch,
+                            **call_kwargs,
+                        )
                 if isinstance(output, LogitsProcessorOutput):
                     return LogitsProcessorOutput(
                         next_token_logits=output.next_token_logits[
