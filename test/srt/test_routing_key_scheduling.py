@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 import unittest
 
 import aiohttp
@@ -69,22 +70,21 @@ class TestRoutingKeyScheduling(CustomTestCase):
                 "temperature": 0,
                 "routing_key": routing_key,
             }
+            start_time = time.perf_counter()
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{self.base_url}/v1/chat/completions", json=payload
                 ) as resp:
-                    result = await resp.json()
-                    e2e_latency = result.get("usage", {}).get("e2e_latency", 0)
-                    if e2e_latency == 0:
-                        e2e_latency = result.get("timings", {}).get("e2e_latency", 0)
-                    return routing_key, e2e_latency
+                    await resp.json()
+            latency = time.perf_counter() - start_time
+            return routing_key, latency
 
         long_running_tasks = [
-            asyncio.create_task(send_chat_request("key_a", 2000)),
-            asyncio.create_task(send_chat_request("key_a", 2000)),
+            asyncio.create_task(send_chat_request("key_a", 8000)),
+            asyncio.create_task(send_chat_request("key_a", 8000)),
         ]
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1.0)
 
         short_tasks = []
         for _ in range(10):
