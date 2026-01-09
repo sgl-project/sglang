@@ -153,7 +153,8 @@ def temp_db_with_schema():
                 request_count INTEGER DEFAULT 0,
                 total_tokens INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                end_time DATETIME
             );
 
             CREATE TABLE IF NOT EXISTS fingerprints (

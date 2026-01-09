@@ -323,20 +323,20 @@ class TestClusterCentroid:
         except ImportError:
             pytest.skip("ClusterCentroid not available")
 
-        vector = np.random.randn(FINGERPRINT_DIM).astype(np.float32)
+        centroid_vec = [0.1] * FINGERPRINT_DIM
 
         centroid = ClusterCentroid(
             cluster_id=0,
-            vector=vector,
+            centroid=centroid_vec,
             size=100,
-            zone="syntax_floor",
-            zone_confidence=0.85,
+            traits=["syntax_floor", "high_local_mass"],
+            sampling_hint={"temperature": 0.7, "top_p": 0.9},
         )
 
         assert centroid.cluster_id == 0
         assert centroid.size == 100
-        assert centroid.zone == "syntax_floor"
-        np.testing.assert_array_equal(centroid.vector, vector)
+        assert "syntax_floor" in centroid.traits
+        assert centroid.centroid == centroid_vec
 
 
 class TestVersionAndStatus:

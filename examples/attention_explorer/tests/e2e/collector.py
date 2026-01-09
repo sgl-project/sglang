@@ -279,11 +279,11 @@ class AttentionCollector:
 
                     # Extract content
                     delta = chunk.get("choices", [{}])[0].get("delta", {})
-                    content = delta.get("content", "")
+                    content = delta.get("content") or ""  # Handle None values
                     completion_text += content
 
-                    # Extract attention tokens
-                    attention_data = chunk.get("attention_tokens")
+                    # Extract attention tokens - in streaming mode they're in delta
+                    attention_data = delta.get("attention_tokens") or chunk.get("attention_tokens")
                     if attention_data and isinstance(attention_data, list):
                         for step_data in attention_data:
                             step = self._parse_attention_step(step_data, step_index)
@@ -297,8 +297,8 @@ class AttentionCollector:
                                     trace.fingerprints.append(fp)
                             step_index += 1
 
-                    # Extract MoE routing if present
-                    moe_data = chunk.get("moe_routing")
+                    # Extract MoE routing if present - check delta first for streaming
+                    moe_data = delta.get("moe_routing") or chunk.get("moe_routing")
                     if moe_data:
                         for routing in moe_data:
                             moe = self._parse_moe_routing(routing, step_index)
@@ -322,9 +322,12 @@ class AttentionCollector:
             if first_token_time:
                 trace.time_to_first_token_ms = (first_token_time - start_time) * 1000
 
-            if trace.completion_tokens > 0 and trace.total_generation_time_ms > 0:
+            # Compute tokens per second - use completion_tokens if available,
+            # otherwise estimate from attention steps
+            token_count = trace.completion_tokens if trace.completion_tokens > 0 else len(trace.attention_steps)
+            if token_count > 0 and trace.total_generation_time_ms > 0:
                 trace.tokens_per_second = (
-                    trace.completion_tokens / (trace.total_generation_time_ms / 1000)
+                    token_count / (trace.total_generation_time_ms / 1000)
                 )
 
             logger.info(
@@ -342,26 +345,60 @@ class AttentionCollector:
     def _parse_attention_step(
         self, data: Dict[str, Any], step_index: int
     ) -> Optional[AttentionStep]:
-        """Parse attention step from response data."""
+        """Parse attention step from response data.
+
+        Handles both old format (top_k list) and new format (token_positions + attention_scores arrays).
+        """
         try:
             top_k = []
-            tokens_data = data.get("top_k", [])
 
-            for t in tokens_data:
-                top_k.append(AttentionToken(
-                    token_id=t.get("token_id", 0),
-                    token_str=t.get("token", ""),
-                    offset=t.get("offset", 0),
-                    weight=t.get("weight", 0.0),
-                    position=t.get("position", 0),
-                ))
+            # Try new format first: token_positions + attention_scores arrays
+            token_positions = data.get("token_positions", [])
+            attention_scores = data.get("attention_scores", [])
+
+            if token_positions and attention_scores:
+                # New format from server - build AttentionToken list from parallel arrays
+                for i, (pos, score) in enumerate(zip(token_positions, attention_scores)):
+                    # In new format, position is the source position, offset is distance from current
+                    # We use position directly and compute offset later if needed
+                    top_k.append(AttentionToken(
+                        token_id=0,  # Not available in new format
+                        token_str="",  # Not available in new format
+                        offset=pos,  # Position from start (can compute relative offset if needed)
+                        weight=score,
+                        position=pos,
+                    ))
+            else:
+                # Old format: top_k list with full token data
+                tokens_data = data.get("top_k", [])
+                for t in tokens_data:
+                    top_k.append(AttentionToken(
+                        token_id=t.get("token_id", 0),
+                        token_str=t.get("token", ""),
+                        offset=t.get("offset", 0),
+                        weight=t.get("weight", 0.0),
+                        position=t.get("position", 0),
+                    ))
+
+            # Get fingerprint data if available (new format)
+            fingerprint = data.get("fingerprint", {})
+            entropy = fingerprint.get("entropy") if fingerprint else data.get("entropy")
+            local_mass = fingerprint.get("local_mass") if fingerprint else None
+            mid_mass = fingerprint.get("mid_mass") if fingerprint else None
+            long_mass = fingerprint.get("long_mass") if fingerprint else None
+
+            # Use decode_step from data if available, otherwise use passed step_index
+            actual_step_index = data.get("decode_step", step_index)
 
             return AttentionStep(
-                step_index=step_index,
+                step_index=actual_step_index,
                 output_token_id=data.get("output_token_id", 0),
                 output_token_str=data.get("output_token", ""),
                 top_k_tokens=top_k,
-                entropy=data.get("entropy"),
+                entropy=entropy,
+                local_mass=local_mass,
+                mid_mass=mid_mass,
+                long_mass=long_mass,
             )
         except Exception as e:
             logger.warning(f"Failed to parse attention step: {e}")
