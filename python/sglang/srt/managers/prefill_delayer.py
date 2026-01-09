@@ -191,8 +191,8 @@ class PrefillDelayerSinglePassExecutor:
             outcome=self._result.outcome,
             num_prefillable=self._result.num_prefillable,
             num_token_watermark_force_allow=self._result.num_token_watermark_force_allow,
+            metrics_collector=self._prefill_delayer._metrics_collector,
         )
-        TODO_report_metrics
 
     def negotiate_should_allow_prefill(self, local_prefillable: bool) -> bool:
         if not self._called:
@@ -207,6 +207,7 @@ def _record_outcome(
     outcome: str,
     num_prefillable: int,
     num_token_watermark_force_allow: int,
+    metrics_collector: Optional["SchedulerMetricsCollector"],
 ) -> None:
     if _DEBUG_LOG:
         if outcome == "wait_timeout_allow_mixed_prefillable":
@@ -227,13 +228,13 @@ def _record_outcome(
                 "no_prefillable",
             }
 
-    if (collector := _metrics_collector) is not None:
+    if metrics_collector is not None:
         if (x := _curr_state) is not None:
             wait_seconds = time.perf_counter() - x.start_time
             forward_passes = x.delayed_count
         else:
             wait_seconds = forward_passes = 0
-        collector.observe_prefill_delayer_wait(
+        metrics_collector.observe_prefill_delayer_wait(
             forward_passes=forward_passes,
             wait_seconds=wait_seconds,
             outcome=outcome,
