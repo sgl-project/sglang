@@ -39,6 +39,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
@@ -47,7 +48,6 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_triton_kernels_available,
-    cpu_has_amx_support,
     log_info_on_rank0,
     mxfp_supported,
     next_power_of_2,
@@ -570,10 +570,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         elif _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             if use_intel_amx_backend(layer):
-                packed_w13_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(layer.w13_weight_scale)
-                packed_w2_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(layer.w2_weight_scale)
-                layer.w13_weight_scale = Parameter(packed_w13_weight_scale, requires_grad=False)
-                layer.w2_weight_scale = Parameter(packed_w2_weight_scale, requires_grad=False)
+                packed_w13_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(
+                    layer.w13_weight_scale
+                )
+                packed_w2_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(
+                    layer.w2_weight_scale
+                )
+                layer.w13_weight_scale = Parameter(
+                    packed_w13_weight_scale, requires_grad=False
+                )
+                layer.w2_weight_scale = Parameter(
+                    packed_w2_weight_scale, requires_grad=False
+                )
             return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
