@@ -521,7 +521,10 @@ def _launch_server(
             "--prefill-delayer-max-delay-passes",
             str(max_delay_passes),
             *(
-                ["--prefill-delayer-token-usage-low-watermark", str(token_usage_low_watermark)]
+                [
+                    "--prefill-delayer-token-usage-low-watermark",
+                    str(token_usage_low_watermark),
+                ]
                 if token_usage_low_watermark is not None
                 else []
             ),
