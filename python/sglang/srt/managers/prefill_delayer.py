@@ -116,7 +116,8 @@ class PrefillDelayer:
         if _DEBUG_LOG:
             if outcome == "wait_timeout":
                 logger.info(
-                    f"PrefillDelayer timeout thus not forbid prefill (num_prefillable={debug_num_prefillable})"
+                    f"PrefillDelayer timeout thus not forbid prefill "
+                    f"(num_prefillable={debug_num_prefillable})"
                 )
             elif outcome == "token_watermark_force_allow":
                 logger.info(
