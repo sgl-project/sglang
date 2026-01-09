@@ -217,7 +217,7 @@ impl AuditLogger {
 
         // Log the event
         info!(
-            target: "sgl_model_gateway::audit",
+            target: "smg::audit",
             timestamp = %event.timestamp.to_rfc3339(),
             principal = %event.principal,
             auth_method = %event.auth_method,
