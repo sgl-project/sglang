@@ -174,6 +174,9 @@ class GetKAndS:
         """
         Triton implementation for gathering both K and S data from paged buffer in a single call.
         :param page_indices: (num_pages,), int32/int64
+        :param seq_len_tensor: (num_pages,), int32/int64
+        :param seq_len_sum: sum of all sequence len, int32
+        :param max_seq_len: max of all sequence len, int32
         :return: tuple of (k_fp8, k_scale) where
                  k_fp8: (seq_len, index_head_dim), uint8
                  k_scale: (seq_len, 4), uint8
@@ -640,7 +643,9 @@ def _get_k_and_s_triton(
 
     :param buf: (num_pages, page_size * 128 + page_size * 4), uint8
     :param page_indices: (num_pages,), int32/int64
-    :param seq_len: int, number of tokens to gather
+    :param seq_lens: tensor of sequence lens, int64
+    :param seq_len_sum: sum of all sequence len, int32
+    :param seq_len_sum: max of sequence len, int32
     :param page_size: int, typically 64
     :param index_head_dim: int, typically 128
     :return: tuple of (k_out, s_out) where
@@ -699,19 +704,6 @@ def _get_k_and_s_triton_kernel(
     Fused kernel that gathers both K and S data in a single pass.
     Each program handles one token (seq_len tokens total).
     Loads 128 bytes (K) + 4 bytes (S) from the appropriate page.
-
-    :param buf_ptr: (num_pages, page_size * 128 + page_size * 4), uint8
-    :param page_indices_ptr: all batch page block indices tensor ptr, (batch, max_page_num), int32
-    :param k_out_ptr: all batch k out tensor ptr
-    :param s_out_ptr: all batch s out tensor ptr
-    :param seq_len_ptr: every batch seq len tensor ptr
-    :param seq_len_offset_ptr: every batch seq len offset tensor ptr, for example, seq_len_ptr=[12, 24, 32],
-                               seq_len_offset_ptr=[0, 12, 36]
-    :param page_size: attention kv cache page size
-    :param buf_numel_per_page: buf_ptr second dim,=page_size * 128 + page_size * 4
-    :param index_head_dim: 128
-    :param s_offset_in_page: page_size * 128
-    :param page_indice_batch_offset: page_indices_ptr second dim, =(max_seq_len + page_size - 1)/page_size
     """
     batch_id = tl.program_id(0)
     token_id = tl.program_id(1)
@@ -784,6 +776,7 @@ def _get_ke_and_ks_triton(
     prefix_sum = [0,10,25,45,55]
     seq_lens_sum = [0, 20, 50, 90]
 
+    :param extend_sum_seq_len: sum of all extend sequence len, int32
     :param seq_lens: (num_pages, page_size * 128 + page_size * 4), int32
     :param extend_seq_lens: (num_pages,), int32
     :param seq_lens_expanded: int, number of tokens to gather
@@ -828,15 +821,6 @@ def _get_ke_ks_triton_kernel(
 ):
     '''
     Get ke and ks fuse kernel.
-    
-    :param seq_lens_ptr: every batch seq len, int64
-    :param extend_seq_lens_ptr: every batch extend seq len, int32
-    :param ks: shape=[sum_extend_seq_len] int64
-    :param ke: shape=[sum_extend_seq_len] int64
-    :param seq_lens_expanded: shape=[sum_extend_seq_len] int32
-    :param extend_seq_lens_sum: extend seq_len sum (sum_extend_seq_len)
-    :param BLOCK_SIZE: block size
-    :param seq_lens_len: seq_lens/extend_seq_lens数组的长度
     '''
     pid = tl.program_id(axis=0)
     if pid >= extend_seq_lens_sum:

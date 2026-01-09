@@ -264,6 +264,7 @@ class TestGetKAndS:
         # Ensure seq_len doesn't exceed available pages
         max_seq_len = num_pages * page_size
         seq_len = min(seq_len, max_seq_len)
+        seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
         # Create mock pool
         pool = MockNSATokenToKVPool(
@@ -283,13 +284,14 @@ class TestGetKAndS:
         page_indices = torch.randint(
             0, num_pages, (num_pages_needed,), dtype=torch.int32, device=device
         )
+        page_indices_ = page_indices.unsqueeze(0)
 
         # Run baseline: separate torch_fast calls
         k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
         s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
 
         # Run fused Triton implementation
-        k_triton, s_triton = GetKAndS.triton(pool, buf, seq_len, page_indices)
+        k_triton, s_triton = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
 
         # Verify shapes
         assert k_torch.shape == (seq_len, index_head_dim)
@@ -320,6 +322,7 @@ class TestGetKAndS:
         index_head_dim = 128
         num_pages = 10
         seq_len = 320  # 5 pages
+        seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
         pool = MockNSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
@@ -328,13 +331,14 @@ class TestGetKAndS:
 
         # Sequential page indices [0, 1, 2, 3, 4]
         page_indices = torch.arange(5, dtype=torch.int32, device=device)
+        page_indices_ = page_indices.unsqueeze(0)
 
         # Baseline
         k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
         s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
 
         # Fused
-        k_triton, s_triton = GetKAndS.triton(pool, buf, seq_len, page_indices)
+        k_triton, s_triton = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
 
         torch.testing.assert_close(k_triton, k_torch, rtol=0, atol=0)
         torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
@@ -346,6 +350,7 @@ class TestGetKAndS:
         index_head_dim = 128
         num_pages = 5
         seq_len = 192  # 3 pages
+        seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
         pool = MockNSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
@@ -354,13 +359,14 @@ class TestGetKAndS:
 
         # Repeated page indices [2, 2, 2]
         page_indices = torch.full((3,), 2, dtype=torch.int32, device=device)
+        page_indices_ = page_indices.unsqueeze(0)
 
         # Baseline
         k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
         s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
 
         # Fused
-        k_triton, s_triton = GetKAndS.triton(pool, buf, seq_len, page_indices)
+        k_triton, s_triton = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
 
         torch.testing.assert_close(k_triton, k_torch, rtol=0, atol=0)
         torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
@@ -372,6 +378,7 @@ class TestGetKAndS:
         index_head_dim = 128
         num_pages = 5
         seq_len = 100  # Not a multiple of 64
+        seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
         pool = MockNSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
@@ -380,13 +387,14 @@ class TestGetKAndS:
 
         num_pages_needed = (seq_len + page_size - 1) // page_size
         page_indices = torch.arange(num_pages_needed, dtype=torch.int32, device=device)
+        page_indices_ = page_indices.unsqueeze(0)
 
         # Baseline
         k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
         s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
 
         # Fused
-        k_triton, s_triton = GetKAndS.triton(pool, buf, seq_len, page_indices)
+        k_triton, s_triton = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
 
         # Should handle partial pages correctly
         torch.testing.assert_close(k_triton, k_torch, rtol=0, atol=0)
@@ -404,12 +412,14 @@ class TestEdgeCases:
         index_head_dim = 128
         num_pages = 2
         seq_len = 1
+        seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
         pool = MockNSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
         buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
         page_indices = torch.tensor([0], dtype=torch.int32, device=device)
+        page_indices_ = page_indices.unsqueeze(0)
 
         # Test GetK
         k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
@@ -422,7 +432,7 @@ class TestEdgeCases:
         torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
 
         # Test GetKAndS
-        k_triton2, s_triton2 = GetKAndS.triton(pool, buf, seq_len, page_indices)
+        k_triton2, s_triton2 = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
         torch.testing.assert_close(k_triton2, k_torch, rtol=0, atol=0)
         torch.testing.assert_close(s_triton2, s_torch, rtol=0, atol=0)
 
@@ -433,12 +443,14 @@ class TestEdgeCases:
         index_head_dim = 128
         num_pages = 5
         seq_len = 192  # Exactly 3 pages
+        seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
         pool = MockNSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
         )
         buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
         page_indices = torch.arange(3, dtype=torch.int32, device=device)
+        page_indices_ = page_indices.unsqueeze(0)
 
         # Test GetK
         k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
@@ -451,7 +463,7 @@ class TestEdgeCases:
         torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
 
         # Test GetKAndS
-        k_triton2, s_triton2 = GetKAndS.triton(pool, buf, seq_len, page_indices)
+        k_triton2, s_triton2 = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
         torch.testing.assert_close(k_triton2, k_torch, rtol=0, atol=0)
         torch.testing.assert_close(s_triton2, s_torch, rtol=0, atol=0)
 
@@ -462,6 +474,7 @@ class TestEdgeCases:
         index_head_dim = 128
         num_pages = 100
         seq_len = 4096  # 64 pages
+        seq_len_tensor = torch.tensor([seq_len], dtype=torch.int64, device=device)
 
         pool = MockNSATokenToKVPool(
             page_size=page_size, index_head_dim=index_head_dim, device=device
@@ -472,6 +485,7 @@ class TestEdgeCases:
         page_indices = torch.randint(
             0, num_pages, (num_pages_needed,), dtype=torch.int32, device=device
         )
+        page_indices_ = page_indices.unsqueeze(0)
 
         # Test GetK
         k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
@@ -484,7 +498,7 @@ class TestEdgeCases:
         torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
 
         # Test GetKAndS
-        k_triton2, s_triton2 = GetKAndS.triton(pool, buf, seq_len, page_indices)
+        k_triton2, s_triton2 = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
         torch.testing.assert_close(k_triton2, k_torch, rtol=0, atol=0)
         torch.testing.assert_close(s_triton2, s_torch, rtol=0, atol=0)
 
@@ -541,7 +555,7 @@ if __name__ == "__main__":
     test_get_k_and_s.test_get_k_and_s_partial_page()
     print("✓ GetKAndS tests passed\n")
 
-    # Test edge cases
+    # # Test edge cases
     print("Testing edge cases...")
     test_edge = TestEdgeCases()
     test_edge.test_single_token()
