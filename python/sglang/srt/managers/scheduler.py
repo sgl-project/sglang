@@ -775,6 +775,9 @@ class Scheduler(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 max_delay_passes=envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get(),
+                token_usage_low_watermark=(
+                    envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
+                ),
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
@@ -1846,8 +1849,9 @@ class Scheduler(
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
+            _, token_usage, _, _ = self._get_token_info()
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
-                self.prefill_delayer
+                self.prefill_delayer, token_usage=token_usage
             )
 
         ret = self._get_new_batch_prefill_raw(

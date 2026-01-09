@@ -31,6 +31,7 @@ class _NegotiateOutput(NamedTuple):
     output_allow: bool
     output_reason: str
     num_prefillable: int
+    num_token_watermark_force_allow: int
 
 
 class PrefillDelayer:
@@ -41,15 +42,19 @@ class PrefillDelayer:
         cpu_group,
         server_args,
         max_delay_passes: int,
+        token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
     ):
         self._max_delay_passes = max_delay_passes
+        self._token_usage_low_watermark = token_usage_low_watermark
         logger.info(
-            f"PrefillDelayer initialized with max_delay_passes={self._max_delay_passes}"
+            f"PrefillDelayer initialized with "
+            f"max_delay_passes={self._max_delay_passes} "
+            f"token_usage_low_watermark={self._token_usage_low_watermark}"
         )
 
         self._global_info_buffer = torch.empty(
-            (dp_size, attn_tp_size, 1),
+            (dp_size, attn_tp_size, 2),
             dtype=torch.int64,
             device="cpu",
         )
@@ -70,33 +75,53 @@ class PrefillDelayer:
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
     def _negotiate_should_allow_prefill(
-        self, local_prefillable: bool
+        self, local_prefillable: bool, token_usage: float
     ) -> _NegotiateOutput:
         out = self._negotiate_should_allow_prefill_pure(
             prev_state=self._curr_state,
             local_prefillable=local_prefillable,
+            token_usage=token_usage,
         )
         self._curr_state = out.next_state
         return out
 
+    # (Almost) pure function, do not modify self state
     def _negotiate_should_allow_prefill_pure(
         self,
         prev_state: Optional[_State],
         local_prefillable: bool,
+        token_usage: float,
     ) -> _NegotiateOutput:
-        global_prefillable = self._gather_info(local_prefillable=local_prefillable)
+        # Compute local states
+        local_token_watermark_force_allow = (
+            local_prefillable
+            and ((x := self._token_usage_low_watermark) is not None)
+            and (token_usage < x)
+        )
 
+        # Gather global states
+        global_prefillable, global_token_watermark_force_allow = self._gather_info(
+            local_prefillable=local_prefillable,
+            local_token_watermark_force_allow=local_token_watermark_force_allow,
+        )
+
+        # Compute derived global states
         if global_prefillable.min().item() > 0:
             prefillable_status = "all"
         elif global_prefillable.max().item() == 0:
             prefillable_status = "none"
         else:
             prefillable_status = "mixed"
+        global_exists_token_watermark_force_allow = (
+            global_token_watermark_force_allow.max().item() > 0
+        )
         debug_info = dict(
             input_estimation=prefillable_status,
             num_prefillable=global_prefillable.sum().item(),
+            num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
         )
 
+        # Compute outputs
         if prefillable_status == "all":
             exist_previous_wait = prev_state is not None
             return _NegotiateOutput(
@@ -108,11 +133,20 @@ class PrefillDelayer:
         elif prefillable_status == "none":
             return _NegotiateOutput(
                 next_state=None,
+                # It does not matter whether we allow or not, thus we allow for simplicity
                 output_allow=True,
                 output_reason="",
                 **debug_info,
             )
         elif prefillable_status == "mixed":
+            if global_exists_token_watermark_force_allow:
+                return _NegotiateOutput(
+                    next_state=None,
+                    output_allow=True,
+                    output_reason="token_watermark",
+                    **debug_info,
+                )
+
             prev_delayed_count = prev_state.delayed_count if prev_state else 0
             if prev_delayed_count < self._max_delay_passes - 1:
                 next_state = prev_state or _State()
@@ -133,9 +167,11 @@ class PrefillDelayer:
         else:
             raise NotImplementedError
 
-    def _gather_info(self, local_prefillable: bool):
+    def _gather_info(
+        self, local_prefillable: bool, local_token_watermark_force_allow: bool
+    ):
         local_info = torch.tensor(
-            [int(local_prefillable)],
+            [int(local_prefillable), int(local_token_watermark_force_allow)],
             device="cpu",
             dtype=torch.int64,
         )
@@ -145,12 +181,13 @@ class PrefillDelayer:
             group=self._cpu_group,
         )
         tp0_info = self._global_info_buffer[:, 0, :]
-        return tp0_info[:, 0]
+        return tp0_info[:, 0], tp0_info[:, 1]
 
 
 class PrefillDelayerSinglePassExecutor:
-    def __init__(self, prefill_delayer: PrefillDelayer):
+    def __init__(self, prefill_delayer: PrefillDelayer, token_usage: float):
         self._prefill_delayer = prefill_delayer
+        self._token_usage = token_usage
         self._result: Optional[_NegotiateOutput] = None
 
     @property
@@ -171,6 +208,7 @@ class PrefillDelayerSinglePassExecutor:
         if not self._called:
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
                 local_prefillable=local_prefillable,
+                token_usage=self._token_usage,
             )
         return self._result.output_allow
 
@@ -185,6 +223,13 @@ def _record_single_pass_result(
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill "
                 f"(num_prefillable={output.num_prefillable}, "
+                f"actual_execution={actual_execution})"
+            )
+        elif output.output_allow and (output.output_reason == "token_watermark"):
+            logger.info(
+                f"PrefillDelayer force allow prefill due to low watermark. "
+                f"(num_prefillable={output.num_prefillable}, "
+                f"num_token_watermark_force_allow={output.num_token_watermark_force_allow}, "
                 f"actual_execution={actual_execution})"
             )
         else:
