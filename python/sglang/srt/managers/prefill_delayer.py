@@ -222,13 +222,15 @@ def _record_single_pass_result(
         if output.output_allow and (output.output_reason == "wait_timeout"):
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill "
-                f"(num_prefillable={output.num_prefillable})"
+                f"(num_prefillable={output.num_prefillable}, "
+                f"actual_execution={actual_execution})"
             )
         elif output.output_allow and (output.output_reason == "token_watermark"):
             logger.info(
                 f"PrefillDelayer force allow prefill due to low watermark. "
                 f"(num_prefillable={output.num_prefillable}, "
-                f"num_token_watermark_force_allow={output.num_token_watermark_force_allow})"
+                f"num_token_watermark_force_allow={output.num_token_watermark_force_allow}, "
+                f"actual_execution={actual_execution})"
             )
         else:
             assert output.output_reason in {
