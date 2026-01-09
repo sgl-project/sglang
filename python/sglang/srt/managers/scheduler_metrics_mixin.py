@@ -95,7 +95,9 @@ class SchedulerMetricsMixin:
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
             self.metrics_collector = SchedulerMetricsCollector(
-                labels=labels, enable_lora=self.enable_lora
+                labels=labels,
+                enable_lora=self.enable_lora,
+                prefill_delayer_max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
             )
 
             if ENABLE_METRICS_DEVICE_TIMER:

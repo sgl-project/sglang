@@ -489,6 +489,18 @@ _warn_deprecated_env_to_cli_flag(
     "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
     "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
 )
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
+    "Please use '--enable-prefill-delayer' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES",
+    "Please use '--prefill-delayer-max-delay-passes' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK",
+    "Please use '--prefill-delayer-token-usage-low-watermark' instead.",
+)
 
 
 def example_with_exit_stack():
