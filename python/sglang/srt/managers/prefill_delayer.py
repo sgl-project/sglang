@@ -1,11 +1,11 @@
+import dataclasses
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -16,32 +16,46 @@ _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class _DelayInfo:
+@dataclass(frozen=True)
+class _State:
     delayed_count: int = 0
     start_time: float = field(default_factory=time.perf_counter)
+
+    def bump_delayed_count(self) -> "_State":
+        return dataclasses.replace(self, delayed_count=self.delayed_count + 1)
+
+
+class _NegotiateOutput(NamedTuple):
+    next_state: Optional[_State]
+    input_estimation: str
+    output_allow: bool
+    output_reason: str
+    num_prefillable: int
 
 
 class PrefillDelayer:
     def __init__(
         self,
-        dp_size,
-        attn_tp_size,
-        tp_worker,
+        dp_size: int,
+        attn_tp_size: int,
+        cpu_group,
         server_args,
+        max_delay_passes: int,
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
     ):
-        self.global_info = torch.empty(
+        self._max_delay_passes = max_delay_passes
+        logger.info(f"PrefillDelayer initialized with max_delay_passes={self._max_delay_passes}")
+
+        self._global_info_buffer = torch.empty(
             (dp_size, attn_tp_size, 1),
             dtype=torch.int64,
             device="cpu",
         )
-        self.cpu_group = tp_worker.get_tp_group().cpu_group
+        self._cpu_group = cpu_group
 
-        self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
         self._metrics_collector = metrics_collector
 
-        self._curr_delay_info: Optional[_DelayInfo] = None
+        self._curr_state: Optional[_State] = None
 
         assert (
             server_args.enable_dp_attention
@@ -53,40 +67,67 @@ class PrefillDelayer:
             not server_args.disable_overlap_schedule
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
-    def _negotiate_should_allow_prefill(self, local_prefillable: bool) -> bool:
-        tp0_info = self._gather_info(local_prefillable=local_prefillable)
-        global_prefillable = tp0_info[:, 0]
-        global_exists_not_prefillable = global_prefillable.min().item() == 0
-        global_exists_prefillable = global_prefillable.max().item() > 0
-        global_mixed_prefillable = (
-            global_exists_not_prefillable and global_exists_prefillable
+    def _negotiate_should_allow_prefill(self, local_prefillable: bool) -> _NegotiateOutput:
+        out = self._negotiate_should_allow_prefill_pure(
+            prev_state=self._curr_state,
+            local_prefillable=local_prefillable,
+        )
+        self._curr_state = out.next_state
+        return out
+
+    def _negotiate_should_allow_prefill_pure(
+        self,
+        prev_state: Optional[_State],
+        local_prefillable: bool,
+    ) -> _NegotiateOutput:
+        global_prefillable = self._gather_info(local_prefillable=local_prefillable)
+
+        if global_prefillable.min().item() > 0:
+            prefillable_status = "all"
+        elif global_prefillable.max().item() == 0:
+            prefillable_status = "none"
+        else:
+            prefillable_status = "mixed"
+        debug_info = dict(
+            input_estimation=prefillable_status,
+            num_prefillable=global_prefillable.sum().item(),
         )
 
-        if global_mixed_prefillable:
-            if self._curr_delay_info is None:
-                self._curr_delay_info = _DelayInfo()
-            self._curr_delay_info.delayed_count += 1
-            if self._curr_delay_info.delayed_count < self.max_delay_passes:
-                return False
-
-        is_timeout = global_mixed_prefillable
-        if _DEBUG_LOG and is_timeout:
-            logger.info(
-                f"PrefillDelayer timeout thus not forbid prefill (prefillable: {global_prefillable.sum()})"
+        if prefillable_status == "all":
+            exist_previous_wait = prev_state is not None
+            return _NegotiateOutput(
+                next_state=None,
+                output_allow=True,
+                output_reason="wait_success" if exist_previous_wait else "no_wait",
+                **debug_info,
             )
-
-        self._record_metrics(is_timeout=is_timeout)
-        self._curr_delay_info = None
-        return True
-
-    def _record_metrics(self, is_timeout: bool) -> None:
-        if self._curr_delay_info is not None and self._metrics_collector is not None:
-            wait_seconds = time.perf_counter() - self._curr_delay_info.start_time
-            self._metrics_collector.observe_prefill_delayer_wait(
-                forward_passes=self._curr_delay_info.delayed_count,
-                wait_seconds=wait_seconds,
-                is_timeout=is_timeout,
+        elif prefillable_status == "none":
+            return _NegotiateOutput(
+                next_state=None,
+                output_allow=True,
+                output_reason="",
+                **debug_info,
             )
+        elif prefillable_status == "mixed":
+            prev_delayed_count = prev_state.delayed_count if prev_state else 0
+            if prev_delayed_count < self._max_delay_passes - 1:
+                next_state = prev_state or _State()
+                next_state = next_state.bump_delayed_count()
+                return _NegotiateOutput(
+                    next_state=next_state,
+                    output_allow=False,
+                    output_reason="delay",
+                    **debug_info,
+                )
+            else:
+                return _NegotiateOutput(
+                    next_state=None,
+                    output_allow=True,
+                    output_reason="wait_timeout",
+                    **debug_info,
+                )
+        else:
+            raise NotImplementedError
 
     def _gather_info(self, local_prefillable: bool):
         local_info = torch.tensor(
@@ -95,34 +136,51 @@ class PrefillDelayer:
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
-            self.global_info.flatten(),
+            self._global_info_buffer.flatten(),
             local_info,
-            group=self.cpu_group,
+            group=self._cpu_group,
         )
-        tp0_info = self.global_info[:, 0, :]
-        return tp0_info
+        tp0_info = self._global_info_buffer[:, 0, :]
+        return tp0_info[:, 0]
 
 
 class PrefillDelayerSinglePassExecutor:
     def __init__(self, prefill_delayer: PrefillDelayer):
         self._prefill_delayer = prefill_delayer
-        self._result: Optional[bool] = None
+        self._result: Optional[_NegotiateOutput] = None
 
     @property
     def _called(self) -> bool:
         return self._result is not None
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def finalize(self, *, actual_prefill: bool):
         if not self._called:
             self.negotiate_should_allow_prefill(local_prefillable=False)
-        return False
+
+        result = self._result
+        if _DEBUG_LOG and result.output_reason:
+            logger.info(
+                f"PrefillDelayer {result.output_reason} "
+                f"(num_prefillable={result.num_prefillable}, actual_execution={actual_prefill})"
+            )
+        self._record_metrics(actual_prefill=actual_prefill)
+
+    def _record_metrics(self, actual_prefill: bool) -> None:
+        result = self._result
+        state = self._prefill_delayer._curr_state
+        metrics = self._prefill_delayer._metrics_collector
+        if metrics is not None:
+            forward_passes = state.delayed_count if state else 0
+            wait_seconds = (time.perf_counter() - state.start_time) if state else 0
+            metrics.observe_prefill_delayer_wait(
+                forward_passes=forward_passes,
+                wait_seconds=wait_seconds,
+                is_timeout=(result.output_reason == "wait_timeout"),
+            )
 
     def negotiate_should_allow_prefill(self, local_prefillable: bool) -> bool:
         if not self._called:
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
                 local_prefillable=local_prefillable
             )
-        return self._result
+        return self._result.output_allow

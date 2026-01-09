@@ -770,8 +770,9 @@ class Scheduler(
             self.prefill_delayer = PrefillDelayer(
                 dp_size=self.dp_size,
                 attn_tp_size=self.attn_tp_size,
-                tp_worker=self.tp_worker,
+                cpu_group=self.tp_worker.get_tp_group().cpu_group,
                 server_args=self.server_args,
+                max_delay_passes=envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get(),
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
@@ -1844,14 +1845,17 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        with (
+        prefill_delayer_single_pass = (
             PrefillDelayerSinglePassExecutor(self.prefill_delayer)
             if self.prefill_delayer
-            else nullcontext()
-        ) as prefill_delayer_single_pass:
-            return self._get_new_batch_prefill_raw(
-                prefill_delayer_single_pass=prefill_delayer_single_pass
-            )
+            else None
+        )
+        result = self._get_new_batch_prefill_raw(
+            prefill_delayer_single_pass=prefill_delayer_single_pass
+        )
+        if prefill_delayer_single_pass is not None:
+            prefill_delayer_single_pass.finalize(actual_prefill=(result is not None))
+        return result
 
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
