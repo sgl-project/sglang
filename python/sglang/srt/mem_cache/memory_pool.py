@@ -77,10 +77,6 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
-KV_CACHE_QUANTIZATION_DEBUG_MODE = (
-    os.getenv("KV_CACHE_QUANTIZATION_DEBUG_MODE", "False").lower() == "true"
-)
-
 
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
@@ -1014,10 +1010,6 @@ class MHATokenToKVPool(KVCache):
         else:
             layer_id = layer.layer_id
 
-        if self.dtype in ("int4", "int8") and KV_CACHE_QUANTIZATION_DEBUG_MODE is True:
-            cache_k_original = cache_k.clone()
-            cache_v_original = cache_v.clone()
-
         if self.dtype in ("int4", "int8"):
             # Use Triton kernels for efficient quantization and direct cache write
             if self.dtype == "int4":
@@ -1045,96 +1037,6 @@ class MHATokenToKVPool(KVCache):
                     self.k_scales_zeros[layer_id - self.start_layer],
                     self.v_scales_zeros[layer_id - self.start_layer],
                 )
-
-            # Quantized values and scales/zeros have been written directly to buffers by the kernel
-            # No need for additional copies!
-            if (
-                self.dtype in ("int4", "int8")
-                and KV_CACHE_QUANTIZATION_DEBUG_MODE is True
-            ):
-
-                # ===== DEBUG: Verify quantization accuracy =====
-                # Read back and dequantize to check error
-                quantized_k = self.k_buffer[layer_id - self.start_layer][loc]
-                quantized_v = self.v_buffer[layer_id - self.start_layer][loc]
-                scales_zeros_k = self.k_scales_zeros[layer_id - self.start_layer][loc]
-                scales_zeros_v = self.v_scales_zeros[layer_id - self.start_layer][loc]
-
-                scale_k = scales_zeros_k[..., 0]
-                zero_k = scales_zeros_k[..., 1]
-                scale_v = scales_zeros_v[..., 0]
-                zero_v = scales_zeros_v[..., 1]
-
-                if self.dtype == "int4":
-                    # Unpack INT4: lower nibble and upper nibble
-                    q_k1 = (quantized_k & 0x0F).to(cache_k_original.dtype)
-                    q_k2 = ((quantized_k >> 4) & 0x0F).to(cache_k_original.dtype)
-                    # Dequantize: x = (q - zeros) * scales
-                    dequant_k1 = (q_k1 - zero_k.unsqueeze(-1)) * scale_k.unsqueeze(-1)
-                    dequant_k2 = (q_k2 - zero_k.unsqueeze(-1)) * scale_k.unsqueeze(-1)
-                    dequant_k = torch.cat([dequant_k1, dequant_k2], dim=-1)
-
-                    q_v1 = (quantized_v & 0x0F).to(cache_v_original.dtype)
-                    q_v2 = ((quantized_v >> 4) & 0x0F).to(cache_v_original.dtype)
-                    dequant_v1 = (q_v1 - zero_v.unsqueeze(-1)) * scale_v.unsqueeze(-1)
-                    dequant_v2 = (q_v2 - zero_v.unsqueeze(-1)) * scale_v.unsqueeze(-1)
-                    dequant_v = torch.cat([dequant_v1, dequant_v2], dim=-1)
-
-                elif self.dtype == "int8":
-                    # Dequantize INT8: x = (q - zeros) * scales
-                    dequant_k = (
-                        quantized_k.to(cache_k_original.dtype) - zero_k.unsqueeze(-1)
-                    ) * scale_k.unsqueeze(-1)
-                    dequant_v = (
-                        quantized_v.to(cache_v_original.dtype) - zero_v.unsqueeze(-1)
-                    ) * scale_v.unsqueeze(-1)
-
-                # Compute errors
-                k_abs_error = torch.abs(dequant_k - cache_k_original)
-                v_abs_error = torch.abs(dequant_v - cache_v_original)
-
-                k_rel_error = torch.norm(k_abs_error, p=2) / (
-                    torch.norm(cache_k_original, p=2) + 1e-8
-                )
-                v_rel_error = torch.norm(v_abs_error, p=2) / (
-                    torch.norm(cache_v_original, p=2) + 1e-8
-                )
-
-                print(f"\n{'='*80}")
-                print(
-                    f"KV CACHE QUANTIZATION DEBUG - Layer {layer_id}, dtype={self.dtype}"
-                )
-                print(f"{'='*80}")
-                print(
-                    f"Original K range: [{cache_k_original.min():.6f}, {cache_k_original.max():.6f}]"
-                )
-                print(
-                    f"Original V range: [{cache_v_original.min():.6f}, {cache_v_original.max():.6f}]"
-                )
-                print(f"\nK Quantization Error:")
-                print(
-                    f"  Abs Error - Mean: {k_abs_error.mean():.6f}, Max: {k_abs_error.max():.6f}, Std: {k_abs_error.std():.6f}"
-                )
-                print(f"  Rel Error - {k_rel_error:.6f}")
-                print(f"  Scale range: [{scale_k.min():.6f}, {scale_k.max():.6f}]")
-                print(f"\nV Quantization Error:")
-                print(
-                    f"  Abs Error - Mean: {v_abs_error.mean():.6f}, Max: {v_abs_error.max():.6f}, Std: {v_abs_error.std():.6f}"
-                )
-                print(f"  Rel Error - {v_rel_error:.6f}")
-                print(f"  Scale range: [{scale_v.min():.6f}, {scale_v.max():.6f}]")
-                print(f"{'='*80}\n")
-
-                # Optional: Assert reasonable error bounds
-                if k_rel_error > 0.3:
-                    logger.warning(
-                        f"K quantization error high: rel_error={k_rel_error:.6f}"
-                    )
-                if v_rel_error > 0.3:
-                    logger.warning(
-                        f"V quantization error high: rel_error={v_rel_error:.6f}"
-                    )
-                # ===== END DEBUG =====
 
             # Early return - INT4/INT8 quantization is complete
             return
