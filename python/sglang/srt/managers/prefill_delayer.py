@@ -68,19 +68,18 @@ class PrefillDelayer:
             local_prefillable=local_prefillable,
             force_allow_prefill=force_allow_prefill,
         )
+
+        global_force_allow = tp0_info[:, 1]
+        if global_force_allow.max().item() > 0:
+            if _DEBUG_LOG:
+                logger.info(
+                    f"PrefillDelayer force allow prefill due to low watermark (force_allow ranks: {global_force_allow.sum()})"
+                )
+            self._record_metrics(is_timeout=False)
+            self._curr_delay_info = None
+            return True
+
         global_prefillable = tp0_info[:, 0]
-
-        if self.low_watermark is not None:
-            global_force_allow = tp0_info[:, 1]
-            if global_force_allow.max().item() > 0:
-                if _DEBUG_LOG:
-                    logger.info(
-                        f"PrefillDelayer force allow prefill due to low watermark (force_allow ranks: {global_force_allow.sum()})"
-                    )
-                self._record_metrics(is_timeout=False)
-                self._curr_delay_info = None
-                return True
-
         global_exists_not_prefillable = global_prefillable.min().item() == 0
         global_exists_prefillable = global_prefillable.max().item() > 0
         global_mixed_prefillable = (
