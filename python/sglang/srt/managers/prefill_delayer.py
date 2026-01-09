@@ -31,15 +31,16 @@ class PrefillDelayer:
         server_args,
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
     ):
+        self.low_watermark = envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
+        info_size = 2 if self.low_watermark is not None else 1
         self.global_info = torch.empty(
-            (dp_size, attn_tp_size, 2),
+            (dp_size, attn_tp_size, info_size),
             dtype=torch.int64,
             device="cpu",
         )
         self.cpu_group = tp_worker.get_tp_group().cpu_group
 
         self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
-        self.low_watermark = envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
         self._metrics_collector = metrics_collector
 
         self._curr_delay_info: Optional[_DelayInfo] = None
@@ -62,16 +63,17 @@ class PrefillDelayer:
             force_allow_prefill=force_allow_prefill,
         )
         global_prefillable = tp0_info[:, 0]
-        global_force_allow = tp0_info[:, 1]
 
-        if global_force_allow.max().item() > 0:
-            if _DEBUG_LOG:
-                logger.info(
-                    f"PrefillDelayer force allow prefill due to low watermark (force_allow ranks: {global_force_allow.sum()})"
-                )
-            self._record_metrics(is_timeout=False)
-            self._curr_delay_info = None
-            return True
+        if self.low_watermark is not None:
+            global_force_allow = tp0_info[:, 1]
+            if global_force_allow.max().item() > 0:
+                if _DEBUG_LOG:
+                    logger.info(
+                        f"PrefillDelayer force allow prefill due to low watermark (force_allow ranks: {global_force_allow.sum()})"
+                    )
+                self._record_metrics(is_timeout=False)
+                self._curr_delay_info = None
+                return True
 
         global_exists_not_prefillable = global_prefillable.min().item() == 0
         global_exists_prefillable = global_prefillable.max().item() > 0
@@ -106,11 +108,18 @@ class PrefillDelayer:
             )
 
     def _gather_info(self, local_prefillable: bool, force_allow_prefill: bool):
-        local_info = torch.tensor(
-            [int(local_prefillable), int(force_allow_prefill)],
-            device="cpu",
-            dtype=torch.int64,
-        )
+        if self.low_watermark is not None:
+            local_info = torch.tensor(
+                [int(local_prefillable), int(force_allow_prefill)],
+                device="cpu",
+                dtype=torch.int64,
+            )
+        else:
+            local_info = torch.tensor(
+                [int(local_prefillable)],
+                device="cpu",
+                dtype=torch.int64,
+            )
         torch.distributed.all_gather_into_tensor(
             self.global_info.flatten(),
             local_info,
@@ -124,7 +133,10 @@ class PrefillDelayerSinglePassExecutor:
     def __init__(self, prefill_delayer: PrefillDelayer, token_usage: float):
         self._prefill_delayer = prefill_delayer
         self._token_usage = token_usage
-        self._force_allow_prefill = token_usage < prefill_delayer.low_watermark
+        if prefill_delayer.low_watermark is not None:
+            self._force_allow_prefill = token_usage < prefill_delayer.low_watermark
+        else:
+            self._force_allow_prefill = False
         self._result: Optional[bool] = None
 
     @property
