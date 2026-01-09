@@ -1,7 +1,10 @@
+import concurrent.futures
 import os
+import time
 import unittest
 from types import SimpleNamespace
 
+import openai
 import requests
 
 from sglang.bench_serving import run_benchmark
@@ -196,11 +199,6 @@ def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool):
 
 class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
     def test_low_watermark_force_prefill(self):
-        import concurrent.futures
-        import time
-
-        import openai
-
         model = "Qwen/Qwen3-0.6B"
         base_url = DEFAULT_URL_FOR_TEST
         world_size = int(os.environ.get("SGLANG_TEST_WORLD_SIZE", "8"))
