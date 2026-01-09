@@ -55,7 +55,7 @@ jobs:
             active_runs=$(gh run list \
               --repo "$REPO" \
               --workflow "$workflow_file" \
-              --json databaseId,status,event,headBranch,createdAt,updatedAt,headSha \
+              --json databaseId,status,event,headBranch,createdAt,updatedAt,headSha,runNumber,attempt \
               --limit 500 \
               | jq -c '.[] | select(.status=="queued" or .status=="waiting" or .status=="in_progress") | select(.event=="pull_request")')
 
@@ -69,6 +69,8 @@ jobs:
               run_status=$(echo "$run" | jq -r '.status')
               created_at=$(echo "$run" | jq -r '.createdAt')
               head_sha=$(echo "$run" | jq -r '.headSha')
+              run_number=$(echo "$run" | jq -r '.runNumber')
+              run_attempt=$(echo "$run" | jq -r '.attempt // 1')
 
               # Get detailed run information including jobs
               run_details=$(gh api "repos/$REPO/actions/runs/$run_id" 2>/dev/null || true)
@@ -108,7 +110,7 @@ jobs:
               queue_minutes=$((queue_time / 60))
 
               # Store data in temporary file
-              echo "$pr_number|$workflow_file|$run_id|$run_status|$running_jobs|$queued_jobs|$runners|$queue_minutes|$created_at|$head_sha" >> "$pr_data_file"
+              echo "$pr_number|$workflow_file|$run_id|$run_status|$running_jobs|$queued_jobs|$runners|$queue_minutes|$created_at|$head_sha|$run_attempt" >> "$pr_data_file"
             done
           done
 
@@ -120,54 +122,12 @@ jobs:
 
           if [ ! -s "$pr_data_file" ]; then
             echo "✅ No active PR runs found"
-            rm -f "$pr_data_file" "$pr_retry_file"
+            rm -f "$pr_data_file"
             exit 0
           fi
 
-          # Get unique PR numbers and calculate retry counts
+          # Get unique PR numbers
           pr_numbers=$(cat "$pr_data_file" | cut -d'|' -f1 | sort -u)
-
-          echo "🔄 Calculating retry counts for each PR..."
-          echo ""
-
-          for pr_num in $pr_numbers; do
-            # Get the head SHA for this PR's active runs
-            head_sha=$(grep "^$pr_num|" "$pr_data_file" | head -1 | cut -d'|' -f10)
-
-            if [ -z "$head_sha" ]; then
-              continue
-            fi
-
-            # Get all workflows for this PR
-            pr_workflows=$(grep "^$pr_num|" "$pr_data_file" | cut -d'|' -f2 | sort -u)
-
-            total_retry_count=0
-
-            for workflow_file in $pr_workflows; do
-              # Get all runs for this workflow + PR + SHA (including completed ones)
-              all_runs=$(gh run list \
-                --repo "$REPO" \
-                --workflow "$workflow_file" \
-                --json databaseId,status,event,headSha,conclusion \
-                --limit 100 \
-                | jq -c --arg sha "$head_sha" '.[] | select(.event=="pull_request") | select(.headSha==$sha)')
-
-              if [ -z "$all_runs" ]; then
-                continue
-              fi
-
-              # Count total runs for this commit (including active ones)
-              run_count=$(echo "$all_runs" | wc -l)
-
-              # A retry count is total runs - 1 (the first attempt)
-              retry_count=$((run_count > 0 ? run_count - 1 : 0))
-
-              total_retry_count=$((total_retry_count + retry_count))
-            done
-
-            # Store retry count for this PR
-            echo "$pr_num|$total_retry_count" >> "$pr_retry_file"
-          done
 
           # Separate high priority and normal PRs
           high_priority_prs=()
@@ -190,7 +150,6 @@ jobs:
           pr_count=0
           total_running=0
           total_queued=0
-          total_retries=0
 
           for pr_num in "${sorted_pr_numbers[@]}"; do
             pr_count=$((pr_count + 1))
@@ -211,35 +170,18 @@ jobs:
               pr_labels="(no labels)"
             fi
 
-            # Get retry count for this PR
-            retry_count=$(grep "^$pr_num|" "$pr_retry_file" | cut -d'|' -f2)
-            if [ -z "$retry_count" ]; then
-              retry_count=0
-            fi
-            total_retries=$((total_retries + retry_count))
-
             # Add priority indicator
             priority_indicator=""
             if echo "$pr_labels" | grep -q "high priority"; then
               priority_indicator="🔴 [HIGH PRIORITY] "
             fi
 
-            # Add retry warning if count is high
-            retry_indicator=""
-            if [ "$retry_count" -gt 0 ]; then
-              retry_indicator=" 🔄 [$retry_count retries]"
-            fi
-
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "🔗 ${priority_indicator}PR #$pr_num: $pr_title${retry_indicator}"
+            echo "🔗 ${priority_indicator}PR #$pr_num: $pr_title"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo "👤 Author: $pr_author"
             echo "🏷️  Labels: $pr_labels"
             echo "🔗 URL: $pr_url"
-
-            if [ "$retry_count" -gt 0 ]; then
-              echo "🔄 Retries: $retry_count (for current commit)"
-            fi
             echo ""
 
             # Get all runs for this PR
@@ -257,13 +199,23 @@ jobs:
               runners=$(echo "$line" | cut -d'|' -f7)
               queue_min=$(echo "$line" | cut -d'|' -f8)
               created=$(echo "$line" | cut -d'|' -f9)
+              attempt=$(echo "$line" | cut -d'|' -f11)
 
               pr_running_total=$((pr_running_total + running))
               pr_queued_total=$((pr_queued_total + queued))
 
               run_url="https://github.com/$REPO/actions/runs/$run_id"
 
-              echo "  📦 Workflow: $workflow"
+              # Calculate retry count for this specific run
+              retry_count=$((attempt - 1))
+
+              # Show retry indicator
+              retry_indicator=""
+              if [ "$retry_count" -gt 0 ]; then
+                retry_indicator=" 🔄 Retry #$retry_count"
+              fi
+
+              echo "  📦 Workflow: $workflow (Run #$run_id)$retry_indicator"
               echo "     Status: $status"
               echo "     🟢 Running jobs: $running"
               echo "     🟡 Queued jobs: $queued"
@@ -298,8 +250,7 @@ jobs:
           echo "Total PRs with active runs: $pr_count"
           echo "Total running jobs: $total_running"
           echo "Total queued jobs: $total_queued"
-          echo "Total retries across all PRs: $total_retries"
           echo "========================================="
 
           # Cleanup
-          rm -f "$pr_data_file" "$pr_retry_file"
+          rm -f "$pr_data_file"
