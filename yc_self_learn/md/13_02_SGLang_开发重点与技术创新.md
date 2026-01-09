@@ -290,8 +290,8 @@ SGLang 的开发重点可以概括为：
 
 ## 📚 相关资源
 
-- [SGLang 学习指南](./SGLang_学习指南.md)
-- [TTFT 为什么重要](./TTFT_为什么重要.md)
+- [SGLang 学习指南](./13_01_SGLang_学习指南.md)
+- [SGLang Scheduler 技术变迁](./13_03_SGLang_Scheduler_技术变迁.md) - 详细的 Scheduler 演进与实现原理
 - [官方博客](https://lmsys.org/blog/)
 - [开发路线图](https://github.com/sgl-project/sglang/issues/7736)
 

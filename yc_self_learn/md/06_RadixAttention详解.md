@@ -428,7 +428,7 @@ cache_size = cache_stats.size
 ## 📚 相关资源
 
 - [SGLang 博客 - RadixAttention](https://lmsys.org/blog/2024-01-17-sglang/)
-- [SGLang 开发重点与技术创新](./02_SGLang_开发重点与技术创新.md)
+- [SGLang 开发重点与技术创新](./13_02_SGLang_开发重点与技术创新.md)
 - [RadixCache 源码](../python/sglang/srt/mem_cache/radix_cache.py)
 - [RadixAttention 源码](../python/sglang/srt/layers/radix_attention.py)
 

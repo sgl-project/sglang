@@ -232,7 +232,7 @@ sglang:time_to_first_token_seconds
 
 ## 📚 相关学习资源
 
-- [SGLang 学习指南](./SGLang_学习指南.md)
+- [SGLang 学习指南](./13_01_SGLang_学习指南.md)
 - [SGLang Metrics 文档](../docs/references/production_metrics.md)
 - [SGLang 性能优化指南](../docs/developer_guide/benchmark_and_profiling.md)
 
