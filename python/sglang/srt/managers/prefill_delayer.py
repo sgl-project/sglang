@@ -2,7 +2,7 @@ import dataclasses
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -243,7 +243,6 @@ def _record_single_pass_result(
             forward_passes = s.delayed_count
         else:
             wait_seconds = forward_passes = 0
-        TODO_histogram
         metrics_collector.observe_prefill_delayer_outcome(
             forward_passes=forward_passes,
             wait_seconds=wait_seconds,
