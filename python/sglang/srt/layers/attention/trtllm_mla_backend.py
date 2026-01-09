@@ -321,6 +321,24 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Set to True to use the fused kernel instead of separate calls
         self.use_fused_rope_quantize_append = True  # PERF TEST: fused path
 
+        # Pre-allocated buffers for fused kernel (set in _init_fused_static_buffers)
+        self._fused_batch_indices: Optional[torch.Tensor] = None
+        self._fused_kv_indptr: Optional[torch.Tensor] = None
+        self._fused_max_nnz: int = 0
+
+    def _init_fused_static_buffers(self, max_nnz: int, device: torch.device):
+        """Initialize static buffers for fused kernel. Called once when max_nnz grows."""
+        if max_nnz <= self._fused_max_nnz:
+            return  # Already have enough capacity
+
+        # TODO(ljn):  See if nnz really varies for different batches.
+        self._fused_max_nnz = max_nnz
+
+        self._fused_batch_indices = torch.arange(max_nnz, dtype=torch.int32, device=device)
+        self._fused_kv_indptr = torch.arange(max_nnz + 1, dtype=torch.int32, device=device)
+
+        print(f"[FUSED] Allocated static buffers: max_nnz={max_nnz}")
+
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
         Calculate padded block count that satisfies both TRT-LLM and Triton constraints.
@@ -779,85 +797,48 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         Returns:
             merged_q_out: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=FP8
         """
-        attn_dtype = torch.float8_e4m3fn
-        q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
+        nnz = forward_batch.out_cache_loc.shape[0]
 
-        # Allocate output tensor for merged query (nope + rope)
+        # Ensure static buffers are allocated
+        self._init_fused_static_buffers(nnz, forward_batch.out_cache_loc.device)
+
+        # TODO(ljn):  Should this be moved into _init_fused_static_buffers above?
+        # Allocate output tensor with FP8 dtype
         q_out = q_rope.new_empty(
-            q_len,
-            num_heads,
+            nnz,
+            q_rope.shape[1],  # num heads
             self.kv_lora_rank + self.qk_rope_head_dim,
-            dtype=attn_dtype,
+            dtype=torch.float8_e4m3fn,
         )
 
-        # Get the paged KV cache buffer for this layer
+        # Get the paged KV cache buffer for this layer (no allocation, just view)
         kv_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-
-        # Reshape to paged layout: [num_pages, page_size, kv_cache_dim]
-        num_tokens = kv_buffer.shape[0]
-        num_pages = num_tokens // self.page_size
+        num_pages = kv_buffer.shape[0] // self.page_size
         kv_buffer_paged = kv_buffer.squeeze(1).view(
             num_pages, self.page_size, self.kv_cache_dim
         )
 
-        # Get output cache locations
-        out_cache_loc = forward_batch.out_cache_loc
-        nnz = out_cache_loc.shape[0]
-
-        # Prepare kv_indices (page indices for each token)
-        kv_indices_orig = (out_cache_loc // self.page_size).int()
-
-        # OPTIMIZATION: Only copy the pages we need, not the entire cache
-        # Get unique pages that will be modified
-        unique_pages, inverse_indices = kv_indices_orig.unique(return_inverse=True)
-        num_unique_pages = unique_pages.shape[0]
-
-        # Copy only the unique pages (much smaller than full cache)
-        ckv_cache = kv_buffer_paged[unique_pages, :, : self.kv_lora_rank].contiguous()
-        kpe_cache = kv_buffer_paged[unique_pages, :, self.kv_lora_rank :].contiguous()
-
-        # Remap kv_indices to point into the small buffers (0, 1, 2, ... instead of original page numbers)
-        kv_indices = inverse_indices.int()
-
-        # Prepare batch_indices and positions
-        # positions = page positions (position within page) for cache indexing
-        if forward_batch.forward_mode.is_decode_or_idle():
-            batch_indices = torch.arange(nnz, dtype=torch.int32, device=out_cache_loc.device)
-            positions = (out_cache_loc % self.page_size).int()
-            kv_indptr = torch.arange(nnz + 1, dtype=torch.int32, device=out_cache_loc.device)
-        else:
-            extend_seq_lens = forward_batch.extend_seq_lens
-            bs = forward_batch.batch_size
-            batch_indices = torch.repeat_interleave(
-                torch.arange(bs, dtype=torch.int32, device=out_cache_loc.device),
-                extend_seq_lens.int(),
-            )
-            positions = (out_cache_loc % self.page_size).int()
-            kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=out_cache_loc.device)
-            kv_indptr[1:] = torch.cumsum(extend_seq_lens, dim=0).int()
-
-        # Prepare pos_ids - MUST be sliced to nnz, int32, and contiguous
-        # The fused kernel requires pos_ids to exactly match the number of tokens
-        pos_ids_sliced = forward_batch.positions[:nnz].int().contiguous()
+        # Pass full cache buffer - kernel writes directly to correct pages
+        ckv_cache = kv_buffer_paged[:, :, : self.kv_lora_rank]
+        kpe_cache = kv_buffer_paged[:, :, self.kv_lora_rank :]
 
         # Call the fused FlashInfer kernel
         # For MLA mode: v=None, paged_kv_cache=(ckv_cache, kpe_cache)
-        # Returns: (q_rope_out, q_nope_out)
-        q_rope_out, q_nope_out = flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
+        flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
             q_rope=q_rope,
             k_rope=k_rope,
             q_nope=q_nope,
             k_nope=k_nope,
             v=None,  # MLA mode - no separate V tensor
             cos_sin_cache=cos_sin_cache,
-            pos_ids=pos_ids_sliced,
+            pos_ids=forward_batch.positions,
             paged_kv_cache=(ckv_cache, kpe_cache),
-            kv_indices=kv_indices,
-            kv_indptr=kv_indptr,
-            batch_indices=batch_indices,
-            positions=positions,
+            kv_indices=forward_batch.out_cache_loc // self.page_size,
+            kv_indptr=self._fused_kv_indptr[:nnz + 1],
+            batch_indices=self._fused_batch_indices[:nnz],
+            positions=torch.remainder(forward_batch.out_cache_loc, self.page_size),
             is_neox=is_neox,
-            quantize_dtype=attn_dtype,
+            quantize_dtype=torch.float8_e4m3fn,
             quant_scale_q=1.0,
             quant_scale_kv=1.0,
             page_size=self.page_size,
@@ -865,11 +846,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope_out=q_out[..., self.kv_lora_rank :],  # RoPE part at end
             q_nope_out=q_out[..., : self.kv_lora_rank],  # Nope part at beginning
         )
-
-        # Copy modified caches back to original buffer
-        # We already have unique_pages from the optimization above
-        kv_buffer_paged[unique_pages, :, : self.kv_lora_rank] = ckv_cache
-        kv_buffer_paged[unique_pages, :, self.kv_lora_rank :] = kpe_cache
 
         return q_out
 
