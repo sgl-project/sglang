@@ -16,7 +16,7 @@ _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class _DelayInfo:
     delayed_count: int = 0
     start_time: float = field(default_factory=time.perf_counter)
@@ -67,8 +67,19 @@ class PrefillDelayer:
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
     def _negotiate_should_allow_prefill(
-        self, local_prefillable: bool, token_usage: float
+            self, local_prefillable: bool, token_usage: float
     ) -> _NegotiateOutput:
+        self._curr_delay_info, out = self._negotiate_should_allow_prefill_pure(
+            prev_delay_info=self._curr_delay_info,
+            local_prefillable=local_prefillable,
+            token_usage=token_usage,
+        )
+        return out
+
+    # (Almost) pure function to simplify state management
+    def _negotiate_should_allow_prefill_pure(
+        self, local_prefillable: bool, token_usage: float
+    ) -> Tuple[_DelayInfo, _NegotiateOutput]:
         local_token_watermark_force_allow = (
             local_prefillable
             and ((x := self._token_usage_low_watermark) is not None)
