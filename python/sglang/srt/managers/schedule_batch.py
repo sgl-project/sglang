@@ -791,20 +791,11 @@ class Req:
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
-
-        # NOTE: This function is called exactly once after the request is finished.
-        global_server_args = get_global_server_args()
-        topk = global_server_args.speculative_eagle_topk
-
-        enable_kv_committed_len = topk is None or topk == 1
-        if enable_kv_committed_len:
-            assert (
-                not self.kv_committed_freed
-            ), f"Committed KV cache already freed ({self.kv_committed_len=})"
-            self.kv_committed_freed = True
-            return self.kv_committed_len
-        else:
-            return len(self.origin_input_ids) + max(len(self.output_ids) - 1, 0)
+        assert (
+            not self.kv_committed_freed
+        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        self.kv_committed_freed = True
+        return self.kv_committed_len
 
     def pop_overallocated_kv_cache(self) -> Tuple[int, int]:
         """Return the range of over-allocated KV cache and mark them as freed."""

@@ -562,7 +562,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           pip install -e "python/[dev]"
 

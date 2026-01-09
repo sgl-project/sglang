@@ -16,7 +16,7 @@ use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
+        is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
         WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
@@ -629,7 +629,7 @@ impl Router {
             // Attach load guard to response body for proper RAII lifecycle
             // Guard is dropped when response body is consumed or client disconnects
             if let Some(guard) = load_guard {
-                response = guard.attach_to_response(response);
+                response = AttachedBody::wrap_response(response, guard);
             }
             response
         }
