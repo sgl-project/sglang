@@ -57,7 +57,11 @@ class PrefillDelayer:
     def _negotiate_should_allow_prefill(
         self, local_prefillable: bool, token_usage: bool
     ) -> bool:
-        force_allow_prefill = local_prefillable and ((x := self.low_watermark) is not None) and (token_usage < x)
+        force_allow_prefill = (
+            local_prefillable
+            and ((x := self.low_watermark) is not None)
+            and (token_usage < x)
+        )
 
         tp0_info = self._gather_info(
             local_prefillable=local_prefillable,
