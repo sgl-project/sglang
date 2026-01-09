@@ -1016,13 +1016,38 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.a2_scale = None
         layer.marlin_state = GPTQMarlinState.REPACK
 
+        if not hasattr(layer, "_original_shapes"):
+            layer._original_shapes = {}
+
+        # Force record: these are the target GPTQ shapes for rollback.
+        layer._original_shapes["w13_weight_packed"] = tuple(w13_weight.shape)
+        layer._original_shapes["w2_weight_packed"] = tuple(w2_weight.shape)
+
+        # Also record the shapes of the scales.
+        layer._original_shapes["w2_weight_scale"] = tuple(w2_scale.shape)
+        layer._original_shapes["w13_weight_scale"] = tuple(w13_scale.shape)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
+        # Skip if the layer is already converted to Marlin format to prevent double-packing.
+        if getattr(layer, "is_marlin_converted", False):
+            return
+
+        if not hasattr(layer, "_original_shapes"):
+            layer._original_shapes = {}
+
         def replace_tensor(name, new_t):
+            target_attr = getattr(layer, name)
+
+            # Only save if the key doesn't exist to prevent overwriting with Marlin shapes.
+            if name not in layer._original_shapes:
+                # This is a safety check; `create_weights` usually handles this already.
+                layer._original_shapes[name] = tuple(target_attr.shape)
+
             # It is important to use resize_() here since it ensures
             # the same buffer is reused
-            getattr(layer, name).resize_(new_t.shape)
-            getattr(layer, name).copy_(new_t)
+            target_attr.resize_(new_t.shape)
+            target_attr.copy_(new_t)
             del new_t
 
         num_experts = layer.w13_weight_g_idx.shape[0]
@@ -1078,7 +1103,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_weight_packed.shape[2],
             self.num_bits,
         )
-        replace_parameter(layer, "w13_weight_packed", marlin_w13_qweight)
+        replace_tensor("w13_weight_packed", marlin_w13_qweight)
         marlin_w2_qweight = gptq_marlin_moe_repack(
             layer.w2_weight_packed,
             layer.w2_g_idx_sort_indices,
@@ -1086,7 +1111,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_packed.shape[2],
             self.num_bits,
         )
-        replace_parameter(layer, "w2_weight_packed", marlin_w2_qweight)
+        replace_tensor("w2_weight_packed", marlin_w2_qweight)
         # Repack scales
         marlin_w13_scales = marlin_moe_permute_scales(
             layer.w13_weight_scale,
@@ -1094,7 +1119,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_weight_scale.shape[2],
             self.group_size,
         )
-        replace_parameter(layer, "w13_weight_scale", marlin_w13_scales)
+        replace_tensor("w13_weight_scale", marlin_w13_scales)
 
         marlin_w2_scales = marlin_moe_permute_scales(
             layer.w2_weight_scale,
@@ -1103,7 +1128,23 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_scale.shape[2],
             self.group_size,
         )
-        replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
+        replace_tensor("w2_weight_scale", marlin_w2_scales)
+
+        layer.is_marlin_converted = True
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module):
+        """Forcibly resize parameters back to their original shapes (e.g., GPTQ format) before loading weights."""
+
+        if not hasattr(layer, "_original_shapes"):
+            return
+
+        for name, orig_shape in layer._original_shapes.items():
+            param = getattr(layer, name, None)
+
+            if param is not None and param.shape != orig_shape:
+                param.resize_(orig_shape)
+
+        layer.is_marlin_converted = False
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
