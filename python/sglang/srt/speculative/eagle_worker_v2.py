@@ -164,6 +164,16 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
+        # Set eagle_use_aux_hidden_state for EAGLE3 (needed by cuda graph runner)
+        self.eagle_use_aux_hidden_state = False
+        if self.speculative_algorithm.is_eagle3():
+            self.eagle_use_aux_hidden_state = True
+            eagle_config = getattr(
+                self.draft_runner.model_config.hf_config, "eagle_config", {}
+            )
+            self.eagle_use_aux_hidden_state = eagle_config.get(
+                "use_aux_hidden_state", True
+            )
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
@@ -276,7 +286,11 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
         # Capture extend
-        if self.draft_extend_attn_backend and (_is_cuda or _is_npu):
+        # Only enable CUDA graphs for draft_extend when there's NO plan stream overlap.
+        # With plan stream overlap, we want init_forward_metadata to run on Plan Stream
+        # (overlapped with verify tail), not in replay() on Main Stream (blocking).
+        enable_overlap = envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
+        if self.draft_extend_attn_backend and (_is_cuda or _is_npu) and not enable_overlap:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(

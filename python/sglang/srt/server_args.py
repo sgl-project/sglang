@@ -2095,13 +2095,6 @@ class ServerArgs:
                 logger.warning(
                     "Spec v2 is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
                 )
-                if (
-                    self.speculative_eagle_topk is not None
-                    and self.speculative_eagle_topk > 1
-                ):
-                    raise ValueError(
-                        "Spec v2 currently only supports topk = 1 for speculative decoding."
-                    )
             else:
                 self.disable_overlap_schedule = True
                 logger.warning(
