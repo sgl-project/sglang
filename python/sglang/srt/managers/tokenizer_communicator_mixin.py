@@ -327,6 +327,7 @@ class TokenizerCommunicatorMixin:
         merge_profiles: bool = False,
         profile_prefix: Optional[str] = None,
         profile_stages: Optional[List[str]] = None,
+        include_host: bool = True,
     ):
         self.auto_create_handle_loop()
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
@@ -335,6 +336,10 @@ class TokenizerCommunicatorMixin:
             "SGLANG_PROFILE_RECORD_SHAPES", "true"
         )
         record_shapes = (record_shapes is not False) and env_record_shapes
+
+        # Generate a shared profile_id for both scheduler and tokenizer
+        profile_id = str(time.time())
+
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
@@ -344,15 +349,40 @@ class TokenizerCommunicatorMixin:
             with_stack=with_stack,
             record_shapes=record_shapes,
             profile_by_stage=profile_by_stage,
-            profile_id=str(time.time()),
+            profile_id=profile_id,
             merge_profiles=merge_profiles,
             profile_prefix=profile_prefix,
             profile_stages=profile_stages,
         )
+
+        # Start host profiler with the same profile_id and output_dir
+        if include_host and hasattr(self, "start_host_profile"):
+            # Include both CPU and GPU for host since multimodal preprocessing uses GPU
+            host_activities = ["CPU", "GPU"]
+            host_result = self.start_host_profile(
+                output_dir=output_dir,
+                activities=host_activities,
+                with_stack=with_stack,
+                record_shapes=record_shapes,
+                profile_id=profile_id,
+            )
+            if host_result.get("success"):
+                logger.info(
+                    f"Host profiler started with profile_id: {profile_id}, "
+                    f"activities: {host_activities}"
+                )
+
         return await self._execute_profile(req)
 
-    async def stop_profile(self: TokenizerManager):
+    async def stop_profile(self: TokenizerManager, include_host: bool = True):
         self.auto_create_handle_loop()
+
+        # Stop host profiler first
+        if include_host and hasattr(self, "stop_host_profile"):
+            host_result = self.stop_host_profile()
+            if host_result.get("success"):
+                logger.info("Host profiler stopped")
+
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 
