@@ -94,7 +94,7 @@ def apply_flashinfer_rope_qk_inplace(
         return q_rot.view(bsz, seqlen, nheads, d), k_rot.view(bsz, seqlen, nheads, d)
 
     if positions is None:
-        pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)
+        pos_1d = torch.arange(seqlen, device=q.device, dtype=torch.long)
         positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
     else:
         if not (
@@ -107,8 +107,6 @@ def apply_flashinfer_rope_qk_inplace(
             raise ValueError(
                 f"positions length must be bsz*seqlen={bsz*seqlen}, got {positions.numel()}"
             )
-
-    positions = positions.to(q.device, non_blocking=True)
 
     q_flat = q.reshape(bsz * seqlen, nheads * d).contiguous()
     k_flat = k.reshape(bsz * seqlen, nheads * d).contiguous()
