@@ -2,7 +2,7 @@ import dataclasses
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional, Tuple, NamedTuple, Literal
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -69,7 +69,7 @@ class PrefillDelayer:
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
     def _negotiate_should_allow_prefill(
-            self, local_prefillable: bool, token_usage: float
+        self, local_prefillable: bool, token_usage: float
     ) -> _NegotiateOutput:
         self._curr_state, out = self._negotiate_should_allow_prefill_pure(
             prev_state=self._curr_state,
@@ -100,8 +100,12 @@ class PrefillDelayer:
 
         # Compute derived global states
         num_prefillable = global_prefillable.sum().item()
-        num_token_watermark_force_allow = global_token_watermark_force_allow.sum().item()
-        global_exists_token_watermark_force_allow = global_token_watermark_force_allow.max().item() > 0
+        num_token_watermark_force_allow = (
+            global_token_watermark_force_allow.sum().item()
+        )
+        global_exists_token_watermark_force_allow = (
+            global_token_watermark_force_allow.max().item() > 0
+        )
         global_exists_not_prefillable = global_prefillable.min().item() == 0
         global_all_prefillable = global_prefillable.min().item() > 0
         global_exists_prefillable = global_prefillable.max().item() > 0
@@ -133,7 +137,9 @@ class PrefillDelayer:
                 delayed_count=next_state.delayed_count + 1,
             )
 
-        if global_mixed_prefillable and (next_state.delayed_count < self._max_delay_passes):
+        if global_mixed_prefillable and (
+            next_state.delayed_count < self._max_delay_passes
+        ):
             return _NegotiateOutput(
                 allow_prefill=False,
                 outcome="forbid",
@@ -156,7 +162,9 @@ class PrefillDelayer:
         )
         return _NegotiateOutput(allow_prefill=True)
 
-    def _gather_info(self, local_prefillable: bool, local_token_watermark_force_allow: bool):
+    def _gather_info(
+        self, local_prefillable: bool, local_token_watermark_force_allow: bool
+    ):
         local_info = torch.tensor(
             [int(local_prefillable), int(local_token_watermark_force_allow)],
             device="cpu",
@@ -197,7 +205,9 @@ class PrefillDelayerSinglePassExecutor:
 
 
 def _record_outcome(
-    debug_outcome: str, debug_num_prefillable: int, debug_num_token_watermark_force_allow: int
+    debug_outcome: str,
+    debug_num_prefillable: int,
+    debug_num_token_watermark_force_allow: int,
 ) -> None:
     if _DEBUG_LOG:
         if debug_outcome == "wait_timeout":
@@ -228,4 +238,3 @@ def _record_outcome(
             wait_seconds=wait_seconds,
             outcome=debug_outcome,
         )
-
