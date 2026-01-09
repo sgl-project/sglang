@@ -2,7 +2,7 @@ import dataclasses
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional, Tuple, NamedTuple
+from typing import TYPE_CHECKING, Optional, Tuple, NamedTuple, Literal
 
 import torch
 
@@ -23,8 +23,12 @@ class _State:
     start_time: float = field(default_factory=time.perf_counter)
 
 
+_Outcome = Literal["forbid_prefill"]
+
+
 class _NegotiateOutput(NamedTuple):
     allow_prefill: bool
+    outcome: _Outcome
 
 
 class PrefillDelayer:
@@ -123,7 +127,10 @@ class PrefillDelayer:
             )
 
         if global_mixed_prefillable and (next_state.delayed_count < self._max_delay_passes):
-            return _NegotiateOutput(allow_prefill=False)
+            return _NegotiateOutput(
+                allow_prefill=False,
+                outcome="forbid_prefill",
+            )
 
         is_timeout = global_mixed_prefillable
         exist_previous_wait = prev_state is not None
