@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.dflash_info import DFlashDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -68,9 +69,20 @@ class FutureMap:
             # This is to make the shape derivation easier.
             self.buf_initialized = False
 
-    def _lazy_init_buf(self, draft_input: EagleDraftInput):
+    def _is_dflash_input(self, draft_input) -> bool:
+        """Check if the draft input is DFlash type."""
+        return hasattr(draft_input, 'block_size') and not hasattr(draft_input, 'topk_p')
+
+    def _lazy_init_buf(self, draft_input: Union["EagleDraftInput", "DFlashDraftInput"]):
         self.buf_initialized = True
 
+        if self._is_dflash_input(draft_input):
+            self._lazy_init_buf_dflash(draft_input)
+        else:
+            self._lazy_init_buf_eagle(draft_input)
+
+    def _lazy_init_buf_eagle(self, draft_input: "EagleDraftInput"):
+        """Initialize buffers for EAGLE-style draft input."""
         # Get a reference for each tensor
         topk_p0 = draft_input.topk_p[0]
         topk_index0 = draft_input.topk_index[0]
@@ -106,6 +118,21 @@ class FutureMap:
                 device=self.device,
             )
 
+    def _lazy_init_buf_dflash(self, draft_input: "DFlashDraftInput"):
+        """Initialize buffers for DFlash-style draft input."""
+        # DFlash only needs verified_id in FutureMap
+        # Hidden states are managed in worker's per-request state (different shape than EAGLE)
+        verified_id0 = draft_input.verified_id[0]
+        
+        self.verified_id_buf = torch.empty(
+            (self.future_buffer_len, *verified_id0.shape) if verified_id0.dim() > 0 else (self.future_buffer_len,),
+            dtype=verified_id0.dtype,
+            device=self.device,
+        )
+        
+        # Don't allocate hidden_states_buf for DFlash - it has per-token shape, not per-batch
+        self.hidden_states_buf = None
+
     def alloc_future_indices(self, bs: int) -> FutureIndices:
         """Update the circular buffer pointer and allocate future indices."""
         cur_future_ct = self.future_ct
@@ -119,18 +146,24 @@ class FutureMap:
         if self.spec_algo.is_none():
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
         else:
-            # TODO(lsyin): write future indices into spec_info.future_indices
-            draft_input: EagleDraftInput = model_worker_batch.spec_info
+            draft_input = model_worker_batch.spec_info
             if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             indices = draft_input.future_indices.indices
-            draft_input.topk_p = self.topk_p_buf[indices]
-            draft_input.topk_index = self.topk_index_buf[indices]
-            draft_input.verified_id = self.verified_id_buf[indices]
-            draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
-            if spec_need_hidden_states():
-                draft_input.hidden_states = self.hidden_states_buf[indices]
+            
+            if self._is_dflash_input(draft_input):
+                # DFlash only needs verified_id from FutureMap
+                # Hidden states are managed in worker's per-request state
+                draft_input.verified_id = self.verified_id_buf[indices]
+            else:
+                # EAGLE-style resolution
+                draft_input.topk_p = self.topk_p_buf[indices]
+                draft_input.topk_index = self.topk_index_buf[indices]
+                draft_input.verified_id = self.verified_id_buf[indices]
+                draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
+                if spec_need_hidden_states():
+                    draft_input.hidden_states = self.hidden_states_buf[indices]
 
     def is_empty_slice(self, s: slice) -> bool:
         start, stop, step = s.indices(self.future_buffer_len)
@@ -150,7 +183,7 @@ class FutureMap:
             self.store_to_map_for_new_batch(future_indices, draft_input)
 
     def store_to_map_for_new_batch(
-        self, future_indices: FutureIndices, draft_input: EagleDraftInput
+        self, future_indices: FutureIndices, draft_input: Union["EagleDraftInput", "DFlashDraftInput"]
     ):
         intv = future_indices.interval
         if self.is_empty_slice(intv):
@@ -160,9 +193,15 @@ class FutureMap:
         if not self.buf_initialized:
             self._lazy_init_buf(draft_input)
 
-        self.topk_p_buf[intv] = draft_input.topk_p
-        self.topk_index_buf[intv] = draft_input.topk_index
-        self.verified_id_buf[intv] = draft_input.verified_id
-        self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
-        if spec_need_hidden_states():
-            self.hidden_states_buf[intv] = draft_input.hidden_states
+        if self._is_dflash_input(draft_input):
+            # DFlash only stores verified_id in FutureMap
+            # Hidden states are managed in worker's per-request state (different shape than EAGLE)
+            self.verified_id_buf[intv] = draft_input.verified_id
+        else:
+            # EAGLE-style storage
+            self.topk_p_buf[intv] = draft_input.topk_p
+            self.topk_index_buf[intv] = draft_input.topk_index
+            self.verified_id_buf[intv] = draft_input.verified_id
+            self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
+            if spec_need_hidden_states():
+                self.hidden_states_buf[intv] = draft_input.hidden_states

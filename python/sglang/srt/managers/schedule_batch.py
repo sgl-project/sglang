@@ -628,6 +628,8 @@ class Req:
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        # DFlash hidden state indices for speculative decoding prefix sharing
+        self.hidden_indices: Optional[torch.Tensor] = None
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -882,6 +884,8 @@ class Req:
                 match_result.host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            # Store hidden indices for DFlash speculative decoding
+            self.hidden_indices = match_result.hidden_indices
             self.cache_protected_len = len(self.prefix_indices)
 
         if (

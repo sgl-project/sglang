@@ -19,6 +19,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    DFLASH = auto()
     NONE = auto()
 
     @classmethod
@@ -46,8 +47,11 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_dflash(self) -> bool:
+        return self == SpeculativeAlgorithm.DFLASH
+
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_dflash()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -101,6 +105,15 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+        elif self.is_dflash():
+            if enable_overlap:
+                from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+                return DFlashWorkerV2
+
+            from sglang.srt.speculative.dflash_worker import DFlashWorker
+
+            return DFlashWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 
@@ -111,6 +124,8 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    DFLASH_DRAFT = auto()
+    DFLASH_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -126,6 +141,7 @@ class SpecInput(ABC):
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.NGRAM_VERIFY,
+            SpecInputType.DFLASH_VERIFY,
         }
 
     @abstractmethod

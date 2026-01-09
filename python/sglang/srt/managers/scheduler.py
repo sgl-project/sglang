@@ -594,6 +594,8 @@ class Scheduler(
         )
 
         # Create cache
+        # Note: DFlash hidden states are stored in the unified KV pool (MHATokenToKVPool)
+        # using the same indices as KV cache.
         params = CacheInitParams(
             disable=server_args.disable_radix_cache,
             req_to_token_pool=self.req_to_token_pool,
@@ -668,6 +670,20 @@ class Scheduler(
                 )
             else:
                 self.tree_cache = RadixCache(params)
+
+        # Wire up DFlash radix cache integration for hidden state prefix sharing
+        if (
+            self.spec_algorithm.is_dflash() 
+            and self.draft_worker is not None
+            and hasattr(self.draft_worker, 'set_radix_cache')
+        ):
+            # Pass the token_to_kv_pool so hidden states can be stored at the same indices as KV cache
+            token_to_kv_pool = self.tp_worker.model_runner.token_to_kv_pool
+            self.draft_worker.set_radix_cache(self.tree_cache, token_to_kv_pool)
+            
+            # Initialize CUDA graphs for draft model
+            if hasattr(self.draft_worker, 'init_cuda_graphs'):
+                self.draft_worker.init_cuda_graphs()
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -831,7 +847,8 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+        if self.draft_worker is None or self.spec_algorithm.is_ngram() or self.spec_algorithm.is_dflash():
+            # NGRAM and DFlash don't use TpModelWorker for draft, so no draft KV pool
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:

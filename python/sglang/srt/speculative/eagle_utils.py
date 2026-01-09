@@ -196,4 +196,6 @@ def verify_tree_greedy_func(
             retrive_next_sibling=retrive_next_sibling,
             target_predict=target_predict,
         )
+    else:
+        pass
     return predicts, accept_index, accept_token_num
