@@ -132,11 +132,10 @@ class PrefillDelayer:
 class PrefillDelayerSinglePassExecutor:
     def __init__(self, prefill_delayer: PrefillDelayer, token_usage: float):
         self._prefill_delayer = prefill_delayer
-        self._token_usage = token_usage
-        if prefill_delayer.low_watermark is not None:
-            self._force_allow_prefill = token_usage < prefill_delayer.low_watermark
-        else:
-            self._force_allow_prefill = False
+        self._force_allow_prefill = (
+            (prefill_delayer.low_watermark is not None)
+            and (token_usage < prefill_delayer.low_watermark)
+        )
         self._result: Optional[bool] = None
 
     @property
