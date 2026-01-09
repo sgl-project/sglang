@@ -203,6 +203,19 @@ _NEGOTIATE_TEST_CASES = [
         expected_allow=True,
         expected_reason="wait_timeout",
     ),
+    NegotiateTestCase(
+        name="mixed_watermark_one_rank_low_usage",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, False, False],
+                token_usage=[0.9, 0.5, 0.9, 0.9],
+            )
+        ],
+        expected_allow=True,
+        expected_reason="token_watermark",
+    ),
 ]
 
 
