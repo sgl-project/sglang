@@ -26,8 +26,8 @@ class _State:
 class _NegotiateOutput(NamedTuple):
     allow_prefill: bool
     outcome: str
-    debug_num_prefillable: int
-    debug_num_token_watermark_force_allow: int
+    num_prefillable: int
+    num_token_watermark_force_allow: int
 
 
 class PrefillDelayer:
@@ -107,8 +107,8 @@ class PrefillDelayer:
             global_token_watermark_force_allow.max().item() > 0
         )
         debug_info = dict(
-            debug_num_prefillable=global_prefillable.sum().item(),
-            debug_num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
+            num_prefillable=global_prefillable.sum().item(),
+            num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
         )
 
         # Compute outputs
@@ -187,6 +187,9 @@ class PrefillDelayerSinglePassExecutor:
         if not self._called:
             self.negotiate_should_allow_prefill(local_prefillable=False)
 
+        _record_outcome(
+            outcome=self._result.outcome,
+        )
         TODO_report_metrics
 
     def negotiate_should_allow_prefill(self, local_prefillable: bool) -> bool:
@@ -199,24 +202,24 @@ class PrefillDelayerSinglePassExecutor:
 
 
 def _record_outcome(
-    debug_outcome: str,
-    debug_num_prefillable: int,
-    debug_num_token_watermark_force_allow: int,
+    outcome: str,
+    num_prefillable: int,
+    num_token_watermark_force_allow: int,
 ) -> None:
     if _DEBUG_LOG:
-        if debug_outcome == "wait_timeout":
+        if outcome == "wait_timeout":
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill "
-                f"(num_prefillable={debug_num_prefillable})"
+                f"(num_prefillable={num_prefillable})"
             )
-        elif debug_outcome == "token_watermark_force_allow":
+        elif outcome == "token_watermark_force_allow":
             logger.info(
                 f"PrefillDelayer force allow prefill due to low watermark. "
-                f"(num_prefillable={debug_num_prefillable}, "
-                f"num_token_watermark_force_allow={debug_num_token_watermark_force_allow})"
+                f"(num_prefillable={num_prefillable}, "
+                f"num_token_watermark_force_allow={num_token_watermark_force_allow})"
             )
         else:
-            assert debug_outcome in {
+            assert outcome in {
                 "wait_success_all_prefillable",
                 "no_wait_all_prefillable",
             }
@@ -230,5 +233,5 @@ def _record_outcome(
         collector.observe_prefill_delayer_wait(
             forward_passes=forward_passes,
             wait_seconds=wait_seconds,
-            outcome=debug_outcome,
+            outcome=outcome,
         )
