@@ -299,7 +299,6 @@ class LoRAPipeline(ComposedPipelineBase):
         lora_path: str | None,
         rank: int,
         strength: float = 1.0,
-        module_name: str | None = None,
     ) -> int:
         """
         Apply LoRA weights to the given lora_layers.
@@ -310,7 +309,6 @@ class LoRAPipeline(ComposedPipelineBase):
             lora_path: The path to the LoRA adapter.
             rank: The distributed rank (for logging).
             strength: LoRA strength for merge, default 1.0.
-            module_name: The module name (e.g., "transformer", "transformer_2").
 
         Returns:
             The number of layers that had LoRA weights applied.
@@ -513,7 +511,6 @@ class LoRAPipeline(ComposedPipelineBase):
                     lora_path,
                     rank,
                     strength,
-                    module_name,
                 )
                 adapted_count += count
                 self.cur_adapter_name[module_name] = lora_nickname
