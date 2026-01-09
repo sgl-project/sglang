@@ -176,13 +176,11 @@ class PrefillDelayerSinglePassExecutor:
     def _called(self) -> bool:
         return self._result is not None
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def finalize(self, *, actual_prefill: bool):
         if not self._called:
             self.negotiate_should_allow_prefill(local_prefillable=False)
-        return False
+
+        TODO
 
     def negotiate_should_allow_prefill(self, local_prefillable: bool) -> bool:
         if not self._called:
