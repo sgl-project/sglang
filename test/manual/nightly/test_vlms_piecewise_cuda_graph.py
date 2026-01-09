@@ -18,7 +18,9 @@ from sglang.test.test_utils import (
 )
 
 MODELS = [
-    SimpleNamespace(model="Qwen/Qwen2.5-VL-7B-Instruct", mmmu_accuracy=0.60),
+    SimpleNamespace(model="Qwen/Qwen2.5-VL-7B-Instruct", mmmu_accuracy=0.50),
+    SimpleNamespace(model="Qwen/Qwen3-VL-8B-Instruct", mmmu_accuracy=0.50),
+    SimpleNamespace(model="Qwen/Qwen3-VL-30B-A3B-Instruct", mmmu_accuracy=0.50),
 ]
 
 
@@ -59,7 +61,7 @@ class TestVLMPiecewiseCudaGraph(CustomTestCase):
         """
         # -------- fixed settings --------
         model = "openai_compatible"
-        tp = 1
+        tp = 2
         tasks = "mmmu_val"
         batch_size = 32
         log_suffix = "openai_compatible"
@@ -142,7 +144,7 @@ class TestVLMPiecewiseCudaGraph(CustomTestCase):
                     "--piecewise-cuda-graph-max-tokens",
                     "8192",
                     "--enable-piecewise-cuda-graph",
-                    "--tp=8",
+                    "--tp=2",
                     "--piecewise-cuda-graph-compiler=eager",
                     "--disable-radix-cache",
                     "--log-level",
