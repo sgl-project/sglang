@@ -1844,17 +1844,20 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        prefill_delayer_single_pass = (
-            PrefillDelayerSinglePassExecutor(self.prefill_delayer)
-            if self.prefill_delayer
-            else None
-        )
-        result = self._get_new_batch_prefill_raw(
+        prefill_delayer_single_pass = None
+        if self.prefill_delayer:
+            prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
+                self.prefill_delayer
+            )
+
+        ret = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass
         )
-        if prefill_delayer_single_pass is not None:
-            prefill_delayer_single_pass.finalize(actual_prefill=(result is not None))
-        return result
+
+        if self.prefill_delayer:
+            prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
+
+        return ret
 
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
