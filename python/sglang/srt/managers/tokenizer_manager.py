@@ -72,6 +72,7 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
+from sglang.srt.managers.host_profiler_mixin import HostProfilerMixin
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -157,7 +158,7 @@ class ReqState:
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
 
 
-class TokenizerManager(TokenizerCommunicatorMixin):
+class TokenizerManager(TokenizerCommunicatorMixin, HostProfilerMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
     def __init__(
@@ -167,6 +168,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     ):
         # Parse args
         self.server_args = server_args
+
+        # Initialize host profiler
+        self.init_host_profiler()
         self.enable_metrics = server_args.enable_metrics
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
@@ -1499,6 +1503,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
+
+            # Check host profiler auto-stop on finished requests
+            if state.finished:
+                self._check_host_profile_auto_stop()
 
     def convert_logprob_style(
         self,

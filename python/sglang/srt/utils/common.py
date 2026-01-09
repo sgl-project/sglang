@@ -949,6 +949,7 @@ def load_image_tensor(
         # Decode with torchvision
         try:
             img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
+            return img_tensor_byte
             img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
         except Exception:
             # Fallback to PIL

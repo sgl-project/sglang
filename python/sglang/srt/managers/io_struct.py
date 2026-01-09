@@ -1259,6 +1259,9 @@ class ProfileReqInput(BaseReq):
     record_shapes: Optional[bool] = None
     # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
+    # Whether to also profile the host process (CPU operations like tokenization
+    # and multimodal preprocessing). Default is True for complete end-to-end profiling.
+    include_host: bool = True
 
 
 class ProfileReqType(Enum):
@@ -1285,6 +1288,24 @@ class ProfileReq(BaseReq):
 class ProfileReqOutput(BaseReq):
     success: bool
     message: str
+
+
+@dataclass
+class HostProfileReqInput(BaseReq):
+    """Request input for host process profiling."""
+
+    # The output directory for traces
+    output_dir: Optional[str] = None
+    # Activities to profile. Options: ["CPU", "GPU"]
+    # Default is ["CPU", "GPU"] to capture both tokenization (CPU) and
+    # multimodal preprocessing like image encoding (GPU).
+    activities: Optional[List[str]] = None
+    # Whether to record stack traces
+    with_stack: Optional[bool] = None
+    # Whether to record tensor shapes
+    record_shapes: Optional[bool] = None
+    # Number of requests to profile before auto-stopping. None means manual stop.
+    num_requests: Optional[int] = None
 
 
 @dataclass
