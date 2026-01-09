@@ -28,7 +28,6 @@ from sglang.srt.model_loader.ci_weight_validation import (  # noqa: E402
 )
 
 # Limits to avoid spending too much time on validation
-MAX_SNAPSHOTS_TO_VALIDATE = 30  # Max number of snapshots to validate
 MAX_VALIDATION_TIME_SECONDS = 300  # Max 5 minutes total
 
 
@@ -286,7 +285,6 @@ def main():
     print("=" * 70)
     print("CI_OFFLINE: Pre-validating cached HuggingFace models")
     print("=" * 70)
-    print(f"Max snapshots: {MAX_SNAPSHOTS_TO_VALIDATE}")
     print(f"Max time: {MAX_VALIDATION_TIME_SECONDS}s")
     print()
 
@@ -299,12 +297,6 @@ def main():
         return
 
     print(f"Found {len(snapshots)} snapshot(s) in cache")
-
-    # Apply quantity limit
-    if len(snapshots) > MAX_SNAPSHOTS_TO_VALIDATE:
-        print(f"Limiting to {MAX_SNAPSHOTS_TO_VALIDATE} most recently used snapshots")
-        snapshots = snapshots[:MAX_SNAPSHOTS_TO_VALIDATE]
-
     print()
 
     validated_count = 0

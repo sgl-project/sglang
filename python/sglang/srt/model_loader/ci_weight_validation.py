@@ -632,9 +632,7 @@ def _validate_config_and_tokenizer_files(
                     pass
 
     if not tokenizer_found:
-        missing_files.append(
-            "tokenizer file (none of: tokenizer.json, tokenizer.model, tiktoken.model)"
-        )
+        missing_files.append("tokenizer file")
 
     is_valid = len(missing_files) == 0
     return is_valid, missing_files
@@ -839,6 +837,47 @@ def validate_cache_lightweight(
     )
     if not has_tokenizer:
         return False
+
+    # Check for trust_remote_code dynamic module files if needed
+    # When auto_map exists in config.json, the model requires custom Python files
+    # These files must be present for offline mode to work
+    config_path = os.path.join(snapshot_dir, "config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+
+            auto_map = config.get("auto_map", {})
+            if auto_map and isinstance(auto_map, dict):
+                # Extract Python module files from auto_map
+                # auto_map format: {"AutoConfig": "configuration_xxx.ConfigClass", ...}
+                # We need to check if the .py files exist
+                custom_files = set()
+                for key, value in auto_map.items():
+                    if isinstance(value, str) and "." in value:
+                        # Extract module name (e.g., "configuration_xxx" from "configuration_xxx.ConfigClass")
+                        module_name = value.split(".")[0]
+                        custom_files.add(f"{module_name}.py")
+
+                # Check if all custom files exist in snapshot directory
+                for custom_file in custom_files:
+                    custom_file_path = os.path.join(snapshot_dir, custom_file)
+                    if not os.path.exists(custom_file_path):
+                        logger.debug(
+                            "Custom module file not in snapshot: %s for %s",
+                            custom_file,
+                            snapshot_dir,
+                        )
+                        return False
+                    elif not os.path.isfile(custom_file_path):
+                        logger.debug(
+                            "Custom module path exists but not a file: %s",
+                            custom_file_path,
+                        )
+                        return False
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            # If we can't read config.json, it will be caught by earlier validation
+            logger.debug("Failed to check auto_map in config.json: %s", e)
 
     # Check for weight files with index self-consistency
     index_path = os.path.join(snapshot_dir, "model.safetensors.index.json")
