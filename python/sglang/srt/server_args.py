@@ -311,6 +311,9 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    enable_prefill_delayer: bool = False
+    prefill_delayer_max_delay_passes: int = 30
+    prefill_delayer_token_usage_low_watermark: Optional[float] = None
 
     # Runtime options
     device: Optional[str] = None
@@ -665,6 +668,9 @@ class ServerArgs:
         # Handle deprecated arguments.
         self._handle_deprecated_args()
 
+        # Handle deprecated environment variables for prefill delayer.
+        self._handle_prefill_delayer_env_compat()
+
         # Set missing default values.
         self._handle_missing_default_values()
 
@@ -777,6 +783,14 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
+
+    def _handle_prefill_delayer_env_compat(self):
+        if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
+            self.enable_prefill_delayer = True
+        if x := envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get():
+            self.prefill_delayer_max_delay_passes = x
+        if x := envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get():
+            self.prefill_delayer_token_usage_low_watermark = x
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -2883,6 +2897,23 @@ class ServerArgs:
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
             help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
+        )
+        parser.add_argument(
+            "--enable-prefill-delayer",
+            action="store_true",
+            help="Enable prefill delayer for DP attention to reduce idle time.",
+        )
+        parser.add_argument(
+            "--prefill-delayer-max-delay-passes",
+            type=int,
+            default=ServerArgs.prefill_delayer_max_delay_passes,
+            help="Maximum forward passes to delay prefill.",
+        )
+        parser.add_argument(
+            "--prefill-delayer-token-usage-low-watermark",
+            type=float,
+            default=None,
+            help="Token usage low watermark for prefill delayer.",
         )
 
         # Runtime options
