@@ -76,7 +76,7 @@ class PrefillDelayer:
                     f"(num_prefillable={global_prefillable.sum().item()}, "
                     f"num_force_allow={global_force_allow.sum().item()})"
                 )
-            self._record_metrics_and_reset(outcome="token_usage_watermark")
+            self._reset(outcome="token_usage_watermark")
             return True
 
         global_exists_not_prefillable = global_prefillable.min().item() == 0
@@ -98,10 +98,10 @@ class PrefillDelayer:
                 f"PrefillDelayer timeout thus not forbid prefill (num_prefillable={global_prefillable.sum()})"
             )
 
-        self._record_metrics_and_reset(outcome="timeout" if is_timeout else "all_prefillable")
+        self._reset(outcome="timeout" if is_timeout else "all_prefillable")
         return True
 
-    def _record_metrics_and_reset(self, outcome: str) -> None:
+    def _reset(self, outcome: str) -> None:
         self._record_metrics(outcome=outcome)
         self._curr_delay_info = None
 
