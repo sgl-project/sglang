@@ -83,6 +83,32 @@ def _is_qwen3_vl_model(model_path: str) -> bool:
     return "qwen3-vl" in model_lower or "qwen3vl" in model_lower
 
 
+def _detect_rerank_backend(
+    *,
+    request: V1RerankReqInput,
+    chat_template: Optional[str],
+    model_path: str,
+) -> str:
+    """
+    Unify rerank routing decisions used by both `_convert_to_internal_request` and
+    `_handle_non_streaming_request`.
+
+    Returns:
+        "vl_decoder" | "text_decoder" | "cross_encoder"
+    """
+    is_multimodal = request.is_multimodal()
+    is_vl_model = _is_qwen3_vl_model(model_path)
+    is_vl_template = _is_qwen3_vl_reranker_template(chat_template)
+    is_text_template = _is_qwen3_reranker_template(chat_template)
+
+    # Prefer VL when template/model indicates VL, or request is multimodal with reranker template.
+    if is_vl_template or is_vl_model or (is_multimodal and is_text_template):
+        return "vl_decoder"
+    if is_text_template:
+        return "text_decoder"
+    return "cross_encoder"
+
+
 def _qwen3_rerank_score(p_yes: float, p_no: float) -> float:
     denom = p_yes + p_no
     if denom <= 0.0:
@@ -187,7 +213,7 @@ class OpenAIServingRerank(OpenAIServingBase):
             tokenizer_manager.tokenizer
         )
         logger.info(
-            f"Qwen3 reranker token IDs: yes={self._yes_token_id}, no={self._no_token_id}"
+            f"Reranker yes/no token IDs: yes={self._yes_token_id}, no={self._no_token_id}"
         )
 
     # NOTE: /v1/rerank is not an official OpenAI endpoint. This module may be moved
@@ -231,40 +257,17 @@ class OpenAIServingRerank(OpenAIServingBase):
         """
         chat_template = self.tokenizer_manager.tokenizer.chat_template
         model_path = getattr(self.tokenizer_manager.model_config, "model_path", "")
-
-        # Check if this is a multimodal request
-        is_multimodal = request.is_multimodal()
-
-        # Check if this is a Qwen3-VL model
-        is_vl_model = _is_qwen3_vl_model(model_path)
-
-        # Check if using VL reranker template
-        is_vl_template = isinstance(
-            chat_template, str
-        ) and _is_qwen3_vl_reranker_template(chat_template)
-
-        # For VL template/model or multimodal requests with reranker template, keep as is
-        if (
-            is_vl_template
-            or is_vl_model
-            or (
-                is_multimodal
-                and isinstance(chat_template, str)
-                and _is_qwen3_reranker_template(chat_template)
-            )
-        ):
-            return request, request
-
-        # Only treat as Qwen3 text-only reranker when the chat template matches
-        # and it's not a VL template (VL templates are handled above).
-        if isinstance(chat_template, str) and _is_qwen3_reranker_template(
-            chat_template
-        ):
+        backend = _detect_rerank_backend(
+            request=request,
+            chat_template=chat_template if isinstance(chat_template, str) else None,
+            model_path=model_path,
+        )
+        if backend in ("vl_decoder", "text_decoder"):
             return request, request
 
         # Cross-encoder rerank: Create pairs of [query, document] for each document.
         # Note: Cross-encoder only supports text-only content
-        if is_multimodal:
+        if request.is_multimodal():
             # Extract text for cross-encoder (multimodal not supported)
             query_text = _extract_text_from_content(request.query)
             doc_texts = [_extract_text_from_content(doc) for doc in request.documents]
@@ -284,71 +287,14 @@ class OpenAIServingRerank(OpenAIServingBase):
         """Handle the rerank request"""
         chat_template = getattr(self.tokenizer_manager.tokenizer, "chat_template", None)
         model_path = getattr(self.tokenizer_manager.model_config, "model_path", "")
-
-        # Check if this is a multimodal request
-        is_multimodal = request.is_multimodal()
-
-        # Check if this is a Qwen3-VL model (for multimodal reranking)
-        is_vl_model = _is_qwen3_vl_model(model_path)
-
-        # Check if using VL reranker template (expects query/document format, not messages)
-        is_vl_template = isinstance(
-            chat_template, str
-        ) and _is_qwen3_vl_reranker_template(chat_template)
-
-        # Qwen3-VL reranker path (decoder-only scoring with query/document template format)
-        # Trigger if: VL template OR VL model OR (multimodal request with reranker template)
-        if (
-            is_vl_template
-            or is_vl_model
-            or (
-                is_multimodal
-                and isinstance(chat_template, str)
-                and _is_qwen3_reranker_template(chat_template)
-            )
-        ):
-            return await self._handle_vl_reranker_request(
-                request, raw_request, chat_template or ""
-            )
-
-        # Qwen3 text-only reranker path (decoder-only scoring).
-        if isinstance(chat_template, str) and _is_qwen3_reranker_template(
-            chat_template
-        ):
-            # Qwen3 reranker relies on decoder-only logprobs. If the server is launched
-            # with --is-embedding, model_config.is_generation is typically False and
-            # logprob scoring is not supported.
-            if not self.tokenizer_manager.model_config.is_generation:
-                return self.create_error_response(
-                    "Detected Qwen3 reranker chat template, but the server is not in generation mode. "
-                    "Please relaunch without --is-embedding for Qwen3-Reranker models."
-                )
-            try:
-                prompts = [
-                    _render_jinja_chat_template(
-                        chat_template,
-                        query=request.query,
-                        document=doc,
-                        instruct=getattr(request, "instruct", None),
-                    )
-                    for doc in request.documents
-                ]
-
-                probs = await self.tokenizer_manager.score_prompts(
-                    prompts,
-                    label_token_ids=[self._yes_token_id, self._no_token_id],
-                    apply_softmax=False,
-                    request=raw_request,
-                )
-                scores = [_qwen3_rerank_score(p[0], p[1]) for p in probs]
-            except ValueError as e:
-                return self.create_error_response(str(e))
-            except Exception as e:
-                # Includes template rendering errors from jinja2.
-                return self.create_error_response(str(e))
-
-            responses = self._build_rerank_response(scores, request)
-            return responses
+        rerank_ret = await self._handle_rerank_paths(
+            request=request,
+            raw_request=raw_request,
+            chat_template=chat_template,
+            model_path=model_path,
+        )
+        if rerank_ret is not None:
+            return rerank_ret
 
         # Default cross-encoder rerank path (existing behavior).
         try:
@@ -370,6 +316,85 @@ class OpenAIServingRerank(OpenAIServingBase):
         responses = self._build_rerank_response(ret, request)
         return responses
 
+    async def _handle_rerank_paths(
+        self,
+        *,
+        request: V1RerankReqInput,
+        raw_request: Request,
+        chat_template: Optional[str],
+        model_path: str,
+    ) -> Optional[Union[List[RerankResponse], ErrorResponse, ORJSONResponse]]:
+        """
+        Handle decoder-only rerank paths (VL/text) and return a response if matched.
+
+        Returns None if the request should fall back to cross-encoder rerank.
+        """
+        backend = _detect_rerank_backend(
+            request=request,
+            chat_template=chat_template,
+            model_path=model_path,
+        )
+
+        # Qwen3-VL reranker path (decoder-only scoring with query/document template format)
+        if backend == "vl_decoder":
+            return await self._handle_vl_reranker_request(
+                request, raw_request, chat_template or ""
+            )
+
+        # Qwen3 text-only reranker path (decoder-only scoring).
+        if backend == "text_decoder":
+            return await self._handle_text_reranker_request(
+                request=request,
+                raw_request=raw_request,
+                chat_template=chat_template or "",
+            )
+
+        return None
+
+    async def _handle_text_reranker_request(
+        self,
+        *,
+        request: V1RerankReqInput,
+        raw_request: Request,
+        chat_template: str,
+    ) -> Union[List[RerankResponse], ErrorResponse]:
+        """Handle text-only decoder reranker request via score_prompts()."""
+        # Qwen3 reranker relies on decoder-only logprobs. If the server is launched
+        # with --is-embedding, model_config.is_generation is typically False and
+        # logprob scoring is not supported.
+        if not self.tokenizer_manager.model_config.is_generation:
+            return self.create_error_response(
+                "Detected Qwen3 reranker chat template, but the server is not in generation mode. "
+                "Please relaunch without --is-embedding for Qwen3-Reranker models."
+            )
+
+        try:
+            prompts = [
+                _render_jinja_chat_template(
+                    chat_template,
+                    query=request.query,
+                    document=doc,
+                    instruct=getattr(request, "instruct", None),
+                )
+                for doc in request.documents
+            ]
+
+            probs = await self.tokenizer_manager.score_prompts(
+                prompts,
+                label_token_ids=[self._yes_token_id, self._no_token_id],
+                apply_softmax=False,
+                request=raw_request,
+            )
+            scores = [_qwen3_rerank_score(p[0], p[1]) for p in probs]
+        except ValueError as e:
+            return self.create_error_response(str(e))
+        except Exception as e:
+            # Includes template rendering errors from jinja2.
+            return self.create_error_response(str(e))
+
+        responses = self._build_rerank_response(scores, request)
+        return responses
+
     async def _handle_vl_reranker_request(
         self,
         request: V1RerankReqInput,
@@ -386,7 +411,6 @@ class OpenAIServingRerank(OpenAIServingBase):
         try:
             scores = []
             instruct = getattr(request, "instruct", None)
-
             for doc in request.documents:
                 # Build multimodal content lists and render prompt using jinja template
                 query_content, doc_content, image_data, video_data = (
@@ -518,22 +542,6 @@ class OpenAIServingRerank(OpenAIServingBase):
         # Use output_top_logprobs[0] - the model's prediction for the first generated token
         top_logprobs = output_top_logprobs[0] if output_top_logprobs else []
 
-        # -- DEBUG -- Log top tokens and target token IDs
-        if isinstance(top_logprobs, list) and top_logprobs:
-            # Decode token IDs to see what model is actually outputting
-            try:
-                tokenizer = self.tokenizer_manager.tokenizer
-                decoded_tokens = []
-                for item in top_logprobs[:10]:
-                    if isinstance(item, (list, tuple)) and len(item) >= 2:
-                        logprob, token_id = item[0], item[1]
-                        token_str = tokenizer.decode([token_id])
-                        decoded_tokens.append(f"({token_id}='{token_str}', {logprob:.3f})")
-                logger.info(f"[DEBUG] Top 10 tokens decoded: {decoded_tokens}")
-            except Exception:
-                logger.info(f"[DEBUG] Top 5 logprobs: {top_logprobs[:5]}")
-        # -- DEBUG --
-
         # Find yes and no token probabilities
         # Format: list of tuples (logprob, token_id, token_text)
         p_yes = 0.0
@@ -546,7 +554,6 @@ class OpenAIServingRerank(OpenAIServingBase):
             elif token_id == self._no_token_id:
                 p_no = math.exp(logprob)
 
-        logger.info(f"[DEBUG] p_yes={p_yes}, p_no={p_no}, score={_qwen3_rerank_score(p_yes, p_no)}")
         return _qwen3_rerank_score(p_yes, p_no)
 
     def _build_rerank_response(

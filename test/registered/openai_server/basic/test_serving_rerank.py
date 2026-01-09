@@ -271,13 +271,13 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
                 self.call_count += 1
 
                 # Qwen3 token IDs: YES=9693, NO=2152
-                logprobs = {
-                    "9693": yes_logprob,
-                    "2152": no_logprob,
-                }
+                top_logprobs = [
+                    (yes_logprob, 9693, "yes"),
+                    (no_logprob, 2152, "no"),
+                ]
 
-                # The code checks input_top_logprobs[-1] or output_top_logprobs[0]
-                meta_info = {"output_top_logprobs": [logprobs]}
+                # The rerank handler checks output_top_logprobs[0] for the first generated token
+                meta_info = {"output_top_logprobs": [top_logprobs]}
 
                 yield {"meta_info": meta_info, "embedding": None}
 
