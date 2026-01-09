@@ -371,7 +371,8 @@ def _assert_throughput_improvement(
 
 class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
     def test_1_with_low_watermark(self):
-        self._run(token_usage_low_watermark=0.8)
+        # The kv cache size here is deliberately small, thus we use smaller token usage
+        self._run(token_usage_low_watermark=0.5)
 
     def test_2_without_low_watermark(self):
         self._run(token_usage_low_watermark=None)
