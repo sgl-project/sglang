@@ -24,6 +24,7 @@ class _State:
 
 
 class _NegotiateOutput(NamedTuple):
+    next_state: Optional[_State]
     allow_prefill: bool
     prefillable_status: str
     reason: str
@@ -74,11 +75,12 @@ class PrefillDelayer:
     def _negotiate_should_allow_prefill(
         self, local_prefillable: bool, token_usage: float
     ) -> _NegotiateOutput:
-        self._curr_state, out = self._negotiate_should_allow_prefill_pure(
+        out = self._negotiate_should_allow_prefill_pure(
             prev_state=self._curr_state,
             local_prefillable=local_prefillable,
             token_usage=token_usage,
         )
+        self._curr_state = out.next_state
         return out
 
     # (Almost) pure function, do not modify self state
@@ -87,7 +89,7 @@ class PrefillDelayer:
         prev_state: Optional[_State],
         local_prefillable: bool,
         token_usage: float,
-    ) -> Tuple[Optional[_State], _NegotiateOutput]:
+    ) -> _NegotiateOutput:
         # Compute local states
         local_token_watermark_force_allow = (
             local_prefillable
@@ -120,13 +122,15 @@ class PrefillDelayer:
         # Compute outputs
         if prefillable_status == "all":
             exist_previous_wait = prev_state is not None
-            return None, _NegotiateOutput(
+            return _NegotiateOutput(
+                next_state=None,
                 allow_prefill=True,
                 reason="wait_success" if exist_previous_wait else "no_wait",
                 **debug_info,
             )
         elif prefillable_status == "none":
-            return None, _NegotiateOutput(
+            return _NegotiateOutput(
+                next_state=None,
                 # It does not matter whether we allow or not, thus we allow for simplicity
                 allow_prefill=True,
                 reason="allow",
@@ -134,7 +138,8 @@ class PrefillDelayer:
             )
         elif prefillable_status == "mixed":
             if global_exists_token_watermark_force_allow:
-                return None, _NegotiateOutput(
+                return _NegotiateOutput(
+                    next_state=None,
                     allow_prefill=True,
                     reason="token_watermark",
                     **debug_info,
@@ -146,13 +151,15 @@ class PrefillDelayer:
                     prev_state,
                     delayed_count=prev_state.delayed_count + 1,
                 )
-                return next_state, _NegotiateOutput(
+                return _NegotiateOutput(
+                    next_state=next_state,
                     allow_prefill=False,
                     reason="delay",
                     **debug_info,
                 )
             else:
-                return None, _NegotiateOutput(
+                return _NegotiateOutput(
+                    next_state=None,
                     allow_prefill=True,
                     reason="wait_timeout",
                     **debug_info,
