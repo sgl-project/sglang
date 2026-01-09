@@ -51,13 +51,13 @@ class AttentionBackendEnum(enum.Enum):
     )
 
     SAGE_ATTN = AttentionBackendSpec(
-        fallback="fa",
+        fallback="torch_sdpa",
         import_path="sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend",
         log_msg="Using SAGE Attention backend.",
         fallback_msg=(
             "Sage Attention backend is not installed (To install it, run "
             "`pip install sageattention==2.2.0 --no-build-isolation`). "
-            "Falling back to Flash Attention."
+            "Falling back to Torch SDPA."
         ),
         imports=[
             ("sageattention", "sageattn"),
@@ -129,6 +129,35 @@ class AttentionBackendEnum(enum.Enum):
 
     def __str__(self):
         return self.name.lower()
+
+    @property
+    def import_path(self) -> str:
+        return self.value.import_path
+
+    @property
+    def imports(self) -> tuple[tuple[str, str], ...]:
+        return self.value.imports
+
+    @property
+    def log_msg(self) -> str:
+        return self.value.log_msg
+
+    @property
+    def fallback_msg(self) -> str:
+        return self.value.fallback_msg
+
+    @property
+    def fallback(self) -> AttentionBackendEnum | None:
+        name = self.value.fallback_name
+        return None if name is None else AttentionBackendEnum[name]
+
+    @property
+    def error_prefix(self) -> str:
+        return self.value.error_prefix
+
+    @property
+    def error_msg(self) -> str:
+        return self.value.error_msg
 
 
 class PlatformEnum(enum.Enum):
