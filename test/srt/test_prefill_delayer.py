@@ -67,6 +67,7 @@ class TestPrefillDelayerThroughputOfflineGen(CustomTestCase):
                 "--max-total-tokens",
                 "200000",
             ],
+            token_usage_low_watermark=0.8,
         )
 
 
@@ -75,6 +76,7 @@ def _run_throughput_test(
     prefill_delayer: bool,
     other_launch_args,
     other_benchmark_args,
+    token_usage_low_watermark: float = None,
 ):
     model = "Qwen/Qwen3-0.6B"
     base_url = DEFAULT_URL_FOR_TEST
@@ -84,6 +86,7 @@ def _run_throughput_test(
         model=model,
         base_url=base_url,
         other_args=other_launch_args,
+        token_usage_low_watermark=token_usage_low_watermark,
     )
 
     try:
