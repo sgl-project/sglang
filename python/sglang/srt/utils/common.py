@@ -2582,6 +2582,14 @@ def has_hf_quant_config(model_path: str) -> bool:
         return False
 
 
+def get_quantization_config(hf_config) -> Optional[str]:
+    """Extract quantization method from HuggingFace config."""
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if quantization_config is not None:
+        return quantization_config.get("quant_method")
+    return None
+
+
 def flatten_nested_list(nested_list):
     if isinstance(nested_list, list):
         return [
