@@ -276,6 +276,82 @@ class FingerprintStorage:
                 self._conn = None
 
 
+class DiscoveryProgressTracker:
+    """
+    Tracks discovery job progress for SSE live updates.
+
+    Stores recent progress events that can be streamed to clients
+    via Server-Sent Events (SSE).
+    """
+
+    def __init__(self, max_events: int = 1000):
+        self.max_events = max_events
+        self._events: deque = deque(maxlen=max_events)
+        self._lock = threading.Lock()
+        self._subscribers: List[threading.Event] = []
+        self._current_run_id: Optional[str] = None
+        self._current_stage: int = 0
+        self._current_stage_name: str = ""
+        self._percent_complete: float = 0.0
+
+    def post_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        """Post a new progress event."""
+        event = {
+            "type": event_type,
+            "timestamp": time.time(),
+            "data": data,
+        }
+
+        with self._lock:
+            self._events.append(event)
+
+            # Update current state
+            if event_type == "progress":
+                self._current_run_id = data.get("run_id")
+                self._current_stage = data.get("stage", 0)
+                self._current_stage_name = data.get("stage_name", "")
+                self._percent_complete = data.get("percent_complete", 0.0)
+            elif event_type == "run_start":
+                self._current_run_id = data.get("run_id")
+                self._current_stage = 0
+                self._percent_complete = 0.0
+            elif event_type in ("run_complete", "run_error"):
+                self._current_run_id = None
+
+            # Notify subscribers
+            for subscriber in self._subscribers:
+                subscriber.set()
+
+    def get_events_since(self, since_timestamp: float = 0) -> List[Dict]:
+        """Get events since a timestamp."""
+        with self._lock:
+            return [e for e in self._events if e["timestamp"] > since_timestamp]
+
+    def get_current_status(self) -> Dict:
+        """Get current discovery status."""
+        with self._lock:
+            return {
+                "run_id": self._current_run_id,
+                "stage": self._current_stage,
+                "stage_name": self._current_stage_name,
+                "percent_complete": self._percent_complete,
+                "is_running": self._current_run_id is not None,
+            }
+
+    def subscribe(self) -> threading.Event:
+        """Subscribe to event notifications."""
+        event = threading.Event()
+        with self._lock:
+            self._subscribers.append(event)
+        return event
+
+    def unsubscribe(self, event: threading.Event) -> None:
+        """Unsubscribe from event notifications."""
+        with self._lock:
+            if event in self._subscribers:
+                self._subscribers.remove(event)
+
+
 class DiscoveryIntegration:
     """
     Integration with discovery job artifacts for zone classification.
@@ -631,6 +707,9 @@ class RAPIDSSidecar:
         if blessed_configs_path:
             self._blessed_storage = BlessedConfigStorage(blessed_configs_path)
             print(f"Blessed configs storage enabled: {blessed_configs_path}")
+
+        # Discovery progress tracker for SSE live updates
+        self._progress_tracker = DiscoveryProgressTracker()
 
         # Backend selection
         if online_mode:
@@ -1139,6 +1218,30 @@ class RAPIDSSidecar:
             return self._blessed_storage.remove(config_id)
         return False
 
+    # -------------------------------------------------------------------------
+    # Discovery Progress API (for SSE live updates)
+    # -------------------------------------------------------------------------
+
+    def post_discovery_progress(self, event_type: str, data: Dict[str, Any]) -> None:
+        """Post a discovery progress event for SSE streaming."""
+        self._progress_tracker.post_event(event_type, data)
+
+    def get_discovery_progress(self) -> Dict:
+        """Get current discovery progress status."""
+        return self._progress_tracker.get_current_status()
+
+    def get_discovery_events(self, since_timestamp: float = 0) -> List[Dict]:
+        """Get discovery events since a timestamp."""
+        return self._progress_tracker.get_events_since(since_timestamp)
+
+    def subscribe_discovery_progress(self) -> threading.Event:
+        """Subscribe to discovery progress notifications."""
+        return self._progress_tracker.subscribe()
+
+    def unsubscribe_discovery_progress(self, event: threading.Event) -> None:
+        """Unsubscribe from discovery progress notifications."""
+        self._progress_tracker.unsubscribe(event)
+
 
 class SidecarHandler(BaseHTTPRequestHandler):
     """HTTP handler for sidecar API."""
@@ -1179,6 +1282,15 @@ class SidecarHandler(BaseHTTPRequestHandler):
             # Get discovery integration status
             data = self.sidecar.get_discovery_status()
             self._send_json(data)
+
+        elif parsed.path == "/discovery/progress":
+            # Get current discovery progress (non-streaming)
+            data = self.sidecar.get_discovery_progress()
+            self._send_json(data)
+
+        elif parsed.path == "/discovery/live" or parsed.path.startswith("/discovery/live?"):
+            # SSE endpoint for live discovery updates
+            self._handle_sse_discovery(parsed)
 
         elif parsed.path == "/blessed-configs":
             # Get all blessed configs
@@ -1265,6 +1377,20 @@ class SidecarHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json({"status": "storage_disabled"})
 
+        elif parsed.path == "/discovery/progress":
+            # Post discovery progress event for SSE streaming
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+
+            try:
+                data = json.loads(body)
+                event_type = data.get("type", "progress")
+                event_data = data.get("data", data)
+                self.sidecar.post_discovery_progress(event_type, event_data)
+                self._send_json({"status": "posted", "type": event_type})
+            except json.JSONDecodeError as e:
+                self._send_json_error(400, f"Invalid JSON: {e}")
+
         elif parsed.path == "/blessed-configs":
             # Add or update a blessed config with schema validation
             content_len = int(self.headers.get('Content-Length', 0))
@@ -1307,6 +1433,74 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "Config not found or storage disabled")
         else:
             self.send_error(404)
+
+    def _handle_sse_discovery(self, parsed) -> None:
+        """
+        Handle SSE (Server-Sent Events) for live discovery updates.
+
+        Streams discovery progress events to the client in real-time.
+        Client should connect with: EventSource('/discovery/live')
+        """
+        # Parse query parameters
+        query = urllib.parse.parse_qs(parsed.query)
+        since = float(query.get('since', ['0'])[0])
+
+        # Send SSE headers
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+
+        # Subscribe to updates
+        notify_event = self.sidecar.subscribe_discovery_progress()
+
+        try:
+            # Send initial status
+            status = self.sidecar.get_discovery_progress()
+            self._send_sse_event('status', status)
+
+            # Send any missed events
+            events = self.sidecar.get_discovery_events(since)
+            for event in events:
+                self._send_sse_event(event['type'], event['data'])
+
+            # Stream updates
+            last_check = time.time()
+            while True:
+                # Wait for notification or timeout (30s heartbeat)
+                notify_event.wait(timeout=30)
+
+                # Check for new events
+                events = self.sidecar.get_discovery_events(last_check)
+                for event in events:
+                    self._send_sse_event(event['type'], event['data'])
+                    last_check = event['timestamp']
+
+                # Send heartbeat if no events
+                if not events:
+                    self._send_sse_event('heartbeat', {'timestamp': time.time()})
+
+                # Reset notification event
+                notify_event.clear()
+
+        except (BrokenPipeError, ConnectionResetError):
+            # Client disconnected
+            pass
+        except Exception as e:
+            print(f"SSE error: {e}")
+        finally:
+            self.sidecar.unsubscribe_discovery_progress(notify_event)
+
+    def _send_sse_event(self, event_type: str, data: Dict) -> None:
+        """Send a single SSE event."""
+        try:
+            event_str = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+            self.wfile.write(event_str.encode())
+            self.wfile.flush()
+        except Exception:
+            raise BrokenPipeError("Client disconnected")
 
     def _send_json(self, data):
         response = json.dumps(data).encode()
@@ -1462,18 +1656,21 @@ def main():
         print(f"Blessed configs:  {args.blessed_configs}")
     print(f"{'='*60}")
     print(f"\nEndpoints:")
-    print(f"  GET  /centroids        - Current cluster centroids")
-    print(f"  GET  /stats            - Sidecar statistics")
-    print(f"  GET  /health           - Health check")
-    print(f"  GET  /discovery/status - Discovery integration status")
-    print(f"  GET  /blessed-configs  - List blessed quantization configs")
-    print(f"  POST /fingerprint      - Submit fingerprint (stores + classifies)")
-    print(f"  POST /classify         - Classify fingerprint (read-only)")
-    print(f"  POST /predict          - Predict cluster for fingerprint")
-    print(f"  POST /recluster        - Force recluster")
-    print(f"  POST /discovery/reload - Reload discovery artifacts")
-    print(f"  POST /storage/flush    - Flush storage buffer to SQLite")
-    print(f"  POST /blessed-configs  - Add/update blessed config")
+    print(f"  GET  /centroids          - Current cluster centroids")
+    print(f"  GET  /stats              - Sidecar statistics")
+    print(f"  GET  /health             - Health check")
+    print(f"  GET  /discovery/status   - Discovery integration status")
+    print(f"  GET  /discovery/progress - Current discovery progress")
+    print(f"  GET  /discovery/live     - SSE stream for live discovery updates")
+    print(f"  GET  /blessed-configs    - List blessed quantization configs")
+    print(f"  POST /fingerprint        - Submit fingerprint (stores + classifies)")
+    print(f"  POST /classify           - Classify fingerprint (read-only)")
+    print(f"  POST /predict            - Predict cluster for fingerprint")
+    print(f"  POST /recluster          - Force recluster")
+    print(f"  POST /discovery/reload   - Reload discovery artifacts")
+    print(f"  POST /discovery/progress - Post discovery progress event")
+    print(f"  POST /storage/flush      - Flush storage buffer to SQLite")
+    print(f"  POST /blessed-configs    - Add/update blessed config")
     print(f"  DELETE /blessed-configs/:id - Remove blessed config")
     print(f"\nPress Ctrl+C to stop\n")
 

@@ -50,6 +50,13 @@ try:
 except ImportError:
     HAS_MANIFEST = False
 
+# Import threshold tuner for adaptive zone tuning
+try:
+    from .threshold_tuner import ZoneThresholdTuner, create_threshold_tuner
+    HAS_THRESHOLD_TUNER = True
+except ImportError:
+    HAS_THRESHOLD_TUNER = False
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -237,15 +244,30 @@ class ManifoldHarness:
         db_path: str = "fingerprints.db",
         concurrency: int = 1,
         seed: Optional[int] = None,
+        tune_thresholds: bool = False,
+        thresholds_path: Optional[str] = None,
+        tuner_state_path: Optional[str] = None,
     ):
         self.server_url = server_url.rstrip('/')
         self.db_path = Path(db_path)
         self.concurrency = concurrency
         self.seed = seed
+        self.tune_thresholds = tune_thresholds
         self.probe_packs = get_all_probe_packs()
         self.results: List[ProbeResult] = []
         self._manifest: Optional['ExperimentManifest'] = None
         self._init_db()
+
+        # Initialize threshold tuner if enabled
+        self._threshold_tuner: Optional['ZoneThresholdTuner'] = None
+        if tune_thresholds and HAS_THRESHOLD_TUNER:
+            self._threshold_tuner = create_threshold_tuner(
+                thresholds_path=thresholds_path,
+                state_path=tuner_state_path,
+            )
+            logger.info("Threshold tuner enabled")
+        elif tune_thresholds and not HAS_THRESHOLD_TUNER:
+            logger.warning("Threshold tuning requested but tuner module not available")
 
         # Set random seed for reproducibility
         if seed is not None:
@@ -388,7 +410,39 @@ class ManifoldHarness:
                 logger.error(f"Probe failed: {e}")
 
         self._save_result(result)
+
+        # Feed result to threshold tuner if enabled
+        if self._threshold_tuner and result.fingerprint and result.manifold_zone:
+            self._feed_to_tuner(result)
+
         return result
+
+    def _feed_to_tuner(self, result: ProbeResult) -> None:
+        """Feed a probe result to the threshold tuner."""
+        if not self._threshold_tuner or not result.fingerprint:
+            return
+
+        # Extract features from fingerprint
+        fp = result.fingerprint
+        if isinstance(fp, list) and len(fp) >= 4:
+            features = {
+                'local_mass': fp[0],
+                'mid_mass': fp[1],
+                'long_mass': fp[2],
+                'entropy': fp[3],
+            }
+        elif isinstance(fp, dict):
+            features = fp
+        else:
+            return
+
+        self._threshold_tuner.add_sample(
+            fingerprint_id=hash(result.request_id),
+            features=features,
+            predicted_zone=result.manifold_zone or 'unknown',
+            actual_zone=result.probe.expected_zone,
+            confidence=0.0,
+        )
 
     async def run_discovery(
         self,
@@ -495,15 +549,26 @@ class ManifoldHarness:
                 # Small delay to avoid overwhelming server
                 await asyncio.sleep(0.1)
 
+        # Update threshold tuner if enabled
+        tuner_accuracy = None
+        if self._threshold_tuner:
+            # Update thresholds based on collected samples
+            new_thresholds = self._threshold_tuner.update_thresholds()
+            tuner_accuracy = self._threshold_tuner.compute_accuracy()
+            logger.info(f"Tuner accuracy: {tuner_accuracy.get('overall', 0.0):.1%}")
+
         # Finalize manifest with statistics
         if HAS_MANIFEST and self._manifest:
-            self._manifest.set_statistics({
+            stats = {
                 "probes_run": probes_run,
                 "errors": errors,
                 "error_rate": errors / probes_run if probes_run > 0 else 0.0,
                 "zone_distribution": zone_counts,
                 "unique_probes": len(all_probes),
-            })
+            }
+            if tuner_accuracy:
+                stats["tuner_accuracy"] = tuner_accuracy
+            self._manifest.set_statistics(stats)
             self._manifest.add_artifact("database", str(self.db_path))
             self._manifest.finalize()
             logger.info(f"Manifest finalized: {probes_run} probes, {errors} errors")
@@ -536,6 +601,58 @@ class ManifoldHarness:
         if not HAS_MANIFEST or not self._manifest:
             return None
         return self._manifest.to_dict()
+
+    def save_tuner_state(self, output_path: str) -> Optional[str]:
+        """
+        Save the threshold tuner state for resume.
+
+        Args:
+            output_path: Path to save the tuner state JSON
+
+        Returns:
+            Path where state was saved, or None if tuner not available
+        """
+        if not self._threshold_tuner:
+            logger.warning("Threshold tuner not enabled")
+            return None
+
+        state_path = Path(output_path)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._threshold_tuner.save_state(str(state_path))
+        logger.info(f"Tuner state saved to: {state_path}")
+        return str(state_path)
+
+    def export_thresholds(self, output_path: str) -> Optional[str]:
+        """
+        Export optimized zone thresholds.
+
+        Args:
+            output_path: Path to save the thresholds JSON
+
+        Returns:
+            Path where thresholds were saved, or None if tuner not available
+        """
+        if not self._threshold_tuner:
+            logger.warning("Threshold tuner not enabled")
+            return None
+
+        thresholds_path = Path(output_path)
+        thresholds_path.parent.mkdir(parents=True, exist_ok=True)
+        self._threshold_tuner.export_thresholds(str(thresholds_path))
+        logger.info(f"Thresholds exported to: {thresholds_path}")
+        return str(thresholds_path)
+
+    def get_tuner_accuracy(self) -> Optional[Dict[str, float]]:
+        """Get current tuner accuracy metrics."""
+        if not self._threshold_tuner:
+            return None
+        return self._threshold_tuner.compute_accuracy()
+
+    def get_tuner_suggestions(self) -> Optional[List[str]]:
+        """Get suggestions for improving tuner accuracy."""
+        if not self._threshold_tuner:
+            return None
+        return self._threshold_tuner.get_improvement_suggestions()
 
 
 # ============================================================================
@@ -720,6 +837,31 @@ Examples:
         help="Output directory for manifest and report (default: same as db)"
     )
 
+    # Threshold tuning arguments
+    parser.add_argument(
+        "--tune-thresholds",
+        action="store_true",
+        help="Enable adaptive zone threshold tuning"
+    )
+    parser.add_argument(
+        "--thresholds",
+        type=str,
+        default=None,
+        help="Path to initial zone thresholds JSON (for tuning)"
+    )
+    parser.add_argument(
+        "--tuner-state",
+        type=str,
+        default=None,
+        help="Path to tuner state file (for resuming tuning)"
+    )
+    parser.add_argument(
+        "--export-thresholds",
+        type=str,
+        default=None,
+        help="Path to export optimized thresholds after tuning"
+    )
+
     args = parser.parse_args()
 
     if args.report:
@@ -747,6 +889,9 @@ Examples:
         db_path=args.db,
         concurrency=args.concurrency,
         seed=args.seed,
+        tune_thresholds=args.tune_thresholds,
+        thresholds_path=args.thresholds,
+        tuner_state_path=args.tuner_state,
     )
 
     asyncio.run(harness.run_discovery(args.duration))
@@ -765,6 +910,40 @@ Examples:
     saved_path = harness.save_manifest(str(manifest_path))
     if saved_path:
         print(f"Manifest saved to: {saved_path}")
+
+    # Save threshold tuner results if enabled
+    if args.tune_thresholds:
+        # Print tuner accuracy
+        accuracy = harness.get_tuner_accuracy()
+        if accuracy:
+            print("\n" + "=" * 40)
+            print("THRESHOLD TUNER RESULTS")
+            print("=" * 40)
+            print(f"Overall accuracy: {accuracy.get('overall', 0):.1%}")
+            for zone, acc in accuracy.items():
+                if zone != 'overall':
+                    print(f"  {zone}: {acc:.1%}")
+
+            # Print suggestions
+            suggestions = harness.get_tuner_suggestions()
+            if suggestions:
+                print("\nSuggestions for improvement:")
+                for s in suggestions:
+                    print(f"  - {s}")
+
+        # Save tuner state for resume
+        tuner_state_path = output_dir / "tuner_state.json"
+        harness.save_tuner_state(str(tuner_state_path))
+        print(f"Tuner state saved to: {tuner_state_path}")
+
+        # Export optimized thresholds
+        if args.export_thresholds:
+            harness.export_thresholds(args.export_thresholds)
+            print(f"Thresholds exported to: {args.export_thresholds}")
+        else:
+            thresholds_path = output_dir / "zone_thresholds.json"
+            harness.export_thresholds(str(thresholds_path))
+            print(f"Thresholds exported to: {thresholds_path}")
 
     return 0
 

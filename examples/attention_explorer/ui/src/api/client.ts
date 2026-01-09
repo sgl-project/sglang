@@ -28,6 +28,7 @@ const PROGRAM_CONFIGS: Record<Program, AttentionCaptureParams> = {
   prod: {
     return_attention_tokens: true,
     top_k_attention: 10,
+    max_tokens: 2048,
   },
   debug: {
     return_attention_tokens: true,
@@ -35,12 +36,14 @@ const PROGRAM_CONFIGS: Record<Program, AttentionCaptureParams> = {
     attention_capture_layer_ids: [7, 15, 23, 31],
     return_moe_routing: true,
     moe_routing_top_k: 2,
+    max_tokens: 2048,
   },
   discovery: {
     return_attention_tokens: true,
     top_k_attention: 10,
     attention_sketch_mode: true,
     return_moe_routing: true,
+    max_tokens: 4096,
   },
 };
 
