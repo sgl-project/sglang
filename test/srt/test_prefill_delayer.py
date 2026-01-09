@@ -251,7 +251,11 @@ class TestPrefillDelayerThroughputOnlineServing(CustomTestCase):
         _run_throughput_comparison(
             self,
             test_name="online_serving",
-            other_launch_args=["--schedule-policy", "lpm"],
+            other_launch_args=[
+                # Not really needed, only to test support non-FCFS algorithms
+                "--schedule-policy",
+                "lpm",
+            ],
             other_benchmark_args=dict(
                 num_prompts=500,
                 random_input_len=30000,
@@ -284,19 +288,20 @@ def _run_throughput_comparison(
     token_usage_low_watermark: float = None,
     min_improvement_pct: float = -5,
 ):
-    res_enabled = _run_throughput_test(
-        debug_name=f"{test_name} (prefill_delayer=True)",
-        prefill_delayer=True,
+    common_kwargs = dict(
         other_launch_args=other_launch_args,
         other_benchmark_args=other_benchmark_args,
         token_usage_low_watermark=token_usage_low_watermark,
     )
+    res_enabled = _run_throughput_test(
+        debug_name=f"{test_name} (prefill_delayer=True)",
+        prefill_delayer=True,
+        **common_kwargs,
+    )
     res_disabled = _run_throughput_test(
         debug_name=f"{test_name} (prefill_delayer=False)",
         prefill_delayer=False,
-        other_launch_args=other_launch_args,
-        other_benchmark_args=other_benchmark_args,
-        token_usage_low_watermark=token_usage_low_watermark,
+        **common_kwargs,
     )
 
     _assert_throughput_improvement(
