@@ -31,8 +31,10 @@ class PrefillDelayer:
         server_args,
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
     ):
-        self.max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
-        self.low_watermark = envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
+        self._max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
+        self._token_usage_low_watermark = (
+            envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
+        )
 
         self._global_info_buffer = torch.empty(
             (dp_size, attn_tp_size, 2),
@@ -60,7 +62,7 @@ class PrefillDelayer:
     ) -> bool:
         local_force_allow = (
             local_prefillable
-            and ((x := self.low_watermark) is not None)
+            and ((x := self._token_usage_low_watermark) is not None)
             and (token_usage < x)
         )
 
@@ -89,7 +91,7 @@ class PrefillDelayer:
             if self._curr_delay_info is None:
                 self._curr_delay_info = _DelayInfo()
             self._curr_delay_info.delayed_count += 1
-            if self._curr_delay_info.delayed_count < self.max_delay_passes:
+            if self._curr_delay_info.delayed_count < self._max_delay_passes:
                 return False
 
         is_timeout = global_mixed_prefillable

@@ -805,7 +805,9 @@ class SchedulerMetricsCollector:
     ) -> None:
         self._log_histogram(self.prefill_delayer_wait_forward_passes, forward_passes)
         self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
-        self.prefill_delayer_outcomes_total.labels(**self.labels, outcome=outcome).inc(1)
+        self.prefill_delayer_outcomes_total.labels(**self.labels, outcome=outcome).inc(
+            1
+        )
 
     def increment_retracted_reqs(
         self,
