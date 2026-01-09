@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       workflows:
-        description: 'Space-separated list of workflow filenames to check (empty for all)'
+        description: 'Space-separated list of workflow filenames to check'
         required: false
         type: string
         default: 'pr-test.yml'
@@ -43,7 +43,6 @@ jobs:
 
           # Create a temporary file to store PR data
           pr_data_file=$(mktemp)
-          pr_retry_file=$(mktemp)
 
           # Process each workflow
           for workflow_file in ${workflow_files[@]}; do
@@ -92,8 +91,8 @@ jobs:
                 continue
               fi
 
-              # Get jobs for this run
-              jobs=$(gh api "repos/$REPO/actions/runs/$run_id/jobs" --jq '.jobs')
+              # Get jobs for this run (with pagination to avoid missing jobs)
+              jobs=$(gh api "repos/$REPO/actions/runs/$run_id/jobs" --paginate --jq '.jobs[]' | jq -s '.')
 
               running_jobs=$(echo "$jobs" | jq '[.[] | select(.status=="in_progress")] | length')
               queued_jobs=$(echo "$jobs" | jq '[.[] | select(.status=="queued" or .status=="waiting")] | length')
