@@ -54,7 +54,7 @@ class PrefillDelayer:
             dtype=torch.int64,
             device="cpu",
         )
-        self.cpu_group = tp_worker.get_tp_group().cpu_group
+        self._cpu_group = tp_worker.get_tp_group().cpu_group
 
         self._metrics_collector = metrics_collector
 
@@ -167,7 +167,7 @@ class PrefillDelayer:
         torch.distributed.all_gather_into_tensor(
             self._global_info_buffer.flatten(),
             local_info,
-            group=self.cpu_group,
+            group=self._cpu_group,
         )
         tp0_info = self._global_info_buffer[:, 0, :]
         return tp0_info[:, 0], tp0_info[:, 1]
