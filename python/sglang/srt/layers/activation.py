@@ -22,13 +22,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -58,7 +59,12 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 
-class SiluAndMul(CustomOp):
+class SiluAndMul(MultiPlatformOp):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if get_global_server_args().rl_on_policy_target is not None:
+            self._forward_method = self.forward_native
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
@@ -89,7 +95,7 @@ class SiluAndMul(CustomOp):
         return out
 
 
-class GeluAndMul(CustomOp):
+class GeluAndMul(MultiPlatformOp):
     def __init__(self, approximate="tanh"):
         super().__init__()
         self.approximate = approximate
@@ -110,6 +116,14 @@ class GeluAndMul(CustomOp):
         d = x.shape[-1] // 2
         return F.gelu(x[..., :d], approximate=self.approximate) * x[..., d:]
 
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_cpu_amx_available and self.approximate == "tanh":
+            return torch.ops.sgl_kernel.gelu_tanh_and_mul_cpu(x)
+        elif _is_cpu_amx_available and self.approximate == "none":
+            return torch.ops.sgl_kernel.gelu_and_mul_cpu(x)
+        else:
+            return self.forward_native(x)
+
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         return self._forward_impl(x)
 
@@ -126,7 +140,7 @@ class GeluAndMul(CustomOp):
         return y_npu
 
 
-class NewGELU(CustomOp):
+class NewGELU(MultiPlatformOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         c = math.sqrt(2.0 / math.pi)
         return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
@@ -147,7 +161,7 @@ class ReLU2(nn.Module):
         return x * x
 
 
-class QuickGELU(CustomOp):
+class QuickGELU(MultiPlatformOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(1.702 * x)
 
@@ -161,6 +175,116 @@ class QuickGELU(CustomOp):
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         return torch_npu.npu_fast_gelu(x)
+
+
+class XIELU(MultiPlatformOp):
+    """
+    Applies the xIELU activation function introduced in https://arxiv.org/abs/2411.13010
+    If the user has installed the nickjbrowning/XIELU, we import xIELU CUDA
+    Otherwise, we emit a single warning and use xIELU Python
+    """
+
+    def __init__(
+        self,
+        alpha_p_init: float = 0.8,
+        alpha_n_init: float = 0.8,
+        beta: float = 0.5,
+        eps: float = -1e-6,
+        dtype: torch.dtype = torch.bfloat16,
+        with_vector_loads: bool = False,
+    ):
+        super().__init__()
+        self.alpha_p = nn.Parameter(
+            torch.log(torch.exp(torch.tensor(alpha_p_init, dtype=dtype)) - 1).unsqueeze(
+                0
+            )
+        )
+        self.alpha_n = nn.Parameter(
+            torch.log(
+                torch.exp(torch.tensor(alpha_n_init - beta, dtype=dtype)) - 1
+            ).unsqueeze(0)
+        )
+        self.register_buffer("beta", torch.tensor(beta, dtype=dtype))
+        self.register_buffer("eps", torch.tensor(eps, dtype=dtype))
+        self.with_vector_loads = with_vector_loads
+        # Temporary until xIELU CUDA fully implemented
+        self._beta_scalar = float(self.beta.detach().cpu().float().item())
+        self._eps_scalar = float(self.eps.detach().cpu().float().item())
+
+        self._xielu_cuda_obj = None
+        try:
+            import xielu.ops  # noqa: F401
+
+            self._xielu_cuda_obj = torch.classes.xielu.XIELU()
+            msg = "Using experimental xIELU CUDA."
+            try:
+                from torch._dynamo import allow_in_graph
+
+                self._xielu_cuda_fn = allow_in_graph(self._xielu_cuda)
+                msg += " Enabled torch._dynamo for xIELU CUDA."
+            except Exception as err:
+                msg += (
+                    f" Could not enable torch._dynamo for xIELU ({err}) - "
+                    "this may result in slower performance."
+                )
+                self._xielu_cuda_fn = self._xielu_cuda
+            logger.warning_once(msg)
+        except Exception as err:
+            pass
+            # logger.warning_once(
+            #     "CUDA-fused xIELU not available (%s) –"
+            #     " falling back to a Python version.\n"
+            #     "For CUDA xIELU (experimental), `pip install git+https://github.com/nickjbrowning/XIELU`",
+            #     str(err),
+            # )
+
+    def _xielu_python(self, x: torch.Tensor) -> torch.Tensor:
+        alpha_p = nn.functional.softplus(self.alpha_p)
+        alpha_n = self.beta + nn.functional.softplus(self.alpha_n)
+        return torch.where(
+            x > 0,
+            alpha_p * x * x + self.beta * x,
+            (torch.expm1(torch.min(x, self.eps)) - x) * alpha_n + self.beta * x,
+        )
+
+    def _xielu_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        """Firewall function to prevent torch.compile from seeing .item()"""
+        assert self._xielu_cuda_obj is not None, "XIELU CUDA object must not be None"
+        original_shape = x.shape
+        # CUDA kernel expects 3D tensors, reshape if needed
+        while x.dim() < 3:
+            x = x.unsqueeze(0)
+        if x.dim() > 3:
+            x = x.view(-1, 1, x.size(-1))
+        if original_shape != x.shape:
+            logger.warning_once(
+                "Warning: xIELU input tensor expects 3 dimensions"
+                " but got (shape: %s). Reshaping to (shape: %s).\n"
+                "Note: For SGLang this may be expected if sending"
+                "[B*S,D] instead of [B,S,D].",
+                original_shape,
+                x.shape,
+            )
+        result = self._xielu_cuda_obj.forward(
+            x,
+            self.alpha_p,
+            self.alpha_n,
+            # Temporary until xIELU CUDA fully implemented -> self.{beta,eps}.item()
+            self._beta_scalar,
+            self._eps_scalar,
+            self.with_vector_loads,
+        )
+        return result.view(original_shape)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self._xielu_cuda_obj is not None and input.is_cuda:
+            if not torch._dynamo.is_compiling():
+                return self._xielu_cuda_fn(input)
+            else:
+                logger.warning_once(
+                    "torch._dynamo is compiling, using Python version of xIELU."
+                )
+        return self._xielu_python(input)
 
 
 class ScaledActivation(nn.Module):
@@ -210,6 +334,7 @@ _ACTIVATION_REGISTRY = {
     "gelu_pytorch_tanh": nn.GELU(approximate="tanh"),
     "gelu_new": NewGELU(),
     "relu2": ReLU2(),
+    "xielu": XIELU(),
 }
 
 
@@ -261,4 +386,7 @@ if not (
     logger.info(
         "sgl-kernel is not available on Non-NV, Non-AMD platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )
-    from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
+    from vllm.model_executor.layers.activation import (  # noqa: F401
+        GeluAndMul,
+        SiluAndMul,
+    )

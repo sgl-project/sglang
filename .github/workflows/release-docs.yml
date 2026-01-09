@@ -41,9 +41,9 @@ jobs:
           make compile
 
       - name: Push HTML to sgl-project.github.io
-        timeout-minutes: 60
+        timeout-minutes: 30
         env:
-          GITHUB_TOKEN: ${{ secrets.DOCUMENTATION_PAT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_DOCUMENTATION }}
         run: |
           cd docs
           make html
@@ -56,8 +56,8 @@ jobs:
           cp -r * ../sgl-project.github.io
           cp ../../README.md ../sgl-project.github.io/README.md
           cd ../sgl-project.github.io
-          git config user.name "zhaochenyang20"
-          git config user.email "zhaochenyang20@gmail.com"
+          git config user.name "sglang-bot"
+          git config user.email "sglangbot@gmail.com"
           git add .
           git commit -m "Update $(date +'%Y-%m-%d %H:%M:%S')"
           git push https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git main

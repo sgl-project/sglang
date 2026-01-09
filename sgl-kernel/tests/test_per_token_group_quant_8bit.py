@@ -153,7 +153,7 @@ def test_per_token_group_quant_with_column_major(
         *triton_per_token_group_quant_8bit(**execute_kwargs)
     )
     x_q_sglang, x_s_sglang = _postprocess(
-        *sglang_per_token_group_quant_8bit(**execute_kwargs)
+        *sglang_per_token_group_quant_8bit(**execute_kwargs, enable_v2=True)
     )
 
     try:
@@ -166,7 +166,6 @@ def test_per_token_group_quant_with_column_major(
             msg=lambda message: message + f" {x_s_triton=} {x_s_sglang=}",
         )
     except AssertionError:
-        # torch.set_printoptions(profile="full")
         print(
             f"{x.shape=} {x_q_triton.shape=} {x_s_triton.shape=} {x_q_sglang.shape=} {x_s_sglang.shape=}"
         )
@@ -176,22 +175,6 @@ def test_per_token_group_quant_with_column_major(
         print(f"{x_s_triton=}")
         print(f"{x_q_sglang=}")
         print(f"{x_s_sglang=}")
-        # torch.set_printoptions(profile="default")
-
-        # if (d := os.environ.get("SGLANG_DUMP_TEST_ERROR_DIR", "")) != "":
-        #     import matplotlib.pyplot as plt
-        #
-        #     base_stem = time.time()
-        #     for name, value in [
-        #         ("x_q", x_q_triton != x_q_sglang),
-        #         ("x_s", x_s_triton != x_s_sglang),
-        #     ]:
-        #         value = value.reshape((-1, value.shape[-1]))
-        #         plt.figure(figsize=(20, 20))
-        #         plt.imshow((value * 1.0).cpu().numpy())
-        #         p = Path(d) / f"{base_stem}_{name}.png"
-        #         print(f"Write diff to {p}", flush=True)
-        #         plt.savefig(p)
 
         raise
 

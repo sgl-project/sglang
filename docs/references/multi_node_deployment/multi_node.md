@@ -7,9 +7,19 @@
 ```bash
 # replace 172.16.4.52:20000 with your own node ip address and port of the first node
 
-python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --dist-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 0
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Meta-Llama-3.1-405B-Instruct \
+  --tp 16 \
+  --dist-init-addr 172.16.4.52:20000 \
+  --nnodes 2 \
+  --node-rank 0
 
-python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct --tp 16 --dist-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 1
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Meta-Llama-3.1-405B-Instruct \
+  --tp 16 \
+  --dist-init-addr 172.16.4.52:20000 \
+  --nnodes 2 \
+  --node-rank 1
 ```
 
 Note that LLama 405B (fp8) can also be launched on a single node.
@@ -20,7 +30,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instr
 
 ## DeepSeek V3/R1
 
-Please refer to [DeepSeek documents for reference](https://docs.sglang.ai/basic_usage/deepseek.html#running-examples-on-multi-node).
+Please refer to [DeepSeek documents for reference](https://docs.sglang.io/basic_usage/deepseek.html#running-examples-on-multi-node).
 
 ## Multi-Node Inference on SLURM
 
@@ -85,6 +95,6 @@ echo "[INFO] $HEAD_NODE:30000 is ready to accept connections"
 wait
 ```
 
-Then, you can test the server by sending requests following other [documents](https://docs.sglang.ai/backend/openai_api_completions.html).
+Then, you can test the server by sending requests following other [documents](https://docs.sglang.io/basic_usage/openai_api_completions.html).
 
 Thanks for [aflah02](https://github.com/aflah02) for providing the example, based on his [blog post](https://aflah02.substack.com/p/multi-node-llm-inference-with-sglang).

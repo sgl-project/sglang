@@ -1,0 +1,120 @@
+name: Build and Push CUDA 13 Docker Images
+
+# release this manually via workflow_dispatch for now
+on:
+    workflow_dispatch:
+
+jobs:
+    build-dev:
+        if: ${{ github.repository == 'sgl-project/sglang' }}
+        runs-on: ${{ matrix.runner }}
+        strategy:
+            matrix:
+                include:
+                    - runner: x64-docker-build-node
+                      platform: linux/amd64
+                      build_type: all
+                      grace_blackwell: 0
+                      tag: dev-x86-cu13-$(date +%Y%m%d)
+                      version: 13.0.1
+                    - runner: arm-docker-build-node
+                      platform: linux/arm64
+                      build_type: all
+                      grace_blackwell: 1
+                      tag: dev-arm64-cu13-$(date +%Y%m%d)
+                      version: 13.0.1
+        steps:
+            - name: Delete huge unnecessary tools folder
+              run: rm -rf /opt/hostedtoolcache
+
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Free disk space
+              uses: jlumbroso/free-disk-space@main
+              with:
+                  tool-cache: true
+                  docker-images: true
+                  android: true
+                  dotnet: true
+                  haskell: true
+                  large-packages: true
+                  swap-storage: true
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Login to Docker Hub
+              uses: docker/login-action@v2
+              with:
+                  username: ${{ secrets.DOCKERHUB_USERNAME }}
+                  password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+            - name: Build and Push Dev Image
+              run: |
+                  docker buildx build \
+                    --platform ${{ matrix.platform }} \
+                    --push \
+                    --target framework \
+                    -f docker/Dockerfile \
+                    --build-arg CUDA_VERSION=${{ matrix.version }} \
+                    --build-arg BUILD_TYPE=${{ matrix.build_type }} \
+                    --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
+                    --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
+                    --build-arg USE_LATEST_SGLANG=1 \
+                    -t lmsysorg/sglang:${{ matrix.tag }} \
+                    --no-cache \
+                    .
+
+    create-manifests:
+        runs-on: ubuntu-22.04
+        needs: [build-dev]
+        if: ${{ github.repository == 'sgl-project/sglang' }}
+        strategy:
+            matrix:
+                variant:
+                    - tag: dev-cu13
+                      x86_tag: dev-x86-cu13
+                      arm64_tag: dev-arm64-cu13
+        steps:
+            - uses: docker/setup-buildx-action@v3
+
+            - uses: docker/login-action@v2
+              with:
+                  username: ${{ secrets.DOCKERHUB_USERNAME }}
+                  password: ${{ secrets.DOCKERHUB_TOKEN }}
+            - run: |
+                  docker buildx imagetools create \
+                    -t lmsysorg/sglang:${{ matrix.variant.tag }} \
+                    -t lmsysorg/sglang:nightly-${{ matrix.variant.tag }}-$(date +%Y%m%d)-${GITHUB_SHA:0:8} \
+                    lmsysorg/sglang:${{ matrix.variant.x86_tag }} \
+                    lmsysorg/sglang:${{ matrix.variant.arm64_tag }}
+
+            - name: Cleanup Old Nightly Builds
+              run: |
+                  # Get JWT token for Docker Hub API
+                  TOKEN=$(curl -s -H "Content-Type: application/json" -X POST -d '{"username": "${{ secrets.DOCKERHUB_USERNAME }}", "password": "${{ secrets.DOCKERHUB_TOKEN }}"}' https://hub.docker.com/v2/users/login/ | jq -r .token)
+
+                  # Get all tags for the repository
+                  TAGS_RESPONSE=$(curl -s -H "Authorization: JWT $TOKEN" "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/?page_size=100")
+
+                  # Extract tags that match our pattern and sort by last_updated timestamp (most recent first)
+                  TAGS=$(echo "$TAGS_RESPONSE" | jq -r '.results[] | select(.name | startswith("nightly-${{ matrix.variant.tag }}-")) | "\(.last_updated)|\(.name)"' | sort -r | cut -d'|' -f2)
+
+                  # Count total tags and keep only the 14 most recent
+                  TAG_COUNT=$(echo "$TAGS" | wc -l)
+                  if [ "$TAG_COUNT" -gt 14 ]; then
+                    echo "Found $TAG_COUNT nightly builds, keeping only the 14 most recent"
+                    TAGS_TO_DELETE=$(echo "$TAGS" | tail -n +15)
+                    echo "Tags to delete: $TAGS_TO_DELETE"
+
+                    # Delete old tags
+                    for tag in $TAGS_TO_DELETE; do
+                      echo "Deleting tag: $tag"
+                      curl -X DELETE \
+                        -H "Authorization: JWT $TOKEN" \
+                        "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/$tag/"
+                    done
+                  else
+                    echo "Only $TAG_COUNT nightly builds found, no cleanup needed"
+                  fi

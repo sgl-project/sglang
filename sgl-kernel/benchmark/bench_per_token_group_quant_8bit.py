@@ -8,7 +8,6 @@ import torch
 import triton
 from sgl_kernel.test_utils import create_per_token_group_quant_test_data
 
-from sglang.srt.bench_utils import bench_kineto
 from sglang.srt.layers.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
@@ -17,27 +16,21 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.bench_utils import bench_kineto
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
-mode_concentrated = os.environ.get("SGLANG_BENCH_MODE", "") == "concentrated"
+
+mode_concentrated = IS_CI or (os.environ.get("SGLANG_BENCH_MODE", "") == "concentrated")
 
 if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
-    # configs = [[
-    #     768,
-    #     16384,
-    #     128,
-    #     None,
-    #     fp8_type_,
-    #     dict(
-    #         column_major_scales=True,
-    #         scale_tma_aligned=True,
-    #         scale_ue8m0=True,
-    #         fuse_silu_and_mul=False,
-    #         masked_layout_mode=None,
-    #     ),
-    # ]]
     configs = [
         [
             768 * 8,
@@ -231,7 +224,7 @@ def benchmark(
             "_per_token_group_quant_8bit|_silu_and_mul_post_quant_kernel",
         ),
         "sglang": (
-            sglang_per_token_group_quant_8bit,
+            partial(sglang_per_token_group_quant_8bit, enable_v2=True),
             "per_token_group_quant_8bit_kernel",
         ),
     }[provider]

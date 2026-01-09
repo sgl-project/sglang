@@ -8,7 +8,6 @@ import hashlib
 import json
 import logging
 import os
-import queue
 import tempfile
 from collections import defaultdict
 from typing import (
@@ -35,17 +34,25 @@ from tqdm.auto import tqdm
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
-from sglang.srt.utils import print_warning_once
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp8Config,
+)
+from sglang.srt.model_loader.ci_weight_validation import (
+    ci_download_with_validation_and_retry,
+    ci_validate_and_cleanup_local_snapshot,
+)
+from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
+from sglang.utils import is_in_ci
+
+try:
+    from fastsafetensors import SafeTensorsFileLoader, SingleGroup
+except ImportError as e:
+    SafeTensorsFileLoader = SingleGroup = None
 
 logger = logging.getLogger(__name__)
-
-# use system-level temp directory for file locks, so that multiple users
-# can share the same lock without error.
-# lock files in the temp directory will be automatically deleted when the
-# system reboots, so users will not complain about annoying lock files
-temp_dir = tempfile.gettempdir()
 
 
 def enable_hf_transfer():
@@ -63,18 +70,22 @@ def enable_hf_transfer():
 enable_hf_transfer()
 
 
-class DisabledTqdm(tqdm):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, disable=True)
+# use system-level temp directory for file locks, so that multiple users
+# can share the same lock without error.
+# lock files in the temp directory will be automatically deleted when the
+# system reboots, so users will not complain about annoying lock files
+temp_dir = tempfile.gettempdir()
 
 
-def get_lock(model_name_or_path: str, cache_dir: Optional[str] = None):
+def get_lock(
+    model_name_or_path: str, cache_dir: Optional[str] = None, suffix: str = ""
+):
     lock_dir = cache_dir or temp_dir
     os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
     model_name = model_name_or_path.replace("/", "-")
     hash_name = hashlib.sha256(model_name.encode()).hexdigest()
     # add hash to avoid conflict with old users' lock files
-    lock_file_name = hash_name + model_name + ".lock"
+    lock_file_name = hash_name + model_name + suffix + ".lock"
     # mode 0o666 is required for the filelock to be shared across users
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
@@ -108,6 +119,9 @@ def convert_bin_to_safetensor_file(
 
     dirname = os.path.dirname(sf_filename)
     os.makedirs(dirname, exist_ok=True)
+
+    from safetensors.torch import save_file
+
     save_file(loaded, sf_filename, metadata={"format": "pt"})
 
     # check file size
@@ -130,11 +144,32 @@ def convert_bin_to_safetensor_file(
             raise RuntimeError(f"The output tensors do not match for key {k}")
 
 
+def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
+    for prefix, new_prefix in prefix_mapping.items():
+        if key.startswith(prefix):
+            key = key.replace(prefix, new_prefix, 1)
+    return key
+
+
+def replace_substrings(key: str, substring_mapping: dict[str, str]) -> str:
+    for substr, new_substr in substring_mapping.items():
+        if substr in key:
+            key = key.replace(substr, new_substr)
+    return key
+
+
+class DisabledTqdm(tqdm):
+    def __init__(self, *args, **kwargs):
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
     packed_modules_mapping: Dict[str, List[str]],
+    remap_prefix: Dict[str, str] | None = None,
 ) -> QuantizationConfig:
     quant_cls = get_quantization_config(model_config.quantization)
 
@@ -154,6 +189,7 @@ def get_quant_config(
     if hf_quant_config is not None:
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         return quant_cls.from_config(hf_quant_config)
+
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
         if (
@@ -164,9 +200,9 @@ def get_quant_config(
         model_name_or_path = load_config.model_loader_extra_config[
             "qlora_adapter_name_or_path"
         ]
-
     else:
         model_name_or_path = model_config.model_path
+
     is_local = os.path.isdir(model_name_or_path)
     if not is_local:
         # Download the config files.
@@ -204,35 +240,199 @@ def get_quant_config(
     quant_config_file = quant_config_files[0]
     with open(quant_config_file) as f:
         config = json.load(f)
+        if remap_prefix is not None:
+            exclude_modules = [
+                replace_prefix(key, remap_prefix)
+                for key in config["quantization"]["exclude_modules"]
+            ]
+            config["quantization"]["exclude_modules"] = exclude_modules
+        config["packed_modules_mapping"] = packed_modules_mapping
 
         if model_config.quantization == "bitsandbytes":
             config["adapter_name_or_path"] = model_name_or_path
-        elif model_config.quantization == "modelopt":
-            if config["producer"]["name"] == "modelopt":
+        elif model_config.quantization.startswith("modelopt") and (
+            config.get("producer", {}).get("name", "").startswith("modelopt")
+        ):
+            quant_algo = config["quantization"]["quant_algo"]
+            if quant_algo is None:
                 # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
-                if config["quantization"]["quant_algo"] is None:
-                    if (
-                        model_config.hf_config.architectures[0]
-                        != "LlamaForCausalLMEagle3"
-                    ):
-                        raise ValueError(
-                            f"Invalid quant_config, quantization method: {model_config.quantization},"
-                            f"hf architectures: {model_config.hf_config.architectures[0]}. "
-                        )
-                    return None
-                if "FP4" in config["quantization"]["quant_algo"]:
-                    return ModelOptFp4Config.from_config(config)
-                else:
-                    return quant_cls.from_config(config)
-            else:
-                raise ValueError(
-                    f"Unsupported quantization config"
-                    f" found for {model_config.quantization} in {f}."
-                )
-        elif model_config.quantization == "w8a8_int8":
-            config["packed_modules_mapping"] = packed_modules_mapping
+                if model_config.hf_config.architectures[0] != "LlamaForCausalLMEagle3":
+                    raise ValueError(
+                        f"Invalid quant_config, quantization method: {model_config.quantization},"
+                        f"hf architectures: {model_config.hf_config.architectures[0]}. "
+                    )
+                return None
+            elif quant_algo == "FP8" or model_config.quantization == "modelopt_fp8":
+                return ModelOptFp8Config.from_config(config)
+            elif "FP4" in quant_algo:
+                return ModelOptFp4Config.from_config(config)
+        return quant_cls.from_config(config)
 
-    return quant_cls.from_config(config)
+
+def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
+    """
+    Check if all files listed in safetensors index files actually exist on disk.
+
+    This catches cases where the snapshot directory exists but files are missing
+    (e.g., due to incomplete downloads or corrupted cache).
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+
+    Returns:
+        Tuple of (all_exist, error_message)
+    """
+    index_files = [
+        f for f in os.listdir(snapshot_dir) if f.endswith(".safetensors.index.json")
+    ]
+
+    if not index_files:
+        return True, None  # Not a sharded model
+
+    for index_file in index_files:
+        index_path = os.path.join(snapshot_dir, index_file)
+        if not os.path.exists(index_path):
+            continue
+        try:
+            with open(index_path) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            if not weight_map:
+                continue
+            required_files = set(weight_map.values())
+            missing_files = [
+                fn
+                for fn in required_files
+                if not os.path.exists(os.path.join(snapshot_dir, fn))
+            ]
+            if missing_files:
+                return (
+                    False,
+                    f"Missing {len(missing_files)} file(s) from index {index_file}: "
+                    f"{missing_files[:3]}{'...' if len(missing_files) > 3 else ''}",
+                )
+        except Exception as e:
+            logger.warning("Failed to read index file %s: %s", index_file, e)
+            continue
+
+    return True, None
+
+
+def _find_local_hf_snapshot_dir_unlocked(
+    model_name_or_path: str,
+    cache_dir: Optional[str],
+    allow_patterns: List[str],
+    revision: Optional[str] = None,
+) -> Optional[str]:
+    """Find local HF snapshot directory without locking.
+
+    IMPORTANT: Caller MUST hold the model lock before calling this function
+    to prevent race conditions during validation and cleanup.
+
+    If the weights are already local, skip downloading and returns the path.
+    """
+    if os.path.isdir(model_name_or_path):
+        return None
+
+    found_local_snapshot_dir = None
+
+    # Check custom cache_dir (if provided)
+    if cache_dir:
+        try:
+            repo_folder = os.path.join(
+                cache_dir,
+                huggingface_hub.constants.REPO_ID_SEPARATOR.join(
+                    ["models", *model_name_or_path.split("/")]
+                ),
+            )
+            rev_to_use = revision
+            if not rev_to_use:
+                ref_main = os.path.join(repo_folder, "refs", "main")
+                if os.path.isfile(ref_main):
+                    with open(ref_main) as f:
+                        rev_to_use = f.read().strip()
+            if rev_to_use:
+                rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
+                if os.path.isdir(rev_dir):
+                    found_local_snapshot_dir = rev_dir
+        except Exception as e:
+            logger.warning(
+                "Failed to find local snapshot in custom cache_dir %s: %s",
+                cache_dir,
+                e,
+            )
+
+    # Check default HF cache as well
+    if not found_local_snapshot_dir:
+        try:
+            rev_dir = find_local_repo_dir(model_name_or_path, revision)
+            if rev_dir and os.path.isdir(rev_dir):
+                found_local_snapshot_dir = rev_dir
+        except Exception as e:
+            logger.warning("Failed to find local snapshot in default HF cache: %s", e)
+
+    # if local snapshot exists, validate it contains at least one weight file
+    # matching allow_patterns before skipping download.
+    if found_local_snapshot_dir is None:
+        return None
+
+    # Check if snapshot dir exists (might have been cleaned by another process
+    # before we acquired the lock)
+    if not os.path.isdir(found_local_snapshot_dir):
+        return None
+
+    local_weight_files: List[str] = []
+    try:
+        for pattern in allow_patterns:
+            matched_files = glob.glob(os.path.join(found_local_snapshot_dir, pattern))
+            for f in matched_files:
+                # os.path.exists returns False for broken symlinks.
+                if not os.path.exists(f):
+                    continue
+                local_weight_files.append(f)
+    except Exception as e:
+        logger.warning(
+            "Failed to scan local snapshot %s with patterns %s: %s",
+            found_local_snapshot_dir,
+            allow_patterns,
+            e,
+        )
+        local_weight_files = []
+
+    # Check for missing files from index (lightweight, for all users)
+    # This catches incomplete downloads before they cause cryptic load errors
+    if local_weight_files:
+        is_complete, error_msg = _check_index_files_exist(found_local_snapshot_dir)
+        if not is_complete:
+            log_info_on_rank0(
+                logger,
+                f"Local snapshot incomplete for {model_name_or_path}: {error_msg}. "
+                f"Will download missing files.",
+            )
+            return None  # Triggers snapshot_download() which handles partial downloads
+
+    # Only perform cache validation and cleanup in CI to avoid
+    # unnecessary overhead for regular users
+    if is_in_ci() and local_weight_files:
+        is_valid = ci_validate_and_cleanup_local_snapshot(
+            model_name_or_path, found_local_snapshot_dir, local_weight_files
+        )
+        if not is_valid:
+            return None
+
+    if len(local_weight_files) > 0:
+        log_info_on_rank0(
+            logger,
+            f"Found local HF snapshot for {model_name_or_path} at "
+            f"{found_local_snapshot_dir}; skipping download.",
+        )
+        return found_local_snapshot_dir
+    else:
+        log_info_on_rank0(
+            logger,
+            f"Local HF snapshot at {found_local_snapshot_dir} has no files matching "
+            f"{allow_patterns}; will attempt download.",
+        )
+        return None
 
 
 def download_weights_from_hf(
@@ -241,6 +441,7 @@ def download_weights_from_hf(
     allow_patterns: List[str],
     revision: Optional[str] = None,
     ignore_patterns: Optional[Union[str, List[str]]] = None,
+    max_retries: int = 3,
 ) -> str:
     """Download model weights from Hugging Face Hub.
 
@@ -255,36 +456,69 @@ def download_weights_from_hf(
         ignore_patterns (Optional[Union[str, List[str]]]): The patterns to
             filter out the weight files. Files matched by any of the patterns
             will be ignored.
+        max_retries (int): Maximum number of download retries if corruption
+            is detected. Defaults to 3.
 
     Returns:
         str: The path to the downloaded model weights.
     """
-    if not huggingface_hub.constants.HF_HUB_OFFLINE:
-        # Before we download we look at that is available:
-        fs = HfFileSystem()
-        file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+    # For local paths, no HF operations needed
+    if os.path.isdir(model_name_or_path):
+        return model_name_or_path
 
-        # depending on what is available we download different things
-        for pattern in allow_patterns:
-            matching = fnmatch.filter(file_list, pattern)
-            if len(matching) > 0:
-                allow_patterns = [pattern]
-                break
-
-    logger.info("Using model weights format %s", allow_patterns)
-    # Use file lock to prevent multiple processes from
-    # downloading the same model weights at the same time.
+    # Use a SINGLE lock for the entire operation (validation + cleanup + download)
+    # to prevent race conditions where:
+    # 1. Process A validates, finds corruption, deletes corrupted file
+    # 2. Process B validates, sees missing file, deletes ENTIRE cache
+    # 3. Process A tries to download but cache is gone
+    # By using one lock, validation/cleanup and download are atomic.
     with get_lock(model_name_or_path, cache_dir):
-        hf_folder = snapshot_download(
-            model_name_or_path,
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            cache_dir=cache_dir,
-            tqdm_class=DisabledTqdm,
-            revision=revision,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        # Check for valid local cache first (validates and cleans up if needed)
+        path = _find_local_hf_snapshot_dir_unlocked(
+            model_name_or_path, cache_dir, allow_patterns, revision
         )
-    return hf_folder
+        if path is not None:
+            # Valid local cache found, skip download
+            return path
+
+        # In CI, skip HF API calls if we're in offline mode or want to avoid rate limits
+        # But we already checked for local cache above, so if we're here we need to download
+        if not huggingface_hub.constants.HF_HUB_OFFLINE:
+            # Before we download we look at what is available:
+            fs = HfFileSystem()
+            file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+
+            # depending on what is available we download different things
+            for pattern in allow_patterns:
+                matching = fnmatch.filter(file_list, pattern)
+                if len(matching) > 0:
+                    allow_patterns = [pattern]
+                    break
+
+        log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
+
+        if not is_in_ci():
+            # Simple download without validation for non-CI environments
+            hf_folder = snapshot_download(
+                model_name_or_path,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                tqdm_class=DisabledTqdm,
+                revision=revision,
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            )
+            return hf_folder
+        else:
+            # Only perform validation and retry in CI to avoid overhead for regular users
+            return ci_download_with_validation_and_retry(
+                model_name_or_path=model_name_or_path,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                revision=revision,
+                max_retries=max_retries,
+            )
 
 
 def download_safetensors_index_file_from_hf(
@@ -333,6 +567,14 @@ def filter_duplicate_safetensors_files(
     # torch state_dict to safetensors file holding that weight.
     index_file_name = os.path.join(hf_folder, index_file)
     if not os.path.isfile(index_file_name):
+        # NOTE: this is a trick of handling mistral model
+        # skip the unsupported consolidated.safetensors file
+        if len(hf_weights_files) == 2:
+            hf_weights_files.sort()
+            if hf_weights_files[0].endswith(
+                "consolidated.safetensors"
+            ) and hf_weights_files[1].endswith("model.safetensors"):
+                return [hf_weights_files[1]]
         return hf_weights_files
 
     # Iterate through the weight_map (weight_name: safetensors files)
@@ -470,6 +712,61 @@ def safetensors_weights_iterator(
                     yield name, f.get_tensor(name)
 
 
+def fastsafetensors_weights_iterator(
+    hf_weights_files: List[str],
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """
+    Iterate over the weights in the model safetensor files
+    using fastsafetensor library to accelerate loading via GPU Direct Storage (if available).
+    """
+    if SafeTensorsFileLoader is None:
+        raise ImportError(
+            "Please install fastsafetensors via `pip install fastsafetensors`"
+        )
+
+    if torch.distributed.is_initialized():
+        pg = torch.distributed.group.WORLD
+    else:
+        pg = SingleGroup()
+
+    try:
+        rank = pg.rank()
+    except Exception:
+        rank = 0
+
+    device = torch.device(f"cuda:{rank}")
+
+    weight_files_sub_lists = [
+        hf_weights_files[i : i + pg.size()]
+        for i in range(0, len(hf_weights_files), pg.size())
+    ]
+
+    _BAR_FORMAT = (
+        "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+    )
+
+    for f_list in tqdm(
+        weight_files_sub_lists,
+        desc="Loading safetensors using Fastsafetensor loader",
+        disable=False,
+        bar_format=_BAR_FORMAT,
+    ):
+        loader = SafeTensorsFileLoader(pg, device)
+        rank_file_map = {i: [f] for i, f in enumerate(f_list)}
+        loader.add_filenames(rank_file_map)
+        try:
+            fb = loader.copy_files_to_device()
+            try:
+                keys = list(fb.key_to_rank_lidx.keys())
+                for k in keys:
+                    t = fb.get_tensor(k)
+                    yield k, t
+            finally:
+                pass
+        finally:
+            loader.close()
+
+
 def multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     is_all_weights_sharded: bool = False,
@@ -525,6 +822,26 @@ def multi_thread_safetensors_weights_iterator(
                 yield name, param
 
 
+def _load_pt_file(bin_file: str) -> dict:
+    """Load a PyTorch checkpoint file, handling legacy tar format.
+
+    PyTorch 2.6 changed the default of weights_only from False to True.
+    Legacy tar format files cannot be loaded with weights_only=True.
+    This function tries weights_only=True first, then falls back to False
+    for legacy tar format files from trusted sources (HuggingFace Hub).
+    """
+    try:
+        return torch.load(bin_file, map_location="cpu", weights_only=True)
+    except RuntimeError as e:
+        if "legacy .tar format" in str(e):
+            logger.warning(
+                "Loading %s with weights_only=False (legacy tar format)",
+                os.path.basename(bin_file),
+            )
+            return torch.load(bin_file, map_location="cpu", weights_only=False)
+        raise
+
+
 def pt_weights_iterator(
     hf_weights_files: List[str],
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
@@ -538,7 +855,7 @@ def pt_weights_iterator(
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
     ):
-        state = torch.load(bin_file, map_location="cpu", weights_only=True)
+        state = _load_pt_file(bin_file)
         yield from state.items()
         del state
 
@@ -552,12 +869,9 @@ def multi_thread_pt_weights_iterator(
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
-    def _load_file(bin_file: str):
-        return torch.load(bin_file, map_location="cpu", weights_only=True)
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(_load_file, bin_file) for bin_file in hf_weights_files
+            executor.submit(_load_pt_file, bin_file) for bin_file in hf_weights_files
         ]
 
         if enable_tqdm:
@@ -680,7 +994,7 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_attention_tp_rank()
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size

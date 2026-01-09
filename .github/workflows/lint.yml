@@ -1,6 +1,10 @@
 name: Lint
 
-on: [pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
   lint:
@@ -11,12 +15,36 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.10"
+          python-version: "3.12"
 
       - name: Install pre-commit hook
         run: |
           python -m pip install pre-commit
           pre-commit install
 
-      - name: Linting
-        run: pre-commit run --all-files --show-diff-on-failure
+      - name: Run pre-commit checks
+        run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
+
+      - name: Run sgl-kernel clang-format checks
+        uses: DoozyX/clang-format-lint-action@v0.18.1
+        with:
+          source: sgl-kernel
+          extensions: h,c,cpp,hpp,cu,cuh,cc
+          clangFormatVersion: 18
+          style: file
+
+      - name: Check proto files are in sync
+        run: |
+          if ! diff -q python/sglang/srt/grpc/sglang_scheduler.proto sgl-model-gateway/src/proto/sglang_scheduler.proto; then
+            echo "❌ ERROR: Proto files are out of sync!"
+            echo ""
+            echo "The following files must be kept identical:"
+            echo "  - python/sglang/srt/grpc/sglang_scheduler.proto"
+            echo "  - sgl-model-gateway/src/proto/sglang_scheduler.proto"
+            echo ""
+            echo "Please ensure both files have the same content."
+            echo ""
+            echo "Differences:"
+            diff python/sglang/srt/grpc/sglang_scheduler.proto sgl-model-gateway/src/proto/sglang_scheduler.proto || true
+            exit 1
+          fi

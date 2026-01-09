@@ -1,10 +1,11 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
 
@@ -187,7 +188,9 @@ fused_dual_residual_rmsnorm_kernel_autotune = rmsnorm_autotune(
 
 def fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps, autotune=False):
     assert len(x.shape) == 2
-    assert x.shape == residual.shape and x.dtype == residual.dtype
+    assert (
+        x.shape == residual.shape and x.dtype == residual.dtype
+    ), f"{x.shape=} {residual.shape=} {x.dtype=} {residual.dtype=}"
     output, mid = torch.empty_like(x), torch.empty_like(x)
     bs, hidden_dim = x.shape
     if autotune:
@@ -356,7 +359,12 @@ def experts_combine_kernel(
     tl.store(out_hidden_states + start_index_mlp + offsets, combined_x, mask=mask)
 
 
-def experts_combine_triton(moe_hidden_states, mlp_hidden_states, output_buffer=None):
+@register_custom_op(out_shape="mlp_hidden_states")
+def experts_combine_triton(
+    moe_hidden_states: torch.Tensor,
+    mlp_hidden_states: torch.Tensor,
+    output_buffer: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     assert moe_hidden_states.is_contiguous()
     assert mlp_hidden_states.is_contiguous()
 
@@ -391,6 +399,7 @@ def experts_combine_triton(moe_hidden_states, mlp_hidden_states, output_buffer=N
         hidden_dim,
         **config,
     )
+
     return out_hidden_states
 
 

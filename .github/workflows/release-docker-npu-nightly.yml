@@ -1,10 +1,11 @@
-name: Release Docker Images Nightly (Ascend NPU)
+name: Release Docker Images Nightly (NPU)
 on:
   pull_request:
     branches:
       - main
     paths:
       - ".github/workflows/release-docker-npu-nightly.yml"
+      - "docker/npu.Dockerfile"
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * *"
@@ -18,7 +19,7 @@ jobs:
     runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
-        cann_version: ["8.2.rc1"]
+        cann_version: ["8.3.rc2"]
         device_type: ["910b", "a3"]
     steps:
       - name: Checkout repository
@@ -64,7 +65,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: docker
-          file: docker/Dockerfile.npu
+          file: docker/npu.Dockerfile
           # TODO: need add x86 platforms support when memfabric is ready
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
@@ -72,5 +73,6 @@ jobs:
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
+            SGLANG_KERNEL_NPU_TAG=2025.12.31
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}

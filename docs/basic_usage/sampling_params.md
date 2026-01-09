@@ -12,7 +12,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 | text                       | `Optional[Union[List[str], str]] = None`                                     | The input prompt. Can be a single prompt or a batch of prompts.                                                                                                 |
 | input_ids                  | `Optional[Union[List[List[int]], List[int]]] = None`                         | The token IDs for text; one can specify either text or input_ids.                                                                                               |
 | input_embeds               | `Optional[Union[List[List[List[float]]], List[List[float]]]] = None`         | The embeddings for input_ids; one can specify either text, input_ids, or input_embeds.                                                                          |
-| image_data                 | `Optional[Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]] = None` | The image input. Can be an image instance, file name, URL, or base64 encoded string. Can be a single image, list of images, or list of lists of images. |
+| image_data                 | `Optional[Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]] = None` | The image input. Supports three formats: (1) **Raw images**: PIL Image, file path, URL, or base64 string; (2) **Processor output**: Dict with `format: "processor_output"` containing HuggingFace processor outputs; (3) **Precomputed embeddings**: Dict with `format: "precomputed_embedding"` and `feature` containing pre-calculated visual embeddings. Can be a single image, list of images, or list of lists of images. See [Multimodal Input Formats](#multimodal-input-formats) for details. |
 | audio_data                 | `Optional[Union[List[AudioDataItem], AudioDataItem]] = None`                 | The audio input. Can be a file name, URL, or base64 encoded string.                                                                                             |
 | sampling_params            | `Optional[Union[List[Dict], Dict]] = None`                                   | The sampling parameters as described in the sections below.                                                                                                     |
 | rid                        | `Optional[Union[List[str], str]] = None`                                     | The request ID.                                                                                                                                                 |
@@ -30,6 +30,18 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 
 The object is defined at `sampling_params.py::SamplingParams`. You can also read the source code to find more arguments and docs.
 
+### Note on defaults
+
+By default, SGLang initializes several sampling parameters from the model's `generation_config.json` (when the server is launched with `--sampling-defaults model`, which is the default). To use SGLang/OpenAI constant defaults instead, start the server with `--sampling-defaults openai`. You can always override any parameter per request via `sampling_params`.
+
+```bash
+# Use model-provided defaults from generation_config.json (default behavior)
+python -m sglang.launch_server --model-path <MODEL> --sampling-defaults model
+
+# Use SGLang/OpenAI constant defaults instead
+python -m sglang.launch_server --model-path <MODEL> --sampling-defaults openai
+```
+
 ### Core parameters
 
 | Argument        | Type/Default                                 | Description                                                                                                                                    |
@@ -37,10 +49,11 @@ The object is defined at `sampling_params.py::SamplingParams`. You can also read
 | max_new_tokens  | `int = 128`                                  | The maximum output length measured in tokens.                                                                                                  |
 | stop            | `Optional[Union[str, List[str]]] = None`     | One or multiple [stop words](https://platform.openai.com/docs/api-reference/chat/create#chat-create-stop). Generation will stop if one of these words is sampled. |
 | stop_token_ids  | `Optional[List[int]] = None`                 | Provide stop words in the form of token IDs. Generation will stop if one of these token IDs is sampled.                                        |
-| temperature     | `float = 1.0`                                | [Temperature](https://platform.openai.com/docs/api-reference/chat/create#chat-create-temperature) when sampling the next token. `temperature = 0` corresponds to greedy sampling, a higher temperature leads to more diversity. |
-| top_p           | `float = 1.0`                                | [Top-p](https://platform.openai.com/docs/api-reference/chat/create#chat-create-top_p) selects tokens from the smallest sorted set whose cumulative probability exceeds `top_p`. When `top_p = 1`, this reduces to unrestricted sampling from all tokens. |
-| top_k           | `int = -1`                                   | [Top-k](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) randomly selects from the `k` highest-probability tokens. |
-| min_p           | `float = 0.0`                                | [Min-p](https://github.com/huggingface/transformers/issues/27670) samples from tokens with probability larger than `min_p * highest_token_probability`. |
+| stop_regex      | `Optional[Union[str, List[str]]] = None`     | Stop when hitting any of the regex patterns in this list |
+| temperature     | `float (model default; fallback 1.0)`        | [Temperature](https://platform.openai.com/docs/api-reference/chat/create#chat-create-temperature) when sampling the next token. `temperature = 0` corresponds to greedy sampling, a higher temperature leads to more diversity. |
+| top_p           | `float (model default; fallback 1.0)`        | [Top-p](https://platform.openai.com/docs/api-reference/chat/create#chat-create-top_p) selects tokens from the smallest sorted set whose cumulative probability exceeds `top_p`. When `top_p = 1`, this reduces to unrestricted sampling from all tokens. |
+| top_k           | `int (model default; fallback -1)`           | [Top-k](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) randomly selects from the `k` highest-probability tokens. |
+| min_p           | `float (model default; fallback 0.0)`        | [Min-p](https://github.com/huggingface/transformers/issues/27670) samples from tokens with probability larger than `min_p * highest_token_probability`. |
 
 ### Penalizers
 
@@ -48,6 +61,7 @@ The object is defined at `sampling_params.py::SamplingParams`. You can also read
 |--------------------|------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
 | frequency_penalty  | `float = 0.0`          | Penalizes tokens based on their frequency in generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of penalization grows linearly with each appearance of a token. |
 | presence_penalty   | `float = 0.0`          | Penalizes tokens if they appeared in the generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of the penalization is constant if a token occurred. |
+| repetition_penalty | `float = 1.0`          | Scales the logits of previously generated tokens to discourage (values > 1) or encourage (values < 1) repetition. Valid range is `[0, 2]`; `1.0` leaves probabilities unchanged. |
 | min_new_tokens     | `int = 0`              | Forces the model to generate at least `min_new_tokens` until a stop word or EOS token is sampled. Note that this might lead to unintended behavior, for example, if the distribution is highly skewed towards these tokens. |
 
 ### Constrained decoding
@@ -148,7 +162,7 @@ python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-o
 Download an image:
 
 ```bash
-curl -o example_image.png -L https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true
+curl -o example_image.png -L https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true
 ```
 
 Send a request:
@@ -258,7 +272,10 @@ Detailed example in [structured outputs](../advanced_features/structured_outputs
 Launch a server with `--enable-custom-logit-processor` flag on.
 
 ```bash
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --enable-custom-logit-processor
+python -m sglang.launch_server \
+  --model-path meta-llama/Meta-Llama-3-8B-Instruct \
+  --port 30000 \
+  --enable-custom-logit-processor
 ```
 
 Define a custom logit processor that will always sample a specific token id.
@@ -302,4 +319,28 @@ response = requests.post(
     },
 )
 print(response.json())
+```
+
+Send an OpenAI chat completion request:
+
+```python
+import openai
+from sglang.utils import print_highlight
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
+
+response = client.chat.completions.create(
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
+    messages=[
+        {"role": "user", "content": "List 3 countries and their capitals."},
+    ],
+    temperature=0.0,
+    max_tokens=32,
+    extra_body={
+        "custom_logit_processor": DeterministicLogitProcessor().to_str(),
+        "custom_params": {"token_id": 5},
+    },
+)
+
+print_highlight(f"Response: {response}")
 ```

@@ -16,28 +16,33 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional
 
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.hf_transformers_utils import AutoConfig
-from sglang.srt.lora.backend.base_backend import BaseLoRABackend, get_backend_from_name
+from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
-    LoRABatchInfo,
     LoRAType,
-    get_layer_id,
     get_normalized_target_modules,
     get_target_module_name,
 )
-from sglang.srt.managers.io_struct import LoRAUpdateResult
+from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import replace_submodule
+from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +61,7 @@ class LoRAManager:
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
         lora_paths: Optional[List[LoRARef]] = None,
+        server_args: Optional[ServerArgs] = None,
     ):
         self.base_model: torch.nn.Module = base_model
         self.base_hf_config: AutoConfig = base_hf_config
@@ -65,11 +71,19 @@ class LoRAManager:
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
+        self.lora_added_tokens_size: Optional[int] = None
+
+        # Store eviction policy from server args
+        self.eviction_policy = server_args.lora_eviction_policy
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
         backend_type = get_backend_from_name(lora_backend)
-        self.lora_backend: BaseLoRABackend = backend_type(lora_backend)
+        self.lora_backend: BaseLoRABackend = backend_type(
+            max_loras_per_batch=max_loras_per_batch,
+            device=self.device,
+            server_args=server_args,
+        )
 
         # Initialize mutable internal state of the LoRAManager.
         self.init_state(
@@ -78,38 +92,19 @@ class LoRAManager:
             lora_paths=lora_paths,
         )
 
-    def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
+    def init_cuda_graph_batch_info(
+        self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
+    ):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
-        with torch.device("cuda"):
-            self.cuda_graph_batch_info = LoRABatchInfo(
-                bs=self.max_bs_in_cuda_graph,
-                seg_lens=torch.zeros(self.max_bs_in_cuda_graph, dtype=torch.int32),
-                seg_indptr=torch.zeros(
-                    self.max_bs_in_cuda_graph + 1, dtype=torch.int32
-                ),
-                max_len=1,
-                weight_indices=torch.zeros(
-                    self.max_bs_in_cuda_graph, dtype=torch.int32
-                ),
-                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
-                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
-            )
-
-            # Initialize seg_lens and seg_indptr for CUDA graph as they remain constant
-            # across batches.
-            self.cuda_graph_batch_info.seg_lens[: self.max_bs_in_cuda_graph].fill_(1)
-            torch.cumsum(
-                self.cuda_graph_batch_info.seg_lens[: self.max_bs_in_cuda_graph],
-                dim=0,
-                out=self.cuda_graph_batch_info.seg_indptr[
-                    1 : self.max_bs_in_cuda_graph + 1
-                ],
-            )
+        self.lora_backend.init_cuda_graph_batch_info(
+            max_bs_in_cuda_graph=max_bs_in_cuda_graph,
+            num_tokens_per_bs=num_tokens_per_bs,
+        )
 
     def create_lora_update_result(
         self, success: bool, error_message: str = ""
-    ) -> LoRAUpdateResult:
-        return LoRAUpdateResult(
+    ) -> LoRAUpdateOutput:
+        return LoRAUpdateOutput(
             success=success,
             error_message=error_message,
             loaded_adapters={
@@ -118,7 +113,7 @@ class LoRAManager:
             },
         )
 
-    def load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateResult:
+    def load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Load a single LoRA adapter from the specified path.
 
@@ -157,6 +152,19 @@ class LoRAManager:
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
 
+        # Check if this LoRA adapter is already loaded
+        for existing_lora_ref in self.lora_refs.values():
+            if lora_ref.lora_name == existing_lora_ref.lora_name:
+                raise ValueError(
+                    f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+                )
+
+            if lora_ref.lora_path == existing_lora_ref.lora_path:
+                logger.warning(
+                    f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
+                    f"but another copy is being loaded with name: {lora_ref.lora_name}"
+                )
+
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
         incompatible = memory_pool and not memory_pool.can_support(lora_config)
@@ -175,7 +183,7 @@ class LoRAManager:
                 "`--max-loras-per-batch` or load it as unpinned LoRA adapters."
             )
 
-    def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateResult:
+    def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Unload LoRA adapters by their names. This will remove the adapters from the memory pool and
         delete the corresponding LoRA modules.
@@ -232,7 +240,6 @@ class LoRAManager:
         return required_slots <= mem_pool_vacancy
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
-
         # Load active loras into lora memory pool
         cur_uids = set(forward_batch.lora_ids)
 
@@ -242,107 +249,37 @@ class LoRAManager:
             lora_adapters=self.loras,
             lora_modules=self.lora_modules,
             lora_refs=self.lora_refs.copy(),  # copy snapshot of current lora_refs to avoid mutation during the batch preparation.
+            lora_embed_tokens_module=self.embed_tokens_module,  # merge into embedding or lora module
+            lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
         )
 
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
-        def transfer_adapter_info(
-            weight_indices_out: torch.Tensor,
-            lora_ranks_out: torch.Tensor,
-            scalings_out: torch.Tensor,
-        ):
-            """
-            Transfer adapter metadata (weight indices, LoRA rank, scalings) from host
-            to device (CUDA) asynchronously.
-            """
-            weight_indices = [0] * len(forward_batch.lora_ids)
-            lora_ranks = [0] * self.max_loras_per_batch
-            scalings = [0] * self.max_loras_per_batch
-            for i, uid in enumerate(forward_batch.lora_ids):
-                weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-                if uid is not None:
-                    lora = self.loras[uid]
-                    lora_ranks[weight_indices[i]] = lora.config.r
-                    scalings[weight_indices[i]] = lora.scaling
-
-            # Use pinned memory to avoid synchronizations during host-to-device transfer
-            weight_indices_tensor = torch.tensor(
-                weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
-            )
-            lora_ranks_tensor = torch.tensor(
-                lora_ranks, dtype=torch.int32, pin_memory=True, device="cpu"
-            )
-            scalings_tensor = torch.tensor(
-                scalings, dtype=torch.float, pin_memory=True, device="cpu"
-            )
-
-            # Copy to device tensors asynchronously
-            weight_indices_out[:bs].copy_(weight_indices_tensor, non_blocking=True)
-            lora_ranks_out[: self.max_loras_per_batch].copy_(
-                lora_ranks_tensor, non_blocking=True
-            )
-            scalings_out[: self.max_loras_per_batch].copy_(
-                scalings_tensor, non_blocking=True
-            )
-
-        if (
+        use_cuda_graph = (
             hasattr(self, "max_bs_in_cuda_graph")
             and bs <= self.max_bs_in_cuda_graph
             and forward_batch.forward_mode.is_cuda_graph()
-        ):
-            # Do in-place updates when CUDA graph is enabled and the batch forward mode
-            # could use CUDA graph.
+        )
 
-            transfer_adapter_info(
-                self.cuda_graph_batch_info.weight_indices,
-                self.cuda_graph_batch_info.lora_ranks,
-                self.cuda_graph_batch_info.scalings,
-            )
-
-            self.cuda_graph_batch_info.bs = bs
-            self.cuda_graph_batch_info.max_len = 1
-            batch_info = self.cuda_graph_batch_info
-        else:
-            weight_indices = torch.empty((bs,), dtype=torch.int32, device=self.device)
-            lora_ranks = torch.zeros(
-                (self.max_loras_per_batch,), dtype=torch.int64, device=self.device
-            )
-            scalings = torch.zeros(
-                (self.max_loras_per_batch,), dtype=torch.float, device=self.device
-            )
-            transfer_adapter_info(
-                weight_indices,
-                lora_ranks,
-                scalings,
-            )
-
-            seg_lens = (
-                forward_batch.extend_seq_lens
-                if forward_batch.forward_mode.is_extend()
-                else torch.ones(bs, device=self.device)
-            )
-
-            max_len = (
-                # Calculate max_len from the CPU copy to avoid D2H transfer.
-                max(forward_batch.extend_seq_lens_cpu)
-                if forward_batch.forward_mode.is_extend()
-                else 1
-            )
-
-            seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
-            seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
-
-            batch_info = LoRABatchInfo(
-                bs=bs,
-                seg_lens=seg_lens,
-                seg_indptr=seg_indptr,
-                max_len=max_len,
-                weight_indices=weight_indices,
-                lora_ranks=lora_ranks,
-                scalings=scalings,
-            )
-        self.lora_backend.set_batch_info(batch_info)
+        weight_indices = [0] * len(forward_batch.lora_ids)
+        lora_ranks = [0] * self.max_loras_per_batch
+        scalings = [0] * self.max_loras_per_batch
+        for i, uid in enumerate(forward_batch.lora_ids):
+            weight_indices[i] = self.memory_pool.get_buffer_id(uid)
+            if uid is not None:
+                lora = self.loras[uid]
+                lora_ranks[weight_indices[i]] = lora.config.r
+                scalings[weight_indices[i]] = lora.scaling
+        # Do in-place updates when CUDA graph is enabled and the batch forward mode
+        # could use CUDA graph.
+        self.lora_backend.prepare_lora_batch(
+            forward_batch=forward_batch,
+            weight_indices=weight_indices,
+            lora_ranks=lora_ranks,
+            scalings=scalings,
+            use_cuda_graph=use_cuda_graph,
+        )
 
     def update_lora_info(self):
         """
@@ -365,6 +302,21 @@ class LoRAManager:
                         lora_type=LoRAType.LORA_B,
                     ),
                 )
+
+        # Update embedding layer if present - gotta merge (refer to PR codebase)
+        if self.embed_tokens_module is not None:
+            self.embed_tokens_module.set_lora_info(
+                self.memory_pool.get_embedding_tensor("added_tokens", LoRAType.LORA_A),
+                self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_A),
+                self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_B),
+            )
+
+        # Update lm_head layer if present
+        if self.lm_head_module is not None:
+            self.lm_head_module.set_lora_info(
+                self.memory_pool.get_embedding_tensor("lm_head", LoRAType.LORA_A),
+                self.memory_pool.get_embedding_tensor("lm_head", LoRAType.LORA_B),
+            )
 
     def init_state(
         self,
@@ -460,6 +412,24 @@ class LoRAManager:
                 default=0,
             )
 
+        # Auto-infer self.lora_added_vocab_size from loaded LoRA configs
+        # This happens automatically without requiring user input
+        # if self.lora_added_vocab_size is None:
+        if self.lora_added_tokens_size is None:
+            inferred_extra_vocab_size = next(
+                (
+                    x.lora_added_tokens_size
+                    for x in self.configs.values()
+                    if x.lora_added_tokens_size > 0
+                ),
+                0,
+            )
+            if inferred_extra_vocab_size > 0:
+                logger.info(
+                    f"self.lora_added_tokens_size={inferred_extra_vocab_size} from LoRA adapters."
+                )
+            self.lora_added_tokens_size = inferred_extra_vocab_size
+
     def load_lora_weights(self, lora_ref: LoRARef):
         """
         Load the weights of a LoRA adapter to CPU memory and conducts post-loading validation.
@@ -485,6 +455,8 @@ class LoRAManager:
             max_lora_rank=self.max_lora_rank,
             target_modules=self.target_modules,
             base_model=self.base_model,
+            eviction_policy=self.eviction_policy,
+            lora_added_tokens_size=self.lora_added_tokens_size,
         )
 
     def set_lora_module(self, module_name, module):
@@ -498,6 +470,9 @@ class LoRAManager:
             {} for _ in range(self.base_hf_config.num_hidden_layers)
         ]
 
+        self.embed_tokens_module: Optional[BaseLayerWithLoRA] = None
+        self.lm_head_module: Optional[BaseLayerWithLoRA] = None
+
         for module_name, module in self.base_model.named_modules():
             # TODO (lifuhuang): in the future, we should consider generalizing the
             # should_apply_lora function to support mapping by full module name instead
@@ -508,6 +483,24 @@ class LoRAManager:
                 self.base_model, "should_apply_lora", None
             ) and not self.base_model.should_apply_lora(module_name):
                 continue
+
+            # Handle embed_tokens
+            if "embed_tokens" in module_name and "embed_tokens" in self.target_modules:
+                if isinstance(module, VocabParallelEmbedding) and not isinstance(
+                    module, BaseLayerWithLoRA
+                ):
+                    lora_module = self.set_lora_module(module_name, module)
+                    self.embed_tokens_module = lora_module
+                    continue
+
+            # Handle lm_head
+            if "lm_head" in module_name and "lm_head" in self.target_modules:
+                if isinstance(module, ParallelLMHead) and not isinstance(
+                    module, BaseLayerWithLoRA
+                ):
+                    lora_module = self.set_lora_module(module_name, module)
+                    self.lm_head_module = lora_module
+                    continue
 
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in self.target_modules:

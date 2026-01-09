@@ -1,3 +1,4 @@
+import itertools
 import math
 
 import torch
@@ -15,9 +16,27 @@ factor_for_scale = 1e-3
 fp8_max, fp8_min = 400, -400
 
 
+def parametrize(**params):
+    def decorator(func):
+        def wrapper(self):
+            for combo in itertools.product(*params.values()):
+                kwargs = dict(zip(params.keys(), combo))
+                with self.subTest(**kwargs):
+                    func(self, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 def SiluAndMul(x: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1] // 2
     return F.silu(x[..., :d]) * x[..., d:]
+
+
+def GeluAndMul(x: torch.Tensor, approximate="tanh") -> torch.Tensor:
+    d = x.shape[-1] // 2
+    return F.gelu(x[..., :d], approximate=approximate) * x[..., d:]
 
 
 def per_token_quant_int8(x):

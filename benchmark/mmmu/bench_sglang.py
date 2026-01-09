@@ -83,9 +83,9 @@ async def process_sample(
     assert image is not None
     image_path = sample["image_path"]
     extra_body = None if lora_path is None else {"lora_path": lora_path}
-    response = await client.chat.completions.create(
-        model="default",
-        messages=[
+    payload = {
+        "model": "default",
+        "messages": [
             {
                 "role": "user",
                 "content": [
@@ -95,11 +95,11 @@ async def process_sample(
                 ],
             }
         ],
-        temperature=0,
-        max_completion_tokens=sampling_params["max_new_tokens"],
-        max_tokens=sampling_params["max_new_tokens"],
-        extra_body=extra_body,
-    )
+        "extra_body": extra_body,
+    }
+    if sampling_params:
+        payload.update(sampling_params)
+    response = await client.chat.completions.create(**payload)
     return sample, response.choices[0].message.content
 
 
@@ -124,7 +124,9 @@ async def eval_mmmu(args) -> None:
     answer_dict = {}
     out_samples = {}
     client = openai.AsyncOpenAI(
-        api_key="sk", base_url=f"http://127.0.0.1:{args.port}/v1"
+        api_key="sk",
+        base_url=f"http://127.0.0.1:{args.port}/v1",
+        timeout=20 * 60 * 60,
     )
     start = time.perf_counter()
     base_url = f"http://127.0.0.1:{args.port}"
@@ -146,13 +148,14 @@ async def eval_mmmu(args) -> None:
             _, response = await process_sample(
                 client, sample, sampling_params, lora_path
             )
+            sample["original_response"] = response
             answer = (
                 re.search(args.response_answer_regex, response)
                 if response is not None
                 else None
             )
             process_result(
-                answer.group(1) if answer else response,
+                answer.group(1).strip() if answer else response,
                 sample,
                 answer_dict,
                 out_samples,
@@ -168,13 +171,14 @@ async def eval_mmmu(args) -> None:
 
         for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
             sample, response = await coro
+            sample["original_response"] = response
             answer = (
                 re.search(args.response_answer_regex, response)
                 if response is not None
                 else None
             )
             process_result(
-                answer.group(1) if answer else response,
+                answer.group(1).strip() if answer else response,
                 sample,
                 answer_dict,
                 out_samples,

@@ -19,17 +19,18 @@
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
 import logging
-import re
 from typing import Dict, List
 
 import torch
 from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.hf_transformers_utils import AutoConfig
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class LoRALayer(nn.Module):
 
 
 class LoRAAdapter(nn.Module):
+
     def __init__(
         self,
         uid: str,
@@ -69,24 +71,46 @@ class LoRAAdapter(nn.Module):
             ]
         )
 
-        self.weights: Dict[str, torch.Tensor] = {}
+        self.embedding_layers: Dict[str, torch.Tensor] = {}
+        self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
 
     # initialize the LoRA weights to cpu
     def initialize_weights(self):
         model_path = self.config.path
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
+
+        # Get normalized target modules for filtering
+        from sglang.srt.lora.utils import get_normalized_target_modules
+
+        normalized_target_modules = get_normalized_target_modules(
+            self.config.target_modules
+        )
+
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(
                 model_path, revision=revision, fall_back_to_pt=True
             )
         ):
-            match = re.search(r"layers\.(\d+)\.", name)
-            if match is not None:
-                layer_id = int(match.group(1))
+            layer_id = get_layer_id(name)
+            if layer_id is not None:
                 self.layers[layer_id].weights[name] = loaded_weight.cpu()
-            else:
-                self.weights[name] = loaded_weight.cpu()
+            elif "embed_tokens" in name or "lm_head" in name:
+                # Check if this module is declared in target_modules before loading
+                module_name = "embed_tokens" if "embed_tokens" in name else "lm_head"
+                if module_name in normalized_target_modules:
+                    self.embedding_layers[name] = loaded_weight.cpu()
+                else:
+                    logger.debug(
+                        f"Skipping {name} as '{module_name}' is not in adapter's target_modules: {self.config.target_modules}"
+                    )
+            elif "input_embeddings" in name or "output_embeddings" in name:
+                # added/extra token emb
+                self.added_tokens_embeddings[name] = loaded_weight.cpu()
+                assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
+                    f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
+                    f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
+                )
 
         # normalize kv_proj and gate_up_proj
         for layer in self.layers:
@@ -156,8 +180,8 @@ class LoRAAdapter(nn.Module):
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
                 if up_name not in weights:
                     weights[up_name] = torch.zeros_like(weights[weight_name])
-                    assert self.lora_backend.name == "triton", (
-                        f"LoRA weight initialization currently only supported for 'triton' backend. "
+                    assert self.lora_backend.name in LORA_SUPPORTED_BACKENDS, (
+                        f"LoRA weight initialization currently only supported for LoRA backends: {', '.join(b for b in LORA_SUPPORTED_BACKENDS)}"
                         f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
                         f"or consider implementing custom initialization logic for other backends."
                     )

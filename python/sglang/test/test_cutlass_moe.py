@@ -1,5 +1,4 @@
 import argparse
-import time
 
 import torch
 import triton  # Added import
@@ -22,7 +21,7 @@ def calc_diff(x, y):
 
 def get_model_config(tp_size: int):
     config = AutoConfig.from_pretrained(
-        "deepseek-ai/deepseek-R1", trust_remote_code=True
+        "deepseek-ai/Deepseek-R1", trust_remote_code=True
     )
     E = config.n_routed_experts
     topk = config.num_experts_per_tok
@@ -34,7 +33,7 @@ def get_model_config(tp_size: int):
         "topk": topk,
         "hidden_size": config.hidden_size,
         "shard_intermediate_size": shard_intermediate_size,
-        "dtype": config.torch_dtype,
+        "dtype": config.dtype,
         "block_shape": config.quantization_config["weight_block_size"],
     }
 
@@ -129,6 +128,12 @@ def run_test(tp_size, batch_size, model_config, check=False):
     problem_sizes1 = torch.empty((E, 3), dtype=torch.int32, device="cuda")
     problem_sizes2 = torch.empty((E, 3), dtype=torch.int32, device="cuda")
 
+    enable_es = (False, False)
+    if torch.cuda.get_device_name(torch.cuda.current_device()) == "NVIDIA H200":
+        enable_es = (False, True)
+    elif torch.cuda.get_device_name(torch.cuda.current_device()) == "NVIDIA H20":
+        enable_es = (True, True)
+
     # --- Lambdas for Benchmarking ---
     cutlass_lambda = lambda: cutlass_fused_experts_fp8(
         x,
@@ -151,6 +156,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
         expert_offsets,
         problem_sizes1,
         problem_sizes2,
+        enable_es=enable_es,
     )
 
     topk_output = StandardTopKOutput(
@@ -163,11 +169,10 @@ def run_test(tp_size, batch_size, model_config, check=False):
 
     moe_runner_config = MoeRunnerConfig(
         num_experts=E,
-        topk=topk,
+        top_k=topk,
         hidden_size=H,
-        shard_intermediate_size=I,
-        dtype=dtype,
-        block_shape=block_shape,
+        intermediate_size_per_partition=I,
+        params_dtype=dtype,
         activation="silu",
         inplace=False,
     )
@@ -236,6 +241,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
                 expert_offsets,
                 problem_sizes1,
                 problem_sizes2,
+                enable_es=enable_es,
             )
 
             # Run Triton version (requires original shape weights, use inplace=False)

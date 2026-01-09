@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/gemma3_mm.py
 
 import logging
+import re
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
 
@@ -23,7 +24,6 @@ import torch
 from torch import nn
 from transformers import Gemma3Config, PreTrainedModel
 
-from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -44,6 +44,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +155,10 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
     embedding_modules = {}
     embedding_padding_modules = []
     supports_lora = True
+    # Pattern to match language model layers only (skip vision_tower and multi_modal_projector)
+    lora_pattern = re.compile(
+        r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
+    )
 
     def __init__(
         self,
@@ -164,6 +169,13 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
         self.quant_config = quant_config
+
+        # For LoRA compatibility: expose text_config attributes at top level
+        # This allows LoRA code to work without special multimodal handling
+        if not hasattr(config, "num_hidden_layers"):
+            config.num_hidden_layers = config.text_config.num_hidden_layers
+        if not hasattr(config, "hidden_size"):
+            config.hidden_size = config.text_config.hidden_size
 
         self.vision_tower = SiglipVisionModel(
             config=config.vision_config,
@@ -278,15 +290,26 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
     def get_image_feature(self, items: List[MultimodalDataItem]):
         """
         Projects the last hidden state from the vision model into language model space.
+        Supports both raw image pixel values and precomputed embeddings.
 
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
         # Process images one by one to handle flatten_batch=True constraint in vision_tower
         all_pixel_values = flatten_nested_list([item.feature for item in items])
-        vision_outputs_list = []
+
+        final_features_list = []
 
         for pixel_values_batch in all_pixel_values:
+            if (
+                pixel_values_batch.dim() == 3
+                and pixel_values_batch.shape[-1] == self.config.text_config.hidden_size
+            ):
+                final_features_list.append(
+                    pixel_values_batch.to(self.language_model.device)
+                )
+                continue
+
             # Normalize input shape to [batch_size, channels, height, width]
             if pixel_values_batch.dim() == 5:
                 pixel_values_batch = pixel_values_batch.squeeze(0)
@@ -297,20 +320,29 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                     f"Unexpected pixel_values shape: {pixel_values_batch.shape}"
                 )
 
-            # Process each image in the batch
+            # Process each image in the batch through Vision Tower
+            batch_vision_outputs = []
             batch_size = pixel_values_batch.shape[0]
+
             for i in range(batch_size):
                 pixel_value = pixel_values_batch[i : i + 1]  # Keep batch dimension as 1
                 pixel_value = pixel_value.to(
                     device=self.vision_tower.device, dtype=self.language_model.dtype()
                 )
                 vision_output = self.vision_tower(pixel_values=pixel_value)
-                vision_outputs_list.append(vision_output)
+                batch_vision_outputs.append(vision_output)
 
-        # Concatenate all vision outputs
-        vision_outputs = torch.cat(vision_outputs_list, dim=0)
-        image_features = self.multi_modal_projector(vision_outputs)
-        return image_features
+            if batch_vision_outputs:
+                vision_outputs_cat = torch.cat(batch_vision_outputs, dim=0)
+
+                projected_features = self.multi_modal_projector(vision_outputs_cat)
+                final_features_list.append(projected_features)
+
+        # Concatenate all features (all are now in text space)
+        if final_features_list:
+            return torch.cat(final_features_list, dim=0)
+        else:
+            return torch.tensor([], device=self.language_model.device)
 
     @torch.no_grad()
     def forward(
@@ -379,6 +411,10 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         )
 
         return hs
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        """Skip vision tower and multi_modal_projector for LoRA."""
+        return bool(self.lora_pattern.match(module_name))
 
     def tie_weights(self):
         return self.language_model.tie_weights()

@@ -54,6 +54,7 @@ class MathEval(Eval):
                 sampler._pack_message(content=QUERY_TEMPLATE.format(**row), role="user")
             ]
             response_text = sampler(prompt_messages)
+            response_text = response_text or ""
             match = re.search(ANSWER_PATTERN, response_text)
             extracted_answer = match.group(1) if match else None
             score = float(
