@@ -27,8 +27,8 @@ logger = init_logger(__name__)
 @dataclass(frozen=True)
 class AttentionBackendSpec:
     fallback: str | None = None
-    log_msg: str
-    import_path: str
+    log_msg: str | None = None
+    import_path: str | None = None
     fallback_msg: str | None = None
     error_prefix: str | None = None
     error_msg: str | None = None
@@ -99,16 +99,33 @@ class AttentionBackendEnum(enum.Enum):
         ],
     )
 
-    FA2 = enum.auto()
-    FA = enum.auto()
+    VMOBA_ATTN = AttentionBackendSpec(
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend",
+        log_msg="Using Video MOBA Attention backend",
+        error_prefix="Failed to import Video MoBA Attention backend",
+        error_msg="Video MoBA Attention backend is not installed. ",
+        imports=[
+            ("kernel.attn.vmoba_attn.vmoba", "moba_attn_varlen"),
+            (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba",
+                "VMOBAAttentionBackend",
+            ),
+        ],
+    )
 
-    TORCH_SDPA = enum.auto()
-    SAGE_ATTN = enum.auto()
-    SAGE_ATTN_3 = enum.auto()
-    VIDEO_SPARSE_ATTN = enum.auto()
-    VMOBA_ATTN = enum.auto()
-    AITER = enum.auto()
-    NO_ATTENTION = enum.auto()
+    AITER = AttentionBackendSpec(
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend",
+        log_msg="Using AITer backend",
+    )
+
+    TORCH_SDPA = AttentionBackendSpec(
+        import_path="sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend",
+        log_msg="Using Torch SDPA backend.",
+    )
+
+    FA = AttentionBackendSpec()
+    FA2 = AttentionBackendSpec()
+    NO_ATTENTION = AttentionBackendSpec()
 
     def __str__(self):
         return self.name.lower()
