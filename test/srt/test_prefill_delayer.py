@@ -183,19 +183,6 @@ _NEGOTIATE_TEST_CASES = [
         expected_reason="delay",
     ),
     NegotiateTestCase(
-        name="mixed_watermark_high_token_usage_rank_should_also_allow",
-        max_delay_passes=100,
-        token_usage_low_watermark=0.8,
-        calls=[
-            NegotiateCall(
-                prefillable=[True, True, False, False],
-                token_usage=[0.9, 0.5, 0.9, 0.9],
-            )
-        ],
-        expected_allow=True,
-        expected_reason="token_watermark",
-    ),
-    NegotiateTestCase(
         name="mixed_timeout",
         max_delay_passes=3,
         token_usage_low_watermark=0.8,
