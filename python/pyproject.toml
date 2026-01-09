@@ -125,6 +125,10 @@ dev = ["sglang[test]"]
 st-attn = ["torch", "setuptools"]
 vsa = ["torch", "setuptools"]
 
+[[tool.uv.index]]
+name = "torch"
+url = "https://download.pytorch.org/whl/cu129"
+
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
