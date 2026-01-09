@@ -313,6 +313,7 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     max_idle_secs: u64,
+    assignment_mode: String,
     max_payload_size: usize,
     dp_aware: bool,
     api_key: Option<String>,
@@ -421,6 +422,11 @@ impl Router {
                 PolicyType::Manual => ConfigPolicyConfig::Manual {
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_idle_secs: self.max_idle_secs,
+                    assignment_mode: match self.assignment_mode.as_str() {
+                        "random" => config::ManualAssignmentMode::Random,
+                        "min_load" => config::ManualAssignmentMode::MinLoad,
+                        other => panic!("Unknown assignment mode: {}", other),
+                    },
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
@@ -594,6 +600,7 @@ impl Router {
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
         max_idle_secs = 14400,
+        assignment_mode = String::from("random"),
         max_payload_size = 512 * 1024 * 1024,
         dp_aware = false,
         api_key = None,
@@ -677,6 +684,7 @@ impl Router {
         eviction_interval_secs: u64,
         max_tree_size: usize,
         max_idle_secs: u64,
+        assignment_mode: String,
         max_payload_size: usize,
         dp_aware: bool,
         api_key: Option<String>,
@@ -773,6 +781,7 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             max_idle_secs,
+            assignment_mode,
             max_payload_size,
             dp_aware,
             api_key,
