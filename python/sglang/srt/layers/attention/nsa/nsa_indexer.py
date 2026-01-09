@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -23,6 +24,7 @@ if is_npu():
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
@@ -146,6 +148,10 @@ class Indexer(MultiPlatformOp):
         if is_cuda():
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
+            pp_size = get_global_server_args().pp_size
+            self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
+        else:
+            self.logits_with_pp_recv = False
 
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
@@ -183,6 +189,21 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+
+    @contextlib.contextmanager
+    def _with_real_sm_count(self):
+        # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
+        # request to receive the PP proxy tensor or output from the previous stage, occupying one SM resource.
+        # Model execution runs in parallel with the recv operation, so the SMs available to the indexer must be reduced
+        # by 1. Currently, the last rank starts the send result + recv request only after waiting for execution results.
+        if self.logits_with_pp_recv:
+            pp_recv_sm_count = 1
+            with deep_gemm_wrapper.configure_deep_gemm_num_sms(
+                self.sm_count - pp_recv_sm_count
+            ):
+                yield
+        else:
+            yield
 
     @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
@@ -333,7 +354,6 @@ class Indexer(MultiPlatformOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_fp8,
             kv_cache_fp8,
@@ -432,14 +452,15 @@ class Indexer(MultiPlatformOp):
 
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8[:q_offset],
-                kv_fp8,
-                weights[:q_offset],
-                ks,
-                ke,
-                clean_logits=False,
-            )
+            with self._with_real_sm_count():
+                logits = deep_gemm.fp8_mqa_logits(
+                    q_fp8[:q_offset],
+                    kv_fp8,
+                    weights[:q_offset],
+                    ks,
+                    ke,
+                    clean_logits=False,
+                )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
@@ -468,14 +489,15 @@ class Indexer(MultiPlatformOp):
         while start < q_offset:
             end = min(start + max_rows, q_offset)
 
-            logits_chunk = deep_gemm.fp8_mqa_logits(
-                q_fp8[start:end],
-                kv_fp8,
-                weights[start:end],
-                ks[start:end],
-                ke[start:end],
-                clean_logits=False,
-            )
+            with self._with_real_sm_count():
+                logits_chunk = deep_gemm.fp8_mqa_logits(
+                    q_fp8[start:end],
+                    kv_fp8,
+                    weights[start:end],
+                    ks[start:end],
+                    ke[start:end],
+                    clean_logits=False,
+                )
 
             lengths_chunk = seq_lens_expanded[start:end]
 
@@ -630,14 +652,15 @@ class Indexer(MultiPlatformOp):
             ke_offset = torch.cat(ke_offset_list, dim=0)
             ke = ks + ke_offset
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8,
-                kv_fp8,
-                weights,
-                ks,
-                ke,
-                clean_logits=False,
-            )
+            with self._with_real_sm_count():
+                logits = deep_gemm.fp8_mqa_logits(
+                    q_fp8,
+                    kv_fp8,
+                    weights,
+                    ks,
+                    ke,
+                    clean_logits=False,
+                )
             topk_result = metadata.topk_transform(
                 logits,
                 self.index_topk,
@@ -675,14 +698,15 @@ class Indexer(MultiPlatformOp):
             )
             ke = ks + ke_offset
 
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8,
-                kv_fp8,
-                weights,
-                ks,
-                ke,
-                clean_logits=False,
-            )
+            with self._with_real_sm_count():
+                logits = deep_gemm.fp8_mqa_logits(
+                    q_fp8,
+                    kv_fp8,
+                    weights,
+                    ks,
+                    ke,
+                    clean_logits=False,
+                )
             actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
                 device="cuda", non_blocking=True
             )
