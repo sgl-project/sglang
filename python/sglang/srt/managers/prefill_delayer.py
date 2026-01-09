@@ -73,8 +73,8 @@ class PrefillDelayer:
             if _DEBUG_LOG:
                 logger.info(
                     f"PrefillDelayer force allow prefill due to low watermark. "
-                    f"num_prefillable={global_prefillable.sum().item()} "
-                    f"num_force_allow={global_force_allow.sum().item()}"
+                    f"(num_prefillable={global_prefillable.sum().item()}, "
+                    f"num_force_allow={global_force_allow.sum().item()})"
                 )
             self._record_metrics_and_reset(is_timeout=False)
             return True
@@ -95,7 +95,7 @@ class PrefillDelayer:
         is_timeout = global_mixed_prefillable
         if _DEBUG_LOG and is_timeout:
             logger.info(
-                f"PrefillDelayer timeout thus not forbid prefill (prefillable: {global_prefillable.sum()})"
+                f"PrefillDelayer timeout thus not forbid prefill (num_prefillable={global_prefillable.sum()})"
             )
 
         self._record_metrics_and_reset(is_timeout=is_timeout)
