@@ -332,7 +332,6 @@ def _run_throughput_test(
         kill_process_tree(process.pid)
 
     print(f"=== {debug_name} ({prefill_delayer=}) ===")
-    res["total_throughput"] = res["input_throughput"] + res["output_throughput"]
     print(f"Input throughput: {res['input_throughput']:.2f} token/s")
     print(f"Output throughput: {res['output_throughput']:.2f} token/s")
     print(f"Total throughput: {res['total_throughput']:.2f} token/s")
@@ -438,16 +437,9 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
 
             metrics_text = _print_prefill_delayer_metrics(base_url, expect_metrics=True)
             if token_usage_low_watermark is not None:
-                matches = re.findall(
-                    r'outcome="token_watermark_force_allow".*?\} (\d+)', metrics_text
-                )
-                total_force_allow = sum(int(m) for m in matches)
-                self.assertGreater(
-                    total_force_allow,
-                    0,
-                    "Expected token_watermark_force_allow > 0 when low watermark is enabled",
-                )
-                print(f"total token_watermark_force_allow: {total_force_allow}")
+                total = _sum_prometheus_metric_values(metrics_text, "token_watermark")
+                self.assertGreater(total, 0, "Expected token_watermark > 0")
+                print(f"total token_watermark: {total}")
         finally:
             kill_process_tree(process.pid)
 
@@ -545,6 +537,11 @@ def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool) -> str:
         assert "sglang:prefill_delayer_wait_seconds" in metrics_text
         assert "sglang:prefill_delayer_outcomes_total" in metrics_text
     return metrics_text
+
+
+def _sum_prometheus_metric_values(metrics_text: str, label_value: str) -> int:
+    matches = re.findall(rf'{label_value}".*?\}} (\d+)', metrics_text)
+    return sum(int(m) for m in matches)
 
 
 if __name__ == "__main__":
