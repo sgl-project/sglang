@@ -4,7 +4,7 @@ from typing import Dict, List, Tuple, Union
 import torch
 
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
-from sglang.srt.models.kimi_k2_vl import K2VLForConditionalGeneration
+from sglang.srt.models.kimi_k2_vl import KimiK25ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -13,7 +13,7 @@ from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTok
 
 # Compatible with KimiVLForConditionalGeneration
 class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
-    models = [K2VLForConditionalGeneration]
+    models = [KimiK25ForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

@@ -25,7 +25,6 @@ from typing import Any, Dict, List, Optional, Type, Union
 import torch
 from huggingface_hub import snapshot_download
 
-from sglang.srt.configs.kimi_k2_vl import K2VLConfig
 from sglang.srt.utils import get_bool_env_var
 
 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
@@ -57,6 +56,7 @@ from sglang.srt.configs import (
     JetVLMConfig,
     KimiLinearConfig,
     KimiVLConfig,
+    KimiK25Config,
     LongcatFlashConfig,
     MultiModalityConfig,
     NemotronH_Nano_VL_V2_Config,
@@ -64,7 +64,9 @@ from sglang.srt.configs import (
     Olmo3Config,
     Qwen3NextConfig,
     Step3VLConfig,
+
 )
+
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
@@ -94,7 +96,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     DeepseekVLV2Config,
     JetNemotronConfig,
     JetVLMConfig,
-    K2VLConfig,
+    KimiK25Config,
 ]
 
 _CONFIG_REGISTRY = {

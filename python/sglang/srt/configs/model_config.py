@@ -1169,10 +1169,14 @@ multimodal_model_archs = [
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
 <<<<<<< HEAD
+<<<<<<< HEAD
     "StepVLForConditionalGeneration",
 =======
     "K2VLForConditionalGeneration",
 >>>>>>> f8d2590c4 (warmup succeed)
+=======
+    "KimiK25ForConditionalGeneration",
+>>>>>>> f343d4953 (update)
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():

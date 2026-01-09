@@ -51,8 +51,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import activations
 
-from sglang.srt.configs.kimi_k2_vl import K2VLConfig
-from sglang.srt.configs.kimi_vl import KimiVLConfig
+from sglang.srt.configs.kimi_k25 import KimiK25VisionConfig, KimiK25Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -143,25 +142,6 @@ def tpool_patch_merger(
         pre_sum += t * h * w
 
     return outputs
-
-
-class VisionTowerConfig(PretrainedConfig):
-    model_type = "moonvit3d"
-
-    def __init__(self, config: K2VLConfig, **kwargs):
-        super().__init__(**kwargs)
-        self.patch_size = config.patch_size
-        self.init_pos_emb_height = config.init_pos_emb_height
-        self.init_pos_emb_width = config.init_pos_emb_width
-        self.init_pos_emb_time = config.init_pos_emb_time
-        self.pos_emb_type = config.pos_emb_type
-        self.num_attention_heads = config.vt_num_attention_heads
-        self.num_hidden_layers = config.vt_num_hidden_layers
-        self.hidden_size = config.vt_hidden_size
-        self.intermediate_size = config.vt_intermediate_size
-        self.merge_kernel_size = config.merge_kernel_size
-        self.video_attn_type = config.video_attn_type
-        self.merge_type = config.merge_type
 
 
 class MoonViTEncoderLayer(nn.Module):
@@ -622,7 +602,7 @@ class K2VLMultiModalProjector(nn.Module):
 
     def __init__(
         self,
-        config: VisionTowerConfig,
+        config: KimiK25VisionConfig,
         use_data_parallel: bool = False,
         prefix: str = "",
     ):
@@ -642,7 +622,7 @@ class K2VLMultiModalProjector(nn.Module):
         )
         self.linear_2 = ReplicatedLinear(
             self.hidden_size,
-            config.text_config.hidden_size,
+            config.text_hidden_size,
             bias=True,
             prefix=add_prefix(prefix, "linear_2"),
         )
@@ -725,10 +705,10 @@ def vision_tower_forward_auto(
     return tensors
 
 
-class K2VLForConditionalGeneration(nn.Module):
+class KimiK25ForConditionalGeneration(nn.Module):
     def __init__(
         self,
-        config: KimiVLConfig,
+        config: KimiK25Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         **kwargs,  # fix init_tts argument error
@@ -736,11 +716,9 @@ class K2VLForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         # Create vision tower
-        vt_config = VisionTowerConfig(config)
-        self.vision_tower = MoonViT3dPretrainedModel(vt_config)
-
+        self.vision_tower = MoonViT3dPretrainedModel(config.vision_config)
         # Create mm projector
-        self.mm_projector = K2VLMultiModalProjector(config)
+        self.mm_projector = K2VLMultiModalProjector(config.vision_config)
 
         self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
 
@@ -832,4 +810,4 @@ class K2VLForConditionalGeneration(nn.Module):
             self.language_model.load_weights(language_weights)
 
 
-EntryClass = [K2VLForConditionalGeneration]
+EntryClass = [KimiK25ForConditionalGeneration]
