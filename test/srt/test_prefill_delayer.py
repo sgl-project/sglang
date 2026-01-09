@@ -360,7 +360,9 @@ def _assert_throughput_improvement(
     improvement_pct = (enabled - disabled) / disabled * 100
 
     print(f"\n=== {test_name} Throughput Comparison ===")
-    print(f"Total: enabled={enabled:.2f}, disabled={disabled:.2f}, improvement={improvement_pct:.2f}%")
+    print(
+        f"Total: enabled={enabled:.2f}, disabled={disabled:.2f}, improvement={improvement_pct:.2f}%"
+    )
 
     test_case.assertGreaterEqual(
         improvement_pct,
