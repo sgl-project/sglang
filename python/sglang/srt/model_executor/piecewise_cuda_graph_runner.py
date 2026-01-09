@@ -373,7 +373,9 @@ class PiecewiseCudaGraphRunner:
         ):
             kwargs = {}
             if self.is_multimodal and hasattr(self, "input_deepstack_embeds"):
-                kwargs["input_deepstack_embeds"] = self.input_deepstack_embeds[:num_tokens]
+                kwargs["input_deepstack_embeds"] = self.input_deepstack_embeds[
+                    :num_tokens
+                ]
             with torch.no_grad():
                 _ = self.model_runner.model.forward(
                     forward_batch.input_ids,
@@ -710,7 +712,9 @@ class PiecewiseCudaGraphRunner:
                     call_kwargs = {}
                     if self.is_multimodal and hasattr(self, "input_deepstack_embeds"):
                         static_num_tokens = len(static_forward_batch.input_ids)
-                        call_kwargs["input_deepstack_embeds"] = self.input_deepstack_embeds[:static_num_tokens]
+                        call_kwargs["input_deepstack_embeds"] = (
+                            self.input_deepstack_embeds[:static_num_tokens]
+                        )
                     with torch.no_grad():
                         output = self.model_runner.model.forward(
                             static_forward_batch.input_ids,
