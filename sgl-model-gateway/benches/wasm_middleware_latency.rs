@@ -4,16 +4,16 @@ use axum::{
     body::Body,
     http::{HeaderMap, Request, Response, StatusCode},
     middleware,
+    response::IntoResponse,
 };
 use criterion::{criterion_group, criterion_main, Criterion};
-use futures::StreamExt;
 use http_body_util::BodyExt;
 use smg::{
     app_context::AppContext, config::RouterConfig, middleware::wasm_middleware,
     protocols::chat::ChatCompletionRequest, routers::RouterTrait, server::AppState,
 };
 use tokio::runtime::Runtime;
-use tower::{Service, ServiceExt};
+use tower::{Layer, Service};
 
 /// Dummy router to satisfy AppState requirements for the benchmark
 #[derive(Debug)]
@@ -29,7 +29,7 @@ impl RouterTrait for MockRouter {
         _headers: Option<&HeaderMap>,
         _body: &ChatCompletionRequest,
         _model_id: Option<&str>,
-    ) -> Response {
+    ) -> Response<Body> {
         StatusCode::OK.into_response()
     }
     fn router_type(&self) -> &'static str {
@@ -38,8 +38,7 @@ impl RouterTrait for MockRouter {
 }
 
 /// Mock service that simulates a streaming response with a 500ms delay.
-/// This delay represents the worker's generation time.
-async fn mock_next_streaming(_req: Request<Body>) -> Response {
+async fn mock_next_streaming(_req: Request<Body>) -> Response<Body> {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
 
     tokio::spawn(async move {
@@ -48,7 +47,6 @@ async fn mock_next_streaming(_req: Request<Body>) -> Response {
             .send(Ok::<_, std::io::Error>(bytes::Bytes::from("chunk 1 ")))
             .await;
         // Simulate generation delay
-        // IN THE PRE-FIX STATE: the middleware will block here for 500ms!
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         // Send final chunk
         let _ = tx
@@ -64,7 +62,7 @@ async fn mock_next_streaming(_req: Request<Body>) -> Response {
 fn bench_wasm_middleware_buffering(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
-    // Setup AppContext with WASM enabled (required to hit the buffering path)
+    // Setup AppContext with WASM enabled
     let config = RouterConfig::builder().enable_wasm(true).build_unchecked();
 
     let context = rt.block_on(AppContext::from_config(config, 30)).unwrap();
@@ -83,7 +81,7 @@ fn bench_wasm_middleware_buffering(c: &mut Criterion) {
                     .body(Body::empty())
                     .unwrap();
 
-                // Build a Tower service applying the middleware to our mock streamer
+                // Create the service by applying the middleware layer to the mock streamer
                 let mut service =
                     middleware::from_fn_with_state(app_state.clone(), wasm_middleware).layer(
                         tower::service_fn(|req: Request<Body>| async move {
@@ -91,10 +89,11 @@ fn bench_wasm_middleware_buffering(c: &mut Criterion) {
                         }),
                     );
 
-                // Call the service and wait for the response header
-                let response = service.call(req).await.unwrap();
+                // Explicitly poll the service
+                let response: Response<Body> =
+                    service.call(req).await.expect("Middleware service failed");
 
-                // Measure how long it takes to receive the FIRST frame (chunk)
+                // Measure how long it takes to receive the FIRST frame
                 let mut body = response.into_body();
                 let _first_frame = body.frame().await;
             });
