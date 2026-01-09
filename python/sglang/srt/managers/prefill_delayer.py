@@ -100,10 +100,11 @@ class PrefillDelayer:
                 f"PrefillDelayer timeout thus not forbid prefill (num_prefillable={global_prefillable.sum()})"
             )
 
-        self._reset(outcome="timeout" if is_timeout else "all_prefillable")
+        self._reset(outcome="timeout" if is_timeout else TODO)
         return True
 
     def _reset(self, outcome: str) -> None:
+        TODO_should_this_info_is_not_none
         if self._curr_delay_info is not None and self._metrics_collector is not None:
             wait_seconds = time.perf_counter() - self._curr_delay_info.start_time
             self._metrics_collector.observe_prefill_delayer_wait(
