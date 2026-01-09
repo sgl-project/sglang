@@ -235,6 +235,7 @@ export interface AttentionCaptureParams {
   attention_sketch_mode?: boolean;
   return_moe_routing?: boolean;
   moe_routing_top_k?: number;
+  max_tokens?: number;
 }
 
 export interface ChatCompletionWithAttention {

@@ -13,6 +13,18 @@ import { useTraceStore } from './useTraceStore';
 // Scope options for filtering which sessions to show
 export type ManifoldScope = 'current' | 'recent' | 'saved' | 'all';
 
+// Discovery progress state
+export interface DiscoveryProgress {
+  run_id: string | null;
+  stage: number;
+  stage_name: string;
+  percent_complete: number;
+  items_processed: number;
+  total_items: number;
+  eta_seconds: number | null;
+  is_running: boolean;
+}
+
 // How many recent sessions to show
 const RECENT_SESSION_COUNT = 50;
 
@@ -46,6 +58,11 @@ interface ManifoldState {
   isLoading: boolean;
   error: string | null;
 
+  // Live discovery state
+  discoveryProgress: DiscoveryProgress;
+  sseConnected: boolean;
+  sidecarUrl: string;
+
   // Actions
   setScope: (scope: ManifoldScope) => void;
   selectPoint: (pointId: string | null) => void;
@@ -54,7 +71,14 @@ interface ManifoldState {
   // Data management
   loadArtifacts: (artifacts: ManifoldArtifacts) => void;
   addSessionPoint: (point: ManifoldPoint) => void;
+  addSessionPoints: (points: ManifoldPoint[]) => void;
   clearSessionPoints: () => void;
+
+  // Live discovery SSE
+  setSidecarUrl: (url: string) => void;
+  connectToDiscovery: () => void;
+  disconnectFromDiscovery: () => void;
+  handleDiscoveryEvent: (eventType: string, data: any) => void;
 
   // Computed
   getFilteredPoints: () => ManifoldPoint[];
@@ -156,6 +180,21 @@ function formatZoneName(zone: ManifoldZone): string {
     .join(' ');
 }
 
+// Default discovery progress state
+const DEFAULT_DISCOVERY_PROGRESS: DiscoveryProgress = {
+  run_id: null,
+  stage: 0,
+  stage_name: '',
+  percent_complete: 0,
+  items_processed: 0,
+  total_items: 0,
+  eta_seconds: null,
+  is_running: false,
+};
+
+// Global SSE connection (outside React lifecycle)
+let sseConnection: EventSource | null = null;
+
 export const useManifoldStore = create<ManifoldState>()(
   persist(
     (set, get) => ({
@@ -166,6 +205,9 @@ export const useManifoldStore = create<ManifoldState>()(
       hoveredPointId: null,
       isLoading: false,
       error: null,
+      discoveryProgress: DEFAULT_DISCOVERY_PROGRESS,
+      sseConnected: false,
+      sidecarUrl: 'http://localhost:9000',
 
       setScope: (scope) => set({ scope }),
 
@@ -188,8 +230,199 @@ export const useManifoldStore = create<ManifoldState>()(
         }));
       },
 
+      addSessionPoints: (points) => {
+        set((state) => ({
+          sessionPoints: [...state.sessionPoints, ...points],
+        }));
+      },
+
       clearSessionPoints: () => {
         set({ sessionPoints: [], artifacts: null });
+      },
+
+      setSidecarUrl: (url) => {
+        set({ sidecarUrl: url });
+        // Reconnect if already connected
+        if (get().sseConnected) {
+          get().disconnectFromDiscovery();
+          get().connectToDiscovery();
+        }
+      },
+
+      connectToDiscovery: () => {
+        const { sidecarUrl, handleDiscoveryEvent } = get();
+
+        // Close existing connection
+        if (sseConnection) {
+          sseConnection.close();
+          sseConnection = null;
+        }
+
+        try {
+          const sseUrl = `${sidecarUrl}/discovery/live`;
+          console.log('[Manifold] Connecting to SSE:', sseUrl);
+
+          sseConnection = new EventSource(sseUrl);
+
+          sseConnection.onopen = () => {
+            console.log('[Manifold] SSE connected');
+            set({ sseConnected: true, error: null });
+          };
+
+          sseConnection.onerror = (event) => {
+            console.error('[Manifold] SSE error:', event);
+            set({ sseConnected: false, error: 'SSE connection error' });
+          };
+
+          // Handle different event types
+          const eventTypes = [
+            'status', 'progress', 'stage_start', 'stage_complete',
+            'batch_complete', 'cluster_update', 'zone_stats',
+            'run_start', 'run_complete', 'run_error', 'heartbeat'
+          ];
+
+          for (const eventType of eventTypes) {
+            sseConnection.addEventListener(eventType, (event: MessageEvent) => {
+              try {
+                const data = JSON.parse(event.data);
+                handleDiscoveryEvent(eventType, data);
+              } catch (e) {
+                console.warn('[Manifold] Failed to parse SSE event:', e);
+              }
+            });
+          }
+
+          // Generic message handler as fallback
+          sseConnection.onmessage = (event: MessageEvent) => {
+            try {
+              const data = JSON.parse(event.data);
+              handleDiscoveryEvent('message', data);
+            } catch (e) {
+              console.warn('[Manifold] Failed to parse SSE message:', e);
+            }
+          };
+
+        } catch (e) {
+          console.error('[Manifold] Failed to connect to SSE:', e);
+          set({ sseConnected: false, error: `Failed to connect: ${e}` });
+        }
+      },
+
+      disconnectFromDiscovery: () => {
+        if (sseConnection) {
+          sseConnection.close();
+          sseConnection = null;
+        }
+        set({
+          sseConnected: false,
+          discoveryProgress: DEFAULT_DISCOVERY_PROGRESS,
+        });
+        console.log('[Manifold] SSE disconnected');
+      },
+
+      handleDiscoveryEvent: (eventType, data) => {
+        console.log('[Manifold] SSE event:', eventType, data);
+
+        switch (eventType) {
+          case 'status':
+          case 'progress':
+            set((state) => ({
+              discoveryProgress: {
+                ...state.discoveryProgress,
+                run_id: data.run_id || state.discoveryProgress.run_id,
+                stage: data.stage ?? state.discoveryProgress.stage,
+                stage_name: data.stage_name || state.discoveryProgress.stage_name,
+                percent_complete: data.percent_complete ?? state.discoveryProgress.percent_complete,
+                items_processed: data.items_processed ?? state.discoveryProgress.items_processed,
+                total_items: data.total_items ?? state.discoveryProgress.total_items,
+                eta_seconds: data.eta_seconds ?? state.discoveryProgress.eta_seconds,
+                is_running: data.is_running ?? (data.run_id != null),
+              },
+            }));
+            break;
+
+          case 'stage_start':
+            set((state) => ({
+              discoveryProgress: {
+                ...state.discoveryProgress,
+                stage: data.stage,
+                stage_name: data.stage_name,
+                percent_complete: 0,
+                is_running: true,
+              },
+            }));
+            break;
+
+          case 'stage_complete':
+            set((state) => ({
+              discoveryProgress: {
+                ...state.discoveryProgress,
+                stage: data.stage,
+                stage_name: data.stage_name,
+                percent_complete: 100,
+              },
+            }));
+            break;
+
+          case 'batch_complete':
+            // Add new points from batch
+            if (data.new_points && Array.isArray(data.new_points)) {
+              const points: ManifoldPoint[] = data.new_points.map((p: any) => ({
+                session_id: `discovery-${p.fingerprint_id || Math.random()}`,
+                coords: [p.x || 0, p.y || 0] as [number, number],
+                cluster_id: p.cluster_id ?? -1,
+                manifold_zone: (p.zone || 'unknown') as ManifoldZone,
+                consensus: 0,
+                hubness: 0,
+                entropy: 0,
+                timestamp: new Date().toISOString(),
+                model_id: 'discovery',
+              }));
+              get().addSessionPoints(points);
+            }
+            break;
+
+          case 'run_start':
+            set((state) => ({
+              discoveryProgress: {
+                ...state.discoveryProgress,
+                run_id: data.run_id,
+                stage: 0,
+                stage_name: 'starting',
+                percent_complete: 0,
+                is_running: true,
+              },
+            }));
+            break;
+
+          case 'run_complete':
+            set((state) => ({
+              discoveryProgress: {
+                ...state.discoveryProgress,
+                is_running: false,
+                percent_complete: 100,
+              },
+            }));
+            break;
+
+          case 'run_error':
+            set((state) => ({
+              discoveryProgress: {
+                ...state.discoveryProgress,
+                is_running: false,
+              },
+              error: data.message || 'Discovery run failed',
+            }));
+            break;
+
+          case 'heartbeat':
+            // Just update connection state
+            break;
+
+          default:
+            // Unknown event type
+            break;
+        }
       },
 
       getFilteredPoints: () => {
@@ -261,6 +494,7 @@ export const useManifoldStore = create<ManifoldState>()(
       partialize: (state) => ({
         sessionPoints: state.sessionPoints.slice(-200), // Keep last 200 points
         scope: state.scope,
+        sidecarUrl: state.sidecarUrl,
       }),
     }
   )

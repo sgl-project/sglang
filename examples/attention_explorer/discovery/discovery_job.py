@@ -34,6 +34,20 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# Import manifest module for reproducibility layer
+try:
+    from schemas.manifest import ExperimentManifest, RunType
+    HAS_MANIFEST = True
+except ImportError:
+    HAS_MANIFEST = False
+
+# Import coordinator for long-running jobs
+try:
+    from .coordinator import DiscoveryJobCoordinator, CoordinatorConfig, run_discovery as run_discovery_coordinated
+    HAS_COORDINATOR = True
+except ImportError:
+    HAS_COORDINATOR = False
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -916,39 +930,99 @@ def run_discovery(config: DiscoveryConfig) -> DiscoveryResult:
     joblib.dump(clusterer, f"{run_dir}/clusterer.joblib")
     logger.info(f"  Saved models to {run_dir}")
 
-    # Write manifest
+    # Write manifest with full reproducibility metadata
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = int(np.sum(labels == -1))
 
-    manifest = {
-        'schema_version': SCHEMA_VERSION,
-        'run_id': run_id,
-        'created_at': datetime.utcnow().isoformat(),
-        'fingerprint_count': len(df),
-        'request_count': df['request_id'].nunique(),
-        'cluster_count': n_clusters,
-        'noise_count': n_noise,
-        'embedding_method': f'pca_{config.pca_components}_umap_2',
-        'clustering_method': 'hdbscan',
-        'parameters': {
+    if HAS_MANIFEST:
+        # Use ExperimentManifest for comprehensive reproducibility
+        manifest_obj = ExperimentManifest.create(
+            run_type=RunType.DISCOVERY,
+            run_id=run_id,
+            capture_git=True,
+            capture_hardware=True,
+        )
+
+        # Set source database info
+        manifest_obj.set_source(
+            database_path=config.db_path,
+            time_window_hours=config.time_window_hours,
+            fingerprint_count=len(df),
+            request_count=df['request_id'].nunique(),
+        )
+
+        # Set discovery parameters
+        manifest_obj.set_parameters({
             'time_window_hours': config.time_window_hours,
             'min_cluster_size': config.min_cluster_size,
             'min_samples': config.min_samples,
             'umap_neighbors': config.umap_neighbors,
             'umap_min_dist': config.umap_min_dist,
             'pca_components': config.pca_components,
-        },
-        'zone_distribution': {
-            'syntax_floor': int(np.sum(zones == 'syntax_floor')),
-            'semantic_bridge': int(np.sum(zones == 'semantic_bridge')),
-            'structure_ripple': int(np.sum(zones == 'structure_ripple')),
-        },
-        'time_range': {
-            'start': (datetime.utcnow() - timedelta(hours=config.time_window_hours)).isoformat(),
-            'end': datetime.utcnow().isoformat(),
-        },
-    }
-    write_manifest(f"{run_dir}/manifest.json", manifest)
+            'prototype_count': config.prototype_count,
+            'embedding_method': f'pca_{config.pca_components}_umap_2',
+            'clustering_method': 'hdbscan',
+        })
+
+        # Set statistics
+        manifest_obj.set_statistics({
+            'fingerprint_count': len(df),
+            'request_count': df['request_id'].nunique(),
+            'cluster_count': n_clusters,
+            'noise_count': n_noise,
+            'zone_distribution': {
+                'syntax_floor': int(np.sum(zones == 'syntax_floor')),
+                'semantic_bridge': int(np.sum(zones == 'semantic_bridge')),
+                'structure_ripple': int(np.sum(zones == 'structure_ripple')),
+            },
+            'time_range': {
+                'start': (datetime.utcnow() - timedelta(hours=config.time_window_hours)).isoformat(),
+                'end': datetime.utcnow().isoformat(),
+            },
+        })
+
+        # Add artifact references
+        manifest_obj.add_artifact("embeddings", f"{run_dir}/embeddings.parquet")
+        manifest_obj.add_artifact("clusters", f"{run_dir}/clusters.parquet")
+        manifest_obj.add_artifact("prototypes", f"{run_dir}/prototypes.parquet")
+        manifest_obj.add_artifact("request_embeddings", f"{run_dir}/request_embeddings.parquet")
+        manifest_obj.add_artifact("embedding_models", f"{run_dir}/embedding_models.joblib")
+        manifest_obj.add_artifact("clusterer", f"{run_dir}/clusterer.joblib")
+
+        # Finalize and save
+        manifest_obj.finalize()
+        manifest_obj.save(f"{run_dir}/manifest.json")
+    else:
+        # Fallback to simple dict manifest
+        manifest = {
+            'schema_version': SCHEMA_VERSION,
+            'run_id': run_id,
+            'created_at': datetime.utcnow().isoformat(),
+            'fingerprint_count': len(df),
+            'request_count': df['request_id'].nunique(),
+            'cluster_count': n_clusters,
+            'noise_count': n_noise,
+            'embedding_method': f'pca_{config.pca_components}_umap_2',
+            'clustering_method': 'hdbscan',
+            'parameters': {
+                'time_window_hours': config.time_window_hours,
+                'min_cluster_size': config.min_cluster_size,
+                'min_samples': config.min_samples,
+                'umap_neighbors': config.umap_neighbors,
+                'umap_min_dist': config.umap_min_dist,
+                'pca_components': config.pca_components,
+            },
+            'zone_distribution': {
+                'syntax_floor': int(np.sum(zones == 'syntax_floor')),
+                'semantic_bridge': int(np.sum(zones == 'semantic_bridge')),
+                'structure_ripple': int(np.sum(zones == 'structure_ripple')),
+            },
+            'time_range': {
+                'start': (datetime.utcnow() - timedelta(hours=config.time_window_hours)).isoformat(),
+                'end': datetime.utcnow().isoformat(),
+            },
+        }
+        write_manifest(f"{run_dir}/manifest.json", manifest)
 
     # Update latest symlink
     update_latest_symlink(config.output_dir, run_id)
@@ -1044,6 +1118,51 @@ def main():
         help='Batch size for loading fingerprints',
     )
 
+    # Long-running mode arguments
+    parser.add_argument(
+        '--long-running',
+        action='store_true',
+        help='Enable long-running mode with checkpointing and live updates',
+    )
+    parser.add_argument(
+        '--resume',
+        type=str,
+        help='Run ID to resume from (long-running mode only)',
+    )
+    parser.add_argument(
+        '--websocket-port',
+        type=int,
+        default=9010,
+        help='WebSocket port for live updates (0 to disable)',
+    )
+    parser.add_argument(
+        '--max-memory-gb',
+        type=float,
+        default=8.0,
+        help='Maximum memory usage in GB',
+    )
+    parser.add_argument(
+        '--max-hours',
+        type=float,
+        help='Maximum runtime in hours (for time-limited runs)',
+    )
+    parser.add_argument(
+        '--checkpoint-db',
+        type=str,
+        help='Separate database for checkpoints (defaults to --db)',
+    )
+    parser.add_argument(
+        '--zone-thresholds',
+        type=str,
+        help='Path to zone thresholds JSON file',
+    )
+    parser.add_argument(
+        '--umap-sample-size',
+        type=int,
+        default=50000,
+        help='Sample size for UMAP fitting (long-running mode)',
+    )
+
     args = parser.parse_args()
 
     # Validate inputs
@@ -1051,29 +1170,69 @@ def main():
         logger.error(f"Database not found: {args.db}")
         sys.exit(1)
 
-    config = DiscoveryConfig(
-        db_path=args.db,
-        output_dir=args.output,
-        time_window_hours=args.hours,
-        min_cluster_size=args.min_cluster_size,
-        min_samples=args.min_samples,
-        umap_neighbors=args.umap_neighbors,
-        umap_min_dist=args.umap_min_dist,
-        pca_components=args.pca_components,
-        prototype_count=args.prototypes,
-        batch_size=args.batch_size,
-    )
+    # Check for long-running mode
+    if args.long_running or args.resume:
+        if not HAS_COORDINATOR:
+            logger.error(
+                "Coordinator module not available. "
+                "Ensure coordinator.py is in the discovery package."
+            )
+            sys.exit(1)
 
-    try:
-        result = run_discovery(config)
-        print(f"\nDiscovery completed successfully!")
-        print(f"  Run ID: {result.run_id}")
-        print(f"  Output: {result.output_dir}")
-        print(f"  Clusters: {result.cluster_count}")
-        print(f"  Duration: {result.duration_seconds:.1f}s")
-    except Exception as e:
-        logger.exception(f"Discovery job failed: {e}")
-        sys.exit(1)
+        import asyncio
+
+        # Run with coordinator
+        logger.info("Running in long-running mode with coordinator")
+
+        result = asyncio.run(run_discovery_coordinated(
+            db_path=args.db,
+            output_dir=args.output,
+            resume_from=args.resume,
+            websocket_port=args.websocket_port,
+            max_memory_gb=args.max_memory_gb,
+            chunk_size=args.batch_size,
+            umap_sample_size=args.umap_sample_size,
+            zone_thresholds_path=args.zone_thresholds,
+            max_runtime_hours=args.max_hours,
+        ))
+
+        if result.success:
+            print(f"\nDiscovery completed successfully!")
+            print(f"  Run ID: {result.run_id}")
+            print(f"  Duration: {result.total_duration_seconds:.1f}s")
+            print(f"  Stages completed: {result.stages_completed}")
+            print(f"  Fingerprints: {result.total_fingerprints}")
+            print(f"  Clusters: {result.total_clusters}")
+            print(f"  Zone distribution: {result.zone_distribution}")
+        else:
+            print(f"\nDiscovery failed!")
+            print(f"  Error: {result.error}")
+            sys.exit(1)
+    else:
+        # Standard mode (existing implementation)
+        config = DiscoveryConfig(
+            db_path=args.db,
+            output_dir=args.output,
+            time_window_hours=args.hours,
+            min_cluster_size=args.min_cluster_size,
+            min_samples=args.min_samples,
+            umap_neighbors=args.umap_neighbors,
+            umap_min_dist=args.umap_min_dist,
+            pca_components=args.pca_components,
+            prototype_count=args.prototypes,
+            batch_size=args.batch_size,
+        )
+
+        try:
+            result = run_discovery(config)
+            print(f"\nDiscovery completed successfully!")
+            print(f"  Run ID: {result.run_id}")
+            print(f"  Output: {result.output_dir}")
+            print(f"  Clusters: {result.cluster_count}")
+            print(f"  Duration: {result.duration_seconds:.1f}s")
+        except Exception as e:
+            logger.exception(f"Discovery job failed: {e}")
+            sys.exit(1)
 
 
 if __name__ == '__main__':
