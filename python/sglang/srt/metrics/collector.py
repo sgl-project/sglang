@@ -779,7 +779,13 @@ class SchedulerMetricsCollector:
         self.prefill_delayer_outcomes_total = Counter(
             name="sglang:prefill_delayer_outcomes_total",
             documentation="Prefill delayer outcome counts.",
-            labelnames=[*labels.keys(), "input_estimation", "output_allow", "output_reason", "actual_execution"],
+            labelnames=[
+                *labels.keys(),
+                "input_estimation",
+                "output_allow",
+                "output_reason",
+                "actual_execution",
+            ],
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:

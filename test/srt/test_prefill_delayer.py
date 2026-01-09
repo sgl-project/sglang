@@ -5,8 +5,8 @@ import time
 import unittest
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Optional
 from types import SimpleNamespace
+from typing import List, Optional
 
 import openai
 import requests
@@ -89,10 +89,12 @@ _NEGOTIATE_TEST_CASES = [
         name="all_prefillable",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        calls=[NegotiateCall(
-            prefillable=[True, True, True, True],
-            token_usage=[0.9, 0.9, 0.9, 0.9],
-        )],
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            )
+        ],
         expected_allow=True,
         expected_reason="no_wait",
     ),
@@ -117,10 +119,12 @@ _NEGOTIATE_TEST_CASES = [
         name="none_prefillable",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        calls=[NegotiateCall(
-            prefillable=[False, False, False, False],
-            token_usage=[0.9, 0.9, 0.9, 0.9],
-        )],
+        calls=[
+            NegotiateCall(
+                prefillable=[False, False, False, False],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            )
+        ],
         expected_allow=True,
         expected_reason="",
     ),
@@ -128,10 +132,12 @@ _NEGOTIATE_TEST_CASES = [
         name="mixed_delay",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        calls=[NegotiateCall(
-            prefillable=[True, False, True, False],
-            token_usage=[0.9, 0.9, 0.9, 0.9],
-        )],
+        calls=[
+            NegotiateCall(
+                prefillable=[True, False, True, False],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            )
+        ],
         expected_allow=False,
         expected_reason="delay",
     ),
@@ -139,10 +145,12 @@ _NEGOTIATE_TEST_CASES = [
         name="mixed_watermark_force_allow",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        calls=[NegotiateCall(
-            prefillable=[True, False, True, False],
-            token_usage=[0.5, 0.9, 0.9, 0.9],
-        )],
+        calls=[
+            NegotiateCall(
+                prefillable=[True, False, True, False],
+                token_usage=[0.5, 0.9, 0.9, 0.9],
+            )
+        ],
         expected_allow=True,
         expected_reason="token_watermark",
     ),
@@ -150,10 +158,12 @@ _NEGOTIATE_TEST_CASES = [
         name="mixed_watermark_disabled",
         max_delay_passes=100,
         token_usage_low_watermark=None,
-        calls=[NegotiateCall(
-            prefillable=[True, False, True, False],
-            token_usage=[0.5, 0.9, 0.9, 0.9],
-        )],
+        calls=[
+            NegotiateCall(
+                prefillable=[True, False, True, False],
+                token_usage=[0.5, 0.9, 0.9, 0.9],
+            )
+        ],
         expected_allow=False,
         expected_reason="delay",
     ),
@@ -161,10 +171,12 @@ _NEGOTIATE_TEST_CASES = [
         name="mixed_watermark_not_prefillable",
         max_delay_passes=100,
         token_usage_low_watermark=0.8,
-        calls=[NegotiateCall(
-            prefillable=[False, False, True, False],
-            token_usage=[0.5, 0.9, 0.9, 0.9],
-        )],
+        calls=[
+            NegotiateCall(
+                prefillable=[False, False, True, False],
+                token_usage=[0.5, 0.9, 0.9, 0.9],
+            )
+        ],
         expected_allow=False,
         expected_reason="delay",
     ),
@@ -351,8 +363,12 @@ def _assert_throughput_improvement(
     output_improvement_pct = (output_enabled - output_disabled) / output_disabled * 100
 
     print(f"\n=== {test_name} Throughput Comparison ===")
-    print(f"Input:  enabled={input_enabled:.2f}, disabled={input_disabled:.2f}, improvement={input_improvement_pct:.2f}%")
-    print(f"Output: enabled={output_enabled:.2f}, disabled={output_disabled:.2f}, improvement={output_improvement_pct:.2f}%")
+    print(
+        f"Input:  enabled={input_enabled:.2f}, disabled={input_disabled:.2f}, improvement={input_improvement_pct:.2f}%"
+    )
+    print(
+        f"Output: enabled={output_enabled:.2f}, disabled={output_disabled:.2f}, improvement={output_improvement_pct:.2f}%"
+    )
 
     test_case.assertGreaterEqual(
         input_improvement_pct,

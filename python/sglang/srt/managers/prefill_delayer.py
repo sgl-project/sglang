@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
