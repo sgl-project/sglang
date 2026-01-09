@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
 ACC_THRESHOLDS = {
-    QWEN3_NEXT_MODEL: {"kl_div": 0.008, "gsm8k": 0.93},
+    QWEN3_NEXT_MODEL: {"kl_div": 0.0025, "gsm8k": 0.93},
 }
 
 
