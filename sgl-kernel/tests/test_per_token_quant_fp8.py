@@ -27,8 +27,9 @@ def sglang_per_token_quant_fp8(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     scale = torch.zeros(input.size(0), device=input.device, dtype=torch.float32)
     output = torch.empty_like(input, device=input.device, dtype=fp8_type_)
+    input_scale_ub = torch.tensor(1200.0, device=input.device)
 
-    sgl_per_token_quant_fp8(input, output, scale)
+    sgl_per_token_quant_fp8(input, output, scale, input_scale_ub)
     scale = scale.reshape(-1, 1)
 
     return output, scale

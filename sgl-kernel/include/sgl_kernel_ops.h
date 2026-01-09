@@ -249,7 +249,11 @@ void sgl_per_token_group_quant_8bit_v2(
     bool fuse_silu_and_mul,
     const std::optional<torch::Tensor>& masked_m);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
-void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
+void sgl_per_token_quant_fp8(
+    torch::Tensor const& input,
+    torch::Tensor& output_q,
+    torch::Tensor& output_s,
+    std::optional<torch::Tensor> const& scale_ub);
 void bmm_fp8(
     at::Tensor A,
     at::Tensor B,
