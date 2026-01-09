@@ -116,6 +116,16 @@ class MemoryMonitor:
         status = self.get_status()
         return status.percent_used, status.should_gc
 
+    def get_usage_gb(self) -> float:
+        """
+        Get current memory usage in GB.
+
+        Returns:
+            Memory usage in gigabytes
+        """
+        status = self.get_status()
+        return status.used_bytes / (1024 ** 3)
+
     def maybe_gc(self) -> bool:
         """
         Run GC if appropriate (respecting cooldown).

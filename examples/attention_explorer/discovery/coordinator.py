@@ -147,7 +147,11 @@ class DiscoveryJobCoordinator:
         self._ws_server: Optional[ManifoldWebSocketServer] = None
 
         # Memory monitor
-        self._memory_monitor = MemoryMonitor(warning_threshold_gb=config.max_memory_gb * 0.8)
+        self._memory_monitor = MemoryMonitor(
+            max_memory_gb=config.max_memory_gb,
+            warning_threshold=0.8,
+            critical_threshold=0.95,
+        )
 
         # State
         self._run_id: str = ""
