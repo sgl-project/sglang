@@ -21,7 +21,6 @@ import sys
 import time
 from collections import deque
 from concurrent import futures
-from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -770,10 +769,14 @@ class Scheduler(
             self.prefill_delayer = PrefillDelayer(
                 dp_size=self.dp_size,
                 attn_tp_size=self.attn_tp_size,
-                tp_worker=self.tp_worker,
+                cpu_group=self.tp_worker.get_tp_group().cpu_group,
                 server_args=self.server_args,
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
+                ),
+                max_delay_passes=envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get(),
+                token_usage_low_watermark=(
+                    envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
                 ),
             )
         # Enable preemption for priority scheduling.
@@ -1844,14 +1847,21 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        with (
-            PrefillDelayerSinglePassExecutor(self.prefill_delayer)
-            if self.prefill_delayer
-            else nullcontext()
-        ) as prefill_delayer_single_pass:
-            return self._get_new_batch_prefill_raw(
-                prefill_delayer_single_pass=prefill_delayer_single_pass
+        prefill_delayer_single_pass = None
+        if self.prefill_delayer:
+            _, token_usage, _, _ = self._get_token_info()
+            prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
+                self.prefill_delayer, token_usage=token_usage
             )
+
+        ret = self._get_new_batch_prefill_raw(
+            prefill_delayer_single_pass=prefill_delayer_single_pass
+        )
+
+        if self.prefill_delayer:
+            prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
+
+        return ret
 
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
