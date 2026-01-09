@@ -467,7 +467,9 @@ class LoRAPipeline(ComposedPipelineBase):
         # This is critical because convert_to_lora_layers needs to save cpu_weight from actual weights,
         # not from offloaded placeholder tensors
         if not self.lora_initialized:
-            with self._temporarily_disable_offload(target=target, use_module_names_only=True):
+            with self._temporarily_disable_offload(
+                target=target, use_module_names_only=True
+            ):
                 self.convert_to_lora_layers()
 
         # Re-fetch target_modules after convert_to_lora_layers() to get populated dicts
@@ -566,7 +568,9 @@ class LoRAPipeline(ComposedPipelineBase):
                     )
                 for name, layer in lora_layers_dict.items():
                     # Only re-enable LoRA for layers that actually have LoRA weights
-                    has_lora_weights = hasattr(layer, "lora_A") and layer.lora_A is not None
+                    has_lora_weights = (
+                        hasattr(layer, "lora_A") and layer.lora_A is not None
+                    )
                     if not has_lora_weights:
                         continue
                     if hasattr(layer, "disable_lora"):
