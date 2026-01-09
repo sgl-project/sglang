@@ -27,7 +27,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          WORKFLOWS: ${{ github.event.inputs.workflows }}
+          WORKFLOWS: ${{ github.event.inputs.workflows || 'pr-test.yml' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -38,13 +38,8 @@ jobs:
           echo ""
 
           # Get all workflows or specific ones
-          if [ -z "$WORKFLOWS" ]; then
-            echo "📋 Checking all workflows..."
-            workflow_files=$(gh api "repos/$REPO/actions/workflows" --jq '.workflows[].path' | sed 's|^.github/workflows/||')
-          else
-            read -r -a workflow_files <<< "${WORKFLOWS}"
-            echo "📋 Checking specified workflows: ${WORKFLOWS}"
-          fi
+          read -r -a workflow_files <<< "${WORKFLOWS}"
+          echo "📋 Checking specified workflows: ${WORKFLOWS}"
 
           echo ""
 
