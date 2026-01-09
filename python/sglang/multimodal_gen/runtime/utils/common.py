@@ -170,13 +170,7 @@ def get_zmq_socket(
         set_send_opt()
     elif socket_type == zmq.PULL:
         set_recv_opt()
-    elif socket_type == zmq.DEALER:
-        set_send_opt()
-        set_recv_opt()
-    elif socket_type == zmq.REQ:
-        set_send_opt()
-        set_recv_opt()
-    elif socket_type == zmq.REP:
+    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP, zmq.ROUTER]:
         set_send_opt()
         set_recv_opt()
     else:
@@ -267,6 +261,13 @@ def is_blackwell():
     if not is_cuda():
         return False
     return torch.cuda.get_device_capability()[0] == 10
+
+
+@lru_cache(maxsize=1)
+def is_sm120():
+    if not is_cuda():
+        return False
+    return torch.cuda.get_device_capability()[0] == 12
 
 
 @lru_cache(maxsize=1)

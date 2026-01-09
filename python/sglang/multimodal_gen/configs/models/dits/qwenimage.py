@@ -20,9 +20,30 @@ class QwenImageArchConfig(DiTArchConfig):
     pooled_projection_dim: int = 768
     guidance_embeds: bool = False
     axes_dims_rope: Tuple[int, int, int] = (16, 56, 56)
+    zero_cond_t: bool = False
+
+    stacked_params_mapping: list[tuple[str, str, str]] = field(
+        default_factory=lambda: [
+            # (param_name, shard_name, shard_id)
+            (".to_qkv", ".to_q", "q"),
+            (".to_qkv", ".to_k", "k"),
+            (".to_qkv", ".to_v", "v"),
+            (".to_added_qkv", ".add_q_proj", "q"),
+            (".to_added_qkv", ".add_k_proj", "k"),
+            (".to_added_qkv", ".add_v_proj", "v"),
+        ]
+    )
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            # QKV fusion mappings
+            r"(.*)\.to_q\.(weight|bias)$": (r"\1.to_qkv.\2", 0, 3),
+            r"(.*)\.to_k\.(weight|bias)$": (r"\1.to_qkv.\2", 1, 3),
+            r"(.*)\.to_v\.(weight|bias)$": (r"\1.to_qkv.\2", 2, 3),
+            r"(.*)\.add_q_proj\.(weight|bias)$": (r"\1.to_added_qkv.\2", 0, 3),
+            r"(.*)\.add_k_proj\.(weight|bias)$": (r"\1.to_added_qkv.\2", 1, 3),
+            r"(.*)\.add_v_proj\.(weight|bias)$": (r"\1.to_added_qkv.\2", 2, 3),
+            # LoRA mappings
             r"^(transformer_blocks\.\d+\.attn\..*\.lora_[AB])\.default$": r"\1",
         }
     )

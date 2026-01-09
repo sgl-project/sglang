@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.6"
+version = "0.5.6.post2"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,7 +37,7 @@ runtime_common = [
   "ninja",
   "numpy",
   "openai-harmony==0.0.4",
-  "openai==1.99.1",
+  "openai==2.6.1",
   "orjson",
   "outlines==0.1.11",
   "packaging",
@@ -103,6 +103,20 @@ test = [
   "sentence_transformers",
   "tabulate",
 ]
+diffusion = [
+  "diffusers @ git+https://github.com/huggingface/diffusers.git@6290fdfda40610ce7b99920146853614ba529c6e",
+  "opencv-python==4.10.0.84",
+  "imageio==2.36.0",
+  "imageio-ffmpeg==0.5.1",
+  "PyYAML==6.0.1",
+  "moviepy>=2.0.0",
+  "cloudpickle",
+  "remote-pdb",
+  "torchcodec==0.5.0",
+  "st_attn==0.0.7",
+  "vsa==0.0.4",
+  "runai_model_streamer",
+]
 all_hip = ["sglang[srt_hip]"]
 all_npu = ["sglang[srt_npu]"]
 all_hpu = ["sglang[srt_hpu]"]
@@ -114,6 +128,9 @@ dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[project.scripts]
+sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
 "sglang" = [

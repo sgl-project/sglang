@@ -14,6 +14,7 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
+import math
 import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
@@ -23,20 +24,21 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from transformers.activations import ACT2FN
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VisionRotaryEmbedding,
-)
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -50,10 +52,15 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
-from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
+from sglang.srt.models.utils import (
+    RotaryPosMixin,
+    WeightsMapper,
+    compute_cu_seqlens_from_grid_numpy,
+)
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_int_env_var
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -181,14 +188,18 @@ class Qwen3_VisionBlock(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        position_embeddings: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        output_ws: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
         attn = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            output_ws=output_ws,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
@@ -257,7 +268,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         return out
 
 
-class Qwen3VLMoeVisionModel(nn.Module):
+class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
     def __init__(
         self,
@@ -285,7 +296,13 @@ class Qwen3VLMoeVisionModel(nn.Module):
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
-        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
+        self.rotary_pos_emb = get_rope(
+            head_size=head_dim,
+            rotary_dim=head_dim // 2,
+            max_position=8192,
+            base=10000.0,
+            is_neox_style=True,
+        )
 
         self.blocks = nn.ModuleList(
             [
@@ -328,6 +345,11 @@ class Qwen3VLMoeVisionModel(nn.Module):
             ]
         )
 
+        self.tp_size = (
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        )
+        self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
+
     @property
     def dtype(self) -> torch.dtype:
         return self.patch_embed.proj.weight.dtype
@@ -336,34 +358,24 @@ class Qwen3VLMoeVisionModel(nn.Module):
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
 
-    def rot_pos_emb(self, grid_thw):
+    def rot_pos_emb(
+        self, grid_thw: list[list[int]]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         pos_ids = []
         for t, h, w in grid_thw:
-            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
-            hpos_ids = hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
-            hpos_ids = hpos_ids.flatten()
+            base = self.rot_pos_ids(h, w, self.spatial_merge_size)
+            pos_ids.append(base if t == 1 else base.repeat(t, 1))
 
-            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
-            wpos_ids = wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
-            wpos_ids = wpos_ids.flatten()
-            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
-        pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
-        return rotary_pos_emb
+        pos_ids = torch.cat(pos_ids, dim=0).to(self.device, non_blocking=True)
+        max_grid_size = max(max(h, w) for _, h, w in grid_thw)
+
+        # Use pre-computed cos_sin_cache from RotaryEmbedding
+        cos, sin = self.rotary_pos_emb.get_cos_sin(max_grid_size)
+
+        cos_combined = cos[pos_ids].flatten(1)
+        sin_combined = sin[pos_ids].flatten(1)
+
+        return cos_combined, sin_combined
 
     def fast_pos_embed_interpolate(self, grid_thw):
         num_grid_per_side = int(self.num_position_embeddings**0.5)
@@ -455,29 +467,40 @@ class Qwen3VLMoeVisionModel(nn.Module):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            return self.forward_with_cuda_graph(x, grid_thw)
+
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
 
+        if isinstance(grid_thw, list):
+            grid_thw_list = grid_thw
+            grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
+        else:
+            grid_thw_list = grid_thw.tolist()
+
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         x += pos_embeds
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        seq_len, _ = x.size()
-        rotary_pos_emb = rotary_pos_emb.to(x.device)
-
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
 
         x = x.unsqueeze(1)
+        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
+
         for layer_num, blk in enumerate(self.blocks):
-            x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+            x = blk(
+                x,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+            )
+
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](
                     x
@@ -489,6 +512,46 @@ class Qwen3VLMoeVisionModel(nn.Module):
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
+
+    def forward_with_cuda_graph(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        # patchify
+        x = x.to(device=self.device, dtype=self.dtype)
+        x = self.patch_embed(x)
+
+        if isinstance(grid_thw, list):
+            grid_thw_list = grid_thw
+            grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
+        else:
+            grid_thw_list = grid_thw.tolist()
+
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        x += pos_embeds
+
+        # rotary embedding -> (cos, sin)
+        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+
+        # compute cu_seqlens
+        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
+        if not isinstance(cu_seqlens, torch.Tensor):
+            cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
+        else:
+            cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
+        cu_seqlens = cu_seqlens.contiguous()
+
+        # blocks + merger + deepstack(optional) via CUDA Graph Runner
+        return self.cuda_graph_runner.run(
+            x=x,
+            position_embeddings=None,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            cu_seqlens=cu_seqlens,
+            cu_window_seqlens=None,
+            output_indices=None,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -608,6 +671,21 @@ class Qwen3LLMModel(Qwen3Model):
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
+    # To ensure correct weight loading and mapping.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "attn.qkv": "attn.qkv_proj",
+        },
+        orig_to_new_prefix={
+            # mapping for new names in checkpoint saved after transformers v4.52
+            "model.language_model.": "language_model.model.",
+            "model.visual.": "visual.",
+            # mapping for original checkpoint
+            "lm_head.": "language_model.lm_head.",
+            "model.": "language_model.model.",
+        },
+    )
+
     def __init__(
         self,
         config: Qwen3VLConfig,
@@ -616,8 +694,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         language_model_cls=Qwen3LLMModel,
     ) -> None:
         super().__init__()
+        self.pp_group = get_pp_group()
 
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
@@ -633,22 +713,31 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.config: Qwen3VLConfig = config  # for qwen3-vl
         else:
             self.config = config.text_config  # for qwen3-omni
+            self.config.encoder_only = getattr(config, "encoder_only", False)
+            self.config.language_only = getattr(config, "language_only", False)
 
-        self.model = language_model_cls(
-            config=self.config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
-
-        if self.config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                self.config.vocab_size,
-                self.config.hidden_size,
+        if not hasattr(config, "encoder_only") or not config.encoder_only:
+            self.model = language_model_cls(
+                config=self.config,
                 quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
+                prefix=add_prefix("model", prefix),
             )
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                    self.lm_head = self.model.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        self.config.vocab_size,
+                        self.config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                    )
+            else:
+                self.lm_head = PPMissingLayer()
+        else:
+            # encoder_only mode: no language model, so no lm_head needed
+            self.lm_head = None
+
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
         self.logits_processor = LogitsProcessor(self.config)
@@ -657,7 +746,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
         # deepstack
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
@@ -683,13 +772,101 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        if self.use_data_parallel:
-            return run_dp_sharded_mrope_vision_model(
-                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
-            )
-        else:
-            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        return image_embeds
+
+        max_patches_per_call = get_int_env_var("SGLANG_VLM_MAX_PATCHES_PER_VIT", 0)
+        max_images_per_call = get_int_env_var("SGLANG_VLM_MAX_IMAGES_PER_VIT", 0)
+
+        if max_patches_per_call == 0 and max_images_per_call == 0:
+            if self.use_data_parallel:
+                return run_dp_sharded_mrope_vision_model(
+                    self.visual,
+                    pixel_values,
+                    image_grid_thw.tolist(),
+                    rope_type="rope_3d",
+                )
+            else:
+                return self.visual(pixel_values, grid_thw=image_grid_thw)
+
+        # compute the number of patches per image and the slice positions in pixel_values
+        grid_thw_list = (
+            image_grid_thw.tolist()
+        )  # List[List[int]], each is [T, H, W] or similar
+        patches_per_image = [int(math.prod(g)) for g in grid_thw_list]
+        num_images = len(patches_per_image)
+
+        # cumulative sum used to slice pixel_values along the image dimension
+        cum_patches = [0]
+        for p in patches_per_image:
+            cum_patches.append(cum_patches[-1] + p)
+        total_patches = cum_patches[-1]
+
+        assert pixel_values.size(0) == total_patches, (
+            f"pixel_values rows ({pixel_values.size(0)}) "
+            f"!= total patches ({total_patches})"
+        )
+
+        # split into chunks in image order, each chunk obeys the patch/image limits
+        all_chunk_embeds: List[torch.Tensor] = []
+        img_start = 0
+
+        while img_start < num_images:
+            img_end = img_start
+            patches_in_chunk = 0
+            images_in_chunk = 0
+
+            # try to pack more images into the current chunk until some limit would be exceeded
+            while img_end < num_images:
+                next_patches = patches_per_image[img_end]
+
+                # if adding this image would exceed the patch limit, stop
+                if (
+                    max_patches_per_call > 0
+                    and patches_in_chunk + next_patches > max_patches_per_call
+                ):
+                    break
+
+                # if adding this image would exceed the image-count limit, also stop
+                if (
+                    max_images_per_call > 0
+                    and images_in_chunk + 1 > max_images_per_call
+                ):
+                    break
+
+                patches_in_chunk += next_patches
+                images_in_chunk += 1
+                img_end += 1
+
+            # extreme case: the first image alone exceeds the patch limit -> at least ensure img_end > img_start
+            if img_end == img_start:
+                img_end = img_start + 1
+                patches_in_chunk = patches_per_image[img_start]
+                images_in_chunk = 1
+
+            # slice pixel_values and grid_thw according to [img_start:img_end]
+            patch_start = cum_patches[img_start]
+            patch_end = cum_patches[img_end]
+            pixel_chunk = pixel_values[patch_start:patch_end]
+            grid_chunk = image_grid_thw[img_start:img_end]
+
+            # run ViT once on this chunk without extra padding
+            if self.use_data_parallel:
+                chunk_embeds = run_dp_sharded_mrope_vision_model(
+                    self.visual,
+                    pixel_chunk,
+                    grid_chunk.tolist(),
+                    rope_type="rope_3d",
+                )
+            else:
+                chunk_embeds = self.visual(pixel_chunk, grid_thw=grid_chunk)
+
+            # chunk_embeds: (sum_patches_after_merge_this_chunk, hidden)
+            all_chunk_embeds.append(chunk_embeds)
+
+            # next batch
+            img_start = img_end
+
+        # concatenate back the full image embedding sequence
+        return torch.cat(all_chunk_embeds, dim=0)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
@@ -723,6 +900,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         """Run forward pass for Qwen3-VL.
 
@@ -756,14 +934,21 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             multimodal_model=self,
             positions=positions,
             use_deepstack=self.use_deepstack,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
         else:
-            return self.pooler(hidden_states, forward_batch)
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -780,6 +965,27 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
+            layer_id = get_layer_id(name)
+
+            if self.pp_group.is_last_rank and "model.embed_tokens.weight" in name:
+                if "lm_head.weight" in params_dict:
+                    lm_head_param = params_dict["lm_head.weight"]
+                    weight_loader = getattr(
+                        lm_head_param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(lm_head_param, loaded_weight)
+
+            is_visual = "visual" in name
+            if (
+                not is_visual
+                and layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -790,6 +996,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip loading visual/language model weights
+                if (
+                    self.config.encoder_only or self.config.language_only
+                ) and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -805,7 +1016,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    param = params_dict[name]
+                    if name in params_dict.keys():
+                        param = params_dict[name]
+                    else:
+                        continue
+
                 except KeyError:
                     print(params_dict.keys())
                     raise

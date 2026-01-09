@@ -30,7 +30,9 @@ from sgl_kernel.elementwise import (
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
     rmsnorm,
+    rotary_embedding,
     silu_and_mul,
+    timestep_embedding,
 )
 from sgl_kernel.expert_specialization import (
     es_fp8_blockwise_scaled_grouped_mm,

@@ -93,6 +93,7 @@ class SchedulePolicy:
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
+        self.priority_sign = 1 if schedule_low_priority_values_first else -1
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -101,7 +102,7 @@ class SchedulePolicy:
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
-                    waiting_queue, self.schedule_low_priority_values_first
+                    waiting_queue, self.priority_sign
                 )
             return False
 
@@ -128,7 +129,7 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_longest_output(
                     waiting_queue,
                     self.enable_priority_scheduling,
-                    self.schedule_low_priority_values_first,
+                    self.priority_sign,
                 )
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
@@ -173,7 +174,6 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
-
             # NOTE: the prefix_indices must always be aligned with last_node
             match_result = self.tree_cache.match_prefix(
                 rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
@@ -255,18 +255,16 @@ class SchedulePolicy:
     def _sort_by_longest_output(
         waiting_queue: List[Req],
         enable_priority_scheduling: bool,
-        schedule_low_priority_values_first: bool,
+        priority_sign: int,
     ) -> None:
         """Sorts the waiting queue based on the longest output (max_new_tokens). If using priority scheduling, sort by priority first."""
         if enable_priority_scheduling:
-            if schedule_low_priority_values_first:
-                waiting_queue.sort(
-                    key=lambda x: (x.priority, -x.sampling_params.max_new_tokens)
+            waiting_queue.sort(
+                key=lambda x: (
+                    x.priority * priority_sign,
+                    -x.sampling_params.max_new_tokens,
                 )
-            else:
-                waiting_queue.sort(
-                    key=lambda x: (-x.priority, -x.sampling_params.max_new_tokens)
-                )
+            )
         else:
             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
 
@@ -277,17 +275,15 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_priority_and_fcfs(
-        waiting_queue: List[Req], schedule_low_priority_values_first: bool
+        waiting_queue: List[Req], priority_sign: int
     ) -> None:
         """Sorts the waiting queue based on the request priority then received titmestamp."""
-        if schedule_low_priority_values_first:
-            waiting_queue.sort(
-                key=lambda x: (x.priority, x.time_stats.wait_queue_entry_time)
+        waiting_queue.sort(
+            key=lambda x: (
+                x.priority * priority_sign,
+                x.time_stats.wait_queue_entry_time,
             )
-        else:
-            waiting_queue.sort(
-                key=lambda x: (-x.priority, x.time_stats.wait_queue_entry_time)
-            )
+        )
 
     @staticmethod
     def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:
@@ -329,6 +325,7 @@ class PrefillAdder:
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
+        prefill_max_requests: Optional[int] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -339,7 +336,6 @@ class PrefillAdder:
         self.rem_chunk_tokens = rem_chunk_tokens
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= mixed_with_decode_tokens
-
         self.rem_total_token_offset = mixed_with_decode_tokens
         self.cur_rem_token_offset = mixed_with_decode_tokens
 
@@ -362,12 +358,13 @@ class PrefillAdder:
         self.is_hybrid_swa = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
-        self.is_hybrid_gdn_cache = isinstance(self.tree_cache, MambaRadixCache)
+        self.is_hybrid_ssm_cache = isinstance(self.tree_cache, MambaRadixCache)
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.prefill_max_requests = prefill_max_requests
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -387,7 +384,7 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.swa_available_size()
                 + self.tree_cache.swa_evictable_size(),
             )
-        elif self.is_hybrid_gdn_cache:
+        elif self.is_hybrid_ssm_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.full_evictable_size()
@@ -397,7 +394,6 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
             )
-
         return available_and_evictable - self.rem_total_token_offset
 
     @property
@@ -409,7 +405,7 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.swa_available_size()
                 + self.tree_cache.swa_evictable_size(),
             )
-        elif self.is_hybrid_gdn_cache:
+        elif self.is_hybrid_ssm_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.full_evictable_size()
@@ -453,6 +449,10 @@ class PrefillAdder:
 
     def add_chunked_req(self, req: Req):
         _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+        # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
+        # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
+        if _rem_tokens <= 0:
+            _rem_tokens = self.rem_chunk_tokens
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
@@ -485,7 +485,7 @@ class PrefillAdder:
             finally:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
+    def add_one_req_ignore_eos(self, req: Req):
         # Early exit if no enough tokens for the input tokens
         if self.ceil_paged_tokens(req.extend_input_len) > min(
             self.cur_rem_tokens, self.rem_total_tokens
@@ -575,8 +575,12 @@ class PrefillAdder:
         # therefore, the prefill-batch setting is temporarily set to 1.
         if self.nsa_enable_prefill_cp and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
+
+        if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
+            return AddReqResult.OTHER
+
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req, has_chunked_req)
+            return self.add_one_req_ignore_eos(req)
 
         total_tokens = req.extend_input_len + min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
@@ -667,19 +671,20 @@ class PrefillAdder:
         Returns True if preemption was committed, and the new request can be scheduled.
         """
         # Iterate running requests to find preemptible requests
+        priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+
         valid_running_reqs = (
             r for r in self.running_batch.reqs if r not in self.preempt_list
         )
-        if server_args.schedule_low_priority_values_first:
-            sorted_valid_running_reqs = sorted(
-                valid_running_reqs,
-                key=lambda x: (-x.priority, -x.time_stats.wait_queue_entry_time),
-            )
-        else:
-            sorted_valid_running_reqs = sorted(
-                valid_running_reqs,
-                key=lambda x: (x.priority, -x.time_stats.wait_queue_entry_time),
-            )
+
+        sorted_valid_running_reqs = sorted(
+            valid_running_reqs,
+            key=lambda x: (
+                x.priority * (-priority_sign),
+                -x.time_stats.wait_queue_entry_time,
+            ),
+        )
+
         preemptible_reqs = []
         min_tokens_to_remove = (
             req.extend_input_len
@@ -688,9 +693,8 @@ class PrefillAdder:
         )
         for running_req in sorted_valid_running_reqs:
             # Priority difference needs to meet the threshold to be preemptible.
-            priority_diff = req.priority - running_req.priority
-            if server_args.schedule_low_priority_values_first:
-                priority_diff *= -1
+            priority_diff = (req.priority - running_req.priority) * (-priority_sign)
+
             if priority_diff > self.priority_scheduling_preemption_threshold:
                 preemptible_reqs.append(running_req)
                 min_tokens_to_remove -= self._get_running_request_total_token_offset(

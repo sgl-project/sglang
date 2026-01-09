@@ -12,63 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from diffusers.models.attention import AttentionModuleMixin
-from diffusers.models.embeddings import (
-    TimestepEmbedding,
-    Timesteps,
-    get_1d_rotary_pos_embed,
-)
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    NDRotaryEmbedding,
+    _apply_rotary_emb,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 
-def _get_projections(attn: "Flux2Attention", hidden_states, encoder_hidden_states=None):
-    query = attn.to_q(hidden_states)
-    key = attn.to_k(hidden_states)
-    value = attn.to_v(hidden_states)
-
-    encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        encoder_query = attn.add_q_proj(encoder_hidden_states)
-        encoder_key = attn.add_k_proj(encoder_hidden_states)
-        encoder_value = attn.add_v_proj(encoder_hidden_states)
-
-    return query, key, value, encoder_query, encoder_key, encoder_value
-
-
-def _get_fused_projections(
-    attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
-):
-    query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
-
-    encoder_query = encoder_key = encoder_value = (None,)
-    if encoder_hidden_states is not None and hasattr(attn, "to_added_qkv"):
-        encoder_query, encoder_key, encoder_value = attn.to_added_qkv(
-            encoder_hidden_states
-        ).chunk(3, dim=-1)
-
-    return query, key, value, encoder_query, encoder_key, encoder_value
-
-
 def _get_qkv_projections(
     attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
 ):
-    if attn.fused_projections:
-        return _get_fused_projections(attn, hidden_states, encoder_hidden_states)
-    return _get_projections(attn, hidden_states, encoder_hidden_states)
+    qkv, _ = attn.to_qkv(hidden_states)
+    query, key, value = qkv.chunk(3, dim=-1)
+
+    encoder_query = encoder_key = encoder_value = None
+    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
+        added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
+        encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
+
+    return query, key, value, encoder_query, encoder_key, encoder_value
 
 
 class Flux2SwiGLU(nn.Module):
@@ -114,7 +92,6 @@ class Flux2FeedForward(nn.Module):
 
 
 class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
-
     def __init__(
         self,
         query_dim: int,
@@ -143,9 +120,8 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
-        self.to_q = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
-        self.to_k = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
-        self.to_v = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
+        # Use ReplicatedLinear for fused QKV projections
+        self.to_qkv = ReplicatedLinear(query_dim, self.inner_dim * 3, bias=bias)
 
         # QK Norm
         self.norm_q = RMSNorm(dim_head, eps=eps)
@@ -158,14 +134,9 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
-            self.add_q_proj = torch.nn.Linear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
-            )
-            self.add_k_proj = torch.nn.Linear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
-            )
-            self.add_v_proj = torch.nn.Linear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+            # Use ReplicatedLinear for added (encoder) QKV projections
+            self.to_added_qkv = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim * 3, bias=added_proj_bias
             )
             self.to_add_out = torch.nn.Linear(self.inner_dim, query_dim, bias=out_bias)
 
@@ -175,11 +146,6 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
-            supported_attention_backends={
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.SAGE_ATTN,
-            },
         )
 
     def forward(
@@ -308,11 +274,6 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
-            supported_attention_backends={
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.SAGE_ATTN,
-            },
         )
 
     def forward(
@@ -598,35 +559,22 @@ class Flux2Modulation(nn.Module):
 
 
 class Flux2PosEmbed(nn.Module):
-    # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
-    def __init__(self, theta: int, axes_dim: list[int]):
+    def __init__(self, theta: int, axes_dim: List[int]):
         super().__init__()
-        self.theta = theta
-        self.axes_dim = axes_dim
+        self.rope = NDRotaryEmbedding(
+            rope_dim_list=axes_dim,
+            rope_theta=theta,
+            use_real=False,
+            repeat_interleave_real=False,
+            dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+        )
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        # Expected ids shape: [S, len(self.axes_dim)]
-        cos_out = []
-        sin_out = []
+    def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         pos = ids.float()
-        is_mps = ids.device.type == "mps"
-        is_npu = ids.device.type == "npu"
-        freqs_dtype = torch.float32 if (is_mps or is_npu) else torch.float64
-        # Unlike Flux 1, loop over len(self.axes_dim) rather than ids.shape[-1]
-        for i in range(len(self.axes_dim)):
-            cos, sin = get_1d_rotary_pos_embed(
-                self.axes_dim[i],
-                pos[..., i],
-                theta=self.theta,
-                repeat_interleave_real=True,
-                use_real=True,
-                freqs_dtype=freqs_dtype,
-            )
-            cos_out.append(cos)
-            sin_out.append(sin)
-        freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device)
-        freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device)
-        return freqs_cos, freqs_sin
+        # TODO: potential error: flux use n_axes = ids.shape[-1]
+        # see: https://github.com/huggingface/diffusers/blob/17c0e79dbdf53fb6705e9c09cc1a854b84c39249/src/diffusers/models/transformers/transformer_flux.py#L509
+        freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
+        return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
 class Flux2Transformer2DModel(CachableDiT):
@@ -636,6 +584,8 @@ class Flux2Transformer2DModel(CachableDiT):
     Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
 
     """
+
+    param_names_mapping = FluxConfig().arch_config.param_names_mapping
 
     def __init__(self, config: FluxConfig, hf_config: dict[str, Any]):
         super().__init__(config=config, hf_config=hf_config)

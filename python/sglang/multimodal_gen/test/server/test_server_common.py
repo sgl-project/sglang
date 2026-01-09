@@ -13,8 +13,10 @@ from typing import Any, Callable
 
 import openai
 import pytest
+import requests
 from openai import OpenAI
 
+from sglang.multimodal_gen.runtime.utils.common import is_hip
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
@@ -46,14 +48,34 @@ logger = init_logger(__name__)
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
+    server_args = case.server_args
+
+    # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
+    # which is not available on AMD. Use Ulysses parallelism instead.
+    if is_hip() and server_args.ring_degree is not None and server_args.ring_degree > 1:
+        pytest.skip(
+            f"Skipping {case.id}: Ring Attention (ring_degree={server_args.ring_degree}) "
+            "requires Flash Attention which is not available on AMD/ROCm"
+        )
+
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
-    server_args = case.server_args
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
-    extra_args += (
-        f" --num-gpus {server_args.num_gpus} --ulysses-degree {server_args.num_gpus}"
-    )
+    extra_args += f" --num-gpus {server_args.num_gpus}"
+
+    if server_args.tp_size is not None:
+        extra_args += f" --tp-size {server_args.tp_size}"
+
+    if server_args.ulysses_degree is not None:
+        extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
+
+    if server_args.ring_degree is not None:
+        extra_args += f" --ring-degree {server_args.ring_degree}"
+
+    # LoRA support
+    if server_args.lora_path:
+        extra_args += f" --lora-path {server_args.lora_path}"
 
     # start server
     manager = ServerManager(
@@ -66,7 +88,10 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     try:
         # Reconstruct output size for OpenAI API
-        output_size = sampling_params.output_size
+        # Allow override via environment variable (useful for AMD where large resolutions can cause GPU hang)
+        output_size = os.environ.get(
+            "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
+        )
         warmup = WarmupRunner(
             port=ctx.port,
             model=server_args.model_path,
@@ -81,15 +106,25 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             and sampling_params.image_path
         ):
             # Handle URL or local path
-            if is_image_url(sampling_params.image_path):
-                image_path = download_image_from_url(str(sampling_params.image_path))
-            else:
-                image_path = Path(sampling_params.image_path)
+            image_path_list = sampling_params.image_path
+            if not isinstance(image_path_list, list):
+                image_path_list = [image_path_list]
+
+            new_image_path_list = []
+            for image_path in image_path_list:
+                if is_image_url(image_path):
+                    new_image_path_list.append(download_image_from_url(str(image_path)))
+                else:
+                    new_image_path_list.append(Path(image_path))
+                    if not image_path.exists():
+                        pytest.skip(f"{case.id}: file missing: {image_path}")
+
+            image_path_list = new_image_path_list
 
             warmup.run_edit_warmups(
                 count=server_args.warmup_edit,
                 edit_prompt=sampling_params.prompt,
-                image_path=image_path,
+                image_path=image_path_list,
             )
     except Exception as exc:
         logger.error("Warm-up failed for %s: %s", case.id, exc)
@@ -358,6 +393,112 @@ Consider updating perf_baselines.json with the snippets below:
 """
         logger.error(output)
 
+    def _test_lora_api_functionality(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+        generate_fn: Callable[[str, openai.Client], str],
+    ) -> None:
+        """
+        Test LoRA API functionality with end-to-end validation: merge, unmerge, and set_lora.
+        This test verifies that each API call succeeds AND that generation works after each operation.
+        """
+        base_url = f"http://localhost:{ctx.port}/v1"
+        client = OpenAI(base_url=base_url, api_key="dummy")
+
+        # Test 1: unmerge_lora_weights - API should succeed and generation should work
+        logger.info("[LoRA E2E] Testing unmerge_lora_weights for %s", case.id)
+        resp = requests.post(f"{base_url}/unmerge_lora_weights")
+        assert resp.status_code == 200, f"unmerge_lora_weights failed: {resp.text}"
+
+        logger.info("[LoRA E2E] Verifying generation after unmerge for %s", case.id)
+        output_after_unmerge = generate_fn(case.id, client)
+        assert output_after_unmerge is not None, "Generation after unmerge failed"
+        logger.info("[LoRA E2E] Generation after unmerge succeeded")
+
+        # Test 2: merge_lora_weights - API should succeed and generation should work
+        logger.info("[LoRA E2E] Testing merge_lora_weights for %s", case.id)
+        resp = requests.post(f"{base_url}/merge_lora_weights")
+        assert resp.status_code == 200, f"merge_lora_weights failed: {resp.text}"
+
+        logger.info("[LoRA E2E] Verifying generation after re-merge for %s", case.id)
+        output_after_merge = generate_fn(case.id, client)
+        assert output_after_merge is not None, "Generation after merge failed"
+        logger.info("[LoRA E2E] Generation after merge succeeded")
+
+        # Test 3: set_lora (re-set the same adapter) - API should succeed and generation should work
+        logger.info("[LoRA E2E] Testing set_lora for %s", case.id)
+        resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        assert resp.status_code == 200, f"set_lora failed: {resp.text}"
+
+        logger.info("[LoRA E2E] Verifying generation after set_lora for %s", case.id)
+        output_after_set = generate_fn(case.id, client)
+        assert output_after_set is not None, "Generation after set_lora failed"
+        logger.info("[LoRA E2E] Generation after set_lora succeeded")
+
+        logger.info("[LoRA E2E] All LoRA API E2E tests passed for %s", case.id)
+
+    def _test_lora_dynamic_switch_e2e(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+        generate_fn: Callable[[str, openai.Client], str],
+        second_lora_path: str,
+    ) -> None:
+        """
+        Test dynamic LoRA switching with end-to-end validation.
+        This test verifies that switching between LoRA adapters works correctly
+        and generation succeeds after each switch.
+        """
+        base_url = f"http://localhost:{ctx.port}/v1"
+        client = OpenAI(base_url=base_url, api_key="dummy")
+
+        # Test 1: Generate with initial LoRA
+        logger.info(
+            "[LoRA Switch E2E] Testing generation with initial LoRA for %s", case.id
+        )
+        output_initial = generate_fn(case.id, client)
+        assert output_initial is not None, "Generation with initial LoRA failed"
+        logger.info("[LoRA Switch E2E] Generation with initial LoRA succeeded")
+
+        # Test 2: Switch to second LoRA and generate
+        logger.info(
+            "[LoRA Switch E2E] Switching to second LoRA adapter for %s", case.id
+        )
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={"lora_nickname": "lora2", "lora_path": second_lora_path},
+        )
+        assert (
+            resp.status_code == 200
+        ), f"set_lora to second adapter failed: {resp.text}"
+
+        logger.info(
+            "[LoRA Switch E2E] Verifying generation with second LoRA for %s", case.id
+        )
+        output_second = generate_fn(case.id, client)
+        assert output_second is not None, "Generation with second LoRA failed"
+        logger.info("[LoRA Switch E2E] Generation with second LoRA succeeded")
+
+        # Test 3: Switch back to original LoRA and generate
+        logger.info("[LoRA Switch E2E] Switching back to original LoRA for %s", case.id)
+        resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        assert resp.status_code == 200, f"set_lora back to default failed: {resp.text}"
+
+        logger.info(
+            "[LoRA Switch E2E] Verifying generation after switching back for %s",
+            case.id,
+        )
+        output_switched_back = generate_fn(case.id, client)
+        assert (
+            output_switched_back is not None
+        ), "Generation after switching back failed"
+        logger.info("[LoRA Switch E2E] Generation after switching back succeeded")
+
+        logger.info(
+            "[LoRA Switch E2E] All dynamic switch E2E tests passed for %s", case.id
+        )
+
     def test_diffusion_perf(
         self,
         case: DiffusionTestCase,
@@ -381,4 +522,9 @@ Consider updating perf_baselines.json with the snippets below:
             case.id,
             generate_fn,
         )
+
         self._validate_and_record(case, perf_record)
+
+        # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
+        if case.server_args.lora_path:
+            self._test_lora_api_functionality(diffusion_server, case, generate_fn)

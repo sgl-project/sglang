@@ -8,6 +8,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
@@ -15,22 +16,7 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     norm_infer,
     rms_norm_fn,
 )
-from sglang.multimodal_gen.runtime.utils.common import (
-    get_bool_env_var,
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_npu,
-    is_xpu,
-)
-
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-_is_npu = is_npu()
-_is_cpu = is_cpu()
-_is_xpu = is_xpu()
-
-from sgl_kernel import fused_add_rmsnorm, rmsnorm
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 
 # Copied and adapted from sglang
@@ -132,6 +118,14 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self.forward_native(x, residual)
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # ROCm builds of sgl-kernel do not expose rmsnorm custom ops yet.
         return self.forward_native(x, residual)
 
     def extra_repr(self) -> str:

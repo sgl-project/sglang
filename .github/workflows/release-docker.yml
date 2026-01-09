@@ -1,4 +1,15 @@
 name: Release Docker Images
+#
+# This workflow builds and publishes both framework and runtime Docker images:
+#
+# Framework images (full development environment):
+#   - lmsysorg/sglang:v{version}, lmsysorg/sglang:latest
+#   - lmsysorg/sglang:v{version}-cu129-{amd64,arm64}
+#
+# Runtime images (production-optimized, ~50% smaller):
+#   - lmsysorg/sglang:v{version}-runtime, lmsysorg/sglang:latest-runtime
+#   - lmsysorg/sglang:v{version}-cu129-{amd64,arm64}-runtime
+#
 on:
   push:
     branches:
@@ -45,18 +56,56 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and Push AMD64
+      - name: Build and Push AMD64 Framework
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           tag=v${version}-cu129-amd64
 
           docker buildx build \
+            --target framework \
             --platform linux/amd64 \
             --push \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            -t lmsysorg/sglang:${tag} \
+            --no-cache \
+            .
+
+      - name: Build and Push AMD64 Runtime
+        run: |
+          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          tag=v${version}-cu129-amd64-runtime
+
+          docker buildx build \
+            --target runtime \
+            --platform linux/amd64 \
+            --push \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
+            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
+            --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            -t lmsysorg/sglang:${tag} \
+            --no-cache \
+            .
+
+      - name: Build and Push AMD64 Runtime (CUDA 13)
+        run: |
+          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          tag=v${version}-cu130-amd64-runtime
+
+          docker buildx build \
+            --target runtime \
+            --platform linux/amd64 \
+            --push \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg GRACE_BLACKWELL=0 \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .
@@ -87,18 +136,55 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and Push ARM64
+      - name: Build and Push ARM64 Framework
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           tag=v${version}-cu129-arm64
 
           docker buildx build \
+            --target framework \
             --platform linux/arm64 \
             --push \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            -t lmsysorg/sglang:${tag} \
+            --no-cache \
+            .
+
+      - name: Build and Push ARM64 Runtime
+        run: |
+          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          tag=v${version}-cu129-arm64-runtime
+
+          docker buildx build \
+            --target runtime \
+            --platform linux/arm64 \
+            --push \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
+            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
+            --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            -t lmsysorg/sglang:${tag} \
+            --no-cache \
+            .
+
+      - name: Build and Push ARM64 Runtime (CUDA 13)
+        run: |
+          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          tag=v${version}-cu130-arm64-runtime
+
+          docker buildx build \
+            --target runtime \
+            --platform linux/arm64 \
+            --push \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
+            --build-arg GRACE_BLACKWELL=1 \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .
@@ -125,14 +211,38 @@ jobs:
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
 
-          # Create versioned manifest
+          # Create versioned framework manifest (default)
           docker buildx imagetools create \
             -t lmsysorg/sglang:v${version} \
             lmsysorg/sglang:v${version}-cu129-amd64 \
             lmsysorg/sglang:v${version}-cu129-arm64
 
-          # Create latest manifest
+          # Create latest framework manifest (default)
           docker buildx imagetools create \
             -t lmsysorg/sglang:latest \
             lmsysorg/sglang:v${version}-cu129-amd64 \
             lmsysorg/sglang:v${version}-cu129-arm64
+
+          # Create versioned runtime manifest
+          docker buildx imagetools create \
+            -t lmsysorg/sglang:v${version}-runtime \
+            lmsysorg/sglang:v${version}-cu129-amd64-runtime \
+            lmsysorg/sglang:v${version}-cu129-arm64-runtime
+
+          # Create latest runtime manifest
+          docker buildx imagetools create \
+            -t lmsysorg/sglang:latest-runtime \
+            lmsysorg/sglang:v${version}-cu129-amd64-runtime \
+            lmsysorg/sglang:v${version}-cu129-arm64-runtime
+
+          # Create versioned CUDA 13 runtime manifest
+          docker buildx imagetools create \
+            -t lmsysorg/sglang:v${version}-cu130-runtime \
+            lmsysorg/sglang:v${version}-cu130-amd64-runtime \
+            lmsysorg/sglang:v${version}-cu130-arm64-runtime
+
+          # Create latest CUDA 13 runtime manifest
+          docker buildx imagetools create \
+            -t lmsysorg/sglang:latest-cu130-runtime \
+            lmsysorg/sglang:v${version}-cu130-amd64-runtime \
+            lmsysorg/sglang:v${version}-cu130-arm64-runtime

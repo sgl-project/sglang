@@ -31,7 +31,6 @@ from sglang.srt.configs.qwen3_omni import (
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -318,7 +317,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.use_postshuffle_norm = use_postshuffle_norm
-        self.ln_q = RMSNorm(
+        self.ln_q = nn.LayerNorm(
             self.hidden_size if use_postshuffle_norm else context_dim, eps=1e-6
         )
         self.mlp = nn.ModuleList(
@@ -615,7 +614,10 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                             and name_mapped not in params_dict
                         ):
                             continue
-                        param = params_dict[name_mapped]
+                        if name_mapped in params_dict.keys():
+                            param = params_dict[name_mapped]
+                        else:
+                            continue
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
                         # # other available replicas.

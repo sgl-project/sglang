@@ -40,6 +40,7 @@ from sglang.srt.distributed.parallel_state import (
     graph_capture,
     set_pdmux_status,
 )
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -51,7 +52,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
-from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -264,6 +264,9 @@ class CudaGraphRunner:
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+        self.is_dllm = self.dllm_config is not None
+
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
@@ -284,6 +287,9 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
+        elif self.is_dllm:
+            self.capture_forward_mode = ForwardMode.DLLM_EXTEND
+            self.num_tokens_per_bs = self.dllm_config.block_size
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
@@ -300,6 +306,8 @@ class CudaGraphRunner:
         self.maybe_init_pdmux()
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+            if self.dllm_config is None
+            else self.dllm_config.block_size
         )
 
         self.encoder_len_fill_value = 0
@@ -312,6 +320,11 @@ class CudaGraphRunner:
                 max_bs_in_cuda_graph=self.max_bs,
                 num_tokens_per_bs=self.num_tokens_per_bs,
             )
+
+        enable_mamba_track = (
+            self.model_runner.server_args.enable_mamba_extra_buffer()
+            and self.model_runner.spec_algorithm.is_none()
+        )
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
@@ -330,6 +343,7 @@ class CudaGraphRunner:
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
+            enable_mamba_track=enable_mamba_track,
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
@@ -489,9 +503,6 @@ class CudaGraphRunner:
                     self.graphs[key] = graph
                     self.output_buffers[key] = output_buffers
 
-                    # Save gemlite cache after each capture
-                    save_gemlite_cache()
-
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
@@ -532,7 +543,7 @@ class CudaGraphRunner:
     def capture_one_batch_size(
         self, bs: int, forward: Callable, stream_idx: Optional[int] = None
     ):
-        buffers = self.buffers
+        buffers: GraphInputBuffers = self.buffers
         graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -606,6 +617,18 @@ class CudaGraphRunner:
         else:
             lora_ids = None
 
+        # mamba state tracking
+        mamba_track_indices = (
+            buffers.mamba_track_indices[:bs]
+            if buffers.mamba_track_indices is not None
+            else None
+        )
+        mamba_track_mask = (
+            buffers.mamba_track_mask[:bs]
+            if buffers.mamba_track_mask is not None
+            else None
+        )
+
         if stream_idx is None:
             attn_backend = self.model_runner.attn_backend
         else:
@@ -626,6 +649,9 @@ class CudaGraphRunner:
             attn_backend=attn_backend,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
+            mamba_track_indices=mamba_track_indices,
+            mamba_track_mask=mamba_track_mask,
+            mamba_track_seqlens=None,  # Prefill only
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
@@ -767,8 +793,6 @@ class CudaGraphRunner:
             require_gathered_buffer=self.require_gathered_buffer,
             num_tokens_per_bs=self.num_tokens_per_bs,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
-            attn_tp_rank=self.attn_tp_rank,
-            attn_tp_size=self.attn_tp_size,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(
                 self.model_runner.server_args
             ),
@@ -827,9 +851,18 @@ class CudaGraphRunner:
             graph_key = self.bs
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
+
         if isinstance(output, LogitsProcessorOutput):
+            if self.is_dllm:
+                next_token_logits = None
+                full_logits = output.full_logits[: self.raw_num_token]
+            else:
+                full_logits = None
+                next_token_logits = output.next_token_logits[: self.raw_num_token]
+
             return LogitsProcessorOutput(
-                next_token_logits=output.next_token_logits[: self.raw_num_token],
+                next_token_logits=next_token_logits,
+                full_logits=full_logits,
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None

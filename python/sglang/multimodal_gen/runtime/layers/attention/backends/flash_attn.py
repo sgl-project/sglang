@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 try:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -73,8 +74,8 @@ class FlashAttentionBackend(AttentionBackend):
         return [32, 64, 96, 128, 160, 192, 224, 256]
 
     @staticmethod
-    def get_name() -> str:
-        return "FLASH_ATTN"
+    def get_enum() -> AttentionBackendEnum:
+        return AttentionBackendEnum.FA
 
     @staticmethod
     def get_impl_cls() -> type["FlashAttentionImpl"]:

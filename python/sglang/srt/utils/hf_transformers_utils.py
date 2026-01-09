@@ -24,11 +24,18 @@ from typing import Any, Dict, List, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
+
+from sglang.srt.utils import get_bool_env_var
+
+# Conditional import based on SGLANG_USE_MODELSCOPE environment variable
+if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+    from modelscope import AutoConfig, GenerationConfig
+else:
+    from transformers import AutoConfig, GenerationConfig
+
 from transformers import (
-    AutoConfig,
     AutoProcessor,
     AutoTokenizer,
-    GenerationConfig,
     PretrainedConfig,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
@@ -60,7 +67,7 @@ from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
-from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
+from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     ChatGLMConfig,
@@ -184,6 +191,37 @@ def _load_deepseek_v32_model(
     )
 
 
+# Temporary hack for Mistral Large
+def _load_mistral_large_3_for_causal_LM(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    # first get the local path
+    local_path = download_from_hf(model_path)
+    # then load the config file in json
+    parser = mistral_utils.MistralConfigParser()
+    config_dict, _ = parser.parse(local_path)
+
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".json") as f:
+        json.dump(config_dict, f)
+        f.flush()
+        loaded_config = AutoConfig.from_pretrained(
+            f.name, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    text_config = getattr(loaded_config, "text_config", None)
+    if text_config is not None and isinstance(text_config, dict):
+        text_config = AutoConfig.for_model(**text_config)
+        setattr(loaded_config, "text_config", text_config)
+    vision_config = getattr(loaded_config, "vision_config", None)
+    if vision_config is not None and isinstance(vision_config, dict):
+        vision_config = AutoConfig.for_model(**vision_config)
+        setattr(loaded_config, "vision_config", vision_config)
+
+    return loaded_config
+
+
 def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
     # TODO: Remove this workaround related when AutoConfig correctly identifies deepseek-ocr.
     # Hugging Face's AutoConfig currently misidentifies it as deepseekvl2.
@@ -192,6 +230,17 @@ def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
         and config.auto_map.get("AutoModel")
         == "modeling_deepseekocr.DeepseekOCRForCausalLM"
     )
+
+
+def _override_deepseek_ocr_v_head_dim(config: DeepseekVLV2Config) -> None:
+    # FIXME: deepseek-ocr's v_head_dim is set to 0 in its config file.
+    # https://huggingface.co/deepseek-ai/DeepSeek-OCR/blob/main/config.json#L116
+    if config.text_config.v_head_dim == 0:
+        V_HEAD_DIM_PATCH = 128
+        config.text_config.v_head_dim = V_HEAD_DIM_PATCH
+        logger.warning(
+            f"Overriding deepseek-ocr's v_head_dim from 0 to {V_HEAD_DIM_PATCH} to avoid potential issues."
+        )
 
 
 @lru_cache_frozenset(maxsize=32)
@@ -215,17 +264,21 @@ def get_config(
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         model = client.get_local_dir()
 
-    try:
-        config = AutoConfig.from_pretrained(
+    if "mistral-large-3" in str(model).lower():
+        config = _load_mistral_large_3_for_causal_LM(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-
-    except ValueError as e:
-        if not "deepseek_v32" in str(e):
-            raise e
-        config = _load_deepseek_v32_model(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-        )
+    else:
+        try:
+            config = AutoConfig.from_pretrained(
+                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            )
+        except ValueError as e:
+            if not "deepseek_v32" in str(e):
+                raise e
+            config = _load_deepseek_v32_model(
+                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            )
 
     if (
         config.architectures is not None
@@ -261,6 +314,10 @@ def get_config(
                 model_type = "deepseek-ocr"
         config_class = _CONFIG_REGISTRY[model_type]
         config = config_class.from_pretrained(model, revision=revision)
+
+        if _is_deepseek_ocr_model(config):
+            _override_deepseek_ocr_v_head_dim(config)
+
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
 
@@ -465,14 +522,20 @@ def get_processor(
 ):
     # pop 'revision' from kwargs if present.
     revision = kwargs.pop("revision", tokenizer_revision)
-
-    config = AutoConfig.from_pretrained(
-        tokenizer_name,
-        trust_remote_code=trust_remote_code,
-        revision=revision,
-        **kwargs,
-    )
-
+    if "mistral-large-3" in str(tokenizer_name).lower():
+        config = _load_mistral_large_3_for_causal_LM(
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+    else:
+        config = AutoConfig.from_pretrained(
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
     if _is_deepseek_ocr_model(config):
         # Temporary hack for load deepseek-ocr
         config.model_type = "deepseek-ocr"

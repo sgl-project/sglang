@@ -8,9 +8,6 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 @dataclass
 class FluxSamplingParams(SamplingParams):
-    # Video parameters
-    # height: int = 1024
-    # width: int = 1024
     num_frames: int = 1
     # Denoising stage
     guidance_scale: float = 1.0

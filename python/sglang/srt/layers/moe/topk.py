@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import IntEnum, auto
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -48,6 +48,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -91,9 +92,6 @@ if _use_aiter:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
-if _is_npu:
-    import torch_npu
-    from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 # -------------------------------- TopKConfig ---------------------------------------
 
@@ -123,32 +121,23 @@ class TopKOutputChecker:
 
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
-        return topk_output.format.is_standard()
+        return isinstance(topk_output, StandardTopKOutput)
 
     @staticmethod
     def format_is_triton_kernels(
         topk_output: TopKOutput,
     ) -> TypeGuard[TritonKernelTopKOutput]:
-        return topk_output.format.is_triton_kernels()
+        return isinstance(topk_output, TritonKernelTopKOutput)
 
     @staticmethod
     def format_is_bypassed(topk_output: TopKOutput) -> TypeGuard[BypassedTopKOutput]:
-        return topk_output.format.is_bypassed()
+        return isinstance(topk_output, BypassedTopKOutput)
 
 
-class TopKOutputFormat(Enum):
+class TopKOutputFormat(IntEnum):
     STANDARD = auto()
     TRITON_KERNEL = auto()
     BYPASSED = auto()
-
-    def is_standard(self) -> bool:
-        return self == TopKOutputFormat.STANDARD
-
-    def is_triton_kernels(self) -> bool:
-        return self == TopKOutputFormat.TRITON_KERNEL
-
-    def is_bypassed(self) -> bool:
-        return self == TopKOutputFormat.BYPASSED
 
 
 @runtime_checkable
@@ -215,6 +204,7 @@ class TopK(CustomOp):
         self,
         top_k: int,
         *,
+        layer_id: Optional[int] = None,
         use_grouped_topk: bool = False,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
@@ -236,6 +226,7 @@ class TopK(CustomOp):
         if use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None
 
+        self.layer_id = layer_id
         self.topk_config = TopKConfig(
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
@@ -263,6 +254,7 @@ class TopK(CustomOp):
         self.topk_config.torch_native = True
         return select_experts(
             hidden_states=hidden_states,
+            layer_id=self.layer_id,
             router_logits=router_logits,
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
@@ -312,6 +304,7 @@ class TopK(CustomOp):
             ):
                 topk_output = select_experts(
                     hidden_states=hidden_states,
+                    layer_id=self.layer_id,
                     router_logits=router_logits,
                     topk_config=self.topk_config,
                     num_token_non_padded=num_token_non_padded,
@@ -329,6 +322,7 @@ class TopK(CustomOp):
     ) -> TopKOutput:
         return select_experts(
             hidden_states=hidden_states,
+            layer_id=self.layer_id,
             router_logits=router_logits,
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
@@ -344,76 +338,15 @@ class TopK(CustomOp):
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
 
-        use_grouped_topk = self.topk_config.use_grouped_topk
-        torch_native = self.topk_config.torch_native
-        renormalize = self.topk_config.renormalize
+        from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 
-        if not use_grouped_topk and not torch_native:
-            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k_softmax(
-                router_logits,
-                k=self.topk_config.top_k,
-            )
-
-            if renormalize:
-                topk_weights = l1_norm(
-                    topk_weights
-                    if self.topk_config.num_fused_shared_experts == 0
-                    else topk_weights[:, :-1]
-                )
-            topk_weights = topk_weights.to(torch.float32)
-
-            if expert_location_dispatch_info is not None:
-                topk_ids = topk_ids_logical_to_physical(
-                    topk_ids, expert_location_dispatch_info
-                )
-            get_global_expert_distribution_recorder().on_select_experts(
-                topk_ids=topk_ids
-            )
-
-            return StandardTopKOutput(topk_weights, topk_ids, _)
-        if use_grouped_topk and not torch_native and router_logits.shape[-1] == 256:
-            # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
-            routed_scaling_factor = self.topk_config.routed_scaling_factor or 1
-
-            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
-                router_logits.to(torch.float32),
-                k=self.topk_config.top_k,
-                bias=self.topk_config.correction_bias.to(torch.float32),
-                k_group=self.topk_config.topk_group,
-                group_count=self.topk_config.num_expert_group,
-                group_select_mode=1,
-                renorm=0,
-                norm_type=1,
-                routed_scaling_factor=routed_scaling_factor,
-                eps=float(1e-20),
-            )
-
-            if renormalize:
-                topk_weights_sum = (
-                    topk_weights.sum(dim=-1, keepdim=True)
-                    if self.topk_config.num_fused_shared_experts == 0
-                    else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
-                )
-                topk_weights = topk_weights / topk_weights_sum
-
-            if expert_location_dispatch_info is not None:
-                topk_ids = topk_ids_logical_to_physical(
-                    topk_ids, expert_location_dispatch_info
-                )
-            get_global_expert_distribution_recorder().on_select_experts(
-                topk_ids=topk_ids
-            )
-
-            return StandardTopKOutput(topk_weights, topk_ids, _)
-        else:
-            self.topk_config.torch_native = True
-            return select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_config=self.topk_config,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-            )
+        return fused_topk_npu(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            topk_config=self.topk_config,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
 
     def empty_topk_output(self, device: torch.device) -> TopKOutput:
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
@@ -548,7 +481,7 @@ def fused_topk(
 
 
 # This is used by the Deepseek V2/V3/R1 series models
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -565,9 +498,6 @@ def grouped_topk_gpu(
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     scores = torch.softmax(gating_output, dim=-1)
-    # NPU compiler limitation
-    if _is_npu and scores.dtype == torch.bfloat16:
-        scores = scores.to(torch.float16)
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
     group_scores = (
@@ -584,7 +514,6 @@ def grouped_topk_gpu(
         .reshape(num_token, -1)
     )  # [n, e]
     tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
-    # TODO: NPU can't support directly evaluating a comparison for now
     topk_weights, topk_ids = torch.topk(
         tmp_scores,
         k=topk,
@@ -729,7 +658,6 @@ def biased_grouped_topk_impl(
     tmp_scores = scores_for_choice.masked_fill(
         ~score_mask.bool(), float("-inf")
     )  # [n, e]
-    # TODO: NPU can't support directly evaluating a comparison for now
     _, topk_ids = torch.topk(
         tmp_scores,
         k=topk,
@@ -925,6 +853,7 @@ def select_experts(
     router_logits: torch.Tensor,
     topk_config: TopKConfig,
     *,
+    layer_id: Optional[int] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
@@ -1052,7 +981,10 @@ def select_experts(
         )
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
-
+    get_global_experts_capturer().capture(
+        layer_id=layer_id,
+        topk_ids=topk_ids,
+    )
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
