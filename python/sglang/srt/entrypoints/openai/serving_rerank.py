@@ -411,6 +411,7 @@ class OpenAIServingRerank(OpenAIServingBase):
         try:
             scores = []
             instruct = getattr(request, "instruct", None)
+
             for doc in request.documents:
                 # Build multimodal content lists and render prompt using jinja template
                 query_content, doc_content, image_data, video_data = (
