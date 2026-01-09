@@ -2582,7 +2582,7 @@ def has_hf_quant_config(model_path: str) -> bool:
         return False
 
 
-def get_quantization_config(hf_config) -> Optional[str]:
+def get_quantization_config(hf_config) -> str | None:
     """Extract quantization method from HuggingFace config."""
     quantization_config = getattr(hf_config, "quantization_config", None)
     if quantization_config is not None:
