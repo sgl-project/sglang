@@ -193,7 +193,9 @@ class TestPrefillDelayerLowWatermark(CustomTestCase):
             True
         ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(
             1000
-        ), envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.override(0.3):
+        ), envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.override(
+            0.3
+        ):
             process = popen_launch_server(
                 model,
                 base_url,
@@ -215,9 +217,10 @@ class TestPrefillDelayerLowWatermark(CustomTestCase):
                 ],
             )
 
-        import openai
         import concurrent.futures
         import time
+
+        import openai
 
         try:
             client = openai.Client(base_url=f"{base_url}/v1", api_key="EMPTY")
@@ -225,7 +228,10 @@ class TestPrefillDelayerLowWatermark(CustomTestCase):
             long_prompt = "Hello " * 5000
             blocking_future = None
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=world_size + 1) as executor:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=world_size + 1
+            ) as executor:
+
                 def send_blocking_request():
                     return client.chat.completions.create(
                         model=model,
@@ -257,8 +263,9 @@ class TestPrefillDelayerLowWatermark(CustomTestCase):
                     dp_rank, elapsed, resp = future.result()
                     print(f"DP rank {dp_rank} completed in {elapsed:.2f}s")
                     self.assertLess(
-                        elapsed, 30,
-                        f"Request to DP rank {dp_rank} took too long ({elapsed:.2f}s), low watermark force prefill may not be working"
+                        elapsed,
+                        30,
+                        f"Request to DP rank {dp_rank} took too long ({elapsed:.2f}s), low watermark force prefill may not be working",
                     )
 
             _print_prefill_delayer_metrics(base_url, expect_metrics=True)
