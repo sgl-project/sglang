@@ -72,9 +72,9 @@ class DecodeKVCacheOffloadManager:
         if server_args.hicache_storage_backend_extra_config:
             try:
                 extra_config = json.loads(server_args.hicache_storage_backend_extra_config)
-            except Exception as e:
+            except json.JSONDecodeError as e:
                 logger.error(f"Invalid hicache storage backend extra config JSON: {e}")
-                raise e
+                raise
 
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
