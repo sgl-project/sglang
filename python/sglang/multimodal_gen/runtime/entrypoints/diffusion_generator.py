@@ -17,6 +17,7 @@ import numpy as np
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
@@ -309,6 +310,7 @@ class DiffGenerator:
         response = sync_scheduler_client.forward(req)
         if response.error is None:
             logger.info(success_msg)
+            return response
         else:
             error_msg = response.error
             raise RuntimeError(f"{failure_msg}: {error_msg}")
@@ -373,6 +375,21 @@ class DiffGenerator:
             f"Successfully merged LoRA weights (target: {target}, strength: {strength})",
             "Failed to merge LoRA weights",
         )
+
+    def list_loras(self) -> OutputBatch:
+        """
+        List loaded LoRA adapters and current application status per module.
+        """
+
+        output = self._send_lora_request(
+            req=ListLorasReq(),
+            success_msg="Successfully listed LoRA adapters",
+            failure_msg="Failed to list LoRA adapters",
+        )
+        if output.error is None:
+            return output.output or {}
+        else:
+            raise RuntimeError(f"Failed to list LoRA adapters: {output.error}")
 
     def _ensure_lora_state(
         self,

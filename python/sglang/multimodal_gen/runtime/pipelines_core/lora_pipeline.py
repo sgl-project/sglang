@@ -549,3 +549,55 @@ class LoRAPipeline(ComposedPipelineBase):
             self.is_lora_merged[module_name] = False
             self.cur_adapter_strength.pop(module_name, None)
             logger.info("LoRA weights unmerged for %s", module_name)
+
+    def get_lora_status(self) -> dict[str, Any]:
+        """
+        Summarize loaded LoRA adapters and current application status per module.
+
+        Returns a plain Python dict with no tensor values to allow safe JSON serialization.
+        """
+        # Loaded adapters: list of {nickname, path}
+        loaded_adapters = [
+            {"nickname": nickname, "path": path}
+            for nickname, path in self.loaded_adapter_paths.items()
+        ]
+
+        def _module_status(module_name: str) -> list[dict] | None:
+            # return list of dict to support multi-lora in the future
+            if not self.is_lora_merged.get(module_name, False):
+                return None
+            else:
+                return [
+                    {
+                        "nickname": self.cur_adapter_name.get(module_name, None),
+                        "path": self.cur_adapter_path.get(module_name, None),
+                        "merged": self.is_lora_merged.get(module_name, False),
+                        "strength": self.cur_adapter_strength.get(module_name, None),
+                    }
+                ]
+
+        # Build active usage per module only for modules that exist in this pipeline
+        active: dict[str, Any] = {}
+        if (
+            "transformer" in self.modules
+            and self.modules["transformer"] is not None
+            and (status := _module_status("transformer")) is not None
+        ):
+            active["transformer"] = status
+        if (
+            "transformer_2" in self.modules
+            and self.modules["transformer_2"] is not None
+            and (status := _module_status("transformer_2")) is not None
+        ):
+            active["transformer_2"] = status
+        if (
+            "fake_score_transformer" in self.modules
+            and self.modules["fake_score_transformer"] is not None
+            and (status := _module_status("critic")) is not None
+        ):
+            active["critic"] = status
+
+        return {
+            "loaded_adapters": loaded_adapters,
+            "active": active,
+        }
