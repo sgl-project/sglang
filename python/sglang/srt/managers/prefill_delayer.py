@@ -23,7 +23,7 @@ class _DelayInfo:
 
 
 class _NegotiateOutput(NamedTuple):
-    allow: bool
+    allow_prefill: bool
 
 
 class PrefillDelayer:
@@ -88,7 +88,7 @@ class PrefillDelayer:
                 debug_num_prefillable=num_prefillable,
                 debug_num_force_allow=num_force_allow,
             )
-            return _NegotiateOutput(allow=True)
+            return _NegotiateOutput(allow_prefill=True)
 
         global_exists_not_prefillable = global_prefillable.min().item() == 0
         global_exists_prefillable = global_prefillable.max().item() > 0
@@ -101,7 +101,7 @@ class PrefillDelayer:
                 self._curr_delay_info = _DelayInfo()
             self._curr_delay_info.delayed_count += 1
             if self._curr_delay_info.delayed_count < self._max_delay_passes:
-                return _NegotiateOutput(allow=False)
+                return _NegotiateOutput(allow_prefill=False)
 
         is_timeout = global_mixed_prefillable
         exist_previous_wait = self._curr_delay_info is not None
@@ -118,7 +118,7 @@ class PrefillDelayer:
             debug_num_prefillable=num_prefillable,
             debug_num_force_allow=num_force_allow,
         )
-        return _NegotiateOutput(allow=True)
+        return _NegotiateOutput(allow_prefill=True)
 
     def _record_outcome_and_reset(
         self, debug_outcome: str, debug_num_prefillable: int, debug_num_force_allow: int
@@ -174,7 +174,7 @@ class PrefillDelayerSinglePassExecutor:
     def __init__(self, prefill_delayer: PrefillDelayer, token_usage: float):
         self._prefill_delayer = prefill_delayer
         self._token_usage = token_usage
-        self._result: Optional[bool] = None
+        self._result: Optional[_NegotiateOutput] = None
 
     @property
     def _called(self) -> bool:
@@ -192,4 +192,4 @@ class PrefillDelayerSinglePassExecutor:
                 local_prefillable=local_prefillable,
                 token_usage=self._token_usage,
             )
-        return self._result
+        return self._result.allow_prefill
