@@ -896,7 +896,8 @@ class ServerArgs:
 
         if self.piecewise_cuda_graph_max_tokens is None:
             # Refer to pr #15927, by default we set the piecewise cuda graph max tokens to the chunked prefill size by default.
-            # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode. To avoid the performance regression, we set the max tokens to 2048 by default.
+            # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
+            # To avoid the performance regression, we set the max tokens to 2048 by default.
             if self.use_mla_backend():
                 self.piecewise_cuda_graph_max_tokens = 2048
             else:
