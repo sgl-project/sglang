@@ -100,13 +100,14 @@ class PrefillDelayer:
                 return False
 
         is_timeout = global_mixed_prefillable
+        exist_previous_wait = self._curr_delay_info is not None
         self._reset(
             debug_outcome=(
                 "wait_timeout"
                 if is_timeout
                 else (
                     "wait_success_all_prefillable"
-                    if self._curr_delay_info is not None
+                    if exist_previous_wait
                     else "no_wait_all_prefillable"
                 )
             ),
