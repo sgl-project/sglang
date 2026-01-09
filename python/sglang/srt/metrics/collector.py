@@ -776,10 +776,10 @@ class SchedulerMetricsCollector:
             # Need bucket "<=0" for zero-delay cases
             buckets=[0, 5, 20, 100, 500],
         )
-        self.prefill_delayer_decisions_total = Counter(
+        self.prefill_delayer_outcomes_total = Counter(
             name="sglang:prefill_delayer_decisions_total",
             documentation="Prefill delayer decision counts.",
-            labelnames=[*labels.keys(), "decision", "actual_prefill"],
+            labelnames=[*labels.keys(), TODO],
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
@@ -813,11 +813,11 @@ class SchedulerMetricsCollector:
     ) -> None:
         self._log_histogram(self.prefill_delayer_wait_forward_passes, forward_passes)
         self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
-        TODO_counter_name
-        self.prefill_delayer_decisions_total.labels(
+        self.prefill_delayer_outcomes_total.labels(
             **self.labels,
             prefillable=prefillable,
             allow=str(int(allow)),
+            reason=reason,
             actual_prefill=str(int(actual_prefill)),
         ).inc(1)
 
