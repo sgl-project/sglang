@@ -802,7 +802,7 @@ class SchedulerMetricsCollector:
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
-    def observe_prefill_delayer_wait(
+    def observe_prefill_delayer_outcome(
         self,
         forward_passes: int,
         wait_seconds: float,

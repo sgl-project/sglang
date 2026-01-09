@@ -244,7 +244,7 @@ def _record_single_pass_result(
         else:
             wait_seconds = forward_passes = 0
         TODO_histogram
-        metrics_collector.observe_prefill_delayer_wait(
+        metrics_collector.observe_prefill_delayer_outcome(
             forward_passes=forward_passes,
             wait_seconds=wait_seconds,
             prefillable=output.prefillable,
