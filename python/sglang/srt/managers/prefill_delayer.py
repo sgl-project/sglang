@@ -25,9 +25,9 @@ class _State:
 
 class _NegotiateOutput(NamedTuple):
     next_state: Optional[_State]
-    prefillable: str
-    allow: bool
-    reason: str
+    prefillable_status: str
+    output_allow: bool
+    output_reason: str
     num_prefillable: int
     num_token_watermark_force_allow: int
 
@@ -124,24 +124,24 @@ class PrefillDelayer:
             exist_previous_wait = prev_state is not None
             return _NegotiateOutput(
                 next_state=None,
-                allow=True,
-                reason="wait_success" if exist_previous_wait else "no_wait",
+                output_allow=True,
+                output_reason="wait_success" if exist_previous_wait else "no_wait",
                 **debug_info,
             )
         elif prefillable_status == "none":
             return _NegotiateOutput(
                 next_state=None,
                 # It does not matter whether we allow or not, thus we allow for simplicity
-                allow=True,
-                reason="",
+                output_allow=True,
+                output_reason="",
                 **debug_info,
             )
         elif prefillable_status == "mixed":
             if global_exists_token_watermark_force_allow:
                 return _NegotiateOutput(
                     next_state=None,
-                    allow=True,
-                    reason="token_watermark",
+                    output_allow=True,
+                    output_reason="token_watermark",
                     **debug_info,
                 )
 
@@ -153,15 +153,15 @@ class PrefillDelayer:
                 )
                 return _NegotiateOutput(
                     next_state=next_state,
-                    allow=False,
-                    reason="delay",
+                    output_allow=False,
+                    output_reason="delay",
                     **debug_info,
                 )
             else:
                 return _NegotiateOutput(
                     next_state=None,
-                    allow=True,
-                    reason="wait_timeout",
+                    output_allow=True,
+                    output_reason="wait_timeout",
                     **debug_info,
                 )
         else:
@@ -210,7 +210,7 @@ class PrefillDelayerSinglePassExecutor:
                 local_prefillable=local_prefillable,
                 token_usage=self._token_usage,
             )
-        return self._result.allow
+        return self._result.output_allow
 
 
 def _record_single_pass_result(
@@ -219,19 +219,19 @@ def _record_single_pass_result(
     metrics_collector: Optional["SchedulerMetricsCollector"],
 ) -> None:
     if _DEBUG_LOG:
-        if output.allow and (output.reason == "wait_timeout"):
+        if output.output_allow and (output.output_reason == "wait_timeout"):
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill "
                 f"(num_prefillable={output.num_prefillable})"
             )
-        elif output.allow and (output.reason == "token_watermark"):
+        elif output.output_allow and (output.output_reason == "token_watermark"):
             logger.info(
                 f"PrefillDelayer force allow prefill due to low watermark. "
                 f"(num_prefillable={output.num_prefillable}, "
                 f"num_token_watermark_force_allow={output.num_token_watermark_force_allow})"
             )
         else:
-            assert output.reason in {
+            assert output.output_reason in {
                 "",
                 "wait_success",
                 "no_wait",
@@ -247,8 +247,8 @@ def _record_single_pass_result(
         metrics_collector.observe_prefill_delayer_outcome(
             forward_passes=forward_passes,
             wait_seconds=wait_seconds,
-            input_estimation=output.prefillable,
-            output_decision=output.allow,
-            output_reason=output.reason,
+            input_estimation=output.prefillable_status,
+            output_allow=output.output_allow,
+            output_reason=output.output_reason,
             actual_execution=actual_prefill,
         )
