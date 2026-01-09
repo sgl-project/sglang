@@ -102,45 +102,6 @@ def _run_throughput_test(
     print(f"Output throughput: {res['output_throughput']:.2f} token/s")
 
 
-class TestPrefillDelayerAccuracy(CustomTestCase):
-    def test_1_mgsm_en_has_prefill_delayer(self):
-        self._run_accuracy_test(prefill_delayer=True)
-
-    def test_2_mgsm_en_no_prefill_delayer(self):
-        self._run_accuracy_test(prefill_delayer=False)
-
-    def _run_accuracy_test(self, prefill_delayer: bool):
-        model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
-        base_url = DEFAULT_URL_FOR_TEST
-        process = _launch_server(
-            prefill_delayer=prefill_delayer,
-            model=model,
-            base_url=base_url,
-            other_args=[
-                # Not really needed, only to test support non-FCFS algorithms
-                "--schedule-policy",
-                "lpm",
-                # Use this to ensure prefill delayer will be run
-                "--max-total-tokens",
-                "4096",
-            ],
-        )
-        try:
-            args = SimpleNamespace(
-                base_url=base_url,
-                model=model,
-                eval_name="mgsm_en",
-                num_examples=None,
-                num_threads=1024,
-            )
-            metrics = run_eval(args)
-            print(f"=== mgsm_en ({prefill_delayer=}) ===")
-            print(f"{metrics=}")
-            self.assertGreater(metrics["score"], 0.87)
-        finally:
-            kill_process_tree(process.pid)
-
-
 class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
     def test_1_with_low_watermark(self):
         self._run(token_usage_low_watermark=0.8)
@@ -209,6 +170,45 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
         try:
             asyncio.run(run_test())
             _print_prefill_delayer_metrics(base_url, expect_metrics=True)
+        finally:
+            kill_process_tree(process.pid)
+
+
+class TestPrefillDelayerAccuracy(CustomTestCase):
+    def test_1_mgsm_en_has_prefill_delayer(self):
+        self._run_accuracy_test(prefill_delayer=True)
+
+    def test_2_mgsm_en_no_prefill_delayer(self):
+        self._run_accuracy_test(prefill_delayer=False)
+
+    def _run_accuracy_test(self, prefill_delayer: bool):
+        model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        base_url = DEFAULT_URL_FOR_TEST
+        process = _launch_server(
+            prefill_delayer=prefill_delayer,
+            model=model,
+            base_url=base_url,
+            other_args=[
+                # Not really needed, only to test support non-FCFS algorithms
+                "--schedule-policy",
+                "lpm",
+                # Use this to ensure prefill delayer will be run
+                "--max-total-tokens",
+                "4096",
+            ],
+        )
+        try:
+            args = SimpleNamespace(
+                base_url=base_url,
+                model=model,
+                eval_name="mgsm_en",
+                num_examples=None,
+                num_threads=1024,
+            )
+            metrics = run_eval(args)
+            print(f"=== mgsm_en ({prefill_delayer=}) ===")
+            print(f"{metrics=}")
+            self.assertGreater(metrics["score"], 0.87)
         finally:
             kill_process_tree(process.pid)
 
