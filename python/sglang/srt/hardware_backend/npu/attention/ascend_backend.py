@@ -471,8 +471,6 @@ class AscendAttnBackend(AttentionBackend):
         else:
             return self.alibi_bias[:, :q_seq_len, :kv_seq_len]
 
-
-
     def attn_alibi(self,q,k_cache,v_cache,block_tables,seq_lens,query_lens,scale_value,num_heads,slopes,is_extend):
         curr=0
         num_prompts=query_lens.shape[0]
