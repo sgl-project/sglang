@@ -145,12 +145,10 @@ class PrefillDelayer:
                     outcome="forbid",
                 )
 
-            self._record_outcome_and_reset(
-                debug_outcome="wait_timeout",
-                debug_num_prefillable=num_prefillable,
-                debug_num_token_watermark_force_allow=num_token_watermark_force_allow,
+            return None, _NegotiateOutput(
+                allow_prefill=True,
+                outcome="wait_timeout",
             )
-            return _NegotiateOutput(allow_prefill=True)
 
     def _gather_info(
         self, local_prefillable: bool, local_token_watermark_force_allow: bool
