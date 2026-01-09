@@ -289,20 +289,13 @@ def _run_throughput_comparison(
     min_improvement_pct: float = -5,
 ):
     common_kwargs = dict(
+        debug_name=test_name,
         other_launch_args=other_launch_args,
         other_benchmark_args=other_benchmark_args,
         token_usage_low_watermark=token_usage_low_watermark,
     )
-    res_enabled = _run_throughput_test(
-        debug_name=f"{test_name} (prefill_delayer=True)",
-        prefill_delayer=True,
-        **common_kwargs,
-    )
-    res_disabled = _run_throughput_test(
-        debug_name=f"{test_name} (prefill_delayer=False)",
-        prefill_delayer=False,
-        **common_kwargs,
-    )
+    res_enabled = _run_throughput_test(prefill_delayer=True, **common_kwargs)
+    res_disabled = _run_throughput_test(prefill_delayer=False, **common_kwargs)
 
     _assert_throughput_improvement(
         test_case,
@@ -343,7 +336,7 @@ def _run_throughput_test(
     finally:
         kill_process_tree(process.pid)
 
-    print(f"=== {debug_name} ===")
+    print(f"=== {debug_name} ({prefill_delayer=}) ===")
     print(f"Input throughput: {res['input_throughput']:.2f} token/s")
     print(f"Output throughput: {res['output_throughput']:.2f} token/s")
 
