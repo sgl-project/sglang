@@ -811,7 +811,7 @@ class SchedulerMetricsCollector:
         output_reason: str,
         actual_execution: bool,
     ) -> None:
-        if output_allow:
+        if output_allow and actual_execution:
             self._log_histogram(self.prefill_delayer_wait_forward_passes, forward_passes)
             self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
 
