@@ -101,7 +101,7 @@ class PrefillDelayer:
         # Compute derived global states
         num_prefillable = global_prefillable.sum().item()
         num_token_watermark_force_allow = global_token_watermark_force_allow.sum().item()
-        global_exists_force_allow = global_token_watermark_force_allow.max().item() > 0
+        global_exists_token_watermark_force_allow = global_token_watermark_force_allow.max().item() > 0
         global_exists_not_prefillable = global_prefillable.min().item() == 0
         global_all_prefillable = global_prefillable.min().item() > 0
         global_exists_prefillable = global_prefillable.max().item() > 0
@@ -120,7 +120,7 @@ class PrefillDelayer:
                 ),
             )
 
-        if global_exists_force_allow:
+        if global_exists_token_watermark_force_allow:
             self._record_outcome_and_reset(
                 debug_num_prefillable=num_prefillable,
                 debug_num_token_watermark_force_allow=num_token_watermark_force_allow,
