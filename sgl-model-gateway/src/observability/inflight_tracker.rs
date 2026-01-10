@@ -1,7 +1,7 @@
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, LazyLock, OnceLock,
     },
     time::Instant,
 };
@@ -11,8 +11,9 @@ use dashmap::DashMap;
 use super::gauge_histogram::{GaugeHistogram, INFLIGHT_AGE_BUCKETS};
 use crate::policies::utils::PeriodicTask;
 
-static INFLIGHT_AGE_GAUGE: GaugeHistogram =
-    GaugeHistogram::new("smg_http_inflight_request_age_count", &INFLIGHT_AGE_BUCKETS);
+static INFLIGHT_AGE_GAUGE: LazyLock<GaugeHistogram> = LazyLock::new(|| {
+    GaugeHistogram::new("smg_http_inflight_request_age_count", &INFLIGHT_AGE_BUCKETS)
+});
 
 pub struct InFlightRequestTracker {
     requests: DashMap<u64, Instant>,
