@@ -7,37 +7,44 @@ Note: Keep in sync with Rust implementation in
 sgl-model-gateway/src/observability/gauge_histogram.rs
 """
 
-from typing import Dict, List, Tuple, Union
+import bisect
+from typing import Dict, Iterator, List, Tuple, Union
 
 
-def compute_bucket_labels(
-    bucket_bounds: List[Union[int, float]],
-) -> List[Tuple[str, str]]:
-    """Compute (gt, le) label pairs from bucket bounds."""
-    labels = []
-    for i, upper in enumerate(bucket_bounds):
-        lower = bucket_bounds[i - 1] if i > 0 else 0
-        labels.append((str(lower), str(upper)))
-    labels.append((str(bucket_bounds[-1]), "+Inf"))
-    return labels
+class BucketLabels:
+    """Bucket label pairs and count computation for a GaugeHistogram."""
 
+    def __init__(self, upper_bounds: List[Union[int, float]]):
+        self._upper_bounds = upper_bounds
+        self._labels: List[Tuple[str, str]] = []
+        for i, upper in enumerate(upper_bounds):
+            lower = upper_bounds[i - 1] if i > 0 else 0
+            self._labels.append((str(lower), str(upper)))
+        self._labels.append((str(upper_bounds[-1]), "+Inf"))
 
-def compute_bucket_counts(
-    bucket_bounds: List[Union[int, float]],
-    observations: List[Union[int, float]],
-) -> List[int]:
-    """Compute how many observations fall into each bucket. O(n) complexity."""
-    import bisect
+    def __len__(self) -> int:
+        return len(self._labels)
 
-    counts = [0] * (len(bucket_bounds) + 1)
-    for v in observations:
-        # bisect_left finds insertion point; values at boundary go to current bucket
-        idx = bisect.bisect_left(bucket_bounds, v)
-        counts[idx] += 1
-    return counts
+    def __iter__(self) -> Iterator[Tuple[str, str]]:
+        return iter(self._labels)
+
+    def upper_bounds(self) -> List[Union[int, float]]:
+        return self._upper_bounds
+
+    def compute_bucket_counts(
+        self, observations: List[Union[int, float]]
+    ) -> List[int]:
+        """Compute how many observations fall into each bucket. O(n) complexity."""
+        counts = [0] * len(self)
+        for v in observations:
+            # bisect_left finds insertion point; values at boundary go to current bucket
+            idx = bisect.bisect_left(self._upper_bounds, v)
+            counts[idx] += 1
+        return counts
 
 
 class GaugeHistogram:
+    """Gauge with gt/le bucket labels for Grafana heatmap visualization."""
 
     def __init__(
         self,
@@ -49,8 +56,7 @@ class GaugeHistogram:
     ):
         from prometheus_client import Gauge
 
-        self._bucket_bounds = bucket_bounds
-        self._bucket_labels = compute_bucket_labels(bucket_bounds)
+        self._buckets = BucketLabels(bucket_bounds)
 
         self._gauge = Gauge(
             name=name,
@@ -61,16 +67,15 @@ class GaugeHistogram:
 
     def set_raw(self, labels: Dict[str, str], values: List[int]):
         """Set bucket counts directly."""
-        for (gt, le), count in zip(self._bucket_labels, values):
+        for (gt, le), count in zip(self._buckets, values):
             self._gauge.labels(**labels, gt=gt, le=le).set(count)
 
     def set_by_current_observations(
         self, labels: Dict[str, str], observations: List[Union[int, float]]
     ):
         """Compute bucket counts from observations and set them."""
-        bucket_counts = compute_bucket_counts(self._bucket_bounds, observations)
-        self.set_raw(labels, bucket_counts)
+        counts = self._buckets.compute_bucket_counts(observations)
+        self.set_raw(labels, counts)
 
-    @property
-    def num_buckets(self) -> int:
-        return len(self._bucket_labels)
+    def buckets(self) -> BucketLabels:
+        return self._buckets
