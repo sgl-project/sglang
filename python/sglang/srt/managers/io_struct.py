@@ -216,6 +216,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     attention_fingerprint_mode: Optional[Union[List[bool], bool]] = None
     # Privacy: mask attention to first N tokens (hide system prompt structure)
     attention_mask_prefix: Optional[Union[List[int], int]] = None
+    # SECURE MODE: Only return fingerprint, never raw positions/scores (auto-enabled when mask_prefix > 0)
+    attention_fingerprint_only: Optional[Union[List[bool], bool]] = None
     # Capture first decode step (prompt attention) regardless of stride
     include_prompt_attention: Union[List[bool], bool] = True
     # Only average over these attention heads (None = all heads)
@@ -809,6 +811,8 @@ class TokenizedGenerateReqInput(BaseReq):
     attention_fingerprint_mode: Optional[bool] = None
     # Privacy: mask attention to first N tokens (hide system prompt structure)
     attention_mask_prefix: Optional[int] = None
+    # SECURE MODE: Only return fingerprint, never raw positions/scores (auto-enabled when mask_prefix > 0)
+    attention_fingerprint_only: Optional[bool] = None
     # Capture first decode step (prompt attention) regardless of stride
     include_prompt_attention: bool = True
     # Only average over these attention heads (None = all heads)

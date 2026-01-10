@@ -280,6 +280,7 @@ class CompletionRequest(BaseModel):
     attention_sketch_mode: bool = False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
     attention_fingerprint_mode: Optional[bool] = None  # Override server fingerprint mode (None = use server default)
     attention_mask_prefix: Optional[int] = None  # Mask attention to first N tokens (privacy: hide system prompt structure)
+    attention_fingerprint_only: Optional[bool] = None  # SECURE MODE: Only return fingerprint, never raw positions/scores (auto-enabled when mask_prefix > 0)
     include_prompt_attention: bool = True  # Capture first decode step (prompt attention) regardless of stride
     attention_capture_head_ids: Optional[List[int]] = None  # Only average over these heads (None = all heads)
 
@@ -535,6 +536,7 @@ class ChatCompletionRequest(BaseModel):
     attention_sketch_mode: bool = False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
     attention_fingerprint_mode: Optional[bool] = None  # Override server fingerprint mode (None = use server default)
     attention_mask_prefix: Optional[int] = None  # Mask attention to first N tokens (privacy: hide system prompt structure)
+    attention_fingerprint_only: Optional[bool] = None  # SECURE MODE: Only return fingerprint, never raw positions/scores (auto-enabled when mask_prefix > 0)
     include_prompt_attention: bool = True  # Capture first decode step (prompt attention) regardless of stride
     attention_capture_head_ids: Optional[List[int]] = None  # Only average over these heads (None = all heads)
 

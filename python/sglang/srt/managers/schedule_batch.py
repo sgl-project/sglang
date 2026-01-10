@@ -718,6 +718,7 @@ class Req:
         attention_capture_layer_ids: Optional[List[int]] = None,
         attention_sketch_mode: bool = False,
         attention_fingerprint_mode: Optional[bool] = None,
+        attention_fingerprint_only: Optional[bool] = None,
         attention_mask_prefix: Optional[int] = None,
         include_prompt_attention: bool = True,
         attention_capture_head_ids: Optional[List[int]] = None,
@@ -795,6 +796,7 @@ class Req:
         # Per-request capture control (None = use batch defaults from server_args)
         # These can be set via API or overridden by sidecar feedback
         self.attention_fingerprint_mode: Optional[bool] = attention_fingerprint_mode
+        self.attention_fingerprint_only: Optional[bool] = attention_fingerprint_only  # SECURE: Only return fingerprint, not raw data
         self.attention_mask_prefix: Optional[int] = attention_mask_prefix  # Privacy: mask first N tokens
         self.include_prompt_attention: bool = include_prompt_attention  # Capture first decode step regardless of stride
         self.attention_capture_head_ids: Optional[List[int]] = attention_capture_head_ids  # Only average over these heads
