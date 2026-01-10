@@ -1,7 +1,5 @@
 import unittest
 
-from sglang.srt.utils.gauge_histogram import GaugeHistogram
-
 
 class TestGaugeHistogramComputeBucketCounts(unittest.TestCase):
     """Test GaugeHistogram._compute_bucket_counts with hardcoded expected values."""
