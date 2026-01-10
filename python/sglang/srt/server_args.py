@@ -688,9 +688,6 @@ class ServerArgs:
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
 
-        # Handle Hicache settings.
-        self._handle_hicache()
-
         # Set kernel backends.
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
@@ -698,6 +695,9 @@ class ServerArgs:
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_grammar_backend()
+
+        # Handle Hicache settings.
+        self._handle_hicache()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -2019,7 +2019,8 @@ class ServerArgs:
             effective_decode_backend = (
                 self.decode_attention_backend
                 if self.decode_attention_backend is not None
-                else self.attention_backend
+                else self.attention_backend if self.attention_backend is not None
+                else "fa3"
             )
             if effective_decode_backend == "fa3":
                 if self.decode_attention_backend is None:
@@ -2039,6 +2040,7 @@ class ServerArgs:
                         "FlashAttention3 decode backend is not compatible with hierarchical cache. "
                         "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                     )
+            logger.info(f"HiCache IO backend: {self.hicache_io_backend}, attention backend: {self.attention_backend}, decode backend: {self.decode_attention_backend}")
 
     def _handle_speculative_decoding(self):
         if (
