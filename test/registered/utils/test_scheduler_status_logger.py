@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import tempfile
 import time
@@ -24,15 +25,15 @@ class TestSchedulerStatusLogger(CustomTestCase):
     def setUpClass(cls):
         cls.temp_dir = tempfile.mkdtemp()
         cls.addClassCleanup(shutil.rmtree, cls.temp_dir)
+        env = os.environ.copy()
+        env["SGLANG_LOG_SCHEDULER_STATUS_TARGET"] = cls.temp_dir
+        env["SGLANG_LOG_SCHEDULER_STATUS_INTERVAL"] = "1"
         cls.process = popen_launch_server(
             "Qwen/Qwen3-0.6B",
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=["--skip-server-warmup"],
-            env={
-                "SGLANG_LOG_SCHEDULER_STATUS_TARGET": cls.temp_dir,
-                "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL": "1",
-            },
+            env=env,
         )
         cls.addClassCleanup(kill_process_tree, cls.process.pid)
 
