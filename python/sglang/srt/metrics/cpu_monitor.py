@@ -4,7 +4,7 @@ import time
 import psutil
 
 
-def start_cpu_monitor_thread(component: str, interval: float = 1.0) -> threading.Thread:
+def start_cpu_monitor_thread(component: str, interval: float = 5.0) -> threading.Thread:
     from prometheus_client import Counter
 
     cpu_seconds_total = Counter(
