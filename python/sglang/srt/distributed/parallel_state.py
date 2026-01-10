@@ -39,6 +39,7 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -125,6 +126,7 @@ def _register_group(group: "GroupCoordinator") -> None:
 
 
 @register_custom_op(mutates_args=["tensor"])
+@register_split_op()
 def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
