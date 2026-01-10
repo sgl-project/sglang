@@ -974,6 +974,9 @@ class ServerArgs:
                 if self.speculative_algorithm == "STANDALONE":
                     # standalonedraft model and cuda graphs
                     reserved_mem += 6 * 1024
+                elif self.speculative_algorithm == "DFLASH":
+                    # dflash draft model and cuda graphs
+                    reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
