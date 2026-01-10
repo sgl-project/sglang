@@ -12,14 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
-from diffusers.models.attention_processor import Attention
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
 
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
@@ -226,13 +224,6 @@ class GlmImageAdaLayerNormZero(nn.Module):
         )
 
 
-class GlmImageAttenProcessorState(Enum):
-    ImageGen = "ImageGen"
-    ImageEditWriteKV = "ImageEditWriteKV"
-    ImageEditReadKV = "ImageEditReadKV"
-    ImageEditDontReadKV = "ImageEditNoReadKV"
-
-
 class GlmImageAttention(torch.nn.Module):
     # self.attn1 = Attention(
     #     query_dim=dim,
@@ -266,7 +257,6 @@ class GlmImageAttention(torch.nn.Module):
             raise ImportError(
                 "GlmImageAttnProcessor requires PyTorch 2.0. To use it, please upgrade PyTorch to 2.0."
             )
-        self.processor_state = GlmImageAttenProcessorState.ImageGen
         self.k_cache = None
         self.v_cache = None
 
@@ -318,9 +308,9 @@ class GlmImageAttention(torch.nn.Module):
         key, _ = self.to_k(hidden_states)
         value, _ = self.to_v(hidden_states)
 
-        query = query.unflatten(2, (self.heads, -1)).transpose(1, 2)
-        key = key.unflatten(2, (self.heads, -1)).transpose(1, 2)
-        value = value.unflatten(2, (self.heads, -1)).transpose(1, 2)
+        query = query.unflatten(2, (self.heads, -1))
+        key = key.unflatten(2, (self.heads, -1))
+        value = value.unflatten(2, (self.heads, -1))
 
         # 2. QK normalization
         if self.norm_q is not None:
@@ -332,13 +322,17 @@ class GlmImageAttention(torch.nn.Module):
         if image_rotary_emb is not None:
             from diffusers.models.embeddings import apply_rotary_emb
 
-            query[:, :, text_seq_length:, :] = apply_rotary_emb(
-                query[:, :, text_seq_length:, :],
+            query[:, text_seq_length:, :, :] = apply_rotary_emb(
+                query[:, text_seq_length:, :, :],
                 image_rotary_emb,
+                sequence_dim=1,
                 use_real_unbind_dim=-2,
             )
-            key[:, :, text_seq_length:, :] = apply_rotary_emb(
-                key[:, :, text_seq_length:, :], image_rotary_emb, use_real_unbind_dim=-2
+            key[:, text_seq_length:, :, :] = apply_rotary_emb(
+                key[:, text_seq_length:, :, :],
+                image_rotary_emb,
+                sequence_dim=1,
+                use_real_unbind_dim=-2,
             )
 
         if kv_cache is not None:
@@ -346,10 +340,12 @@ class GlmImageAttention(torch.nn.Module):
                 kv_cache.store(key, value)
             elif kv_cache.mode == "read":
                 k_cache, v_cache = kv_cache.get()
+                print(f"349 {k_cache.shape=}, {key.shape=}", flush=True)
                 key = torch.cat([k_cache, key], dim=1) if k_cache is not None else key
                 value = (
                     torch.cat([v_cache, value], dim=1) if v_cache is not None else value
                 )
+                print(f"350 {key.shape=}, {value.shape=}", flush=True)
             elif kv_cache.mode == "skip":
                 pass
 
@@ -367,128 +363,21 @@ class GlmImageAttention(torch.nn.Module):
             mix_attn_mask = mix_attn_mask.unsqueeze(2)
             attn_mask_matrix = mix_attn_mask @ mix_attn_mask.transpose(1, 2)
             attention_mask = (attn_mask_matrix > 0).unsqueeze(1).to(query.dtype)
-
+        print(f"360 {query.shape=}, {key.shape=}, {value.shape=}", flush=True)
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        print(f"362 {query.shape=}, {key.shape=}, {value.shape=}", flush=True)
         hidden_states = F.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
-        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
+        hidden_states = hidden_states.transpose(1, 2)
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
 
         # 5. Output projection
         hidden_states, _ = self.to_out[0](hidden_states)
         # hidden_states = self.to_out[1](hidden_states)         # (dropout omitted)
-
-        encoder_hidden_states, hidden_states = hidden_states.split(
-            [text_seq_length, hidden_states.size(1) - text_seq_length], dim=1
-        )
-        return hidden_states, encoder_hidden_states
-
-
-class GlmImageAttnProcessor:
-    """
-    Processor for implementing scaled dot-product attention for the GlmImage model. It applies a rotary embedding on
-    query and key vectors, but does not include spatial normalization.
-
-    The processor supports passing an attention mask for text tokens. The attention mask should have shape (batch_size,
-    text_seq_length) where 1 indicates a non-padded token and 0 indicates a padded token.
-    """
-
-    def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError(
-                "GlmImageAttnProcessor requires PyTorch 2.0. To use it, please upgrade PyTorch to 2.0."
-            )
-        self.processor_state = GlmImageAttenProcessorState.ImageGen
-        self.k_cache = None
-        self.v_cache = None
-
-    def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        dtype = encoder_hidden_states.dtype
-
-        batch_size, text_seq_length, embed_dim = encoder_hidden_states.shape
-        batch_size, image_seq_length, embed_dim = hidden_states.shape
-        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
-
-        # 1. QKV projections
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
-
-        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
-        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
-        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
-
-        # 2. QK normalization
-        if attn.norm_q is not None:
-            query = attn.norm_q(query).to(dtype=dtype)
-        if attn.norm_k is not None:
-            key = attn.norm_k(key).to(dtype=dtype)
-
-        # 3. Rotational positional embeddings applied to latent stream
-        if image_rotary_emb is not None:
-            from diffusers.models.embeddings import apply_rotary_emb
-
-            query[:, :, text_seq_length:, :] = apply_rotary_emb(
-                query[:, :, text_seq_length:, :],
-                image_rotary_emb,
-                use_real_unbind_dim=-2,
-            )
-            key[:, :, text_seq_length:, :] = apply_rotary_emb(
-                key[:, :, text_seq_length:, :], image_rotary_emb, use_real_unbind_dim=-2
-            )
-
-        if self.processor_state == GlmImageAttenProcessorState.ImageEditWriteKV:
-            self.k_cache = (
-                key if self.k_cache is None else torch.cat([self.k_cache, key], dim=2)
-            )
-            self.v_cache = (
-                value
-                if self.v_cache is None
-                else torch.cat([self.v_cache, value], dim=2)
-            )
-        elif self.processor_state == GlmImageAttenProcessorState.ImageEditReadKV:
-            key = (
-                torch.cat([self.k_cache, key], dim=2)
-                if self.k_cache is not None
-                else key
-            )
-            value = (
-                torch.cat([self.v_cache, value], dim=2)
-                if self.v_cache is not None
-                else value
-            )
-
-        # 4. Attention
-        if attention_mask is not None:
-            text_attn_mask = attention_mask
-            assert (
-                text_attn_mask.dim() == 2
-            ), "the shape of text_attn_mask should be (batch_size, text_seq_length)"
-            text_attn_mask = text_attn_mask.float().to(query.device)
-            mix_attn_mask = torch.ones(
-                (batch_size, text_seq_length + image_seq_length), device=query.device
-            )
-            mix_attn_mask[:, :text_seq_length] = text_attn_mask
-            mix_attn_mask = mix_attn_mask.unsqueeze(2)
-            attn_mask_matrix = mix_attn_mask @ mix_attn_mask.transpose(1, 2)
-            attention_mask = (attn_mask_matrix > 0).unsqueeze(1).to(query.dtype)
-
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        )
-        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
-
-        # 5. Output projection
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
 
         encoder_hidden_states, hidden_states = hidden_states.split(
             [text_seq_length, hidden_states.size(1) - text_seq_length], dim=1
@@ -854,6 +743,8 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         )
         temb = F.silu(temb)
 
+        print(f"857 {kv_caches=}", flush=True)
+
         # 3. Transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
             hidden_states, encoder_hidden_states = block(
@@ -879,15 +770,6 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         if not return_dict:
             return (output,)
         return output
-
-    def set_attention_processors_state(self, state: GlmImageAttenProcessorState):
-        for block in self.transformer_blocks:
-            block.attn1.processor.processor_state = state
-
-    def clear_attention_processors_cache(self):
-        for block in self.transformer_blocks:
-            block.attn1.processor.k_cache = None
-            block.attn1.processor.v_cache = None
 
 
 EntryClass = GlmImageTransformer2DModel

@@ -34,6 +34,7 @@ class GlmImagePipelineConfig(ImagePipelineConfig):
             "prior_token_drop": batch.prior_token_drop_cond,
             "crop_coords": batch.crop_coords,
             "target_size": batch.target_size,
+            "kv_caches": batch.kv_caches,
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -42,6 +43,7 @@ class GlmImagePipelineConfig(ImagePipelineConfig):
             "prior_token_drop": batch.prior_token_drop_uncond,
             "crop_coords": batch.crop_coords,
             "target_size": batch.target_size,
+            "kv_caches": batch.kv_caches,
         }
 
     def post_denoising_loop(self, latents, batch):

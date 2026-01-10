@@ -937,6 +937,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         batch.target_size = target_size
         batch.crop_coords = crops_coords_top_left
 
+        batch.kv_caches = kv_caches
+
         return batch
 
         transformer_dtype = self.transformer.dtype

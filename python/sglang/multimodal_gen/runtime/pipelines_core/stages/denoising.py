@@ -1061,7 +1061,7 @@ class DenoisingStage(PipelineStage):
 
                         if not is_warmup:
                             self.step_profile()
-
+        batch.kv_caches.clear()
         denoising_end_time = time.time()
         print(f"1066 {latents=}", flush=True)
         if num_timesteps > 0 and not is_warmup:
@@ -1271,6 +1271,7 @@ class DenoisingStage(PipelineStage):
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
             ):
+                batch.kv_caches.set_mode("read")
                 noise_pred_cond = self._predict_noise(
                     current_model=current_model,
                     latent_model_input=latent_model_input,
@@ -1301,6 +1302,7 @@ class DenoisingStage(PipelineStage):
                 forward_batch=batch,
             ):
                 print(f"1298 negative pass")
+                batch.kv_caches.set_mode("skip")
                 noise_pred_uncond = self._predict_noise(
                     current_model=current_model,
                     latent_model_input=latent_model_input,
