@@ -216,7 +216,8 @@ sglang generate \
   --backend diffusers \
   --prompt "A beautiful sunset over mountains" \
   --save-output \
-  --output-path outputs/sunset.png
+  --output-path outputs \
+  --output-file-name sunset.png
 
 # Auto mode - uses native SGLang if available, otherwise diffusers
 sglang generate \
