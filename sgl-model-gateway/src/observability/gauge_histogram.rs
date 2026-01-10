@@ -39,18 +39,12 @@ impl BucketLabels {
         std::iter::zip(&self.gt_labels, &self.le_labels).map(|(&gt, &le)| (gt, le))
     }
 
-    pub fn find_bucket_index(&self, value: u64) -> usize {
-        self.upper_bounds
-            .iter()
-            .position(|&bound| value <= bound)
-            .unwrap_or(self.len() - 1)
-    }
-
     /// Compute bucket counts from observations.
     pub fn compute_bucket_counts(&self, observations: &[u64]) -> Vec<usize> {
         let mut counts = vec![0usize; self.len()];
         for &value in observations {
-            let idx = self.find_bucket_index(value);
+            // Equivalent to Python's bisect.bisect_left. O(log n).
+            let idx = self.upper_bounds.partition_point(|&bound| bound < value);
             counts[idx] += 1;
         }
         counts
