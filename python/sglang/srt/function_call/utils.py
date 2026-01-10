@@ -205,7 +205,9 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
 
 
 def get_json_schema_constraint(
-    tools: List[Tool], tool_choice: Union[ToolChoice, Literal["required"]]
+    tools: List[Tool],
+    tool_choice: Union[ToolChoice, Literal["required"]],
+    parallel_tool_calls: bool,
 ) -> Optional[dict]:
     """
     Get the JSON schema constraint for the specified tool choice.
@@ -241,6 +243,8 @@ def get_json_schema_constraint(
         json_schema_defs = _get_tool_schema_defs(tools)
         if json_schema_defs:
             json_schema["$defs"] = json_schema_defs
+        if parallel_tool_calls is False:
+            json_schema["maxItems"] = 1
         return json_schema
 
     return None
