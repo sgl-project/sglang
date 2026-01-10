@@ -26,10 +26,9 @@ class TestCpuMonitor(unittest.TestCase):
         value = None
         for metric in metrics:
             for sample in metric.samples:
-                if sample.labels.get("component") == "test":
+                if "cpu_seconds" in sample.name and sample.labels.get("component") == "test":
+                    print(f"Found: {sample.name} = {sample.value}")
                     value = sample.value
-
-        print(f"CPU seconds value: {value}")
         self.assertIsNotNone(value)
         self.assertGreater(value, 0)
 
