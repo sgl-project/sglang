@@ -58,6 +58,19 @@ jobs:
             sizes: "3072 4096"
     runs-on: ${{ matrix.runner }}
     steps:
+      - name: Debug - Check artifacts via API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          artifact_name="config-${{ matrix.runner }}-group${{ matrix.batch_group.name }}"
+          echo "=== Looking for artifact: $artifact_name ==="
+          echo ""
+          echo "=== API Response (with name filter) ==="
+          gh api "repos/${{ github.repository }}/actions/artifacts?name=${artifact_name}" || echo "API call failed with name filter"
+          echo ""
+          echo "=== First 5 artifacts in repo ==="
+          gh api "repos/${{ github.repository }}/actions/artifacts?per_page=5" --jq '.artifacts[] | {name, id, expired, created_at}' || echo "API call failed"
+
       - name: Try to download existing group config
         id: download_existing
         uses: dawidd6/action-download-artifact@v6
@@ -72,6 +85,10 @@ jobs:
       - name: Check if should skip
         id: check
         run: |
+          echo "=== Checking downloaded files ==="
+          ls -la ./existing_config/ 2>/dev/null || echo "No existing_config directory"
+          find ./existing_config -name '*.json' 2>/dev/null || echo "No JSON files found"
+
           if [ -d "./existing_config" ] && [ "$(find ./existing_config -name '*.json' 2>/dev/null | head -1)" ]; then
             echo "Found existing config, skipping group ${{ matrix.batch_group.name }}"
             echo "skip=true" >> $GITHUB_OUTPUT
