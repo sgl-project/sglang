@@ -7,6 +7,9 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 from sglang.srt.utils.log_utils import create_log_targets, log_json
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="test-log-utils")
 
 
 class TestLogUtils(unittest.TestCase):
