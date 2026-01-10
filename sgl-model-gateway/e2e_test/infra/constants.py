@@ -61,7 +61,9 @@ HEALTH_CHECK_INTERVAL = 2  # Check every 2s (was 5s)
 
 # Model loading configuration
 INITIAL_GRACE_PERIOD = 30  # Wait before first health check (model loading time)
-LAUNCH_STAGGER_DELAY = 5  # Delay between launching multiple workers
+LAUNCH_STAGGER_DELAY = (
+    10  # Delay between launching multiple workers (avoid I/O contention)
+)
 
 # Retry configuration
 MAX_RETRY_ATTEMPTS = (
