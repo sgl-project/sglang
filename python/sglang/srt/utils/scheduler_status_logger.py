@@ -11,9 +11,9 @@ if TYPE_CHECKING:
 
 
 class SchedulerStatusLogger:
-    def __init__(self, targets: List[str], dump_interval_s: float):
+    def __init__(self, targets: List[str], dump_interval: float):
         self.loggers = create_log_targets(targets=targets, name_prefix=__name__)
-        self.dump_interval_s = dump_interval_s
+        self.dump_interval = dump_interval
         self.last_dump_time = 0.0
 
     @staticmethod
@@ -24,14 +24,14 @@ class SchedulerStatusLogger:
 
         return SchedulerStatusLogger(
             targets=[t.strip() for t in target.split(",") if t.strip()],
-            dump_interval_s=envs.SGLANG_LOG_SCHEDULER_STATUS_INTERVAL.get(),
+            dump_interval=envs.SGLANG_LOG_SCHEDULER_STATUS_INTERVAL.get(),
         )
 
     def maybe_dump(
         self, running_batch: "ScheduleBatch", waiting_queue: List["Req"]
     ) -> None:
         now = time.time()
-        if now - self.last_dump_time < self.dump_interval_s:
+        if now - self.last_dump_time < self.dump_interval:
             return
 
         self.last_dump_time = now
