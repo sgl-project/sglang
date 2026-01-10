@@ -28,14 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 class DFlashWorker(TpModelWorker):
-    """DFlash speculative decoding worker inheriting from TpModelWorker.
-
-    This enables:
-    - Proper model loading via ModelRunner
-    - Shared memory pools with target model
-    - Tensor parallelism support
-    - Hidden state caching via radix cache
-    """
 
     def __init__(
         self,
@@ -58,7 +50,6 @@ class DFlashWorker(TpModelWorker):
         # Override context length to match target model
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
-        # Do not capture CUDA graphs in super().__init__() - will be done later
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
 
@@ -67,7 +58,6 @@ class DFlashWorker(TpModelWorker):
             target_worker.get_memory_pool()
         )
 
-        # DFlash draft model uses ENCODER_ONLY attention (non-causal, no incremental KV cache)
         # Set a minimal draft_runner_cache_size to avoid OOM
         # We only need enough for one batch: max_bs * (max_ctx_len + block_size)
         max_bs = min(32, server_args.max_running_requests or 256)
@@ -137,18 +127,15 @@ class DFlashWorker(TpModelWorker):
         """Initialize attention backend for draft model.
 
         DFlash uses torch-based non-causal attention, not the standard
-        attention backend. This method is a no-op but kept for interface
-        consistency with other speculative workers.
+        attention backend.
         """
-        # DFlash uses direct torch attention in _batched_draft_forward()
-        # No attention backend initialization needed
         pass
 
     def init_cuda_graphs(self):
         """Initialize CUDA graphs for draft model.
 
         DFlash draft model uses eager execution due to variable-length
-        attention patterns. CUDA graphs are not captured for the draft model.
+        attention patterns. CUDA graph support will be added in the future.
         """
         self.cuda_graph_runner = None
         logger.info("DFlash draft model: using eager mode")
@@ -352,9 +339,6 @@ class DFlashWorker(TpModelWorker):
         accept_length_list = verify_input.accept_length.cpu().tolist()
         new_hidden_states = logits_output.hidden_states
 
-        # CRITICAL FIX: After _filter_logits(), hidden_states are FILTERED to only accepted tokens.
-        # The shape is [total_accepted, hidden], NOT [bs * block_size, hidden].
-        # We need to track cumulative offset based on actual accepted tokens per request.
         hidden_offset = 0
 
         for i, req in enumerate(batch.reqs):
