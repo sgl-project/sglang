@@ -55,21 +55,23 @@ class TestSchedulerStatusLogger(unittest.TestCase):
             self.assertEqual(data["queued_rids"], queued_rids)
 
     def test_multiple_targets(self):
-        with tempfile.TemporaryDirectory() as temp_dir1:
-            with tempfile.TemporaryDirectory() as temp_dir2:
-                logger = SchedulerStatusLogger([temp_dir1, temp_dir2])
-                logger.maybe_dump(["rid1"], ["rid2"])
-                for lg in logger.loggers:
-                    lg.handlers[0].flush()
+        with (
+            tempfile.TemporaryDirectory() as temp_dir1,
+            tempfile.TemporaryDirectory() as temp_dir2,
+        ):
+            logger = SchedulerStatusLogger([temp_dir1, temp_dir2])
+            logger.maybe_dump(["rid1"], ["rid2"])
+            for lg in logger.loggers:
+                lg.handlers[0].flush()
 
-                log_files1 = list(Path(temp_dir1).glob("*.log"))
-                log_files2 = list(Path(temp_dir2).glob("*.log"))
-                self.assertEqual(len(log_files1), 1)
-                self.assertEqual(len(log_files2), 1)
+            log_files1 = list(Path(temp_dir1).glob("*.log"))
+            log_files2 = list(Path(temp_dir2).glob("*.log"))
+            self.assertEqual(len(log_files1), 1)
+            self.assertEqual(len(log_files2), 1)
 
-                content1 = log_files1[0].read_text().strip()
-                content2 = log_files2[0].read_text().strip()
-                self.assertEqual(content1, content2)
+            content1 = log_files1[0].read_text().strip()
+            content2 = log_files2[0].read_text().strip()
+            self.assertEqual(content1, content2)
 
     def test_maybe_create_disabled(self):
         with patch.dict("os.environ", {"SGLANG_LOG_SCHEDULER_STATUS_TARGET": ""}):
