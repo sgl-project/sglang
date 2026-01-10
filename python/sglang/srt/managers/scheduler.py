@@ -257,6 +257,9 @@ class Scheduler(
         pp_rank: int,
         dp_rank: Optional[int],
     ):
+        self.is_initializing = True
+        self.init_soft_watchdog(server_args)
+
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
@@ -334,6 +337,9 @@ class Scheduler(
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
+        if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
+            time.sleep(t)
+
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
 
@@ -366,6 +372,8 @@ class Scheduler(
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+        self.is_initializing = False
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -793,15 +801,17 @@ class Scheduler(
         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
 
+    def init_soft_watchdog(self, server_args: ServerArgs):
+        if (x := server_args.soft_watchdog_timeout) is not None:
+            self.soft_watchdog = create_scheduler_watchdog(
+                self, watchdog_timeout=x, soft=True
+            )
+
     def init_watch_dog_memory_saver_input_blocker(self):
         # Start watchdog thread
         self.watchdog = create_scheduler_watchdog(
             self, watchdog_timeout=self.server_args.watchdog_timeout
         )
-        if (x := self.server_args.soft_watchdog_timeout) is not None:
-            self.soft_watchdog = create_scheduler_watchdog(
-                self, watchdog_timeout=x, soft=True
-            )
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
