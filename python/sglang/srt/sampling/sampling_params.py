@@ -102,19 +102,6 @@ class SamplingParams:
         if self.top_k == -1:
             self.top_k = TOP_K_ALL  # whole vocabulary
 
-    @property
-    def has_grammar_constraint(self) -> bool:
-        """
-        Helper property to check if any grammar constraint
-        exists for these SamplingParams.
-        """
-        return (
-            self.json_schema is not None
-            or self.regex is not None
-            or self.ebnf is not None
-            or self.structural_tag is not None
-        )
-
     def verify(self, vocab_size):
         if self.temperature < 0.0:
             raise ValueError(
