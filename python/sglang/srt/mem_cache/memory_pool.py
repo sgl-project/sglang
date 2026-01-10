@@ -131,10 +131,15 @@ class MambaPool:
         conv: List[torch.Tensor]
         temporal: torch.Tensor
 
+        # static field listing all fields of the dataclass
+        # for torch compile compatibility
+        _fields = ("conv", "temporal")
+
         def at_layer_idx(self, layer: int):
             kwargs = {}
-            for k, v in vars(self).items():
-                if k == "conv" or k == "intermediate_conv_window":
+            for k in self._fields:
+                v = getattr(self, k)
+                if k == "conv":
                     kwargs[k] = [conv[layer] for conv in v]
                 else:
                     kwargs[k] = v[layer]
@@ -150,6 +155,15 @@ class MambaPool:
     class SpeculativeState(State):
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
+
+        def at_layer_idx(self, layer: int):
+            kwargs = {}
+            for k, v in vars(self).items():
+                if k == "conv" or k == "intermediate_conv_window":
+                    kwargs[k] = [conv[layer] for conv in v]
+                else:
+                    kwargs[k] = v[layer]
+            return type(self)(**kwargs)
 
     def __init__(
         self,

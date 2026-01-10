@@ -17,7 +17,7 @@ class CompilationConfig:
         self.enable_debug_mode = enable_debug_mode
         self.split_ops = [
             "sglang.unified_attention_with_output",
-            "sglang.gdn_with_output",
+            "sglang.causal_conv1d_gdn_with_output",
             "sglang.inplace_all_reduce",
         ]
 
