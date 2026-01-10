@@ -449,6 +449,7 @@ class SchedulerMetricsMixin:
                 decode_tokens=batch.batch_size() + num_accepted_tokens,
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
+
         if x := self.scheduler_status_logger:
             x.maybe_dump(batch, self.waiting_queue)
 
