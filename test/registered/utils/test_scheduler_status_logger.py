@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 import time
 import unittest
@@ -21,8 +22,8 @@ register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 class TestSchedulerStatusLogger(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls._temp_dir_obj = tempfile.TemporaryDirectory()
-        cls.temp_dir = cls._temp_dir_obj.name
+        cls.temp_dir = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, cls.temp_dir)
         cls.process = popen_launch_server(
             "Qwen/Qwen3-0.6B",
             DEFAULT_URL_FOR_TEST,
@@ -33,11 +34,7 @@ class TestSchedulerStatusLogger(CustomTestCase):
                 "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL": "1",
             },
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-        cls._temp_dir_obj.cleanup()
+        cls.addClassCleanup(kill_process_tree, cls.process.pid)
 
     def test_scheduler_status_dump(self):
         response = requests.post(
@@ -52,25 +49,24 @@ class TestSchedulerStatusLogger(CustomTestCase):
 
         time.sleep(2)
 
-        log_files = list(Path(self.temp_dir).glob("*.log"))
-        self.assertGreater(len(log_files), 0, "No log files found in temp directory")
+        events = _find_log_events(self.temp_dir, "scheduler.status")
+        self.assertGreater(len(events), 0, "scheduler.status event not found")
+        data = events[0]
+        for field in ["timestamp", "running_rids", "queued_rids"]:
+            self.assertIn(field, data)
+        self.assertIsInstance(data["running_rids"], list)
+        self.assertIsInstance(data["queued_rids"], list)
 
-        file_content = "".join(f.read_text() for f in log_files)
-        status_found = False
-        for line in file_content.splitlines():
-            if not line.strip() or not line.startswith("{"):
-                continue
-            data = json.loads(line)
-            if data.get("event") == "scheduler.status":
-                self.assertIn("timestamp", data)
-                self.assertIn("running_rids", data)
-                self.assertIn("queued_rids", data)
-                self.assertIsInstance(data["running_rids"], list)
-                self.assertIsInstance(data["queued_rids"], list)
-                status_found = True
-                break
 
-        self.assertTrue(status_found, "scheduler.status event not found in log files")
+def _find_log_events(log_dir: str, event_name: str) -> list:
+    events = []
+    for f in Path(log_dir).glob("*.log"):
+        for line in f.read_text().splitlines():
+            if line.startswith("{"):
+                data = json.loads(line)
+                if data.get("event") == event_name:
+                    events.append(data)
+    return events
 
 
 if __name__ == "__main__":
