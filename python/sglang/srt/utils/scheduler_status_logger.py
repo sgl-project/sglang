@@ -7,15 +7,14 @@ from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 
 class SchedulerStatusLogger:
-    DUMP_INTERVAL_S = 60.0
-
-    def __init__(self, targets: List[str]):
+    def __init__(self, targets: List[str], dump_interval_s: float):
         self.loggers = create_log_targets(targets=targets, name_prefix=__name__)
+        self.dump_interval_s = dump_interval_s
         self.last_dump_time = 0.0
 
     def maybe_dump(self, running_rids: List[str], queued_rids: List[str]) -> None:
         now = time.time()
-        if now - self.last_dump_time < self.DUMP_INTERVAL_S:
+        if now - self.last_dump_time < self.dump_interval_s:
             return
         self.last_dump_time = now
         log_json(
@@ -37,4 +36,5 @@ class SchedulerStatusLogger:
         targets = [t.strip() for t in raw.split(",") if t.strip()]
         if not targets:
             return None
-        return SchedulerStatusLogger(targets)
+        dump_interval_s = envs.SGLANG_LOG_SCHEDULER_STATUS_INTERVAL_S.get()
+        return SchedulerStatusLogger(targets, dump_interval_s)
