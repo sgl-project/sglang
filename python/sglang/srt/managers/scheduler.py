@@ -93,6 +93,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
+    LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
@@ -1058,6 +1060,10 @@ class Scheduler(
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
+                (
+                    LoadLoRAAdapterFromTensorsReqInput,
+                    self.load_lora_adapter_from_tensors,
+                ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
                 (PauseGenerationReqInput, self.pause_generation),
@@ -2712,6 +2718,14 @@ class Scheduler(
         """In-place loading a new lora adapter from disk or huggingface."""
 
         result = self.tp_worker.load_lora_adapter(recv_req)
+        return result
+
+    def load_lora_adapter_from_tensors(
+        self, recv_req: LoadLoRAAdapterFromTensorsReqInput
+    ) -> LoadLoRAAdapterFromTensorsReqOutput:
+        """In-place loading a new lora adapter from serialized tensors."""
+
+        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
         return result
 
     def unload_lora_adapter(

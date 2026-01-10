@@ -4,6 +4,7 @@
 import os
 from collections import defaultdict
 from collections.abc import Hashable
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -143,6 +144,71 @@ class LoRAPipeline(ComposedPipelineBase):
         else:
             return [], f"Invalid target: {target}. Valid targets: {self.VALID_TARGETS}"
 
+    @contextmanager
+    def _temporarily_disable_offload(
+        self,
+        target_modules: list[tuple[str, dict[str, BaseLayerWithLoRA]]] | None = None,
+        target: str | None = None,
+        use_module_names_only: bool = False,
+    ):
+        """
+        Context manager to temporarily disable layerwise offload for the given modules.
+
+        Args:
+            target_modules: List of (module_name, lora_layers_dict) tuples. If None, will be determined from target.
+            target: Target string ("all", "transformer", etc.). Used if target_modules is None.
+            use_module_names_only: If True, determine module names directly from target without requiring
+                                   LoRA initialization. Used for convert_to_lora_layers scenario.
+
+        Yields:
+            List of modules that had offload disabled.
+        """
+        from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
+            OffloadableDiTMixin,
+        )
+
+        module_names = []
+        if target_modules is not None:
+            # Extract module names from target_modules
+            module_names = [module_name for module_name, _ in target_modules]
+        elif target is not None:
+            if use_module_names_only:
+                if target == "all":
+                    module_names = ["transformer", "transformer_2"]
+                elif target in ["transformer", "transformer_2", "critic"]:
+                    module_names = [target]
+            else:
+                target_modules, _ = self._get_target_lora_layers(target)
+                if target_modules:
+                    module_names = [module_name for module_name, _ in target_modules]
+        else:
+            yield []
+            return
+
+        if not module_names:
+            yield []
+            return
+
+        # clear CUDA cache to free up unused memory
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        offload_disabled_modules = []
+        for module_name in module_names:
+            module = self.modules.get(module_name)
+            if module is not None and isinstance(module, OffloadableDiTMixin):
+                if module.layerwise_offload_managers is not None:
+                    module.disable_offload()
+                    offload_disabled_modules.append(module)
+
+        try:
+            yield offload_disabled_modules
+        finally:
+            # Re-enable layerwise offload: sync weights to CPU and restore hooks
+            for module in offload_disabled_modules:
+                module.enable_offload()
+
     def convert_module_lora_layers(
         self,
         module: torch.nn.Module,
@@ -183,6 +249,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 target_lora_layers[name] = lora_layer
                 replace_submodule(self.modules[module_name], name, lora_layer)
                 converted_count += 1
+
         return converted_count
 
     def convert_to_lora_layers(self) -> None:
@@ -412,8 +479,15 @@ class LoRAPipeline(ComposedPipelineBase):
             raise ValueError(
                 f"Adapter {lora_nickname} not found in the pipeline. Please provide lora_path to load it."
             )
+
+        # Disable layerwise offload before convert_to_lora_layers to ensure weights are accessible
+        # This is critical because convert_to_lora_layers needs to save cpu_weight from actual weights,
+        # not from offloaded placeholder tensors
         if not self.lora_initialized:
-            self.convert_to_lora_layers()
+            with self._temporarily_disable_offload(
+                target="all", use_module_names_only=True
+            ):
+                self.convert_to_lora_layers()
 
         # Re-fetch target_modules after convert_to_lora_layers() to get populated dicts
         target_modules, error = self._get_target_lora_layers(target)
@@ -445,28 +519,34 @@ class LoRAPipeline(ComposedPipelineBase):
         if all_already_applied:
             return
 
-        # Apply LoRA to target modules
-        adapted_count = 0
-        for module_name, lora_layers_dict in target_modules:
-            count = self._apply_lora_to_layers(
-                lora_layers_dict, lora_nickname, lora_path, rank, strength
-            )
-            adapted_count += count
-            self.cur_adapter_name[module_name] = lora_nickname
-            self.cur_adapter_path[module_name] = (
-                lora_path or self.loaded_adapter_paths.get(lora_nickname, "")
-            )
-            self.is_lora_merged[module_name] = True
-            self.cur_adapter_strength[module_name] = strength
+        # Disable layerwise offload if enabled: load all layers to GPU
+        with self._temporarily_disable_offload(target_modules=target_modules):
+            # Apply LoRA to target modules (now all layers are on GPU)
+            adapted_count = 0
+            for module_name, lora_layers_dict in target_modules:
+                count = self._apply_lora_to_layers(
+                    lora_layers_dict,
+                    lora_nickname,
+                    lora_path,
+                    rank,
+                    strength,
+                )
+                adapted_count += count
+                self.cur_adapter_name[module_name] = lora_nickname
+                self.cur_adapter_path[module_name] = (
+                    lora_path or self.loaded_adapter_paths.get(lora_nickname, "")
+                )
+                self.is_lora_merged[module_name] = True
+                self.cur_adapter_strength[module_name] = strength
 
-        logger.info(
-            "Rank %d: LoRA adapter %s applied to %d layers (target: %s, strength: %s)",
-            rank,
-            lora_path,
-            adapted_count,
-            target,
-            strength,
-        )
+            logger.info(
+                "Rank %d: LoRA adapter %s applied to %d layers (target: %s, strength: %s)",
+                rank,
+                lora_path,
+                adapted_count,
+                target,
+                strength,
+            )
 
     def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
         """
@@ -485,38 +565,42 @@ class LoRAPipeline(ComposedPipelineBase):
         if not target_modules:
             return
 
-        for module_name, lora_layers_dict in target_modules:
-            if self.is_lora_merged.get(module_name, False):
-                # Check if strength is the same - if so, skip (idempotent)
-                if self.cur_adapter_strength.get(module_name) == strength:
-                    logger.warning(
-                        "LoRA weights are already merged for %s with same strength",
+        # Disable layerwise offload if enabled: load all layers to GPU
+        with self._temporarily_disable_offload(target_modules=target_modules):
+            for module_name, lora_layers_dict in target_modules:
+                if self.is_lora_merged.get(module_name, False):
+                    # Check if strength is the same - if so, skip (idempotent)
+                    if self.cur_adapter_strength.get(module_name) == strength:
+                        logger.warning(
+                            "LoRA weights are already merged for %s with same strength",
+                            module_name,
+                        )
+                        continue
+                    # Different strength requested - allow re-merge (layer handles unmerge internally)
+                    logger.info(
+                        "Re-merging LoRA weights for %s with new strength %s",
                         module_name,
+                        strength,
                     )
-                    continue
-                # Different strength requested - allow re-merge (layer handles unmerge internally)
+                for name, layer in lora_layers_dict.items():
+                    # Only re-enable LoRA for layers that actually have LoRA weights
+                    has_lora_weights = (
+                        hasattr(layer, "lora_A") and layer.lora_A is not None
+                    )
+                    if not has_lora_weights:
+                        continue
+                    if hasattr(layer, "disable_lora"):
+                        layer.disable_lora = False
+                    try:
+                        layer.merge_lora_weights(strength=strength)
+                    except Exception as e:
+                        logger.warning("Could not merge layer %s: %s", name, e)
+                        continue
+                self.is_lora_merged[module_name] = True
+                self.cur_adapter_strength[module_name] = strength
                 logger.info(
-                    "Re-merging LoRA weights for %s with new strength %s",
-                    module_name,
-                    strength,
+                    "LoRA weights merged for %s (strength: %s)", module_name, strength
                 )
-            for name, layer in lora_layers_dict.items():
-                # Only re-enable LoRA for layers that actually have LoRA weights
-                has_lora_weights = hasattr(layer, "lora_A") and layer.lora_A is not None
-                if not has_lora_weights:
-                    continue
-                if hasattr(layer, "disable_lora"):
-                    layer.disable_lora = False
-                try:
-                    layer.merge_lora_weights(strength=strength)
-                except Exception as e:
-                    logger.warning("Could not merge layer %s: %s", name, e)
-                    continue
-            self.is_lora_merged[module_name] = True
-            self.cur_adapter_strength[module_name] = strength
-            logger.info(
-                "LoRA weights merged for %s (strength: %s)", module_name, strength
-            )
 
     def unmerge_lora_weights(self, target: str = "all") -> None:
         """
@@ -535,34 +619,37 @@ class LoRAPipeline(ComposedPipelineBase):
         if not target_modules:
             return
 
+        # Disable layerwise offload if enabled: load all layers to GPU
+
         for module_name, lora_layers_dict in target_modules:
             if not self.is_lora_merged.get(module_name, False):
                 logger.warning(
                     "LoRA weights are not merged for %s, skipping", module_name
                 )
                 continue
-            for name, layer in lora_layers_dict.items():
-                # Check layer-level state to avoid raising exception
-                if hasattr(layer, "merged") and not layer.merged:
-                    logger.warning("Layer %s is not merged, skipping", name)
-                    # Still disable LoRA to prevent on-the-fly computation
-                    if hasattr(layer, "disable_lora"):
-                        layer.disable_lora = True
-                    continue
-                try:
-                    layer.unmerge_lora_weights()
-                    # Disable LoRA after unmerge to prevent on-the-fly computation
-                    if hasattr(layer, "disable_lora"):
-                        layer.disable_lora = True
-                except ValueError as e:
-                    logger.warning("Could not unmerge layer %s: %s", name, e)
-                    # Still disable LoRA even if unmerge failed
-                    if hasattr(layer, "disable_lora"):
-                        layer.disable_lora = True
-                    continue
-            self.is_lora_merged[module_name] = False
-            self.cur_adapter_strength.pop(module_name, None)
-            logger.info("LoRA weights unmerged for %s", module_name)
+            with self._temporarily_disable_offload(target_modules=target_modules):
+                for name, layer in lora_layers_dict.items():
+                    # Check layer-level state to avoid raising exception
+                    if hasattr(layer, "merged") and not layer.merged:
+                        logger.warning("Layer %s is not merged, skipping", name)
+                        # Still disable LoRA to prevent on-the-fly computation
+                        if hasattr(layer, "disable_lora"):
+                            layer.disable_lora = True
+                        continue
+                    try:
+                        layer.unmerge_lora_weights()
+                        # Disable LoRA after unmerge to prevent on-the-fly computation
+                        if hasattr(layer, "disable_lora"):
+                            layer.disable_lora = True
+                    except ValueError as e:
+                        logger.warning("Could not unmerge layer %s: %s", name, e)
+                        # Still disable LoRA even if unmerge failed
+                        if hasattr(layer, "disable_lora"):
+                            layer.disable_lora = True
+                        continue
+                self.is_lora_merged[module_name] = False
+                self.cur_adapter_strength.pop(module_name, None)
+                logger.info("LoRA weights unmerged for %s", module_name)
 
     def get_lora_status(self) -> dict[str, Any]:
         """

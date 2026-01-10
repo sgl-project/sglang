@@ -41,6 +41,7 @@ suites = {
     # ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_deepseek_v3_cutedsl_4gpu.py", 1800),
+        TestFile("test_disaggregation_aarch64.py", 300),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
@@ -69,6 +70,7 @@ suites = {
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
         TestFile("test_prefill_delayer.py"),
+        TestFile("test_fla_layernorm_guard.py"),
     ],
 }
 
