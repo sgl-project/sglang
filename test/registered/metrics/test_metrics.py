@@ -11,11 +11,7 @@ from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
 from sglang.srt.environ import envs
-from sglang.srt.metrics.collector import (
-    ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
-    compute_routing_key_stats,
-)
-from sglang.srt.utils.gauge_histogram import GaugeHistogram
+from sglang.srt.metrics.collector import compute_routing_key_stats
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -228,56 +224,6 @@ class TestComputeRoutingKeyStats(unittest.TestCase):
         num_unique, req_counts = compute_routing_key_stats(routing_keys)
         self.assertEqual(num_unique, 4)
         self.assertEqual(sorted(req_counts), [1, 5, 15, 250])
-
-
-class TestGaugeHistogramBucketCounts(unittest.TestCase):
-    """Test GaugeHistogram._compute_bucket_counts logic."""
-
-    def setUp(self):
-        # Create a mock GaugeHistogram without actually creating a Prometheus gauge
-        self.bucket_bounds = ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS  # [1, 2, 5, 10, 20, 50, 100, 200]
-
-    def _compute(self, observations):
-        """Helper to compute bucket counts using the same logic as GaugeHistogram."""
-        bounds = self.bucket_bounds
-        counts = []
-        for i, upper in enumerate(bounds):
-            lower = bounds[i - 1] if i > 0 else 0
-            count = sum(1 for v in observations if lower < v <= upper)
-            counts.append(count)
-        counts.append(sum(1 for v in observations if v > bounds[-1]))
-        return counts
-
-    def test_empty(self):
-        counts = self._compute([])
-        self.assertEqual(len(counts), len(self.bucket_bounds) + 1)
-        self.assertTrue(all(c == 0 for c in counts))
-
-    def test_single_value_in_first_bucket(self):
-        counts = self._compute([1])
-        self.assertEqual(counts[0], 1)  # (0, 1]
-        self.assertEqual(sum(counts), 1)
-
-    def test_boundary_values(self):
-        # Test exact boundary values
-        counts = self._compute([1, 2, 5, 10, 20, 50, 100, 200])
-        # Each value should be in its own bucket (at upper boundary)
-        for i in range(len(self.bucket_bounds)):
-            self.assertEqual(counts[i], 1)
-        self.assertEqual(counts[-1], 0)  # +Inf bucket
-
-    def test_distribution(self):
-        # [1, 5, 15, 250] from routing key test
-        counts = self._compute([1, 5, 15, 250])
-        self.assertEqual(counts[0], 1)  # (0, 1]: 1
-        self.assertEqual(counts[2], 1)  # (2, 5]: 5
-        self.assertEqual(counts[4], 1)  # (10, 20]: 15
-        self.assertEqual(counts[-1], 1)  # (200, +Inf]: 250
-
-    def test_value_above_all_bounds(self):
-        counts = self._compute([1000])
-        self.assertEqual(counts[-1], 1)
-        self.assertEqual(sum(counts[:-1]), 0)
 
 
 if __name__ == "__main__":

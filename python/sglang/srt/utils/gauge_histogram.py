@@ -51,14 +51,15 @@ class GaugeHistogram:
     def _compute_bucket_counts(
         self, observations: List[Union[int, float]]
     ) -> List[int]:
-        """Compute how many observations fall into each bucket."""
+        """Compute how many observations fall into each bucket. O(n) complexity."""
+        import bisect
+
         bounds = self._bucket_bounds
-        counts = []
-        for i, upper in enumerate(bounds):
-            lower = bounds[i - 1] if i > 0 else 0
-            count = sum(1 for v in observations if lower < v <= upper)
-            counts.append(count)
-        counts.append(sum(1 for v in observations if v > bounds[-1]))
+        counts = [0] * (len(bounds) + 1)
+        for v in observations:
+            # bisect_left finds insertion point; values at boundary go to current bucket
+            idx = bisect.bisect_left(bounds, v)
+            counts[idx] += 1
         return counts
 
     @property
