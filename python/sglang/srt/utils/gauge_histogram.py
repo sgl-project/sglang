@@ -28,9 +28,7 @@ class BucketLabels:
     def __iter__(self) -> Iterator[Tuple[str, str]]:
         return iter(self._labels)
 
-    def compute_bucket_counts(
-        self, observations: List[Union[int, float]]
-    ) -> List[int]:
+    def compute_bucket_counts(self, observations: List[Union[int, float]]) -> List[int]:
         """Compute how many observations fall into each bucket. O(n) complexity."""
         counts = [0] * len(self)
         for v in observations:
