@@ -180,7 +180,7 @@ echo "[CI-AITER-CHECK] Dockerfile expects AITER_COMMIT=${REPO_AITER_COMMIT}"
 #############################################
 # 2. Check container pre-installed AITER version
 #############################################
-IMAGE_AITER_VERSION=$(docker exec ci_sglang bash -c "pip show aiter 2>/dev/null | grep '^Version:' | awk '{print \$2}'" || echo "none")
+IMAGE_AITER_VERSION=$(docker exec ci_sglang bash -c "pip show amd-aiter 2>/dev/null | grep '^Version:' | awk '{print \$2}'" || echo "none")
 IMAGE_AITER_VERSION="v${IMAGE_AITER_VERSION}"
 echo "[CI-AITER-CHECK] AITER version inside CI image: ${IMAGE_AITER_VERSION}"
 

@@ -2,7 +2,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Reward model tests
 register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=132, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=132, suite="stage-b-test-small-1-gpu-amd")
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");

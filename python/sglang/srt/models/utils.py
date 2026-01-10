@@ -26,7 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_current_device_stream_fast, is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -246,7 +246,7 @@ def apply_qk_norm(
         return q, k
 
     if alt_stream is not None and get_is_capture_mode():
-        current_stream = torch.cuda.current_stream()
+        current_stream = get_current_device_stream_fast()
         alt_stream.wait_stream(current_stream)
         q_by_head = q.reshape(-1, head_dim)
         q_by_head = q_norm(q_by_head)

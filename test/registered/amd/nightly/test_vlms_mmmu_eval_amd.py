@@ -1,5 +1,5 @@
 """
-AMD VLM MMMU Evaluation Test
+AMD VLM MMMU Evaluation Test (Migrated from test/srt/nightly/)
 
 This test evaluates Vision-Language Models (VLMs) on the MMMU benchmark on AMD GPUs.
 Models are selected based on compatibility with AMD/ROCm platform.
@@ -11,6 +11,8 @@ VLMs tested here:
 - deepseek-vl2-small
 
 Note: Some VLMs from the Nvidia test are excluded due to AMD compatibility issues.
+
+Registry: nightly-amd-vlm suite (2-GPU VLM tests)
 """
 
 import os
@@ -20,6 +22,7 @@ import warnings
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -29,6 +32,9 @@ from sglang.test.test_utils import (
     write_github_step_summary,
     write_results_to_json,
 )
+
+# Register for AMD CI - VLM MMMU evaluation tests (~120 min)
+register_amd_ci(est_time=7200, suite="nightly-amd-vlm", nightly=True)
 
 # AMD-verified VLM models with conservative thresholds on 100 MMMU samples
 # Format: (model_path, tp_size, accuracy_threshold, extra_args)

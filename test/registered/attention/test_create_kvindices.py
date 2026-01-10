@@ -9,7 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # Triton kernel unit test for KV indices creation
 register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestCreateKvIndices(CustomTestCase):

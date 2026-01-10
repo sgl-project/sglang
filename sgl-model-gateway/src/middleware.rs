@@ -773,95 +773,91 @@ pub async fn wasm_middleware(
             }
         };
 
-    // Extract request body once before processing modules
-    let method = request.method().clone();
-    let uri = request.uri().clone();
-    let mut headers = request.headers().clone();
-    let max_body_size = wasm_manager.get_max_body_size();
-    let body_bytes = match axum::body::to_bytes(request.into_body(), max_body_size).await {
-        Ok(bytes) => bytes.to_vec(),
-        Err(e) => {
-            error!("Failed to read request body: {}", e);
-            // Create a minimal request with empty body for error recovery
-            let error_request = Request::builder()
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap_or_else(|_| Request::new(Body::empty()));
-            return Ok(next.run(error_request).await);
-        }
-    };
-
-    // Process each OnRequest module
-    let mut modified_body = body_bytes;
-
-    // Pre-compute strings once before the loop to avoid repeated allocations
-    let method_str = method.to_string();
-    let path_str = uri.path().to_string();
-    let query_str = uri.query().unwrap_or("").to_string();
-
-    for module in modules_on_request {
-        // Build WebAssembly request from collected data
-        let wasm_headers = build_wasm_headers_from_axum_headers(&headers);
-        let wasm_request = WasmRequest {
-            method: method_str.clone(),
-            path: path_str.clone(),
-            query: query_str.clone(),
-            headers: wasm_headers,
-            body: modified_body.clone(),
-            request_id: request_id.clone(),
-            now_epoch_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_else(|_| {
-                    // Fallback to 0 if system time is before UNIX_EPOCH
-                    // This should never happen in practice, but provides a safe fallback
-                    Duration::from_millis(0)
-                })
-                .as_millis() as u64,
+    let response = if modules_on_request.is_empty() {
+        next.run(request).await
+    } else {
+        // Extract request body once before processing modules
+        let method = request.method().clone();
+        let uri = request.uri().clone();
+        let mut headers = request.headers().clone();
+        let max_body_size = wasm_manager.get_max_body_size();
+        let body_bytes = match axum::body::to_bytes(request.into_body(), max_body_size).await {
+            Ok(bytes) => bytes.to_vec(),
+            Err(e) => {
+                error!("Failed to read request body: {}", e);
+                // Create a minimal request with empty body for error recovery
+                let error_request = Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| Request::new(Body::empty()));
+                return Ok(next.run(error_request).await);
+            }
         };
 
-        // Execute WASM component
-        let action = match wasm_manager
-            .execute_module_for_attach_point(
-                &module,
-                on_request_attach_point.clone(),
-                WasmComponentInput::MiddlewareRequest(wasm_request),
-            )
-            .await
-        {
-            Some(action) => action,
-            None => continue, // Continue to next module on error
-        };
+        // Process each OnRequest module
+        let mut modified_body = body_bytes;
 
-        // Process action
-        match action {
-            Action::Continue => {
-                // Continue to next module or request processing
-            }
-            Action::Reject(status) => {
-                // Immediately reject the request
-                return Err(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST));
-            }
-            Action::Modify(modify) => {
-                // Apply modifications to headers and body
-                apply_modify_action_to_headers(&mut headers, &modify);
-                // Apply body_replace
-                if let Some(body_bytes) = modify.body_replace {
-                    modified_body = body_bytes;
+        // Pre-compute strings once before the loop to avoid repeated allocations
+        let method_str = method.to_string();
+        let path_str = uri.path().to_string();
+        let query_str = uri.query().unwrap_or("").to_string();
+
+        for module in modules_on_request {
+            // Build WebAssembly request from collected data
+            let wasm_headers = build_wasm_headers_from_axum_headers(&headers);
+            let wasm_request = WasmRequest {
+                method: method_str.clone(),
+                path: path_str.clone(),
+                query: query_str.clone(),
+                headers: wasm_headers,
+                body: modified_body.clone(),
+                request_id: request_id.clone(),
+                now_epoch_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_else(|_| Duration::from_millis(0))
+                    .as_millis() as u64,
+            };
+
+            // Execute WASM component
+            let action = match wasm_manager
+                .execute_module_for_attach_point(
+                    &module,
+                    on_request_attach_point.clone(),
+                    WasmComponentInput::MiddlewareRequest(wasm_request),
+                )
+                .await
+            {
+                Some(action) => action,
+                None => continue, // Continue to next module on error
+            };
+
+            // Process action
+            match action {
+                Action::Continue => {}
+                Action::Reject(status) => {
+                    return Err(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST));
+                }
+                Action::Modify(modify) => {
+                    // Apply modifications to headers and body
+                    apply_modify_action_to_headers(&mut headers, &modify);
+                    if let Some(body_bytes) = modify.body_replace {
+                        modified_body = body_bytes;
+                    }
                 }
             }
         }
-    }
 
-    // Reconstruct request with modifications
-    let mut final_request = Request::builder()
-        .method(method)
-        .uri(uri)
-        .body(Body::from(modified_body))
-        .unwrap_or_else(|_| Request::new(Body::empty()));
-    *final_request.headers_mut() = headers;
+        // Reconstruct request with modifications
+        let mut final_request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::from(modified_body))
+            .unwrap_or_else(|_| Request::new(Body::empty()));
+        *final_request.headers_mut() = headers;
 
-    // Continue with request processing
-    let response = next.run(final_request).await;
+        // Continue with request processing
+        next.run(final_request).await
+    };
 
     // ===== OnResponse Phase =====
     let on_response_attach_point =
@@ -875,10 +871,13 @@ pub async fn wasm_middleware(
                 return Ok(response);
             }
         };
-
+    if modules_on_response.is_empty() {
+        return Ok(response);
+    }
     // Extract response data once before processing modules
     let mut status = response.status();
     let mut headers = response.headers().clone();
+    let max_body_size = wasm_manager.get_max_body_size();
     let mut body_bytes = match axum::body::to_bytes(response.into_body(), max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
         Err(e) => {
