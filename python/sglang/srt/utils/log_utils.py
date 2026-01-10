@@ -9,7 +9,7 @@ from logging.handlers import TimedRotatingFileHandler
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import torch.distributed as dist
+    pass
 
 
 def create_log_target(target: str) -> logging.Logger:
