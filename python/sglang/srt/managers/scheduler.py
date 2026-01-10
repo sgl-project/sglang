@@ -258,10 +258,7 @@ class Scheduler(
         dp_rank: Optional[int],
     ):
         self.is_initializing = True
-        if (x := server_args.soft_watchdog_timeout) is not None:
-            self.soft_watchdog = create_scheduler_watchdog(
-                self, watchdog_timeout=x, soft=True
-            )
+        self.init_soft_watchdog(server_args)
 
         # Parse args
         self.server_args = server_args
@@ -803,6 +800,12 @@ class Scheduler(
             self.init_new_token_ratio - self.min_new_token_ratio
         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
+
+    def init_soft_watchdog(self, server_args: ServerArgs):
+        if (x := server_args.soft_watchdog_timeout) is not None:
+            self.soft_watchdog = create_scheduler_watchdog(
+                self, watchdog_timeout=x, soft=True
+            )
 
     def init_watch_dog_memory_saver_input_blocker(self):
         # Start watchdog thread
