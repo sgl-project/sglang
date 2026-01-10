@@ -28,20 +28,6 @@ from sglang.test.test_utils import CustomTestCase, is_in_ci
 register_cuda_ci(est_time=100, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=100, suite="stage-b-test-small-1-gpu-amd")
 
-# All prompts are used at once in a batch.
-PROMPTS = [
-    "AI is a field of computer science focused on",
-    """
-    ### Instruction:
-    Tell me about llamas and alpacas
-    ### Response:
-    Llamas are large, long-necked animals with a woolly coat. They have two toes on each foot instead of three like other camelids.
-    ### Question:
-    What do you know about llamas?
-    ### Answer:
-    """,
-]
-
 
 class TestMultiLoRABackend(CustomTestCase):
     def test_ci_lora_models_batch_splitting(self):
