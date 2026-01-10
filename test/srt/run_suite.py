@@ -8,10 +8,6 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
-    "per-commit-1-gpu": [
-        TestFile("test_evs.py", 20),
-        TestFile("test_video_utils.py", 5),
-    ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 650),
         TestFile("test_gpt_oss_4gpu.py", 300),
@@ -91,7 +87,6 @@ suite_amd = {
         TestFile("test_rope_rocm.py", 3),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_type_based_dispatcher.py", 10),
-        TestFile("test_video_utils.py", 8),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
         # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),

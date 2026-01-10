@@ -20,7 +20,10 @@ register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
 class TestMamba(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        pass
+        server_args = ServerArgs(model_path="dummy")
+        server_args.enable_dp_attention = False
+        server_args.page_size = 1
+        set_global_server_args_for_scheduler(server_args)
 
     @classmethod
     def tearDownClass(cls):

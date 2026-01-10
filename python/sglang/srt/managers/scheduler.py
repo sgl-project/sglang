@@ -765,7 +765,7 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
-        if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
+        if self.server_args.enable_prefill_delayer:
             self.prefill_delayer = PrefillDelayer(
                 dp_size=self.dp_size,
                 attn_tp_size=self.attn_tp_size,
@@ -774,10 +774,8 @@ class Scheduler(
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
-                max_delay_passes=envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get(),
-                token_usage_low_watermark=(
-                    envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
-                ),
+                max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
+                token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
