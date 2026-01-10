@@ -87,6 +87,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Init running status
         self.init_running_status(server_args)
 
+        # Init CPU monitor
+        if server_args.enable_metrics:
+            from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
+
+            start_cpu_monitor_thread("detokenizer")
+
         # Init dispatcher
         self.init_request_dispatcher()
 
@@ -415,11 +421,6 @@ def run_detokenizer_process(
     setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
-
-    if server_args.enable_metrics:
-        from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
-
-        start_cpu_monitor_thread("detokenizer")
 
     try:
         manager = detokenizer_manager_class(server_args, port_args)

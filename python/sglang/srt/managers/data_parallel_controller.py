@@ -207,6 +207,12 @@ class DataParallelController:
             test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
         )
 
+        # Init CPU monitor
+        if server_args.enable_metrics:
+            from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
+
+            start_cpu_monitor_thread("data_parallel_controller")
+
     def send_to_all_workers(self, obj):
         for worker in self.workers:
             worker.send_pyobj(obj)
@@ -581,10 +587,6 @@ def run_data_parallel_controller_process(
 
     configure_logger(server_args)
 
-    if server_args.enable_metrics:
-        from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
-
-        start_cpu_monitor_thread("data_parallel_controller")
     if server_args.enable_trace:
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
         thread_label = "DP Controller"
