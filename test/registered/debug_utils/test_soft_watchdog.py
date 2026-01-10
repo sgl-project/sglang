@@ -85,7 +85,7 @@ class TestSoftWatchdogSchedulerInit(CustomTestCase):
                 cls.process = popen_launch_server(
                     "Qwen/Qwen3-0.6B",
                     DEFAULT_URL_FOR_TEST,
-                    timeout=60,
+                    timeout=40,
                     other_args=[
                         "--soft-watchdog-timeout",
                         "20",
