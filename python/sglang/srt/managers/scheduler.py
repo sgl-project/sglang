@@ -381,6 +381,7 @@ class Scheduler(
             self.lora_overlap_loader = LoRAOverlapLoader(
                 self.tp_worker.model_runner.lora_manager
             )
+
         self.is_initializing = False
 
     def init_model_config(self):

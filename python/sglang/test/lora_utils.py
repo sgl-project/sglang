@@ -96,6 +96,7 @@ CI_MULTI_LORA_MODELS = [
             ),
         ],
         max_loras_per_batch=2,
+        max_loaded_loras=4,
     ),
 ]
 
