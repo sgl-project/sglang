@@ -13,7 +13,11 @@ from sglang.srt.managers.io_struct import GetLoadReqInput, GetLoadReqOutput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
+from sglang.srt.metrics.collector import (
+    SchedulerMetricsCollector,
+    SchedulerStats,
+    compute_routing_key_stats,
+)
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer
 
@@ -95,7 +99,9 @@ class SchedulerMetricsMixin:
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
             self.metrics_collector = SchedulerMetricsCollector(
-                labels=labels, enable_lora=self.enable_lora
+                labels=labels,
+                enable_lora=self.enable_lora,
+                server_args=self.server_args,
             )
 
             if ENABLE_METRICS_DEVICE_TIMER:
@@ -137,7 +143,7 @@ class SchedulerMetricsMixin:
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
 
-        # assert self.temp_prefill_info is None # TODO re-enable
+        assert self.temp_prefill_info is None
         self.temp_prefill_info = dict(
             adder_log_input_tokens=adder.log_input_tokens,
             adder_log_hit_tokens=adder.log_hit_tokens,
@@ -413,6 +419,16 @@ class SchedulerMetricsMixin:
                 self.stats.num_decode_transfer_queue_reqs = len(
                     self.disagg_decode_transfer_queue.queue
                 )
+
+            running_routing_keys = [r.routing_key for r in batch.reqs]
+            waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
+            (
+                self.stats.num_unique_running_routing_keys,
+                self.stats.routing_key_running_req_counts,
+            ) = compute_routing_key_stats(running_routing_keys)
+            _, self.stats.routing_key_all_req_counts = compute_routing_key_stats(
+                running_routing_keys + waiting_routing_keys
+            )
 
             # Others
             self.calculate_utilization()

@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import base64
-import dataclasses
 import os
 import time
 from typing import List, Optional
@@ -27,11 +26,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import shallow_asdict
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
 logger = init_logger(__name__)
@@ -59,9 +56,10 @@ def _build_sampling_params_from_request(
     image_path: Optional[list[str]] = None,
     seed: Optional[int] = None,
     generator_device: Optional[str] = None,
-    negative_prompt: Optional[str] = None,
-    guidance_scale: Optional[float] = None,
     num_inference_steps: Optional[int] = None,
+    guidance_scale: Optional[float] = None,
+    true_cfg_scale: Optional[float] = None,
+    negative_prompt: Optional[str] = None,
     enable_teacache: Optional[bool] = None,
     num_frames: int = 1,
 ) -> SamplingParams:
@@ -70,14 +68,14 @@ def _build_sampling_params_from_request(
     else:
         width, height = _parse_size(size)
     ext = _choose_ext(output_format, background)
+
     server_args = get_global_server_args()
-    # Build user params
     sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
         request_id=request_id,
         prompt=prompt,
         image_path=image_path,
-        num_frames=num_frames,  # image
+        num_frames=num_frames,
         width=width,
         height=height,
         num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
@@ -90,19 +88,24 @@ def _build_sampling_params_from_request(
         num_inference_steps=num_inference_steps,
         enable_teacache=enable_teacache,
         **({"negative_prompt": negative_prompt} if negative_prompt is not None else {}),
+        **({"true_cfg_scale": true_cfg_scale} if true_cfg_scale is not None else {}),
     )
+
+    if num_inference_steps is not None:
+        sampling_params.num_inference_steps = num_inference_steps
+    if guidance_scale is not None:
+        sampling_params.guidance_scale = guidance_scale
+    if seed is not None:
+        sampling_params.seed = seed
+
     return sampling_params
-
-
-def _build_req_from_sampling(s: SamplingParams) -> Req:
-    req_fields = {f.name for f in dataclasses.fields(Req)}
-    return Req(**{k: v for k, v in shallow_asdict(s).items() if k in req_fields})
 
 
 @router.post("/generations", response_model=ImageResponse)
 async def generations(
     request: ImageGenerationsRequest,
 ):
+
     request_id = generate_request_id()
     sampling = _build_sampling_params_from_request(
         request_id=request_id,
@@ -113,15 +116,19 @@ async def generations(
         background=request.background,
         seed=request.seed,
         generator_device=request.generator_device,
-        negative_prompt=request.negative_prompt,
-        guidance_scale=request.guidance_scale,
         num_inference_steps=request.num_inference_steps,
+        guidance_scale=request.guidance_scale,
+        true_cfg_scale=request.true_cfg_scale,
+        negative_prompt=request.negative_prompt,
         enable_teacache=request.enable_teacache,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
+    # Add diffusers_kwargs if provided
+    if request.diffusers_kwargs:
+        batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
 
     # Run synchronously for images and save to disk
     save_file_path_list, result = await process_generation_batch(
@@ -180,6 +187,7 @@ async def edits(
     user: Optional[str] = Form(None),
     negative_prompt: Optional[str] = Form(None),
     guidance_scale: Optional[float] = Form(None),
+    true_cfg_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
     num_frames: int = Form(1),
@@ -224,11 +232,15 @@ async def edits(
         generator_device=generator_device,
         negative_prompt=negative_prompt,
         guidance_scale=guidance_scale,
+        true_cfg_scale=true_cfg_scale,
         num_inference_steps=num_inference_steps,
         enable_teacache=enable_teacache,
-        num_frames=num_frames,  # image
+        num_frames=num_frames,
     )
-    batch = _build_req_from_sampling(sampling)
+    batch = prepare_request(
+        server_args=get_global_server_args(),
+        sampling_params=sampling,
+    )
 
     save_file_path_list, result = await process_generation_batch(
         async_scheduler_client, batch
