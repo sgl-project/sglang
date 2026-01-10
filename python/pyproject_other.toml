@@ -31,7 +31,7 @@ runtime_common = [
   "hf_transfer",
   "huggingface_hub",
   "interegular",
-  "llguidance>=0.7.11,<0.8.0",
+  "llguidance==1.4.0",
   "modelscope",
   "msgspec",
   "ninja",
@@ -62,7 +62,7 @@ runtime_common = [
   "transformers==4.57.1",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.1.27",
+  "xgrammar==0.1.29",
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
