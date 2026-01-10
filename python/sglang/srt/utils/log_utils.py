@@ -6,6 +6,8 @@ import os
 import socket
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
+from typing import List, Union
+
 import torch.distributed as dist
 
 
@@ -42,10 +44,17 @@ def _create_logger_with_handler(name: str, handler: logging.Handler) -> logging.
     return logger
 
 
-def log_json(logger: logging.Logger, event: str, data: dict) -> None:
+def log_json(
+    loggers: Union[logging.Logger, List[logging.Logger]], event: str, data: dict
+) -> None:
     log_data = {
         "timestamp": datetime.now().isoformat(),
         "event": event,
         **data,
     }
-    logger.info(json.dumps(log_data, ensure_ascii=False))
+    msg = json.dumps(log_data, ensure_ascii=False)
+    if isinstance(loggers, list):
+        for logger in loggers:
+            logger.info(msg)
+    else:
+        loggers.info(msg)

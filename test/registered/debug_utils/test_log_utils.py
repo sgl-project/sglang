@@ -18,7 +18,7 @@ class TestLogUtils(unittest.TestCase):
             self.assertIsNotNone(logger)
             self.assertEqual(logger.level, 20)
 
-    def test_log_json(self):
+    def test_log_json_single_logger(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             logger = create_log_target(temp_dir)
             log_json(logger, "test.event", {"key": "value", "number": 42})
@@ -31,6 +31,24 @@ class TestLogUtils(unittest.TestCase):
             self.assertEqual(data["event"], "test.event")
             self.assertEqual(data["key"], "value")
             self.assertEqual(data["number"], 42)
+
+    def test_log_json_multiple_loggers(self):
+        with tempfile.TemporaryDirectory() as temp_dir1:
+            with tempfile.TemporaryDirectory() as temp_dir2:
+                logger1 = create_log_target(temp_dir1)
+                logger2 = create_log_target(temp_dir2)
+                log_json([logger1, logger2], "test.event", {"key": "value"})
+                logger1.handlers[0].flush()
+                logger2.handlers[0].flush()
+
+                log_files1 = list(Path(temp_dir1).glob("*.log"))
+                log_files2 = list(Path(temp_dir2).glob("*.log"))
+                self.assertEqual(len(log_files1), 1)
+                self.assertEqual(len(log_files2), 1)
+
+                content1 = log_files1[0].read_text().strip()
+                content2 = log_files2[0].read_text().strip()
+                self.assertEqual(content1, content2)
 
 
 if __name__ == "__main__":
