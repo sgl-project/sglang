@@ -31,6 +31,27 @@ class DraftBackendFactory:
         if backend_type is None:
             backend_type = self.server_args.attention_backend
 
+        if backend_type is None:
+            backend_type = "flashinfer"
+        elif backend_type == "trtllm_mha":
+            logger.warning(
+                "Draft attention backend does not support 'trtllm_mha' yet; "
+                "falling back to 'flashinfer'."
+            )
+            backend_type = "flashinfer"
+
+        if backend_type not in backend_map:
+            fallback_backend = "flashinfer" if "flashinfer" in backend_map else None
+            if fallback_backend is None:
+                raise ValueError(error_template.format(backend_type=backend_type))
+            logger.warning(
+                "Draft attention backend '%s' is not supported for speculative draft; "
+                "falling back to '%s'.",
+                backend_type,
+                fallback_backend,
+            )
+            backend_type = fallback_backend
+
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))
 

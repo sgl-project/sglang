@@ -66,12 +66,19 @@ class DFlashWorker:
             draft_backend, _ = draft_server_args.get_attention_backends()
         if draft_backend is None:
             draft_backend = "flashinfer"
-        if draft_backend not in ("flashinfer", "fa3"):
-            raise ValueError(
-                "DFLASH draft worker only supports attention_backend in {'flashinfer', 'fa3'} for now, "
-                f"but got {draft_backend!r}. "
-                "Use `--speculative-draft-attention-backend` to override the draft backend."
+        elif draft_backend == "trtllm_mha":
+            logger.warning(
+                "DFLASH draft worker does not support 'trtllm_mha' yet; "
+                "falling back to 'flashinfer'."
             )
+            draft_backend = "flashinfer"
+        elif draft_backend not in ("flashinfer", "fa3"):
+            logger.warning(
+                "DFLASH draft worker only supports attention_backend in {'flashinfer', 'fa3'} for now, "
+                "but got %r. Falling back to 'flashinfer'.",
+                draft_backend,
+            )
+            draft_backend = "flashinfer"
 
         # Make the draft worker backend explicit and self-contained (no further overrides).
         draft_server_args.speculative_draft_attention_backend = None
