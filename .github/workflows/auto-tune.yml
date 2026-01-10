@@ -66,10 +66,13 @@ jobs:
           echo "=== Looking for artifact: $artifact_name ==="
           echo ""
           echo "=== API Response (with name filter) ==="
-          gh api "repos/${{ github.repository }}/actions/artifacts?name=${artifact_name}" || echo "API call failed with name filter"
+          curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=${artifact_name}" | head -100
           echo ""
           echo "=== First 5 artifacts in repo ==="
-          gh api "repos/${{ github.repository }}/actions/artifacts?per_page=5" --jq '.artifacts[] | {name, id, expired, created_at}' || echo "API call failed"
+          curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?per_page=5" | \
+            jq '.artifacts[] | {name, id, expired, created_at}' || echo "jq not available or API call failed"
 
       - name: Try to download existing group config
         id: download_existing
