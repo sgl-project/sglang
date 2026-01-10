@@ -223,6 +223,15 @@ class GptOssDetector(BaseReasoningFormatDetector):
         normal_text = "".join(normal_parts)
         # Tool call events preserve raw text with structural markers
 
+        # Fallback: if HarmonyParser didn't detect events but we have <|end|> marker,
+        # manually split the content. This happens when tool_choice='required' with xgrammars
+        # but model still outputs Harmony format with only <|end|> marker.
+        if not reasoning_text and not normal_text and "<|end|>" in text:
+            splits = text.split("<|end|>", maxsplit=1)
+            if len(splits) == 2:
+                reasoning_text = splits[0]
+                normal_text = splits[1].strip()
+
         return StreamingParseResult(
             normal_text=normal_text,
             reasoning_text=reasoning_text,
