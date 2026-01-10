@@ -13,7 +13,11 @@ from sglang.srt.managers.io_struct import GetLoadReqInput, GetLoadReqOutput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
+from sglang.srt.metrics.collector import (
+    SchedulerMetricsCollector,
+    SchedulerStats,
+    compute_routing_key_stats,
+)
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer
 
@@ -251,6 +255,12 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
+            routing_keys = [r.routing_key for r in self.running_batch.reqs]
+            (
+                self.stats.num_unique_routing_keys,
+                self.stats.routing_key_req_count_buckets,
+            ) = compute_routing_key_stats(routing_keys)
+
             # Others
             self.calculate_utilization()
             self.update_lora_metrics()
@@ -415,6 +425,12 @@ class SchedulerMetricsMixin:
                 self.stats.num_decode_transfer_queue_reqs = len(
                     self.disagg_decode_transfer_queue.queue
                 )
+
+            routing_keys = [r.routing_key for r in batch.reqs]
+            (
+                self.stats.num_unique_routing_keys,
+                self.stats.routing_key_req_count_buckets,
+            ) = compute_routing_key_stats(routing_keys)
 
             # Others
             self.calculate_utilization()

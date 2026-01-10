@@ -246,6 +246,32 @@ class SchedulerStats:
     lora_pool_slots_total: int = 0
     lora_pool_utilization: float = 0.0
 
+    # Routing key metrics
+    num_unique_routing_keys: int = 0
+    routing_key_req_count_buckets: List[int] = field(default_factory=list)
+
+
+ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 5, 10, 20, 50, 100, 200]
+
+
+def compute_routing_key_stats(
+    routing_keys: List[Optional[str]],
+) -> tuple:
+    from collections import Counter
+
+    key_counts = Counter(k for k in routing_keys if k is not None)
+    num_unique_keys = len(key_counts)
+
+    buckets = ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS
+    bucket_counts = []
+    for i, upper in enumerate(buckets):
+        lower = buckets[i - 1] if i > 0 else 0
+        count = sum(1 for c in key_counts.values() if lower < c <= upper)
+        bucket_counts.append(count)
+    bucket_counts.append(sum(1 for c in key_counts.values() if c > buckets[-1]))
+
+    return num_unique_keys, bucket_counts
+
 
 @dataclass
 class DPCooperationInfo:
@@ -721,6 +747,25 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
+        self.num_unique_routing_keys = Gauge(
+            name="sglang:num_unique_routing_keys",
+            documentation="Number of unique routing keys in running batch.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        buckets = ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS
+        self._routing_key_bucket_labels = []
+        for i, upper in enumerate(buckets):
+            lower = buckets[i - 1] if i > 0 else 0
+            self._routing_key_bucket_labels.append((str(lower), str(upper)))
+        self._routing_key_bucket_labels.append((str(buckets[-1]), "+Inf"))
+        self.routing_key_running_req_count = Gauge(
+            name="sglang:routing_key_running_req_count",
+            documentation="Distribution of routing keys by running request count (gt < count <= le).",
+            labelnames=list(labels.keys()) + ["gt", "le"],
+            multiprocess_mode="mostrecent",
+        )
+
         self.new_token_ratio = Gauge(
             name="sglang:new_token_ratio",
             documentation="The new token ratio.",
@@ -980,6 +1025,14 @@ class SchedulerMetricsCollector:
             self._log_gauge(self.lora_pool_slots_used, stats.lora_pool_slots_used)
             self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
             self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
+
+        self._log_gauge(self.num_unique_routing_keys, stats.num_unique_routing_keys)
+        for (gt, le), count in zip(
+            self._routing_key_bucket_labels, stats.routing_key_req_count_buckets
+        ):
+            self.routing_key_running_req_count.labels(**self.labels, gt=gt, le=le).set(
+                count
+            )
 
         self.last_log_time = time.perf_counter()
 
