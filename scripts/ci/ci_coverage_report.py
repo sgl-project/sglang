@@ -54,35 +54,97 @@ def get_test_basename(filename: str) -> str:
     return Path(filename).name
 
 
-def generate_markdown_report(tests: list[CIRegistry]) -> str:
-    """Generate markdown report for GitHub step summary."""
-    lines = []
-    lines.append("# CI Coverage Overview\n")
-
-    # Organize data
-    total = len(tests)
+def organize_test_data(tests: list[CIRegistry]) -> dict:
+    """Organize tests into various groupings."""
     by_backend = defaultdict(list)
     by_folder = defaultdict(list)
-    by_suite = defaultdict(list)
     disabled_tests = []
 
     for t in tests:
         by_backend[t.backend.name].append(t)
         by_folder[get_folder_name(t.filename)].append(t)
-        by_suite[t.suite].append(t)
         if t.disabled:
             disabled_tests.append(t)
 
-    enabled = total - len(disabled_tests)
+    return {
+        "total": len(tests),
+        "enabled": len(tests) - len(disabled_tests),
+        "disabled_count": len(disabled_tests),
+        "by_backend": by_backend,
+        "by_folder": by_folder,
+        "disabled_tests": disabled_tests,
+    }
+
+
+def generate_summary_section(data: dict) -> str:
+    """Generate the summary/overview section."""
+    lines = []
+    lines.append("# CI Coverage Overview\n")
     lines.append(
-        f"**Total Tests:** {total} ({enabled} enabled, {len(disabled_tests)} disabled)\n"
+        f"**Total Tests:** {data['total']} ({data['enabled']} enabled, {data['disabled_count']} disabled)\n"
     )
 
-    # =========================================================================
-    # SECTION 1: All Tests Listed by Folder
-    # =========================================================================
-    lines.append("---")
-    lines.append("# 1. All Tests by Folder\n")
+    by_backend = data["by_backend"]
+    by_folder = data["by_folder"]
+    disabled_tests = data["disabled_tests"]
+
+    # Backend summary
+    lines.append("## Backend Summary\n")
+    lines.append("| Backend | Total | Enabled | Disabled | Per-Commit | Nightly |")
+    lines.append("|---------|-------|---------|----------|------------|---------|")
+
+    for backend in ["CUDA", "AMD", "NPU", "CPU"]:
+        backend_tests = by_backend.get(backend, [])
+        if not backend_tests:
+            continue
+        b_total = len(backend_tests)
+        b_disabled = sum(1 for t in backend_tests if t.disabled)
+        b_enabled = b_total - b_disabled
+        b_per_commit = sum(1 for t in backend_tests if not t.nightly and not t.disabled)
+        b_nightly = sum(1 for t in backend_tests if t.nightly and not t.disabled)
+        lines.append(
+            f"| {backend} | {b_total} | {b_enabled} | {b_disabled} | {b_per_commit} | {b_nightly} |"
+        )
+
+    lines.append("")
+
+    # Folder summary
+    lines.append("## Folder Summary\n")
+    lines.append("| Folder | CUDA | AMD | NPU | CPU | Total |")
+    lines.append("|--------|------|-----|-----|-----|-------|")
+
+    for folder in sorted(by_folder.keys()):
+        folder_tests = by_folder[folder]
+        cuda = sum(1 for t in folder_tests if t.backend == HWBackend.CUDA)
+        amd = sum(1 for t in folder_tests if t.backend == HWBackend.AMD)
+        npu = sum(1 for t in folder_tests if t.backend == HWBackend.NPU)
+        cpu = sum(1 for t in folder_tests if t.backend == HWBackend.CPU)
+        lines.append(
+            f"| {folder} | {cuda} | {amd} | {npu} | {cpu} | {len(folder_tests)} |"
+        )
+
+    lines.append("")
+
+    # Disabled tests section
+    if disabled_tests:
+        lines.append("## Disabled Tests\n")
+        lines.append("| File | Backend | Suite | Reason |")
+        lines.append("|------|---------|-------|--------|")
+        for t in sorted(disabled_tests, key=lambda x: (x.backend.name, x.filename)):
+            test_name = get_test_basename(t.filename)
+            reason = t.disabled[:50] + "..." if len(t.disabled) > 50 else t.disabled
+            lines.append(f"| `{test_name}` | {t.backend.name} | {t.suite} | {reason} |")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def generate_by_folder_section(data: dict) -> str:
+    """Generate the 'All Tests by Folder' section."""
+    lines = []
+    by_folder = data["by_folder"]
+
+    lines.append("# All Tests by Folder\n")
 
     for folder in sorted(by_folder.keys()):
         folder_tests = by_folder[folder]
@@ -115,11 +177,15 @@ def generate_markdown_report(tests: list[CIRegistry]) -> str:
 
             lines.append("")
 
-    # =========================================================================
-    # SECTION 2: All Tests Listed by Test Suite (Backend -> Suite)
-    # =========================================================================
-    lines.append("---")
-    lines.append("# 2. All Tests by Test Suite\n")
+    return "\n".join(lines)
+
+
+def generate_by_suite_section(data: dict) -> str:
+    """Generate the 'All Tests by Test Suite' section."""
+    lines = []
+    by_backend = data["by_backend"]
+
+    lines.append("# All Tests by Test Suite\n")
 
     for backend in ["CUDA", "AMD", "NPU", "CPU"]:
         backend_tests = by_backend.get(backend, [])
@@ -172,61 +238,28 @@ def generate_markdown_report(tests: list[CIRegistry]) -> str:
 
             lines.append("")
 
-    # =========================================================================
-    # Summary Tables
-    # =========================================================================
-    lines.append("---")
-    lines.append("# Summary Tables\n")
-
-    # Backend summary
-    lines.append("## Backend Summary\n")
-    lines.append("| Backend | Total | Enabled | Disabled | Per-Commit | Nightly |")
-    lines.append("|---------|-------|---------|----------|------------|---------|")
-
-    for backend in ["CUDA", "AMD", "NPU", "CPU"]:
-        backend_tests = by_backend.get(backend, [])
-        if not backend_tests:
-            continue
-        b_total = len(backend_tests)
-        b_disabled = sum(1 for t in backend_tests if t.disabled)
-        b_enabled = b_total - b_disabled
-        b_per_commit = sum(1 for t in backend_tests if not t.nightly and not t.disabled)
-        b_nightly = sum(1 for t in backend_tests if t.nightly and not t.disabled)
-        lines.append(
-            f"| {backend} | {b_total} | {b_enabled} | {b_disabled} | {b_per_commit} | {b_nightly} |"
-        )
-
-    lines.append("")
-
-    # Folder summary
-    lines.append("## Folder Summary\n")
-    lines.append("| Folder | CUDA | AMD | NPU | CPU | Total |")
-    lines.append("|--------|------|-----|-----|-----|-------|")
-
-    for folder in sorted(by_folder.keys()):
-        folder_tests = by_folder[folder]
-        cuda = sum(1 for t in folder_tests if t.backend == HWBackend.CUDA)
-        amd = sum(1 for t in folder_tests if t.backend == HWBackend.AMD)
-        npu = sum(1 for t in folder_tests if t.backend == HWBackend.NPU)
-        cpu = sum(1 for t in folder_tests if t.backend == HWBackend.CPU)
-        lines.append(
-            f"| {folder} | {cuda} | {amd} | {npu} | {cpu} | {len(folder_tests)} |"
-        )
-
-    lines.append("")
-
-    # Disabled tests section
-    if disabled_tests:
-        lines.append("## Disabled Tests\n")
-        lines.append("| File | Backend | Suite | Reason |")
-        lines.append("|------|---------|-------|--------|")
-        for t in sorted(disabled_tests, key=lambda x: (x.backend.name, x.filename)):
-            test_name = get_test_basename(t.filename)
-            reason = t.disabled[:50] + "..." if len(t.disabled) > 50 else t.disabled
-            lines.append(f"| `{test_name}` | {t.backend.name} | {t.suite} | {reason} |")
-        lines.append("")
-
     return "\n".join(lines)
+
+
+def generate_markdown_report(tests: list[CIRegistry], section: str = "all") -> str:
+    """Generate markdown report for GitHub step summary."""
+    data = organize_test_data(tests)
+
+    if section == "summary":
+        return generate_summary_section(data)
+    elif section == "by-folder":
+        return generate_by_folder_section(data)
+    elif section == "by-suite":
+        return generate_by_suite_section(data)
+    else:  # "all"
+        parts = [
+            generate_summary_section(data),
+            "---",
+            generate_by_folder_section(data),
+            "---",
+            generate_by_suite_section(data),
+        ]
+        return "\n".join(parts)
 
 
 def generate_json_report(tests: list[CIRegistry]) -> str:
@@ -376,6 +409,12 @@ def main():
         help="Output format (default: markdown)",
     )
     parser.add_argument(
+        "--section",
+        choices=["all", "summary", "by-folder", "by-suite"],
+        default="all",
+        help="Which section to output (default: all). Only applies to markdown format.",
+    )
+    parser.add_argument(
         "--registered-dir",
         default="test/registered",
         help="Path to registered test directory",
@@ -390,7 +429,7 @@ def main():
     tests = collect_all_tests(args.registered_dir)
 
     if args.output_format == "markdown":
-        report = generate_markdown_report(tests)
+        report = generate_markdown_report(tests, section=args.section)
     else:
         report = generate_json_report(tests)
 
