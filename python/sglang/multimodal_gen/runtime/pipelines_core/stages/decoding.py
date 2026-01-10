@@ -223,8 +223,7 @@ class DecodingStage(PipelineStage):
         # frames = self.decode(batch.latents, server_args)
         frames = self.vae.decode(batch.latents, return_dict=False)[0]
         img = self.image_processor.postprocess(frames, output_type="pil")
-        img[0].save(f"/sgl-workspace/decoded_image.png")
-        frames = self.image_processor.postprocess(frames, output_type="latent")
+        frames = self.image_processor.postprocess(frames, output_type="pt")
 
         # decode trajectory latents if needed
         if batch.return_trajectory_decoded:
