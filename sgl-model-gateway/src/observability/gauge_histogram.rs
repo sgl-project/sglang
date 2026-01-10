@@ -6,8 +6,6 @@
 //! Note: Keep in sync with Python implementation in
 //! python/sglang/srt/utils/gauge_histogram.py
 
-use std::sync::LazyLock;
-
 use metrics::gauge;
 
 pub struct BucketLabels {
@@ -86,11 +84,6 @@ impl GaugeHistogram {
         self.buckets
     }
 }
-
-pub const INFLIGHT_AGE_BUCKET_BOUNDS: &[u64] =
-    &[30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400];
-pub static INFLIGHT_AGE_BUCKETS: LazyLock<BucketLabels> =
-    LazyLock::new(|| BucketLabels::new(INFLIGHT_AGE_BUCKET_BOUNDS));
 
 #[cfg(test)]
 mod tests {

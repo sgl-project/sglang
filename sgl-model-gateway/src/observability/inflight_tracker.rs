@@ -8,9 +8,13 @@ use std::{
 
 use dashmap::DashMap;
 
-use super::gauge_histogram::{GaugeHistogram, INFLIGHT_AGE_BUCKETS};
+use super::gauge_histogram::{BucketLabels, GaugeHistogram};
 use crate::policies::utils::PeriodicTask;
 
+const INFLIGHT_AGE_BUCKET_BOUNDS: &[u64] =
+    &[30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400];
+static INFLIGHT_AGE_BUCKETS: LazyLock<BucketLabels> =
+    LazyLock::new(|| BucketLabels::new(INFLIGHT_AGE_BUCKET_BOUNDS));
 static INFLIGHT_AGE_GAUGE: LazyLock<GaugeHistogram> = LazyLock::new(|| {
     GaugeHistogram::new("smg_http_inflight_request_age_count", &INFLIGHT_AGE_BUCKETS)
 });
