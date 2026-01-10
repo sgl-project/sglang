@@ -249,7 +249,9 @@ class SchedulerStats:
 
     # Routing key metrics
     num_unique_routing_keys: int = 0
-    routing_key_req_counts: List[int] = field(default_factory=list)  # per-key running counts
+    routing_key_req_counts: List[int] = field(
+        default_factory=list
+    )  # per-key running counts
     routing_key_running_and_waiting_req_counts: List[int] = field(
         default_factory=list
     )  # per-key running+waiting counts
