@@ -8,6 +8,8 @@ Components:
 - schema.sql: SQLite schema for fingerprint storage
 - discovery_job.py: Batch pipeline for embedding and clustering
 - classifier.py: Online classifier for real-time sidecar use
+- spectral_discovery.py: Laplacian Eigenmaps for geometric memory analysis
+- spectral_router.py: Query routing based on spectral coherence
 
 Usage:
     # Initialize database
@@ -21,6 +23,12 @@ Usage:
 
     classifier = SidecarClassifier('./discovery_outputs')
     result = classifier.classify(fingerprint_vector)
+
+    # Use spectral router for model selection
+    from discovery import SpectralRouter, create_router_from_fingerprints
+
+    router = create_router_from_fingerprints(fingerprints)
+    decision = router.route(query_fingerprint)
 """
 
 from .classifier import (
@@ -30,11 +38,44 @@ from .classifier import (
     SidecarClassifier,
 )
 
+from .spectral_discovery import (
+    SpectralManifoldDiscovery,
+    SpectralDiscoveryConfig,
+    SpectralAnalysis,
+    SpectralCoherence,
+    SpectralMode,
+    FrequencyBandAnalyzer,
+)
+
+from .spectral_router import (
+    SpectralRouter,
+    AdaptiveSpectralRouter,
+    RouterConfig,
+    RoutingDecision,
+    ModelSize,
+    create_router_from_fingerprints,
+)
+
 __all__ = [
+    # Classifier
     'ClassificationResult',
     'ClusterInfo',
     'OnlineClassifier',
     'SidecarClassifier',
+    # Spectral Discovery
+    'SpectralManifoldDiscovery',
+    'SpectralDiscoveryConfig',
+    'SpectralAnalysis',
+    'SpectralCoherence',
+    'SpectralMode',
+    'FrequencyBandAnalyzer',
+    # Spectral Router
+    'SpectralRouter',
+    'AdaptiveSpectralRouter',
+    'RouterConfig',
+    'RoutingDecision',
+    'ModelSize',
+    'create_router_from_fingerprints',
 ]
 
-__version__ = '1.0.0'
+__version__ = '1.1.0'
