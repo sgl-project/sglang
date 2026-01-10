@@ -1,7 +1,7 @@
 """
 E2E tests for HiCache Storage functionality.
 Usage:
-    python3 -m pytest test/registered/hicache/test_hicache_storage_file_backend.py -v
+    python3 -m pytest test/registered/engine/cache/test_hicache_storage_file_backend.py -v
 """
 
 import json
