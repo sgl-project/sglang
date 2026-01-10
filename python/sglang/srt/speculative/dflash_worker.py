@@ -141,26 +141,23 @@ class DFlashWorker(TpModelWorker):
         
         DFlash uses ENCODER_ONLY attention (non-causal) which is handled
         automatically by RadixAttention when attn_type is set.
+        
+        Unlike EAGLE, DFlash processes the entire block in a single forward pass,
+        so we use the model_runner's native attention backend directly.
         """
-        # Create backend factory - use topk=1 and num_steps=1 for DFlash
-        # since DFlash generates full block in one forward pass
-        draft_backend_factory = DraftBackendFactory(
-            self.server_args,
-            self.draft_model_runner,
-            topk=1,  # DFlash doesn't use topk tree
-            speculative_num_steps=1,  # Single-pass block generation
-        )
-
-        # Initialize decode attention backend
-        self.draft_attn_backend = draft_backend_factory.create_decode_backend()
-
-        # Initialize extend attention backend
-        self.draft_extend_attn_backend = draft_backend_factory.create_draft_extend_backend()
-
-        # Store on model runner for use by RadixAttention
+        # Use the model runner's native attention backend for DFlash
+        # This is the backend initialized when ModelRunner is created
+        # RadixAttention will use this backend with ENCODER_ONLY attention type
+        self.draft_attn_backend = self.draft_model_runner.attn_backend
+        
+        # Store for backward compatibility
+        self.draft_extend_attn_backend = self.draft_attn_backend
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
 
-        logger.info("DFlash attention backends initialized")
+        if self.draft_attn_backend is not None:
+            logger.info(f"DFlash using native attention backend: {type(self.draft_attn_backend).__name__}")
+        else:
+            logger.warning("DFlash attention backend is None, will use torch fallback")
 
     def init_cuda_graphs(self):
         """Capture CUDA graphs for draft model."""
@@ -434,18 +431,18 @@ class DFlashWorker(TpModelWorker):
         verified_ids: List[torch.Tensor],
         ctx_lens: List[int],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Batched draft forward using ForwardBatch and model_runner.forward().
+        """Batched draft forward using ForwardBatch and RadixAttention.
         
-        This enables proper RadixAttention backend usage.
+        Creates proper ForwardBatch with attention backend for RadixAttention integration.
         """
         bs = len(target_hiddens)
         block_size = self.block_size
         max_ctx_len = max(ctx_lens)
+        hidden_size = self.draft_model_runner.model.config.hidden_size
 
         # Get input dimension (may be num_layers * hidden_size before FC projection)
         first_th = target_hiddens[0]
         input_dim = first_th.shape[-1]
-        hidden_size = self.draft_model_runner.model.config.hidden_size
 
         # Pad and stack target_hiddens to [bs, max_ctx_len, input_dim]
         padded_target_hiddens = torch.zeros(
@@ -467,7 +464,7 @@ class DFlashWorker(TpModelWorker):
             for v in verified_ids
         ]).to(dtype=torch.long, device=self.device)
 
-        # Create noise embeddings [bs, block_size, hidden]
+        # Create noise input_ids [bs, block_size]
         block_input_ids = torch.full(
             (bs, block_size), self.mask_token_id,
             dtype=torch.long, device=self.device
@@ -482,10 +479,39 @@ class DFlashWorker(TpModelWorker):
             padded_target_hiddens = self.draft_model_runner.model.model.fc(padded_target_hiddens)
         padded_target_hiddens = self.draft_model_runner.model.model.hidden_norm(padded_target_hiddens)
 
-        # Use batched forward through model layers with correct DFlash attention pattern
-        draft_hidden = self._model_forward_batched(
-            padded_target_hiddens, noise_embedding, ctx_lens_tensor
-        )
+        # Process each request through model layers
+        # Using torch fallback attention (forward_batch=None) which correctly implements
+        # DFlash pattern: Q from noise only, K/V from full sequence
+        all_draft_hidden = []
+        
+        for i in range(bs):
+            ctx_len = ctx_lens[i]
+            total_len = ctx_len + block_size
+
+            # Get valid target hidden [ctx_len, hidden] - already normalized
+            th = padded_target_hiddens[i, :ctx_len, :]
+
+            # Get noise embedding [block_size, hidden]
+            ne = noise_embedding[i]
+
+            # Concatenate [total_len, hidden]
+            combined = torch.cat([th, ne], dim=0)
+
+            # Create positions [total_len]
+            positions = torch.arange(total_len, device=self.device)
+
+            # Forward through model layers with torch fallback (forward_batch=None)
+            hidden = combined
+            for layer in self.draft_model_runner.model.model.layers:
+                hidden = layer(positions, hidden, forward_batch=None, ctx_len=ctx_len)
+
+            # Extract noise portion and apply final norm
+            noise_hidden = hidden[ctx_len:]
+            noise_hidden = self.draft_model_runner.model.model.norm(noise_hidden)
+            all_draft_hidden.append(noise_hidden)
+
+        # Stack to [bs, block_size, hidden]
+        draft_hidden = torch.stack(all_draft_hidden, dim=0)
 
         # Get draft logits and tokens [bs, block_size-1]
         draft_hidden_for_logits = draft_hidden[:, 1:, :]  # [bs, block_size-1, hidden]
@@ -507,56 +533,6 @@ class DFlashWorker(TpModelWorker):
         positions = torch.cat(all_positions, dim=0)
         return draft_tokens, positions
 
-    def _model_forward_batched(
-        self,
-        target_hidden: torch.Tensor,  # [bs, max_ctx_len, hidden] - already FC + hidden_norm processed
-        noise_embedding: torch.Tensor,  # [bs, block_size, hidden]
-        ctx_lens: torch.Tensor,  # [bs]
-    ) -> torch.Tensor:
-        """Run draft model forward through layers with correct DFlash attention pattern.
-        
-        Matches original DFlash:
-        - target_hidden is already normalized by hidden_norm (done before this call)
-        - input_layernorm is applied ONLY to noise, NOT to target_hidden
-        - Q comes from noise only, K/V come from [target_hidden, noise]
-        """
-        bs = target_hidden.shape[0]
-        block_size = noise_embedding.shape[1]
-
-        # Process each request separately (different ctx_lens mean different valid regions)
-        all_draft_hidden = []
-        for i in range(bs):
-            ctx_len = ctx_lens[i].item()
-
-            # Get valid target hidden [ctx_len, hidden] - already normalized by hidden_norm
-            th = target_hidden[i, :ctx_len, :]
-
-            # Get noise embedding [block_size, hidden]
-            ne = noise_embedding[i]
-
-            # Concatenate [ctx_len + block_size, hidden]
-            combined = torch.cat([th, ne], dim=0)
-
-            # Create positions
-            total_len = ctx_len + block_size
-            positions = torch.arange(total_len, device=self.device)
-
-            # Forward through layers with correct ctx_len for DFlash pattern
-            # The layer will apply input_layernorm only to noise, not to target_hidden
-            hidden = combined
-            for layer in self.draft_model_runner.model.model.layers:
-                hidden = layer(positions, hidden, forward_batch=None, ctx_len=ctx_len)
-
-            # Final norm only on noise portion (already extracted by layer)
-            # After all layers, hidden is [ctx_len + block_size, hidden]
-            # Extract noise portion
-            noise_hidden = hidden[ctx_len:]
-            noise_hidden = self.draft_model_runner.model.model.norm(noise_hidden)
-            
-            all_draft_hidden.append(noise_hidden)
-
-        # Stack to [bs, block_size, hidden]
-        return torch.stack(all_draft_hidden, dim=0)
 
     def _evict_rejected_cache(
         self,

@@ -205,7 +205,11 @@ class Qwen3DFlashAttention(nn.Module):
         q_full, k = self.rotary_emb(positions, q_full, k)
         
         # Check if we have a proper attention backend
-        if forward_batch is not None and hasattr(forward_batch, 'attn_backend') and forward_batch.attn_backend is not None:
+        use_radix = (forward_batch is not None and 
+                     hasattr(forward_batch, 'attn_backend') and 
+                     forward_batch.attn_backend is not None)
+        
+        if use_radix:
             # Use RadixAttention (ENCODER_ONLY = non-causal)
             # Note: This computes attention for all positions, but we only use noise portion
             attn_output = self.attn(q_full, k, v, forward_batch)
