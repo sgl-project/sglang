@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
     LatentPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.comfyui_latent_preparation import (
+    ComfyUILatentPreparationStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.stepvideo_encoding import (
     StepvideoPromptEncodingStage,
 )
@@ -46,6 +49,7 @@ __all__ = [
     "InputValidationStage",
     "TimestepPreparationStage",
     "LatentPreparationStage",
+    "ComfyUILatentPreparationStage",
     "ConditioningStage",
     "DenoisingStage",
     "DmdDenoisingStage",

@@ -185,6 +185,9 @@ class Req:
     # results
     output: torch.Tensor | None = None
 
+    # for ComfyUI 
+    comfyui_mode: bool = False
+
     @property
     def batch_size(self):
         # Determine batch size
@@ -242,3 +245,6 @@ class OutputBatch:
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None
+    
+    # For ComfyUI integration: noise prediction from denoising stage
+    noise_pred: torch.Tensor | None = None
