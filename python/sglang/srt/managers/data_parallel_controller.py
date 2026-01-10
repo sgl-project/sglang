@@ -37,6 +37,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, RequestStage
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
@@ -206,6 +207,9 @@ class DataParallelController:
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
         )
+
+        if server_args.enable_metrics:
+            start_cpu_monitor_thread("data_parallel_controller")
 
     def send_to_all_workers(self, obj):
         for worker in self.workers:
