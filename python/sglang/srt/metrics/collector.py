@@ -255,6 +255,23 @@ class SchedulerStats:
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 5, 10, 20, 50, 100, 200]
 
 
+def compute_routing_key_stats(routing_keys: List[Optional[str]]) -> tuple:
+    from collections import Counter
+
+    key_counts = Counter(k for k in routing_keys if k is not None)
+    num_unique_keys = len(key_counts)
+
+    buckets = ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS
+    bucket_counts = []
+    for i, upper in enumerate(buckets):
+        lower = buckets[i - 1] if i > 0 else 0
+        count = sum(1 for c in key_counts.values() if lower < c <= upper)
+        bucket_counts.append(count)
+    bucket_counts.append(sum(1 for c in key_counts.values() if c > buckets[-1]))
+
+    return num_unique_keys, bucket_counts
+
+
 @dataclass
 class DPCooperationInfo:
     # Users can derive that, except for cases with idle, num_decode_ranks=world_size-num_prefill_ranks
