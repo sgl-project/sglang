@@ -1,0 +1,37 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from sglang.srt.utils.log_utils import create_log_target, log_json
+
+
+class TestLogUtils(unittest.TestCase):
+    def test_create_log_target_stdout(self):
+        logger = create_log_target("stdout")
+        self.assertIsNotNone(logger)
+        self.assertEqual(logger.level, 20)  # INFO level
+
+    def test_create_log_target_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            logger = create_log_target(temp_dir)
+            self.assertIsNotNone(logger)
+            self.assertEqual(logger.level, 20)
+
+    def test_log_json(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            logger = create_log_target(temp_dir)
+            log_json(logger, "test.event", {"key": "value", "number": 42})
+            logger.handlers[0].flush()
+            log_files = list(Path(temp_dir).glob("*.log"))
+            self.assertEqual(len(log_files), 1)
+            content = log_files[0].read_text().strip()
+            data = json.loads(content)
+            self.assertIn("timestamp", data)
+            self.assertEqual(data["event"], "test.event")
+            self.assertEqual(data["key"], "value")
+            self.assertEqual(data["number"], 42)
+
+
+if __name__ == "__main__":
+    unittest.main()

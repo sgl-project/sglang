@@ -5,35 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sglang.srt.utils.log_utils import create_log_target, log_json
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
-
-
-class TestLogUtils(unittest.TestCase):
-    def test_create_log_target_stdout(self):
-        logger = create_log_target("stdout")
-        self.assertIsNotNone(logger)
-        self.assertEqual(logger.level, 20)  # INFO level
-
-    def test_create_log_target_file(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            logger = create_log_target(temp_dir)
-            self.assertIsNotNone(logger)
-            self.assertEqual(logger.level, 20)
-
-    def test_log_json(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            logger = create_log_target(temp_dir)
-            log_json(logger, "test.event", {"key": "value", "number": 42})
-            logger.handlers[0].flush()
-            log_files = list(Path(temp_dir).glob("*.log"))
-            self.assertEqual(len(log_files), 1)
-            content = log_files[0].read_text().strip()
-            data = json.loads(content)
-            self.assertIn("timestamp", data)
-            self.assertEqual(data["event"], "test.event")
-            self.assertEqual(data["key"], "value")
-            self.assertEqual(data["number"], 42)
 
 
 class TestSchedulerStatusLogger(unittest.TestCase):
@@ -82,20 +54,20 @@ class TestSchedulerStatusLogger(unittest.TestCase):
             self.assertEqual(data["running_rids"], running_rids)
             self.assertEqual(data["queued_rids"], queued_rids)
 
-    def test_create_if_enabled_disabled(self):
+    def test_maybe_create_disabled(self):
         with patch.dict("os.environ", {"SGLANG_LOG_SCHEDULER_STATUS_TARGET": ""}):
             from sglang.srt.environ import envs
 
             envs.SGLANG_LOG_SCHEDULER_STATUS_TARGET.clear()
-            logger = SchedulerStatusLogger.create_if_enabled()
+            logger = SchedulerStatusLogger.maybe_create()
             self.assertIsNone(logger)
 
-    def test_create_if_enabled_stdout(self):
+    def test_maybe_create_stdout(self):
         with patch.dict("os.environ", {"SGLANG_LOG_SCHEDULER_STATUS_TARGET": "stdout"}):
             from sglang.srt.environ import envs
 
             envs.SGLANG_LOG_SCHEDULER_STATUS_TARGET.set("stdout")
-            logger = SchedulerStatusLogger.create_if_enabled()
+            logger = SchedulerStatusLogger.maybe_create()
             self.assertIsNotNone(logger)
             envs.SGLANG_LOG_SCHEDULER_STATUS_TARGET.clear()
 

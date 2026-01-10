@@ -28,7 +28,7 @@ class SchedulerStatusLogger:
         )
 
     @staticmethod
-    def create_if_enabled() -> Optional["SchedulerStatusLogger"]:
+    def maybe_create() -> Optional["SchedulerStatusLogger"]:
         from sglang.srt.environ import envs
 
         target = envs.SGLANG_LOG_SCHEDULER_STATUS_TARGET.get()

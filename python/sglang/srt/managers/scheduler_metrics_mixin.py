@@ -113,7 +113,7 @@ class SchedulerMetricsMixin:
         if self.enable_kv_cache_events:
             self.init_kv_events(self.server_args.kv_events_config)
 
-        self.scheduler_status_logger = SchedulerStatusLogger.create_if_enabled()
+        self.scheduler_status_logger = SchedulerStatusLogger.maybe_create()
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
