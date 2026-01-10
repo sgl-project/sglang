@@ -35,11 +35,11 @@ class SchedulerStatusLogger:
     def maybe_create() -> Optional["SchedulerStatusLogger"]:
         from sglang.srt.environ import envs
 
-        raw = envs.SGLANG_LOG_SCHEDULER_STATUS_TARGET.get()
-        if not raw:
+        target = envs.SGLANG_LOG_SCHEDULER_STATUS_TARGET.get()
+        if not target:
             return None
-        targets = [t.strip() for t in raw.split(",") if t.strip()]
-        if not targets:
-            return None
-        dump_interval_s = envs.SGLANG_LOG_SCHEDULER_STATUS_INTERVAL_S.get()
-        return SchedulerStatusLogger(targets, dump_interval_s)
+
+        return SchedulerStatusLogger(
+            targets=[t.strip() for t in target.split(",") if t.strip()],
+            dump_interval_s=envs.SGLANG_LOG_SCHEDULER_STATUS_INTERVAL_S.get(),
+        )
