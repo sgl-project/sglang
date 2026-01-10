@@ -199,13 +199,19 @@ class BaseLayerWithLoRA(nn.Module):
         # avoid precision loss
         if isinstance(self.base_layer.weight, DTensor):
             device = self.base_layer.weight.data.device
-            self.base_layer.weight = nn.Parameter(
-                self.cpu_weight.to(device, non_blocking=True)
-            )
+            old_weight = self.base_layer.weight
+            new_weight_data = self.cpu_weight.to(device, non_blocking=True)
+            self.base_layer.weight = nn.Parameter(new_weight_data)
+            del old_weight
         else:
-            self.base_layer.weight.data = self.cpu_weight.data.to(
-                self.base_layer.weight, non_blocking=True
-            )
+            current_device = self.base_layer.weight.data.device
+            cpu_weight_on_device = self.cpu_weight.to(current_device, non_blocking=True)
+            self.base_layer.weight.data.copy_(cpu_weight_on_device)
+            if (
+                cpu_weight_on_device.data_ptr()
+                != self.base_layer.weight.data.data_ptr()
+            ):
+                del cpu_weight_on_device
 
         self.merged = False
 
