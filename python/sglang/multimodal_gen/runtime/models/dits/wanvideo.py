@@ -11,7 +11,11 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
+from sglang.multimodal_gen.runtime.distributed import divide
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_world_size,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
     SparseLinearAttention,
@@ -24,12 +28,17 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     ScaleResidual,
     ScaleResidualLayerNormScaleShift,
+    tensor_parallel_rms_norm,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
+    apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     ModulateProjection,
@@ -132,10 +141,10 @@ class WanSelfAttention(nn.Module):
         self.parallel_attention = parallel_attention
 
         # layers
-        self.to_q = ReplicatedLinear(dim, dim)
-        self.to_k = ReplicatedLinear(dim, dim)
-        self.to_v = ReplicatedLinear(dim, dim)
-        self.to_out = ReplicatedLinear(dim, dim)
+        self.to_q = ColumnParallelLinear(dim, dim, gather_output=True)
+        self.to_k = ColumnParallelLinear(dim, dim, gather_output=True)
+        self.to_v = ColumnParallelLinear(dim, dim, gather_output=True)
+        self.to_out = ColumnParallelLinear(dim, dim, gather_output=True)
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
@@ -218,8 +227,8 @@ class WanI2VCrossAttention(WanSelfAttention):
             supported_attention_backends=supported_attention_backends,
         )
 
-        self.add_k_proj = ReplicatedLinear(dim, dim)
-        self.add_v_proj = ReplicatedLinear(dim, dim)
+        self.add_k_proj = ColumnParallelLinear(dim, dim, gather_output=True)
+        self.add_v_proj = ColumnParallelLinear(dim, dim, gather_output=True)
         self.norm_added_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_added_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
@@ -272,11 +281,11 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True)
+        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
 
-        self.to_out = ReplicatedLinear(dim, dim, bias=True)
+        self.to_out = RowParallelLinear(dim, dim, bias=True, reduce_results=True)
         if attention_type == "sla":
             self.attn1 = MinimalA2AAttnOp(
                 SparseLinearAttention(
@@ -285,7 +294,7 @@ class WanTransformerBlock(nn.Module):
             )
         else:
             self.attn1 = USPAttention(
-                num_heads=num_heads,
+                num_heads=divide(num_heads, get_tensor_model_parallel_world_size()),
                 head_size=dim // num_heads,
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
@@ -294,10 +303,10 @@ class WanTransformerBlock(nn.Module):
 
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
-        dim_head = dim // num_heads
+        self.dim_head = dim // num_heads
         if qk_norm == "rms_norm":
-            self.norm_q = RMSNorm(dim_head, eps=eps)
-            self.norm_k = RMSNorm(dim_head, eps=eps)
+            self.norm_q = RMSNorm(self.dim_head, eps=eps)
+            self.norm_k = RMSNorm(self.dim_head, eps=eps)
         elif qk_norm == "rms_norm_across_heads":
             # LTX applies qk norm across all heads
             self.norm_q = RMSNorm(dim, eps=eps)
@@ -306,6 +315,7 @@ class WanTransformerBlock(nn.Module):
             logger.error("QK Norm type not supported")
             raise Exception
         assert cross_attn_norm is True
+        self.qk_norm = qk_norm
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
             norm_type="layer",
@@ -387,21 +397,42 @@ class WanTransformerBlock(nn.Module):
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
-
+        tp_rmsnorm = (
+            self.qk_norm == "rms_norm_across_heads"
+            and get_tensor_model_parallel_world_size() > 1
+        )
         if self.norm_q is not None:
-            query = self.norm_q(query)
+            if tp_rmsnorm:
+                query = tensor_parallel_rms_norm(query, self.norm_q)
+            else:
+                query = self.norm_q(query)
         if self.norm_k is not None:
-            key = self.norm_k(key)
+            if tp_rmsnorm:
+                key = tensor_parallel_rms_norm(key, self.norm_k)
+            else:
+                key = self.norm_k(key)
 
-        query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        query = query.squeeze(1).unflatten(2, (-1, self.dim_head))
+        key = key.squeeze(1).unflatten(2, (-1, self.dim_head))
+        value = value.squeeze(1).unflatten(2, (-1, self.dim_head))
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        query, key = _apply_rotary_emb(
-            query, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        if query.is_cuda and query.shape == key.shape:
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
+            )
+            query, key = apply_flashinfer_rope_qk_inplace(
+                query, key, cos_sin_cache, is_neox=False
+            )
+        else:
+            query, key = _apply_rotary_emb(
+                query, cos, sin, is_neox_style=False
+            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -454,12 +485,14 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ReplicatedLinear(dim, dim, bias=True)
-        self.to_k = ReplicatedLinear(dim, dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, dim, bias=True)
-        self.to_gate_compress = ReplicatedLinear(dim, dim, bias=True)
+        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_gate_compress = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=True
+        )
 
-        self.to_out = ReplicatedLinear(dim, dim, bias=True)
+        self.to_out = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
         self.attn1 = UlyssesAttention_VSA(
             num_heads=num_heads,
             head_size=dim // num_heads,
@@ -567,9 +600,21 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        query, key = _apply_rotary_emb(
-            query, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        if query.is_cuda and query.shape == key.shape:
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
+            )
+            query, key = apply_flashinfer_rope_qk_inplace(
+                query, key, cos_sin_cache, is_neox=False
+            )
+        else:
+            query, key = _apply_rotary_emb(
+                query, cos, sin, is_neox_style=False
+            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
 
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)

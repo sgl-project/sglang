@@ -1,9 +1,5 @@
 use super::*;
-use crate::tool_parser::{
-    parsers::JsonParser,
-    partial_json::{compute_diff, find_common_prefix, is_complete_json, PartialJson},
-    traits::ToolParser,
-};
+use crate::tool_parser::{parsers::JsonParser, partial_json::PartialJson, traits::ToolParser};
 
 #[tokio::test]
 async fn test_tool_parser_factory() {
@@ -95,37 +91,6 @@ fn test_partial_json_depth_limit() {
     let input = r#"{"a": {"b": {"c": {"d": 1}}}}"#;
     let result = parser.parse_value(input, true);
     assert!(result.is_err());
-}
-
-#[test]
-fn test_is_complete_json() {
-    assert!(is_complete_json(r#"{"name": "test"}"#));
-    assert!(is_complete_json(r#"[1, 2, 3]"#));
-    assert!(is_complete_json(r#""string""#));
-    assert!(is_complete_json("42"));
-    assert!(is_complete_json("true"));
-    assert!(is_complete_json("null"));
-
-    assert!(!is_complete_json(r#"{"name": "#));
-    assert!(!is_complete_json(r#"[1, 2, "#));
-    assert!(!is_complete_json(r#""unclosed"#));
-}
-
-#[test]
-fn test_find_common_prefix() {
-    assert_eq!(find_common_prefix("hello", "hello"), 5);
-    assert_eq!(find_common_prefix("hello", "help"), 3);
-    assert_eq!(find_common_prefix("hello", "world"), 0);
-    assert_eq!(find_common_prefix("", "hello"), 0);
-    assert_eq!(find_common_prefix("hello", ""), 0);
-}
-
-#[test]
-fn test_compute_diff() {
-    assert_eq!(compute_diff("hello", "hello world"), " world");
-    assert_eq!(compute_diff("", "hello"), "hello");
-    assert_eq!(compute_diff("hello", "hello"), "");
-    assert_eq!(compute_diff("test", "hello"), "hello");
 }
 
 // NOTE: test_stream_result_variants removed - StreamResult enum replaced by StreamingParseResult

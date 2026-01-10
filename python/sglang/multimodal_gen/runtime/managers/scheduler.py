@@ -9,9 +9,11 @@ from typing import Any, List
 import zmq
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
+    _parse_size,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -78,12 +80,20 @@ class Scheduler:
             UnmergeLoraWeightsReq: self._handle_unmerge_lora,
             Req: self._handle_generation,
             List[Req]: self._handle_generation,
+            ListLorasReq: self._handle_list_loras,
         }
 
         # FIFO, new reqs are appended
         self.waiting_queue: deque[tuple[bytes, Req]] = deque()
 
+        # whether we've send the necessary warmup reqs
         self.warmed_up = False
+
+        self.prepare_server_warmup_reqs()
+
+        # Maximum consecutive errors before terminating the event loop
+        self._max_consecutive_errors = 3
+        self._consecutive_error_count = 0
 
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status
@@ -101,7 +111,13 @@ class Scheduler:
         req = reqs[0]
         return self.worker.unmerge_lora_weights(req.target)
 
+    def _handle_list_loras(self, _reqs: List[Any]) -> OutputBatch:
+        return self.worker.list_loras()
+
     def _handle_generation(self, reqs: List[Req]):
+        has_warmup = any(req.is_warmup for req in reqs)
+        if has_warmup:
+            logger.info("Processing warmup req...")
         return self.worker.execute_forward(reqs)
 
     def return_result(
@@ -125,6 +141,50 @@ class Scheduler:
         item = self.waiting_queue.popleft()
 
         return [item]
+
+    def prepare_server_warmup_reqs(self):
+        if (
+            self.server_args.warmup
+            and not self.warmed_up
+            and self.server_args.warmup_resolutions is not None
+        ):
+            # insert warmup reqs constructed with each warmup-resolution
+            for resolution in self.server_args.warmup_resolutions:
+                width, height = _parse_size(resolution)
+                req = Req(
+                    data_type=self.server_args.pipeline_config.task_type.data_type(),
+                    width=width,
+                    height=height,
+                    prompt="",
+                    is_warmup=True,
+                )
+                self.waiting_queue.append((None, req))
+            # if server is warmed-up, set this flag to avoid req-based warmup
+            self.warmed_up = True
+
+    def process_received_reqs_with_req_based_warmup(
+        self, recv_reqs: List[tuple[bytes, Any]]
+    ) -> List[tuple[bytes, Any]]:
+        if (
+            self.warmed_up
+            or not self.server_args.warmup
+            or not recv_reqs
+            or self.server_args.warmup_resolutions is not None
+        ):
+            return recv_reqs
+
+        # handle server req-based warmup by inserting an identical req to the beginning of the waiting queue
+        # only the very first req through server's lifetime will be warmup
+        identity, req = recv_reqs[0]
+        if isinstance(req, Req):
+            warmup_req = deepcopy(req)
+            warmup_req.is_warmup = True
+            warmup_req.extra["cache_dit_num_inference_steps"] = req.num_inference_steps
+            warmup_req.num_inference_steps = 1
+            recv_reqs.insert(0, (identity, warmup_req))
+            logger.info("Server warming up....")
+            self.warmed_up = True
+        return recv_reqs
 
     def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
@@ -178,22 +238,6 @@ class Scheduler:
 
         assert recv_reqs is not None
 
-        # handle server warmup by inserting an identical req to the beginning of the waiting queue
-        # only the very first req through server's lifetime will be warmup
-        if (
-            not self.warmed_up
-            and len(recv_reqs) == 1
-            and self.server_args.enable_warmup
-        ):
-            identity, req = recv_reqs[0]
-            if isinstance(req, Req):
-                warmup_req = deepcopy(req)
-                warmup_req.is_warmup = True
-                warmup_req.num_inference_steps = 1
-                recv_reqs.insert(0, (identity, warmup_req))
-                self.warmed_up = True
-                logger.info("Server warming up....")
-
         return recv_reqs
 
     def event_loop(self) -> None:
@@ -210,13 +254,26 @@ class Scheduler:
             # 1: receive requests
             try:
                 new_reqs = self.recv_reqs()
-                # after processing input reqs
+                new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
                 self.waiting_queue.extend(new_reqs)
+                # Reset error count on success
+                self._consecutive_error_count = 0
             except Exception as e:
+                self._consecutive_error_count += 1
                 logger.error(
-                    f"Error receiving requests in scheduler event loop: {e}",
+                    f"Error receiving requests in scheduler event loop "
+                    f"(attempt {self._consecutive_error_count}/{self._max_consecutive_errors}): {e}",
                     exc_info=True,
                 )
+                if self._consecutive_error_count >= self._max_consecutive_errors:
+                    logger.error(
+                        f"Maximum consecutive errors ({self._max_consecutive_errors}) reached. "
+                        "Terminating scheduler event loop."
+                    )
+                    raise RuntimeError(
+                        f"Scheduler terminated after {self._max_consecutive_errors} "
+                        f"consecutive errors. Last error: {e}"
+                    ) from e
                 continue
 
             # 2: execute, make sure a reply is always sent
@@ -250,16 +307,20 @@ class Scheduler:
 
             # 3. return results
             try:
-                # TODO: Support sending back to multiple identities if batched
+                # log warmup info
                 is_warmup = (
                     processed_req.is_warmup if isinstance(processed_req, Req) else False
                 )
                 if is_warmup:
-                    logger.info(
-                        f"Server warmup done in {GREEN}%.2f{RESET} seconds",
-                        output_batch.timings.total_duration_s,
-                    )
+                    if output_batch.error is None:
+                        logger.info(
+                            f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
+                            output_batch.timings.total_duration_s,
+                        )
+                    else:
+                        logger.info(f"Warmup req processing failed")
 
+                # TODO: Support sending back to multiple identities if batched
                 self.return_result(output_batch, identities[0], is_warmup=is_warmup)
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests

@@ -17,6 +17,7 @@ import numpy as np
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
@@ -200,15 +201,20 @@ class DiffGenerator:
             **sampling_params_kwargs,
         )
 
+        # Extract diffusers_kwargs if passed
+        diffusers_kwargs = sampling_params_kwargs.pop("diffusers_kwargs", None)
+
         requests: list[Req] = []
         for output_idx, p in enumerate(prompts):
             sampling_params.prompt = p
-            requests.append(
-                prepare_request(
-                    server_args=self.server_args,
-                    sampling_params=sampling_params,
-                )
+            req = prepare_request(
+                server_args=self.server_args,
+                sampling_params=sampling_params,
             )
+            # Add diffusers_kwargs to request's extra dict
+            if diffusers_kwargs:
+                req.extra["diffusers_kwargs"] = diffusers_kwargs
+            requests.append(req)
 
         results = []
         total_start_time = time.perf_counter()
@@ -268,7 +274,7 @@ class DiffGenerator:
         log_batch_completion(logger, len(results), total_gen_time)
 
         if results:
-            if self.server_args.enable_warmup:
+            if self.server_args.warmup:
                 total_duration_ms = results[0]["timings"]["total_duration_ms"]
                 logger.info(
                     f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
@@ -304,6 +310,7 @@ class DiffGenerator:
         response = sync_scheduler_client.forward(req)
         if response.error is None:
             logger.info(success_msg)
+            return response
         else:
             error_msg = response.error
             raise RuntimeError(f"{failure_msg}: {error_msg}")
@@ -368,6 +375,21 @@ class DiffGenerator:
             f"Successfully merged LoRA weights (target: {target}, strength: {strength})",
             "Failed to merge LoRA weights",
         )
+
+    def list_loras(self) -> OutputBatch:
+        """
+        List loaded LoRA adapters and current application status per module.
+        """
+
+        output = self._send_lora_request(
+            req=ListLorasReq(),
+            success_msg="Successfully listed LoRA adapters",
+            failure_msg="Failed to list LoRA adapters",
+        )
+        if output.error is None:
+            return output.output or {}
+        else:
+            raise RuntimeError(f"Failed to list LoRA adapters: {output.error}")
 
     def _ensure_lora_state(
         self,
