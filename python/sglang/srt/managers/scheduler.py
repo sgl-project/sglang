@@ -169,6 +169,7 @@ from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.tracing.trace_metric_wrapper import (
     NullContext,
     RequestStage,
+    StageMetricContext,
     TraceMetricContext,
     metric_trace_slice_batch,
     trace_event_batch,
@@ -2817,23 +2818,23 @@ class Scheduler(
     def _req_trace_metric_ctx_init(
         self, req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
     ):
-        if self.server_args.trace_level == 0 and not self.server_args.enable_metrics:
-            req.trace_metric_ctx = NullContext()
-            return
-
-        bootstrap_room = req.bootstrap_room if hasattr(req, "bootstrap_room") else None
-
-        propagation_context = req.trace_metric_ctx
-        req.trace_metric_ctx = TraceMetricContext(
-            req.rid,
-            bootstrap_room,
-            module_name="request",
-            server_args=self.server_args,
-            metrics_collector=(
+        if isinstance(req.trace_metric_ctx, TraceMetricContext):
+            req.trace_metric_ctx.rebuild_thread_context()
+            metrics_collector = (
                 self.metrics_collector if self.server_args.enable_metrics else None
-            ),
-        )
-        req.trace_metric_ctx.trace_set_proc_propagate_context(propagation_context)
+            )
+            req.trace_metric_ctx.reinit_metric_ctx(
+                self.server_args.enable_metrics,
+                metrics_collector=metrics_collector,
+            )
+        elif self.server_args.enable_metrics:
+            req.trace_metric_ctx = StageMetricContext(
+                True,
+                metrics_collector=self.metrics_collector,
+            )
+        else:
+            req.trace_metric_ctx = NullContext()
+
         req.trace_metric_ctx.slice_start(RequestStage.ANONYMOUS)
 
 

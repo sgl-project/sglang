@@ -101,15 +101,10 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
         trace_metric_ctx.slice_end(RequestStage.D, thread_finish_flag = True)
         ```
 
-5. When the request execution flow transfers to another thread, the trace context needs to be explicitly propagated.
-    - sender: Execute the following code before sending the request to another thread via ZMQ
-        ```python
-        trace_context = trace_metric_ctx.trace_get_proc_propagate_context(rid)
-        req.trace_metric_ctx = trace_context
-        ```
+5. When the request execution flow transfers to another thread, the thread context needs to be explicitly rebuilt.
     - receiver: Execute the following code after receiving the request via ZMQ
         ```python
-        trace_metric_ctx = TraceMetricContext(......,propagation_context = req.trace_metric_ctx)
+        trace_metric_ctx.rebuild_thread_context()
         ```
 
 ## How to Extend the Tracing Framework to Support Complex Tracing Scenarios
@@ -129,5 +124,3 @@ TraceReqContext (req_id="req-123")
 Each traced request maintains a global `TraceReqContext` and creates a corresponding request span. For every thread that processes the request, a `TraceThreadContext` is recorded and a thread span is created. The `TraceThreadContext` is nested within the `TraceReqContext`, and each currently traced code slice—potentially nested—is stored in its associated `TraceThreadContext`.
 
 In addition to the above hierarchy, each slice also records its previous slice via Span.add_link(), which can be used to trace the execution flow.
-
-When the request execution flow transfers to a new thread, the trace context needs to be explicitly propagated. In the framework, this is represented by `TracePropagateContext`, which contains the context of the request span and the previous slice span.

@@ -109,50 +109,6 @@ class TraceThreadContext:
     thread_info: TraceThreadInfo
     cur_slice: Optional[TraceSliceContext] = None
     thread_span: Optional[trace.span.Span] = None
-    # Record the most recently completed span as the previous span for the next span to be created.
-    last_span_context: Optional[trace.span.SpanContext] = None
-
-
-@dataclass
-class TracePropagateContext:
-    root_span_context: context.Context
-    prev_span_context: Optional[trace.span.SpanContext]
-
-    def to_dict(self):
-        carrier: dict[str, str] = {}
-        propagate.inject(carrier, self.root_span_context)
-
-        if self.prev_span_context:
-            return {
-                "root_span": carrier,
-                "prev_span": {
-                    "span_id": self.prev_span_context.span_id,
-                    "trace_id": self.prev_span_context.trace_id,
-                },
-            }
-        else:
-            return {"root_span": carrier, "prev_span": None}
-
-    @classmethod
-    def instance_from_dict(cls, d):
-        if not isinstance(d, dict):
-            return None
-        if "root_span" not in d or "prev_span" not in d:
-            return None
-
-        carrier = d["root_span"]
-        root_span_context = propagate.extract(carrier)
-
-        if d["prev_span"] == "None" or d["prev_span"] is None:
-            prev_span_context = None
-        else:
-            prev_span_context = trace.span.SpanContext(
-                trace_id=d["prev_span"]["trace_id"],
-                span_id=d["prev_span"]["span_id"],
-                is_remote=True,
-            )
-
-        return cls(root_span_context, prev_span_context)
 
 
 class TraceCustomIdGenerator(id_generator.IdGenerator):
@@ -313,6 +269,8 @@ class TraceReqContext:
         self.is_copy: bool = False
         self.root_span: Optional[trace.span.Span] = None
         self.root_span_context: Optional[context.Context] = None
+        # Record the most recently completed span as the previous span for the next span to be created.
+        self.last_span_context: Optional[trace.span.SpanContext] = None
 
         self.pid: int = threading.get_native_id()
 
@@ -351,44 +309,69 @@ class TraceReqContext:
 
         return thread_context
 
-    def trace_get_proc_propagate_context(self) -> Optional[Dict[str, Any]]:
+    def __getstate__(self) -> Optional[Dict[str, Any]]:
         if not self.tracing_enable:
-            return None
+            return {"tracing_enable": False}
 
         if not self.root_span_context:
-            return None
+            return {"tracing_enable": False}
 
-        prev_span_context = None
-        if self.thread_context.cur_slice:
+        state = {
+            "tracing_enable": self.tracing_enable,
+            "rid": self.rid,
+            "bootstrap_room": self.bootstrap_room,
+            "start_time_ns": self.start_time_ns,
+            "role": self.role,
+            "trace_level": self.trace_level,
+            "module_name": self.module_name,
+            "is_copy": self.is_copy,
+            "pid": self.pid,
+            "thread_context": None,
+            "root_span": None,
+            "last_span_context": None,
+        }
+
+        carrier: dict[str, str] = {}
+        propagate.inject(carrier, self.root_span_context)
+        state["root_span_context"] = carrier
+
+        prev_span_context = self.last_span_context
+        if self.thread_context and self.thread_context.cur_slice:
             cur_slice = self.thread_context.cur_slice
             if cur_slice.span:
                 prev_span_context = cur_slice.span.get_span_context()
 
-        if not prev_span_context:
-            # may be None
-            prev_span_context = self.thread_context.last_span_context
+        if prev_span_context:
+            state["last_span_context"] = {
+                "span_id": prev_span_context.span_id,
+                "trace_id": prev_span_context.trace_id,
+            }
 
-        root_span_context = self.root_span_context
+        return state
 
-        trace_context = TracePropagateContext(root_span_context, prev_span_context)
-        return trace_context.to_dict()
-
-    def trace_set_proc_propagate_context(self, trace_context: Optional[Dict[str, Any]]):
+    def __setstate__(self, state: Dict[str, Any]):
+        self.__dict__.update(state)
+        if not opentelemetry_initialized:
+            self.tracing_enable = False
         if not self.tracing_enable:
             return
 
-        self.start_time_ns = get_cur_time_ns()
         self.is_copy = True
+        self.pid = threading.get_native_id()
+        self.root_span_context = propagate.extract(self.root_span_context)
+        if self.last_span_context:
+            self.last_span_context = trace.span.SpanContext(
+                trace_id=self.last_span_context["trace_id"],
+                span_id=self.last_span_context["span_id"],
+                is_remote=True,
+            )
 
-        trace_context = TracePropagateContext.instance_from_dict(trace_context)
-        if not trace_context:
-            self.tracing_enable = False
+    def rebuild_thread_context(self, ts: Optional[int] = None):
+        if not self.tracing_enable:
             return
-        else:
-            self.root_span_context = trace_context.root_span_context
 
-        self.thread_context = self.__create_thread_context(self.start_time_ns)
-        self.thread_context.last_span_context = trace_context.prev_span_context
+        ts = ts or get_cur_time_ns()
+        self.thread_context = self.__create_thread_context(ts)
 
     def trace_req_start(
         self,
@@ -524,8 +507,8 @@ class TraceReqContext:
 
         # find prev span, only first level slice has previous span
         if not cur_slice.parent_slice:
-            if self.thread_context.last_span_context:
-                cur_slice.prev_span_context = self.thread_context.last_span_context
+            if self.last_span_context:
+                cur_slice.prev_span_context = self.last_span_context
 
         # check if span creation is lazy
         if anonymous or (cur_slice.parent_slice and cur_slice.parent_slice.lazy_flag):
@@ -602,7 +585,8 @@ class TraceReqContext:
         cur_slice.level = level
 
         if cur_slice.lazy_flag:
-            # check if span can be created now
+            # cur slice span has not been created.
+            # check if parent slice is lazy, if so, mark cur slice as lazy
             if cur_slice.parent_slice and cur_slice.parent_slice.lazy_flag:
                 if attrs:
                     cur_slice.attrs.update(attrs)
@@ -622,15 +606,12 @@ class TraceReqContext:
         self.thread_context.cur_slice = cur_slice.parent_slice
         # only for first level slice
         if not cur_slice.parent_slice:
-            self.thread_context.last_span_context = span.get_span_context()
+            self.last_span_context = span.get_span_context()
         else:
             cur_slice.parent_slice.child_slices.remove(cur_slice)
         self.__end_slice_span(cur_slice)
 
         self.__trace_slice_end_flag_process(auto_next_anon, thread_finish_flag, ts)
-
-    # alias
-    trace_slice = trace_slice_end
 
     # Add event to the current slice on the same thread with the same rid.
     def trace_event(

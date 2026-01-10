@@ -21,7 +21,7 @@ import threading
 import time
 from collections import deque
 from enum import Enum, auto
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional
 
 import psutil
 import setproctitle
@@ -47,7 +47,6 @@ from sglang.srt.tracing.trace_metric_wrapper import (
     NullContext,
     RequestStage,
     TraceMetricContext,
-    metric_trace_slice_batch_scope,
 )
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
@@ -218,31 +217,17 @@ class DataParallelController:
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
 
-    def _req_trace_metric_ctx_init(
-        self, req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
-    ):
-        if self.server_args.trace_level == 0:
-            req.trace_metric_ctx = NullContext()
-            return
-
-        bootstrap_room = req.bootstrap_room if hasattr(req, "bootstrap_room") else None
-
-        propagation_context = req.trace_metric_ctx
-        req.trace_metric_ctx = TraceMetricContext(
-            req.rid,
-            bootstrap_room,
-            module_name="request",
-            server_args=self.server_args,
-        )
-        req.trace_metric_ctx.trace_set_proc_propagate_context(propagation_context)
-
     def dispatching_with_trace(self, req: Req):
-        self._req_trace_metric_ctx_init(req)
+        if isinstance(req.trace_metric_ctx, TraceMetricContext):
+            req.trace_metric_ctx.rebuild_thread_context()
+        else:
+            req.trace_metric_ctx = NullContext()
 
-        with metric_trace_slice_batch_scope(
-            RequestStage.DC_DISPATCH, [req], True, True
-        ):
-            self.dispatching(req)
+        req.trace_metric_ctx.slice_start(RequestStage.DC_DISPATCH)
+        self.dispatching(req)
+        req.trace_metric_ctx.slice_end(
+            RequestStage.DC_DISPATCH, thread_finish_flag=True
+        )
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(

@@ -253,9 +253,7 @@ class TestTrace(CustomTestCase):
 
             try:
                 req = recv_from_main.recv_pyobj()
-                req_context = TraceReqContext(0, tracing_enable=True)
-                req_context.trace_set_proc_propagate_context(req.req_context)
-                req.req_context = req_context
+                req.req_context.rebuild_thread_context()
                 req.req_context.trace_slice_start("work")
                 time.sleep(1)
                 req.req_context.trace_slice_end("work", thread_finish_flag=True)
@@ -287,7 +285,6 @@ class TestTrace(CustomTestCase):
             req.req_context.trace_slice_start("dispatch")
             time.sleep(1)
             req_context = req.req_context
-            req.req_context = req_context.trace_get_proc_propagate_context()
             send_to_subproc.send_pyobj(req)
             # restore
             req.req_context = req_context

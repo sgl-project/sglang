@@ -94,7 +94,8 @@ from sglang.srt.tracing.trace_metric_wrapper import (
     global_del_trace_metric_ctx,
     global_get_trace_metric_ctx,
     global_set_trace_metric_ctx,
-    metric_trace_slice_batch_scope,
+    metric_trace_slice_batch,
+    metric_trace_slice_start_batch,
 )
 from sglang.srt.utils import (
     configure_gc_warning,
@@ -1039,13 +1040,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
-        with metric_trace_slice_batch_scope(
-            RequestStage.TOKENIZER_DISPATCH, [tokenized_obj], True, True
-        ):
-            self.send_to_scheduler.send_pyobj(tokenized_obj)
+        tokenized_obj.trace_metric_ctx.slice_start(RequestStage.TOKENIZER_DISPATCH)
+        self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
+        tokenized_obj.trace_metric_ctx.slice_end(
+            RequestStage.TOKENIZER_DISPATCH, thread_finish_flag=True
+        )
         return state
 
     def _send_batch_request(
@@ -1057,14 +1059,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         created_time: Optional[float] = None,
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        metric_trace_slice_start_batch(RequestStage.TOKENIZER_DISPATCH, tokenized_objs)
         if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
             batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
-        with metric_trace_slice_batch_scope(
-            RequestStage.TOKENIZER_DISPATCH, tokenized_objs, True, True
-        ):
-            self.send_to_scheduler.send_pyobj(batch_req)
+
+        self.send_to_scheduler.send_pyobj(batch_req)
         # Create states for each individual request in the batch
         for i, tokenized_obj in enumerate(tokenized_objs):
             tmp_obj = obj[i]
@@ -1072,6 +1073,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 [], False, asyncio.Event(), tmp_obj, created_time=created_time
             )
             self.rid_to_state[tmp_obj.rid] = state
+        metric_trace_slice_batch(
+            RequestStage.TOKENIZER_DISPATCH, tokenized_objs, thread_finish_flag=True
+        )
 
     async def _wait_one_response(
         self,
