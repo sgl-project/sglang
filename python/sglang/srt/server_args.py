@@ -4918,7 +4918,7 @@ class ServerArgs:
                     and self.max_loaded_loras <= max_loaded_loras_limit
                 ), (
                     "Enabling LoRA overlap loading requires pinning LoRA adapter weights in CPU memory, "
-                    f"so --max-loaded-loras must be greater than or equal to double --max-loras-per-batch: {max_loaded_loras_limit}"
+                    f"so --max-loaded-loras must be less than or equal to double --max-loras-per-batch: {max_loaded_loras_limit}"
                 )
 
             # Validate compatibility with speculative decoding
