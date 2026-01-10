@@ -440,18 +440,17 @@ class SchedulerMetricsMixin:
             self._emit_kv_metrics()
         self._publish_kv_events()
 
-    def maybe_dump_scheduler_status(self: Scheduler, batch: ScheduleBatch):
-        if x := self.scheduler_status_logger:
-            x.maybe_dump(batch, self.waiting_queue)
-
     def log_decode_stats_every_iteration(
         self: Scheduler, batch: ScheduleBatch, num_accepted_tokens: int
     ):
-        self.metrics_collector.increment_realtime_tokens(
-            # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
-            decode_tokens=batch.batch_size() + num_accepted_tokens,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
+        if self.enable_metrics:
+            self.metrics_collector.increment_realtime_tokens(
+                # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
+                decode_tokens=batch.batch_size() + num_accepted_tokens,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+        if x := self.scheduler_status_logger:
+            x.maybe_dump(batch, self.waiting_queue)
 
     def log_batch_result_stats(
         self: Scheduler,
