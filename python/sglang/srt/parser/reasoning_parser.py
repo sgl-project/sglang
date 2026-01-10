@@ -204,6 +204,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
         )
         self.parser = HarmonyParser()
+        self._fallback_triggered = False
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         events = self.parser.parse(text)
@@ -238,6 +239,9 @@ class GptOssDetector(BaseReasoningFormatDetector):
         )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        if self._fallback_triggered:
+            return StreamingParseResult(normal_text=new_text)
+
         events = self.parser.parse(new_text)
 
         reasoning_text = "".join(
@@ -251,6 +255,31 @@ class GptOssDetector(BaseReasoningFormatDetector):
                 # Use raw_text to preserve structural markers for function call detector
                 normal_parts.append(e.raw_text if e.raw_text else e.content)
         normal_text = "".join(normal_parts)
+
+        if reasoning_text or normal_text:
+            return StreamingParseResult(
+                normal_text=normal_text,
+                reasoning_text=reasoning_text,
+            )
+
+        # Fallback: if HarmonyParser didn't detect events (strategy is None)
+        # but we have <|end|> marker in the buffer.
+        if self.parser.strategy is None and "<|end|>" in self.parser._buffer:
+            splits = self.parser._buffer.split("<|end|>", maxsplit=1)
+            if len(splits) == 2:
+                reasoning_text = splits[0]
+                normal_text = splits[1]
+
+                # Consume the buffer since we manually parsed it
+                self.parser._buffer = ""
+
+                # Enable fallback mode for future chunks to bypass parser
+                self._fallback_triggered = True
+
+                return StreamingParseResult(
+                    normal_text=normal_text,
+                    reasoning_text=reasoning_text,
+                )
 
         return StreamingParseResult(
             normal_text=normal_text,

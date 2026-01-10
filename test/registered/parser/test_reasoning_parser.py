@@ -688,6 +688,23 @@ class TestGptOssDetector(CustomTestCase):
         result = self.detector.parse_streaming_increment("Answer: 42")
         self.assertEqual(result.normal_text, "Answer: 42")
 
+    def test_parse_streaming_increment_only_end_marker(self):
+        """Test streaming parsing when only <|end|> marker is present (bug fix scenario)."""
+        # Chunk 1: Reasoning content
+        result = self.detector.parse_streaming_increment("Reasoning content")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "")
+
+        # Chunk 2: End marker
+        result = self.detector.parse_streaming_increment("<|end|>")
+        self.assertEqual(result.reasoning_text, "Reasoning content")
+        self.assertEqual(result.normal_text, "")
+
+        # Chunk 3: Normal content (tool call)
+        result = self.detector.parse_streaming_increment(' {"tool": "test"}')
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, ' {"tool": "test"}')
+
 
 if __name__ == "__main__":
     unittest.main()
