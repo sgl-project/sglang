@@ -440,11 +440,12 @@ class SchedulerMetricsMixin:
     def log_decode_stats_every_iteration(
         self: Scheduler, batch: ScheduleBatch, num_accepted_tokens: int
     ):
-        self.metrics_collector.increment_realtime_tokens(
-            # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
-            decode_tokens=batch.batch_size() + num_accepted_tokens,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
+        if self.enable_metrics:
+            self.metrics_collector.increment_realtime_tokens(
+                # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
+                decode_tokens=batch.batch_size() + num_accepted_tokens,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
 
     def log_batch_result_stats(
         self: Scheduler,
