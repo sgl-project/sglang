@@ -8,29 +8,29 @@ from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 class TestLogUtils(unittest.TestCase):
     def test_create_log_targets_stdout(self):
-        loggers = create_log_targets(["stdout"], "test_log_utils")
+        loggers = create_log_targets(targets=["stdout"], name_prefix="test_log_utils")
         self.assertEqual(len(loggers), 1)
         self.assertEqual(loggers[0].level, 20)  # INFO level
 
     def test_create_log_targets_default_stdout(self):
-        loggers = create_log_targets(None, "test_log_utils_default")
+        loggers = create_log_targets(targets=None, name_prefix="test_log_utils_default")
         self.assertEqual(len(loggers), 1)
         self.assertEqual(loggers[0].level, 20)
 
     def test_create_log_targets_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            loggers = create_log_targets([temp_dir], "test_log_utils_file")
+            loggers = create_log_targets(targets=[temp_dir], name_prefix="test_log_utils_file")
             self.assertEqual(len(loggers), 1)
             self.assertEqual(loggers[0].level, 20)
 
     def test_create_log_targets_multiple(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            loggers = create_log_targets(["stdout", temp_dir], "test_log_utils_multi")
+            loggers = create_log_targets(targets=["stdout", temp_dir], name_prefix="test_log_utils_multi")
             self.assertEqual(len(loggers), 2)
 
     def test_log_json_single_logger(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            loggers = create_log_targets([temp_dir], "test_log_json_single")
+            loggers = create_log_targets(targets=[temp_dir], name_prefix="test_log_json_single")
             log_json(loggers[0], "test.event", {"key": "value", "number": 42})
             loggers[0].handlers[0].flush()
             log_files = list(Path(temp_dir).glob("*.log"))
@@ -48,7 +48,7 @@ class TestLogUtils(unittest.TestCase):
             tempfile.TemporaryDirectory() as temp_dir2,
         ):
             loggers = create_log_targets(
-                [temp_dir1, temp_dir2], "test_log_json_multi"
+                targets=[temp_dir1, temp_dir2], name_prefix="test_log_json_multi"
             )
             log_json(loggers, "test.event", {"key": "value"})
             for lg in loggers:
