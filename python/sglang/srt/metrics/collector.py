@@ -772,7 +772,7 @@ class SchedulerMetricsCollector:
                     x
                     for x in (
                         server_args.prefill_delayer_forward_passes_buckets
-                        or [0, 5, 20, 50, 100, 200]
+                        or [5, 20, 50, 100, 200]
                     )
                     if x < max_delay
                 )
@@ -787,7 +787,7 @@ class SchedulerMetricsCollector:
             buckets=sorted(
                 set(
                     server_args.prefill_delayer_wait_seconds_buckets
-                    or [0, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+                    or [1, 2, 5, 10, 20, 50, 100, 200, 500]
                 )
                 # Need bucket "<=0" for zero-delay cases
                 | {0}
