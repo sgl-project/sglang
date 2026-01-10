@@ -180,6 +180,7 @@ class TestEnableMetrics(CustomTestCase):
             ("sglang:realtime_tokens_total", {"mode": "decode"}),
             ("sglang:gpu_execution_seconds_total", {"category": "forward_extend"}),
             ("sglang:gpu_execution_seconds_total", {"category": "forward_decode"}),
+            ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
 
