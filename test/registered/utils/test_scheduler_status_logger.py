@@ -49,7 +49,7 @@ class TestSchedulerStatusLogger(CustomTestCase):
 
         time.sleep(2)
 
-        events = _find_log_events(self.temp_dir, "scheduler.status")
+        events = list(_find_log_events(self.temp_dir, "scheduler.status"))
         self.assertGreater(len(events), 0, "scheduler.status event not found")
         data = events[0]
         for field in ["timestamp", "running_rids", "queued_rids"]:
@@ -58,15 +58,13 @@ class TestSchedulerStatusLogger(CustomTestCase):
         self.assertIsInstance(data["queued_rids"], list)
 
 
-def _find_log_events(log_dir: str, event_name: str) -> list:
-    events = []
+def _find_log_events(log_dir: str, event_name: str):
     for f in Path(log_dir).glob("*.log"):
         for line in f.read_text().splitlines():
             if line.startswith("{"):
                 data = json.loads(line)
                 if data.get("event") == event_name:
-                    events.append(data)
-    return events
+                    yield data
 
 
 if __name__ == "__main__":
