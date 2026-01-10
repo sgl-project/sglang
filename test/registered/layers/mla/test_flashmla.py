@@ -1,6 +1,6 @@
 """
 Usage:
-python3 test/registered/mla/test_flashmla.py
+python3 test/registered/layers/mla/test_flashmla.py
 """
 
 import unittest
