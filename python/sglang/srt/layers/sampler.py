@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -11,6 +11,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
@@ -31,16 +32,21 @@ logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+_CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
+_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.use_nan_detection = get_global_server_args().enable_nan_detection
-        self.tp_sync_group = get_tp_group().device_group
-
-        if is_dp_attention_enabled():
-            self.tp_sync_group = get_attention_tp_group().device_group
+        tp_group = (
+            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
+        )
+        self.tp_rank = tp_group.rank_in_group
+        self.tp_size = tp_group.world_size
+        self.tp_root_rank = tp_group.ranks[0]
+        self.tp_sync_group = tp_group.device_group
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -202,13 +208,21 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             ]
 
-        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+        if sampling_info.grammars:
+            if self.tp_size > 1:
+                # Grammar-aware sampling only runs on TP rank 0
+                # We broadcast its choice to keep ranks in sync.
+                dist.broadcast(
+                    batch_next_token_ids,
+                    src=self.tp_root_rank,
+                    group=self.tp_sync_group,
+                )
+        elif SYNC_TOKEN_IDS_ACROSS_TP:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
             # the last all-reduce, the last lm_head matmul, and all sampling kernels.
             # These kernels are deterministic in most cases, but there are some rare instances where they are not deterministic.
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
-            # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
 
             torch.distributed.all_reduce(
                 batch_next_token_ids,
@@ -266,6 +280,42 @@ class Sampler(nn.Module):
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
+
+
+def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> None:
+    """Register a custom sampler factory for a backend string."""
+
+    if not backend:
+        raise ValueError("backend must be a non-empty string")
+
+    from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
+
+    if backend in _CUSTOM_SAMPLER_FACTORIES:
+        logger.warning("Overriding existing sampler factory for backend '%s'", backend)
+    SAMPLING_BACKEND_CHOICES.add(backend)
+    _CUSTOM_SAMPLER_FACTORIES[backend] = factory
+
+
+def create_sampler(backend: Optional[str] = None) -> "Sampler":
+    """Create a sampler honoring custom backend registrations."""
+
+    server_args = get_global_server_args()
+    backend = backend or (server_args.sampling_backend if server_args else None)
+
+    if backend in _CUSTOM_SAMPLER_FACTORIES:
+        sampler = _CUSTOM_SAMPLER_FACTORIES[backend]()
+        if not isinstance(sampler, Sampler):
+            raise TypeError(
+                f"Custom sampler factory for backend '{backend}' must return a Sampler"
+            )
+        return sampler
+
+    if backend is None or backend in _BUILT_IN_SAMPLING_BACKENDS:
+        return Sampler()
+
+    raise ValueError(
+        f"Unknown sampling backend '{backend}'. Register it via register_sampler_backend()."
+    )
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
@@ -414,27 +464,6 @@ def top_p_normalize_probs_torch(
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
 
 
-def get_top_logprobs(
-    logprobs: torch.Tensor,
-    top_logprobs_nums: List[int],
-):
-    max_k = max(top_logprobs_nums)
-    ret = logprobs.topk(max_k, dim=1)
-    values = ret.values.tolist()
-    indices = ret.indices.tolist()
-
-    output_top_logprobs_val = []
-    output_top_logprobs_idx = []
-    for i, k in enumerate(top_logprobs_nums):
-        output_top_logprobs_val.append(values[i][:k])
-        output_top_logprobs_idx.append(indices[i][:k])
-
-    return (
-        output_top_logprobs_val,
-        output_top_logprobs_idx,
-    )
-
-
 def get_token_ids_logprobs_batch_optimized(
     logprobs: torch.Tensor,
     token_ids_logprobs: List[List[int]],
@@ -521,23 +550,6 @@ def get_token_ids_logprobs_batch_optimized(
             output_token_ids_logprobs_idx.append([])
 
     return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
-
-
-def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List[int]]):
-    output_token_ids_logprobs_val = []
-    output_token_ids_logprobs_idx = []
-    for i, token_ids in enumerate(token_ids_logprobs):
-        if token_ids is not None:
-            output_token_ids_logprobs_val.append(logprobs[i, token_ids].tolist())
-            output_token_ids_logprobs_idx.append(token_ids)
-        else:
-            output_token_ids_logprobs_val.append([])
-            output_token_ids_logprobs_idx.append([])
-
-    return (
-        output_token_ids_logprobs_val,
-        output_token_ids_logprobs_idx,
-    )
 
 
 def apply_custom_logit_processor(

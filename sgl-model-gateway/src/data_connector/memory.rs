@@ -288,7 +288,8 @@ impl MemoryResponseStorage {
     }
 
     /// Get statistics about the store
-    pub fn stats(&self) -> MemoryStoreStats {
+    #[allow(dead_code)]
+    pub(super) fn stats(&self) -> MemoryStoreStats {
         let store = self.store.read();
         MemoryStoreStats {
             response_count: store.responses.len(),
@@ -332,9 +333,11 @@ impl ResponseStorage for MemoryResponseStorage {
                 .push(response_id.clone());
         }
 
-        // Store the response
         store.responses.insert(response_id.clone(), response);
-        tracing::info!("memory_store_size" = store.responses.len());
+        tracing::debug!(
+            memory_store_size = store.responses.len(),
+            "Response stored in memory"
+        );
 
         Ok(response_id)
     }
@@ -345,7 +348,7 @@ impl ResponseStorage for MemoryResponseStorage {
     ) -> ResponseResult<Option<StoredResponse>> {
         let store = self.store.read();
         let result = store.responses.get(response_id).cloned();
-        tracing::info!("memory_get_response" = %response_id.0, found = result.is_some());
+        tracing::debug!(response_id = %response_id.0, found = result.is_some(), "Memory response lookup");
         Ok(result)
     }
 
@@ -457,7 +460,8 @@ impl ResponseStorage for MemoryResponseStorage {
 
 /// Statistics for the memory store
 #[derive(Debug, Clone)]
-pub struct MemoryStoreStats {
+#[allow(dead_code)]
+pub(super) struct MemoryStoreStats {
     pub response_count: usize,
     pub identifier_count: usize,
 }
