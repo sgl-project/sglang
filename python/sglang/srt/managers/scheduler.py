@@ -558,14 +558,14 @@ class Scheduler(
         # the base TP group. Entry rank is the local rank 0 in that group.
         # Use the CPU (gloo) group to broadcast VLM Python objects and avoid CUDA
         # stream/device coupling (#11910).
-        if self.server_args.enable_dp_attention:
-            self.dp_tp_cpu_group = self.attn_tp_cpu_group
-            self.dp_tp_entry_rank = self.attn_tp_group.first_rank
-            self.is_dp_tp_entry_rank = self.attn_tp_rank == 0
-        else:
-            self.dp_tp_cpu_group = self.tp_cpu_group
-            self.dp_tp_entry_rank = self.tp_group.first_rank
-            self.is_dp_tp_entry_rank = self.tp_group.rank_in_group == 0
+        self.dp_tp_group = (
+            self.attn_tp_group
+            if self.server_args.enable_dp_attention
+            else self.tp_group
+        )
+        self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
+        self.dp_tp_entry_rank = self.dp_tp_group.first_rank
+        self.is_dp_tp_entry_rank = self.dp_tp_group.rank_in_group == 0
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
