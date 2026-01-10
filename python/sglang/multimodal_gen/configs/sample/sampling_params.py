@@ -334,21 +334,26 @@ class SamplingParams:
         except (AttributeError, ValueError) as e:
             # Handle safetensors files or other cases where model_index.json is not available
             # Use appropriate SamplingParams based on pipeline_class_name from registry
-            if os.path.isfile(model_path) and model_path.endswith('.safetensors'):
+            if os.path.isfile(model_path) and model_path.endswith(".safetensors"):
                 # Determine which sampling params to use based on pipeline_class_name
-                pipeline_class_name = getattr(server_args, 'pipeline_class_name', None)
-                
+                pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
+
                 # Try to get SamplingParams from registry
                 from sglang.multimodal_gen.registry import get_pipeline_config_classes
-                config_classes = get_pipeline_config_classes(pipeline_class_name) if pipeline_class_name else None
-                
+
+                config_classes = (
+                    get_pipeline_config_classes(pipeline_class_name)
+                    if pipeline_class_name
+                    else None
+                )
+
                 if config_classes is not None:
                     _, sampling_params_cls = config_classes
                     try:
                         sampling_params = sampling_params_cls()
                         logger.info(
                             f"Using {sampling_params_cls.__name__} for {pipeline_class_name} safetensors file (no model_index.json): %s",
-                            model_path
+                            model_path,
                         )
                     except Exception as import_error:
                         logger.warning(
@@ -357,7 +362,9 @@ class SamplingParams:
                         )
                         sampling_params = SamplingParams()
                 else:
-                    raise ValueError(f"Could not get pipeline config classes for {pipeline_class_name}")
+                    raise ValueError(
+                        f"Could not get pipeline config classes for {pipeline_class_name}"
+                    )
             else:
                 # Re-raise if it's not a safetensors file issue
                 raise

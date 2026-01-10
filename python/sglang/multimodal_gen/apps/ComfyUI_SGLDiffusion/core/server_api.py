@@ -537,4 +537,3 @@ if __name__ == "__main__":
                 prompt="A calico cat playing a piano on stage", size="1024x1024"
             )
         )
-

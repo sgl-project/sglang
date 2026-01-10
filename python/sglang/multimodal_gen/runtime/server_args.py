@@ -251,7 +251,9 @@ class ServerArgs:
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # Pipeline override
-    pipeline_class_name: str | None = None  # Override pipeline class from model_index.json
+    pipeline_class_name: str | None = (
+        None  # Override pipeline class from model_index.json
+    )
 
     # LoRA parameters
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.

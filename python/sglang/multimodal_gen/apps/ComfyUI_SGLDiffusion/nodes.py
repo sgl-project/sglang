@@ -8,7 +8,7 @@ import os
 import folder_paths
 import torch
 
-from .core import SGLDiffusionServerAPI, SGLDiffusionGenerator
+from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
 from .utils import (
     convert_b64_to_tensor_image,
     convert_video_to_comfy_video,
@@ -89,7 +89,7 @@ class SGLDOptions:
         ulysses_degree = None if ulysses_degree == -1 else ulysses_degree
         ring_degree = None if ring_degree == -1 else ring_degree
         attention_backend = None if attention_backend == "" else attention_backend
-        
+
         options = {
             "enable_torch_compile": enable_torch_compile,
             "num_gpus": num_gpus,
@@ -108,15 +108,23 @@ class SGLDOptions:
         options = {k: v for k, v in options.items() if v is not None}
         return (options,)
 
+
 class SGLDUNETLoader:
     def __init__(self):
         self.generator = SGLDiffusionGenerator()
+
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "unet_name": (folder_paths.get_filename_list("diffusion_models"), ),
-                              "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e5m2"],),
-                            },
-                "optional": {"sgld_options": ("SGLD_OPTIONS",),}}
+        return {
+            "required": {
+                "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
+                "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e5m2"],),
+            },
+            "optional": {
+                "sgld_options": ("SGLD_OPTIONS",),
+            },
+        }
+
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_unet"
 
@@ -128,11 +136,14 @@ class SGLDUNETLoader:
             model_options["dtype"] = torch.float8_e4m3fn
         elif weight_dtype == "fp8_e5m2":
             model_options["dtype"] = torch.float8_e5m2
-        
+
         unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
 
-        model = self.generator.load_model(unet_path, model_options=model_options, sgld_options=sgld_options)
+        model = self.generator.load_model(
+            unet_path, model_options=model_options, sgld_options=sgld_options
+        )
         return (model,)
+
 
 class SGLDiffusionServerModel:
     """Node to load and manage SGLang Diffusion server connection."""

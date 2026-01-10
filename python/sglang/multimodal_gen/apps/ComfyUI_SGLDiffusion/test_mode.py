@@ -1,7 +1,9 @@
 import torch
+
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+
 
 class SGLDiffusionZImageNode:
     """Node to generate images using SGLang Diffusion."""
@@ -13,6 +15,7 @@ class SGLDiffusionZImageNode:
                 "model": ("MODEL",),
             },
         }
+
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "generate_image"
     CATEGORY = "SGLDiffusion"
@@ -31,9 +34,9 @@ class SGLDiffusionZImageNode:
         height = H * 8
         width = W * 8
         sampling_params = SamplingParams.from_user_sampling_params_args(
-        self.generator.server_args.model_path,
+            self.generator.server_args.model_path,
             server_args=self.generator.server_args,
-            prompt=" ", 
+            prompt=" ",
             guidance_scale=1.0,
             height=height,
             width=width,
@@ -41,22 +44,25 @@ class SGLDiffusionZImageNode:
             num_inference_steps=1,  # Single step for ComfyUI
             comfyui_mode=True,
         )
-        
+
         # Prepare request (converts SamplingParams to Req)
         req = prepare_request(
             server_args=self.generator.server_args,
             sampling_params=sampling_params,
         )
         latents = x.unsqueeze(2)
-        context = context.squeeze(0) 
+        context = context.squeeze(0)
         # Set ComfyUI-specific inputs directly on the Req object
         req.latents = latents  # ComfyUI's x parameter
-        req.timesteps = timesteps * 1000.0    # ComfyUI's timesteps parameter
-        req.prompt_embeds = [context]  # ComfyUI's context parameter (must be List[Tensor])
+        req.timesteps = timesteps * 1000.0  # ComfyUI's timesteps parameter
+        req.prompt_embeds = [
+            context
+        ]  # ComfyUI's context parameter (must be List[Tensor])
         req.raw_latent_shape = torch.tensor(latents.shape, dtype=torch.long)
         req.do_classifier_free_guidance = False
-        req.generator = [torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)]
-
+        req.generator = [
+            torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)
+        ]
 
         output_batch = self.generator._send_to_scheduler_and_wait_for_response([req])
         noise_pred = output_batch.noise_pred
@@ -71,6 +77,7 @@ class SGLDiffusionZImageNode:
 
         return (model,)
 
+
 class SGLDiffusionFluxNode:
     """Node to generate images using SGLang Flux."""
 
@@ -81,6 +88,7 @@ class SGLDiffusionFluxNode:
                 "model": ("MODEL",),
             }
         }
+
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "generate_image"
     CATEGORY = "SGLDiffusion"
@@ -93,7 +101,7 @@ class SGLDiffusionFluxNode:
             pipeline_class_name="ComfyUIFluxPipeline",
             num_gpus=2,
         )
-    
+
     def generate_image(self, model):
         """Generate image using SGLang Diffusion."""
         ori_forward = model.model.diffusion_model.forward
@@ -101,13 +109,14 @@ class SGLDiffusionFluxNode:
         model.model.diffusion_model.forward = self.forward
 
         return (model,)
+
     def _unpack_latents(self, latents, height, width, channels):
         batch_size = latents.shape[0]
         # channels=16, height=160, width=90
         latents = latents.view(batch_size, height // 2, width // 2, channels, 2, 2)
         latents = latents.permute(0, 3, 1, 4, 2, 5)
         latents = latents.reshape(batch_size, channels, height, width)
-        
+
         return latents
 
     def _pack_latents(self, latents):
@@ -147,7 +156,7 @@ class SGLDiffusionFluxNode:
             return_frames=False,
             comfyui_mode=True,
         )
-        
+
         # Prepare request (converts SamplingParams to Req)
         req = prepare_request(
             server_args=self.generator.server_args,
@@ -157,23 +166,26 @@ class SGLDiffusionFluxNode:
         req.timesteps = timesteps  # ComfyUI's timesteps parameter
         req.prompt_embeds = [pooled_projections, encoder_hidden_states]  # [CLIP, T5]
         req.raw_latent_shape = torch.tensor(hidden_states.shape, dtype=torch.long)
-        
+
         # Set pooled_projections (required by Flux)
         req.pooled_embeds = [pooled_projections]  # List format as per Req definition
         req.do_classifier_free_guidance = False
-        req.generator = [torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)]
-        
+        req.generator = [
+            torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)
+        ]
+
         # Send request to scheduler
         output_batch = self.generator._send_to_scheduler_and_wait_for_response([req])
         noise_pred = output_batch.noise_pred
         return self._unpack_latents(noise_pred, H, W, C)
 
+
 NODE_CLASS_MAPPINGS = {
     "SGLDiffusionZImageNode": SGLDiffusionZImageNode,
-    "SGLDiffusionFluxNode": SGLDiffusionFluxNode
+    "SGLDiffusionFluxNode": SGLDiffusionFluxNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDiffusionZImageNode": "SGLDiffusionZImageNode",
-    "SGLDiffusionFluxNode": "SGLDiffusionFluxNode"
+    "SGLDiffusionFluxNode": "SGLDiffusionFluxNode",
 }

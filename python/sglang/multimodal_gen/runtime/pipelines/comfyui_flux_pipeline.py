@@ -8,24 +8,22 @@ from typing import Any, Generator
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
-from sglang.multimodal_gen.configs.pipeline_configs.flux import FluxPipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
-from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_comfyui_passthrough import (
+    ComfyUIPassThroughScheduler,
+)
+from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    DenoisingStage,
     ComfyUILatentPreparationStage,
-    TimestepPreparationStage,
-)
-from sglang.multimodal_gen.runtime.models.schedulers.scheduling_comfyui_passthrough import (
-    ComfyUIPassThroughScheduler,
+    DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -33,12 +31,12 @@ logger = init_logger(__name__)
 class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
     """
     Simplified pipeline for ComfyUI integration with only denoising stage.
-    
+
     This pipeline requires pre-processed inputs:
     - prompt_embeds: Pre-encoded text embeddings (list of tensors)
     - negative_prompt_embeds: Pre-encoded negative prompt embeddings (if using CFG)
     - latents: Optional initial noise latents (will be generated if not provided)
-    
+
     Usage:
         generator = DiffGenerator.from_pretrained(
             model_path="path/to/model",
@@ -46,11 +44,13 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
             device="cuda",
         )
     """
+
     pipeline_name = "ComfyUIFluxPipeline"
-    
+
     # Configuration classes for safetensors files without model_index.json
     from sglang.multimodal_gen.configs.pipeline_configs.flux import FluxPipelineConfig
     from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
+
     pipeline_config_cls = FluxPipelineConfig
     sampling_params_cls = FluxSamplingParams
 
@@ -67,10 +67,12 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
         self.modules["scheduler"] = ComfyUIPassThroughScheduler(
             num_train_timesteps=1000
         )
-        
-        if hasattr(server_args.pipeline_config, 'vae_config'):
+
+        if hasattr(server_args.pipeline_config, "vae_config"):
             vae_config = server_args.pipeline_config.vae_config
-            if hasattr(vae_config, 'post_init') and not hasattr(vae_config, '_post_init_called'):
+            if hasattr(vae_config, "post_init") and not hasattr(
+                vae_config, "_post_init_called"
+            ):
                 vae_config.post_init()
                 logger.info(
                     "Called vae_config.post_init() to set spatial_compression_ratio. "
@@ -84,20 +86,20 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
     ) -> dict[str, Any]:
         """
         Load modules for ComfyUIFluxPipeline.
-        
+
         If model_path is a safetensors file, load transformer directly from it
         without requiring model_index.json. Otherwise, fall back to default loading.
         """
-        if os.path.isfile(self.model_path) and self.model_path.endswith('.safetensors'):
+        if os.path.isfile(self.model_path) and self.model_path.endswith(".safetensors"):
             logger.info(
                 "Detected safetensors file, loading transformer directly from: %s",
-                self.model_path
+                self.model_path,
             )
             return self._load_transformer_from_safetensors(server_args, loaded_modules)
         else:
             logger.info(
                 "Model path is a directory, using default loading method: %s",
-                self.model_path
+                self.model_path,
             )
             return super().load_modules(server_args, loaded_modules)
 
@@ -116,24 +118,24 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
         """
         Load and convert weights from safetensors file, then load them into the model.
         """
-        from sglang.multimodal_gen.runtime.loader.weight_utils import (
-            safetensors_weights_iterator,
-        )
         from sglang.multimodal_gen.runtime.loader.utils import (
             get_param_names_mapping,
             set_default_torch_dtype,
         )
-        
+        from sglang.multimodal_gen.runtime.loader.weight_utils import (
+            safetensors_weights_iterator,
+        )
+
         logger.info(
             "Converting ComfyUI Flux weights to SGLang format and loading model..."
         )
-        
+
         # Create model on target device
         device = get_local_torch_device()
         with set_default_torch_dtype(default_dtype):
             model = model_cls(**{"config": dit_config, "hf_config": hf_config})
             model = model.to(device)
-        
+
         # Verify model has guidance_embedder if config says it should
         has_guidance_embedder = hasattr(model.time_text_embed, "guidance_embedder")
         if has_guidance_embeds and not has_guidance_embedder:
@@ -146,13 +148,13 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
                 "Config has guidance_embeds=False but model has guidance_embedder. "
                 "This may indicate a configuration mismatch."
             )
-        
+
         # Note: guidance_in mappings are already included in comfyui_flux_mappings above.
         # If model doesn't support guidance embeddings, the weights will be filtered out
         # in _convert_comfyui_weights() based on has_guidance_embeds flag.
-        
+
         param_names_mapping_fn = get_param_names_mapping(updated_mapping)
-        
+
         weight_iterator = safetensors_weights_iterator(safetensors_list)
         converted_weights = self._convert_comfyui_weights(
             weight_iterator=weight_iterator,
@@ -160,26 +162,29 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
             mlp_hidden_dim=mlp_hidden_dim,
             has_guidance_embeds=has_guidance_embeds,
         )
-        
+
         model_state_dict = model.state_dict()
         missing_keys = set(model_state_dict.keys())
         unexpected_keys = []
         loaded_count = 0
         reverse_param_names_mapping = {}
-        
+
         # Handle merged parameters (collect all parts before merging)
         from collections import defaultdict
+
         to_merge_params = defaultdict(dict)
-        
+
         # Process weights incrementally: load immediately after conversion
         for source_name, tensor in converted_weights:
-            target_name, merge_index, num_params_to_merge = param_names_mapping_fn(source_name)
+            target_name, merge_index, num_params_to_merge = param_names_mapping_fn(
+                source_name
+            )
             reverse_param_names_mapping[target_name] = (
                 source_name,
                 merge_index,
                 num_params_to_merge,
             )
-            
+
             if merge_index is not None:
                 # Collect parts for merging
                 to_merge_params[target_name][merge_index] = tensor
@@ -193,7 +198,9 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
                     # Load immediately after merging
                     if target_name in model_state_dict:
                         param = model_state_dict[target_name]
-                        loaded_tensor = merged_tensor.to(device=param.device, dtype=param.dtype)
+                        loaded_tensor = merged_tensor.to(
+                            device=param.device, dtype=param.dtype
+                        )
                         param.data.copy_(loaded_tensor)
                         missing_keys.discard(target_name)
                         loaded_count += 1
@@ -218,14 +225,17 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
                         unexpected_keys.append(target_name)
                         del tensor
                         continue
-                    
+
                     # Debug logging for norm_out.linear to verify mapping
-                    if "norm_out.linear" in target_name or "final_layer.adaLN_modulation" in source_name:
+                    if (
+                        "norm_out.linear" in target_name
+                        or "final_layer.adaLN_modulation" in source_name
+                    ):
                         logger.info(
                             f"Loading norm_out.linear: {source_name} -> {target_name}, "
                             f"shape: {tensor.shape}"
                         )
-                    
+
                     loaded_tensor = tensor.to(device=param.device, dtype=param.dtype)
                     param.data.copy_(loaded_tensor)
                     missing_keys.discard(target_name)
@@ -239,22 +249,24 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
                             f"Source: {source_name}"
                         )
                     unexpected_keys.append(target_name)
-        
+
         optional_missing_keys = []
         required_missing_keys = []
         for key in missing_keys:
-            if key.endswith('.bias'):
+            if key.endswith(".bias"):
                 # Check if corresponding weight exists (if weight exists but bias doesn't, it's optional)
-                weight_key = key.replace('.bias', '.weight')
+                weight_key = key.replace(".bias", ".weight")
                 if weight_key not in missing_keys:
                     optional_missing_keys.append(key)
                 else:
                     required_missing_keys.append(key)
             else:
                 required_missing_keys.append(key)
-        
+
         if required_missing_keys:
-            logger.warning(f"Required missing keys (first 10): {required_missing_keys[:10]}...")
+            logger.warning(
+                f"Required missing keys (first 10): {required_missing_keys[:10]}..."
+            )
         if optional_missing_keys:
             logger.info(
                 f"Optional missing keys (bias parameters, {len(optional_missing_keys)} total): "
@@ -262,9 +274,9 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
             )
         if unexpected_keys:
             logger.warning(f"Unexpected keys (first 10): {unexpected_keys[:10]}...")
-        
+
         logger.info(f"Successfully loaded {loaded_count} weight tensors")
-        
+
         return model, reverse_param_names_mapping
 
     def _convert_comfyui_weights(
@@ -282,25 +294,31 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
         """
         for name, tensor in weight_iterator:
             if not has_guidance_embeds and name.startswith("guidance_in."):
-                logger.debug(f"Skipping {name} (model doesn't support guidance embeddings)")
+                logger.debug(
+                    f"Skipping {name} (model doesn't support guidance embeddings)"
+                )
                 continue
-            
+
             match = re.match(r"single_blocks\.(\d+)\.linear1\.(weight|bias)$", name)
             if match:
                 block_idx, param_type = match.groups()
                 expected_size = qkv_size + mlp_hidden_dim
-                
+
                 if tensor.shape[0] < expected_size:
                     logger.warning(
                         f"linear1.{param_type} shape {tensor.shape} doesn't match "
                         f"expected size {expected_size}, skipping"
                     )
                     continue
-                
+
                 # Split tensor
-                qkv_tensor = tensor[:qkv_size] if param_type == "bias" else tensor[:qkv_size, :]
-                mlp_tensor = tensor[qkv_size:] if param_type == "bias" else tensor[qkv_size:, :]
-                
+                qkv_tensor = (
+                    tensor[:qkv_size] if param_type == "bias" else tensor[:qkv_size, :]
+                )
+                mlp_tensor = (
+                    tensor[qkv_size:] if param_type == "bias" else tensor[qkv_size:, :]
+                )
+
                 # Yield split weights
                 yield f"single_transformer_blocks.{block_idx}.attn.to_qkv.{param_type}", qkv_tensor
                 yield f"single_transformer_blocks.{block_idx}.proj_mlp.{param_type}", mlp_tensor
@@ -312,7 +330,7 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
                 # Split into two halves and swap them
                 half_size = tensor.shape[0] // 2
                 shift_weights = tensor[:half_size, :]
-                scale_weights = tensor[half_size:, :]  
+                scale_weights = tensor[half_size:, :]
                 # Swap: put scale first, then shift
                 swapped_tensor = torch.cat([scale_weights, shift_weights], dim=0)
                 logger.info(
@@ -351,12 +369,10 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
             }
             return components
 
-        if hasattr(server_args.pipeline_config, 'dit_config'):
+        if hasattr(server_args.pipeline_config, "dit_config"):
             dit_config = server_args.pipeline_config.dit_config
             if not isinstance(dit_config, FluxConfig):
-                logger.warning(
-                    "dit_config is not FluxConfig, creating new FluxConfig"
-                )
+                logger.warning("dit_config is not FluxConfig, creating new FluxConfig")
                 dit_config = FluxConfig()
                 server_args.pipeline_config.dit_config = dit_config
         else:
@@ -366,7 +382,7 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
 
         if dit_config.arch_config.param_names_mapping is None:
             dit_config.arch_config.param_names_mapping = {}
-        
+
         # ComfyUI Flux uses different parameter names than SGLang Flux
         # Key differences:
         # - ComfyUI: single_blocks.{i}.linear1 (fused QKV + MLP input)
@@ -375,7 +391,7 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
         # - SGLang: single_transformer_blocks.{i}.proj_out
         # - ComfyUI: double_blocks.{i}.img_attn.qkv / txt_attn.qkv
         # - SGLang: transformer_blocks.{i}.attn.to_qkv / attn.to_added_qkv
-        
+
         # Note: For fused layers like linear1, we need custom weight splitting logic
         # which will be handled in the weight conversion function below
         comfyui_flux_mappings = {
@@ -519,9 +535,12 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
                 None,
             ),
         }
-        
+
         # Merge ComfyUI mappings with existing mappings (ComfyUI mappings take precedence)
-        updated_mapping = {**dit_config.arch_config.param_names_mapping, **comfyui_flux_mappings}
+        updated_mapping = {
+            **dit_config.arch_config.param_names_mapping,
+            **comfyui_flux_mappings,
+        }
         dit_config.arch_config.param_names_mapping = updated_mapping
         logger.info(
             "Added ComfyUI weight name mappings for Flux model. "
@@ -531,7 +550,7 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
         cls_name = "FluxTransformer2DModel"
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
         logger.info("Resolved transformer class: %s", cls_name)
-        
+
         original_mapping = None
         if comfyui_flux_mappings:
             original_mapping = model_cls.param_names_mapping
@@ -547,31 +566,36 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
         server_args.model_paths["transformer"] = os.path.dirname(self.model_path) or "."
         hf_config = {}
 
-        hidden_size = dit_config.arch_config.num_attention_heads * dit_config.arch_config.attention_head_dim
+        hidden_size = (
+            dit_config.arch_config.num_attention_heads
+            * dit_config.arch_config.attention_head_dim
+        )
         mlp_ratio = getattr(dit_config.arch_config, "mlp_ratio", 4.0)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         qkv_size = 3 * hidden_size
         has_guidance_embeds = True
 
         # Load and convert weights from safetensors file
-        model, reverse_param_names_mapping = self._load_and_convert_weights_from_safetensors(
-            model_cls=model_cls,
-            dit_config=dit_config,
-            hf_config=hf_config,
-            safetensors_list=safetensors_list,
-            updated_mapping=updated_mapping,
-            qkv_size=qkv_size,
-            mlp_hidden_dim=mlp_hidden_dim,
-            has_guidance_embeds=has_guidance_embeds,
-            default_dtype=default_dtype,
+        model, reverse_param_names_mapping = (
+            self._load_and_convert_weights_from_safetensors(
+                model_cls=model_cls,
+                dit_config=dit_config,
+                hf_config=hf_config,
+                safetensors_list=safetensors_list,
+                updated_mapping=updated_mapping,
+                qkv_size=qkv_size,
+                mlp_hidden_dim=mlp_hidden_dim,
+                has_guidance_embeds=has_guidance_embeds,
+                default_dtype=default_dtype,
+            )
         )
-        
+
         model = model.eval()
         for param in model.parameters():
             param.requires_grad = False
-        
+
         model.reverse_param_names_mapping = reverse_param_names_mapping
-        
+
         if original_mapping is not None:
             model_cls.param_names_mapping = original_mapping
 
@@ -587,8 +611,10 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
         return components
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        logger.info("ComfyUIFluxPipeline.create_pipeline_stages() called - creating latent_preparation_stage and denoising_stage")
-        
+        logger.info(
+            "ComfyUIFluxPipeline.create_pipeline_stages() called - creating latent_preparation_stage and denoising_stage"
+        )
+
         # Add ComfyUILatentPreparationStage to handle latents properly for SP
         # This stage includes device mismatch fix for ComfyUI pipelines in multi-GPU scenarios
         self.add_stage(
@@ -598,7 +624,7 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
                 transformer=self.get_module("transformer"),
             ),
         )
-        
+
         # Add DenoisingStage for the actual denoising process
         self.add_stage(
             stage_name="denoising_stage",
@@ -607,9 +633,9 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
                 scheduler=self.get_module("scheduler"),
             ),
         )
-        logger.info(f"ComfyUIFluxPipeline stages created: {list(self._stage_name_mapping.keys())}")
+        logger.info(
+            f"ComfyUIFluxPipeline stages created: {list(self._stage_name_mapping.keys())}"
+        )
 
 
 EntryClass = ComfyUIFluxPipeline
-
-

@@ -514,9 +514,13 @@ class PipelineConfig:
             raise ValueError("model_path is required in kwargs")
 
         # Check if model_path is a safetensors file and pipeline_class_name is specified
-        pipeline_class_name = kwargs.get(prefix_with_dot + "pipeline_class_name") or kwargs.get("pipeline_class_name")
-        is_safetensors_file = os.path.isfile(model_path) and model_path.endswith('.safetensors')
-        
+        pipeline_class_name = kwargs.get(
+            prefix_with_dot + "pipeline_class_name"
+        ) or kwargs.get("pipeline_class_name")
+        is_safetensors_file = os.path.isfile(model_path) and model_path.endswith(
+            ".safetensors"
+        )
+
         # 1. Get the pipeline config class from the registry
         from sglang.multimodal_gen.configs.pipeline_configs.flux import (
             Flux2PipelineConfig,
@@ -536,7 +540,11 @@ class PipelineConfig:
             else:
                 model_info = get_model_info(model_path)
                 if model_info is None:
-                    from sglang.multimodal_gen.registry import _discover_and_register_pipelines, _PIPELINE_CONFIG_REGISTRY
+                    from sglang.multimodal_gen.registry import (
+                        _PIPELINE_CONFIG_REGISTRY,
+                        _discover_and_register_pipelines,
+                    )
+
                     _discover_and_register_pipelines()
                     available_pipelines = list(_PIPELINE_CONFIG_REGISTRY.keys())
                     raise ValueError(

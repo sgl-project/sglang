@@ -700,7 +700,7 @@ class DenoisingStage(PipelineStage):
         latents, trajectory_tensor = self._postprocess_sp_latents(
             batch, latents, trajectory_tensor
         )
-        
+
         # Gather noise_pred if using sequence parallelism
         # noise_pred has the same shape as latents (sharded along sequence dimension)
         if (

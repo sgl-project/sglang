@@ -4,17 +4,10 @@ Base executor class for SGLang Diffusion ComfyUI integration.
 
 import torch
 
-try:
-    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
-    from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-    from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-except ImportError:
-    print("Error: sglang.multimodal_gen is not installed. Please install it using 'pip install sglang[diffusion]'")
-
 
 class SGLDiffusionExecutor(torch.nn.Module):
     """Base executor class for SGLang Diffusion models in ComfyUI."""
-    
+
     def __init__(self, generator, model_path, model, config):
         super(SGLDiffusionExecutor, self).__init__()
         self.generator = generator
@@ -30,7 +23,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         latents = latents.view(batch_size, height // 2, width // 2, channels, 2, 2)
         latents = latents.permute(0, 3, 1, 4, 2, 5)
         latents = latents.reshape(batch_size, channels, height, width)
-        
+
         return latents
 
     def _pack_latents(self, latents):
@@ -44,4 +37,3 @@ class SGLDiffusionExecutor(torch.nn.Module):
             batch_size, (height // 2) * (width // 2), num_channels_latents * 4
         )
         return latents
-

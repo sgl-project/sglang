@@ -112,9 +112,11 @@ def _discover_and_register_pipelines():
                                 f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
                             )
                         _PIPELINE_REGISTRY[cls.pipeline_name] = cls
-                        
+
                         # Auto-register config classes if Pipeline class has them defined
-                        if hasattr(cls, "pipeline_config_cls") and hasattr(cls, "sampling_params_cls"):
+                        if hasattr(cls, "pipeline_config_cls") and hasattr(
+                            cls, "sampling_params_cls"
+                        ):
                             _PIPELINE_CONFIG_REGISTRY[cls.pipeline_name] = (
                                 cls.pipeline_config_cls,
                                 cls.sampling_params_cls,
@@ -136,10 +138,10 @@ def register_pipeline_config_classes(
 ) -> None:
     """
     Manually register configuration classes for a pipeline.
-    
-    This is useful for pipelines that don't define pipeline_config_cls and 
+
+    This is useful for pipelines that don't define pipeline_config_cls and
     sampling_params_cls as class attributes, or for backward compatibility.
-    
+
     Args:
         pipeline_class_name: The name of the pipeline class (e.g., "ComfyUIZImagePipeline")
         pipeline_config_cls: The PipelineConfig class for this pipeline
@@ -161,10 +163,10 @@ def get_pipeline_config_classes(
 ) -> Tuple[Type[PipelineConfig], Type[Any]] | None:
     """
     Get the configuration classes for a pipeline.
-    
+
     Args:
         pipeline_class_name: The name of the pipeline class
-        
+
     Returns:
         A tuple of (PipelineConfig class, SamplingParams class) if found, None otherwise
     """
@@ -499,4 +501,3 @@ def _register_configs():
 
 
 _register_configs()
-

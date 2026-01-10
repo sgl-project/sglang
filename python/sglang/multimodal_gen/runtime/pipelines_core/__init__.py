@@ -42,21 +42,28 @@ def build_pipeline(
     3. based on the config, determine the pipeline class
     """
     model_path = server_args.model_path
-    
+
     # Check if pipeline class is explicitly specified
     if server_args.pipeline_class_name:
-        from sglang.multimodal_gen.registry import _discover_and_register_pipelines, _PIPELINE_REGISTRY
-        
+        from sglang.multimodal_gen.registry import (
+            _PIPELINE_REGISTRY,
+            _discover_and_register_pipelines,
+        )
+
         _discover_and_register_pipelines()
         logger.info(f"Requested pipeline_class_name: {server_args.pipeline_class_name}")
-        logger.info(f"Available pipelines in registry: {list(_PIPELINE_REGISTRY.keys())}")
+        logger.info(
+            f"Available pipelines in registry: {list(_PIPELINE_REGISTRY.keys())}"
+        )
         pipeline_cls = _PIPELINE_REGISTRY.get(server_args.pipeline_class_name)
         if pipeline_cls is None:
             raise ValueError(
                 f"Pipeline class '{server_args.pipeline_class_name}' not found in registry. "
                 f"Available pipelines: {list(_PIPELINE_REGISTRY.keys())}"
             )
-        logger.info(f"✓ Using explicitly specified pipeline: {server_args.pipeline_class_name} (class: {pipeline_cls.__name__})")
+        logger.info(
+            f"✓ Using explicitly specified pipeline: {server_args.pipeline_class_name} (class: {pipeline_cls.__name__})"
+        )
     else:
         logger.info("No pipeline_class_name specified, using model_index.json")
         model_info = get_model_info(model_path)
