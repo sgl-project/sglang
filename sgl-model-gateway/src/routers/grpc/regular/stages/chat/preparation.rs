@@ -61,8 +61,13 @@ impl ChatPreparationStage {
 
         // Step 3: Tokenize the processed text (no special tokens - chat template already handles them)
         let encoding = match tokenizer.encode(&processed_messages.text, false) {
+            Ok(encoding) => encoding,
+            Err(e) => {
+                error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");
+                return Err(error::internal_error(
                     "tokenization_failed",
                     format!("Tokenization failed: {}", e),
+                ));
             }
         };
 

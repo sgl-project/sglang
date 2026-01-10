@@ -52,6 +52,7 @@ pip install mf-adapter==1.0.0
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
 At the moment NPUGraph optimizations are supported only in `torch_npu==2.6.0.post3` that requires 'torch==2.6.0'.
+
 _TODO: NPUGraph optimizations will be supported in future releases of 'torch_npu' 2.7.1, 2.8.0 and 2.9.0_
 
 ```shell

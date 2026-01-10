@@ -26,10 +26,10 @@ on:
         required: false
         type: string
         default: ""
-<<<<<<< HEAD
-
-concurrency:
-  group: pr-test-amd-${{ github.ref }}
+      pr_head_sha:
+        description: "PR head SHA to checkout (for /rerun-stage on fork PRs)"
+        required: false
+        type: string
         default: ""
   workflow_call:
     inputs:
@@ -48,10 +48,10 @@ concurrency:
   # Include pr_head_sha in group for /rerun-stage dispatches to avoid collisions with main branch runs
   group: pr-test-amd-${{ inputs.pr_head_sha || inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
->>>>>>> origin/main
 
 jobs:
   call-gate:
+    uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
   check-changes:
     needs: [call-gate]

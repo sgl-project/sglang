@@ -1629,8 +1629,11 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v6
         with:
           path: sgl-kernel/dist/
+          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
@@ -1676,8 +1679,11 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
+          merge-multiple: true
           pattern: wheel-python3.10-cuda12.9-aarch64
 
       - name: Install dependencies

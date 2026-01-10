@@ -360,7 +360,11 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
     use smg::{
         core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
         workflow::WorkflowEngine,
+    };
+    let engine = Arc::new(WorkflowEngine::new());
+    engine
         .register_workflow(create_worker_registration_workflow(&config))
+        .expect("worker_registration workflow should be valid");
     engine
         .register_workflow(create_worker_removal_workflow())
         .expect("worker_removal workflow should be valid");
@@ -622,7 +626,11 @@ pub async fn create_test_context_with_mcp_config(
     use smg::{
         core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
         workflow::WorkflowEngine,
+    };
+    let engine = Arc::new(WorkflowEngine::new());
+    engine
         .register_workflow(create_worker_registration_workflow(&config))
+        .expect("worker_registration workflow should be valid");
     engine
         .register_workflow(create_worker_removal_workflow())
         .expect("worker_removal workflow should be valid");

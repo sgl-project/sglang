@@ -54,7 +54,10 @@ from sglang.srt.utils.common import (
     next_power_of_2,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.patch_torch import register_fake_if_exists
+
 if TYPE_CHECKING:
+    from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,

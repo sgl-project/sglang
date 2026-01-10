@@ -164,7 +164,10 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -e HF_TOKEN="${HF_TOKEN:-}" \
   -e HF_HOME=/sgl-data/hf-cache \
   -e HF_HUB_ETAG_TIMEOUT=300 \
+  -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
+  -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
   -e MIOPEN_CUSTOM_CACHE_DIR=/sgl-data/miopen-cache \
   --security-opt seccomp=unconfined \
   -w /sglang-checkout \
+  --name ci_sglang \
   "${IMAGE}"

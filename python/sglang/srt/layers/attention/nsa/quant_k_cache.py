@@ -7,8 +7,6 @@ def quantize_k_cache(cache_k):
     return _quantize_k_cache_fast_wrapped(cache_k)
 
 
-<<<<<<< HEAD
-=======
 def quantize_k_cache_separate(
     k_nope: torch.Tensor,
     k_rope: torch.Tensor,
@@ -57,7 +55,6 @@ def quantize_k_cache_separate(
     )
 
 
->>>>>>> origin/main
 # Copied from original
 def _quantize_k_cache_ref(
     input_k_cache: torch.Tensor,  # (num_blocks, block_size, h_k, d)
@@ -190,8 +187,6 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
     return output
 
 
-<<<<<<< HEAD
-=======
 def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
     """
     Quantize k_nope and k_rope in a single Triton kernel, directly outputting two separate tensors.
@@ -269,7 +264,6 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
     return nope_part_u8.unsqueeze(1), rope_part_u8.unsqueeze(1)
 
 
->>>>>>> origin/main
 @triton.jit
 def _quantize_k_cache_fast_kernel(
     output_nope_q_ptr,
@@ -380,9 +374,6 @@ if __name__ == "__main__":
         )
 
     print("Passed")
-<<<<<<< HEAD
-    print("Do benchmark...")
-=======
 
     # Test quantize_k_cache_separate: verify output matches concat path
     print("\nTesting quantize_k_cache_separate...")
@@ -427,7 +418,6 @@ if __name__ == "__main__":
     print("quantize_k_cache_separate tests passed!")
 
     print("\nDo benchmark...")
->>>>>>> origin/main
 
     for num_blocks, block_size in [
         (1, 64),

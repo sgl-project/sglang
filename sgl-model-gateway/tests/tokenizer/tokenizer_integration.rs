@@ -133,8 +133,12 @@ fn test_decode_stream() {
             .encode(prompt, false)
             .expect("Failed to encode prompt");
 
+        let mut decoder = DecodeStream::new(tokenizer.clone(), &[], false);
+        let mut output = String::new();
+
         for token_id in encoding.token_ids() {
             if let Some(text) = decoder.step(*token_id).expect("Failed to decode token") {
+                output.push_str(&text);
             }
         }
 

@@ -7,7 +7,10 @@ mod pd_routing_unit_tests {
         core::{BasicWorkerBuilder, Worker, WorkerType},
         routers::{http::pd_types::PDSelectionPolicy, RouterFactory},
         tokenizer::registry::TokenizerRegistry,
+    };
+
     #[derive(Debug)]
+    struct PDRequest {
         pub is_stream: bool,
         pub batch_size: Option<usize>,
     }

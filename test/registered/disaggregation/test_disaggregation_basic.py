@@ -13,15 +13,9 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
-<<<<<<< HEAD
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-    DEFAULT_MODEL_NAME_FOR_TEST,
-=======
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TARGET_MODEL_EAGLE,
->>>>>>> origin/main
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
@@ -289,13 +283,8 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-<<<<<<< HEAD
-        cls.model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
-        cls.draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
-=======
         cls.model = DEFAULT_TARGET_MODEL_EAGLE
         cls.draft_model = DEFAULT_DRAFT_MODEL_EAGLE
->>>>>>> origin/main
         cls.spec_args = [
             "--speculative-algorithm",
             "EAGLE",

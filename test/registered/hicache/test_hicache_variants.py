@@ -120,7 +120,11 @@ class TestHiCacheEagle(HiCacheBaseServer, HiCacheEvalMixin):
     model_name = DEFAULT_TARGET_MODEL_EAGLE3
     needs_tokenizer = True
     hicache_args = [
+        "--enable-hierarchical-cache",
+        "--hicache-ratio",
+        1.2,
         "--mem-fraction-static",
+        0.7,
         "--speculative-algorithm",
         "EAGLE3",
         "--speculative-draft-model-path",
@@ -131,7 +135,11 @@ class TestHiCacheEagle(HiCacheBaseServer, HiCacheEvalMixin):
         1,
         "--speculative-num-draft-tokens",
         3,
+        "--dtype",
+        "float16",
+        "--chunked-prefill-size",
         1024,
+    ]
     expected_mmlu_score = 0.72
 
     def test_mmlu(self):
@@ -157,8 +165,14 @@ class TestHiCacheEagle(HiCacheBaseServer, HiCacheEvalMixin):
 
 
 class TestHiCachePage(HiCacheBaseServer, HiCacheEvalMixin):
+    """HiCache with custom page size tests"""
+
+    model_name = DEFAULT_MODEL_NAME_FOR_TEST
+    hicache_args = [
+        "--enable-hierarchical-cache",
         "--page-size",
         32,
+        "--hicache-write-policy",
         "write_back",
     ]
     expected_mmlu_score = 0.65

@@ -32,9 +32,12 @@ pub struct EmbeddingRequest {
     pub rid: Option<String>,
 
     /// SGLang extension: enable/disable logging of metrics for this request
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_metrics: Option<bool>,
 }
 
 impl GenerationRequest for EmbeddingRequest {
+    fn is_stream(&self) -> bool {
         // Embeddings are non-streaming
         false
     }

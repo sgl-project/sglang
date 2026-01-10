@@ -51,15 +51,15 @@ python3 -m sglang.launch_server \
     --dtype bfloat16
 ```
 
-<<<<<<< HEAD
-#### Running DeepSeek with PD disaggregation on 2 x Atlas 800I A3.
+#### Running DeepSeek with PD disaggregation mode on 2 x Atlas 800I A3.
 
 W4A8 Model weights could be found [here](https://modelers.cn/models/Modelers_Park/DeepSeek-R1-0528-w4a8).
+
 1. Prefill:
->>>>>>> origin/main
 
 ```shell
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
 
 #memfabric config store
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"

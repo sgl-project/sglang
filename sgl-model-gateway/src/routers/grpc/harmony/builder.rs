@@ -232,6 +232,10 @@ impl HarmonyBuilder {
         })
     }
 
+    /// Build system message with common logic
+    ///
+    /// # Arguments
+    /// * `reasoning_effort` - Optional reasoning effort level
     /// * `has_tools` - Whether custom tools are present
     fn build_system_message(
         &self,

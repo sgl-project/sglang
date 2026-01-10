@@ -79,6 +79,8 @@ class TestDPRetract(
 ):
     @classmethod
     def setUpClass(cls):
+        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -118,6 +120,7 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
             "--disable-radix",

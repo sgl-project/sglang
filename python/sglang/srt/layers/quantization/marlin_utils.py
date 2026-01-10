@@ -862,6 +862,8 @@ class MarlinLinearMethod(LinearMethodBase):
 
 def fake_unified_apply_gptq_marlin_gemm(
     input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
     weight_zp: torch.Tensor,
     g_idx: torch.Tensor,
     g_idx_sort_indices: torch.Tensor,
@@ -881,6 +883,7 @@ def fake_unified_apply_gptq_marlin_gemm(
 def unified_apply_gptq_marlin_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
+    weight_scale: torch.Tensor,
     weight_zp: torch.Tensor,
     g_idx: torch.Tensor,
     g_idx_sort_indices: torch.Tensor,

@@ -486,3 +486,4 @@ def assign_extend_cache_locs_func(
             out_cache_loc,
         )
 
+        return out_cache_loc

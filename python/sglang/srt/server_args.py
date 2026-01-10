@@ -45,7 +45,10 @@ from sglang.srt.utils.common import (
     is_blackwell_supported,
     is_cuda,
     is_fa3_default_architecture,
+    is_flashinfer_available,
+    is_hip,
     is_hopper_with_cuda_12_3,
+    is_no_spec_infer_or_topk_one,
     is_npu,
     is_port_available,
     is_remote_url,
@@ -109,7 +112,10 @@ QUANTIZATION_CHOICES = [
 ]
 
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
+
 ATTENTION_BACKEND_CHOICES = [
+    # Common
+    "triton",
     "torch_native",
     "flex_attention",
     "nsa",
@@ -440,7 +446,10 @@ class ServerArgs:
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
 
+    # Expert parallelism
+    ep_size: int = 1
     moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep"] = "none"
+    moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
@@ -571,12 +580,19 @@ class ServerArgs:
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
+    scheduler_recv_interval: int = 1
+    numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
+    rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
+    nsa_prefill_cp_mode: str = "in-seq-split"
+    enable_fused_qk_norm_rope: bool = False
+    enable_precise_embedding_interpolation: bool = False
 
     # Dynamic batch tokenizer
+    enable_dynamic_batch_tokenizer: bool = False
     dynamic_batch_tokenizer_batch_size: int = 32
     dynamic_batch_tokenizer_batch_timeout: float = 0.002
 
@@ -698,12 +714,20 @@ class ServerArgs:
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
 
+        # Handle speculative decoding logic.
+        self._handle_speculative_decoding()
+
+        # Handle model loading format.
         self._handle_load_format()
 
         # Handle PD disaggregation.
+        self._handle_pd_disaggregation()
+
+        # Handle Encoder disaggregation.
         self._handle_encoder_disaggregation()
 
         # Validate tokenizer settings.
+        self._handle_tokenizer_batching()
 
         # Propagate environment variables.
         self._handle_environment_variables()
@@ -885,6 +909,19 @@ class ServerArgs:
                         self.cuda_graph_max_bs = 32
                     else:
                         self.cuda_graph_max_bs = 160
+            elif gpu_mem < 90 * 1024:
+                # H100, A100
+                # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
+                if self.chunked_prefill_size is None:
+                    self.chunked_prefill_size = 8192
+                if self.cuda_graph_max_bs is None:
+                    if self.tp_size < 4:
+                        self.cuda_graph_max_bs = 256
+                    else:
+                        self.cuda_graph_max_bs = 512
+            elif gpu_mem < 160 * 1024:
+                # H20, H200
+                # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
                 if self.chunked_prefill_size is None:
                     self.chunked_prefill_size = 8192
                 if self.cuda_graph_max_bs is None:
@@ -1871,7 +1908,7 @@ class ServerArgs:
                 "modelopt_fp8",
                 "compressed-tensors",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'compressed-tensors' or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'compressed-tensors', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -4467,6 +4504,7 @@ class ServerArgs:
 
         # Custom weight loader
         parser.add_argument(
+            "--custom-weight-loader",
             type=str,
             nargs="*",
             default=None,
@@ -5301,4 +5339,3 @@ def auto_choose_speculative_params(self: ServerArgs):
     else:
         # The default value for all other models
         return (3, 1, 4)
-

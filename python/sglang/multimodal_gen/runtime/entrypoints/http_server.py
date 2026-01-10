@@ -35,6 +35,11 @@ async def lifespan(app: FastAPI):
     server_args = app.state.server_args
     async_scheduler_client.initialize(server_args)
 
+    # 2. Start the ZMQ Broker in the background to handle offline requests
+    broker_task = asyncio.create_task(run_zeromq_broker(server_args))
+
+    yield
+
     # On shutdown
     print("FastAPI app is shutting down...")
     broker_task.cancel()

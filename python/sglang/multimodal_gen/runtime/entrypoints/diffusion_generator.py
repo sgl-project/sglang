@@ -218,6 +218,7 @@ class DiffGenerator:
 
         results = []
         total_start_time = time.perf_counter()
+
         # 2. send requests to scheduler, one at a time
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):

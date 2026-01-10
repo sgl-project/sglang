@@ -250,6 +250,7 @@ struct SymbolicDType {
   auto set_options(std::span<const DLDataType> options) -> void {
     m_options = options;
   }
+
   template <typename... Ts>
   auto set_options() -> void {
     m_options = details::kDTypeList<Ts...>;
@@ -310,6 +311,7 @@ struct SymbolicDevice {
   auto set_options(std::span<const DLDevice> options) -> void {
     m_options = options;
   }
+
   template <DLDeviceType... Codes>
   auto set_options() -> void {
     m_options = details::kDeviceList<Codes...>;
