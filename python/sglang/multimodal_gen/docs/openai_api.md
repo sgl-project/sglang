@@ -299,6 +299,43 @@ curl -X POST http://localhost:30010/v1/unmerge_lora_weights \
   -H "Content-Type: application/json"
 ```
 
+#### List LoRA Adapters
+
+Returns loaded LoRA adapters and current application status per module.
+
+**Endpoint:** `GET /v1/list_loras`
+
+**Curl Example:**
+
+```bash
+curl -sS -X GET "http://localhost:30010/v1/list_loras"
+```
+
+**Response Example:**
+
+```json
+{
+  "loaded_adapters": [
+    { "nickname": "lora_a", "path": "/weights/lora_a.safetensors" },
+    { "nickname": "lora_b", "path": "/weights/lora_b.safetensors" }
+  ],
+  "active": {
+    "transformer": [
+      {
+        "nickname": "lora2",
+        "path": "tarn59/pixel_art_style_lora_z_image_turbo",
+        "merged": true,
+        "strength": 1.0
+      }
+    ]
+  }
+}
+```
+
+Notes:
+- If LoRA is not enabled for the current pipeline, the server will return an error.
+- `num_lora_layers_with_weights` counts only layers that have LoRA weights applied for the active adapter.
+
 ### Example: Switching LoRAs
 
 1.  Set LoRA A:

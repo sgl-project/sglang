@@ -23,7 +23,7 @@ use crate::{
 ///
 /// Extracts generate-specific preparation logic from the old unified PreparationStage.
 /// This is a direct extraction without architectural changes.
-pub struct GeneratePreparationStage;
+pub(crate) struct GeneratePreparationStage;
 
 #[async_trait]
 impl PipelineStage for GeneratePreparationStage {
@@ -119,8 +119,9 @@ impl GeneratePreparationStage {
         tokenizer: &Arc<dyn Tokenizer>,
         text: &str,
     ) -> Result<(String, Vec<u32>), String> {
+        // Don't add special tokens - raw text generation uses text as-is
         let encoding = tokenizer
-            .encode(text)
+            .encode(text, false)
             .map_err(|e| format!("Tokenization failed: {}", e))?;
         Ok((text.to_string(), encoding.token_ids().to_vec()))
     }

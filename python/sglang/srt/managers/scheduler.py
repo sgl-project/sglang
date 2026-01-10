@@ -92,6 +92,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
+    LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
@@ -119,6 +121,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.managers.prefill_delayer import (
+    PrefillDelayer,
+    PrefillDelayerSinglePassExecutor,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
@@ -133,7 +139,6 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
-from sglang.srt.managers.scheduler_enhancer import SchedulerEnhancer
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
@@ -203,7 +208,6 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
-SCHEDULER_DECREASE_PREFILL_IDLE = envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get()
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
@@ -255,6 +259,9 @@ class Scheduler(
         pp_rank: int,
         dp_rank: Optional[int],
     ):
+        self.is_initializing = True
+        self.init_soft_watchdog(server_args)
+
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
@@ -332,6 +339,9 @@ class Scheduler(
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
+        if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
+            time.sleep(t)
+
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
 
@@ -364,6 +374,8 @@ class Scheduler(
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+        self.is_initializing = False
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -465,7 +477,7 @@ class Scheduler(
         # This must be called after initialize_moe_config
         self.require_mlp_sync = require_mlp_sync(self.server_args)
 
-    def init_model_worker(self):
+    def init_tp_model_worker(self):
         from sglang.srt.managers.tp_worker import TpModelWorker
 
         self.tp_worker = TpModelWorker(
@@ -477,6 +489,11 @@ class Scheduler(
             dp_rank=self.dp_rank,
             nccl_port=self.nccl_port,
         )
+
+    def maybe_init_draft_worker(self):
+        if self.spec_algorithm.is_none():
+            self.draft_worker = None
+            return
 
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
@@ -497,45 +514,12 @@ class Scheduler(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
             )
 
-        # Draft workers are looked up via `SpeculativeAlgorithm` registry; new
-        # algorithms should register their factory instead of patching this code.
-        if self.spec_algorithm.is_eagle():
-            draft_worker_kwargs["enable_overlap"] = self.enable_overlap
+        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
+        self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 
-        # FIXME: refactor the draft worker registration logic
-        if self.server_args.enable_multi_layer_eagle:
-            if self.enable_overlap:
-                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
-                    MultiLayerEagleWorkerV2,
-                )
-
-                self.draft_worker = MultiLayerEagleWorkerV2(
-                    gpu_id=self.gpu_id,
-                    tp_rank=self.tp_rank,
-                    moe_ep_rank=self.moe_ep_rank,
-                    server_args=self.server_args,
-                    nccl_port=self.nccl_port,
-                    target_worker=self.tp_worker,
-                    dp_rank=self.dp_rank,
-                )
-            else:
-                from sglang.srt.speculative.multi_layer_eagle_worker import (
-                    MultiLayerEagleWorker,
-                )
-
-                self.draft_worker = MultiLayerEagleWorker(
-                    gpu_id=self.gpu_id,
-                    tp_rank=self.tp_rank,
-                    moe_ep_rank=self.moe_ep_rank,
-                    server_args=self.server_args,
-                    nccl_port=self.nccl_port,
-                    target_worker=self.tp_worker,
-                    dp_rank=self.dp_rank,
-                )
-        else:
-            self.draft_worker = self.spec_algorithm.create_draft_worker(
-                **draft_worker_kwargs
-            )
+    def init_model_worker(self):
+        self.init_tp_model_worker()
+        self.maybe_init_draft_worker()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -635,6 +619,9 @@ class Scheduler(
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            chunked_prefill_size=server_args.chunked_prefill_size,
         )
 
         if (
@@ -727,8 +714,6 @@ class Scheduler(
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
-        # The current split prefill batch
-        self.split_prefill_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
@@ -789,14 +774,18 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
         )
-        self.schedule_enhancer = None
-        if SCHEDULER_DECREASE_PREFILL_IDLE:
-            self.schedule_enhancer = SchedulerEnhancer(
-                self.dp_size,
-                self.attn_tp_size,
-                self.tp_worker,
-                self.max_running_requests,
-                self.server_args,
+        self.prefill_delayer: Optional[PrefillDelayer] = None
+        if self.server_args.enable_prefill_delayer:
+            self.prefill_delayer = PrefillDelayer(
+                dp_size=self.dp_size,
+                attn_tp_size=self.attn_tp_size,
+                cpu_group=self.tp_worker.get_tp_group().cpu_group,
+                server_args=self.server_args,
+                metrics_collector=(
+                    self.metrics_collector if self.enable_metrics else None
+                ),
+                max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
+                token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
@@ -814,15 +803,17 @@ class Scheduler(
         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
 
+    def init_soft_watchdog(self, server_args: ServerArgs):
+        if (x := server_args.soft_watchdog_timeout) is not None:
+            self.soft_watchdog = create_scheduler_watchdog(
+                self, watchdog_timeout=x, soft=True
+            )
+
     def init_watch_dog_memory_saver_input_blocker(self):
         # Start watchdog thread
         self.watchdog = create_scheduler_watchdog(
             self, watchdog_timeout=self.server_args.watchdog_timeout
         )
-        if (x := self.server_args.soft_watchdog_timeout) is not None:
-            self.soft_watchdog = create_scheduler_watchdog(
-                self, watchdog_timeout=x, soft=True
-            )
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -852,7 +843,7 @@ class Scheduler(
 
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
-        elif self.spec_algorithm.is_eagle() and self.enable_overlap:
+        elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
@@ -930,11 +921,13 @@ class Scheduler(
                 hidden_size=(
                     model_config.hidden_size
                     if self.spec_algorithm.is_eagle()
+                    or self.spec_algorithm.is_standalone()
                     else 16  # minimal padding size for RDMA
                 ),
                 hidden_states_dtype=(
                     model_config.dtype
                     if self.spec_algorithm.is_eagle()
+                    or self.spec_algorithm.is_standalone()
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
@@ -1061,6 +1054,10 @@ class Scheduler(
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
+                (
+                    LoadLoRAAdapterFromTensorsReqInput,
+                    self.load_lora_adapter_from_tensors,
+                ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
                 (PauseGenerationReqInput, self.pause_generation),
@@ -1452,6 +1449,7 @@ class Scheduler(
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
+                routing_key=recv_req.routing_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
             )
@@ -1523,6 +1521,10 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
+            # When return_logprob is False, logprob_start_len should be ignored
+            recv_req.logprob_start_len = -1
 
         if recv_req.logprob_start_len == -1:
             if req.is_prefill_only:
@@ -1827,7 +1829,9 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.prepare_mlp_sync_batch(new_batch)
+            new_batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(
+                new_batch, log_stats=False
+            )
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -1841,14 +1845,13 @@ class Scheduler(
             else:
                 ret = None
 
-        # Handle DP attention
-        if need_mlp_sync:
-            ret = self.prepare_mlp_sync_batch(ret)
+        # Handle DP attention and log stats
+        ret = self.maybe_prepare_mlp_sync_batch_and_log_stats(
+            ret, need_sync=need_mlp_sync
+        )
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
-
-        self.log_prefill_stats_late(ret)
 
         return ret
 
@@ -1859,12 +1862,25 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        if self.schedule_enhancer and not self.schedule_enhancer.get_schedule_decision(
-            self.running_batch
-        ):
-            # Decrease prefill idle as much as possible during high dp load.
-            return None
+        prefill_delayer_single_pass = None
+        if self.prefill_delayer:
+            _, token_usage, _, _ = self._get_token_info()
+            prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
+                self.prefill_delayer, token_usage=token_usage
+            )
 
+        ret = self._get_new_batch_prefill_raw(
+            prefill_delayer_single_pass=prefill_delayer_single_pass
+        )
+
+        if self.prefill_delayer:
+            prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
+
+        return ret
+
+    def _get_new_batch_prefill_raw(
+        self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
+    ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1873,7 +1889,6 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
@@ -1897,7 +1912,7 @@ class Scheduler(
             self.tree_cache.check_hicache_events()
 
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue)
+        self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -1925,6 +1940,7 @@ class Scheduler(
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
         )
 
         if self.chunked_req is not None:
@@ -1944,14 +1960,11 @@ class Scheduler(
                     | set([req.lora_id])
                 )
                 if not self.tp_worker.can_run_lora_batch(new_lora_set):
-                    # If this is a LoRA request that would exceed the LoRA slot limit,
-                    # skip it and continue to try scheduling non-LoRA requests.
-                    # Non-LoRA requests (lora_id=None) share a single reserved slot
-                    # and should never cause this check to fail.
-                    if req.lora_id is not None:
-                        # Skip this LoRA request - it would trigger adapter eviction/loading
-                        # which is slow. We'll try to schedule it in a future iteration.
-                        continue
+                    # Batch would exceed the LoRA slot limit.
+                    # Skip this request and try scheduling it in a future iteration.
+                    # Note: When eviction is needed, the eviction policy prefers to
+                    # evict LoRA adapters over base model (None) - see mem_pool.py.
+                    continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -2019,7 +2032,12 @@ class Scheduler(
 
         # Print stats
         if self.current_scheduler_metrics_enabled:
-            self.log_prefill_stats(adder, can_run_list, running_bs, 0)
+            self.log_prefill_stats(
+                adder,
+                can_run_list,
+                running_bs=len(self.running_batch.reqs),
+                running_bs_offline_batch=0,
+            )
 
         # Record metrics
         for req in can_run_list:
@@ -2264,7 +2282,7 @@ class Scheduler(
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
-            if batch.return_logprob or self.spec_algorithm.is_eagle():
+            if batch.return_logprob:
                 batch_result.extend_input_len_per_req = [
                     req.extend_input_len for req in batch.reqs
                 ]
@@ -2484,6 +2502,7 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
+        ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
@@ -2688,6 +2707,14 @@ class Scheduler(
         """In-place loading a new lora adapter from disk or huggingface."""
 
         result = self.tp_worker.load_lora_adapter(recv_req)
+        return result
+
+    def load_lora_adapter_from_tensors(
+        self, recv_req: LoadLoRAAdapterFromTensorsReqInput
+    ) -> LoadLoRAAdapterFromTensorsReqOutput:
+        """In-place loading a new lora adapter from serialized tensors."""
+
+        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
         return result
 
     def unload_lora_adapter(
