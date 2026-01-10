@@ -7,24 +7,12 @@ from pathlib import Path
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 
-def read_log_file(temp_dir: str) -> dict:
-    log_files = list(Path(temp_dir).glob("*.log"))
-    assert len(log_files) == 1
-    return json.loads(log_files[0].read_text().strip())
-
-
-def capture_stdout_log(logger, event: str, data: dict) -> dict:
-    stream = io.StringIO()
-    logger.handlers[0].stream = stream
-    log_json(logger, event, data)
-    return json.loads(stream.getvalue().strip())
-
 
 class TestLogUtils(unittest.TestCase):
     def test_stdout(self):
         loggers = create_log_targets(targets=["stdout"], name_prefix="test_stdout")
         self.assertEqual(len(loggers), 1)
-        data = capture_stdout_log(loggers[0], "test.event", {"key": "value"})
+        data = _capture_stdout_log(loggers[0], "test.event", {"key": "value"})
         self.assertIn("timestamp", data)
         self.assertEqual(data["event"], "test.event")
         self.assertEqual(data["key"], "value")
@@ -32,7 +20,7 @@ class TestLogUtils(unittest.TestCase):
     def test_default_stdout(self):
         loggers = create_log_targets(targets=None, name_prefix="test_default")
         self.assertEqual(len(loggers), 1)
-        data = capture_stdout_log(loggers[0], "default.event", {"foo": "bar"})
+        data = _capture_stdout_log(loggers[0], "default.event", {"foo": "bar"})
         self.assertEqual(data["event"], "default.event")
         self.assertEqual(data["foo"], "bar")
 
@@ -42,7 +30,7 @@ class TestLogUtils(unittest.TestCase):
             self.assertEqual(len(loggers), 1)
             log_json(loggers[0], "file.event", {"data": 123})
             loggers[0].handlers[0].flush()
-            data = read_log_file(temp_dir)
+            data = _read_log_file(temp_dir)
             self.assertIn("timestamp", data)
             self.assertEqual(data["event"], "file.event")
             self.assertEqual(data["data"], 123)
@@ -58,10 +46,23 @@ class TestLogUtils(unittest.TestCase):
             log_json(loggers, "multi.event", {"x": 1})
             loggers[1].handlers[0].flush()
             stdout_data = json.loads(stdout_stream.getvalue().strip())
-            file_data = read_log_file(temp_dir)
+            file_data = _read_log_file(temp_dir)
             self.assertEqual(stdout_data["event"], "multi.event")
             self.assertEqual(file_data["event"], "multi.event")
             self.assertEqual(stdout_data["x"], file_data["x"])
+
+
+def _read_log_file(temp_dir: str) -> dict:
+    log_files = list(Path(temp_dir).glob("*.log"))
+    assert len(log_files) == 1
+    return json.loads(log_files[0].read_text().strip())
+
+
+def _capture_stdout_log(logger, event: str, data: dict) -> dict:
+    stream = io.StringIO()
+    logger.handlers[0].stream = stream
+    log_json(logger, event, data)
+    return json.loads(stream.getvalue().strip())
 
 
 if __name__ == "__main__":
