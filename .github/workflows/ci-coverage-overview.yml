@@ -1,0 +1,37 @@
+name: CI Coverage Overview
+
+on:
+  workflow_dispatch:
+    inputs:
+      output_format:
+        description: 'Output format'
+        required: false
+        default: 'markdown'
+        type: choice
+        options:
+          - markdown
+          - json
+
+jobs:
+  coverage-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate CI Coverage Report
+        run: |
+          python scripts/ci/ci_coverage_report.py --output-format ${{ inputs.output_format }}
+
+      - name: Upload JSON artifact
+        if: inputs.output_format == 'json'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-coverage-report
+          path: ci_coverage.json
+          if-no-files-found: ignore
