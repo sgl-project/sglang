@@ -440,8 +440,8 @@ class SchedulerMetricsMixin:
             self._emit_kv_metrics()
         self._publish_kv_events()
 
-        if self.scheduler_status_logger:
-            self.scheduler_status_logger.maybe_dump(batch, self.waiting_queue)
+        if x := self.scheduler_status_logger:
+            x.maybe_dump(batch, self.waiting_queue)
 
     def log_decode_stats_every_iteration(
         self: Scheduler, batch: ScheduleBatch, num_accepted_tokens: int

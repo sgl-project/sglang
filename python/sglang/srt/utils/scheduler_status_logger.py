@@ -25,7 +25,7 @@ class SchedulerStatusLogger:
 
         return SchedulerStatusLogger(
             targets=[t.strip() for t in target.split(",") if t.strip()],
-            dump_interval_s=envs.SGLANG_LOG_SCHEDULER_STATUS_INTERVAL_S.get(),
+            dump_interval_s=envs.SGLANG_LOG_SCHEDULER_STATUS_INTERVAL.get(),
         )
 
     def maybe_dump(

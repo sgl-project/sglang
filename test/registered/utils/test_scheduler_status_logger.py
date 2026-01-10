@@ -30,7 +30,7 @@ class TestSchedulerStatusLogger(CustomTestCase):
             other_args=["--skip-server-warmup"],
             env={
                 "SGLANG_LOG_SCHEDULER_STATUS_TARGET": cls.temp_dir,
-                "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL_S": "1",
+                "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL": "1",
             },
         )
 
