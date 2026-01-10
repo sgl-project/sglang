@@ -56,7 +56,9 @@ def mamba2_state_dtype() -> Mamba2StateDType:
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
     }
-    ssm_dtype = dtype_map.get(os.environ.get("SGLANG_MAMBA_SSM_DTYPE", "float32"), torch.float32)
+    ssm_dtype = dtype_map.get(
+        os.environ.get("SGLANG_MAMBA_SSM_DTYPE", "float32"), torch.float32
+    )
     return Mamba2StateDType(conv=get_conv_dtype(), temporal=ssm_dtype)
 
 

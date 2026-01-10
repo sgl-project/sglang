@@ -16,12 +16,16 @@
 
 from typing import List, Optional
 
-from transformers import Lfm2Config as HFLfm2Config
+import torch
 from transformers import CONFIG_MAPPING
+from transformers import Lfm2Config as HFLfm2Config
 from transformers.utils import logging
 
-import torch
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape, Mamba2StateDType
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateDType,
+    Mamba2StateShape,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -42,7 +46,9 @@ class Lfm2Config(HFLfm2Config):
     @property
     def linear_layer_ids(self) -> List[int]:
         """Return indices of conv layers for conv state cache."""
-        return [i for i, lt in enumerate(self.layer_types) if lt in ("conv", "short_conv")]
+        return [
+            i for i, lt in enumerate(self.layer_types) if lt in ("conv", "short_conv")
+        ]
 
     @property
     def mamba_chunk_size(self) -> int:
@@ -89,7 +95,11 @@ class Lfm2Config(HFLfm2Config):
         # Get conv dtype from torch default (set by model runner before this is called)
         # Fall back to bfloat16 if default is float32
         default_dtype = torch.get_default_dtype()
-        conv_dtype = default_dtype if default_dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+        conv_dtype = (
+            default_dtype
+            if default_dtype in (torch.float16, torch.bfloat16)
+            else torch.bfloat16
+        )
 
         return Mamba2CacheParams(
             shape=shape,

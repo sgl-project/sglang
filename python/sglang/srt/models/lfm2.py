@@ -19,11 +19,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.lfm2 import Lfm2Config
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -45,8 +45,8 @@ from sglang.srt.utils import add_prefix, make_layers
 logger = logging.getLogger(__name__)
 
 
-# We don't use it, we keep it for reference. If we run sglang.srt.layers.layernorm.RMSNorm 
-# kernel the difference in logporbs slighlty increases, but to an acceptable degree
+# We don't use it, we keep it for reference. If we run sglang.srt.layers.layernorm.RMSNorm
+# kernel the difference in logprobs slightly increases, but to an acceptable degree
 # class Lfm2RMSNorm(nn.Module):
 #     """LFM2-specific RMSNorm: weight * x (not (1 + weight) * x like Gemma)."""
 
@@ -237,12 +237,18 @@ class Lfm2ShortConv(nn.Module):
         self.use_bias = bool(config.conv_bias)
         self.hidden_size = config.hidden_size
 
-        self.in_proj = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias=self.use_bias)
-        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=self.use_bias)
+        self.in_proj = nn.Linear(
+            config.hidden_size, 3 * config.hidden_size, bias=self.use_bias
+        )
+        self.out_proj = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=self.use_bias
+        )
 
         # Conv weights stored in format matching causal_conv1d: (hidden_size, kernel_size)
         # Weight loading will handle conversion from HF's (hidden_size, 1, kernel_size)
-        self.conv_weight = nn.Parameter(torch.empty(config.hidden_size, self.conv_kernel))
+        self.conv_weight = nn.Parameter(
+            torch.empty(config.hidden_size, self.conv_kernel)
+        )
         if self.use_bias:
             self.conv_bias = nn.Parameter(torch.empty(config.hidden_size))
         else:
@@ -283,13 +289,19 @@ class Lfm2ShortConv(nn.Module):
             # Build query_start_loc: [0, cumsum(seq_lens)...]
             extend_start_loc = forward_batch.extend_start_loc
             if extend_start_loc is not None and len(extend_start_loc) > 1:
-                query_start_loc = torch.cat([
-                    extend_start_loc,
-                    torch.tensor([T], dtype=torch.int32, device=hidden_states.device)
-                ])
+                query_start_loc = torch.cat(
+                    [
+                        extend_start_loc,
+                        torch.tensor(
+                            [T], dtype=torch.int32, device=hidden_states.device
+                        ),
+                    ]
+                )
                 cache_indices = req_pool_indices.to(torch.int32)
             else:
-                query_start_loc = torch.tensor([0, T], dtype=torch.int32, device=hidden_states.device)
+                query_start_loc = torch.tensor(
+                    [0, T], dtype=torch.int32, device=hidden_states.device
+                )
                 cache_indices = req_pool_indices[:1].to(torch.int32)
 
             conv_out = causal_conv1d_fn(

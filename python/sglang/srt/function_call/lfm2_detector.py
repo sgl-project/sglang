@@ -102,9 +102,13 @@ class Lfm2Detector(BaseFormatDetector):
                 return -inner
             raise ValueError(f"Cannot negate non-numeric value: {inner}")
         else:
-            raise ValueError(f"Tool call arguments must be literals, got: {type(val).__name__}")
+            raise ValueError(
+                f"Tool call arguments must be literals, got: {type(val).__name__}"
+            )
 
-    def _parse_pythonic_call(self, call: ast.Call, call_index: int, tool_indices: Dict[str, int]) -> Optional[ToolCallItem]:
+    def _parse_pythonic_call(
+        self, call: ast.Call, call_index: int, tool_indices: Dict[str, int]
+    ) -> Optional[ToolCallItem]:
         """
         Parse a single AST Call node into a ToolCallItem.
 
@@ -117,14 +121,18 @@ class Lfm2Detector(BaseFormatDetector):
             ToolCallItem if successful, None if the call should be skipped
         """
         if not isinstance(call.func, ast.Name):
-            logger.warning(f"Tool call function must be a simple name, got: {type(call.func).__name__}")
+            logger.warning(
+                f"Tool call function must be a simple name, got: {type(call.func).__name__}"
+            )
             return None
 
         function_name = call.func.id
 
         # Validate that the function exists in the tools
         if function_name not in tool_indices:
-            logger.warning(f"Model attempted to call undefined function: {function_name}")
+            logger.warning(
+                f"Model attempted to call undefined function: {function_name}"
+            )
             if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                 return None  # Skip unknown tools (default legacy behavior)
 
@@ -147,7 +155,9 @@ class Lfm2Detector(BaseFormatDetector):
             parameters=json.dumps(arguments, ensure_ascii=False),
         )
 
-    def _parse_pythonic_content(self, content: str, tools: List[Tool]) -> Tuple[List[ToolCallItem], str]:
+    def _parse_pythonic_content(
+        self, content: str, tools: List[Tool]
+    ) -> Tuple[List[ToolCallItem], str]:
         """
         Parse Pythonic format tool calls using AST.
 
@@ -174,7 +184,10 @@ class Lfm2Detector(BaseFormatDetector):
             elif isinstance(parsed, ast.Call):
                 call_nodes = [parsed]
             else:
-                return [], f"Expected function call or list, got: {type(parsed).__name__}"
+                return (
+                    [],
+                    f"Expected function call or list, got: {type(parsed).__name__}",
+                )
 
             # Validate all elements are calls
             if not all(isinstance(e, ast.Call) for e in call_nodes):
@@ -194,7 +207,9 @@ class Lfm2Detector(BaseFormatDetector):
             logger.exception("Unexpected error in pythonic tool call parsing")
             return [], f"Unexpected error: {e}"
 
-    def _parse_json_content(self, content: str, tools: List[Tool]) -> Tuple[List[ToolCallItem], str]:
+    def _parse_json_content(
+        self, content: str, tools: List[Tool]
+    ) -> Tuple[List[ToolCallItem], str]:
         """
         Parse JSON format tool calls.
 
@@ -220,7 +235,9 @@ class Lfm2Detector(BaseFormatDetector):
         except json.JSONDecodeError as e:
             return [], f"JSON parse error: {e}"
 
-    def _parse_tool_calls_content(self, content: str, tools: List[Tool]) -> List[ToolCallItem]:
+    def _parse_tool_calls_content(
+        self, content: str, tools: List[Tool]
+    ) -> List[ToolCallItem]:
         """
         Parse the content between tool call tags.
         Handles both JSON and Pythonic formats.
@@ -376,8 +393,8 @@ class Lfm2Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text="")
 
         # We have a complete tool call block
-        tool_call_block = self._buffer[bot_pos:eot_pos + len(self.eot_token)]
-        remaining = self._buffer[eot_pos + len(self.eot_token):]
+        tool_call_block = self._buffer[bot_pos : eot_pos + len(self.eot_token)]
+        remaining = self._buffer[eot_pos + len(self.eot_token) :]
 
         # Parse the complete block
         result = self.detect_and_parse(tool_call_block, tools)
@@ -408,7 +425,7 @@ class Lfm2Detector(BaseFormatDetector):
         supports_structural_tag() returns False.
         """
         return lambda name: StructureInfo(
-            begin='<|tool_call_start|>[' + name + '(',
+            begin="<|tool_call_start|>[" + name + "(",
             end=")]<|tool_call_end|>",
             trigger="<|tool_call_start|>",
         )

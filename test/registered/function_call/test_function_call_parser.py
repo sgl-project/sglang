@@ -5,12 +5,12 @@ from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
-from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
+from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
@@ -3151,7 +3151,9 @@ class TestLfm2Detector(unittest.TestCase):
 
     def test_detect_and_parse_special_characters_in_value(self):
         """Test parsing with special characters in argument values."""
-        text = '<|tool_call_start|>[search(query="what\'s the weather?")]<|tool_call_end|>'
+        text = (
+            '<|tool_call_start|>[search(query="what\'s the weather?")]<|tool_call_end|>'
+        )
         result = self.detector.detect_and_parse(text, self.tools)
 
         self.assertEqual(len(result.calls), 1)
