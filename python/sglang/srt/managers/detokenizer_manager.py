@@ -87,7 +87,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Init running status
         self.init_running_status(server_args)
 
-        # Init CPU monitor
         if server_args.enable_metrics:
             from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
 

@@ -207,7 +207,6 @@ class DataParallelController:
             test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
         )
 
-        # Init CPU monitor
         if server_args.enable_metrics:
             from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
 
