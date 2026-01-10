@@ -28,9 +28,6 @@ class BucketLabels:
     def __iter__(self) -> Iterator[Tuple[str, str]]:
         return iter(self._labels)
 
-    def upper_bounds(self) -> List[Union[int, float]]:
-        return self._upper_bounds
-
     def compute_bucket_counts(
         self, observations: List[Union[int, float]]
     ) -> List[int]:

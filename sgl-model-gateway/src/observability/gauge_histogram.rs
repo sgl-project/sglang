@@ -33,10 +33,6 @@ impl BucketLabels {
         }
     }
 
-    pub fn upper_bounds(&self) -> &[u64] {
-        self.upper_bounds
-    }
-
     pub fn len(&self) -> usize {
         self.le_labels.len()
     }
