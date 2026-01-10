@@ -337,7 +337,7 @@ def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
 ) -> WatchdogRaw:
     def dump_info() -> str:
-        if disable_request_logging():
+        if scheduler.is_initializing or disable_request_logging():
             return ""
         if scheduler.is_hybrid_swa:
             _, info_msg = scheduler._check_hybrid_memory()
