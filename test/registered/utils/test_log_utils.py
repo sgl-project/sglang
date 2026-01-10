@@ -4,6 +4,10 @@ import unittest
 from pathlib import Path
 
 from sglang.srt.utils.log_utils import create_log_target, log_json
+from sglang.test.ci.ci_register import register_cpu_ci
+
+
+register_cpu_ci(est_time=60, suite="default", nightly=True)
 
 
 class TestLogUtils(unittest.TestCase):
