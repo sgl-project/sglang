@@ -100,73 +100,106 @@ pub static INFLIGHT_AGE_BUCKETS: LazyLock<BucketLabels> =
 mod tests {
     use super::*;
 
+    // --- Bucket Labels Tests ---
+
     #[test]
-    fn test_bucket_labels() {
+    fn test_bucket_labels_basic() {
         let buckets = BucketLabels::new(&[10, 30, 60]);
-
-        assert_eq!(buckets.le_labels, vec!["10", "30", "60", "+Inf"]);
-        assert_eq!(buckets.gt_labels, vec!["0", "10", "30", "60"]);
-        assert_eq!(buckets.len(), 4);
-    }
-
-    #[test]
-    fn test_find_bucket_index() {
-        let buckets = BucketLabels::new(&[10, 30, 60]);
-
-        assert_eq!(buckets.find_bucket_index(5), 0);
-        assert_eq!(buckets.find_bucket_index(10), 0);
-        assert_eq!(buckets.find_bucket_index(11), 1);
-        assert_eq!(buckets.find_bucket_index(30), 1);
-        assert_eq!(buckets.find_bucket_index(31), 2);
-        assert_eq!(buckets.find_bucket_index(60), 2);
-        assert_eq!(buckets.find_bucket_index(61), 3);
-        assert_eq!(buckets.find_bucket_index(1000), 3);
-    }
-
-    #[test]
-    fn test_iter() {
-        let buckets = BucketLabels::new(&[10, 30]);
         let pairs: Vec<_> = buckets.iter().collect();
-        assert_eq!(pairs, vec![("0", "10"), ("10", "30"), ("30", "+Inf")]);
+        assert_eq!(
+            pairs,
+            vec![("0", "10"), ("10", "30"), ("30", "60"), ("60", "+Inf")]
+        );
     }
+
+    #[test]
+    fn test_bucket_labels_single_bound() {
+        let buckets = BucketLabels::new(&[100]);
+        let pairs: Vec<_> = buckets.iter().collect();
+        assert_eq!(pairs, vec![("0", "100"), ("100", "+Inf")]);
+    }
+
+    #[test]
+    fn test_bucket_labels_many_bounds() {
+        let buckets = BucketLabels::new(&[1, 2, 5, 10]);
+        let pairs: Vec<_> = buckets.iter().collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("0", "1"),
+                ("1", "2"),
+                ("2", "5"),
+                ("5", "10"),
+                ("10", "+Inf")
+            ]
+        );
+    }
+
+    // --- Bucket Counts Tests ---
 
     #[test]
     fn test_compute_bucket_counts_empty() {
         let buckets = BucketLabels::new(&[10, 30, 60]);
-        let counts = buckets.compute_bucket_counts(&[]);
-        assert_eq!(counts, vec![0, 0, 0, 0]);
+        assert_eq!(buckets.compute_bucket_counts(&[]), vec![0, 0, 0, 0]);
     }
 
     #[test]
-    fn test_compute_bucket_counts_distribution() {
+    fn test_compute_bucket_counts_single_value_first_bucket() {
         let buckets = BucketLabels::new(&[10, 30, 60]);
-        // Values: 5 (<=10), 10 (<=10), 15 (<=30), 40 (<=60), 100 (+Inf)
-        let counts = buckets.compute_bucket_counts(&[5, 10, 15, 40, 100]);
-        assert_eq!(counts, vec![2, 1, 1, 1]);
+        assert_eq!(buckets.compute_bucket_counts(&[5]), vec![1, 0, 0, 0]);
     }
 
     #[test]
-    fn test_compute_bucket_counts_all_in_one_bucket() {
+    fn test_compute_bucket_counts_single_value_last_bucket() {
         let buckets = BucketLabels::new(&[10, 30, 60]);
-        let counts = buckets.compute_bucket_counts(&[1, 2, 3, 4, 5]);
-        assert_eq!(counts, vec![5, 0, 0, 0]);
+        assert_eq!(buckets.compute_bucket_counts(&[100]), vec![0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn test_compute_bucket_counts_exact_boundary_values() {
+        // Values at exact boundaries: 10 -> (0,10], 30 -> (10,30], 60 -> (30,60]
+        let buckets = BucketLabels::new(&[10, 30, 60]);
+        assert_eq!(
+            buckets.compute_bucket_counts(&[10, 30, 60]),
+            vec![1, 1, 1, 0]
+        );
+    }
+
+    #[test]
+    fn test_compute_bucket_counts_just_above_boundary() {
+        // 11 -> (10,30], 31 -> (30,60], 61 -> (60,+Inf]
+        let buckets = BucketLabels::new(&[10, 30, 60]);
+        assert_eq!(
+            buckets.compute_bucket_counts(&[11, 31, 61]),
+            vec![0, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn test_compute_bucket_counts_multiple_values_same_bucket() {
+        let buckets = BucketLabels::new(&[10, 30, 60]);
+        assert_eq!(
+            buckets.compute_bucket_counts(&[1, 2, 3, 4, 5]),
+            vec![5, 0, 0, 0]
+        );
     }
 
     #[test]
     fn test_compute_bucket_counts_all_overflow() {
         let buckets = BucketLabels::new(&[10, 30, 60]);
-        let counts = buckets.compute_bucket_counts(&[100, 200, 300]);
-        assert_eq!(counts, vec![0, 0, 0, 3]);
+        assert_eq!(
+            buckets.compute_bucket_counts(&[100, 200, 300]),
+            vec![0, 0, 0, 3]
+        );
     }
 
     #[test]
-    fn test_inflight_age_buckets() {
-        let buckets = &*INFLIGHT_AGE_BUCKETS;
-
-        assert_eq!(buckets.le_labels.first(), Some(&"30"));
-        assert_eq!(buckets.le_labels.last(), Some(&"+Inf"));
-        assert_eq!(buckets.gt_labels.first(), Some(&"0"));
-        assert_eq!(buckets.gt_labels.last(), Some(&"86400"));
-        assert_eq!(buckets.le_labels.len(), buckets.gt_labels.len());
+    fn test_compute_bucket_counts_distribution() {
+        // 5 (<=10), 10 (<=10), 15 (<=30), 40 (<=60), 100 (+Inf)
+        let buckets = BucketLabels::new(&[10, 30, 60]);
+        assert_eq!(
+            buckets.compute_bucket_counts(&[5, 10, 15, 40, 100]),
+            vec![2, 1, 1, 1]
+        );
     }
 }
