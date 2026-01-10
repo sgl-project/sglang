@@ -259,31 +259,40 @@ class DFlashDraftModel(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if name.endswith(".bias") and name not in params_dict:
-                # Some quantized checkpoints may have extra biases.
-                # (May still be mappable to a fused/parallel param.)
-                pass
 
+        def resolve_param_name(name: str) -> Optional[str]:
+            if name in params_dict:
+                return name
+            if name.startswith("model."):
+                stripped_name = name[len("model.") :]
+                if stripped_name in params_dict:
+                    return stripped_name
+            else:
+                prefixed_name = f"model.{name}"
+                if prefixed_name in params_dict:
+                    return prefixed_name
+            return None
+
+        for name, loaded_weight in weights:
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
                     continue
                 mapped_name = name.replace(weight_name, param_name)
-                param = params_dict.get(mapped_name)
-                if param is None:
+                resolved_name = resolve_param_name(mapped_name)
+                if resolved_name is None:
                     continue
+                param = params_dict[resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                if name.endswith(".bias") and name not in params_dict:
+                resolved_name = resolve_param_name(name)
+                if resolved_name is None:
+                    # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
-            param = params_dict.get(name)
-            if param is None:
-                # Ignore unexpected weights (e.g., HF rotary caches).
-                continue
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
+                param = params_dict[resolved_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
 
 
 EntryClass = DFlashDraftModel
