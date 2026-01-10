@@ -689,7 +689,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.append(get_user_message(request.input))
         else:
             if prev_response is not None:
-                prev_outputs = copy(prev_response.output)
+                prev_outputs = copy.copy(prev_response.output)
             else:
                 prev_outputs = []
             for response_msg in request.input:
