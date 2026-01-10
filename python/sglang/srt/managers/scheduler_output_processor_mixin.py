@@ -940,6 +940,13 @@ class SchedulerOutputProcessorMixin:
                 if mask_prefix is None:
                     mask_prefix = 0
 
+                # SECURITY: Fingerprint-only mode (never send raw positions/scores to client)
+                # Auto-enabled when mask_prefix > 0 to prevent privacy leakage
+                fingerprint_only = getattr(req, "attention_fingerprint_only", None)
+                if fingerprint_only is None:
+                    # Auto-enable secure mode when privacy masking is active
+                    fingerprint_only = mask_prefix > 0
+
                 # Current position for distance calculations
                 current_pos = len(req.origin_input_ids) + len(req.output_ids) - 1
 
@@ -1001,42 +1008,53 @@ class SchedulerOutputProcessorMixin:
                                 layer_entry["topk_mass"] = topk_mass
                         layers_data[layer_id] = layer_entry
 
-                    attention_info = {
-                        "schema_version": 1,
-                        "mode": "raw",
-                        "layers": layers_data,
-                        # Also include last layer at top level for backward compatibility
-                        "layer_id": getattr(logits_output, "attention_layer_id", -1),
-                        # Server-side fingerprint (computed from unmasked data)
-                        "fingerprint": server_fingerprint,
-                        "manifold_zone": manifold_zone,
-                    }
-                    # Copy last layer data to top level for backward compatibility
-                    if logits_output.attention_token_positions is not None:
-                        top_pos = logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
-                        top_scores = logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
-                        top_logits = (
-                            logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
-                            if logits_output.attention_topk_logits is not None else None
-                        )
-                        # Apply privacy mask to top-level data
-                        if mask_prefix > 0:
-                            top_pos, top_scores, top_logits = apply_attention_privacy_mask(
-                                top_pos, top_scores, mask_prefix, top_logits
+                    # SECURITY: In fingerprint_only mode, only return fingerprint (no raw data)
+                    if fingerprint_only:
+                        attention_info = {
+                            "schema_version": 1,
+                            "mode": "fingerprint_only",
+                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                            # Server-side fingerprint (computed from unmasked data)
+                            "fingerprint": server_fingerprint,
+                            "manifold_zone": manifold_zone,
+                        }
+                    else:
+                        attention_info = {
+                            "schema_version": 1,
+                            "mode": "raw",
+                            "layers": layers_data,
+                            # Also include last layer at top level for backward compatibility
+                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                            # Server-side fingerprint (computed from unmasked data)
+                            "fingerprint": server_fingerprint,
+                            "manifold_zone": manifold_zone,
+                        }
+                        # Copy last layer data to top level for backward compatibility
+                        if logits_output.attention_token_positions is not None:
+                            top_pos = logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
+                            top_scores = logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
+                            top_logits = (
+                                logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
+                                if logits_output.attention_topk_logits is not None else None
                             )
-                        attention_info["token_positions"] = top_pos
-                        attention_info["attention_scores"] = top_scores
-                        if top_logits is not None:
-                            attention_info["topk_logits"] = top_logits
-                    if logits_output.attention_logsumexp_candidates is not None:
-                        lse_val = logits_output.attention_logsumexp_candidates[i].cpu().item()
-                        attention_info["logsumexp_candidates"] = lse_val
-                        # Compute topk_mass for top-level (backward compat)
-                        # Use vectorized torch ops (not Python loop)
-                        if logits_output.attention_topk_logits is not None:
-                            logits_tensor = logits_output.attention_topk_logits[i][:req_top_k]
-                            topk_mass = torch.exp(logits_tensor - lse_val).sum().clamp(max=1.0).item()
-                            attention_info["topk_mass"] = topk_mass
+                            # Apply privacy mask to top-level data
+                            if mask_prefix > 0:
+                                top_pos, top_scores, top_logits = apply_attention_privacy_mask(
+                                    top_pos, top_scores, mask_prefix, top_logits
+                                )
+                            attention_info["token_positions"] = top_pos
+                            attention_info["attention_scores"] = top_scores
+                            if top_logits is not None:
+                                attention_info["topk_logits"] = top_logits
+                        if logits_output.attention_logsumexp_candidates is not None:
+                            lse_val = logits_output.attention_logsumexp_candidates[i].cpu().item()
+                            attention_info["logsumexp_candidates"] = lse_val
+                            # Compute topk_mass for top-level (backward compat)
+                            # Use vectorized torch ops (not Python loop)
+                            if logits_output.attention_topk_logits is not None:
+                                logits_tensor = logits_output.attention_topk_logits[i][:req_top_k]
+                                topk_mass = torch.exp(logits_tensor - lse_val).sum().clamp(max=1.0).item()
+                                attention_info["topk_mass"] = topk_mass
                 else:
                     # Single-layer capture (backward compatible format)
                     # First extract UNMASKED data for fingerprint computation
@@ -1052,42 +1070,53 @@ class SchedulerOutputProcessorMixin:
                     )
                     manifold_zone = classify_manifold_zone(server_fingerprint)
 
-                    # Now apply privacy mask if needed
-                    single_pos = unmasked_pos
-                    single_scores = unmasked_scores
-                    single_logits = (
-                        logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
-                        if logits_output.attention_topk_logits is not None else None
-                    )
-
-                    # Apply privacy mask
-                    if mask_prefix > 0:
-                        single_pos, single_scores, single_logits = apply_attention_privacy_mask(
-                            single_pos, single_scores, mask_prefix, single_logits
+                    # SECURITY: In fingerprint_only mode, only return fingerprint (no raw data)
+                    if fingerprint_only:
+                        attention_info = {
+                            "schema_version": 1,
+                            "mode": "fingerprint_only",
+                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                            # Server-side fingerprint (computed from unmasked data)
+                            "fingerprint": server_fingerprint,
+                            "manifold_zone": manifold_zone,
+                        }
+                    else:
+                        # Now apply privacy mask if needed
+                        single_pos = unmasked_pos
+                        single_scores = unmasked_scores
+                        single_logits = (
+                            logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
+                            if logits_output.attention_topk_logits is not None else None
                         )
 
-                    attention_info = {
-                        "schema_version": 1,
-                        "mode": "raw",
-                        "token_positions": single_pos,
-                        "attention_scores": single_scores,
-                        "layer_id": getattr(logits_output, "attention_layer_id", -1),
-                        # Server-side fingerprint (computed from unmasked data)
-                        "fingerprint": server_fingerprint,
-                        "manifold_zone": manifold_zone,
-                    }
-                    # Add true probability info if available
-                    if single_logits is not None:
-                        attention_info["topk_logits"] = single_logits
-                    if logits_output.attention_logsumexp_candidates is not None:
-                        lse_val = logits_output.attention_logsumexp_candidates[i].cpu().item()
-                        attention_info["logsumexp_candidates"] = lse_val
-                        # Compute topk_mass: fraction of attention captured by top-k
-                        # Vectorized computation for efficiency
-                        if logits_output.attention_topk_logits is not None:
-                            logits_tensor = logits_output.attention_topk_logits[i][:req_top_k]
-                            topk_mass = torch.exp(logits_tensor - lse_val).sum().clamp(max=1.0).item()
-                            attention_info["topk_mass"] = topk_mass
+                        # Apply privacy mask
+                        if mask_prefix > 0:
+                            single_pos, single_scores, single_logits = apply_attention_privacy_mask(
+                                single_pos, single_scores, mask_prefix, single_logits
+                            )
+
+                        attention_info = {
+                            "schema_version": 1,
+                            "mode": "raw",
+                            "token_positions": single_pos,
+                            "attention_scores": single_scores,
+                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                            # Server-side fingerprint (computed from unmasked data)
+                            "fingerprint": server_fingerprint,
+                            "manifold_zone": manifold_zone,
+                        }
+                        # Add true probability info if available
+                        if single_logits is not None:
+                            attention_info["topk_logits"] = single_logits
+                        if logits_output.attention_logsumexp_candidates is not None:
+                            lse_val = logits_output.attention_logsumexp_candidates[i].cpu().item()
+                            attention_info["logsumexp_candidates"] = lse_val
+                            # Compute topk_mass: fraction of attention captured by top-k
+                            # Vectorized computation for efficiency
+                            if logits_output.attention_topk_logits is not None:
+                                logits_tensor = logits_output.attention_topk_logits[i][:req_top_k]
+                                topk_mass = torch.exp(logits_tensor - lse_val).sum().clamp(max=1.0).item()
+                                attention_info["topk_mass"] = topk_mass
 
                 # Add decode_step and think phase to the attention info
                 attention_info["decode_step"] = req.attention_tokens_decode_step

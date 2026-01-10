@@ -124,6 +124,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             attention_capture_layer_ids=request.attention_capture_layer_ids,
             attention_sketch_mode=request.attention_sketch_mode,
             attention_fingerprint_mode=request.attention_fingerprint_mode,
+            attention_fingerprint_only=request.attention_fingerprint_only,
             attention_mask_prefix=request.attention_mask_prefix,
             include_prompt_attention=request.include_prompt_attention,
             attention_capture_head_ids=request.attention_capture_head_ids,
