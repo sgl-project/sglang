@@ -58,23 +58,25 @@ jobs:
             sizes: "3072 4096"
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Check if group already completed
+      - name: Try to download existing group config
+        id: download_existing
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          name: config-${{ matrix.runner }}-group${{ matrix.batch_group.name }}
+          path: ./existing_config/
+          if_no_artifact_found: ignore
+          search_artifacts: true
+          workflow_conclusion: success
+        continue-on-error: true
+
+      - name: Check if should skip
         id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          artifact_name="config-${{ matrix.runner }}-group${{ matrix.batch_group.name }}"
-          echo "Checking for existing artifact: $artifact_name"
-
-          # Use name filter for fast lookup (single API call)
-          exists=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=${artifact_name}" \
-            --jq '.artifacts[] | select(.expired == false) | .id' 2>/dev/null | head -1)
-
-          if [ -n "$exists" ]; then
-            echo "Found existing artifact (id: $exists), skipping group ${{ matrix.batch_group.name }}"
+          if [ -d "./existing_config" ] && [ "$(find ./existing_config -name '*.json' 2>/dev/null | head -1)" ]; then
+            echo "Found existing config, skipping group ${{ matrix.batch_group.name }}"
             echo "skip=true" >> $GITHUB_OUTPUT
           else
-            echo "No existing artifact found, will run tuning for group ${{ matrix.batch_group.name }}"
+            echo "No existing config found, will run tuning for group ${{ matrix.batch_group.name }}"
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
