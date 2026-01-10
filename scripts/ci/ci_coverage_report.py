@@ -17,10 +17,10 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# Add the python directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "python"))
+# Add the ci_register module path directly to avoid heavy sglang imports
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "python" / "sglang" / "test" / "ci"))
 
-from sglang.test.ci.ci_register import CIRegistry, HWBackend, ut_parse_one_file
+from ci_register import CIRegistry, HWBackend, ut_parse_one_file
 
 
 def collect_all_tests(registered_dir: str) -> list[CIRegistry]:

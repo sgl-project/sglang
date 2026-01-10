@@ -29,10 +29,6 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
-        run: |
-          pip install -e "python/[dev]"
-
       - name: Generate CI Coverage Report
         run: |
           python scripts/ci/ci_coverage_report.py --output-format ${{ inputs.output_format || 'markdown' }}
