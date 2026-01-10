@@ -6,6 +6,7 @@ import unittest
 import aiohttp
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -25,7 +26,7 @@ class TestRoutingKeyScheduling(CustomTestCase):
     def setUpClass(cls):
         os.environ["SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG"] = "1"
 
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
+        cls.model = "Qwen/Qwen3-0.6B"
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         cls.stdout = open(STDOUT_FILENAME, "w")
