@@ -1,0 +1,8 @@
+{
+  "n_fingerprints": 50000,
+  "spectral_gap": 8.533986488595995e-08,
+  "effective_dimension": 22,
+  "graph_connectivity": -8.664239826280598e-08,
+  "high_coherence_threshold": 0.9408917054277707,
+  "low_coherence_threshold": 0.9045166718960238
+}
