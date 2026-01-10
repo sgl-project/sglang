@@ -3,9 +3,8 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, List, Optional
 
-from sglang.srt.utils.log_utils import create_log_targets, log_json
 from sglang.srt.environ import envs
-
+from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch

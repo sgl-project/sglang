@@ -8,15 +8,18 @@ from pathlib import Path
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 
-
 class TestLogUtils(unittest.TestCase):
     def test_stdout(self):
         for targets in [["stdout"], None]:
             with self.subTest(targets=targets):
-                loggers = create_log_targets(targets=targets, name_prefix=f"test_{targets}")
+                loggers = create_log_targets(
+                    targets=targets, name_prefix=f"test_{targets}"
+                )
                 self.assertEqual(len(loggers), 1)
 
-                data = _log_and_capture_stdout(loggers[0], "test.event", {"key": "value"})
+                data = _log_and_capture_stdout(
+                    loggers[0], "test.event", {"key": "value"}
+                )
                 self.assertIn("timestamp", data)
                 self.assertEqual(data["event"], "test.event")
                 self.assertEqual(data["key"], "value")

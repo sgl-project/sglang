@@ -61,7 +61,9 @@ class RequestLogger:
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
 
     def _setup_targets(self) -> List[logging.Logger]:
-        return create_log_targets(targets=self.log_requests_target, name_prefix=__name__)
+        return create_log_targets(
+            targets=self.log_requests_target, name_prefix=__name__
+        )
 
     def configure(
         self,
