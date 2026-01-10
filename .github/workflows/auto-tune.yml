@@ -2,105 +2,157 @@ name: Auto Tune Kernels
 
 permissions:
   contents: write
+  actions: read
 
 on:
   workflow_dispatch:
     inputs:
       model:
-        description: 'Model name/path to auto-tune.'
+        description: "Model name/path to auto-tune."
         required: false
         type: string
-        default: 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+        default: "Qwen/Qwen3-30B-A3B-Instruct-2507"
       tp_size:
-        description: 'Tensor parallel size.'
+        description: "Tensor parallel size."
         required: false
         type: string
-        default: '8'
+        default: "8"
       ep_size:
-        description: 'Expert parallel size.'
+        description: "Expert parallel size."
         required: false
         type: string
-        default: '8'
-      batch_sizes:
-        description: 'Space-separated batch sizes (e.g. "1 2 4 8"). Leave empty for defaults.'
-        required: false
-        type: string
-        default: ''
+        default: "8"
       create_pr:
-        description: 'Create a PR with tuned configs (true/false).'
+        description: "Create a PR with tuned configs (true/false)."
         required: false
         type: string
-        default: 'false'
+        default: "false"
       runner:
-        description: "Runner label to use (e.g. 4-gpu-a10). Use 'all' to run the full matrix."
+        description: "Runner label to use (e.g. 4-gpu-b200). Use 'all' to run the full matrix."
         required: false
         type: string
-        default: 'all'
+        default: "all"
 
 env:
   CONFIG_DIR: python/sglang/srt/layers/moe/fused_moe_triton/configs
 
 jobs:
-  auto-tune-matrix:
+  # Tune each batch group (uses Ray for multi-GPU parallelism within group)
+  tune-group:
     if: github.repository == 'sgl-project/sglang'
     strategy:
       fail-fast: false
       matrix:
         runner: ${{ fromJSON(inputs.runner == 'all' && '["4-gpu-b200","4-gpu-gb200","4-gpu-h100","8-gpu-b200","8-gpu-h20","8-gpu-h200"]' || format('["{0}"]', inputs.runner)) }}
+        batch_group:
+          - name: "A"
+            sizes: "1 2 4 8 16 24 32 48"
+          - name: "B"
+            sizes: "64 96 128 256 512 1024 1536 2048"
+          - name: "C"
+            sizes: "3072 4096"
     runs-on: ${{ matrix.runner }}
     steps:
+      - name: Check if group already completed
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          artifact_name="config-${{ matrix.runner }}-group${{ matrix.batch_group.name }}"
+          exists=$(gh api repos/${{ github.repository }}/actions/artifacts \
+            --jq ".artifacts[] | select(.name == \"$artifact_name\" and .expired == false) | .id" \
+            2>/dev/null | head -1)
+          if [ -n "$exists" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Group ${{ matrix.batch_group.name }} already completed, skipping"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Checkout code
+        if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
 
       - name: Install dependencies
+        if: steps.check.outputs.skip != 'true'
         run: |
           bash scripts/ci/ci_install_dependency.sh
           pip install ray
 
-      - name: Restore checkpoint cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.sglang/auto_tune_checkpoints/
-          key: auto-tune-${{ matrix.runner }}-${{ inputs.model }}-tp${{ inputs.tp_size }}-ep${{ inputs.ep_size }}
-
-      - name: Run auto tune
+      - name: Run auto tune for group ${{ matrix.batch_group.name }}
+        if: steps.check.outputs.skip != 'true'
         run: |
-          args=(--model "${{ inputs.model }}" --tp-size "${{ inputs.tp_size }}" --ep-size "${{ inputs.ep_size }}")
-          args+=(--output-dir "${{ env.CONFIG_DIR }}")
-          args+=(--resume --checkpoint-dir ~/.sglang/auto_tune_checkpoints/)
-          if [[ -n "${{ inputs.batch_sizes }}" ]]; then
-            args+=(--batch-sizes ${{ inputs.batch_sizes }})
-          fi
-          python3 -m sglang.auto_tune "${args[@]}"
+          python3 -m sglang.auto_tune \
+            --model "${{ inputs.model }}" \
+            --tp-size "${{ inputs.tp_size }}" \
+            --ep-size "${{ inputs.ep_size }}" \
+            --batch-sizes ${{ matrix.batch_group.sizes }} \
+            --output-dir ./tuned_configs/
 
-      - name: Upload tuned configs
-        if: always()
+      - name: Upload tuned config for group
+        if: steps.check.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: tuned-configs-${{ matrix.runner }}
-          path: ${{ env.CONFIG_DIR }}/**
+          name: config-${{ matrix.runner }}-group${{ matrix.batch_group.name }}
+          path: ./tuned_configs/**
           if-no-files-found: warn
+          retention-days: 90
 
-  commit-configs:
-    if: github.repository == 'sgl-project/sglang' && inputs.create_pr == 'true'
-    needs: auto-tune-matrix
+  # Merge all group configs
+  merge-configs:
+    if: github.repository == 'sgl-project/sglang'
+    needs: tune-group
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download tuned configs
+      - name: Download all artifacts (current run)
         uses: actions/download-artifact@v4
         with:
-          pattern: tuned-configs-*
-          path: ${{ env.CONFIG_DIR }}
+          pattern: config-*
+          path: ./downloaded_configs/
           merge-multiple: true
 
+      - name: Download existing artifacts from previous runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ./downloaded_configs/
+
+          # Get all non-expired config-*-group* artifacts
+          gh api repos/${{ github.repository }}/actions/artifacts \
+            --jq '.artifacts[] | select(.name | startswith("config-")) | select(.expired == false) | "\(.id) \(.name)"' \
+            2>/dev/null | while read -r id name; do
+            if [ -z "$id" ]; then
+              continue
+            fi
+
+            echo "Downloading artifact: $name (id: $id)"
+            gh api repos/${{ github.repository }}/actions/artifacts/$id/zip > artifact.zip 2>/dev/null || continue
+            unzip -o artifact.zip -d ./downloaded_configs/ 2>/dev/null || true
+            rm -f artifact.zip
+          done
+
+          echo "Downloaded configs:"
+          find ./downloaded_configs -name "*.json" 2>/dev/null | head -20 || echo "No configs found"
+
+      - name: Merge configs
+        run: python3 scripts/merge_tuned_configs.py --input-dir ./downloaded_configs/ --output-dir ${{ env.CONFIG_DIR }}
+
+      - name: Upload merged configs
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-configs-all
+          path: ${{ env.CONFIG_DIR }}/**
+          if-no-files-found: warn
+
       - name: Create PR with tuned configs
+        if: inputs.create_pr == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "Auto-tune fused MoE configs (all runners)"
+          commit-message: "Auto-tune fused MoE configs"
           title: "Auto-tuned fused MoE configs"
           body: |
             Auto-tuned fused MoE Triton configs aggregated from all runners.
