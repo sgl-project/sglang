@@ -1017,7 +1017,9 @@ class SchedulerMetricsCollector:
             self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
             self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
 
-        self._log_gauge(self.num_unique_running_routing_keys, stats.num_unique_running_routing_keys)
+        self._log_gauge(
+            self.num_unique_running_routing_keys, stats.num_unique_running_routing_keys
+        )
         self.routing_key_running_req_count.set_by_current_observations(
             self.labels, stats.routing_key_running_req_counts
         )
