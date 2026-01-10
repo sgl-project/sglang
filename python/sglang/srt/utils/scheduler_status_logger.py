@@ -3,14 +3,14 @@ from __future__ import annotations
 import time
 from typing import List, Optional
 
-from sglang.srt.utils.log_utils import create_log_target, log_json
+from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 
 class SchedulerStatusLogger:
     DUMP_INTERVAL_S = 60.0
 
     def __init__(self, targets: List[str]):
-        self.loggers = [create_log_target(t) for t in targets]
+        self.loggers = create_log_targets(targets)
         self.last_dump_time = 0.0
 
     def maybe_dump(self, running_rids: List[str], queued_rids: List[str]) -> None:

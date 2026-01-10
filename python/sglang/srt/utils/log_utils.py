@@ -13,21 +13,21 @@ import torch.distributed as dist
 
 def create_log_targets(targets: Optional[List[str]]) -> List[logging.Logger]:
     if not targets:
-        return [create_log_target_stdout()]
-    return [create_log_target(t) for t in targets]
+        return [_create_log_target_stdout()]
+    return [_create_log_target(t) for t in targets]
 
 
-def create_log_target(target: str) -> logging.Logger:
+def _create_log_target(target: str) -> logging.Logger:
     if target.lower() == "stdout":
-        return create_log_target_stdout()
-    return create_log_target_file(target)
+        return _create_log_target_stdout()
+    return _create_log_target_file(target)
 
 
-def create_log_target_stdout() -> logging.Logger:
+def _create_log_target_stdout() -> logging.Logger:
     return _create_logger_with_handler(f"{__name__}.stdout", logging.StreamHandler())
 
 
-def create_log_target_file(directory: str) -> logging.Logger:
+def _create_log_target_file(directory: str) -> logging.Logger:
     os.makedirs(directory, exist_ok=True)
     hostname = socket.gethostname()
     rank = dist.get_rank() if dist.is_initialized() else 0
