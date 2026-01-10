@@ -58,45 +58,33 @@ jobs:
             sizes: "3072 4096"
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Debug - Check artifacts via API
+      - name: Check if group already completed
+        id: check
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           artifact_name="config-${{ matrix.runner }}-group${{ matrix.batch_group.name }}"
-          echo "=== Looking for artifact: $artifact_name ==="
-          echo ""
-          echo "=== API Response (with name filter) ==="
-          curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=${artifact_name}" | head -100
-          echo ""
-          echo "=== First 5 artifacts in repo ==="
-          curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?per_page=5" | \
-            jq '.artifacts[] | {name, id, expired, created_at}' || echo "jq not available or API call failed"
+          echo "Checking for existing artifact: $artifact_name"
 
-      - name: Try to download existing group config
-        id: download_existing
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          name: config-${{ matrix.runner }}-group${{ matrix.batch_group.name }}
-          path: ./existing_config/
-          if_no_artifact_found: ignore
-          search_artifacts: true
-          workflow_conclusion: success
-        continue-on-error: true
+          # Use curl + python to check for existing artifact (gh/jq not available on self-hosted runner)
+          response=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=${artifact_name}")
 
-      - name: Check if should skip
-        id: check
-        run: |
-          echo "=== Checking downloaded files ==="
-          ls -la ./existing_config/ 2>/dev/null || echo "No existing_config directory"
-          find ./existing_config -name '*.json' 2>/dev/null || echo "No JSON files found"
+          exists=$(echo "$response" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          artifacts = data.get('artifacts', [])
+          for a in artifacts:
+              if not a.get('expired', True):
+                  print(a['id'])
+                  break
+          " 2>/dev/null)
 
-          if [ -d "./existing_config" ] && [ "$(find ./existing_config -name '*.json' 2>/dev/null | head -1)" ]; then
-            echo "Found existing config, skipping group ${{ matrix.batch_group.name }}"
+          if [ -n "$exists" ]; then
+            echo "Found existing artifact (id: $exists), skipping group ${{ matrix.batch_group.name }}"
             echo "skip=true" >> $GITHUB_OUTPUT
           else
-            echo "No existing config found, will run tuning for group ${{ matrix.batch_group.name }}"
+            echo "No existing artifact found, will run tuning for group ${{ matrix.batch_group.name }}"
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
