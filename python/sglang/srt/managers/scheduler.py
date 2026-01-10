@@ -564,8 +564,6 @@ class Scheduler(
             else self.tp_group
         )
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
-        self.dp_tp_entry_rank = self.dp_tp_group.first_rank
-        self.is_dp_tp_entry_rank = self.dp_tp_group.rank_in_group == 0
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
@@ -1375,14 +1373,16 @@ class Scheduler(
         # Since the Scheduler is single-threaded, any large CPU cost will impact
         # handling of other messages. For example, CPU hits 99.9% can significantly
         # increase the CUDA kernel launch time.
-        if self.is_dp_tp_entry_rank:
+        if self.dp_tp_group.rank_in_group == 0:
             # Only the entry rank materializes once from dict.
             image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
             # Broadcast to other TP ranks (use src=0 within the group).
             if group_world_size > 1:
                 obj_list = [image_inputs]
                 torch.distributed.broadcast_object_list(
-                    obj_list, src=self.dp_tp_entry_rank, group=self.dp_tp_cpu_group
+                    obj_list,
+                    src=self.dp_tp_group.first_rank,
+                    group=self.dp_tp_cpu_group,
                 )
                 image_inputs = obj_list[0]
         else:
@@ -1390,7 +1390,9 @@ class Scheduler(
             if group_world_size > 1:
                 obj_list = [None]
                 torch.distributed.broadcast_object_list(
-                    obj_list, src=self.dp_tp_entry_rank, group=self.dp_tp_cpu_group
+                    obj_list,
+                    src=self.dp_tp_group.first_rank,
+                    group=self.dp_tp_cpu_group,
                 )
                 image_inputs = obj_list[0]
             else:
