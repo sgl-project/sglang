@@ -277,8 +277,10 @@ class BenchmarkWorker:
     ) -> Dict[str, int]:
         best_config = None
         best_time = float("inf")
+        update_interval = 10
         with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
-            for config in tqdm(search_space, miniters=10):
+            pbar = tqdm(total=len(search_space))
+            for i, config in enumerate(search_space):
                 try:
                     kernel_time = benchmark_config(
                         config,
@@ -297,11 +299,21 @@ class BenchmarkWorker:
                     )
                 except (triton.runtime.autotuner.OutOfResources, RuntimeError):
                     # Some configurations may be invalid and fail to compile.
+                    if (i + 1) % update_interval == 0:
+                        pbar.update(update_interval)
                     continue
 
                 if kernel_time < best_time:
                     best_time = kernel_time
                     best_config = config
+
+                if (i + 1) % update_interval == 0:
+                    pbar.update(update_interval)
+            # Update any remaining progress
+            remaining = len(search_space) % update_interval
+            if remaining > 0:
+                pbar.update(remaining)
+            pbar.close()
         now = datetime.now()
         print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
         assert best_config is not None
