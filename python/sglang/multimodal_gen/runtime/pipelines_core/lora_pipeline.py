@@ -1,5 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
+#
 # SPDX-License-Identifier: Apache-2.0
 import os
 from collections import defaultdict
@@ -21,7 +21,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
-    normalize_lora_state_dict,
+    prepare_lora_state_dict_for_target,
+    set_lora_weights_dynamic_rank,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
@@ -259,12 +260,20 @@ class LoRAPipeline(ComposedPipelineBase):
                 lora_A_name in self.lora_adapters[lora_nickname]
                 and lora_B_name in self.lora_adapters[lora_nickname]
             ):
-                layer.set_lora_weights(
-                    self.lora_adapters[lora_nickname][lora_A_name],
-                    self.lora_adapters[lora_nickname][lora_B_name],
+                lora_A = self.lora_adapters[lora_nickname][lora_A_name]
+                lora_B = self.lora_adapters[lora_nickname][lora_B_name]
+
+                set_lora_weights_dynamic_rank(
+                    layer,
+                    lora_A,
+                    lora_B,
                     lora_path=lora_path,
                     strength=strength,
+                    rank=rank,
+                    layer_name=name,
+                    logger=logger,
                 )
+
                 adapted_count += 1
             else:
                 if rank == 0:
@@ -322,7 +331,20 @@ class LoRAPipeline(ComposedPipelineBase):
             lora_local_path = maybe_download_lora(lora_path)
 
         raw_state_dict = load_file(lora_local_path)
-        lora_state_dict = normalize_lora_state_dict(raw_state_dict, logger=logger)
+
+        # Normalize + (if needed) fuse split projections to match the target model's fused modules.
+        target_layer_names: list[str] = list(self.lora_layers.keys())
+        if self.lora_layers_transformer_2:
+            target_layer_names.extend(self.lora_layers_transformer_2.keys())
+        if self.lora_layers_critic:
+            target_layer_names.extend(self.lora_layers_critic.keys())
+
+        lora_state_dict = prepare_lora_state_dict_for_target(
+            raw_state_dict,
+            target_lora_layer_names=target_layer_names,
+            logger=logger,
+            rank=rank,
+        )
 
         if lora_nickname in self.lora_adapters:
             self.lora_adapters[lora_nickname].clear()
