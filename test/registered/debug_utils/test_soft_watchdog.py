@@ -29,7 +29,11 @@ class BaseTestSoftWatchdog:
         cls.stderr = io.StringIO()
         cls.process = None
 
-        expect_timeout = unittest.TestCase().assertRaises(TimeoutError) if cls.triggers_during_init else nullcontext()
+        expect_timeout = (
+            unittest.TestCase().assertRaises(TimeoutError)
+            if cls.triggers_during_init
+            else nullcontext()
+        )
         with cls.env_override(), expect_timeout:
             cls.process = popen_launch_server(
                 "Qwen/Qwen3-0.6B",

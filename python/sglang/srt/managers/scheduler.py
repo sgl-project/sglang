@@ -259,7 +259,9 @@ class Scheduler(
     ):
         self.is_initializing = True
         if (x := server_args.soft_watchdog_timeout) is not None:
-            self.soft_watchdog = create_scheduler_watchdog(self, watchdog_timeout=x, soft=True)
+            self.soft_watchdog = create_scheduler_watchdog(
+                self, watchdog_timeout=x, soft=True
+            )
 
         # Parse args
         self.server_args = server_args
