@@ -2918,7 +2918,7 @@ def run_scheduler_process(
                     "tp_rank": tp_rank,
                     "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
                     "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
-                    "parallelism_config": parallelism_config,
+                    "parallelism_config_info": parallelism_config,
                 }
             )
 
