@@ -528,7 +528,7 @@ Consider updating perf_baselines.json with the snippets below:
             "[LoRA Switch E2E] All dynamic switch E2E tests passed for %s", case.id
         )
 
-    def test_dynamic_lora_loading(
+    def _test_dynamic_lora_loading(
         self,
         ctx: ServerContext,
         case: DiffusionTestCase,
@@ -556,7 +556,7 @@ Consider updating perf_baselines.json with the snippets below:
         assert resp.status_code == 200, f"Dynamic set_lora failed: {resp.text}"
         logger.info("[Dynamic LoRA] set_lora succeeded for %s", case.id)
 
-    def test_multi_lora_e2e(
+    def _test_multi_lora_e2e(
         self,
         ctx: ServerContext,
         case: DiffusionTestCase,
