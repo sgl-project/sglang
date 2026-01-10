@@ -21,7 +21,8 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -34,9 +35,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_cuda
 
 logger = logging.getLogger(__name__)
+
+
+_is_cuda = is_cuda()
 
 
 class Glm4MoeModelNextN(nn.Module):
@@ -67,12 +71,19 @@ class Glm4MoeModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            else None
+        )
+
         self.decoder = Glm4MoeDecoderLayer(
             config,
             0,
             quant_config=quant_config,
             is_nextn=True,
             prefix=add_prefix("decoder", prefix),
+            alt_stream=self.alt_stream,
         )
 
         self.shared_head = nn.Module()
@@ -127,6 +138,9 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self.pp_group = get_pp_group()
+        self.num_fused_shared_experts = 0
+        self.determine_num_fused_shared_experts()
         self.model = Glm4MoeModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -138,10 +152,6 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
-
-        self.num_fused_shared_experts = (
-            0 if get_global_server_args().disable_shared_experts_fusion else 1
-        )
 
     @torch.no_grad()
     def forward(
