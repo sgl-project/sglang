@@ -150,19 +150,25 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:routing_keys_active",
             "sglang:num_unique_routing_keys",
             "sglang:routing_key_running_req_count",
+            "sglang:routing_key_running_and_waiting_req_count",
         ]
         for metric in essential_metrics:
             self.assertIn(metric, metrics_text, f"Missing metric: {metric}")
 
-        gt_le_pairs = set()
-        for sample in metrics.get("sglang:routing_key_running_req_count", []):
-            gt_le_pairs.add((sample.labels.get("gt"), sample.labels.get("le")))
+        # Verify routing key GaugeHistogram buckets
         expected_buckets = len(ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS) + 1
-        self.assertEqual(
-            len(gt_le_pairs),
-            expected_buckets,
-            f"Expected {expected_buckets} buckets, got {len(gt_le_pairs)}",
-        )
+        for metric_name in [
+            "sglang:routing_key_running_req_count",
+            "sglang:routing_key_running_and_waiting_req_count",
+        ]:
+            gt_le_pairs = set()
+            for sample in metrics.get(metric_name, []):
+                gt_le_pairs.add((sample.labels.get("gt"), sample.labels.get("le")))
+            self.assertEqual(
+                len(gt_le_pairs),
+                expected_buckets,
+                f"{metric_name}: Expected {expected_buckets} buckets, got {len(gt_le_pairs)}",
+            )
 
         self.assertIn(f'model_name="{_MODEL_NAME}"', metrics_text)
         self.assertIn("_sum{", metrics_text)
