@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
@@ -14,9 +14,9 @@ from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.metrics.collector import (
+    ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
     SchedulerMetricsCollector,
     SchedulerStats,
-    compute_routing_key_stats,
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer
@@ -29,6 +29,21 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+
+
+def compute_routing_key_stats(routing_keys: List[Optional[str]]) -> tuple:
+    key_counts = Counter(k for k in routing_keys if k is not None)
+    num_unique_keys = len(key_counts)
+
+    buckets = ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS
+    bucket_counts = []
+    for i, upper in enumerate(buckets):
+        lower = buckets[i - 1] if i > 0 else 0
+        count = sum(1 for c in key_counts.values() if lower < c <= upper)
+        bucket_counts.append(count)
+    bucket_counts.append(sum(1 for c in key_counts.values() if c > buckets[-1]))
+
+    return num_unique_keys, bucket_counts
 
 
 class KvMetrics:

@@ -11,11 +11,8 @@ from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
 from sglang.srt.environ import envs
-from sglang.srt.metrics.collector import (
-    ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
-    GaugeHistogram,
-    compute_routing_key_stats,
-)
+from sglang.srt.managers.scheduler_metrics_mixin import compute_routing_key_stats
+from sglang.srt.metrics.collector import ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

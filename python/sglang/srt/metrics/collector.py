@@ -25,6 +25,7 @@ from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
@@ -252,67 +253,6 @@ class SchedulerStats:
 
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 5, 10, 20, 50, 100, 200]
-
-
-class GaugeHistogram:
-    """Gauge with gt/le bucket labels for Grafana heatmap visualization.
-    
-    Unlike Prometheus Histogram which uses cumulative buckets, this uses
-    non-cumulative buckets (gt < value <= le) suitable for heatmap display.
-    
-    Note: Keep in sync with Rust implementation in
-    sgl-model-gateway/src/observability/gauge_histogram.rs
-    """
-
-    def __init__(
-        self,
-        name: str,
-        documentation: str,
-        labelnames: List[str],
-        bucket_bounds: List[int],
-        multiprocess_mode: str = "mostrecent",
-    ):
-        from prometheus_client import Gauge
-
-        self._bucket_labels: List[tuple] = []
-        for i, upper in enumerate(bucket_bounds):
-            lower = bucket_bounds[i - 1] if i > 0 else 0
-            self._bucket_labels.append((str(lower), str(upper)))
-        self._bucket_labels.append((str(bucket_bounds[-1]), "+Inf"))
-
-        self._gauge = Gauge(
-            name=name,
-            documentation=documentation,
-            labelnames=list(labelnames) + ["gt", "le"],
-            multiprocess_mode=multiprocess_mode,
-        )
-
-    def set(self, labels: Dict[str, str], values: List[int]):
-        for (gt, le), count in zip(self._bucket_labels, values):
-            self._gauge.labels(**labels, gt=gt, le=le).set(count)
-
-    @property
-    def num_buckets(self) -> int:
-        return len(self._bucket_labels)
-
-
-def compute_routing_key_stats(
-    routing_keys: List[Optional[str]],
-) -> tuple:
-    from collections import Counter
-
-    key_counts = Counter(k for k in routing_keys if k is not None)
-    num_unique_keys = len(key_counts)
-
-    buckets = ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS
-    bucket_counts = []
-    for i, upper in enumerate(buckets):
-        lower = buckets[i - 1] if i > 0 else 0
-        count = sum(1 for c in key_counts.values() if lower < c <= upper)
-        bucket_counts.append(count)
-    bucket_counts.append(sum(1 for c in key_counts.values() if c > buckets[-1]))
-
-    return num_unique_keys, bucket_counts
 
 
 @dataclass
