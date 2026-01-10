@@ -8,7 +8,7 @@ import os
 import folder_paths
 import torch
 
-from .server_api import SGLDiffusionServerAPI
+from .core import SGLDiffusionServerAPI, SGLDiffusionGenerator
 from .utils import (
     convert_b64_to_tensor_image,
     convert_video_to_comfy_video,
@@ -16,6 +16,123 @@ from .utils import (
     is_empty_image,
 )
 
+
+class SGLDOptions:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "enable_torch_compile": (
+                    "BOOLEAN",
+                    {"default": False},
+                ),
+                "num_gpus": ("INT", {"default": 1, "min": 1, "step": 1}),
+                "tp_size": ("INT", {"default": -1, "min": -1, "step": 1}),
+                "sp_degree": ("INT", {"default": -1, "min": -1, "step": 1}),
+                "ulysses_degree": (
+                    "INT",
+                    {
+                        "default": -1,
+                        "min": -1,
+                        "step": 1,
+                    },
+                ),
+                "ring_degree": (
+                    "INT",
+                    {
+                        "default": -1,
+                        "min": -1,
+                        "step": 1,
+                    },
+                ),
+                "dp_size": ("INT", {"default": 1, "min": 1, "step": 1}),
+                "dp_degree": ("INT", {"default": 1, "min": 1, "step": 1}),
+                "enable_cfg_parallel": (
+                    "BOOLEAN",
+                    {"default": False},
+                ),
+                "attention_backend": (
+                    "STRING",
+                    {"default": ""},
+                ),
+                "cache_strategy": (
+                    "STRING",
+                    {"default": "none"},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("SGLD_OPTIONS",)
+    RETURN_NAMES = ("sgld_options",)
+    FUNCTION = "create_options"
+    CATEGORY = "SGLDiffusion"
+
+    def create_options(
+        self,
+        enable_torch_compile: bool = False,
+        num_gpus: int = 1,
+        tp_size: int = -1,
+        sp_degree: int = -1,
+        ulysses_degree: int = -1,
+        ring_degree: int = -1,
+        dp_size: int = 1,
+        dp_degree: int = 1,
+        enable_cfg_parallel: bool = False,
+        attention_backend: str = "",
+        cache_strategy: str = "none",
+    ):
+        """
+        Build a dictionary of SGLang Diffusion runtime options.
+        """
+        # Convert -1 to None for optional parameters (matching ServerArgs defaults)
+        ulysses_degree = None if ulysses_degree == -1 else ulysses_degree
+        ring_degree = None if ring_degree == -1 else ring_degree
+        attention_backend = None if attention_backend == "" else attention_backend
+        
+        options = {
+            "enable_torch_compile": enable_torch_compile,
+            "num_gpus": num_gpus,
+            "tp_size": tp_size,
+            "sp_degree": sp_degree,
+            "ulysses_degree": ulysses_degree,
+            "ring_degree": ring_degree,
+            "dp_size": dp_size,
+            "dp_degree": dp_degree,
+            "enable_cfg_parallel": enable_cfg_parallel,
+            "attention_backend": attention_backend,
+            "cache_strategy": cache_strategy,
+        }
+
+        # Strip None to keep payload clean
+        options = {k: v for k, v in options.items() if v is not None}
+        return (options,)
+
+class SGLDUNETLoader:
+    def __init__(self):
+        self.generator = SGLDiffusionGenerator()
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "unet_name": (folder_paths.get_filename_list("diffusion_models"), ),
+                              "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e5m2"],),
+                            },
+                "optional": {"sgld_options": ("SGLD_OPTIONS",),}}
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load_unet"
+
+    CATEGORY = "SGLDiffusion"
+
+    def load_unet(self, unet_name, weight_dtype, sgld_options: dict = None):
+        model_options = {}
+        if weight_dtype == "fp8_e4m3fn":
+            model_options["dtype"] = torch.float8_e4m3fn
+        elif weight_dtype == "fp8_e5m2":
+            model_options["dtype"] = torch.float8_e5m2
+        
+        unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
+
+        model = self.generator.load_model(unet_path, model_options=model_options, sgld_options=sgld_options)
+        return (model,)
 
 class SGLDiffusionServerModel:
     """Node to load and manage SGLang Diffusion server connection."""
@@ -394,7 +511,7 @@ class SGLDiffusionGenerateVideo:
         return (video, video_path)
 
 
-class SGLDiffusionSetLora:
+class SGLDiffusionServerSetLora:
     """Node to set LoRA adapter for SGLang Diffusion server."""
 
     @classmethod
@@ -465,7 +582,7 @@ class SGLDiffusionSetLora:
             raise RuntimeError(f"Failed to set LoRA adapter: {str(e)}")
 
 
-class SGLDiffusionUnsetLora:
+class SGLDiffusionServerUnsetLora:
     """Node to unset LoRA adapter for SGLang Diffusion server."""
 
     @classmethod
@@ -514,14 +631,18 @@ NODE_CLASS_MAPPINGS = {
     "SGLDiffusionServerModel": SGLDiffusionServerModel,
     "SGLDiffusionGenerateImage": SGLDiffusionGenerateImage,
     "SGLDiffusionGenerateVideo": SGLDiffusionGenerateVideo,
-    "SGLDiffusionSetLora": SGLDiffusionSetLora,
-    "SGLDiffusionUnsetLora": SGLDiffusionUnsetLora,
+    "SGLDiffusionServerSetLora": SGLDiffusionServerSetLora,
+    "SGLDiffusionServerUnsetLora": SGLDiffusionServerUnsetLora,
+    "SGLDUNETLoader": SGLDUNETLoader,
+    "SGLDOptions": SGLDOptions,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDiffusionServerModel": "SGLDiffusion Server Model",
     "SGLDiffusionGenerateImage": "SGLDiffusion Generate Image",
     "SGLDiffusionGenerateVideo": "SGLDiffusion Generate Video",
-    "SGLDiffusionSetLora": "SGLDiffusion Set LoRA",
-    "SGLDiffusionUnsetLora": "SGLDiffusion Unset LoRA",
+    "SGLDiffusionServerSetLora": "SGLDiffusion Server Set LoRA",
+    "SGLDiffusionServerUnsetLora": "SGLDiffusion Server Unset LoRA",
+    "SGLDUNETLoader": "SGLDiffusion UNET Loader",
+    "SGLDOptions": "SGLDiffusion Options",
 }
