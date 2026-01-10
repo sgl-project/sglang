@@ -71,6 +71,51 @@ class TestDPAttentionDP2TP2(
         self.assertGreater(metrics["score"], 0.8)
 
 
+class TestDPAttentionDP2TP4(
+    CustomTestCase,
+    TestJSONConstrainedMixin,
+    TestEBNFConstrainedMinxin,
+    TestRegexConstrainedMixin,
+):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--enable-dp-attention",
+                "--dp",
+                "2",
+                "--enable-torch-compile",
+                "--torch-compile-max-bs",
+                "2",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_mgsm_en(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mgsm_en",
+            num_examples=None,
+            num_threads=1024,
+        )
+
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], 0.8)
+
+
 class TestDPRetract(
     CustomTestCase,
     TestJSONConstrainedMixin,
