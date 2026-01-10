@@ -396,51 +396,91 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         return cos_combined, sin_combined
 
+    def _compute_interpolation_indices_for_dim(
+        self, dim_size: int, device: torch.device
+    ) -> torch.Tensor:
+        """Compute continuous interpolation indices for a single dimension.
+
+        Returns continuous indices.
+        """
+        if self.align_corners:
+            idxs = torch.linspace(
+                0, self.num_grid_per_side - 1, dim_size, device=device
+            )
+        else:
+            idxs = (torch.arange(dim_size, device=device) + 0.5) * (
+                self.num_grid_per_side / dim_size
+            ) - 0.5
+            idxs = idxs.clamp(0, self.num_grid_per_side - 1)
+
+        return idxs
+
+    def _compute_bilinear_interpolation_params(
+        self,
+        h_idxs: torch.Tensor,
+        w_idxs: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Compute bilinear interpolation indices and weights.
+
+        Returns tuple of (indices, weights), each as a list of 4 tensors for the 4 corner points.
+        """
+        h_idxs_floor = h_idxs.int()
+        h_idxs_ceil = (h_idxs_floor + 1).clamp(max=self.num_grid_per_side - 1)
+        w_idxs_floor = w_idxs.int()
+        w_idxs_ceil = (w_idxs_floor + 1).clamp(max=self.num_grid_per_side - 1)
+
+        dh = h_idxs - h_idxs_floor
+        dw = w_idxs - w_idxs_floor
+
+        base_h = h_idxs_floor * self.num_grid_per_side
+        base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+
+        indices = [
+            (base_h[None].T + w_idxs_floor[None]).flatten(),
+            (base_h[None].T + w_idxs_ceil[None]).flatten(),
+            (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
+            (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
+        ]
+
+        weights = [
+            ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+            ((1 - dh)[None].T * dw[None]).flatten(),
+            (dh[None].T * (1 - dw)[None]).flatten(),
+            (dh[None].T * dw[None]).flatten(),
+        ]
+
+        return indices, weights
+
     def fast_pos_embed_interpolate(self, grid_thw):
-        grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+        """Interpolate position embeddings for arbitrary input dimensions.
+
+        Performs bilinear interpolation on spatial dimensions (height, width) and replicates
+        along temporal dimension. The result is reorganized according to spatial_merge_size.
+
+        Args:
+            grid_thw: Tensor of shape [batch_size, 3] with (temporal, height, width) dimensions
+                     in patches for each sample.
+
+        Returns:
+            Interpolated position embeddings tensor.
+        """
+        temporal_dims, height_dims, width_dims = (
+            grid_thw[:, 0],
+            grid_thw[:, 1],
+            grid_thw[:, 2],
+        )
         device = self.pos_embed.weight.device
 
         idx_list = [[] for _ in range(4)]
         weight_list = [[] for _ in range(4)]
 
-        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
-            if self.align_corners:
-                h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h, device=device)
-                w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w, device=device)
-            else:
-                h_idxs = (torch.arange(h, device=device) + 0.5) * (
-                    self.num_grid_per_side / h
-                ) - 0.5
-                w_idxs = (torch.arange(w, device=device) + 0.5) * (
-                    self.num_grid_per_side / w
-                ) - 0.5
-                h_idxs = h_idxs.clamp(0, self.num_grid_per_side - 1)
-                w_idxs = w_idxs.clamp(0, self.num_grid_per_side - 1)
+        for t, h, w in zip(temporal_dims, height_dims, width_dims):
+            h_idxs = self._compute_interpolation_indices_for_dim(h, device)
+            w_idxs = self._compute_interpolation_indices_for_dim(w, device)
 
-            h_idxs_floor = h_idxs.int()
-            w_idxs_floor = w_idxs.int()
-            h_idxs_ceil = (h_idxs_floor + 1).clip(max=self.num_grid_per_side - 1)
-            w_idxs_ceil = (w_idxs_floor + 1).clip(max=self.num_grid_per_side - 1)
-
-            dh = h_idxs - h_idxs_floor
-            dw = w_idxs - w_idxs_floor
-
-            base_h = h_idxs_floor * self.num_grid_per_side
-            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
-
-            indices = [
-                (base_h[None].T + w_idxs_floor[None]).flatten(),
-                (base_h[None].T + w_idxs_ceil[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
-            ]
-
-            weights = [
-                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
-                ((1 - dh)[None].T * dw[None]).flatten(),
-                (dh[None].T * (1 - dw)[None]).flatten(),
-                (dh[None].T * dw[None]).flatten(),
-            ]
+            indices, weights = self._compute_bilinear_interpolation_params(
+                h_idxs, w_idxs
+            )
 
             for i in range(4):
                 idx_list[i].append(indices[i])
@@ -450,16 +490,18 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         weight_tensor = torch.stack([torch.cat(l) for l in weight_list]).to(
             self.pos_embed.weight.dtype
         )
-        pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
-        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+        patch_pos_embeds = torch.sum(pos_embeds, dim=0)
 
         patch_pos_embeds = patch_pos_embeds.split(
-            [h * w for h, w in zip(grid_hs, grid_ws)]
+            [h * w for h, w in zip(height_dims, width_dims)]
         )
 
         patch_pos_embeds_permute = []
         merge_size = self.spatial_merge_size
-        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+        for pos_embed, t, h, w in zip(
+            patch_pos_embeds, temporal_dims, height_dims, width_dims
+        ):
             pos_embed = pos_embed.repeat(t, 1)
             pos_embed = (
                 pos_embed.view(
