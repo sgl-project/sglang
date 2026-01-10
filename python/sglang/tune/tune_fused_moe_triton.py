@@ -1,9 +1,11 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py
 # Adapted again from sglang/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py
 
-from re import I
+import json
+import os
 import time
 from contextlib import nullcontext
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,6 +27,64 @@ from sglang.tune.fused_moe_utils import (
     get_model_config,
     sort_config,
 )
+
+
+@dataclass
+class TuningCheckpoint:
+    """Checkpoint for resumable auto-tuning."""
+
+    model: str
+    tp_size: int
+    ep_size: int
+    dtype: str
+    per_channel_quant: bool
+    completed_batch_sizes: Dict[int, BenchmarkConfig] = field(default_factory=dict)
+    pending_batch_sizes: List[int] = field(default_factory=list)
+    timestamp: str = ""
+
+    def __post_init__(self):
+        # Convert string keys back to int when loading from JSON
+        if self.completed_batch_sizes:
+            self.completed_batch_sizes = {
+                int(k): v for k, v in self.completed_batch_sizes.items()
+            }
+
+
+def get_checkpoint_path(config_path: str) -> str:
+    """Return checkpoint path for a config file."""
+    return config_path.replace(".json", ".checkpoint.json")
+
+
+def save_checkpoint(checkpoint_path: str, checkpoint: TuningCheckpoint) -> None:
+    """Atomically save checkpoint (write temp -> rename)."""
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    temp_path = checkpoint_path + ".tmp"
+    with open(temp_path, "w") as f:
+        json.dump(asdict(checkpoint), f, indent=2)
+    os.rename(temp_path, checkpoint_path)
+    print(f"Checkpoint saved: {len(checkpoint.completed_batch_sizes)} batch sizes completed")
+
+
+def load_checkpoint(checkpoint_path: str) -> Optional[TuningCheckpoint]:
+    """Load checkpoint if exists, return None otherwise."""
+    if not os.path.exists(checkpoint_path):
+        return None
+    try:
+        with open(checkpoint_path, "r") as f:
+            data = json.load(f)
+        checkpoint = TuningCheckpoint(**data)
+        print(f"Loaded checkpoint: {len(checkpoint.completed_batch_sizes)} batch sizes already completed")
+        return checkpoint
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"Warning: Could not load checkpoint ({e}), starting fresh")
+        return None
+
+
+def cleanup_checkpoint(checkpoint_path: str) -> None:
+    """Remove checkpoint file after successful completion."""
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+        print(f"Cleaned up checkpoint file: {checkpoint_path}")
 
 _is_hip = is_hip()
 
@@ -218,7 +278,7 @@ class BenchmarkWorker:
         best_config = None
         best_time = float("inf")
         with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
-            for config in tqdm(search_space):
+            for config in tqdm(search_space, miniters=10):
                 try:
                     kernel_time = benchmark_config(
                         config,
@@ -259,8 +319,14 @@ def tune_fused_moe_triton(
     seed: int,
     disable_shared_experts_fusion: bool,
     num_iters: int,
+    checkpoint_path: Optional[str] = None,
+    resume: bool = False,
 ) -> Dict[int, BenchmarkConfig]:
     """Run fused MoE Triton tuning programmatically.
+
+    Args:
+        checkpoint_path: Path to save/load checkpoint file. If None, checkpointing is disabled.
+        resume: If True and checkpoint exists, resume from checkpoint.
 
     Returns:
         A mapping of batch size to the tuned kernel config.
@@ -283,21 +349,26 @@ def tune_fused_moe_triton(
 
     batch_sizes = batch_sizes if batch_sizes else get_default_batch_sizes()
 
+    # Load checkpoint if resuming
+    checkpoint: Optional[TuningCheckpoint] = None
+    if resume and checkpoint_path:
+        checkpoint = load_checkpoint(checkpoint_path)
+        if checkpoint:
+            # Validate checkpoint matches current tuning parameters
+            if (
+                checkpoint.model != model
+                or checkpoint.tp_size != tp_size
+                or checkpoint.ep_size != ep_size
+                or checkpoint.dtype != dtype
+                or checkpoint.per_channel_quant != per_channel_quant
+            ):
+                print("Warning: Checkpoint parameters don't match, starting fresh")
+                checkpoint = None
+
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])
     workers = [BenchmarkWorker.remote(seed) for _ in range(num_gpus)]
     print(f"Using {num_gpus} GPUs for tuning")
-
-    def _distribute(inputs: List[Any]) -> List[Any]:
-        outputs = []
-        worker_idx = 0
-        for input_args in inputs:
-            worker = workers[worker_idx]
-            worker_method = getattr(worker, "tune")
-            output = worker_method.remote(*input_args)
-            outputs.append(output)
-            worker_idx = (worker_idx + 1) % num_gpus
-        return ray.get(outputs)
 
     search_space = get_configs_compute_bound()
     if block_shape is not None:
@@ -306,12 +377,33 @@ def tune_fused_moe_triton(
             config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
         ]
 
-    print(f"Start tuning over {len(search_space)} configurations...")
+    # Determine which batch sizes to tune
+    if checkpoint:
+        remaining_batch_sizes = [
+            bs for bs in batch_sizes if bs not in checkpoint.completed_batch_sizes
+        ]
+        completed_configs = dict(checkpoint.completed_batch_sizes)
+        print(f"Resuming: {len(completed_configs)} completed, {len(remaining_batch_sizes)} remaining")
+    else:
+        remaining_batch_sizes = batch_sizes
+        completed_configs = {}
+
+    if not remaining_batch_sizes:
+        print("All batch sizes already completed!")
+        return {M: sort_config(config) for M, config in completed_configs.items()}
+
+    print(f"Start tuning over {len(search_space)} configurations for {len(remaining_batch_sizes)} batch sizes...")
 
     start = time.perf_counter()
-    configs = _distribute(
-        [
-            (
+
+    # Process batch sizes one at a time to enable checkpointing after each
+    for batch_size in remaining_batch_sizes:
+        worker_idx = remaining_batch_sizes.index(batch_size) % num_gpus
+        worker = workers[worker_idx]
+
+        print(f"Tuning batch_size={batch_size}...")
+        config = ray.get(
+            worker.tune.remote(
                 batch_size,
                 E,
                 shard_intermediate_size,
@@ -326,10 +418,29 @@ def tune_fused_moe_triton(
                 search_space,
                 num_iters,
             )
-            for batch_size in batch_sizes
-        ],
-    )
-    best_configs = {M: sort_config(config) for M, config in zip(batch_sizes, configs)}
+        )
+        completed_configs[batch_size] = sort_config(config)
+
+        # Save checkpoint after each batch size completes
+        if checkpoint_path:
+            remaining = [bs for bs in batch_sizes if bs not in completed_configs]
+            checkpoint = TuningCheckpoint(
+                model=model,
+                tp_size=tp_size,
+                ep_size=ep_size,
+                dtype=dtype,
+                per_channel_quant=per_channel_quant,
+                completed_batch_sizes=completed_configs,
+                pending_batch_sizes=remaining,
+                timestamp=datetime.now().isoformat(),
+            )
+            save_checkpoint(checkpoint_path, checkpoint)
+
     end = time.perf_counter()
     print(f"Tuning took {end - start:.2f} seconds")
-    return best_configs
+
+    # Cleanup checkpoint on successful completion
+    if checkpoint_path:
+        cleanup_checkpoint(checkpoint_path)
+
+    return completed_configs

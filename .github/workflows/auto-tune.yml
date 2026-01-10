@@ -37,6 +37,9 @@ on:
         type: string
         default: 'all'
 
+env:
+  CONFIG_DIR: python/sglang/srt/layers/moe/fused_moe_triton/configs
+
 jobs:
   auto-tune-matrix:
     if: github.repository == 'sgl-project/sglang'
@@ -54,12 +57,19 @@ jobs:
           bash scripts/ci/ci_install_dependency.sh
           pip install ray
 
+      - name: Restore checkpoint cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.sglang/auto_tune_checkpoints/
+          key: auto-tune-${{ matrix.runner }}-${{ inputs.model }}-tp${{ inputs.tp_size }}-ep${{ inputs.ep_size }}
+
       - name: Run auto tune
         run: |
-          BATCH_SIZES="${{ inputs.batch_sizes }}"
           args=(--model "${{ inputs.model }}" --tp-size "${{ inputs.tp_size }}" --ep-size "${{ inputs.ep_size }}")
-          if [[ -n "${BATCH_SIZES// }" ]]; then
-            args+=(--batch-sizes ${BATCH_SIZES})
+          args+=(--output-dir "${{ env.CONFIG_DIR }}")
+          args+=(--resume --checkpoint-dir ~/.sglang/auto_tune_checkpoints/)
+          if [[ -n "${{ inputs.batch_sizes }}" ]]; then
+            args+=(--batch-sizes ${{ inputs.batch_sizes }})
           fi
           python3 -m sglang.auto_tune "${args[@]}"
 
@@ -67,8 +77,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fused-moe-triton-configs-${{ matrix.runner }}-${{ github.run_id }}
-          path: python/sglang/srt/layers/moe/fused_moe_triton/configs/**
+          name: tuned-configs-${{ matrix.runner }}
+          path: ${{ env.CONFIG_DIR }}/**
           if-no-files-found: warn
 
   commit-configs:
@@ -82,14 +92,9 @@ jobs:
       - name: Download tuned configs
         uses: actions/download-artifact@v4
         with:
-          pattern: fused-moe-triton-configs-*
-          path: downloaded-configs
+          pattern: tuned-configs-*
+          path: ${{ env.CONFIG_DIR }}
           merge-multiple: true
-
-      - name: Sync configs into repo
-        run: |
-          mkdir -p python/sglang/srt/layers/moe/fused_moe_triton/configs
-          rsync -a downloaded-configs/python/sglang/srt/layers/moe/fused_moe_triton/configs/ python/sglang/srt/layers/moe/fused_moe_triton/configs/
 
       - name: Create PR with tuned configs
         uses: peter-evans/create-pull-request@v6
@@ -104,4 +109,4 @@ jobs:
           branch: auto-tune/configs-${{ github.ref_name }}-${{ github.run_id }}
           delete-branch: true
           add-paths: |
-            python/sglang/srt/layers/moe/fused_moe_triton/configs/**
+            ${{ env.CONFIG_DIR }}/**

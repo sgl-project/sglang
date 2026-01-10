@@ -61,49 +61,64 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "location under fused_moe_triton/configs/triton_<ver>/..."
         ),
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help=(
+            "Output directory for tuned configs. Filename is auto-generated based on "
+            "model parameters. Takes precedence over default path but not --output."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from checkpoint if available. Skips already-completed batch sizes.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory for checkpoint files. If not specified, checkpoints are saved "
+            "alongside the output config file."
+        ),
+    )
     return parser
     
 
 def run_auto_tune(args: argparse.Namespace) -> None:
-    best_configs = tune_fused_moe_triton(
-        model=args.model,
-        tp_size=args.tp_size,
-        ep_size=args.ep_size,
-        dtype=args.dtype,
-        per_channel_quant=args.per_channel_quant,
-        batch_sizes=args.batch_sizes,
-        seed=args.seed,
-        disable_shared_experts_fusion=args.disable_shared_experts_fusion,
-        num_iters=args.num_iters,
+    # Recompute filename for output path (needed for --output-dir and default)
+    from sglang.tune.fused_moe_utils import get_model_config
+    import triton
+
+    model_config = get_model_config(
+        args.model,
+        args.tp_size,
+        args.ep_size,
+        args.disable_shared_experts_fusion,
     )
-    # Derive default output path to match runtime lookup
+
+    filename = get_config_filename(
+        model_config["num_experts"],
+        model_config["shard_intermediate_size"],
+        model_config["hidden_size"],
+        model_config["topk"],
+        model_config["dtype"],
+        args.dtype == "fp8_w8a8",
+        args.dtype == "int8_w8a8",
+        args.dtype == "int8_w8a16",
+        args.per_channel_quant,
+        model_config["block_shape"],
+    )
+    triton_version_dir = f"triton_{triton.__version__.replace('.', '_')}"
+
+    # Derive output path: --output > --output-dir > default
     if args.output:
         output_path = Path(args.output)
+    elif args.output_dir:
+        output_path = Path(args.output_dir) / triton_version_dir / filename
     else:
-        # Recompute filename here so tune_fused_moe_triton stays pure
-        from sglang.tune.fused_moe_utils import get_model_config
-        import triton
-
-        model_config = get_model_config(
-            args.model,
-            args.tp_size,
-            args.ep_size,
-            args.disable_shared_experts_fusion,
-        )
-
-        filename = get_config_filename(
-            model_config["num_experts"],
-            model_config["shard_intermediate_size"],
-            model_config["hidden_size"],
-            model_config["topk"],
-            model_config["dtype"],
-            args.dtype == "fp8_w8a8",
-            args.dtype == "int8_w8a8",
-            args.dtype == "int8_w8a16",
-            args.per_channel_quant,
-            model_config["block_shape"],
-        )
-        triton_version_dir = f"triton_{triton.__version__.replace('.', '_')}"
         output_path = (
             Path(__file__).resolve().parent
             / "srt"
@@ -116,6 +131,31 @@ def run_auto_tune(args: argparse.Namespace) -> None:
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Compute checkpoint path
+    checkpoint_path: str | None = None
+    if args.resume or args.checkpoint_dir:
+        if args.checkpoint_dir:
+            checkpoint_dir = Path(args.checkpoint_dir)
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint_path = str(checkpoint_dir / output_path.name.replace(".json", ".checkpoint.json"))
+        else:
+            checkpoint_path = str(output_path).replace(".json", ".checkpoint.json")
+
+    best_configs = tune_fused_moe_triton(
+        model=args.model,
+        tp_size=args.tp_size,
+        ep_size=args.ep_size,
+        dtype=args.dtype,
+        per_channel_quant=args.per_channel_quant,
+        batch_sizes=args.batch_sizes,
+        seed=args.seed,
+        disable_shared_experts_fusion=args.disable_shared_experts_fusion,
+        num_iters=args.num_iters,
+        checkpoint_path=checkpoint_path,
+        resume=args.resume,
+    )
+
     save_configs(best_configs, str(output_path))
     print(f"Saved tuning results to {output_path}")
 
