@@ -1,6 +1,3 @@
-import os
-import shutil
-import tempfile
 import time
 import unittest
 
@@ -10,13 +7,6 @@ register_cpu_ci(est_time=60, suite="default", nightly=True)
 
 
 class TestCpuMonitor(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
-        os.environ["PROMETHEUS_MULTIPROC_DIR"] = self.temp_dir
-
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
-
     def test_cpu_monitor(self):
         from prometheus_client import REGISTRY
 
