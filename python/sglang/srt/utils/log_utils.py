@@ -6,10 +6,7 @@ import os
 import socket
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
+import torch.distributed as dist
 
 
 def create_log_target(target: str) -> logging.Logger:
@@ -23,8 +20,6 @@ def create_log_target_stdout() -> logging.Logger:
 
 
 def create_log_target_file(directory: str) -> logging.Logger:
-    import torch.distributed as dist
-
     os.makedirs(directory, exist_ok=True)
     hostname = socket.gethostname()
     rank = dist.get_rank() if dist.is_initialized() else 0
