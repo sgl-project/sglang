@@ -109,8 +109,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
             return param_value
         elif param_type.startswith("num") or param_type.startswith("float"):
             try:
-                float_param_value = float(param_value)
-                param_value = float_param_value if float_param_value - int(float_param_value) != 0 else int(float_param_value)
+                maybe_convert = False if "." in param_value or "e" in param_value.lower() else True
+                param_value: float = float(param_value)
+                if maybe_convert and param_value.is_integer():
+                    param_value = int(param_value)
             except:
                 logger.warning(f"Parsed value '{param_value}' of parameter '{param_name}' is not a float in tool " f"'{func_name}', degenerating to string.")
             return param_value
