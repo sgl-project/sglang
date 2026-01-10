@@ -95,6 +95,20 @@ try:
 except ImportError:
     HAS_DISCOVERY = False
 
+# Try to import RoPE de-rotation for educational analysis
+try:
+    from discovery import (
+        RoPEDerotator,
+        RoPEConfig,
+        get_glossary,
+        get_term_explanation,
+        explain_attention_step,
+        ATTENTION_GLOSSARY,
+    )
+    HAS_DEROTATION = True
+except ImportError:
+    HAS_DEROTATION = False
+
 # Try ZMQ for high-performance streaming
 try:
     import zmq
@@ -1276,6 +1290,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 "has_discovery": self.sidecar._discovery is not None,
                 "has_storage": self.sidecar._storage is not None,
                 "has_blessed_configs": self.sidecar._blessed_storage is not None,
+                "has_derotation": HAS_DEROTATION,
             })
 
         elif parsed.path == "/discovery/status":
@@ -1305,6 +1320,37 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self._send_json(config)
             else:
                 self.send_error(404, "Config not found")
+
+        elif parsed.path == "/education/glossary":
+            # Get educational glossary for attention concepts
+            if HAS_DEROTATION:
+                self._send_json({
+                    "glossary": ATTENTION_GLOSSARY,
+                    "terms": list(ATTENTION_GLOSSARY.keys()),
+                    "version": "1.0.0",
+                })
+            else:
+                self._send_json_error(501, "Derotation module not available")
+
+        elif parsed.path.startswith("/education/glossary/"):
+            # Get specific term explanation
+            if HAS_DEROTATION:
+                term = parsed.path.split("/education/glossary/")[1]
+                query = urllib.parse.parse_qs(parsed.query)
+                detail_level = query.get("level", ["simple"])[0]
+                explanation = get_term_explanation(term, detail_level)
+                if explanation:
+                    entry = ATTENTION_GLOSSARY.get(term, {})
+                    self._send_json({
+                        "term": term,
+                        "level": detail_level,
+                        "explanation": explanation,
+                        "full_entry": entry,
+                    })
+                else:
+                    self.send_error(404, f"Term not found: {term}")
+            else:
+                self._send_json_error(501, "Derotation module not available")
 
         else:
             self.send_error(404)
@@ -1416,6 +1462,95 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 })
             else:
                 self._send_json_error(400, "Storage disabled or write failed")
+
+        elif parsed.path == "/education/derotate":
+            # Analyze attention pattern with RoPE de-rotation
+            # Educational endpoint to understand semantic vs positional attention
+            if not HAS_DEROTATION:
+                self._send_json_error(501, "Derotation module not available")
+                return
+
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                self._send_json_error(400, f"Invalid JSON: {e}")
+                return
+
+            # Validate required fields
+            required = ["query_pos", "key_positions", "attention_scores"]
+            missing = [f for f in required if f not in data]
+            if missing:
+                self._send_json_error(400, f"Missing fields: {missing}")
+                return
+
+            # Create derotator with optional config
+            config = None
+            if "config" in data:
+                config = RoPEConfig(
+                    head_dim=data["config"].get("head_dim", 128),
+                    base=data["config"].get("base", 10000.0),
+                    max_position=data["config"].get("max_position", 131072),
+                )
+            derotator = RoPEDerotator(config=config)
+
+            # Run analysis
+            result = derotator.analyze(
+                query_pos=data["query_pos"],
+                key_positions=data["key_positions"],
+                attention_scores=data["attention_scores"],
+                sink_threshold=data.get("sink_threshold", 5),
+            )
+
+            # Optionally generate natural language explanation
+            response = result.to_dict()
+            if "tokens" in data:
+                query_token = data["tokens"].get("query", "token")
+                key_tokens = data["tokens"].get("keys", [])
+                if key_tokens:
+                    response["explanation"] = explain_attention_step(
+                        query_token=query_token,
+                        key_tokens=key_tokens,
+                        attention_scores=data["attention_scores"],
+                        analysis=result,
+                    )
+
+            self._send_json(response)
+
+        elif parsed.path == "/education/explain":
+            # Get explanation for specific attention pattern
+            if not HAS_DEROTATION:
+                self._send_json_error(501, "Derotation module not available")
+                return
+
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                self._send_json_error(400, f"Invalid JSON: {e}")
+                return
+
+            # Quick explanation without full analysis
+            derotator = RoPEDerotator()
+            result = derotator.analyze(
+                query_pos=data.get("query_pos", 0),
+                key_positions=data.get("key_positions", []),
+                attention_scores=data.get("attention_scores", []),
+            )
+
+            self._send_json({
+                "pattern": result.interpretation.get("pattern", "unknown"),
+                "meaning": result.interpretation.get("meaning", ""),
+                "insight": result.explanations.get("insight", ""),
+                "zone": result.manifold_zone,
+                "zone_description": result.explanations.get("zone", ""),
+                "dominant_mode": result.dominant_mode,
+                "rotational_variance": result.rotational_variance,
+            })
 
         else:
             self.send_error(404)
