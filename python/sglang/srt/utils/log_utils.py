@@ -59,8 +59,9 @@ def log_json(
         **data,
     }
     msg = json.dumps(log_data, ensure_ascii=False)
-    if isinstance(loggers, list):
-        for logger in loggers:
-            logger.info(msg)
-    else:
-        loggers.info(msg)
+
+    if not isinstance(loggers, list):
+        loggers = [loggers]
+
+    for logger in loggers:
+        logger.info(msg)
