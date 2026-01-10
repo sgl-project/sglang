@@ -8,6 +8,7 @@ Decoding stage for diffusion pipelines.
 import weakref
 
 import torch
+from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loader import VAELoader
@@ -60,6 +61,13 @@ class DecodingStage(PipelineStage):
         super().__init__()
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
+
+        self.vae_scale_factor = (
+            2 ** (len(self.vae.config.block_out_channels) - 1)
+            if getattr(self, "vae", None)
+            else 8
+        )
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -212,7 +220,11 @@ class DecodingStage(PipelineStage):
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
-        frames = self.decode(batch.latents, server_args)
+        # frames = self.decode(batch.latents, server_args)
+        frames = self.vae.decode(batch.latents, return_dict=False)[0]
+        img = self.image_processor.postprocess(frames, output_type="pil")
+        img[0].save(f"/sgl-workspace/decoded_image.png")
+        frames = self.image_processor.postprocess(frames, output_type="latent")
 
         # decode trajectory latents if needed
         if batch.return_trajectory_decoded:

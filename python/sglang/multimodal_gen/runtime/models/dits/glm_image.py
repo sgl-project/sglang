@@ -20,15 +20,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 from diffusers.models.attention_processor import Attention
-from diffusers.models.embeddings import (
-    PixArtAlphaTextProjection,
-    TimestepEmbedding,
-    Timesteps,
-)
-from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.normalization import LayerNorm, RMSNorm
+from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
 
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
+
+# from diffusers.models.normalization import LayerNorm, RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -128,7 +127,7 @@ class GlmImageAdaLayerNormZero(nn.Module):
 
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-5)
         self.norm_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-5)
-        self.linear = nn.Linear(embedding_dim, 12 * dim, bias=True)
+        self.linear = ReplicatedLinear(embedding_dim, 12 * dim, bias=True)
 
     def forward(
         self,
@@ -142,7 +141,7 @@ class GlmImageAdaLayerNormZero(nn.Module):
             dtype=dtype
         )
 
-        emb = self.linear(temb)
+        emb, _ = self.linear(temb)
         (
             shift_msa,
             c_shift_msa,
@@ -184,6 +183,165 @@ class GlmImageAttenProcessorState(Enum):
     ImageEditWriteKV = "ImageEditWriteKV"
     ImageEditReadKV = "ImageEditReadKV"
     ImageEditDontReadKV = "ImageEditNoReadKV"
+
+
+class GlmImageAttention(torch.nn.Module):
+    # self.attn1 = Attention(
+    #     query_dim=dim,
+    #     heads=num_attention_heads,
+    #     dim_head=attention_head_dim,
+    #     out_dim=dim,
+    #     bias=True,
+    #     qk_norm="layer_norm",
+    #     elementwise_affine=False,
+    #     eps=1e-5,
+    #     processor=GlmImageAttnProcessor(),
+    # )
+    def __init__(
+        self,
+        query_dim,
+        heads,
+        dim_head,
+        out_dim,
+        bias,
+        qk_norm,
+        elementwise_affine,
+        eps,
+    ):
+        super().__init__()
+
+        ### TO REMOVE##
+        kv_heads = None
+        ### TO REMOVE##
+
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError(
+                "GlmImageAttnProcessor requires PyTorch 2.0. To use it, please upgrade PyTorch to 2.0."
+            )
+        self.processor_state = GlmImageAttenProcessorState.ImageGen
+        self.k_cache = None
+        self.v_cache = None
+
+        self.heads = out_dim // dim_head if out_dim is not None else heads
+        self.inner_dim = out_dim if out_dim is not None else dim_head * heads
+        self.inner_kv_dim = self.inner_dim if kv_heads is None else dim_head * kv_heads
+        self.out_dim = out_dim if out_dim is not None else query_dim
+
+        self.to_q = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
+        self.to_k = ReplicatedLinear(query_dim, self.inner_kv_dim, bias=bias)
+        self.to_v = ReplicatedLinear(query_dim, self.inner_kv_dim, bias=bias)
+
+        # (dropout omitted)
+        self.to_out = nn.ModuleList(
+            [ReplicatedLinear(self.inner_dim, self.out_dim, bias=True)]
+        )
+
+        if qk_norm is None:
+            self.norm_q = None
+            self.norm_k = None
+        elif qk_norm == "layer_norm":
+            self.norm_q = nn.LayerNorm(
+                dim_head, eps=eps, elementwise_affine=elementwise_affine
+            )
+            self.norm_k = nn.LayerNorm(
+                dim_head, eps=eps, elementwise_affine=elementwise_affine
+            )
+        else:
+            raise ValueError(
+                f"unknown qk_norm: {qk_norm}. Should be one of None, 'layer_norm', 'fp32_layer_norm', 'layer_norm_across_heads', 'rms_norm', 'rms_norm_across_heads', 'l2'."
+            )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        dtype = encoder_hidden_states.dtype
+
+        batch_size, text_seq_length, embed_dim = encoder_hidden_states.shape
+        batch_size, image_seq_length, embed_dim = hidden_states.shape
+        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+
+        # 1. QKV projections
+        query, _ = self.to_q(hidden_states)
+        key, _ = self.to_k(hidden_states)
+        value, _ = self.to_v(hidden_states)
+
+        query = query.unflatten(2, (self.heads, -1)).transpose(1, 2)
+        key = key.unflatten(2, (self.heads, -1)).transpose(1, 2)
+        value = value.unflatten(2, (self.heads, -1)).transpose(1, 2)
+
+        # 2. QK normalization
+        if self.norm_q is not None:
+            query = self.norm_q(query).to(dtype=dtype)
+        if self.norm_k is not None:
+            key = self.norm_k(key).to(dtype=dtype)
+
+        # 3. Rotational positional embeddings applied to latent stream
+        if image_rotary_emb is not None:
+            from diffusers.models.embeddings import apply_rotary_emb
+
+            query[:, :, text_seq_length:, :] = apply_rotary_emb(
+                query[:, :, text_seq_length:, :],
+                image_rotary_emb,
+                use_real_unbind_dim=-2,
+            )
+            key[:, :, text_seq_length:, :] = apply_rotary_emb(
+                key[:, :, text_seq_length:, :], image_rotary_emb, use_real_unbind_dim=-2
+            )
+
+        if self.processor_state == GlmImageAttenProcessorState.ImageEditWriteKV:
+            self.k_cache = (
+                key if self.k_cache is None else torch.cat([self.k_cache, key], dim=2)
+            )
+            self.v_cache = (
+                value
+                if self.v_cache is None
+                else torch.cat([self.v_cache, value], dim=2)
+            )
+        elif self.processor_state == GlmImageAttenProcessorState.ImageEditReadKV:
+            key = (
+                torch.cat([self.k_cache, key], dim=2)
+                if self.k_cache is not None
+                else key
+            )
+            value = (
+                torch.cat([self.v_cache, value], dim=2)
+                if self.v_cache is not None
+                else value
+            )
+
+        # 4. Attention
+        if attention_mask is not None:
+            text_attn_mask = attention_mask
+            assert (
+                text_attn_mask.dim() == 2
+            ), "the shape of text_attn_mask should be (batch_size, text_seq_length)"
+            text_attn_mask = text_attn_mask.float().to(query.device)
+            mix_attn_mask = torch.ones(
+                (batch_size, text_seq_length + image_seq_length), device=query.device
+            )
+            mix_attn_mask[:, :text_seq_length] = text_attn_mask
+            mix_attn_mask = mix_attn_mask.unsqueeze(2)
+            attn_mask_matrix = mix_attn_mask @ mix_attn_mask.transpose(1, 2)
+            attention_mask = (attn_mask_matrix > 0).unsqueeze(1).to(query.dtype)
+
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+        hidden_states = hidden_states.type_as(query)
+
+        # 5. Output projection
+        hidden_states, _ = self.to_out[0](hidden_states)
+        # hidden_states = self.to_out[1](hidden_states)         # (dropout omitted)
+
+        encoder_hidden_states, hidden_states = hidden_states.split(
+            [text_seq_length, hidden_states.size(1) - text_seq_length], dim=1
+        )
+        return hidden_states, encoder_hidden_states
 
 
 class GlmImageAttnProcessor:
@@ -298,7 +456,7 @@ class GlmImageAttnProcessor:
         return hidden_states, encoder_hidden_states
 
 
-class GlmImageTransformer11Block(nn.Module):
+class GlmImageTransformerBlock(nn.Module):
     def __init__(
         self,
         dim: int = 2560,
@@ -310,7 +468,19 @@ class GlmImageTransformer11Block(nn.Module):
 
         # 1. Attention
         self.norm1 = GlmImageAdaLayerNormZero(time_embed_dim, dim)
-        self.attn1 = Attention(
+        # self.attn1 = Attention(
+        #     query_dim=dim,
+        #     heads=num_attention_heads,
+        #     dim_head=attention_head_dim,
+        #     out_dim=dim,
+        #     bias=True,
+        #     qk_norm="layer_norm",
+        #     elementwise_affine=False,
+        #     eps=1e-5,
+        #     processor=GlmImageAttnProcessor(),
+        # )
+
+        self.attn1 = GlmImageAttention(
             query_dim=dim,
             heads=num_attention_heads,
             dim_head=attention_head_dim,
@@ -319,12 +489,11 @@ class GlmImageTransformer11Block(nn.Module):
             qk_norm="layer_norm",
             elementwise_affine=False,
             eps=1e-5,
-            processor=GlmImageAttnProcessor(),
         )
 
         # 2. Feedforward
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-5)
-        self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-5)
+        self.norm2 = LayerNorm(dim, elementwise_affine=False, eps=1e-5)
+        self.norm2_context = LayerNorm(dim, elementwise_affine=False, eps=1e-5)
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
     def forward(
@@ -456,9 +625,11 @@ class GlmImageAdaLayerNormContinuous(nn.Module):
             conditioning_embedding_dim, embedding_dim * 2, bias=bias
         )
         if norm_type == "layer_norm":
-            self.norm = LayerNorm(embedding_dim, eps, elementwise_affine, bias)
+            self.norm = nn.LayerNorm(embedding_dim, eps, elementwise_affine, bias)
+            # For now, don’t replace this with sglang’s LayerNorm
+            # because the model doesn’t have this parameter and it will break model loading
         elif norm_type == "rms_norm":
-            self.norm = RMSNorm(embedding_dim, eps, elementwise_affine)
+            self.norm = nn.RMSNorm(embedding_dim, eps, elementwise_affine)
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
 
@@ -506,7 +677,7 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     _supports_gradient_checkpointing = True
     _no_split_modules = [
-        "GlmImageTransformer11Block",
+        "GlmImageTransformerBlock",
         "GlmImageImageProjector",
         "GlmImageImageProjector",
     ]
@@ -568,7 +739,7 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         # 3. Transformer blocks
         self.transformer_blocks = nn.ModuleList(
             [
-                GlmImageTransformer11Block(
+                GlmImageTransformerBlock(
                     inner_dim,
                     arch_config.num_attention_heads,
                     arch_config.attention_head_dim,
@@ -610,8 +781,10 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         ] = None,
         ###
         guidance: torch.Tensor = None,  # TODO: this should probably be removed
-    ) -> Union[Tuple[torch.Tensor], Transformer2DModelOutput]:
+    ) -> Tuple[torch.Tensor]:
         batch_size, num_channels, height, width = hidden_states.shape
+
+        timestep -= 1.0
 
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
@@ -628,13 +801,9 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         hidden_states = self.image_projector(hidden_states)
         encoder_hidden_states = self.glyph_projector(encoder_hidden_states)
-        print(f"623 {prior_token_id.shape=}", flush=True)
         prior_embedding = self.prior_token_embedding(prior_token_id)
-        print(f"625 {prior_token_drop=}", flush=True)
-        print(f"626 {prior_embedding.shape=}", flush=True)
         prior_embedding[prior_token_drop] *= 0.0
         prior_hidden_states = self.prior_projector(prior_embedding)
-        print(f"627 {hidden_states.shape=}, {prior_hidden_states.shape=}", flush=True)
         hidden_states = hidden_states + prior_hidden_states
 
         temb = self.time_condition_embed(

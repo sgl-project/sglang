@@ -402,7 +402,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             - pixel_width: Image width in pixels
         """
         device = self.vision_language_encoder.device
-        print(f"405 {device=}", flush=True)
         height = (height // factor) * factor
         width = (width // factor) * factor
 
@@ -412,8 +411,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         expanded_prompt, token_h, token_w, prev_h, prev_w = (
             self._build_prompt_with_shape(prompt, height, width, is_text_to_image)
         )
-        print(f"414 {expanded_prompt=}", flush=True)
-        print(f"415 {token_h=}, {token_w=}, {prev_h=}, {prev_w=}", flush=True)
         # Build messages for processor
         content = []
         if image is not None:
@@ -517,11 +514,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                 for input_ids_ in input_ids
             ],
             device=device,
-        )
-        print(f"473 : {max_sequence_length=}")
-        print(
-            f"474 input_ids: {input_ids.shape}, attention_mask: {attention_mask.shape}",
-            flush=True,
         )
         outputs = self.text_encoder(input_ids, attention_mask=attention_mask)
         glyph_embeds = outputs.last_hidden_state[attention_mask.bool()].unsqueeze(0)
@@ -783,8 +775,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             dtype=dtype,
         )
 
-        print(f"784 {prompt_embeds.shape=}", flush=True)
-
         # 4. process images
         condition_images_prior_token_id = None
         if ar_condition_images is not None:
@@ -922,6 +912,9 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         batch.prior_token_id = prior_token_id
         batch.prior_token_drop_cond = torch.full_like(
             prior_token_id, False, dtype=torch.bool
+        )
+        batch.prior_token_drop_uncond = torch.full_like(
+            prior_token_id, True, dtype=torch.bool
         )
         batch.target_size = target_size
         batch.crop_coords = crops_coords_top_left

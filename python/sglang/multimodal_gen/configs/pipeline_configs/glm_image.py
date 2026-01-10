@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 
+import torch
+
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 from sglang.multimodal_gen.configs.models.vaes.glmimage import GlmImageVAEConfig
@@ -37,7 +39,22 @@ class GlmImagePipelineConfig(ImagePipelineConfig):
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {
             "prior_token_id": batch.prior_token_id,
-            "prior_token_drop": batch.prior_token_drop_cond,
+            "prior_token_drop": batch.prior_token_drop_uncond,
             "crop_coords": batch.crop_coords,
             "target_size": batch.target_size,
         }
+
+    def post_denoising_loop(self, latents, batch):
+        # latents = latents.to(self.vae_config.dtype)
+        latents_mean = (
+            torch.tensor(self.vae_config.latents_mean)
+            .view(1, self.vae_config.latent_channels, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = (
+            torch.tensor(self.vae_config.latents_std)
+            .view(1, self.vae_config.latent_channels, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents = latents * latents_std + latents_mean
+        return latents
