@@ -764,27 +764,23 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
         )
 
-        if prefill_delayer_forward_passes_buckets is None:
-            prefill_delayer_forward_passes_buckets = [0, 1, 2, 3, 5, 8, 12, 18, 25]
-        forward_passes_buckets = sorted(
-            set(prefill_delayer_forward_passes_buckets)
-            | {0, prefill_delayer_max_delay_passes - 1}
-        )
         self.prefill_delayer_wait_forward_passes = Histogram(
             name="sglang:prefill_delayer_wait_forward_passes",
             documentation="Histogram of forward passes waited by prefill delayer.",
             labelnames=labels.keys(),
-            buckets=forward_passes_buckets,
+            buckets=sorted(
+                set(prefill_delayer_forward_passes_buckets or [0, 1, 2, 3, 5, 8, 12, 18, 25])
+                | {0, prefill_delayer_max_delay_passes - 1}
+            ),
         )
-
-        if prefill_delayer_wait_seconds_buckets is None:
-            prefill_delayer_wait_seconds_buckets = [0, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
-        wait_seconds_buckets = sorted(set(prefill_delayer_wait_seconds_buckets) | {0})
         self.prefill_delayer_wait_seconds = Histogram(
             name="sglang:prefill_delayer_wait_seconds",
             documentation="Histogram of wait time in seconds by prefill delayer.",
             labelnames=labels.keys(),
-            buckets=wait_seconds_buckets,
+            buckets=sorted(
+                set(prefill_delayer_wait_seconds_buckets or [0, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500])
+                | {0}
+            ),
         )
         self.prefill_delayer_outcomes_total = Counter(
             name="sglang:prefill_delayer_outcomes_total",
