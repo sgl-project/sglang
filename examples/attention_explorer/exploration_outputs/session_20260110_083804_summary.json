@@ -1,0 +1,38 @@
+{
+  "session_id": "20260110_083804",
+  "start_time": "2026-01-10T08:38:04.121157",
+  "end_time": "2026-01-10T12:41:24.370575",
+  "duration_hours": 4.055624838333333,
+  "total_prompts": 96,
+  "total_tokens": 129254,
+  "category_counts": {
+    "math": 12,
+    "creative": 11,
+    "instruction_following": 13,
+    "factual": 13,
+    "reasoning": 11,
+    "long_context": 2,
+    "analysis": 13,
+    "edge_cases": 5,
+    "roleplay": 2,
+    "coding": 11,
+    "multi_turn_context": 3
+  },
+  "zone_distribution": {
+    "syntax_floor": 1015,
+    "semantic_bridge": 43565,
+    "structure_ripple": 84674,
+    "unknown": 0
+  },
+  "discovery_runs": [
+    "2026-01-10T14-11-02",
+    "2026-01-10T14-45-18",
+    "2026-01-10T15-17-19",
+    "2026-01-10T15-50-47",
+    "2026-01-10T16-23-11",
+    "2026-01-10T16-56-30",
+    "2026-01-10T17-31-18",
+    "2026-01-10T17-41-28"
+  ],
+  "findings_file": "exploration_outputs/findings_20260110_083804.jsonl"
+}

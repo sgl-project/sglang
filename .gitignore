@@ -191,6 +191,9 @@ work_dirs/
 *.csv
 
 !logo.png
+!examples/attention_explorer/ui/e2e/screenshots/*.png
+!examples/attention_explorer/exploration_outputs/*.png
+!examples/attention_explorer/exploration_4b_outputs/*.png
 
 # Prerequisites
 *.d
