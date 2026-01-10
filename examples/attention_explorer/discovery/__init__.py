@@ -68,6 +68,20 @@ from .rope_derotation import (
     explain_attention_step,
 )
 
+from .compass_router import (
+    CompassRouter,
+    CompassRouterConfig,
+    CompassAnalyzer,
+    CompassReading,
+    CompassRoutingDecision,
+    CompassHeading,
+    RoutingTier,
+    SinqAnchor,
+    COMPASS_GLOSSARY,
+    create_compass_router,
+    analyze_attention_compass,
+)
+
 __all__ = [
     # Classifier
     'ClassificationResult',

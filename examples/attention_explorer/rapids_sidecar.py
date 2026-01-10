@@ -109,6 +109,20 @@ try:
 except ImportError:
     HAS_DEROTATION = False
 
+# Try to import Compass Router for angle-based routing
+try:
+    from discovery import (
+        CompassRouter,
+        CompassRouterConfig,
+        CompassAnalyzer,
+        COMPASS_GLOSSARY,
+        create_compass_router,
+        analyze_attention_compass,
+    )
+    HAS_COMPASS = True
+except ImportError:
+    HAS_COMPASS = False
+
 # Try ZMQ for high-performance streaming
 try:
     import zmq
@@ -1291,6 +1305,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 "has_storage": self.sidecar._storage is not None,
                 "has_blessed_configs": self.sidecar._blessed_storage is not None,
                 "has_derotation": HAS_DEROTATION,
+                "has_compass": HAS_COMPASS,
             })
 
         elif parsed.path == "/discovery/status":
@@ -1351,6 +1366,17 @@ class SidecarHandler(BaseHTTPRequestHandler):
                     self.send_error(404, f"Term not found: {term}")
             else:
                 self._send_json_error(501, "Derotation module not available")
+
+        elif parsed.path == "/compass/glossary":
+            # Get compass router educational glossary
+            if HAS_COMPASS:
+                self._send_json({
+                    "glossary": COMPASS_GLOSSARY,
+                    "terms": list(COMPASS_GLOSSARY.keys()),
+                    "version": "1.0.0",
+                })
+            else:
+                self._send_json_error(501, "Compass router not available")
 
         else:
             self.send_error(404)
@@ -1551,6 +1577,100 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 "dominant_mode": result.dominant_mode,
                 "rotational_variance": result.rotational_variance,
             })
+
+        elif parsed.path == "/compass/route":
+            # Route query using Compass Router (angle-based routing)
+            if not HAS_COMPASS:
+                self._send_json_error(501, "Compass router not available")
+                return
+
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                self._send_json_error(400, f"Invalid JSON: {e}")
+                return
+
+            # Validate required fields
+            required = ["query_pos", "key_positions", "attention_scores"]
+            missing = [f for f in required if f not in data]
+            if missing:
+                self._send_json_error(400, f"Missing fields: {missing}")
+                return
+
+            # Create router with optional config
+            config = None
+            if "config" in data:
+                config = CompassRouterConfig(
+                    sink_threshold=data["config"].get("sink_threshold", 5),
+                    low_variance_threshold=data["config"].get("low_variance_threshold", 0.3),
+                    high_variance_threshold=data["config"].get("high_variance_threshold", 0.7),
+                    small_model=data["config"].get("small_model", "Qwen/Qwen3-4B"),
+                    medium_model=data["config"].get("medium_model", "Qwen/Qwen3-14B"),
+                    large_model=data["config"].get("large_model", "Qwen/Qwen3-72B"),
+                )
+            router = CompassRouter(config)
+
+            # Route the query
+            decision = router.route(
+                query_pos=data["query_pos"],
+                key_positions=data["key_positions"],
+                attention_scores=data["attention_scores"],
+                rotational_variance=data.get("rotational_variance"),
+            )
+
+            self._send_json(decision.to_dict())
+
+        elif parsed.path == "/compass/analyze":
+            # Analyze attention pattern with compass (no routing decision)
+            if not HAS_COMPASS:
+                self._send_json_error(501, "Compass router not available")
+                return
+
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                self._send_json_error(400, f"Invalid JSON: {e}")
+                return
+
+            # Quick compass analysis
+            reading = analyze_attention_compass(
+                query_pos=data.get("query_pos", 0),
+                key_positions=data.get("key_positions", []),
+                attention_scores=data.get("attention_scores", []),
+            )
+
+            self._send_json(reading.to_dict())
+
+        elif parsed.path == "/compass/fingerprint":
+            # Route based on fingerprint vector
+            if not HAS_COMPASS:
+                self._send_json_error(501, "Compass router not available")
+                return
+
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                self._send_json_error(400, f"Invalid JSON: {e}")
+                return
+
+            if "fingerprint" not in data:
+                self._send_json_error(400, "Missing 'fingerprint' field")
+                return
+
+            router = create_compass_router()
+            fingerprint = np.array(data["fingerprint"])
+            decision = router.route_fingerprint(fingerprint, data.get("metadata"))
+
+            self._send_json(decision.to_dict())
 
         else:
             self.send_error(404)
