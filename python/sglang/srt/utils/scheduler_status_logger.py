@@ -4,6 +4,8 @@ import time
 from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.utils.log_utils import create_log_targets, log_json
+from sglang.srt.environ import envs
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -21,6 +23,7 @@ class SchedulerStatusLogger:
         now = time.time()
         if now - self.last_dump_time < self.dump_interval_s:
             return
+
         self.last_dump_time = now
         log_json(
             self.loggers,
@@ -33,8 +36,6 @@ class SchedulerStatusLogger:
 
     @staticmethod
     def maybe_create() -> Optional["SchedulerStatusLogger"]:
-        from sglang.srt.environ import envs
-
         target = envs.SGLANG_LOG_SCHEDULER_STATUS_TARGET.get()
         if not target:
             return None
