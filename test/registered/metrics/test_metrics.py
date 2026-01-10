@@ -13,6 +13,7 @@ from prometheus_client.samples import Sample
 from sglang.srt.environ import envs
 from sglang.srt.metrics.collector import (
     ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
+    GaugeHistogram,
     compute_routing_key_stats,
 )
 from sglang.srt.utils import kill_process_tree

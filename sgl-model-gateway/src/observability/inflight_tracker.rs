@@ -1,47 +1,19 @@
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, LazyLock, OnceLock,
+        Arc, OnceLock,
     },
     time::Instant,
 };
 
 use dashmap::DashMap;
 
+use super::gauge_histogram::{GaugeHistogram, INFLIGHT_AGE_BUCKETS};
 use super::metrics::Metrics;
 use crate::policies::utils::PeriodicTask;
 
-struct NumericalBuckets {
-    upper_bounds: &'static [u64],
-    le_labels: Vec<&'static str>,
-    gt_labels: Vec<&'static str>,
-}
-
-impl NumericalBuckets {
-    fn new(upper_bounds: &'static [u64]) -> Self {
-        let leak_str = |n: u64| Box::leak(n.to_string().into_boxed_str()) as &'static str;
-
-        let mut le_labels: Vec<&'static str> = upper_bounds.iter().map(|&b| leak_str(b)).collect();
-        le_labels.push("+Inf");
-
-        let mut gt_labels: Vec<&'static str> = vec!["0"];
-        gt_labels.extend(upper_bounds.iter().map(|&b| leak_str(b)));
-
-        Self {
-            upper_bounds,
-            le_labels,
-            gt_labels,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.le_labels.len()
-    }
-}
-
-const AGE_BUCKET_BOUNDS: &[u64] = &[30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400];
-static AGE_BUCKETS: LazyLock<NumericalBuckets> =
-    LazyLock::new(|| NumericalBuckets::new(AGE_BUCKET_BOUNDS));
+static INFLIGHT_AGE_GAUGE: GaugeHistogram =
+    GaugeHistogram::new("smg_http_inflight_request_age_count", &INFLIGHT_AGE_BUCKETS);
 
 pub struct InFlightRequestTracker {
     requests: DashMap<u64, Instant>,
@@ -84,18 +56,13 @@ impl InFlightRequestTracker {
     }
 
     pub fn compute_bucket_counts(&self) -> Vec<usize> {
-        let buckets = &*AGE_BUCKETS;
+        let buckets = INFLIGHT_AGE_GAUGE.buckets();
         let now = Instant::now();
-        let inf_idx = buckets.len() - 1;
 
         let mut counts = vec![0usize; buckets.len()];
         for entry in self.requests.iter() {
             let age_secs = now.duration_since(*entry.value()).as_secs();
-            let bucket_idx = buckets
-                .upper_bounds
-                .iter()
-                .position(|&bound| age_secs <= bound)
-                .unwrap_or(inf_idx);
+            let bucket_idx = buckets.find_bucket_index(age_secs);
             counts[bucket_idx] += 1;
         }
 
@@ -103,14 +70,8 @@ impl InFlightRequestTracker {
     }
 
     fn sample_and_record(&self) {
-        let buckets = &*AGE_BUCKETS;
         let counts = self.compute_bucket_counts();
-        for ((&gt, &le), &count) in std::iter::zip(
-            std::iter::zip(&buckets.gt_labels, &buckets.le_labels),
-            &counts,
-        ) {
-            Metrics::set_inflight_request_age_count(gt, le, count);
-        }
+        INFLIGHT_AGE_GAUGE.set(&counts);
     }
 }
 

@@ -254,6 +254,45 @@ class SchedulerStats:
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 5, 10, 20, 50, 100, 200]
 
 
+class GaugeHistogram:
+    """Gauge with gt/le bucket labels for Grafana heatmap visualization.
+    
+    Unlike Prometheus Histogram which uses cumulative buckets, this uses
+    non-cumulative buckets (gt < value <= le) suitable for heatmap display.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        documentation: str,
+        labelnames: List[str],
+        bucket_bounds: List[int],
+        multiprocess_mode: str = "mostrecent",
+    ):
+        from prometheus_client import Gauge
+
+        self._bucket_labels: List[tuple] = []
+        for i, upper in enumerate(bucket_bounds):
+            lower = bucket_bounds[i - 1] if i > 0 else 0
+            self._bucket_labels.append((str(lower), str(upper)))
+        self._bucket_labels.append((str(bucket_bounds[-1]), "+Inf"))
+
+        self._gauge = Gauge(
+            name=name,
+            documentation=documentation,
+            labelnames=list(labelnames) + ["gt", "le"],
+            multiprocess_mode=multiprocess_mode,
+        )
+
+    def set(self, labels: Dict[str, str], bucket_counts: List[int]):
+        for (gt, le), count in zip(self._bucket_labels, bucket_counts):
+            self._gauge.labels(**labels, gt=gt, le=le).set(count)
+
+    @property
+    def num_buckets(self) -> int:
+        return len(self._bucket_labels)
+
+
 def compute_routing_key_stats(
     routing_keys: List[Optional[str]],
 ) -> tuple:
@@ -753,17 +792,11 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        buckets = ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS
-        self._routing_key_bucket_labels = []
-        for i, upper in enumerate(buckets):
-            lower = buckets[i - 1] if i > 0 else 0
-            self._routing_key_bucket_labels.append((str(lower), str(upper)))
-        self._routing_key_bucket_labels.append((str(buckets[-1]), "+Inf"))
-        self.routing_key_running_req_count = Gauge(
+        self.routing_key_running_req_count = GaugeHistogram(
             name="sglang:routing_key_running_req_count",
             documentation="Distribution of routing keys by running request count (gt < count <= le).",
-            labelnames=list(labels.keys()) + ["gt", "le"],
-            multiprocess_mode="mostrecent",
+            labelnames=list(labels.keys()),
+            bucket_bounds=ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
         )
 
         self.new_token_ratio = Gauge(
@@ -1027,12 +1060,9 @@ class SchedulerMetricsCollector:
             self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
 
         self._log_gauge(self.num_unique_routing_keys, stats.num_unique_routing_keys)
-        for (gt, le), count in zip(
-            self._routing_key_bucket_labels, stats.routing_key_req_count_buckets
-        ):
-            self.routing_key_running_req_count.labels(**self.labels, gt=gt, le=le).set(
-                count
-            )
+        self.routing_key_running_req_count.set(
+            self.labels, stats.routing_key_req_count_buckets
+        )
 
         self.last_log_time = time.perf_counter()
 
