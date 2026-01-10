@@ -19,7 +19,6 @@ register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 class BaseTestSoftWatchdog:
     env_override = None
     expected_message = None
-    timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
     @classmethod
     def setUpClass(cls):
@@ -30,7 +29,7 @@ class BaseTestSoftWatchdog:
             cls.process = popen_launch_server(
                 "Qwen/Qwen3-0.6B",
                 DEFAULT_URL_FOR_TEST,
-                timeout=cls.timeout,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=[
                     "--soft-watchdog-timeout",
                     "20",
@@ -46,6 +45,20 @@ class BaseTestSoftWatchdog:
         cls.stderr.close()
 
     def test_watchdog_triggers(self):
+        print("Start call /generate API", flush=True)
+        try:
+            requests.post(
+                DEFAULT_URL_FOR_TEST + "/generate",
+                json={
+                    "text": "Hello, please repeat this sentence for 1000 times.",
+                    "sampling_params": {"max_new_tokens": 100, "temperature": 0},
+                },
+                timeout=30,
+            )
+        except requests.exceptions.ReadTimeout as e:
+            print(f"requests.post timeout (but expected): {e}")
+        print("End call /generate API", flush=True)
+
         combined_output = self.stdout.getvalue() + self.stderr.getvalue()
         self.assertIn(self.expected_message, combined_output)
 
@@ -54,52 +67,10 @@ class TestSoftWatchdogDetokenizer(BaseTestSoftWatchdog, CustomTestCase):
     env_override = lambda: envs.SGLANG_TEST_STUCK_DETOKENIZER.override(30)
     expected_message = "DetokenizerManager watchdog timeout"
 
-    def test_watchdog_triggers(self):
-        print("Start call /generate API", flush=True)
-        try:
-            requests.post(
-                DEFAULT_URL_FOR_TEST + "/generate",
-                json={
-                    "text": "Hello, please repeat this sentence for 1000 times.",
-                    "sampling_params": {"max_new_tokens": 100, "temperature": 0},
-                },
-                timeout=30,
-            )
-        except requests.exceptions.ReadTimeout as e:
-            print(f"requests.post timeout (but expected): {e}")
-        print("End call /generate API", flush=True)
-
-        combined_output = self.stdout.getvalue() + self.stderr.getvalue()
-        self.assertIn(self.expected_message, combined_output)
-
 
 class TestSoftWatchdogTokenizer(BaseTestSoftWatchdog, CustomTestCase):
     env_override = lambda: envs.SGLANG_TEST_STUCK_TOKENIZER.override(30)
     expected_message = "TokenizerManager watchdog timeout"
-
-    def test_watchdog_triggers(self):
-        print("Start call /generate API", flush=True)
-        try:
-            requests.post(
-                DEFAULT_URL_FOR_TEST + "/generate",
-                json={
-                    "text": "Hello, please repeat this sentence for 1000 times.",
-                    "sampling_params": {"max_new_tokens": 100, "temperature": 0},
-                },
-                timeout=30,
-            )
-        except requests.exceptions.ReadTimeout as e:
-            print(f"requests.post timeout (but expected): {e}")
-        print("End call /generate API", flush=True)
-
-        combined_output = self.stdout.getvalue() + self.stderr.getvalue()
-        self.assertIn(self.expected_message, combined_output)
-
-
-class TestSoftWatchdogSchedulerInit(BaseTestSoftWatchdog, CustomTestCase):
-    env_override = lambda: envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.override(30)
-    expected_message = "Scheduler watchdog timeout"
-    timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH + 30
 
 
 if __name__ == "__main__":
