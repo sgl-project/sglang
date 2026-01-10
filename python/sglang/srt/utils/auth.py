@@ -93,7 +93,6 @@ def decide_request_auth(
     - Health/metrics endpoints are always allowed (even when api_key/admin_api_key is set),
       to support k8s/liveness/readiness and Prometheus scraping without embedding secrets.
     - We match them by prefix to cover common variants like /health_generate.
-      To avoid surprising over-matches, we keep the prefixes narrow and well-documented here.
     """
     if method == "OPTIONS":
         return AuthDecision(allowed=True)
