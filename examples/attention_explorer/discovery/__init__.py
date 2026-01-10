@@ -82,6 +82,21 @@ from .compass_router import (
     analyze_attention_compass,
 )
 
+from .manifold_firewall import (
+    ManifoldFirewall,
+    ManifoldBatchAnalyzer,
+    FirewallConfig,
+    FirewallState,
+    FirewallCheckResult,
+    ManifoldPoint,
+    DriftEvent,
+    DriftType,
+    AlertSeverity,
+    FIREWALL_GLOSSARY,
+    ZONE_TRANSITIONS,
+    create_firewall,
+)
+
 __all__ = [
     # Classifier
     'ClassificationResult',
