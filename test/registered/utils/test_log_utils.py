@@ -43,7 +43,8 @@ class TestLogUtils(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 loggers = create_log_targets(
-                    targets=["stdout", temp_dir], name_prefix=f"test_multi_{uuid.uuid4()}"
+                    targets=["stdout", temp_dir],
+                    name_prefix=f"test_multi_{uuid.uuid4()}",
                 )
                 self.assertEqual(len(loggers), 2)
                 log_json(loggers, "multi.event", {"x": 1})
