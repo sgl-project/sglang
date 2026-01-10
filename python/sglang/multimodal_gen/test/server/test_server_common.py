@@ -751,3 +751,21 @@ Consider updating perf_baselines.json with the snippets below:
         # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
         if case.server_args.lora_path or case.server_args.dynamic_lora_path:
             self._test_lora_api_functionality(diffusion_server, case, generate_fn)
+
+            # Test dynamic LoRA switching (requires a second LoRA adapter)
+            if case.server_args.second_lora_path:
+                self._test_lora_dynamic_switch_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.second_lora_path,
+                )
+
+                # Test multi-LoRA functionality
+                self._test_multi_lora_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.lora_path,
+                    case.server_args.second_lora_path,
+                )
