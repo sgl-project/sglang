@@ -207,7 +207,10 @@ class BaseLayerWithLoRA(nn.Module):
             current_device = self.base_layer.weight.data.device
             cpu_weight_on_device = self.cpu_weight.to(current_device, non_blocking=True)
             self.base_layer.weight.data.copy_(cpu_weight_on_device)
-            if cpu_weight_on_device.data_ptr() != self.base_layer.weight.data.data_ptr():
+            if (
+                cpu_weight_on_device.data_ptr()
+                != self.base_layer.weight.data.data_ptr()
+            ):
                 del cpu_weight_on_device
 
         self.merged = False

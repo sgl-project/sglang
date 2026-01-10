@@ -620,7 +620,7 @@ class LoRAPipeline(ComposedPipelineBase):
             return
 
         # Disable layerwise offload if enabled: load all layers to GPU
-        
+
         for module_name, lora_layers_dict in target_modules:
             if not self.is_lora_merged.get(module_name, False):
                 logger.warning(
