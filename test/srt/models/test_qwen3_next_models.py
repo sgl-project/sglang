@@ -19,6 +19,11 @@ from sglang.test.test_utils import (
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
 ACC_THRESHOLDS = {
+    QWEN3_NEXT_MODEL: {"kl_div": 0.0025, "gsm8k": 0.93},
+}
+
+# MTP has higher KL divergence threshold
+ACC_THRESHOLDS_MTP = {
     QWEN3_NEXT_MODEL: {"kl_div": 0.008, "gsm8k": 0.93},
 }
 
@@ -241,13 +246,13 @@ class TestQwen3NextMTPTopk(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreaterEqual(
-            metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
+            metrics["accuracy"], ACC_THRESHOLDS_MTP[self.model]["gsm8k"]
         )
 
     def test_input_output_logprobs_match_prefill_cache_hit(self):
         test_input_output_logprobs_match_prefill_cache_hit_helper(
             self.base_url,
-            ACC_THRESHOLDS,
+            ACC_THRESHOLDS_MTP,
             self.model,
             max_samples=32,
             max_new_tokens=512,
@@ -256,7 +261,7 @@ class TestQwen3NextMTPTopk(CustomTestCase):
     def test_input_output_logprobs_match_decode_cache_hit(self):
         test_input_output_logprobs_match_decode_cache_hit_helper(
             self.base_url,
-            ACC_THRESHOLDS,
+            ACC_THRESHOLDS_MTP,
             self.model,
             max_samples=32,
             max_new_tokens=512,

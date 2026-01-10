@@ -50,6 +50,8 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 300
 
 jobs:
   # General tests - 1 GPU
@@ -384,7 +386,7 @@ jobs:
 
       - name: Run common 8-GPU model tests
         if: always()
-        timeout-minutes: 200
+        timeout-minutes: 300
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}

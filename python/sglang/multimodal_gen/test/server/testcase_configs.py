@@ -149,7 +149,12 @@ class DiffusionServerArgs:
     ulysses_degree: int | None = None
     ring_degree: int | None = None
     # LoRA
-    lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
+    lora_path: str | None = (
+        None  # LoRA adapter path (HF repo or local path, loaded at startup)
+    )
+    dynamic_lora_path: str | None = (
+        None  # LoRA path for dynamic loading test (loaded via set_lora after startup)
+    )
     # misc
     enable_warmup: bool = False
 
@@ -406,6 +411,8 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
     ),
     # LoRA test case for single transformer + merge/unmerge API test
+    # Note: Uses dynamic_lora_path instead of lora_path to test LayerwiseOffload + set_lora interaction
+    # Server starts WITHOUT LoRA, then set_lora is called after startup (Wan models auto-enable layerwise offload)
     DiffusionTestCase(
         "wan2_1_t2v_1_3b_lora_1gpu",
         DiffusionServerArgs(
@@ -414,7 +421,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             warmup=0,
             custom_validator="video",
             num_gpus=1,
-            lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
+            dynamic_lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
         ),
         DiffusionSamplingParams(
             prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
@@ -575,6 +582,16 @@ TWO_GPU_CASES_B = [
             # test ring attn
             ulysses_degree=1,
             ring_degree=2,
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "zimage_image_t2i_2_gpus",
+        DiffusionServerArgs(
+            model_path="Tongyi-MAI/Z-Image-Turbo",
+            modality="image",
+            num_gpus=2,
+            ulysses_degree=2,
         ),
         T2I_sampling_params,
     ),
