@@ -103,7 +103,10 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
 )
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    filter_moe_weight_param_global_expert,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -587,6 +590,9 @@ class DeepseekV2MoE(nn.Module):
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
         ]
 
     def forward(
