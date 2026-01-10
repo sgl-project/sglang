@@ -1555,12 +1555,18 @@ class Scheduler(
             else:
                 key = ("structural_tag", req.sampling_params.structural_tag)
 
-            if self.tp_rank == 0:
-                # Only rank 0 compiles grammar and manages the cache
+            if self.server_args.enable_dp_attention:
+                tp_rank = self.attn_tp_rank
+                tp_size = self.attn_tp_size
+            else:
+                tp_rank = self.tp_rank
+                tp_size = self.tp_size
+
+            if tp_rank == 0:
                 if self.server_args.grammar_backend == "none":
                     error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
                     req.set_finish_with_abort(error_msg)
-                    if self.tp_size > 1:
+                    if tp_size > 1:
                         add_to_grammar_queue = True
                 else:
                     value, cache_hit = self.grammar_backend.get_cached_or_future_value(
@@ -1574,7 +1580,7 @@ class Scheduler(
                         req.set_finish_with_abort(error_msg)
 
                     # When TP > 1, always add to grammar_queue for synchronization across ranks
-                    if self.tp_size > 1:
+                    if tp_size > 1:
                         add_to_grammar_queue = True
                     elif not cache_hit:
                         # TP == 1: only add to queue if we didn't get a cache hit.
@@ -2434,9 +2440,14 @@ class Scheduler(
                 tensor.tolist()
             )
 
+            if self.server_args.enable_dp_attention:
+                tp_rank = self.attn_tp_rank
+            else:
+                tp_rank = self.tp_rank
+
             # In order to have the consistent abort request state, we must broadcast the invalid indices
             if num_invalid > 0:
-                if self.tp_rank == 0:
+                if tp_rank == 0:
                     # On rank 0, we create our tensor with our invalid indices data (to send)
                     invalid_tensor = torch.tensor(invalid_indices, dtype=torch.int32)
                 else:
@@ -2468,7 +2479,7 @@ class Scheduler(
         ):
             req = self.grammar_queue[i]
             # Only rank 0 has futures to cancel and cache to update
-            if self.tp_rank == 0 and isinstance(req.grammar, futures.Future):
+            if tp_rank == 0 and isinstance(req.grammar, futures.Future):
                 req.grammar.cancel()
                 self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
             error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
