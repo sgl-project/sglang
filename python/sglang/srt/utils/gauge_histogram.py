@@ -7,7 +7,34 @@ Note: Keep in sync with Rust implementation in
 sgl-model-gateway/src/observability/gauge_histogram.rs
 """
 
-from typing import Dict, List, Union
+from typing import Dict, List, Tuple, Union
+
+
+def compute_bucket_labels(
+    bucket_bounds: List[Union[int, float]],
+) -> List[Tuple[str, str]]:
+    """Compute (gt, le) label pairs from bucket bounds."""
+    labels = []
+    for i, upper in enumerate(bucket_bounds):
+        lower = bucket_bounds[i - 1] if i > 0 else 0
+        labels.append((str(lower), str(upper)))
+    labels.append((str(bucket_bounds[-1]), "+Inf"))
+    return labels
+
+
+def compute_bucket_counts(
+    bucket_bounds: List[Union[int, float]],
+    observations: List[Union[int, float]],
+) -> List[int]:
+    """Compute how many observations fall into each bucket. O(n) complexity."""
+    import bisect
+
+    counts = [0] * (len(bucket_bounds) + 1)
+    for v in observations:
+        # bisect_left finds insertion point; values at boundary go to current bucket
+        idx = bisect.bisect_left(bucket_bounds, v)
+        counts[idx] += 1
+    return counts
 
 
 class GaugeHistogram:
@@ -23,11 +50,7 @@ class GaugeHistogram:
         from prometheus_client import Gauge
 
         self._bucket_bounds = bucket_bounds
-        self._bucket_labels: List[tuple] = []
-        for i, upper in enumerate(bucket_bounds):
-            lower = bucket_bounds[i - 1] if i > 0 else 0
-            self._bucket_labels.append((str(lower), str(upper)))
-        self._bucket_labels.append((str(bucket_bounds[-1]), "+Inf"))
+        self._bucket_labels = compute_bucket_labels(bucket_bounds)
 
         self._gauge = Gauge(
             name=name,
@@ -45,22 +68,8 @@ class GaugeHistogram:
         self, labels: Dict[str, str], observations: List[Union[int, float]]
     ):
         """Compute bucket counts from observations and set them."""
-        bucket_counts = self._compute_bucket_counts(observations)
+        bucket_counts = compute_bucket_counts(self._bucket_bounds, observations)
         self.set_raw(labels, bucket_counts)
-
-    def _compute_bucket_counts(
-        self, observations: List[Union[int, float]]
-    ) -> List[int]:
-        """Compute how many observations fall into each bucket. O(n) complexity."""
-        import bisect
-
-        bounds = self._bucket_bounds
-        counts = [0] * (len(bounds) + 1)
-        for v in observations:
-            # bisect_left finds insertion point; values at boundary go to current bucket
-            idx = bisect.bisect_left(bounds, v)
-            counts[idx] += 1
-        return counts
 
     @property
     def num_buckets(self) -> int:
