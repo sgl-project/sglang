@@ -27,8 +27,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.5.3", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.5.3",
+  "flashinfer_python==0.6.0", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.0",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -38,7 +38,7 @@ dependencies = [
   "msgspec",
   "ninja",
   "numpy",
-  "nvidia-cutlass-dsl==4.2.1",
+  "nvidia-cutlass-dsl==4.3.4",
   "nvidia-ml-py",
   "openai-harmony==0.0.4",
   "openai==2.6.1",

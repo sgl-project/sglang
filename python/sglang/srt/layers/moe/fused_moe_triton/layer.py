@@ -1299,7 +1299,6 @@ class FlashInferFP4MoE(FusedMoE):
             local_expert_offset=self.moe_ep_rank * self.num_local_experts,
             local_num_experts=self.num_local_experts,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
-            tile_tokens_dim=None,
             # Respect the routing method configured for this layer (e.g., Renormalize for Qwen3),
             # instead of always assuming DeepSeekV3.
             routing_method_type=(
