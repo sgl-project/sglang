@@ -1057,8 +1057,9 @@ class DenoisingStage(PipelineStage):
 
                         if not is_warmup:
                             self.step_profile()
-        batch.kv_caches.clear()
+
         denoising_end_time = time.time()
+
         if num_timesteps > 0 and not is_warmup:
             self.log_info(
                 "average time per step: %.4f seconds",

@@ -61,4 +61,7 @@ class GlmImagePipelineConfig(ImagePipelineConfig):
             .to(latents.device, latents.dtype)
         )
         latents = latents * latents_std + latents_mean
+
+        if getattr(batch, "kv_caches", None) is not None:
+            batch.kv_caches.clear()
         return latents
