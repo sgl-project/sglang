@@ -20,12 +20,14 @@ class TestCpuMonitor(unittest.TestCase):
             pass
         time.sleep(0.2)
 
+        metrics = REGISTRY.collect()
+        print(f"{metrics=}")
+
         value = None
-        for metric in REGISTRY.collect():
+        for metric in metrics:
             for sample in metric.samples:
                 if sample.labels.get("component") == "test":
                     value = sample.value
-                    break
 
         print(f"CPU seconds value: {value}")
         self.assertIsNotNone(value)
