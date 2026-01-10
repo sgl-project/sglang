@@ -440,6 +440,7 @@ class SchedulerMetricsMixin:
             self._emit_kv_metrics()
         self._publish_kv_events()
 
+    def maybe_dump_scheduler_status(self: Scheduler, batch: ScheduleBatch):
         if x := self.scheduler_status_logger:
             x.maybe_dump(batch, self.waiting_queue)
 

@@ -479,6 +479,7 @@ class SchedulerOutputProcessorMixin:
             self.log_decode_stats_every_iteration(
                 batch, num_accepted_tokens=result.num_accepted_tokens
             )
+        self.maybe_dump_scheduler_status(batch)
 
     def _mamba_prefix_cache_update(
         self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
