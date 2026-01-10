@@ -7,6 +7,7 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -41,9 +42,6 @@ import PIL
 import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL, GlmImageTransformer2DModel
-from diffusers.models.transformers.transformer_glm_image import (
-    GlmImageAttenProcessorState,
-)
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
@@ -273,6 +271,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             )
         else:
             # Image-to-image: append to existing
+            # print(f"274 {existing_grid.shape=}, {token_h=}, {token_w=}", flush=True)
+            print(f"275 {existing_grid.device=}, {device=}", flush=True)
             return torch.cat(
                 [existing_grid, torch.tensor([[1, token_h, token_w]], device=device)],
                 dim=0,
@@ -426,7 +426,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             tokenize=True,
             return_dict=True,
             return_tensors="pt",
-        )
+        ).to(device)
 
         # Determine if text-to-image or image-to-image
         existing_grid = inputs.get("image_grid_thw")
@@ -451,6 +451,16 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         inputs = inputs.to(device)
         input_length = inputs["input_ids"].shape[-1]
 
+        prior_token_image_ids = None
+        if image is not None:
+            prior_token_image_embed = self.vision_language_encoder.get_image_features(
+                inputs["pixel_values"], existing_grid
+            )
+            prior_token_image_embed = torch.cat(prior_token_image_embed, dim=0)
+            prior_token_image_ids = self.vision_language_encoder.get_image_tokens(
+                prior_token_image_embed, existing_grid
+            )
+
         outputs = self.vision_language_encoder.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -464,10 +474,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             prior_token_ids_d32, token_h, token_w
         )
 
-        pixel_height = token_h * 32
-        pixel_width = token_w * 32
-
-        return prior_token_ids, pixel_height, pixel_width
+        return prior_token_ids, prior_token_image_ids
 
     def get_glyph_texts(self, prompt):
         prompt = prompt[0] if isinstance(prompt, list) else prompt
@@ -751,7 +758,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         import time
 
         time_start = time.time()
-        prior_token_id, ar_height, ar_width = self.generate_prior_tokens(
+        # prior_token_id, ar_height, ar_width = self.generate_prior_tokens(
+        prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
             prompt=prompt,
             image=ar_condition_images,
             height=height,
@@ -761,8 +769,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         time_end = time.time()
         print(f"generate_prior_tokens time: {time_end - time_start}", flush=True)
 
-        height = height or ar_height
-        width = width or ar_width
+        height = height
+        width = width
 
         # 3. Encode input prompt
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
@@ -795,6 +803,9 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                 preprocessed_condition_images.append(img)
             ar_condition_images = preprocessed_condition_images
 
+        height = height or self.default_sample_size * self.vae_scale_factor
+        width = width or self.default_sample_size * self.vae_scale_factor
+
         # 5. Prepare latents and (optional) condition_images kv cache
         latent_channels = self.transformer.config.in_channels
         latents = self.prepare_latents(
@@ -808,39 +819,45 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             latents=latents,
         )
 
-        if (
-            ar_condition_images is not None
-            and condition_images_prior_token_id is not None
-        ):
-            self.transformer.set_attention_processors_state(
-                GlmImageAttenProcessorState.ImageEditWriteKV
+        kv_caches = GlmImageKVCache(num_layers=self.transformer.config.num_layers)
+
+        if ar_condition_images is not None:
+            kv_caches.set_mode("write")
+            latents_mean = torch.tensor(self.vae.config.latents_mean).view(
+                1, self.vae.config.latent_channels, 1, 1
             )
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.latent_channels, 1, 1)
-                .to(self.vae.device, self.vae.dtype)
+            latents_std = torch.tensor(self.vae.config.latents_std).view(
+                1, self.vae.config.latent_channels, 1, 1
             )
-            latents_std = (
-                torch.tensor(self.vae.config.latents_std)
-                .view(1, self.vae.config.latent_channels, 1, 1)
-                .to(self.vae.device, self.vae.dtype)
-            )
-            empty_glyph_hiddens = torch.zeros_like(prompt_embeds)[:1, :0, ...]
+
+            latents_mean = latents_mean.to(device=device, dtype=prompt_embeds.dtype)
+            latents_std = latents_std.to(device=device, dtype=prompt_embeds.dtype)
+
             for condition_image, condition_image_prior_token_id in zip(
-                condition_images, condition_images_prior_token_id
+                ar_condition_images, prior_token_image_ids
             ):
                 condition_image = condition_image.to(
-                    device=device, dtype=self.vae.dtype
+                    device=device, dtype=prompt_embeds.dtype
                 )
+
+                # move to another place
+                self.vae = self.vae.to(device=device, dtype=prompt_embeds.dtype)
+                #
+
+                print(f"834 {condition_image.dtype=}, {self.vae.dtype=}", flush=True)
                 condition_latent = retrieve_latents(
                     self.vae.encode(condition_image),
                     generator=generator,
                     sample_mode="argmax",
                 )
                 condition_latent = (condition_latent - latents_mean) / latents_std
+
+                # Do not remove.
+                # It would be use to run the reference image through a
+                # forward pass at timestep 0 and keep the KV cache.
                 _ = self.transformer(
                     hidden_states=condition_latent,
-                    encoder_hidden_states=empty_glyph_hiddens,
+                    encoder_hidden_states=torch.zeros_like(prompt_embeds)[:1, :0, ...],
                     prior_token_id=condition_image_prior_token_id,
                     prior_token_drop=torch.full_like(
                         condition_image_prior_token_id, False, dtype=torch.bool
@@ -851,6 +868,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                     ),
                     crop_coords=torch.zeros((1, 2), device=device),
                     attention_kwargs=attention_kwargs,
+                    kv_caches=kv_caches,
                 )
 
         # 6. Prepare additional timestep conditions
@@ -942,7 +960,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
                 if condition_images is not None:
                     self.transformer.set_attention_processors_state(
-                        GlmImageAttenProcessorState.ImageEditReadKV
+                        # GlmImageAttenProcessorState.ImageEditReadKV
                     )
 
                 noise_pred_cond = self.transformer(
@@ -961,7 +979,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                 if self.do_classifier_free_guidance:
                     if condition_images is not None:
                         self.transformer.set_attention_processors_state(
-                            GlmImageAttenProcessorState.ImageEditDontReadKV
+                            # GlmImageAttenProcessorState.ImageEditDontReadKV
                         )
                     noise_pred_uncond = self.transformer(
                         hidden_states=latent_model_input,
@@ -1002,7 +1020,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
         self._current_timestep = None
         self.transformer.set_attention_processors_state(
-            GlmImageAttenProcessorState.ImageGen
+            # GlmImageAttenProcessorState.ImageGen
         )
         self.transformer.clear_attention_processors_cache()
 

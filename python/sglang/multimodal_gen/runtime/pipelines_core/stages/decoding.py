@@ -220,6 +220,10 @@ class DecodingStage(PipelineStage):
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
+        # TODO: REMOVE
+        self.vae = self.vae.to(batch.latents.device, batch.latents.dtype)
+        # TODO: REMOVE
+
         # frames = self.decode(batch.latents, server_args)
         frames = self.vae.decode(batch.latents, return_dict=False)[0]
         img = self.image_processor.postprocess(frames, output_type="pil")

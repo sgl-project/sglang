@@ -35,6 +35,54 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+class GlmImageLayerKVCache:
+    """KV cache for GlmImage model."""
+
+    def __init__(self):
+        self.k_cache = None
+        self.v_cache = None
+        self.mode: Optional[str] = None  # "write", "read", "skip"
+
+    def store(self, k: torch.Tensor, v: torch.Tensor):
+        if self.k_cache is None:
+            self.k_cache = k
+            self.v_cache = v
+        else:
+            self.k_cache = torch.cat([self.k_cache, k], dim=2)
+            self.v_cache = torch.cat([self.v_cache, v], dim=2)
+
+    def get(self):
+        return self.k_cache, self.v_cache
+
+    def clear(self):
+        self.k_cache = None
+        self.v_cache = None
+        self.mode = None
+
+
+class GlmImageKVCache:
+    """Container for all layers' KV caches."""
+
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+        self.caches = [GlmImageLayerKVCache() for _ in range(num_layers)]
+
+    def __getitem__(self, layer_idx: int) -> GlmImageLayerKVCache:
+        return self.caches[layer_idx]
+
+    def set_mode(self, mode: Optional[str]):
+        if mode is not None and mode not in ["write", "read", "skip"]:
+            raise ValueError(
+                f"Invalid mode: {mode}, must be one of 'write', 'read', 'skip'"
+            )
+        for cache in self.caches:
+            cache.mode = mode
+
+    def clear(self):
+        for cache in self.caches:
+            cache.clear()
+
+
 class GlmImageCombinedTimestepSizeEmbeddings(nn.Module):
     def __init__(
         self,
@@ -257,6 +305,7 @@ class GlmImageAttention(torch.nn.Module):
         encoder_hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_cache: Optional[GlmImageLayerKVCache] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         dtype = encoder_hidden_states.dtype
 
@@ -292,26 +341,17 @@ class GlmImageAttention(torch.nn.Module):
                 key[:, :, text_seq_length:, :], image_rotary_emb, use_real_unbind_dim=-2
             )
 
-        if self.processor_state == GlmImageAttenProcessorState.ImageEditWriteKV:
-            self.k_cache = (
-                key if self.k_cache is None else torch.cat([self.k_cache, key], dim=2)
-            )
-            self.v_cache = (
-                value
-                if self.v_cache is None
-                else torch.cat([self.v_cache, value], dim=2)
-            )
-        elif self.processor_state == GlmImageAttenProcessorState.ImageEditReadKV:
-            key = (
-                torch.cat([self.k_cache, key], dim=2)
-                if self.k_cache is not None
-                else key
-            )
-            value = (
-                torch.cat([self.v_cache, value], dim=2)
-                if self.v_cache is not None
-                else value
-            )
+        if kv_cache is not None:
+            if kv_cache.mode == "write":
+                kv_cache.store(key, value)
+            elif kv_cache.mode == "read":
+                k_cache, v_cache = kv_cache.get()
+                key = torch.cat([k_cache, key], dim=1) if k_cache is not None else key
+                value = (
+                    torch.cat([v_cache, value], dim=1) if v_cache is not None else value
+                )
+            elif kv_cache.mode == "skip":
+                pass
 
         # 4. Attention
         if attention_mask is not None:
@@ -509,6 +549,7 @@ class GlmImageTransformerBlock(nn.Module):
         ] = None,
         attention_mask: Optional[Dict[str, torch.Tensor]] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
+        kv_cache: Optional[GlmImageLayerKVCache] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # 1. Timestep conditioning
         (
@@ -533,6 +574,7 @@ class GlmImageTransformerBlock(nn.Module):
             encoder_hidden_states=norm_encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
             attention_mask=attention_mask,
+            kv_cache=kv_cache,
             **attention_kwargs,
         )
         hidden_states = hidden_states + attn_hidden_states * gate_msa.unsqueeze(1)
@@ -773,6 +815,7 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
         attention_mask: Optional[torch.Tensor] = None,
+        kv_caches: Optional[GlmImageKVCache] = None,
         freqs_cis: Optional[
             Union[
                 Tuple[torch.Tensor, torch.Tensor],
@@ -812,28 +855,16 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         temb = F.silu(temb)
 
         # 3. Transformer blocks
-        for block in self.transformer_blocks:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states, encoder_hidden_states = (
-                    self._gradient_checkpointing_func(
-                        block,
-                        hidden_states,
-                        encoder_hidden_states,
-                        temb,
-                        image_rotary_emb,
-                        attention_mask,
-                        attention_kwargs,
-                    )
-                )
-            else:
-                hidden_states, encoder_hidden_states = block(
-                    hidden_states,
-                    encoder_hidden_states,
-                    temb,
-                    image_rotary_emb,
-                    attention_mask,
-                    attention_kwargs,
-                )
+        for idx, block in enumerate(self.transformer_blocks):
+            hidden_states, encoder_hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                temb,
+                image_rotary_emb,
+                attention_mask,
+                attention_kwargs,
+                kv_cache=kv_caches[idx] if kv_caches is not None else None,
+            )
 
         # 4. Output norm & projection
         hidden_states = self.norm_out(hidden_states, temb)
