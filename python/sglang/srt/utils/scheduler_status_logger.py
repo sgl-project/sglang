@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, List, Optional
 
+import torch.distributed as dist
+
 from sglang.srt.environ import envs
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 
@@ -15,6 +17,7 @@ class SchedulerStatusLogger:
         self.loggers = create_log_targets(targets=targets, name_prefix=__name__)
         self.dump_interval = dump_interval
         self.last_dump_time = 0.0
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
 
     @staticmethod
     def maybe_create() -> Optional["SchedulerStatusLogger"]:
@@ -39,6 +42,7 @@ class SchedulerStatusLogger:
             self.loggers,
             "scheduler.status",
             {
+                "rank": self.rank,
                 "running_rids": [r.rid for r in running_batch.reqs],
                 "queued_rids": [r.rid for r in waiting_queue],
             },

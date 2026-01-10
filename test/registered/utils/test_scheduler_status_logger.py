@@ -53,7 +53,7 @@ class TestSchedulerStatusLogger(CustomTestCase):
         events = list(_find_log_events(self.temp_dir, "scheduler.status"))
         self.assertGreater(len(events), 0, "scheduler.status event not found")
         data = events[0]
-        for field in ["timestamp", "running_rids", "queued_rids"]:
+        for field in ["timestamp", "rank", "running_rids", "queued_rids"]:
             self.assertIn(field, data)
         self.assertIsInstance(data["running_rids"], list)
         self.assertIsInstance(data["queued_rids"], list)
