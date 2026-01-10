@@ -2,6 +2,7 @@ import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from sglang.srt.utils.log_utils import create_log_targets, log_json
@@ -36,11 +37,8 @@ class TestLogUtils(unittest.TestCase):
                 targets=["stdout", temp_dir], name_prefix="test_multi"
             )
             self.assertEqual(len(loggers), 2)
-            stdout_stream = io.StringIO()
-            loggers[0].handlers[0].stream = stdout_stream
-            log_json(loggers, "multi.event", {"x": 1})
+            stdout_data = _log_and_capture_stdout(loggers, "multi.event", {"x": 1})
             loggers[1].handlers[0].flush()
-            stdout_data = json.loads(stdout_stream.getvalue().strip())
             file_data = _read_log_file(temp_dir)
             self.assertEqual(stdout_data["event"], "multi.event")
             self.assertEqual(file_data["event"], "multi.event")
@@ -53,11 +51,11 @@ def _read_log_file(temp_dir: str) -> dict:
     return json.loads(log_files[0].read_text().strip())
 
 
-def _log_and_capture_stdout(logger, event: str, data: dict) -> dict:
-    stream = io.StringIO()
-    logger.handlers[0].stream = stream
-    log_json(logger, event, data)
-    return json.loads(stream.getvalue().strip())
+def _log_and_capture_stdout(loggers, event: str, data: dict) -> dict:
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        log_json(loggers, event, data)
+    return json.loads(buf.getvalue().strip())
 
 
 if __name__ == "__main__":
