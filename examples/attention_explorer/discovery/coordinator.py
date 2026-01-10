@@ -11,6 +11,7 @@ Orchestrates the 9-stage manifold discovery pipeline with:
 import asyncio
 import logging
 import signal
+import struct
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,6 +21,16 @@ import json
 
 import numpy as np
 import pandas as pd
+
+# Fingerprint dimension (must match schema)
+FINGERPRINT_DIM = 20
+
+
+def unpack_fingerprint(blob: bytes) -> np.ndarray:
+    """Unpack fingerprint from blob to numpy array."""
+    if blob is None:
+        return np.zeros(FINGERPRINT_DIM, dtype=np.float32)
+    return np.array(struct.unpack(f'<{FINGERPRINT_DIM}f', blob), dtype=np.float32)
 
 from .checkpoint import (
     CheckpointManager,
@@ -338,7 +349,7 @@ class DiscoveryJobCoordinator:
         total_loaded = 0
 
         query = """
-            SELECT id, fingerprint, metadata
+            SELECT id, fingerprint, request_id
             FROM fingerprints
             ORDER BY id
         """
@@ -374,11 +385,15 @@ class DiscoveryJobCoordinator:
         if self._fingerprints is None:
             raise ValueError("No fingerprints loaded")
 
-        # Parse fingerprint JSON to feature array
+        # Parse fingerprint BLOB to feature array
         features_list = []
         for idx, row in self._fingerprints.iterrows():
             fp = row['fingerprint']
-            if isinstance(fp, str):
+            if isinstance(fp, bytes):
+                # Unpack from BLOB format (packed float32)
+                fp = unpack_fingerprint(fp)
+            elif isinstance(fp, str):
+                # Legacy JSON format
                 fp = json.loads(fp)
             features_list.append(fp)
 

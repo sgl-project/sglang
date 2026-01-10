@@ -525,13 +525,14 @@ class SidecarClassifier:
             result = self.classifier.classify(fingerprint)
             self._classification_count += 1
 
+            # Convert numpy types to Python native types for JSON serialization
             return {
                 'manifold': {
                     'zone': result.zone,
-                    'confidence': result.zone_confidence,
-                    'cluster_id': result.cluster_id,
+                    'confidence': float(result.zone_confidence),
+                    'cluster_id': int(result.cluster_id),
                     'cluster_label': result.cluster_label,
-                    'cluster_probability': result.cluster_probability,
+                    'cluster_probability': float(result.cluster_probability) if result.cluster_probability is not None else None,
                 },
                 'schema_version': 1,
                 'run_id': self.classifier.run_id,

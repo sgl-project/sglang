@@ -238,7 +238,10 @@ def extract_fingerprints(
     conn.close()
 
     df = pd.DataFrame(rows)
-    logger.info(f"Extracted {len(df)} fingerprints from {df['request_id'].nunique()} requests")
+    if len(df) > 0:
+        logger.info(f"Extracted {len(df)} fingerprints from {df['request_id'].nunique()} requests")
+    else:
+        logger.info("No fingerprints found in the specified time window")
     return df
 
 
