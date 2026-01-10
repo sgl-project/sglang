@@ -808,6 +808,8 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     is_cross_encoder_request: bool = False
     # Priority for the request
     priority: Optional[int] = None
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
