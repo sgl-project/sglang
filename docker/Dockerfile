@@ -273,7 +273,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install \
     datamodel_code_generator \
-    mooncake-transfer-engine==0.3.8 \
+    mooncake-transfer-engine==0.3.8.post1 \
     pre-commit \
     pytest \
     black \
@@ -284,7 +284,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     scikit-build-core \
     nixl \
     py-spy \
-    cubloaty
+    cubloaty \
+    google-cloud-storage
 
 # Build and install sgl-model-gateway (install Rust, build, then remove to save space)
 RUN --mount=type=cache,target=/root/.cache/pip \

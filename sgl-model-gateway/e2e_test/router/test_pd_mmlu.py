@@ -44,10 +44,9 @@ class TestPDMMLU:
         accuracy meets threshold (>= 0.65).
         """
         backend, model, client, *_ = setup_backend
-        base_url = str(client.base_url).rstrip("/v1")
 
         args = SimpleNamespace(
-            base_url=base_url,
+            base_url=str(client.base_url),
             model=model,
             eval_name="mmlu",
             num_examples=64,
