@@ -181,9 +181,6 @@ def flash_attn_with_kvcache(
         if window_size == (-1, -1):
             window_size = (None, None)
 
-        if num_splits == 0:
-            # TODO: Remove this once num_splits=0 is compatible with CUDA Graph.
-            num_splits = 1
         return flash_attn_varlen_func_v4(
             q=q,
             k=k_cache,
