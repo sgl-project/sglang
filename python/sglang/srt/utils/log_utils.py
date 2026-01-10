@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import socket
+import sys
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from typing import List, Optional, Union
@@ -27,7 +28,7 @@ def _create_log_target(target: str, name_prefix: str) -> logging.Logger:
 
 def _create_log_target_stdout(name_prefix: str) -> logging.Logger:
     return _create_logger_with_handler(
-        f"{name_prefix}.stdout", logging.StreamHandler()
+        f"{name_prefix}.stdout", logging.StreamHandler(sys.stdout)
     )
 
 
