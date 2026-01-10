@@ -291,7 +291,9 @@ class TestGetKAndS:
         s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
 
         # Run fused Triton implementation
-        k_triton, s_triton = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
+        k_triton, s_triton = GetKAndS.triton(
+            pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len
+        )
 
         # Verify shapes
         assert k_torch.shape == (seq_len, index_head_dim)
@@ -338,7 +340,9 @@ class TestGetKAndS:
         s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
 
         # Fused
-        k_triton, s_triton = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
+        k_triton, s_triton = GetKAndS.triton(
+            pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len
+        )
 
         torch.testing.assert_close(k_triton, k_torch, rtol=0, atol=0)
         torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
@@ -366,7 +370,9 @@ class TestGetKAndS:
         s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
 
         # Fused
-        k_triton, s_triton = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
+        k_triton, s_triton = GetKAndS.triton(
+            pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len
+        )
 
         torch.testing.assert_close(k_triton, k_torch, rtol=0, atol=0)
         torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
@@ -394,7 +400,9 @@ class TestGetKAndS:
         s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
 
         # Fused
-        k_triton, s_triton = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
+        k_triton, s_triton = GetKAndS.triton(
+            pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len
+        )
 
         # Should handle partial pages correctly
         torch.testing.assert_close(k_triton, k_torch, rtol=0, atol=0)
@@ -432,7 +440,9 @@ class TestEdgeCases:
         torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
 
         # Test GetKAndS
-        k_triton2, s_triton2 = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
+        k_triton2, s_triton2 = GetKAndS.triton(
+            pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len
+        )
         torch.testing.assert_close(k_triton2, k_torch, rtol=0, atol=0)
         torch.testing.assert_close(s_triton2, s_torch, rtol=0, atol=0)
 
@@ -463,7 +473,9 @@ class TestEdgeCases:
         torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
 
         # Test GetKAndS
-        k_triton2, s_triton2 = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
+        k_triton2, s_triton2 = GetKAndS.triton(
+            pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len
+        )
         torch.testing.assert_close(k_triton2, k_torch, rtol=0, atol=0)
         torch.testing.assert_close(s_triton2, s_torch, rtol=0, atol=0)
 
@@ -498,7 +510,9 @@ class TestEdgeCases:
         torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
 
         # Test GetKAndS
-        k_triton2, s_triton2 = GetKAndS.triton(pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len)
+        k_triton2, s_triton2 = GetKAndS.triton(
+            pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len
+        )
         torch.testing.assert_close(k_triton2, k_torch, rtol=0, atol=0)
         torch.testing.assert_close(s_triton2, s_torch, rtol=0, atol=0)
 
@@ -555,7 +569,7 @@ if __name__ == "__main__":
     test_get_k_and_s.test_get_k_and_s_partial_page()
     print("✓ GetKAndS tests passed\n")
 
-    # # Test edge cases
+    # Test edge cases
     print("Testing edge cases...")
     test_edge = TestEdgeCases()
     test_edge.test_single_token()
