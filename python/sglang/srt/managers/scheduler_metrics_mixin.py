@@ -258,7 +258,7 @@ class SchedulerMetricsMixin:
             routing_keys = [r.routing_key for r in self.running_batch.reqs]
             (
                 self.stats.num_unique_routing_keys,
-                self.stats.routing_key_req_count_buckets,
+                self.stats.routing_key_req_counts,
             ) = compute_routing_key_stats(routing_keys)
 
             # Others
@@ -429,7 +429,7 @@ class SchedulerMetricsMixin:
             routing_keys = [r.routing_key for r in batch.reqs]
             (
                 self.stats.num_unique_routing_keys,
-                self.stats.routing_key_req_count_buckets,
+                self.stats.routing_key_req_counts,
             ) = compute_routing_key_stats(routing_keys)
 
             # Others

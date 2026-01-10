@@ -4,7 +4,7 @@
 //! non-cumulative buckets (gt < value <= le) suitable for heatmap display.
 //!
 //! Note: Keep in sync with Python implementation in
-//! python/sglang/srt/metrics/collector.py (GaugeHistogram class)
+//! python/sglang/srt/utils/gauge_histogram.py
 
 use std::sync::LazyLock;
 
@@ -51,6 +51,16 @@ impl BucketLabels {
             .position(|&bound| value <= bound)
             .unwrap_or(self.len() - 1)
     }
+
+    /// Compute bucket counts from observations.
+    pub fn compute_bucket_counts(&self, observations: &[u64]) -> Vec<usize> {
+        let mut counts = vec![0usize; self.len()];
+        for &value in observations {
+            let idx = self.find_bucket_index(value);
+            counts[idx] += 1;
+        }
+        counts
+    }
 }
 
 pub struct GaugeHistogram {
@@ -63,10 +73,17 @@ impl GaugeHistogram {
         Self { name, buckets }
     }
 
-    pub fn set(&self, values: &[usize]) {
+    /// Set bucket counts directly.
+    pub fn set_raw(&self, values: &[usize]) {
         for ((gt, le), &count) in self.buckets.iter().zip(values.iter()) {
             gauge!(self.name, "gt" => gt, "le" => le).set(count as f64);
         }
+    }
+
+    /// Compute bucket counts from observations and set them.
+    pub fn set_by_current_observations(&self, observations: &[u64]) {
+        let counts = self.buckets.compute_bucket_counts(observations);
+        self.set_raw(&counts);
     }
 
     pub fn buckets(&self) -> &BucketLabels {
@@ -111,6 +128,35 @@ mod tests {
         let buckets = BucketLabels::new(&[10, 30]);
         let pairs: Vec<_> = buckets.iter().collect();
         assert_eq!(pairs, vec![("0", "10"), ("10", "30"), ("30", "+Inf")]);
+    }
+
+    #[test]
+    fn test_compute_bucket_counts_empty() {
+        let buckets = BucketLabels::new(&[10, 30, 60]);
+        let counts = buckets.compute_bucket_counts(&[]);
+        assert_eq!(counts, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_compute_bucket_counts_distribution() {
+        let buckets = BucketLabels::new(&[10, 30, 60]);
+        // Values: 5 (<=10), 10 (<=10), 15 (<=30), 40 (<=60), 100 (+Inf)
+        let counts = buckets.compute_bucket_counts(&[5, 10, 15, 40, 100]);
+        assert_eq!(counts, vec![2, 1, 1, 1]);
+    }
+
+    #[test]
+    fn test_compute_bucket_counts_all_in_one_bucket() {
+        let buckets = BucketLabels::new(&[10, 30, 60]);
+        let counts = buckets.compute_bucket_counts(&[1, 2, 3, 4, 5]);
+        assert_eq!(counts, vec![5, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_compute_bucket_counts_all_overflow() {
+        let buckets = BucketLabels::new(&[10, 30, 60]);
+        let counts = buckets.compute_bucket_counts(&[100, 200, 300]);
+        assert_eq!(counts, vec![0, 0, 0, 3]);
     }
 
     #[test]

@@ -55,23 +55,17 @@ impl InFlightRequestTracker {
         self.requests.is_empty()
     }
 
-    pub fn compute_bucket_counts(&self) -> Vec<usize> {
-        let buckets = INFLIGHT_AGE_GAUGE.buckets();
+    fn collect_ages(&self) -> Vec<u64> {
         let now = Instant::now();
-
-        let mut counts = vec![0usize; buckets.len()];
-        for entry in self.requests.iter() {
-            let age_secs = now.duration_since(*entry.value()).as_secs();
-            let bucket_idx = buckets.find_bucket_index(age_secs);
-            counts[bucket_idx] += 1;
-        }
-
-        counts
+        self.requests
+            .iter()
+            .map(|entry| now.duration_since(*entry.value()).as_secs())
+            .collect()
     }
 
     fn sample_and_record(&self) {
-        let counts = self.compute_bucket_counts();
-        INFLIGHT_AGE_GAUGE.set(&counts);
+        let ages = self.collect_ages();
+        INFLIGHT_AGE_GAUGE.set_by_current_observations(&ages);
     }
 }
 
@@ -130,45 +124,29 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_tracker_buckets() {
+    fn test_collect_ages_empty() {
         let tracker = InFlightRequestTracker::new();
-        let counts = tracker.compute_bucket_counts();
-        assert!(counts.iter().all(|&c| c == 0));
+        let ages = tracker.collect_ages();
+        assert!(ages.is_empty());
     }
 
     #[test]
-    fn test_bucket_counts() {
+    fn test_collect_ages() {
         let tracker = InFlightRequestTracker::new();
         let now = Instant::now();
 
         tracker.insert_with_time(1, now);
         tracker.insert_with_time(2, now - Duration::from_secs(45));
         tracker.insert_with_time(3, now - Duration::from_secs(100));
-        tracker.insert_with_time(4, now - Duration::from_secs(250));
-        tracker.insert_with_time(5, now - Duration::from_secs(500));
-        tracker.insert_with_time(6, now - Duration::from_secs(700));
 
-        let counts = tracker.compute_bucket_counts();
-        assert_eq!(counts[0], 1, "bucket <=30s");
-        assert_eq!(counts[1], 1, "bucket <=60s");
-        assert_eq!(counts[2], 1, "bucket <=180s");
-        assert_eq!(counts[3], 1, "bucket <=300s");
-        assert_eq!(counts[4], 1, "bucket <=600s");
-        assert_eq!(counts[5], 1, "bucket <=1200s");
-        assert_eq!(*counts.last().unwrap(), 0, "bucket +Inf");
-    }
-
-    #[test]
-    fn test_bucket_boundary_values() {
-        let tracker = InFlightRequestTracker::new();
-        let now = Instant::now();
-
-        tracker.insert_with_time(1, now - Duration::from_secs(30));
-        tracker.insert_with_time(2, now - Duration::from_secs(31));
-
-        let counts = tracker.compute_bucket_counts();
-        assert_eq!(counts[0], 1, "bucket <=30s includes exact boundary");
-        assert_eq!(counts[1], 1, "bucket <=60s has one request (31s)");
+        let ages = tracker.collect_ages();
+        assert_eq!(ages.len(), 3);
+        // Ages should be approximately 0, 45, 100 (order may vary due to DashMap)
+        let mut sorted_ages = ages.clone();
+        sorted_ages.sort();
+        assert!(sorted_ages[0] <= 1); // ~0s
+        assert!((44..=46).contains(&sorted_ages[1])); // ~45s
+        assert!((99..=101).contains(&sorted_ages[2])); // ~100s
     }
 
     #[test]

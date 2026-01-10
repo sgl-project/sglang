@@ -249,27 +249,18 @@ class SchedulerStats:
 
     # Routing key metrics
     num_unique_routing_keys: int = 0
-    routing_key_req_count_buckets: List[int] = field(default_factory=list)
+    routing_key_req_counts: List[int] = field(default_factory=list)  # per-key counts
 
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 5, 10, 20, 50, 100, 200]
 
 
 def compute_routing_key_stats(routing_keys: List[Optional[str]]) -> tuple:
+    """Returns (num_unique_keys, per_key_counts)."""
     from collections import Counter
 
     key_counts = Counter(k for k in routing_keys if k is not None)
-    num_unique_keys = len(key_counts)
-
-    buckets = ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS
-    bucket_counts = []
-    for i, upper in enumerate(buckets):
-        lower = buckets[i - 1] if i > 0 else 0
-        count = sum(1 for c in key_counts.values() if lower < c <= upper)
-        bucket_counts.append(count)
-    bucket_counts.append(sum(1 for c in key_counts.values() if c > buckets[-1]))
-
-    return num_unique_keys, bucket_counts
+    return len(key_counts), list(key_counts.values())
 
 
 @dataclass
@@ -1020,8 +1011,8 @@ class SchedulerMetricsCollector:
             self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
 
         self._log_gauge(self.num_unique_routing_keys, stats.num_unique_routing_keys)
-        self.routing_key_running_req_count.set(
-            self.labels, stats.routing_key_req_count_buckets
+        self.routing_key_running_req_count.set_by_current_observations(
+            self.labels, stats.routing_key_req_counts
         )
 
         self.last_log_time = time.perf_counter()
