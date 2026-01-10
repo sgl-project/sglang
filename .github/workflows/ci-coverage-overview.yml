@@ -31,7 +31,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install numpy
+          pip install -e "python/[dev]"
 
       - name: Generate CI Coverage Report
         run: |
