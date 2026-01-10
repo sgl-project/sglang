@@ -62,7 +62,9 @@ def save_checkpoint(checkpoint_path: str, checkpoint: TuningCheckpoint) -> None:
     with open(temp_path, "w") as f:
         json.dump(asdict(checkpoint), f, indent=2)
     os.rename(temp_path, checkpoint_path)
-    print(f"Checkpoint saved: {len(checkpoint.completed_batch_sizes)} batch sizes completed")
+    print(
+        f"Checkpoint saved: {len(checkpoint.completed_batch_sizes)} batch sizes completed"
+    )
 
 
 def load_checkpoint(checkpoint_path: str) -> Optional[TuningCheckpoint]:
@@ -73,7 +75,9 @@ def load_checkpoint(checkpoint_path: str) -> Optional[TuningCheckpoint]:
         with open(checkpoint_path, "r") as f:
             data = json.load(f)
         checkpoint = TuningCheckpoint(**data)
-        print(f"Loaded checkpoint: {len(checkpoint.completed_batch_sizes)} batch sizes already completed")
+        print(
+            f"Loaded checkpoint: {len(checkpoint.completed_batch_sizes)} batch sizes already completed"
+        )
         return checkpoint
     except (json.JSONDecodeError, TypeError) as e:
         print(f"Warning: Could not load checkpoint ({e}), starting fresh")
@@ -85,6 +89,7 @@ def cleanup_checkpoint(checkpoint_path: str) -> None:
     if os.path.exists(checkpoint_path):
         os.remove(checkpoint_path)
         print(f"Cleaned up checkpoint file: {checkpoint_path}")
+
 
 _is_hip = is_hip()
 
@@ -395,58 +400,91 @@ def tune_fused_moe_triton(
             bs for bs in batch_sizes if bs not in checkpoint.completed_batch_sizes
         ]
         completed_configs = dict(checkpoint.completed_batch_sizes)
-        print(f"Resuming: {len(completed_configs)} completed, {len(remaining_batch_sizes)} remaining")
+        print(
+            f"Resuming: {len(completed_configs)} completed, {len(remaining_batch_sizes)} remaining"
+        )
     else:
-        remaining_batch_sizes = batch_sizes
+        remaining_batch_sizes = list(batch_sizes)
         completed_configs = {}
 
     if not remaining_batch_sizes:
         print("All batch sizes already completed!")
         return {M: sort_config(config) for M, config in completed_configs.items()}
 
-    print(f"Start tuning over {len(search_space)} configurations for {len(remaining_batch_sizes)} batch sizes...")
+    print(
+        f"Start tuning over {len(search_space)} configurations for {len(remaining_batch_sizes)} batch sizes..."
+    )
 
     start = time.perf_counter()
 
-    # Process batch sizes one at a time to enable checkpointing after each
-    for batch_size in remaining_batch_sizes:
-        worker_idx = remaining_batch_sizes.index(batch_size) % num_gpus
-        worker = workers[worker_idx]
-
-        print(f"Tuning batch_size={batch_size}...")
-        config = ray.get(
-            worker.tune.remote(
-                batch_size,
-                E,
-                shard_intermediate_size,
-                hidden_size,
-                topk,
-                dtype_torch,
-                use_fp8_w8a8,
-                use_int8_w8a8,
-                use_int8_w8a16,
-                per_channel_quant,
-                block_shape,
-                search_space,
-                num_iters,
-            )
+    # Helper to launch a tuning task
+    def launch_tune_task(worker, batch_size):
+        return worker.tune.remote(
+            batch_size,
+            E,
+            shard_intermediate_size,
+            hidden_size,
+            topk,
+            dtype_torch,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            per_channel_quant,
+            block_shape,
+            search_space,
+            num_iters,
         )
-        completed_configs[batch_size] = sort_config(config)
 
-        # Save checkpoint after each batch size completes
-        if checkpoint_path:
-            remaining = [bs for bs in batch_sizes if bs not in completed_configs]
-            checkpoint = TuningCheckpoint(
-                model=model,
-                tp_size=tp_size,
-                ep_size=ep_size,
-                dtype=dtype,
-                per_channel_quant=per_channel_quant,
-                completed_batch_sizes=completed_configs,
-                pending_batch_sizes=remaining,
-                timestamp=datetime.now().isoformat(),
-            )
-            save_checkpoint(checkpoint_path, checkpoint)
+    # Process batch sizes in parallel with checkpointing
+    pending_batch_sizes = list(remaining_batch_sizes)
+    task_to_batch = {}  # task_ref -> batch_size
+    task_to_worker = {}  # task_ref -> worker_idx
+
+    # Launch initial batch of tasks (one per GPU)
+    for i in range(min(num_gpus, len(pending_batch_sizes))):
+        batch_size = pending_batch_sizes.pop(0)
+        worker = workers[i]
+        print(f"Launching batch_size={batch_size} on GPU {i}...")
+        task_ref = launch_tune_task(worker, batch_size)
+        task_to_batch[task_ref] = batch_size
+        task_to_worker[task_ref] = i
+
+    # Process completed tasks and launch new ones
+    while task_to_batch:
+        # Wait for ANY task to complete (non-blocking for others)
+        done_refs, _ = ray.wait(list(task_to_batch.keys()), num_returns=1)
+
+        for done_ref in done_refs:
+            batch_size = task_to_batch.pop(done_ref)
+            worker_idx = task_to_worker.pop(done_ref)
+            config = ray.get(done_ref)
+            completed_configs[batch_size] = sort_config(config)
+            now = datetime.now()
+            print(f"{now.ctime()}] Completed batch_size={batch_size} on GPU {worker_idx}")
+
+            # Save checkpoint after each batch completes
+            if checkpoint_path:
+                remaining = [bs for bs in batch_sizes if bs not in completed_configs]
+                ckpt = TuningCheckpoint(
+                    model=model,
+                    tp_size=tp_size,
+                    ep_size=ep_size,
+                    dtype=dtype,
+                    per_channel_quant=per_channel_quant,
+                    completed_batch_sizes=completed_configs,
+                    pending_batch_sizes=remaining,
+                    timestamp=now.isoformat(),
+                )
+                save_checkpoint(checkpoint_path, ckpt)
+
+            # Launch next task on the freed worker if any pending
+            if pending_batch_sizes:
+                next_batch = pending_batch_sizes.pop(0)
+                worker = workers[worker_idx]
+                print(f"Launching batch_size={next_batch} on GPU {worker_idx}...")
+                task_ref = launch_tune_task(worker, next_batch)
+                task_to_batch[task_ref] = next_batch
+                task_to_worker[task_ref] = worker_idx
 
     end = time.perf_counter()
     print(f"Tuning took {end - start:.2f} seconds")
