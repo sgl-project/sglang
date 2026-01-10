@@ -747,6 +747,278 @@ def ci_validate_cache_and_enable_offline_if_complete(
     return True
 
 
+def _infer_component_type(component_name: str, component_info: list) -> str:
+    """
+    Infer component type from component name and info.
+
+    Args:
+        component_name: Name of the component (e.g., "scheduler", "tokenizer")
+        component_info: Component info from model_index.json (e.g., ["diffusers", "SchedulerClass"])
+
+    Returns:
+        Component type string for validation rules
+    """
+    # Normalize component name for type detection
+    name_lower = component_name.lower()
+
+    # Infer type based on name
+    if "scheduler" in name_lower:
+        return "scheduler"
+    elif "tokenizer" in name_lower:
+        return "tokenizer"
+    elif "image_processor" in name_lower:
+        return "image_processor"
+    elif "feature_extractor" in name_lower:
+        return "feature_extractor"
+    elif "processor" in name_lower:
+        return "processor"
+    else:
+        # Default to model component (needs config.json + weights)
+        return "model"
+
+
+def _check_component_config(
+    component_dir: str, component_type: str
+) -> Tuple[bool, List[str]]:
+    """
+    Check if component has required config files based on type.
+
+    Args:
+        component_dir: Path to component directory
+        component_type: Type of component (scheduler, tokenizer, processor, model, etc.)
+
+    Returns:
+        Tuple of (has_valid_config, list_of_candidates_tried)
+    """
+    if component_type == "scheduler":
+        # Scheduler: scheduler_config.json or config.json
+        candidates = ["scheduler_config.json", "config.json"]
+        for candidate in candidates:
+            candidate_path = os.path.join(component_dir, candidate)
+            if _validate_json_file(candidate_path, candidate):
+                return True, candidates
+        return False, candidates
+
+    elif component_type == "tokenizer":
+        # Tokenizer must have actual tokenizer files (not just tokenizer_config.json)
+        # Valid combinations:
+        # - tokenizer.json
+        # - tokenizer.model
+        # - vocab.json + merges.txt
+        candidates = [
+            "tokenizer.json",
+            "tokenizer.model",
+            "vocab.json+merges.txt",
+        ]
+
+        # Check tokenizer.json (validate as JSON)
+        tokenizer_json_path = os.path.join(component_dir, "tokenizer.json")
+        if _validate_json_file(tokenizer_json_path, "tokenizer.json"):
+            return True, candidates
+
+        # Check tokenizer.model (non-empty file)
+        tokenizer_model_path = os.path.join(component_dir, "tokenizer.model")
+        if os.path.exists(tokenizer_model_path) and os.path.isfile(
+            tokenizer_model_path
+        ):
+            try:
+                if os.path.getsize(tokenizer_model_path) > 0:
+                    return True, candidates
+            except OSError:
+                pass
+
+        # Check vocab.json + merges.txt pair
+        vocab_path = os.path.join(component_dir, "vocab.json")
+        merges_path = os.path.join(component_dir, "merges.txt")
+        if _validate_json_file(vocab_path, "vocab.json") and os.path.exists(
+            merges_path
+        ):
+            return True, candidates
+
+        return False, candidates
+
+    elif component_type in ["processor", "feature_extractor", "image_processor"]:
+        # Processor/feature_extractor/image_processor: preprocessor_config.json or config.json
+        candidates = ["preprocessor_config.json", "config.json"]
+        for candidate in candidates:
+            candidate_path = os.path.join(component_dir, candidate)
+            if _validate_json_file(candidate_path, candidate):
+                return True, candidates
+        return False, candidates
+
+    else:
+        # Default model components: config.json
+        candidates = ["config.json"]
+        config_path = os.path.join(component_dir, "config.json")
+        if _validate_json_file(config_path, "config.json"):
+            return True, candidates
+        return False, candidates
+
+
+def _check_component_weights(component_dir: str) -> bool:
+    """
+    Check if component directory has weight files.
+
+    Args:
+        component_dir: Path to component directory
+
+    Returns:
+        True if weight files found, False otherwise
+    """
+    weight_patterns = ["*.safetensors", "*.bin", "*.pt", "*.pth"]
+
+    for pattern in weight_patterns:
+        weight_files = glob_module.glob(os.path.join(component_dir, pattern))
+        if weight_files:
+            return True
+
+    return False
+
+
+def _format_component_list(components: List[str], max_show: int = 5) -> str:
+    """
+    Format component list with truncation.
+
+    Args:
+        components: List of component names
+        max_show: Maximum number to show before truncating
+
+    Returns:
+        Formatted string like "comp1, comp2, comp3" or "comp1, comp2, +3 more"
+    """
+    if len(components) <= max_show:
+        return ", ".join(components)
+    else:
+        shown = components[:max_show]
+        remaining = len(components) - max_show
+        return f"{', '.join(shown)}, +{remaining} more"
+
+
+def _validate_diffusion_model(
+    snapshot_dir: str,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Validate diffusion model (diffusers pipeline) cache completeness.
+
+    This validation is based on model_index.json as the single source of truth.
+    Error reporting uses coarse-grained error codes unless verbose mode is enabled.
+
+    Error codes:
+    - DIFFUSERS_INVALID_INDEX: model_index.json missing or corrupted
+    - DIFFUSERS_INVALID_COMPONENTS: model_index.json has no valid components
+    - DIFFUSERS_MISSING_COMPONENT: component directory or config missing
+    - DIFFUSERS_MISSING_WEIGHTS: component weights missing
+
+    Args:
+        snapshot_dir: Path to the model snapshot directory
+
+    Returns:
+        Tuple of (is_valid, error_message)
+        - (True, None) if validation passed
+        - (False, error_code_with_components) if validation failed
+    """
+    # Check verbose mode from environment
+    verbose = os.environ.get("SGLANG_CI_VALIDATE_VERBOSE") == "1"
+
+    # 1. Check for model_index.json (required for diffusers models)
+    model_index_path = os.path.join(snapshot_dir, "model_index.json")
+    if not os.path.exists(model_index_path):
+        return False, "DIFFUSERS_INVALID_INDEX: model_index.json not found"
+
+    # Parse model_index.json
+    try:
+        with open(model_index_path, "r", encoding="utf-8") as f:
+            model_index = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        if verbose:
+            return False, f"DIFFUSERS_INVALID_INDEX: model_index.json parse error - {e}"
+        return False, "DIFFUSERS_INVALID_INDEX: model_index.json corrupted"
+
+    # 2. Extract components (non-underscore keys with list values)
+    components = {
+        k: v
+        for k, v in model_index.items()
+        if not k.startswith("_") and isinstance(v, list)
+    }
+
+    if not components:
+        return False, "DIFFUSERS_INVALID_COMPONENTS: no valid components defined"
+
+    # Categorize errors by type
+    missing_dirs = []
+    missing_configs = []
+    missing_configs_verbose = []
+    missing_weights = []
+
+    # 3. Validate each component
+    for component_name, component_info in components.items():
+        component_dir = os.path.join(snapshot_dir, component_name)
+
+        # Component directory must exist
+        if not os.path.isdir(component_dir):
+            missing_dirs.append(component_name)
+            continue
+
+        # Infer component type for validation rules
+        component_type = _infer_component_type(component_name, component_info)
+
+        # Check for required config files based on component type
+        has_valid_config, config_candidates = _check_component_config(
+            component_dir, component_type
+        )
+
+        if not has_valid_config:
+            missing_configs.append(component_name)
+            if verbose:
+                candidates_str = ", ".join(config_candidates)
+                missing_configs_verbose.append(
+                    f"{component_name} (tried: {candidates_str})"
+                )
+            continue
+
+        # 4. Check for weights if component needs them
+        # These components don't require weight files (config-only)
+        needs_weights = component_type not in [
+            "scheduler",
+            "tokenizer",
+            "processor",
+            "feature_extractor",
+            "image_processor",
+        ]
+
+        if needs_weights:
+            has_weights = _check_component_weights(component_dir)
+            if not has_weights:
+                missing_weights.append(component_name)
+
+    # 5. Build error message based on categorized errors
+    if missing_dirs or missing_configs or missing_weights:
+        errors = []
+
+        if missing_dirs:
+            dir_str = _format_component_list(missing_dirs)
+            if verbose:
+                errors.append(f"DIFFUSERS_MISSING_COMPONENT (dirs): {dir_str}")
+            else:
+                errors.append(f"DIFFUSERS_MISSING_COMPONENT(dir): {dir_str}")
+
+        if missing_configs:
+            if verbose:
+                config_str = "; ".join(missing_configs_verbose)
+                errors.append(f"DIFFUSERS_MISSING_COMPONENT (configs): {config_str}")
+            else:
+                config_str = _format_component_list(missing_configs)
+                errors.append(f"DIFFUSERS_MISSING_COMPONENT(cfg): {config_str}")
+
+        if missing_weights:
+            weight_str = _format_component_list(missing_weights)
+            errors.append(f"DIFFUSERS_MISSING_WEIGHTS: {weight_str}")
+
+        return False, " | ".join(errors)
+
+    return True, None
+
+
 def validate_cache_with_detailed_reason(
     snapshot_dir: str, weight_files: List[str], model_name_or_path: str
 ) -> Tuple[bool, Optional[str]]:

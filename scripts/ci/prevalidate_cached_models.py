@@ -24,6 +24,7 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
 from sglang.srt.model_loader.ci_weight_validation import (  # noqa: E402
+    _validate_diffusion_model,
     validate_cache_with_detailed_reason,
 )
 
@@ -302,7 +303,6 @@ def main():
     validated_count = 0
     failed_count = 0
     skipped_count = 0
-    na_count = 0  # Non-transformers models
     processed_count = 0
 
     # In-process cache to avoid re-validating same snapshot in this run
@@ -327,13 +327,39 @@ def main():
         )
         processed_count += 1
 
-        # Check if this is a transformers text model
-        if not is_transformers_text_model(snapshot_dir):
-            print("  N/A (not a transformers text model - diffusion/vision/etc)")
-            na_count += 1
+        # Determine model type by checking for model_index.json (diffusers pipeline marker)
+        model_index_path = os.path.join(snapshot_dir, "model_index.json")
+        is_diffusion_model = os.path.exists(model_index_path)
+
+        if is_diffusion_model:
+            # This is a diffusers pipeline - use diffusion validation
+            try:
+                is_valid, reason = _validate_diffusion_model(snapshot_dir)
+
+                if is_valid:
+                    print("  PASS (diffusion) - Cache complete & valid")
+                    validated_count += 1
+                else:
+                    print(f"  FAIL (diffusion) - {reason}")
+                    failed_count += 1
+
+            except Exception as e:
+                print(f"  FAIL (diffusion) - Validation raised exception: {e}")
+                failed_count += 1
+
             continue
 
-        # Scan weight files (outside lock)
+        # Transformers model - use standard validation
+        # First check if this looks like a transformers text model
+        if not is_transformers_text_model(snapshot_dir):
+            # Not a recognized model type, skip
+            print(
+                "  SKIP (unknown type) - Not a diffusers pipeline or transformers model"
+            )
+            skipped_count += 1
+            continue
+
+        # Scan weight files
         weight_files = scan_weight_files(snapshot_dir)
 
         if not weight_files:
@@ -373,7 +399,6 @@ def main():
     print(f"  PASS (complete & valid):      {validated_count}")
     print(f"  FAIL (incomplete/corrupted):  {failed_count}")
     print(f"  SKIP (no weights/duplicate):  {skipped_count}")
-    print(f"  N/A (not transformers text):  {na_count}")
     print(f"  Total processed:              {processed_count}/{len(snapshots)}")
     print("=" * 70)
 
