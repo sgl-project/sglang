@@ -4,10 +4,9 @@ import threading
 import time
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cuda_ci(est_time=5, suite="stage-a-unit-test")
-register_amd_ci(est_time=5, suite="stage-a-unit-test-amd")
+register_cpu_ci(est_time=60, suite="default", nightly=True)
 
 
 class TestCpuMonitor(unittest.TestCase):
