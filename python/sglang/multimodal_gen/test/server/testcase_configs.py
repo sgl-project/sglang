@@ -155,7 +155,9 @@ class DiffusionServerArgs:
     dynamic_lora_path: str | None = (
         None  # LoRA path for dynamic loading test (loaded via set_lora after startup)
     )
-    second_lora_path: str | None = None  # Second LoRA adapter path for multi-LoRA testing
+    second_lora_path: str | None = (
+        None  # Second LoRA adapter path for multi-LoRA testing
+    )
     # misc
     enable_warmup: bool = False
 
