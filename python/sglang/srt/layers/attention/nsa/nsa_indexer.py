@@ -206,6 +206,12 @@ class Indexer(MultiPlatformOp):
             yield
 
     @torch.compile(dynamic=True)
+    def _project_and_scale_head_gates(self, x: torch.Tensor):
+        weights, _ = self.weights_proj(x.float())
+        weights = weights * self.n_heads**-0.5
+        return weights
+
+    @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x.float())
         weights = weights * self.n_heads**-0.5
@@ -856,21 +862,36 @@ class Indexer(MultiPlatformOp):
                 return_indices,
             )
 
-        query, key = self._get_q_k_bf16(
-            q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
-        )
-
-        if enable_dual_stream:
+        if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            weights = self._project_and_scale_head_gates(x)
             with torch.cuda.stream(self.alt_stream):
+                query, key = self._get_q_k_bf16(
+                    q_lora, x, positions, False, forward_batch=forward_batch
+                )
+                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
             current_stream.wait_stream(self.alt_stream)
+            weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         else:
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-            k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+            query, key = self._get_q_k_bf16(
+                q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+            )
+
+            if enable_dual_stream:
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+
+                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                with torch.cuda.stream(self.alt_stream):
+                    k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+
+            weights = self._get_logits_head_gate(x, q_scale)
 
         # k_fp8: (seq_len, head_dim) fp8_e4m3fn
         # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
@@ -884,8 +905,6 @@ class Indexer(MultiPlatformOp):
             index_k=k_fp8,
             index_k_scale=k_scale,
         )
-
-        weights = self._get_logits_head_gate(x, q_scale)
 
         if is_cuda():
             assert forward_batch.seq_lens_cpu is not None

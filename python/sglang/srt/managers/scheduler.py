@@ -21,7 +21,6 @@ import sys
 import time
 from collections import deque
 from concurrent import futures
-from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -258,6 +257,9 @@ class Scheduler(
         pp_rank: int,
         dp_rank: Optional[int],
     ):
+        self.is_initializing = True
+        self.init_soft_watchdog(server_args)
+
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
@@ -335,6 +337,9 @@ class Scheduler(
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
+        if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
+            time.sleep(t)
+
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
 
@@ -367,6 +372,8 @@ class Scheduler(
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+        self.is_initializing = False
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -766,15 +773,17 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
-        if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
+        if self.server_args.enable_prefill_delayer:
             self.prefill_delayer = PrefillDelayer(
                 dp_size=self.dp_size,
                 attn_tp_size=self.attn_tp_size,
-                tp_worker=self.tp_worker,
+                cpu_group=self.tp_worker.get_tp_group().cpu_group,
                 server_args=self.server_args,
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
+                max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
+                token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
@@ -792,15 +801,17 @@ class Scheduler(
         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
 
+    def init_soft_watchdog(self, server_args: ServerArgs):
+        if (x := server_args.soft_watchdog_timeout) is not None:
+            self.soft_watchdog = create_scheduler_watchdog(
+                self, watchdog_timeout=x, soft=True
+            )
+
     def init_watch_dog_memory_saver_input_blocker(self):
         # Start watchdog thread
         self.watchdog = create_scheduler_watchdog(
             self, watchdog_timeout=self.server_args.watchdog_timeout
         )
-        if (x := self.server_args.soft_watchdog_timeout) is not None:
-            self.soft_watchdog = create_scheduler_watchdog(
-                self, watchdog_timeout=x, soft=True
-            )
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1432,6 +1443,7 @@ class Scheduler(
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
+                routing_key=recv_req.routing_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
             )
@@ -1856,14 +1868,21 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        with (
-            PrefillDelayerSinglePassExecutor(self.prefill_delayer)
-            if self.prefill_delayer
-            else nullcontext()
-        ) as prefill_delayer_single_pass:
-            return self._get_new_batch_prefill_raw(
-                prefill_delayer_single_pass=prefill_delayer_single_pass
+        prefill_delayer_single_pass = None
+        if self.prefill_delayer:
+            _, token_usage, _, _ = self._get_token_info()
+            prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
+                self.prefill_delayer, token_usage=token_usage
             )
+
+        ret = self._get_new_batch_prefill_raw(
+            prefill_delayer_single_pass=prefill_delayer_single_pass
+        )
+
+        if self.prefill_delayer:
+            prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
+
+        return ret
 
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
@@ -1899,7 +1918,7 @@ class Scheduler(
             self.tree_cache.check_hicache_events()
 
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue)
+        self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -1947,14 +1966,11 @@ class Scheduler(
                     | set([req.lora_id])
                 )
                 if not self.tp_worker.can_run_lora_batch(new_lora_set):
-                    # If this is a LoRA request that would exceed the LoRA slot limit,
-                    # skip it and continue to try scheduling non-LoRA requests.
-                    # Non-LoRA requests (lora_id=None) share a single reserved slot
-                    # and should never cause this check to fail.
-                    if req.lora_id is not None:
-                        # Skip this LoRA request - it would trigger adapter eviction/loading
-                        # which is slow. We'll try to schedule it in a future iteration.
-                        continue
+                    # Batch would exceed the LoRA slot limit.
+                    # Skip this request and try scheduling it in a future iteration.
+                    # Note: When eviction is needed, the eviction policy prefers to
+                    # evict LoRA adapters over base model (None) - see mem_pool.py.
+                    continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
