@@ -100,7 +100,7 @@ class RequestLogger:
             }
             if headers:
                 log_data["headers"] = headers
-            self._log_json("request.received", log_data)
+            log_json(self.targets, "request.received", log_data)
         else:
             headers_str = f", headers={headers}" if headers else ""
             self._log(
@@ -145,7 +145,7 @@ class RequestLogger:
                 log_data["out"] = _transform_data_for_logging(
                     out, max_length, out_skip_names
                 )
-            self._log_json("request.finished", log_data)
+            log_json(self.targets, "request.finished", log_data)
         else:
             obj_str = _dataclass_to_string_truncated(
                 obj, max_length, skip_names=skip_names
@@ -197,9 +197,6 @@ class RequestLogger:
                     f"Invalid --log-requests-level: {self.log_requests_level=}"
                 )
         return max_length, skip_names, out_skip_names
-
-    def _log_json(self, event: str, data: dict) -> None:
-        log_json(self.targets, event, data)
 
     def _log(self, msg: str) -> None:
         for target in self.targets:
