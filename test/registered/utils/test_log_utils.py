@@ -15,6 +15,7 @@ class TestLogUtils(unittest.TestCase):
             with self.subTest(targets=targets):
                 loggers = create_log_targets(targets=targets, name_prefix=f"test_{targets}")
                 self.assertEqual(len(loggers), 1)
+
                 data = _log_and_capture_stdout(loggers[0], "test.event", {"key": "value"})
                 self.assertIn("timestamp", data)
                 self.assertEqual(data["event"], "test.event")
@@ -24,6 +25,7 @@ class TestLogUtils(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             loggers = create_log_targets(targets=[temp_dir], name_prefix="test_file")
             self.assertEqual(len(loggers), 1)
+
             log_json(loggers, "file.event", {"data": 123})
             _flush_all(loggers)
             data = _read_log_file(temp_dir)
@@ -37,6 +39,7 @@ class TestLogUtils(unittest.TestCase):
                 targets=["stdout", temp_dir], name_prefix="test_multi"
             )
             self.assertEqual(len(loggers), 2)
+
             stdout_data = _log_and_capture_stdout(loggers, "multi.event", {"x": 1})
             _flush_all(loggers)
             file_data = _read_log_file(temp_dir)
