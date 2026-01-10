@@ -1,6 +1,11 @@
 name: CI Coverage Overview
 
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/ci-coverage-overview.yml'
+      - 'scripts/ci/ci_coverage_report.py'
+      - 'test/registered/**'
   workflow_dispatch:
     inputs:
       output_format:
@@ -26,7 +31,7 @@ jobs:
 
       - name: Generate CI Coverage Report
         run: |
-          python scripts/ci/ci_coverage_report.py --output-format ${{ inputs.output_format }}
+          python scripts/ci/ci_coverage_report.py --output-format ${{ inputs.output_format || 'markdown' }}
 
       - name: Upload JSON artifact
         if: inputs.output_format == 'json'
