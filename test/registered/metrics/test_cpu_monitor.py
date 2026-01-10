@@ -24,9 +24,9 @@ class TestCpuMonitor(unittest.TestCase):
         value = None
         for metric in REGISTRY.collect():
             for sample in metric.samples:
-                if sample.name == "sglang:process_cpu_seconds_total_total" and sample.labels.get("component") == "test":
+                if sample.name == "sglang:process_cpu_seconds_total" and sample.labels.get("component") == "test":
                     value = sample.value
-        print(f"sglang:process_cpu_seconds_total_total = {value}")
+        print(f"sglang:process_cpu_seconds_total = {value}")
         self.assertIsNotNone(value)
         self.assertGreater(value, 0)
 
