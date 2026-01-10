@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import time
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.utils.log_utils import create_log_targets, log_json
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 
 class SchedulerStatusLogger:
@@ -12,7 +15,9 @@ class SchedulerStatusLogger:
         self.dump_interval_s = dump_interval_s
         self.last_dump_time = 0.0
 
-    def maybe_dump(self, running_rids: List[str], queued_rids: List[str]) -> None:
+    def maybe_dump(
+        self, running_batch: "ScheduleBatch", waiting_queue: List["Req"]
+    ) -> None:
         now = time.time()
         if now - self.last_dump_time < self.dump_interval_s:
             return
@@ -21,8 +26,8 @@ class SchedulerStatusLogger:
             self.loggers,
             "scheduler.status",
             {
-                "running_rids": running_rids,
-                "queued_rids": queued_rids,
+                "running_rids": [r.rid for r in running_batch.reqs],
+                "queued_rids": [r.rid for r in waiting_queue],
             },
         )
 
