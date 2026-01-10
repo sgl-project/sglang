@@ -30,6 +30,11 @@ on:
         required: false
         type: string
         default: ""
+      test_path:
+        description: "Only run tests in this directory (e.g., 'registered/dllm/')"
+        required: false
+        type: string
+        default: ""
   workflow_call:
     inputs:
       ref:
@@ -528,9 +533,13 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cuda --suite stage-a-test-1 $CONTINUE_ON_ERROR_FLAG
+          PATH_FLAG=""
+          if [[ -n "${{ inputs.test_path }}" ]]; then
+            PATH_FLAG="--path ${{ inputs.test_path }}"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-a-test-1 $CONTINUE_ON_ERROR_FLAG $PATH_FLAG
           # temporarily put backend-independent cpu tests here
-          python3 run_suite.py --hw cpu --suite default $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite default $CONTINUE_ON_ERROR_FLAG $PATH_FLAG
 
   stage-a-cpu-only:
     needs: [check-changes, call-gate]
@@ -574,7 +583,11 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cpu --suite stage-a-cpu-only $CONTINUE_ON_ERROR_FLAG
+          PATH_FLAG=""
+          if [[ -n "${{ inputs.test_path }}" ]]; then
+            PATH_FLAG="--path ${{ inputs.test_path }}"
+          fi
+          python3 run_suite.py --hw cpu --suite stage-a-cpu-only $CONTINUE_ON_ERROR_FLAG $PATH_FLAG
 
   stage-b-test-small-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
@@ -622,7 +635,11 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 $CONTINUE_ON_ERROR_FLAG
+          PATH_FLAG=""
+          if [[ -n "${{ inputs.test_path }}" ]]; then
+            PATH_FLAG="--path ${{ inputs.test_path }}"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 $CONTINUE_ON_ERROR_FLAG $PATH_FLAG
 
   stage-b-test-large-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
@@ -666,7 +683,11 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu $CONTINUE_ON_ERROR_FLAG
+          PATH_FLAG=""
+          if [[ -n "${{ inputs.test_path }}" ]]; then
+            PATH_FLAG="--path ${{ inputs.test_path }}"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu $CONTINUE_ON_ERROR_FLAG $PATH_FLAG
 
   stage-b-test-large-2-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
@@ -714,7 +735,11 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG
+          PATH_FLAG=""
+          if [[ -n "${{ inputs.test_path }}" ]]; then
+            PATH_FLAG="--path ${{ inputs.test_path }}"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG $PATH_FLAG
 
   stage-c-test-large-4-gpu:
     needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, sgl-kernel-build-wheels]
@@ -758,7 +783,11 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cuda --suite stage-c-test-large-4-gpu $CONTINUE_ON_ERROR_FLAG
+          PATH_FLAG=""
+          if [[ -n "${{ inputs.test_path }}" ]]; then
+            PATH_FLAG="--path ${{ inputs.test_path }}"
+          fi
+          python3 run_suite.py --hw cuda --suite stage-c-test-large-4-gpu $CONTINUE_ON_ERROR_FLAG $PATH_FLAG
 
   stage-c-test-large-4-gpu-b200:
     needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels]
@@ -798,7 +827,11 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-large-4-gpu-b200
+          PATH_FLAG=""
+          if [[ -n "${{ inputs.test_path }}" ]]; then
+            PATH_FLAG="--path ${{ inputs.test_path }}"
+          fi
+          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-large-4-gpu-b200 $PATH_FLAG
 
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -991,7 +1024,11 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 $CONTINUE_ON_ERROR_FLAG
+          PATH_FLAG=""
+          if [[ -n "${{ inputs.test_path }}" ]]; then
+            PATH_FLAG="--path ${{ inputs.test_path }}"
+          fi
+          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 $CONTINUE_ON_ERROR_FLAG $PATH_FLAG
 
   unit-test-backend-4-gpu:
     needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
