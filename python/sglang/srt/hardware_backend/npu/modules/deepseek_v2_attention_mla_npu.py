@@ -12,13 +12,16 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
     enable_prefill_cp,
 )
+from sglang.srt.layers.communicator import ScatterMode
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
-
+_use_ag_after_qlora = get_bool_env_var("SGLANG_USER_AG_AFTER_QLORA")
 
 # region MHA
 def forward_mha_prepare_npu(
@@ -281,6 +284,7 @@ def forward_dsa_prepare_npu(
     hidden_states: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
+    layer_scatter_modes,
 ):
     if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
         if not hasattr(m, "mla_preprocess"):
@@ -345,7 +349,15 @@ def forward_dsa_prepare_npu(
 
         # overlap qk norm
         q = m.q_a_layernorm(q)
-
+        if (
+            _use_ag_after_qlora
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            q = scattered_to_tp_attn_full(q, forward_batch)
+            latent_cache = scattered_to_tp_attn_full(
+                latent_cache, forward_batch
+            )
         q_lora = q.clone()  # required for topk_indices
         q_event = None
         if m.alt_stream is not None:
@@ -383,7 +395,7 @@ def forward_dsa_prepare_npu(
             )
 
     topk_indices = m.indexer(
-        hidden_states, q_lora, positions, forward_batch, m.layer_id
+        hidden_states, q_lora, positions, forward_batch, m.layer_id, layer_scatter_modes
     )
 
     return (
@@ -449,5 +461,18 @@ def forward_dsa_core_npu(
     output, _ = m.o_proj(attn_bmm_output)
     return output
 
-
+def scattered_to_tp_attn_full(
+    hidden_states: torch.Tensor,
+    forward_batch,
+) -> torch.Tensor:
+    hidden_states, local_hidden_states = (
+        torch.empty(
+            (forward_batch.input_ids.shape[0], hidden_states.shape[1]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        ),
+        hidden_states,
+    )
+    attn_tp_all_gather_into_tensor(hidden_states, local_hidden_states.contiguous())
+    return hidden_states
 # endregion
