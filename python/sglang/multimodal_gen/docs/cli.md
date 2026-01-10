@@ -307,7 +307,8 @@ sglang generate \
   --num-inference-steps 30 \
   --guidance-scale 7.5 \
   --save-output \
-  --output-path outputs/ovis_garden.png
+  --output-path outputs/ovis_garden.png \
+  --output-file-name ovis_garden.png
 ```
 
 With attention backend optimization:
