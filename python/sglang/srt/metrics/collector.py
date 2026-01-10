@@ -768,7 +768,8 @@ class SchedulerMetricsCollector:
             documentation="Histogram of forward passes waited by prefill delayer.",
             labelnames=labels.keys(),
             buckets=sorted(
-                set(getattr(server_args, "prefill_delayer_forward_passes_buckets", None) or [0, 1, 2, 3, 5, 8, 12, 18, 25])
+                set(getattr(server_args, "prefill_delayer_forward_passes_buckets", None) or [0, 5, 20, 50, 100, 200])
+                # Need bucket "<=0" for zero-delay cases, and "max_delay-1" to distinguish "max_delay" timeout passes
                 | {0, max_delay - 1}
             ),
         )
@@ -777,7 +778,8 @@ class SchedulerMetricsCollector:
             documentation="Histogram of wait time in seconds by prefill delayer.",
             labelnames=labels.keys(),
             buckets=sorted(
-                set(getattr(server_args, "prefill_delayer_wait_seconds_buckets", None) or [0, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500])
+                set(getattr(server_args, "prefill_delayer_wait_seconds_buckets", None) or [0, 1, 2, 5, 10, 20, 50, 100, 200, 500])
+                # Need bucket "<=0" for zero-delay cases
                 | {0}
             ),
         )
