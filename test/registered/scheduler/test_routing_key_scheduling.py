@@ -66,36 +66,17 @@ class TestRoutingKeyScheduling(CustomTestCase):
         asyncio.run(self._test_routing_key_scheduling_order())
 
     async def _test_routing_key_scheduling_order(self):
-        async def send_chat_request(routing_key: str, max_tokens: int):
-            payload = {
-                "model": self.model,
-                "messages": [{"role": "user", "content": "What is 1+1?"}],
-                "max_tokens": max_tokens,
-                "temperature": 0,
-            }
-            headers = {"x-smg-routing-key": routing_key}
-            start_time = time.perf_counter()
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/v1/chat/completions",
-                    json=payload,
-                    headers=headers,
-                ) as resp:
-                    await resp.json()
-            latency = time.perf_counter() - start_time
-            return routing_key, latency
-
         long_running_tasks = [
-            asyncio.create_task(send_chat_request("key_a", 20000)),
-            asyncio.create_task(send_chat_request("key_a", 20000)),
+            asyncio.create_task(self._send_chat_request("key_a", 20000)),
+            asyncio.create_task(self._send_chat_request("key_a", 20000)),
         ]
 
         await asyncio.sleep(2.0)
 
         short_tasks = []
         for _ in range(10):
-            short_tasks.append(asyncio.create_task(send_chat_request("key_a", 10)))
-            short_tasks.append(asyncio.create_task(send_chat_request("key_b", 10)))
+            short_tasks.append(asyncio.create_task(self._send_chat_request("key_a", 10)))
+            short_tasks.append(asyncio.create_task(self._send_chat_request("key_b", 10)))
 
         all_short_results = await asyncio.gather(*short_tasks)
         await asyncio.gather(*long_running_tasks)
@@ -114,6 +95,25 @@ class TestRoutingKeyScheduling(CustomTestCase):
             avg_key_b,
             f"key_a requests (avg={avg_key_a:.3f}s) should finish before key_b (avg={avg_key_b:.3f}s)",
         )
+
+    async def _send_chat_request(self, routing_key: str, max_tokens: int):
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "What is 1+1?"}],
+            "max_tokens": max_tokens,
+            "temperature": 0,
+        }
+        headers = {"x-smg-routing-key": routing_key}
+        start_time = time.perf_counter()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+                headers=headers,
+            ) as resp:
+                await resp.json()
+        latency = time.perf_counter() - start_time
+        return routing_key, latency
 
 
 if __name__ == "__main__":
