@@ -2208,6 +2208,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # In DP Attention, IDLE batches are padded (batch_size > 0) for MLP sync.
+        # in this case, we need to reinit the forward metadata, otherwise the stale
+        # metadata causes batch_size mismatch in attention kernel(e.g. NSA Indexer).
+        if forward_batch.batch_size > 0:
+            self.attn_backend.init_forward_metadata(forward_batch)
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
