@@ -11,7 +11,7 @@ import triton.language as tl
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.memory_pool import SWAKVPool
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
@@ -325,6 +325,7 @@ class FlashAttentionBackend(AttentionBackend):
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
+        self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.forward_metadata: FlashAttentionMetadata = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
@@ -357,11 +358,12 @@ class FlashAttentionBackend(AttentionBackend):
         self.fa_impl_ver = fa_impl_ver
 
         # Local attention settings
-        self.attention_chunk_size = (
-            model_runner.attention_chunk_size
-            if hasattr(model_runner, "attention_chunk_size")
-            else None
-        )
+        self.has_local_attention = model_runner.model_config.is_local_attention_model
+        if self.has_local_attention:
+            assert (
+                model_runner.attention_chunk_size is not None
+            ), "Attention chunk size is required for local attention"
+            self.attention_chunk_size = model_runner.attention_chunk_size
 
         # For each layer, the sliding_window_size can be different. This is only used for preparing SWA metadata.
         # We use `layer.sliding_window_size` to decide whether to use SWA for each layer.
@@ -470,7 +472,7 @@ class FlashAttentionBackend(AttentionBackend):
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
             # TODO: we need to test this part for llama 4 eagle case
-            self._init_local_attn_metadata(forward_batch, metadata, device)
+            self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata.cache_seqlens_int32 = (
@@ -498,7 +500,7 @@ class FlashAttentionBackend(AttentionBackend):
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
 
-                self._init_local_attn_metadata(forward_batch, metadata, device)
+                self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
             else:
                 metadata.cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
@@ -624,7 +626,7 @@ class FlashAttentionBackend(AttentionBackend):
 
             # Setup local attention if enabled
             if forward_batch.forward_mode == ForwardMode.EXTEND:
-                self._init_local_attn_metadata(forward_batch, metadata, device)
+                self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
 
         # Encoder metadata for cross attention
         if forward_batch.encoder_lens is not None:
@@ -778,7 +780,8 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Check if we should use local attention
         use_local_attn = (
-            self.attention_chunk_size is not None
+            self.has_local_attention
+            and self.attention_chunk_size is not None
             and metadata.local_attn_metadata is not None
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
@@ -1078,7 +1081,8 @@ class FlashAttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
         use_local_attn = (
-            self.attention_chunk_size is not None
+            self.has_local_attention
+            and self.attention_chunk_size is not None
             and local_attn_metadata is not None
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
@@ -1350,7 +1354,7 @@ class FlashAttentionBackend(AttentionBackend):
         }
         # Only allocate local attention buffers if local attention is enabled
         # This prevents OOM errors when local attention is not being used
-        if self.attention_chunk_size is not None:
+        if self.has_local_attention:
             # Estimate maximum sizes for local attention metadata
             max_seq_len = self.max_context_len
             page_size = self.page_size or 1
@@ -1571,20 +1575,25 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                 }
 
-        self.encoder_metadata = {
-            "encoder_page_table": torch.zeros(
-                max_bs,
-                self.max_context_len,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "encoder_lens_int32": torch.zeros(
-                max_bs, dtype=torch.int32, device=self.device
-            ),
-            "encoder_cu_seqlens_k": torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
-            ),
-        }
+        # Only allocate encoder metadata for encoder-decoder models
+        if self.is_encoder_decoder:
+            self.encoder_metadata = {
+                "encoder_page_table": torch.zeros(
+                    max_bs,
+                    self.max_context_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "encoder_lens_int32": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+                "encoder_cu_seqlens_k": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+            }
+        else:
+            # For decoder-only models, skip encoder_metadata allocation
+            self.encoder_metadata = {}
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1692,8 +1701,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
 
-                if self.attention_chunk_size is not None:
-                    self._update_local_attn_metadata_for_capture(metadata, batch_size)
+                self._maybe_update_local_attn_metadata_for_capture(metadata, batch_size)
 
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
@@ -1941,7 +1949,7 @@ class FlashAttentionBackend(AttentionBackend):
                     self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
                 )
 
-                self._update_local_attn_metadata_for_replay(
+                self._maybe_update_local_attn_metadata_for_replay(
                     metadata,
                     bs,
                 )
@@ -2158,11 +2166,11 @@ class FlashAttentionBackend(AttentionBackend):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
 
-    def _init_local_attn_metadata(
+    def _maybe_init_local_attn_metadata(
         self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device
     ):
         """Centralized utility to initialize local_attn_metadata if chunked attention is enabled."""
-        if self.attention_chunk_size is None:
+        if not self.has_local_attention:
             metadata.local_attn_metadata = None
             return
 
@@ -2202,7 +2210,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
         metadata.local_attn_metadata = local_metadata
 
-    def _update_local_attn_metadata_for_capture(
+    def _maybe_update_local_attn_metadata_for_capture(
         self, metadata: FlashAttentionMetadata, bs: int
     ):
         """Update local attention metadata during CUDA graph capture phase.
@@ -2211,6 +2219,9 @@ class FlashAttentionBackend(AttentionBackend):
         during the CUDA graph capture phase, optimizing memory usage by creating views of
         pre-allocated buffers with exactly the sizes needed.
         """
+        if not self.has_local_attention:
+            return
+
         seq_lens_capture = metadata.cache_seqlens_int32
         max_seq_len = int(seq_lens_capture.max().item())
         page_table_capture = metadata.page_table
@@ -2258,13 +2269,13 @@ class FlashAttentionBackend(AttentionBackend):
             local_max_seq_len=max_seq_len,
         )
 
-    def _update_local_attn_metadata_for_replay(
+    def _maybe_update_local_attn_metadata_for_replay(
         self,
         metadata: FlashAttentionMetadata,
         bs: int,
     ):
         """Update preallocated local attention metadata in-place before CUDA graph replay."""
-        if self.attention_chunk_size is None:
+        if not self.has_local_attention:
             return
 
         # Access preallocated buffers

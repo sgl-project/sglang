@@ -1,0 +1,44 @@
+[project]
+name = "sgl-model-gateway-e2e-tests"
+version = "0.1.0"
+description = "E2E tests for sgl-model-gateway"
+requires-python = ">=3.9"
+
+dependencies = [
+  "grpcio",
+  "grpcio-health-checking",
+  "httpx",
+  "openai",
+  "py",  # Required for pytest-parallel with newer pytest versions
+  "pytest",
+  "pytest-parallel",
+  "pytest-rerunfailures",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+markers = [
+  "e2e: mark test as end-to-end test requiring GPU workers",
+  "slow: mark test as slow-running",
+  "thread_unsafe: mark test as incompatible with parallel thread execution",
+]
+addopts = "-v -s"
+# Explicitly disable live log to avoid "---- live log ----" dividers
+# We configure logging manually in conftest.py
+log_cli = false
+
+# Parallel execution configuration:
+# Use --workers 1 --tests-per-worker N to run N tests concurrently as threads
+# within a single process. This enables true shared-worker parallelism where
+# the session-scoped model_pool fixture is shared across all threads.
+#
+# Example usage:
+#   pytest --workers 1 --tests-per-worker 4 e2e_test/router/
+#
+# The thread-safe ModelPool and GPUAllocator classes enable safe concurrent
+# access from multiple test threads.

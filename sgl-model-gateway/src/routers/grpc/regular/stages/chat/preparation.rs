@@ -22,7 +22,7 @@ use crate::{
 ///
 /// Extracts chat-specific preparation logic from the old unified PreparationStage.
 /// This is a direct extraction without architectural changes.
-pub struct ChatPreparationStage;
+pub(crate) struct ChatPreparationStage;
 
 #[async_trait]
 impl PipelineStage for ChatPreparationStage {
