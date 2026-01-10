@@ -20,13 +20,16 @@ class TestCpuMonitor(unittest.TestCase):
             pass
         time.sleep(0.2)
 
+        value = None
         for metric in REGISTRY.collect():
-            if metric.name == "sglang:process_cpu_seconds_total":
-                for sample in metric.samples:
-                    if sample.labels.get("component") == "test":
-                        self.assertGreater(sample.value, 0)
-                        return
-        self.fail("CPU seconds counter not found")
+            for sample in metric.samples:
+                if sample.labels.get("component") == "test":
+                    value = sample.value
+                    break
+
+        print(f"CPU seconds value: {value}")
+        self.assertIsNotNone(value)
+        self.assertGreater(value, 0)
 
 
 if __name__ == "__main__":
