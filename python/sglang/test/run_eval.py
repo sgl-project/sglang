@@ -36,6 +36,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     sampler = ChatCompletionSampler(
         model=args.model,
         max_tokens=getattr(args, "max_tokens", 2048),
+        top_p=getattr(args, "top_p", 1.0),
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
         reasoning_effort=getattr(args, "reasoning_effort", None),
@@ -233,6 +234,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--reasoning-effort", type=str)
     parser.add_argument(
         "--thinking-mode",
