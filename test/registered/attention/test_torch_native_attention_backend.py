@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 
 # Torch native attention backend integration test with MMLU eval
 register_cuda_ci(est_time=150, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=150, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=150, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestTorchNativeAttnBackend(CustomTestCase):

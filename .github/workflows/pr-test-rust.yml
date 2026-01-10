@@ -200,13 +200,6 @@ jobs:
             setup_oracle: true
             setup_brave: true
             parallel_opts: ""  # Cloud backend tests not compatible with parallel execution
-          - name: grpc
-            timeout: 32
-            test_dirs: "e2e_test/e2e_grpc"
-            extra_deps: ""
-            env_vars: "SHOW_ROUTER_LOGS=1"
-            reruns: "--reruns 3 --reruns-delay 2"
-            parallel_opts: ""  # Legacy tests, not yet migrated for parallel
           - name: e2e
             timeout: 45
             test_dirs: "e2e_test/router e2e_test/embeddings"

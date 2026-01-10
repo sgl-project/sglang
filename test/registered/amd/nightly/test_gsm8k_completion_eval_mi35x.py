@@ -1,29 +1,28 @@
 """
-AMD GSM8K Completion Evaluation Test
+MI35x GSM8K Completion Evaluation Test (8-GPU)
 
 This test uses the completion-based gsm8k benchmark (few-shot prompting)
-which works with base models that don't have chat templates.
+for MI35x-specific models that differ from MI300X configurations.
 
-This complements test_gsm8k_eval_amd.py which uses mgsm_en (chat completions)
-for instruction-tuned models.
-
-Base models tested here:
-- GPT-OSS series (lmsys/gpt-oss-20b-bf16, lmsys/gpt-oss-120b-bf16)
-- GROK series (lmzheng/grok-1, amd/grok-1-W4A8KV8, xai-org/grok-2)
-- DeepSeek series (deepseek-ai/DeepSeek-V3-0324, deepseek-ai/DeepSeek-R1-0528)
+MI35x-specific models:
+- GPT-OSS series: Uses openai/gpt-oss-* (not lmsys/gpt-oss-*-bf16)
+- DeepSeek-R1-0528: Same model as MI300X (MXFP4 only used for perf tests)
 
 Model groups are selected via AMD_TEST_MODEL_GROUP environment variable:
-- "gpt-oss" (default): GPT-OSS models only (nightly-amd-8-gpu-gpt-oss)
-- "grok": All GROK models (nightly-amd-8-gpu-grok)
-- "deepseek-v3-dp": DeepSeek-V3 with DP attention (nightly-amd-8-gpu-deepseek-v3-dp)
-- "deepseek-v3-tc": DeepSeek-V3 with torch compile (nightly-amd-8-gpu-deepseek-v3-tc)
-- "deepseek-v3-mtp": DeepSeek-V3 with MTP/EAGLE (nightly-amd-8-gpu-deepseek-v3-mtp)
-- "deepseek-r1": DeepSeek-R1 reasoning model (nightly-amd-8-gpu-deepseek-r1)
-- "all": All models
+- "gpt-oss" (default): GPT-OSS models with MI35x paths
+- "deepseek-r1": DeepSeek-R1-0528 basic + MTP (same as MI300X)
+- "deepseek-r1-dp-tc": DeepSeek-R1-0528 DP + TC (same as MI300X)
+- "deepseek-r1-all": All DeepSeek-R1-0528 variants (basic, MTP, DP, TC)
+
+Registry: nightly-amd-8-gpu-mi35x suite (8-GPU tests on MI35x)
 """
 
 import ast
 import os
+
+# Set HF cache to /data2/models/ for MI35x so HF models download there
+os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
+os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
 import re
 import subprocess
 import time
@@ -35,7 +34,7 @@ import numpy as np
 
 # HuggingFace Hub for model cache checking and download progress
 try:
-    from huggingface_hub import HfFileSystem, snapshot_download
+    from huggingface_hub import HfFileSystem
     from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
 
     HF_HUB_AVAILABLE = True
@@ -44,6 +43,7 @@ except ImportError:
     print("[WARNING] huggingface_hub not available - model cache checking disabled")
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -53,6 +53,9 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
+# Register for AMD CI - MI35x 8-GPU GSM8K completion tests (~120 min)
+register_amd_ci(est_time=7200, suite="nightly-amd-8-gpu-mi35x", nightly=True)
+
 INVALID = -9999999
 
 
@@ -60,13 +63,17 @@ INVALID = -9999999
 class BaseModelConfig:
     """Configuration for a base model to test."""
 
-    model_path: str
+    model_path: str  # HuggingFace model ID (e.g., "amd/DeepSeek-R1-MXFP4-Preview")
     tp_size: int = 8
     accuracy_threshold: float = 0.50
     other_args: Optional[List[str]] = None
     env_vars: Optional[dict] = None
     tokenizer_path: Optional[str] = None
-    timeout: Optional[int] = None  # Custom timeout for server launch (seconds)
+    timeout: Optional[int] = None
+    local_path: Optional[str] = None  # Preferred local path (checked first before HF)
+    variant: Optional[str] = (
+        None  # Test variant name (e.g., "basic", "MTP", "DP", "TC")
+    )
 
     def __post_init__(self):
         if self.other_args is None:
@@ -74,17 +81,28 @@ class BaseModelConfig:
         if self.env_vars is None:
             self.env_vars = {}
 
+    def get_effective_model_path(self) -> str:
+        """Return local_path if it exists, otherwise model_path (HF ID)."""
+        if self.local_path and os.path.exists(self.local_path):
+            return self.local_path
+        return self.model_path
+
+    def get_display_name(self) -> str:
+        """Return display name for logs/summary (model + variant if set)."""
+        if self.variant:
+            return f"{self.model_path} ({self.variant})"
+        return self.model_path
+
 
 # =============================================================================
-# MODEL GROUPS - Each group runs on a separate 8-GPU runner
+# MI35x MODEL GROUPS - Different from MI300X configurations
 # =============================================================================
 
-# Group 1: GPT-OSS models (cached on upstream CI)
-# Runner: nightly-amd-8-gpu
-AMD_GPT_OSS_MODELS = [
-    # GPT-OSS-20B - smaller model, run first for faster feedback
+# Group 1: GPT-OSS models (MI35x uses openai/* paths, not lmsys/*)
+MI35X_GPT_OSS_MODELS = [
+    # GPT-OSS-20B - MI35x specific path
     BaseModelConfig(
-        model_path="lmsys/gpt-oss-20b-bf16",
+        model_path="openai/gpt-oss-20b",
         tp_size=8,
         accuracy_threshold=0.47,
         other_args=[
@@ -98,11 +116,11 @@ AMD_GPT_OSS_MODELS = [
             "triton",
             "--trust-remote-code",
         ],
-        env_vars={"SGLANG_USE_AITER": "0"},
+        env_vars={"SGLANG_USE_AITER": "1"},
     ),
-    # GPT-OSS-120B - large model, needs longer timeout
+    # GPT-OSS-120B - MI35x specific path
     BaseModelConfig(
-        model_path="lmsys/gpt-oss-120b-bf16",
+        model_path="openai/gpt-oss-120b",
         tp_size=8,
         accuracy_threshold=0.79,
         timeout=900,  # 15 minutes for 120B model
@@ -117,147 +135,42 @@ AMD_GPT_OSS_MODELS = [
             "triton",
             "--trust-remote-code",
         ],
-        env_vars={"SGLANG_USE_AITER": "0"},
+        env_vars={"SGLANG_USE_AITER": "1"},
     ),
 ]
 
-# Group 2: All GROK models
-# Runner: nightly-amd-8-gpu-grok
-# Order: GROK1-FP8 -> GROK1-IN4 -> GROK2.5
-AMD_GROK_MODELS = [
-    # GROK1-FP8 - verified accuracy: 0.860, runtime: ~12.5min
+# Group 2: DeepSeek-R1-0528 basic + MTP (same model as MI300X for consistency)
+# Runner: nightly-test-8-gpu-mi35x-deepseek-r1
+# Note: MXFP4 variant only used for perf tests (test_deepseek_r1_mxfp4_perf.py)
+MI35X_DEEPSEEK_R1_MODELS = [
+    # DeepSeek-R1-0528 basic - reasoning model, ~80GB per GPU
     BaseModelConfig(
-        model_path="lmzheng/grok-1",
-        tp_size=8,
-        accuracy_threshold=0.80,
-        timeout=3600,  # 1 hour for kernel compilation
-        tokenizer_path="Xenova/grok-1-tokenizer",
-        other_args=[
-            "--quantization",
-            "fp8",
-            "--attention-backend",
-            "aiter",
-            "--mem-fraction-static",
-            "0.85",
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "RCCL_MSCCL_ENABLE": "0",
-            "SGLANG_USE_AITER": "1",
-            "SGLANG_INT4_WEIGHT": "0",
-        },
-    ),
-    # GROK1-IN4 - verified accuracy: 0.820, runtime: ~12.5min
-    BaseModelConfig(
-        model_path="amd/grok-1-W4A8KV8",
-        tp_size=8,
-        accuracy_threshold=0.80,
-        timeout=3600,  # 1 hour for kernel compilation
-        tokenizer_path="Xenova/grok-1-tokenizer",
-        other_args=[
-            "--quantization",
-            "fp8",
-            "--attention-backend",
-            "aiter",
-            "--mem-fraction-static",
-            "0.85",
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "RCCL_MSCCL_ENABLE": "0",
-            "SGLANG_USE_AITER": "1",
-            "SGLANG_INT4_WEIGHT": "1",
-        },
-    ),
-    # GROK2.5 - verified accuracy: 0.945, runtime: ~14.5min
-    BaseModelConfig(
-        model_path="xai-org/grok-2",
-        tp_size=8,
-        accuracy_threshold=0.915,
-        timeout=3600,  # 1 hour for download + kernel compilation
-        tokenizer_path="alvarobartt/grok-2-tokenizer",
-        other_args=[
-            "--quantization",
-            "fp8",
-            "--attention-backend",
-            "aiter",
-            "--mem-fraction-static",
-            "0.85",
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "RCCL_MSCCL_ENABLE": "0",
-            "SGLANG_USE_AITER": "1",
-            "SGLANG_INT4_WEIGHT": "0",
-        },
-    ),
-]
-
-# Group 3: DeepSeek-V3 with DP Attention
-# Runner: nightly-amd-8-gpu-deepseek-v3-dp
-# Note: Uses DP attention (dp-size=8) for better performance, requires ROCm 7.0+
-AMD_DEEPSEEK_V3_DP_MODELS = [
-    # DeepSeek-V3-0324 with DP attention
-    BaseModelConfig(
-        model_path="deepseek-ai/DeepSeek-V3-0324",
+        model_path="deepseek-ai/DeepSeek-R1-0528",
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=3600,  # 1 hour for large model
+        variant="basic",
         other_args=[
+            "--attention-backend",
+            "aiter",
             "--chunked-prefill-size",
             "131072",
-            "--dp-size",
-            "8",
-            "--enable-dp-attention",
+            "--disable-radix-cache",
             "--mem-fraction-static",
             "0.85",
             "--trust-remote-code",
         ],
         env_vars={
-            "SGLANG_USE_ROCM700A": "1",
             "SGLANG_USE_AITER": "1",
         },
     ),
-]
-
-# Group 3b: DeepSeek-V3 with Torch Compile
-# Runner: nightly-amd-8-gpu-deepseek-v3-tc
-# Note: Uses torch compile for performance optimization, requires ROCm 7.0+
-AMD_DEEPSEEK_V3_TC_MODELS = [
-    # DeepSeek-V3-0324 with torch compile
+    # DeepSeek-R1-0528 with MTP (EAGLE speculative decoding)
     BaseModelConfig(
-        model_path="deepseek-ai/DeepSeek-V3-0324",
+        model_path="deepseek-ai/DeepSeek-R1-0528",
         tp_size=8,
         accuracy_threshold=0.93,
-        timeout=7200,  # 2 hours for compilation + large model
-        other_args=[
-            "--chunked-prefill-size",
-            "131072",
-            "--mem-fraction-static",
-            "0.70",  # Reduced further for torch compile
-            "--cuda-graph-max-bs",
-            "8",  # Reduced from 16 to reduce memory
-            "--enable-torch-compile",
-            "--disable-cuda-graph",  # Disable cuda graph to avoid memory issues
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "SGLANG_USE_ROCM700A": "1",
-            "SGLANG_USE_AITER": "1",
-        },
-    ),
-]
-
-# Group 3c: DeepSeek-V3 with MTP (EAGLE speculative decoding)
-# Runner: nightly-amd-8-gpu-deepseek-v3-mtp
-# Note: Uses MTP for improved throughput, requires ROCm 7.0+
-AMD_DEEPSEEK_V3_MTP_MODELS = [
-    # DeepSeek-V3-0324 with MTP (EAGLE speculative decoding)
-    BaseModelConfig(
-        model_path="deepseek-ai/DeepSeek-V3-0324",
-        tp_size=8,
-        accuracy_threshold=0.93,
-        timeout=3600,  # 1 hour for large model
+        timeout=3600,
+        variant="MTP",
         other_args=[
             "--chunked-prefill-size",
             "131072",
@@ -274,32 +187,56 @@ AMD_DEEPSEEK_V3_MTP_MODELS = [
             "--trust-remote-code",
         ],
         env_vars={
-            "SGLANG_USE_ROCM700A": "1",
             "SGLANG_USE_AITER": "1",
         },
     ),
 ]
 
-# Group 4: DeepSeek-R1 (reasoning model)
-# Runner: nightly-amd-8-gpu-deepseek-r1
-AMD_DEEPSEEK_R1_MODELS = [
-    # DeepSeek-R1-0528 - reasoning model, ~80GB per GPU
+# Group 3: DeepSeek-R1-0528 with DP + TC (requires ROCm 7.0+)
+# Runner: nightly-test-8-gpu-mi35x-deepseek-r1-dp-tc
+MI35X_DEEPSEEK_R1_DP_TC_MODELS = [
+    # DeepSeek-R1-0528 with DP attention
     BaseModelConfig(
         model_path="deepseek-ai/DeepSeek-R1-0528",
         tp_size=8,
         accuracy_threshold=0.93,
-        timeout=3600,  # 1 hour for large model
+        timeout=3600,
+        variant="DP",
         other_args=[
-            "--attention-backend",
-            "aiter",
             "--chunked-prefill-size",
             "131072",
-            "--disable-radix-cache",
+            "--dp-size",
+            "8",
+            "--enable-dp-attention",
             "--mem-fraction-static",
             "0.85",
             "--trust-remote-code",
         ],
         env_vars={
+            "SGLANG_USE_ROCM700A": "1",
+            "SGLANG_USE_AITER": "1",
+        },
+    ),
+    # DeepSeek-R1-0528 with torch compile
+    BaseModelConfig(
+        model_path="deepseek-ai/DeepSeek-R1-0528",
+        tp_size=8,
+        accuracy_threshold=0.93,
+        timeout=7200,  # 2 hours for compilation
+        variant="TC",
+        other_args=[
+            "--chunked-prefill-size",
+            "131072",
+            "--mem-fraction-static",
+            "0.70",
+            "--cuda-graph-max-bs",
+            "8",
+            "--enable-torch-compile",
+            "--disable-cuda-graph",
+            "--trust-remote-code",
+        ],
+        env_vars={
+            "SGLANG_USE_ROCM700A": "1",
             "SGLANG_USE_AITER": "1",
         },
     ),
@@ -312,31 +249,29 @@ def get_model_group() -> str:
 
 
 def get_models_for_group(group: str) -> List[BaseModelConfig]:
-    """Get the list of models for a given group."""
+    """Get the list of models for a given group.
+
+    Note: DeepSeek-R1-MXFP4 is only used for perf tests, not accuracy tests.
+    See test_deepseek_r1_mxfp4_perf.py for MXFP4 perf tests.
+    """
     if group == "gpt-oss":
-        return AMD_GPT_OSS_MODELS
-    elif group == "grok":
-        return AMD_GROK_MODELS
-    elif group == "deepseek-v3-dp":
-        return AMD_DEEPSEEK_V3_DP_MODELS
-    elif group == "deepseek-v3-tc":
-        return AMD_DEEPSEEK_V3_TC_MODELS
-    elif group == "deepseek-v3-mtp":
-        return AMD_DEEPSEEK_V3_MTP_MODELS
+        return MI35X_GPT_OSS_MODELS
     elif group == "deepseek-r1":
-        return AMD_DEEPSEEK_R1_MODELS
+        return MI35X_DEEPSEEK_R1_MODELS
+    elif group == "deepseek-r1-dp-tc":
+        return MI35X_DEEPSEEK_R1_DP_TC_MODELS
+    elif group == "deepseek-r1-all":
+        # All DeepSeek-R1-0528 variants: basic, MTP, DP, TC
+        return MI35X_DEEPSEEK_R1_MODELS + MI35X_DEEPSEEK_R1_DP_TC_MODELS
     elif group == "all":
         return (
-            AMD_GPT_OSS_MODELS
-            + AMD_GROK_MODELS
-            + AMD_DEEPSEEK_V3_DP_MODELS
-            + AMD_DEEPSEEK_V3_TC_MODELS
-            + AMD_DEEPSEEK_V3_MTP_MODELS
-            + AMD_DEEPSEEK_R1_MODELS
+            MI35X_GPT_OSS_MODELS
+            + MI35X_DEEPSEEK_R1_MODELS
+            + MI35X_DEEPSEEK_R1_DP_TC_MODELS
         )
     else:
         print(f"[WARNING] Unknown model group '{group}', using 'gpt-oss'")
-        return AMD_GPT_OSS_MODELS
+        return MI35X_GPT_OSS_MODELS
 
 
 # =============================================================================
@@ -351,12 +286,13 @@ def check_local_cache(model_path: str) -> Tuple[bool, str]:
     Returns:
         Tuple of (is_cached, cache_path_or_message)
     """
-    # Check common HF cache locations
+    # Check common HF cache locations for MI35x
     cache_dirs = [
         os.path.expanduser("~/.cache/huggingface/hub"),
-        "/sgl-data/hf-cache/hub",
-        "/home/runner/sgl-data/hf-cache",
+        "/data2/models/huggingface/hub",
+        os.environ.get("HF_HUB_CACHE", ""),
     ]
+    cache_dirs = [d for d in cache_dirs if d]  # Remove empty
 
     # Convert model_path to cache directory format (org--model)
     cache_name = f"models--{model_path.replace('/', '--')}"
@@ -406,18 +342,44 @@ def check_hf_repo_access(model_path: str) -> Tuple[bool, str]:
             return False, f"ERROR: {error_msg[:100]}"
 
 
-def log_model_status(config: BaseModelConfig) -> Tuple[bool, str]:
+def log_model_status(config: "BaseModelConfig") -> Tuple[bool, str]:
     """
     Log detailed model availability status.
+
+    Checks in order:
+    1. local_path (if specified) - preferred local path
+    2. model_path as local path (if starts with /)
+    3. model_path as HF model ID - check cache then HF access
 
     Returns:
         Tuple of (is_available, status_message)
     """
     model_path = config.model_path
+    local_path = config.local_path
+
     print(f"\n📦 Checking model: {model_path}")
+    if local_path:
+        print(f"   (preferred local: {local_path})")
     print("-" * 50)
 
-    # Check local cache first
+    # Step 1: Check preferred local_path first (if specified)
+    if local_path:
+        if os.path.exists(local_path):
+            print(f"  ✅ LOCAL PATH: Found at {local_path}")
+            return True, f"Local path exists at {local_path}"
+        else:
+            print(f"  ⚠️  LOCAL PATH: Not found at {local_path}, trying HF fallback...")
+
+    # Step 2: For absolute paths (starting with /), check if exists
+    if model_path.startswith("/"):
+        if os.path.exists(model_path):
+            print(f"  ✅ LOCAL PATH: Found at {model_path}")
+            return True, f"Local path exists at {model_path}"
+        else:
+            print(f"  ❌ LOCAL PATH: Not found at {model_path}")
+            return False, f"Local path not found at {model_path}"
+
+    # Step 3: For HF model IDs, check local cache first
     is_cached, cache_msg = check_local_cache(model_path)
     if is_cached:
         print(f"  ✅ LOCAL CACHE: Found at {cache_msg}")
@@ -425,74 +387,17 @@ def log_model_status(config: BaseModelConfig) -> Tuple[bool, str]:
     else:
         print(f"  ⚠️  LOCAL CACHE: {cache_msg}")
 
-    # Check HF repo access
+    # Step 4: Check HF repo access (will download if accessible)
     is_accessible, access_msg = check_hf_repo_access(model_path)
     if is_accessible:
         print(f"  ✅ HF ACCESS: {access_msg}")
-        print(f"  📥 Model will be downloaded from HuggingFace (this may take a while)")
+        print(
+            f"  📥 Model will be downloaded from HuggingFace to {os.environ.get('HF_HOME', '~/.cache/huggingface')}"
+        )
         return True, f"Will download from HF: {access_msg}"
     else:
         print(f"  ❌ HF ACCESS: {access_msg}")
         return False, access_msg
-
-    # Also check tokenizer if specified
-    if config.tokenizer_path:
-        tok_cached, tok_msg = check_local_cache(config.tokenizer_path)
-        if tok_cached:
-            print(f"  ✅ TOKENIZER CACHE: Found at {tok_msg}")
-        else:
-            tok_accessible, tok_access_msg = check_hf_repo_access(config.tokenizer_path)
-            if tok_accessible:
-                print(f"  ✅ TOKENIZER HF: {tok_access_msg}")
-            else:
-                print(f"  ⚠️  TOKENIZER: {tok_access_msg}")
-
-    return is_accessible, access_msg
-
-
-def download_model_with_progress(
-    model_path: str, timeout: int = 3600
-) -> Tuple[bool, str]:
-    """
-    Download model with progress logging.
-
-    Returns:
-        Tuple of (success, message)
-    """
-    if not HF_HUB_AVAILABLE:
-        return True, "huggingface_hub not available, skipping pre-download"
-
-    print(f"\n📥 Pre-downloading model: {model_path}")
-    print(f"   Timeout: {timeout}s ({timeout/60:.0f} minutes)")
-    print("-" * 50)
-
-    start_time = time.time()
-
-    try:
-        # Use snapshot_download which shows progress
-        local_dir = snapshot_download(
-            repo_id=model_path,
-            local_files_only=False,
-            resume_download=True,
-        )
-        elapsed = time.time() - start_time
-        print(f"  ✅ Download complete in {elapsed:.1f}s")
-        print(f"  📁 Location: {local_dir}")
-        return True, f"Downloaded to {local_dir}"
-
-    except GatedRepoError:
-        return False, "GATED REPO - requires authentication/approval"
-    except RepositoryNotFoundError:
-        return False, "REPO NOT FOUND on HuggingFace"
-    except Exception as e:
-        error_msg = str(e)
-        elapsed = time.time() - start_time
-        if elapsed >= timeout:
-            return False, f"TIMEOUT after {elapsed:.0f}s: {error_msg[:100]}"
-        elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
-            return False, f"NETWORK ERROR after {elapsed:.0f}s: {error_msg[:100]}"
-        else:
-            return False, f"ERROR after {elapsed:.0f}s: {error_msg[:100]}"
 
 
 # =============================================================================
@@ -534,21 +439,14 @@ def run_gsm8k_benchmark(
     num_shots: int = 5,
     parallel: int = 64,
 ) -> Tuple[float, float, float]:
-    """
-    Run GSM8K few-shot completion benchmark.
-
-    Returns:
-        Tuple of (accuracy, invalid_rate, latency)
-    """
+    """Run GSM8K few-shot completion benchmark."""
     import sglang as sgl
     from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 
-    # Download and load data
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
     data_path = download_and_cache_file(url)
     lines = list(read_jsonl(data_path))
 
-    # Construct prompts
     few_shot_examples = get_few_shot_examples(lines, num_shots)
 
     questions = []
@@ -559,7 +457,6 @@ def run_gsm8k_benchmark(
     assert all(l != INVALID for l in labels)
     arguments = [{"question": q} for q in questions]
 
-    # Define sglang function
     @sgl.function
     def few_shot_gsm8k(s, question):
         s += few_shot_examples + question
@@ -567,11 +464,9 @@ def run_gsm8k_benchmark(
             "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
         )
 
-    # Set backend
     backend = RuntimeEndpoint(base_url)
     sgl.set_default_backend(backend)
 
-    # Run benchmark
     tic = time.perf_counter()
     states = few_shot_gsm8k.run_batch(
         arguments,
@@ -581,12 +476,10 @@ def run_gsm8k_benchmark(
     )
     latency = time.perf_counter() - tic
 
-    # Extract predictions
     preds = []
     for i in range(len(states)):
         preds.append(get_answer_value(states[i]["answer"]))
 
-    # Compute metrics
     acc = np.mean(np.array(preds) == np.array(labels))
     invalid = np.mean(np.array(preds) == INVALID)
 
@@ -598,13 +491,11 @@ def popen_launch_server_for_base_model(
     config: BaseModelConfig,
 ) -> "subprocess.Popen":
     """Launch server for a base model with appropriate configuration."""
-    # Build environment - start with current env and add config-specific vars
     env = os.environ.copy()
     for key, value in config.env_vars.items():
         env[key] = value
         print(f"Setting env: {key}={value}")
 
-    # Build other_args
     other_args = list(config.other_args)
     other_args.extend(["--tp", str(config.tp_size)])
     other_args.extend(["--log-level-http", "warning"])
@@ -612,42 +503,37 @@ def popen_launch_server_for_base_model(
     if config.tokenizer_path:
         other_args.extend(["--tokenizer-path", config.tokenizer_path])
 
-    # Use custom timeout if provided, otherwise use default
     timeout = config.timeout if config.timeout else DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
+    # Use effective model path (local if exists, else HF model ID)
+    effective_model_path = config.get_effective_model_path()
+    print(f"Using model path: {effective_model_path}")
+
     process = popen_launch_server(
-        model=config.model_path,
+        model=effective_model_path,
         base_url=base_url,
         timeout=timeout,
         other_args=other_args,
-        env=env,  # Pass environment explicitly
+        env=env,
     )
     return process
 
 
-class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
-    """
-    AMD GSM8K Completion Evaluation Test
+class TestMI35xGsm8kCompletionEval(unittest.TestCase):
+    """MI35x GSM8K Completion Evaluation Test (8-GPU)
 
-    Tests base models using few-shot completion benchmark.
-    This is different from mgsm_en which uses chat completions.
-
-    Model group is selected via AMD_TEST_MODEL_GROUP env var:
-    - "gpt-oss": GPT-OSS models only (default, nightly-amd-8-gpu)
-    - "grok": All GROK models (nightly-amd-8-gpu-grok)
-    - "all": All models
+    Tests MI35x-specific base models using few-shot completion benchmark.
     """
 
     @classmethod
     def setUpClass(cls):
-        # Get model group from environment
         cls.model_group = get_model_group()
         cls.models = get_models_for_group(cls.model_group)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
 
         print(f"\n{'='*60}")
-        print(f"AMD GSM8K Completion Evaluation Test")
+        print(f"MI35x GSM8K Completion Evaluation Test (8-GPU)")
         print(f"{'='*60}")
         print(f"Model group: {cls.model_group}")
         print(f"Models to test: {len(cls.models)}")
@@ -657,12 +543,11 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
         print(f"{'='*60}\n")
 
     def test_gsm8k_completion_all_models(self):
-        """Test all configured base models with GSM8K completion benchmark."""
+        """Test all configured MI35x models with GSM8K completion benchmark."""
         all_results = []
         total_test_start = time.time()
 
-        # Summary table with runtime columns
-        summary = f"### Model Group: {self.model_group}\n\n"
+        summary = f"### MI35x Model Group: {self.model_group}\n\n"
         summary += (
             "| Model | TP | Accuracy | Threshold | Startup | Bench | Total | Status |\n"
         )
@@ -671,15 +556,15 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
         )
 
         for config in self.models:
-            with self.subTest(model=config.model_path):
+            display_name = config.get_display_name()
+            with self.subTest(model=display_name):
                 print(f"\n{'='*60}")
-                print(f"Testing: {config.model_path} (TP={config.tp_size})")
+                print(f"Testing: {display_name} (TP={config.tp_size})")
                 print(f"{'='*60}")
 
                 error_message = None
                 acc, invalid, latency = None, None, None
                 startup_time, bench_time, total_time = None, None, None
-                skipped = False
                 model_start = time.time()
 
                 # Check model availability with detailed logging
@@ -687,29 +572,22 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
 
                 if not is_available:
                     print(f"\n❌ MODEL NOT AVAILABLE: {status_msg}")
-                    print(f"⏭️ SKIPPING: {config.model_path}")
-                    status = f"⏭️ SKIP"
-                    skipped = True
+                    print(f"⏭️ SKIPPING: {display_name}")
+                    status = "⏭️ SKIP"
                     all_results.append(
                         {
-                            "model": config.model_path,
+                            "model": display_name,
                             "tp_size": config.tp_size,
                             "accuracy": None,
                             "threshold": config.accuracy_threshold,
-                            "invalid": None,
-                            "latency": None,
-                            "startup_time": None,
-                            "bench_time": None,
-                            "total_time": None,
-                            "passed": True,  # Don't count as failure
+                            "passed": True,
                             "skipped": True,
                             "error": status_msg,
                         }
                     )
                 else:
                     try:
-                        # Launch server with timing
-                        print(f"\n🚀 Launching server for {config.model_path}...")
+                        print(f"\n🚀 Launching server for {display_name}...")
                         server_start = time.time()
                         process = popen_launch_server_for_base_model(
                             self.base_url, config
@@ -718,12 +596,10 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                         print(f"⏱️  Server startup: {startup_time:.1f}s")
 
                         try:
-                            # Run benchmark with timing and retries
                             print(
                                 f"📊 Running GSM8K benchmark ({self.num_questions} questions)..."
                             )
                             bench_start = time.time()
-                            acc, invalid, latency = None, None, None
                             for attempt in range(3):
                                 try:
                                     acc, invalid, latency = run_gsm8k_benchmark(
@@ -738,42 +614,26 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                                     if acc >= config.accuracy_threshold:
                                         break
                                 except Exception as e:
-                                    print(
-                                        f"   Attempt {attempt + 1} failed with error: {e}"
-                                    )
+                                    print(f"   Attempt {attempt + 1} failed: {e}")
                                     if attempt == 2:
                                         raise
                             bench_time = time.time() - bench_start
-
                             total_time = time.time() - model_start
-
-                            print(f"\n📈 Results for {config.model_path}:")
-                            print(
-                                f"   Accuracy: {acc:.3f} (threshold: {config.accuracy_threshold})"
-                            )
-                            print(f"   Invalid: {invalid:.3f}")
-                            print(f"   Benchmark latency: {latency:.1f}s")
-                            print(f"\n⏱️  Runtime breakdown:")
-                            print(f"   Server startup: {startup_time:.1f}s")
-                            print(f"   Benchmark: {bench_time:.1f}s")
-                            print(f"   Total: {total_time:.1f}s")
 
                             passed = acc >= config.accuracy_threshold
                             status = "✅ PASS" if passed else "❌ FAIL"
 
-                            if passed:
-                                print(f"\n   Status: ✅ PASSED")
-                            else:
-                                print(f"\n   Status: ❌ FAILED (below threshold)")
+                            print(
+                                f"\n📈 Results: accuracy={acc:.3f} (threshold: {config.accuracy_threshold})"
+                            )
+                            print(f"⏱️  Total: {total_time:.1f}s")
 
                             all_results.append(
                                 {
-                                    "model": config.model_path,
+                                    "model": display_name,
                                     "tp_size": config.tp_size,
                                     "accuracy": acc,
                                     "threshold": config.accuracy_threshold,
-                                    "invalid": invalid,
-                                    "latency": latency,
                                     "startup_time": startup_time,
                                     "bench_time": bench_time,
                                     "total_time": total_time,
@@ -786,19 +646,14 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                         except Exception as e:
                             error_message = str(e)
                             total_time = time.time() - model_start
-                            print(f"\n❌ Error during benchmark: {error_message}")
+                            print(f"\n❌ Error: {error_message}")
                             status = "❌ ERROR"
                             all_results.append(
                                 {
-                                    "model": config.model_path,
+                                    "model": display_name,
                                     "tp_size": config.tp_size,
                                     "accuracy": None,
                                     "threshold": config.accuracy_threshold,
-                                    "invalid": None,
-                                    "latency": None,
-                                    "startup_time": startup_time,
-                                    "bench_time": None,
-                                    "total_time": total_time,
                                     "passed": False,
                                     "skipped": False,
                                     "error": error_message,
@@ -806,7 +661,7 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                             )
 
                         finally:
-                            print(f"\n🛑 Stopping server for {config.model_path}...")
+                            print(f"\n🛑 Stopping server...")
                             kill_process_tree(process.pid)
 
                     except Exception as e:
@@ -816,43 +671,27 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
                         status = "❌ ERROR"
                         all_results.append(
                             {
-                                "model": config.model_path,
+                                "model": display_name,
                                 "tp_size": config.tp_size,
                                 "accuracy": None,
                                 "threshold": config.accuracy_threshold,
-                                "invalid": None,
-                                "latency": None,
-                                "startup_time": None,
-                                "bench_time": None,
-                                "total_time": total_time,
                                 "passed": False,
                                 "skipped": False,
                                 "error": error_message,
                             }
                         )
 
-                # Add to summary with runtime
+                # Add to summary (use display name to show variant)
                 acc_str = f"{acc:.3f}" if acc is not None else "N/A"
                 startup_str = (
                     f"{startup_time:.0f}s" if startup_time is not None else "N/A"
                 )
                 bench_str = f"{bench_time:.0f}s" if bench_time is not None else "N/A"
                 total_str = f"{total_time:.0f}s" if total_time is not None else "N/A"
-                summary += f"| {config.model_path} | {config.tp_size} | {acc_str} | {config.accuracy_threshold} | {startup_str} | {bench_str} | {total_str} | {status} |\n"
+                summary += f"| {display_name} | {config.tp_size} | {acc_str} | {config.accuracy_threshold} | {startup_str} | {bench_str} | {total_str} | {status} |\n"
 
-        # Calculate total test runtime
+        # Final summary
         total_test_time = time.time() - total_test_start
-
-        # Print summary
-        print(f"\n{'='*60}")
-        print(f"SUMMARY - Model Group: {self.model_group}")
-        print(f"{'='*60}")
-        print(summary)
-        print(
-            f"\n⏱️  Total test runtime: {total_test_time:.1f}s ({total_test_time/60:.1f} min)"
-        )
-
-        # Check for failures (exclude skipped models)
         failed_models = [
             r for r in all_results if not r["passed"] and not r.get("skipped", False)
         ]
@@ -861,61 +700,22 @@ class TestNightlyGsm8kCompletionEvalAMD(unittest.TestCase):
             r for r in all_results if r["passed"] and not r.get("skipped", False)
         ]
 
-        # Build GitHub summary with results and failure details
-        # Note: summary already includes the "### Model Group:" header
-        github_summary = f"{summary}\n"
-        github_summary += f"\n**Statistics:** ✅ Passed: {len(passed_models)} | ❌ Failed: {len(failed_models)} | ⏭️ Skipped: {len(skipped_models)}\n"
-        github_summary += f"\n**Total Runtime:** {total_test_time:.1f}s ({total_test_time/60:.1f} min)\n"
+        print(f"\n{'='*60}")
+        print(f"SUMMARY - MI35x Model Group: {self.model_group}")
+        print(f"{'='*60}")
+        print(summary)
+        print(
+            f"\n📊 Passed: {len(passed_models)} | Failed: {len(failed_models)} | Skipped: {len(skipped_models)}"
+        )
+        print(f"⏱️  Total: {total_test_time:.1f}s ({total_test_time/60:.1f} min)")
 
-        if failed_models:
-            github_summary += "\n#### ❌ Failed Models\n"
-            for r in failed_models:
-                acc_str = f"{r['accuracy']:.3f}" if r["accuracy"] is not None else "N/A"
-                github_summary += f"- **{r['model']}**: accuracy={acc_str}, threshold={r['threshold']}"
-                if r.get("error"):
-                    # Truncate long errors for display
-                    error_short = (
-                        r["error"][:200] + "..."
-                        if len(r["error"]) > 200
-                        else r["error"]
-                    )
-                    github_summary += f"\n  - Error: `{error_short}`"
-                github_summary += "\n"
-
-        if skipped_models:
-            github_summary += "\n#### ⏭️ Skipped Models\n"
-            for r in skipped_models:
-                github_summary += (
-                    f"- **{r['model']}**: {r.get('error', 'Not available')}\n"
-                )
-
-        # Write GitHub step summary
         if is_in_ci():
-            write_github_step_summary(github_summary)
-
-        print(f"\n📊 Final Statistics:")
-        print(f"   Passed: {len(passed_models)}")
-        print(f"   Failed: {len(failed_models)}")
-        print(f"   Skipped: {len(skipped_models)}")
-
-        if skipped_models:
-            print(f"\n⏭️ Skipped models (not available):")
-            for r in skipped_models:
-                print(f"   - {r['model']}: {r['error']}")
+            write_github_step_summary(summary)
 
         if failed_models:
-            print(f"\n❌ Failed models:")
-            for r in failed_models:
-                acc_str = f"{r['accuracy']:.3f}" if r["accuracy"] is not None else "N/A"
-                print(
-                    f"   - {r['model']}: accuracy={acc_str}, threshold={r['threshold']}"
-                )
-                if r.get("error"):
-                    print(f"     Error: {r['error'][:200]}")
-
             failure_msg = "\n".join(
                 [
-                    f"- {r['model']}: accuracy={r['accuracy']}, threshold={r['threshold']}, error={r['error']}"
+                    f"- {r['model']}: {r.get('error', 'below threshold')}"
                     for r in failed_models
                 ]
             )

@@ -224,6 +224,7 @@ class Envs:
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(30)
+    SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
 
     # Test: pd-disaggregation
@@ -487,6 +488,18 @@ _warn_deprecated_env_to_cli_flag(
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
     "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
+    "Please use '--enable-prefill-delayer' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES",
+    "Please use '--prefill-delayer-max-delay-passes' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK",
+    "Please use '--prefill-delayer-token-usage-low-watermark' instead.",
 )
 
 

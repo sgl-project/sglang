@@ -13,7 +13,7 @@ use super::{
     proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
 };
 use crate::{
-    core::{attach_guards_to_response, Worker, WorkerLoadGuard},
+    core::{Worker, WorkerLoadGuard},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         classify::{ClassifyRequest, ClassifyResponse},
@@ -158,44 +158,26 @@ pub(crate) struct DispatchMetadata {
 /// Load guards for worker load tracking
 /// Automatically decrements load when dropped
 pub(crate) enum LoadGuards {
-    Single(WorkerLoadGuard),
+    Single {
+        _guard: WorkerLoadGuard,
+    },
     Dual {
-        prefill: WorkerLoadGuard,
-        decode: WorkerLoadGuard,
+        _prefill: WorkerLoadGuard,
+        _decode: WorkerLoadGuard,
     },
 }
 
 impl From<&WorkerSelection> for LoadGuards {
     fn from(selection: &WorkerSelection) -> Self {
         match selection {
-            WorkerSelection::Single { worker } => {
-                LoadGuards::Single(WorkerLoadGuard::new(worker.clone()))
-            }
+            WorkerSelection::Single { worker } => LoadGuards::Single {
+                _guard: WorkerLoadGuard::new(worker.clone()),
+            },
             WorkerSelection::Dual { prefill, decode } => LoadGuards::Dual {
-                prefill: WorkerLoadGuard::new(prefill.clone()),
-                decode: WorkerLoadGuard::new(decode.clone()),
+                _prefill: WorkerLoadGuard::new(prefill.clone()),
+                _decode: WorkerLoadGuard::new(decode.clone()),
             },
         }
-    }
-}
-
-impl LoadGuards {
-    /// Attach these load guards to a Response, tying their lifetime to the response body.
-    ///
-    /// When the response body is fully consumed or dropped (e.g., client disconnects),
-    /// the guards are dropped and worker load is decremented automatically.
-    ///
-    /// This is the proper RAII pattern for SSE/streaming responses.
-    pub fn attach_to_response(
-        self,
-        response: axum::response::Response,
-    ) -> axum::response::Response {
-        let guards = match self {
-            LoadGuards::Single(guard) => vec![guard],
-            LoadGuards::Dual { prefill, decode } => vec![prefill, decode],
-        };
-
-        attach_guards_to_response(guards, response)
     }
 }
 

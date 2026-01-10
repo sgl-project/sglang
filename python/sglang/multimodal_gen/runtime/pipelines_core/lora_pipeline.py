@@ -305,7 +305,21 @@ class LoRAPipeline(ComposedPipelineBase):
         Load the LoRA, and setup the lora_adapters for later weight replacement
         """
         assert lora_path is not None
-        lora_local_path = maybe_download_lora(lora_path)
+
+        # Only rank 0 downloads to avoid race conditions where other ranks
+        # try to load incomplete downloads
+        if rank == 0:
+            lora_local_path = maybe_download_lora(lora_path)
+        else:
+            lora_local_path = None
+
+        # Synchronize all ranks after download completes
+        if dist.is_initialized():
+            dist.barrier()
+
+        # Non-rank-0 workers now download (will hit cache since rank 0 completed)
+        if rank != 0:
+            lora_local_path = maybe_download_lora(lora_path)
 
         raw_state_dict = load_file(lora_local_path)
         lora_state_dict = normalize_lora_state_dict(raw_state_dict, logger=logger)
