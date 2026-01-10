@@ -65,9 +65,11 @@ jobs:
         run: |
           artifact_name="config-${{ matrix.runner }}-group${{ matrix.batch_group.name }}"
           echo "Checking for existing artifact: $artifact_name"
-          exists=$(gh api repos/${{ github.repository }}/actions/artifacts --paginate \
-            --jq ".artifacts[] | select(.name == \"$artifact_name\" and .expired == false) | .id" \
-            2>/dev/null | head -1)
+
+          # Use name filter for fast lookup (single API call)
+          exists=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=${artifact_name}" \
+            --jq '.artifacts[] | select(.expired == false) | .id' 2>/dev/null | head -1)
+
           if [ -n "$exists" ]; then
             echo "Found existing artifact (id: $exists), skipping group ${{ matrix.batch_group.name }}"
             echo "skip=true" >> $GITHUB_OUTPUT
