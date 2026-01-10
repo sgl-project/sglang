@@ -6,9 +6,15 @@ import os
 import socket
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
-from typing import List, Union
+from typing import List, Optional, Union
 
 import torch.distributed as dist
+
+
+def create_log_targets(targets: Optional[List[str]]) -> List[logging.Logger]:
+    if not targets:
+        return [create_log_target_stdout()]
+    return [create_log_target(t) for t in targets]
 
 
 def create_log_target(target: str) -> logging.Logger:

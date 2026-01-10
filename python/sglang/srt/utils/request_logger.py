@@ -14,15 +14,13 @@
 from __future__ import annotations
 
 import dataclasses
-import json
 import logging
-from datetime import datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_bool_env_var
-from sglang.srt.utils.log_utils import create_log_target, create_log_target_stdout
+from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 if TYPE_CHECKING:
     import fastapi
@@ -63,9 +61,7 @@ class RequestLogger:
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
 
     def _setup_targets(self) -> List[logging.Logger]:
-        if not self.log_requests_target:
-            return [create_log_target_stdout()]
-        return [create_log_target(t) for t in self.log_requests_target]
+        return create_log_targets(self.log_requests_target)
 
     def configure(
         self,
@@ -203,12 +199,7 @@ class RequestLogger:
         return max_length, skip_names, out_skip_names
 
     def _log_json(self, event: str, data: dict) -> None:
-        log_data = {
-            "timestamp": datetime.now().isoformat(),
-            "event": event,
-            **data,
-        }
-        self._log(json.dumps(log_data, ensure_ascii=False))
+        log_json(self.targets, event, data)
 
     def _log(self, msg: str) -> None:
         for target in self.targets:
