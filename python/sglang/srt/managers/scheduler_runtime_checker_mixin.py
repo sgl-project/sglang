@@ -361,29 +361,3 @@ def create_scheduler_watchdog(
         soft=soft,
         dump_info=dump_info,
     )
-
-
-def create_scheduler_init_watchdog(scheduler: Scheduler, server_args):
-    from sglang.srt.utils.watchdog import WatchdogRawNoop
-
-    soft_watchdog_timeout = server_args.soft_watchdog_timeout
-    if soft_watchdog_timeout is None:
-        return WatchdogRawNoop()
-
-    def is_active():
-        if getattr(scheduler, "_initializing", False):
-            return True
-        return getattr(scheduler, "cur_batch", None) is not None
-
-    def get_counter():
-        if getattr(scheduler, "_initializing", False):
-            return getattr(scheduler, "_init_counter", 0)
-        return getattr(scheduler, "forward_ct", 0)
-
-    return WatchdogRaw(
-        debug_name="Scheduler",
-        get_counter=get_counter,
-        is_active=is_active,
-        watchdog_timeout=soft_watchdog_timeout,
-        soft=True,
-    )

@@ -98,10 +98,6 @@ class _WatchdogNoop(Watchdog):
     pass
 
 
-class WatchdogRawNoop:
-    pass
-
-
 class WatchdogRaw:
     def __init__(
         self,
