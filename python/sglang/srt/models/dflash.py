@@ -199,7 +199,29 @@ class DFlashDraftModel(nn.Module):
         self.fc = nn.Linear(num_layers * hidden_size, hidden_size, bias=False)
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-        self.block_size = int(getattr(config, "block_size", 16))
+        dflash_cfg = getattr(config, "dflash_config", None)
+        dflash_block_size = None
+        if isinstance(dflash_cfg, dict):
+            dflash_block_size = dflash_cfg.get("block_size", None)
+
+        block_size = (
+            dflash_block_size
+            if dflash_block_size is not None
+            else getattr(config, "block_size", None)
+        )
+        if block_size is None:
+            block_size = 16
+        elif getattr(config, "block_size", None) is not None and dflash_block_size is not None:
+            if int(dflash_block_size) != int(getattr(config, "block_size")):
+                logger.warning(
+                    "DFLASH draft config has both block_size=%s and dflash_config.block_size=%s; using dflash_config.block_size.",
+                    getattr(config, "block_size"),
+                    dflash_block_size,
+                )
+        try:
+            self.block_size = int(block_size)
+        except Exception as e:
+            raise ValueError(f"Invalid DFLASH block_size={block_size!r}.") from e
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""

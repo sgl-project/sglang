@@ -18,6 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
+from sglang.srt.speculative.dflash_utils import resolve_dflash_mask_token
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -49,7 +50,6 @@ class DFlashWorker:
         self.page_size = server_args.page_size
         self.device = target_worker.device
 
-        self._mask_token_id = self._resolve_mask_token_id()
         self._warned_forced_greedy = False
         self._logged_first_verify = False
 
@@ -94,7 +94,23 @@ class DFlashWorker:
         )
         self.native_draft_model_runner = self.native_draft_worker.model_runner
         self.native_draft_model = self.native_draft_model_runner.model
-        self.block_size = int(getattr(self.native_draft_model, "block_size", 16))
+        if server_args.speculative_num_draft_tokens is None:
+            # Should not happen (ServerArgs should have inferred it), but keep a fallback.
+            self.block_size = int(getattr(self.native_draft_model, "block_size", 16))
+        else:
+            self.block_size = int(server_args.speculative_num_draft_tokens)
+            model_block_size = getattr(self.native_draft_model, "block_size", None)
+            if model_block_size is not None and int(model_block_size) != int(self.block_size):
+                logger.warning(
+                    "DFLASH block size mismatch: using speculative_num_draft_tokens=%s but draft config block_size=%s.",
+                    self.block_size,
+                    model_block_size,
+                )
+
+        self._mask_token = resolve_dflash_mask_token(
+            draft_hf_config=self.native_draft_model_runner.model_config.hf_config
+        )
+        self._mask_token_id = self._resolve_mask_token_id(mask_token=self._mask_token)
         if self.tp_rank == 0:
             logger.info(
                 "Initialized native DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s",
@@ -103,7 +119,8 @@ class DFlashWorker:
                 self.block_size,
             )
             logger.info(
-                "DFLASH draft impl selected. impl=native, mask_token_id=%s",
+                "DFLASH draft impl selected. impl=native, mask_token=%s, mask_token_id=%s",
+                self._mask_token,
                 self._mask_token_id,
             )
 
@@ -121,44 +138,52 @@ class DFlashWorker:
         if hasattr(req, "dflash_draft_seq_len"):
             req.dflash_draft_seq_len = 0
 
-    def _resolve_mask_token_id(self) -> int:
+    def _resolve_mask_token_id(self, *, mask_token: str) -> int:
+        if not isinstance(mask_token, str) or not mask_token:
+            raise ValueError(f"DFLASH mask_token must be a non-empty string, got {mask_token!r}.")
+
         tokenizer = getattr(self.target_worker, "tokenizer", None)
         if tokenizer is None:
             raise RuntimeError("DFLASH requires tokenizer initialization (skip_tokenizer_init is not supported).")
 
         vocab_size = int(self.target_worker.model_runner.model_config.vocab_size)
-        mask_token_id = getattr(tokenizer, "mask_token_id", None)
+        mask_token_id = None
+        if getattr(tokenizer, "mask_token", None) == mask_token:
+            mask_token_id = getattr(tokenizer, "mask_token_id", None)
+
         if mask_token_id is None:
-            # `convert_tokens_to_ids` can return `None` (or an unk id) depending on tokenizer.
             # Prefer checking the explicit vocab mapping first.
             vocab = tokenizer.get_vocab()
-            mask_token_id = vocab.get("<|MASK|>", None)
+            mask_token_id = vocab.get(mask_token, None)
 
         if mask_token_id is None:
             # Mirror the reference DFlash HF demo by adding the mask token to the tokenizer.
             # This is safe only when the resulting id stays within the target model vocab size.
-            added = tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
+            added = tokenizer.add_special_tokens({"mask_token": mask_token})
             mask_token_id = getattr(tokenizer, "mask_token_id", None)
             if mask_token_id is None:
-                mask_token_id = tokenizer.convert_tokens_to_ids("<|MASK|>")
+                mask_token_id = tokenizer.convert_tokens_to_ids(mask_token)
 
             if added and self.tp_rank == 0:
                 logger.info(
                     "Added DFLASH mask token to tokenizer. token=%s, mask_token_id=%s, tokenizer_len=%s, model_vocab_size=%s",
-                    "<|MASK|>",
+                    mask_token,
                     mask_token_id,
                     len(tokenizer),
                     vocab_size,
                 )
 
         if mask_token_id is None or int(mask_token_id) < 0:
-            raise ValueError("DFLASH requires a `<|MASK|>` token id, but it could not be resolved.")
+            raise ValueError(
+                "DFLASH requires resolving a mask token id, but it could not be resolved. "
+                f"mask_token={mask_token!r}."
+            )
 
         if mask_token_id >= vocab_size:
             raise ValueError(
                 "DFLASH mask_token_id is outside the target vocab size. "
                 f"mask_token_id={mask_token_id}, vocab_size={vocab_size}. "
-                "This likely means `<|MASK|>` requires vocab expansion beyond the model's embedding size. "
+                f"This likely means mask_token={mask_token!r} requires vocab expansion beyond the model's embedding size. "
                 "SGLang does not support resizing target embeddings for DFLASH yet."
             )
 

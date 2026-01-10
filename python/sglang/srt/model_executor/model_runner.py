@@ -138,7 +138,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.dflash_utils import build_target_layer_ids
+from sglang.srt.speculative.dflash_utils import resolve_dflash_target_layer_ids
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
@@ -318,6 +318,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
         self.dflash_use_aux_hidden_state = False
+        self.dflash_target_layer_ids = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
             draft_model_config = ModelConfig.from_server_args(
@@ -369,8 +370,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
             self.dflash_use_aux_hidden_state = True
-            self.dflash_aux_hidden_state_layer_ids = build_target_layer_ids(
-                int(target_num_layers), int(draft_num_layers)
+            self.dflash_target_layer_ids = resolve_dflash_target_layer_ids(
+                draft_hf_config=draft_model_config.hf_config,
+                target_num_layers=int(target_num_layers),
+                draft_num_layers=int(draft_num_layers),
             )
 
         # Apply the rank zero filter to logger
@@ -619,7 +622,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"Model {self.model.__class__.__name__} does not implement set_dflash_layers_to_capture, "
                     "which is required for DFLASH."
                 )
-            self.model.set_dflash_layers_to_capture(self.dflash_aux_hidden_state_layer_ids)
+            self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
@@ -1797,7 +1800,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.eagle_use_aux_hidden_state:
             self.model.set_eagle3_layers_to_capture()
         if self.dflash_use_aux_hidden_state:
-            self.model.set_dflash_layers_to_capture(self.dflash_aux_hidden_state_layer_ids)
+            self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
 
         require_mlp_tp_gather_ = require_mlp_tp_gather(self.server_args)
         if require_gathered_buffer(self.server_args):

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 import torch
+
+
+DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> List[int]:
@@ -44,6 +47,71 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
         int(round(start + (i * span) / (num_draft_layers - 1)))
         for i in range(num_draft_layers)
     ]
+
+
+def _get_dflash_config(config: Any) -> dict:
+    cfg = getattr(config, "dflash_config", None)
+    if cfg is None:
+        return {}
+    if isinstance(cfg, dict):
+        return cfg
+
+    try:
+        return dict(cfg)
+    except Exception:
+        return {}
+
+
+def resolve_dflash_target_layer_ids(
+    *,
+    draft_hf_config: Any,
+    target_num_layers: int,
+    draft_num_layers: int,
+) -> List[int]:
+    """Resolve target layer ids used to build DFlash context features.
+
+    Precedence:
+      1) `draft_hf_config.dflash_config.target_layer_ids`
+      2) default `build_target_layer_ids(target_num_layers, draft_num_layers)`
+    """
+    cfg = _get_dflash_config(draft_hf_config)
+    layer_ids = cfg.get("target_layer_ids", None)
+    if layer_ids is None:
+        return build_target_layer_ids(target_num_layers, draft_num_layers)
+
+    if not isinstance(layer_ids, (list, tuple)):
+        raise ValueError(
+            "DFLASH dflash_config.target_layer_ids must be a list of ints, "
+            f"got type={type(layer_ids).__name__}."
+        )
+
+    resolved: List[int] = [int(x) for x in layer_ids]
+    if len(resolved) != int(draft_num_layers):
+        raise ValueError(
+            "DFLASH target_layer_ids length must equal the draft num_hidden_layers. "
+            f"Got len(target_layer_ids)={len(resolved)}, draft_num_layers={int(draft_num_layers)}."
+        )
+
+    for idx, val in enumerate(resolved):
+        if val < 0 or val >= int(target_num_layers):
+            raise ValueError(
+                "DFLASH target_layer_ids contains an out-of-range layer id. "
+                f"target_layer_ids[{idx}]={val}, target_num_layers={int(target_num_layers)}."
+            )
+    return resolved
+
+
+def resolve_dflash_mask_token(*, draft_hf_config: Any) -> str:
+    cfg = _get_dflash_config(draft_hf_config)
+    mask_token = cfg.get("mask_token", None)
+    if mask_token is None:
+        return DEFAULT_DFLASH_MASK_TOKEN
+    if not isinstance(mask_token, str) or not mask_token:
+        raise ValueError(
+            "DFLASH dflash_config.mask_token must be a non-empty string, "
+            f"got {mask_token!r}."
+        )
+    return mask_token
 
 
 def compute_dflash_accept_len_and_bonus(

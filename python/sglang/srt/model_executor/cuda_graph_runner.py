@@ -363,7 +363,7 @@ class CudaGraphRunner:
                     "which is required for DFLASH aux hidden capture."
                 )
             self.model_runner.model.set_dflash_layers_to_capture(
-                self.model_runner.dflash_aux_hidden_state_layer_ids
+                self.model_runner.dflash_target_layer_ids
             )
 
         # Capture

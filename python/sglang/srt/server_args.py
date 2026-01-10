@@ -421,6 +421,7 @@ class ServerArgs:
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
+    speculative_dflash_block_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -2053,12 +2054,48 @@ class ServerArgs:
                     "DFLASH speculative decoding requires setting --speculative-draft-model-path."
                 )
 
-            # Set default spec params expected by generic spec-v1 plumbing.
+            # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
+            # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
+            # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
+            #
             # For DFlash, the natural unit is `block_size` (verify window length).
             if self.speculative_num_steps is None:
                 self.speculative_num_steps = 1
+            elif int(self.speculative_num_steps) != 1:
+                logger.warning(
+                    "DFLASH only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
+                    self.speculative_num_steps,
+                )
+                self.speculative_num_steps = 1
+
             if self.speculative_eagle_topk is None:
                 self.speculative_eagle_topk = 1
+            elif int(self.speculative_eagle_topk) != 1:
+                logger.warning(
+                    "DFLASH only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
+                    self.speculative_eagle_topk,
+                )
+                self.speculative_eagle_topk = 1
+
+            if self.speculative_dflash_block_size is not None:
+                if int(self.speculative_dflash_block_size) <= 0:
+                    raise ValueError(
+                        "DFLASH requires --speculative-dflash-block-size to be positive, "
+                        f"got {self.speculative_dflash_block_size}."
+                    )
+                if (
+                    self.speculative_num_draft_tokens is not None
+                    and int(self.speculative_num_draft_tokens)
+                    != int(self.speculative_dflash_block_size)
+                ):
+                    raise ValueError(
+                        "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
+                        "but they differ. For DFLASH they must match. "
+                        f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
+                        f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
+                    )
+                self.speculative_num_draft_tokens = int(self.speculative_dflash_block_size)
+
             if self.speculative_num_draft_tokens is None:
                 inferred_block_size = None
                 try:
@@ -2069,7 +2106,28 @@ class ServerArgs:
                         if os.path.isfile(draft_config_path):
                             with open(draft_config_path, "r") as f:
                                 draft_config_json = json.load(f)
-                            inferred_block_size = draft_config_json.get("block_size")
+                            top_level_block_size = draft_config_json.get("block_size", None)
+                            dflash_cfg = draft_config_json.get("dflash_config", None)
+                            dflash_block_size = (
+                                dflash_cfg.get("block_size", None)
+                                if isinstance(dflash_cfg, dict)
+                                else None
+                            )
+
+                            if dflash_block_size is not None:
+                                inferred_block_size = dflash_block_size
+                                if (
+                                    top_level_block_size is not None
+                                    and int(dflash_block_size) != int(top_level_block_size)
+                                ):
+                                    logger.warning(
+                                        "DFLASH draft config has both block_size=%s and dflash_config.block_size=%s; "
+                                        "using dflash_config.block_size for speculative_num_draft_tokens inference.",
+                                        top_level_block_size,
+                                        dflash_block_size,
+                                    )
+                            else:
+                                inferred_block_size = top_level_block_size
                 except Exception as e:
                     logger.warning(
                         "Failed to infer DFlash block_size from draft config.json; "
@@ -3535,6 +3593,12 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-dflash-block-size",
+            type=int,
+            help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+            default=ServerArgs.speculative_dflash_block_size,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
