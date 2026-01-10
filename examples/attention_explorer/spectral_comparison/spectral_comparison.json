@@ -1,0 +1,50 @@
+{
+  "models": {
+    "4B": {
+      "architecture": "Dense",
+      "params": "4B",
+      "effective_dimension": 22,
+      "high_threshold": 0.9408917054277707,
+      "low_threshold": 0.9045166718960238,
+      "routing": {
+        "small": 0.1,
+        "medium": 0.28,
+        "large": 0.62
+      },
+      "complexity": {
+        "trivial": 0.178,
+        "moderate": 0.006,
+        "complex": 0.816
+      },
+      "coherence_mean": 0.922,
+      "coherence_std": 0.032,
+      "cot_rate": 0.9
+    },
+    "80B": {
+      "architecture": "MoE",
+      "params": "80B (17B active)",
+      "effective_dimension": 39,
+      "high_threshold": 0.8990883609004479,
+      "low_threshold": 0.8108254937607747,
+      "routing": {
+        "small": 0.026,
+        "medium": 0.422,
+        "large": 0.552
+      },
+      "complexity": {
+        "trivial": 0.174,
+        "moderate": 0.258,
+        "complex": 0.568
+      },
+      "coherence_mean": 0.855,
+      "coherence_std": 0.06,
+      "cot_rate": 0.936
+    }
+  },
+  "insights": [
+    "80B manifold has 77% higher effective dimension (39 vs 22)",
+    "4B fingerprints are more tightly clustered (higher coherence)",
+    "4B has binary complexity view; 80B recognizes gradations",
+    "MoE architecture creates richer attention geometry"
+  ]
+}
