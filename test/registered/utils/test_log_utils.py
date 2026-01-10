@@ -25,7 +25,7 @@ class TestLogUtils(unittest.TestCase):
             loggers = create_log_targets(targets=[temp_dir], name_prefix="test_file")
             self.assertEqual(len(loggers), 1)
             log_json(loggers, "file.event", {"data": 123})
-            loggers[0].handlers[0].flush()
+            _flush_all(loggers)
             data = _read_log_file(temp_dir)
             self.assertIn("timestamp", data)
             self.assertEqual(data["event"], "file.event")
@@ -38,11 +38,17 @@ class TestLogUtils(unittest.TestCase):
             )
             self.assertEqual(len(loggers), 2)
             stdout_data = _log_and_capture_stdout(loggers, "multi.event", {"x": 1})
-            loggers[1].handlers[0].flush()
+            _flush_all(loggers)
             file_data = _read_log_file(temp_dir)
             self.assertEqual(stdout_data["event"], "multi.event")
             self.assertEqual(file_data["event"], "multi.event")
             self.assertEqual(stdout_data["x"], file_data["x"])
+
+
+def _flush_all(loggers: list) -> None:
+    for logger in loggers:
+        for handler in logger.handlers:
+            handler.flush()
 
 
 def _read_log_file(temp_dir: str) -> dict:
