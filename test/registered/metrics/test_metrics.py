@@ -150,7 +150,7 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:routing_keys_active",
             "sglang:num_unique_routing_keys",
             "sglang:routing_key_running_req_count",
-            "sglang:routing_key_running_and_waiting_req_count",
+            "sglang:routing_key_all_req_count",
         ]
         for metric in essential_metrics:
             self.assertIn(metric, metrics_text, f"Missing metric: {metric}")
@@ -159,7 +159,7 @@ class TestEnableMetrics(CustomTestCase):
         expected_buckets = len(ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS) + 1
         for metric_name in [
             "sglang:routing_key_running_req_count",
-            "sglang:routing_key_running_and_waiting_req_count",
+            "sglang:routing_key_all_req_count",
         ]:
             gt_le_pairs = set()
             for sample in metrics.get(metric_name, []):
