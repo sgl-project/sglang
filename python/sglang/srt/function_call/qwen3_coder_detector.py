@@ -2,8 +2,7 @@ import ast
 import json
 import logging
 import re
-import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -30,8 +29,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # Regex for non-streaming fallback
         self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-        self.tool_call_function_regex = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
-        self.tool_call_parameter_regex = re.compile(r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", re.DOTALL)
+        self.tool_call_function_regex = re.compile(
+            r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
+        )
+        self.tool_call_parameter_regex = re.compile(
+            r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+            re.DOTALL,
+        )
 
         # Streaming State
         # Override parent class _buffer management, or work with parent class.
@@ -64,12 +68,16 @@ class Qwen3CoderDetector(BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
-    def _get_arguments_config(self, func_name: str, tools: Optional[list[Tool]]) -> dict:
+    def _get_arguments_config(
+        self, func_name: str, tools: Optional[list[Tool]]
+    ) -> dict:
         """Extract argument configuration for a function."""
         if tools is None:
             return {}
         for config in tools:
-            if not hasattr(config, "type") or not (hasattr(config, "function") and hasattr(config.function, "name")):
+            if not hasattr(config, "type") or not (
+                hasattr(config, "function") and hasattr(config.function, "name")
+            ):
                 continue
             if config.type == "function" and config.function.name == func_name:
                 if not hasattr(config.function, "parameters"):
@@ -84,7 +92,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
         logger.warning(f"Tool '{func_name}' is not defined in the tools list.")
         return {}
 
-    def _convert_param_value(self, param_value: str, param_name: str, param_config: dict, func_name: str) -> Any:
+    def _convert_param_value(
+        self, param_value: str, param_name: str, param_config: dict, func_name: str
+    ) -> Any:
         """Convert parameter value based on its type in the schema."""
         # Handle null value for any type
         if param_value.lower() == "null":
@@ -92,46 +102,77 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         if param_name not in param_config:
             if param_config != {}:
-                logger.warning(f"Parsed parameter '{param_name}' is not defined in the tool " f"parameters for tool '{func_name}', directly returning the string value.")
+                logger.warning(
+                    f"Parsed parameter '{param_name}' is not defined in the tool "
+                    f"parameters for tool '{func_name}', directly returning the string value."
+                )
             return param_value
 
-        if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
+        if (
+            isinstance(param_config[param_name], dict)
+            and "type" in param_config[param_name]
+        ):
             param_type = str(param_config[param_name]["type"]).strip().lower()
         else:
             param_type = "string"
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
             return param_value
-        elif param_type.startswith("int") or param_type.startswith("uint") or param_type.startswith("long") or param_type.startswith("short") or param_type.startswith("unsigned"):
+        elif (
+            param_type.startswith("int")
+            or param_type.startswith("uint")
+            or param_type.startswith("long")
+            or param_type.startswith("short")
+            or param_type.startswith("unsigned")
+        ):
             try:
                 param_value = int(param_value)
             except:
-                logger.warning(f"Parsed value '{param_value}' of parameter '{param_name}' is not an integer in tool " f"'{func_name}', degenerating to string.")
+                logger.warning(
+                    f"Parsed value '{param_value}' of parameter '{param_name}' is not an integer in tool "
+                    f"'{func_name}', degenerating to string."
+                )
             return param_value
         elif param_type.startswith("num") or param_type.startswith("float"):
             try:
-                maybe_convert = False if "." in param_value or "e" in param_value.lower() else True
+                maybe_convert = (
+                    False if "." in param_value or "e" in param_value.lower() else True
+                )
                 param_value: float = float(param_value)
                 if maybe_convert and param_value.is_integer():
                     param_value = int(param_value)
             except:
-                logger.warning(f"Parsed value '{param_value}' of parameter '{param_name}' is not a float in tool " f"'{func_name}', degenerating to string.")
+                logger.warning(
+                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a float in tool "
+                    f"'{func_name}', degenerating to string."
+                )
             return param_value
         elif param_type in ["boolean", "bool", "binary"]:
             param_value = param_value.lower()
             if param_value not in ["true", "false"]:
-                logger.warning(f"Parsed value '{param_value}' of parameter '{param_name}' is not a boolean (`true` of `false`) in tool '{func_name}', degenerating to false.")
+                logger.warning(
+                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a boolean (`true` of `false`) in tool '{func_name}', degenerating to false."
+                )
             return param_value == "true"
         else:
-            if param_type in ["object", "array", "arr"] or param_type.startswith("dict") or param_type.startswith("list"):
+            if (
+                param_type in ["object", "array", "arr"]
+                or param_type.startswith("dict")
+                or param_type.startswith("list")
+            ):
                 try:
                     param_value = json.loads(param_value)
                     return param_value
                 except:
-                    logger.warning(f"Parsed value '{param_value}' of parameter '{param_name}' cannot be parsed with json.loads in tool " f"'{func_name}', will try other methods to parse it.")
+                    logger.warning(
+                        f"Parsed value '{param_value}' of parameter '{param_name}' cannot be parsed with json.loads in tool "
+                        f"'{func_name}', will try other methods to parse it."
+                    )
             try:
                 param_value = ast.literal_eval(param_value)  # safer
             except:
-                logger.warning(f"Parsed value '{param_value}' of parameter '{param_name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string.")
+                logger.warning(
+                    f"Parsed value '{param_value}' of parameter '{param_name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
+                )
             return param_value
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
@@ -172,9 +213,17 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         p_name = p_match[:p_idx]
                         p_val = p_match[p_idx + 1 :].strip()  # Remove \n
 
-                        parsed_params[p_name] = self._convert_param_value(p_val, p_name, param_config, func_name)
+                        parsed_params[p_name] = self._convert_param_value(
+                            p_val, p_name, param_config, func_name
+                        )
 
-                    calls.append(ToolCallItem(tool_index=tool_idx, name=func_name, parameters=json.dumps(parsed_params, ensure_ascii=False)))
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=tool_idx,
+                            name=func_name,
+                            parameters=json.dumps(parsed_params, ensure_ascii=False),
+                        )
+                    )
                     tool_idx += 1
 
             # Determine normal text (text before the first tool call)
@@ -189,7 +238,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
             logger.error(f"Error in detect_and_parse: {e}")
             return StreamingParseResult(normal_text=text)
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(
+        self, new_text: str, tools: List[Tool]
+    ) -> StreamingParseResult:
         """
         Robust cursor-based streaming parser.
         """
@@ -232,7 +283,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     self.json_started = False
                     self.current_func_name = func_name  # Store for param parsing
 
-                    calls.append(ToolCallItem(tool_index=self.current_tool_id, name=func_name, parameters=""))
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=func_name,
+                            parameters="",
+                        )
+                    )
 
                     self.parsed_pos += end_angle + 1
                     continue
@@ -260,7 +317,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
                     candidates = []
                     if cand_end_param != -1:
-                        candidates.append((cand_end_param, len(self.parameter_end_token)))
+                        candidates.append(
+                            (cand_end_param, len(self.parameter_end_token))
+                        )
                     if cand_next_param != -1:
                         candidates.append((cand_next_param, 0))
                     if cand_end_func != -1:
@@ -271,7 +330,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         end_pos = best_cand[0]
                         end_token_len = best_cand[1]
 
-                        param_name = current_slice[len(self.parameter_prefix) : name_end]
+                        param_name = current_slice[
+                            len(self.parameter_prefix) : name_end
+                        ]
                         raw_value = rest_of_slice[:end_pos]
 
                         # Cleanup value
@@ -282,11 +343,19 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
                         # JSON Construction
                         if not self.json_started:
-                            calls.append(ToolCallItem(tool_index=self.current_tool_id, parameters="{"))
+                            calls.append(
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id, parameters="{"
+                                )
+                            )
                             self.json_started = True
 
-                        param_config = self._get_arguments_config(self.current_func_name, tools)
-                        converted_val = self._convert_param_value(raw_value, param_name, param_config, self.current_func_name)
+                        param_config = self._get_arguments_config(
+                            self.current_func_name, tools
+                        )
+                        converted_val = self._convert_param_value(
+                            raw_value, param_name, param_config, self.current_func_name
+                        )
 
                         # Construct JSON fragment: "key": value
                         # Note: We must be careful with json.dumps to ensure valid JSON streaming
@@ -297,7 +366,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         else:
                             fragment = json_key_val
 
-                        calls.append(ToolCallItem(tool_index=self.current_tool_id, parameters=fragment))
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id, parameters=fragment
+                            )
+                        )
                         self.current_tool_param_count += 1
 
                         # Advance cursor
@@ -313,10 +386,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             if current_slice.startswith(self.function_end_token):
                 if not self.json_started:
-                    calls.append(ToolCallItem(tool_index=self.current_tool_id, parameters="{"))
+                    calls.append(
+                        ToolCallItem(tool_index=self.current_tool_id, parameters="{")
+                    )
                     self.json_started = True
 
-                calls.append(ToolCallItem(tool_index=self.current_tool_id, parameters="}"))
+                calls.append(
+                    ToolCallItem(tool_index=self.current_tool_id, parameters="}")
+                )
                 self.parsed_pos += len(self.function_end_token)
                 self.current_func_name = None
                 continue

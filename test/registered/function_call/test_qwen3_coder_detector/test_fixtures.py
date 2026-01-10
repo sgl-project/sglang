@@ -1,4 +1,8 @@
-from sglang.srt.entrypoints.openai.protocol import Tool, Function
+from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(1.0, "default")
+
 
 def get_test_tools():
     return [

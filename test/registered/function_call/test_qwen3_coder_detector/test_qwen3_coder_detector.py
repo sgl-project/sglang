@@ -30,7 +30,10 @@ class TestQwen3CoderDetector(unittest.TestCase):
                         "type": "object",
                         "properties": {
                             "location": {"type": "string"},
-                            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
                             "days": {"type": "integer"},
                         },
                         "required": ["location"],
@@ -378,8 +381,12 @@ class TestQwen3CoderDetector(unittest.TestCase):
 
         # First session
         result1 = detector.parse_streaming_increment("<tool_call>", self.tools)
-        result2 = detector.parse_streaming_increment("<function=get_current_weather>", self.tools)
-        result3 = detector.parse_streaming_increment("<parameter=location>NYC</parameter>", self.tools)
+        result2 = detector.parse_streaming_increment(
+            "<function=get_current_weather>", self.tools
+        )
+        result3 = detector.parse_streaming_increment(
+            "<parameter=location>NYC</parameter>", self.tools
+        )
         result4 = detector.parse_streaming_increment("</function>", self.tools)
         result5 = detector.parse_streaming_increment("</tool_call>", self.tools)
 
@@ -388,8 +395,12 @@ class TestQwen3CoderDetector(unittest.TestCase):
 
         # Second session should work independently
         result6 = detector.parse_streaming_increment("<tool_call>", self.tools)
-        result7 = detector.parse_streaming_increment("<function=sql_interpreter>", self.tools)
-        result8 = detector.parse_streaming_increment("<parameter=query>SELECT 1</parameter>", self.tools)
+        result7 = detector.parse_streaming_increment(
+            "<function=sql_interpreter>", self.tools
+        )
+        result8 = detector.parse_streaming_increment(
+            "<parameter=query>SELECT 1</parameter>", self.tools
+        )
         result9 = detector.parse_streaming_increment("</function>", self.tools)
         result10 = detector.parse_streaming_increment("</tool_call>", self.tools)
 

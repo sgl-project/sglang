@@ -4,16 +4,18 @@ register_cpu_ci(1.0, "default")
 
 
 import json
-import re
 import random
-from typing import Dict, List, Optional, Generator, Tuple
+import re
 from dataclasses import dataclass
+from typing import Dict, Generator, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+
 
 @dataclass
 class StreamingTestResult:
     """Result of a streaming test execution."""
+
     test_name: str
     full_parsed_text: str
     final_reconstructed: Dict
@@ -27,8 +29,15 @@ class StreamingTestResult:
     non_streaming_match: Optional[bool] = None
     non_streaming_errors: Optional[List[str]] = None
 
+
 class StreamingTestRunner:
-    def __init__(self, detector, tools: Optional[List[Tool]] = None, parser_mode: str = "both", verbose: bool = False):
+    def __init__(
+        self,
+        detector,
+        tools: Optional[List[Tool]] = None,
+        parser_mode: str = "both",
+        verbose: bool = False,
+    ):
         self.detector = detector
         self.parser_mode = parser_mode
         self.default_tools = tools
@@ -72,7 +81,9 @@ class StreamingTestRunner:
             compare_with_non_streaming = run_non_streaming
 
         if verbose:
-            self._print_test_header(test_name, response_text, mode, run_streaming, run_non_streaming)
+            self._print_test_header(
+                test_name, response_text, mode, run_streaming, run_non_streaming
+            )
 
         tools = tools or self.default_tools
         if tools is None:
@@ -99,12 +110,17 @@ class StreamingTestRunner:
                     if result.calls:
                         for call in result.calls:
                             if call.tool_index not in final_reconstructed:
-                                final_reconstructed[call.tool_index] = {"name": "", "args": ""}
+                                final_reconstructed[call.tool_index] = {
+                                    "name": "",
+                                    "args": "",
+                                }
 
                             if call.name:
                                 final_reconstructed[call.tool_index]["name"] = call.name
                             if call.parameters:
-                                final_reconstructed[call.tool_index]["args"] += call.parameters
+                                final_reconstructed[call.tool_index][
+                                    "args"
+                                ] += call.parameters
 
                     if verbose:
                         display_chunk = chunk.replace("\n", "\\n")
@@ -122,13 +138,21 @@ class StreamingTestRunner:
         non_streaming_result = None
         if run_non_streaming:
             try:
-                non_streaming_result = self.detector.detect_and_parse(response_text, tools)
+                non_streaming_result = self.detector.detect_and_parse(
+                    response_text, tools
+                )
             except Exception as e:
                 if verbose:
                     print(f"WARNING: Non-streaming parse failed: {e}")
 
         if verbose:
-            self._print_test_summary(full_parsed_text, final_reconstructed, non_streaming_result, run_streaming, run_non_streaming)
+            self._print_test_summary(
+                full_parsed_text,
+                final_reconstructed,
+                non_streaming_result,
+                run_streaming,
+                run_non_streaming,
+            )
 
         # Validate results
         streaming_match = None
@@ -139,7 +163,12 @@ class StreamingTestRunner:
         if expected is not None:
             # Only validate streaming parse result when running streaming parsing
             if run_streaming:
-                streaming_match, streaming_errors = self._validate_result(expected=expected, actual_text=full_parsed_text, actual_tools=final_reconstructed, result_type="streaming")
+                streaming_match, streaming_errors = self._validate_result(
+                    expected=expected,
+                    actual_text=full_parsed_text,
+                    actual_tools=final_reconstructed,
+                    result_type="streaming",
+                )
 
             # Only validate non-streaming parse result when running non-streaming parsing
             if run_non_streaming and non_streaming_result is not None:
@@ -149,7 +178,10 @@ class StreamingTestRunner:
                         args = json.loads(call.parameters) if call.parameters else {}
                     except:
                         args = call.parameters
-                    non_streaming_tools[call.tool_index] = {"name": call.name, "args": args}
+                    non_streaming_tools[call.tool_index] = {
+                        "name": call.name,
+                        "args": args,
+                    }
                 non_streaming_match, non_streaming_errors = self._validate_result(
                     expected=expected,
                     actual_text=non_streaming_result.normal_text or "",
@@ -171,7 +203,14 @@ class StreamingTestRunner:
             non_streaming_errors=non_streaming_errors if non_streaming_errors else None,
         )
 
-    def _print_test_header(self, test_name: str, response_text: str, mode: str, run_streaming: bool, run_non_streaming: bool):
+    def _print_test_header(
+        self,
+        test_name: str,
+        response_text: str,
+        mode: str,
+        run_streaming: bool,
+        run_non_streaming: bool,
+    ):
         """Print test header information"""
         print(f"\n{'='*60}")
         mode_info = []
@@ -185,7 +224,14 @@ class StreamingTestRunner:
         print(response_text)
         print(f"{'-'*60}")
 
-    def _print_test_summary(self, full_parsed_text: str, final_reconstructed: Dict, non_streaming_result: any, run_streaming: bool, run_non_streaming: bool):
+    def _print_test_summary(
+        self,
+        full_parsed_text: str,
+        final_reconstructed: Dict,
+        non_streaming_result: any,
+        run_streaming: bool,
+        run_non_streaming: bool,
+    ):
         """Print test result summary"""
         print("Parse Result Summary (FINAL RESULTS):")
 
@@ -208,7 +254,9 @@ class StreamingTestRunner:
                 except:
                     print(f"\t  P-dict: (parse error)")
 
-    def _validate_result(self, expected: Dict, actual_text: str, actual_tools: Dict, result_type: str) -> Tuple[bool, List[str]]:
+    def _validate_result(
+        self, expected: Dict, actual_text: str, actual_tools: Dict, result_type: str
+    ) -> Tuple[bool, List[str]]:
         """
         Validate if parse result matches expected result
 
@@ -230,7 +278,9 @@ class StreamingTestRunner:
 
             if actual_text.rstrip() != expected_text.rstrip():
                 match = False
-                errors.append(f"{result_type} text mismatch: expected '{expected_text}', got '{actual_text}'")
+                errors.append(
+                    f"{result_type} text mismatch: expected '{expected_text}', got '{actual_text}'"
+                )
 
         # Validate tool calls
         if "tools" in expected:
@@ -257,7 +307,9 @@ class StreamingTestRunner:
             # Compare tool count
             if len(actual_tools_list) != len(expected_tools):
                 match = False
-                errors.append(f"{result_type} tool count mismatch: expected {len(expected_tools)}, got {len(actual_tools_list)}")
+                errors.append(
+                    f"{result_type} tool count mismatch: expected {len(expected_tools)}, got {len(actual_tools_list)}"
+                )
 
             # Compare each tool
             for i, expected_tool in enumerate(expected_tools):
@@ -269,12 +321,18 @@ class StreamingTestRunner:
                 actual_tool = actual_tools_list[i]
                 if actual_tool["name"] != expected_tool["name"]:
                     match = False
-                    errors.append(f"{result_type} tool {i} name mismatch: expected '{expected_tool['name']}', got '{actual_tool['name']}'")
+                    errors.append(
+                        f"{result_type} tool {i} name mismatch: expected '{expected_tool['name']}', got '{actual_tool['name']}'"
+                    )
 
                 # Deep compare args
-                if not self._deep_compare(actual_tool.get("args", {}), expected_tool.get("args", {})):
+                if not self._deep_compare(
+                    actual_tool.get("args", {}), expected_tool.get("args", {})
+                ):
                     match = False
-                    errors.append(f"{result_type} tool {i} args mismatch: expected {expected_tool.get('args')}, got {actual_tool.get('args')}")
+                    errors.append(
+                        f"{result_type} tool {i} args mismatch: expected {expected_tool.get('args')}, got {actual_tool.get('args')}"
+                    )
 
         return match, errors
 
@@ -300,7 +358,10 @@ class StreamingTestRunner:
         else:
             return actual == expected
 
-def token_stream_generator(text: str, mode: str = "atomic_tags") -> Generator[str, None, None]:
+
+def token_stream_generator(
+    text: str, mode: str = "atomic_tags"
+) -> Generator[str, None, None]:
     """
     Generator to simulate streaming output.
 
