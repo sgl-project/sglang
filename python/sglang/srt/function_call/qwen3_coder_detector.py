@@ -14,7 +14,6 @@ from sglang.srt.function_call.core_types import (
 )
 
 logger = logging.getLogger(__name__)
-logger.critical(f"[xixi.yjx] PARSER: 1231 Try to port from vLLM parser: Using cursor-based streaming parser.")
 
 
 class Qwen3CoderDetector(BaseFormatDetector):
@@ -35,19 +34,19 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self.tool_call_parameter_regex = re.compile(r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", re.DOTALL)
 
         # Streaming State
-        # 覆盖父类的 _buffer 管理，或者配合父类使用。
-        # SGLang BaseFormatDetector 通常有自己的 _buffer，但这里我们显式管理以确保逻辑清晰
+        # Override parent class _buffer management, or work with parent class.
+        # SGLang BaseFormatDetector usually has its own _buffer, but we explicitly manage it here to ensure logic clarity
         if not hasattr(self, "_buffer"):
             self._buffer = ""
 
-        # 指向 buffer 中下一个待处理字符的索引
+        # Index pointing to the next character to be processed in buffer
         self.parsed_pos = 0
-        # 当前正在处理的 tool 内部的参数计数，用于判断是否加逗号
+        # Parameter count inside the current tool being processed, used to determine whether to add comma
         self.current_tool_param_count = 0
-        # 标记当前 tool 是否已经发送了 '{'
+        # Flag indicating whether current tool has already sent '{'
         self.json_started = False
 
-        # [FIX] 新增状态位：标记是否处于 tool_call 结构块内部
+        # [FIX] New state flag: mark whether inside tool_call structure block
         self.is_inside_tool_call = False
 
     def _reset_streaming_state(self):
@@ -210,11 +209,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 break
 
             # -------------------------------------------------------
-            # 1. 优先检测是否是 Tool Call 的开始
+            # 1. Priority detection: check if it's the start of Tool Call
             # -------------------------------------------------------
             if current_slice.startswith(self.tool_call_start_token):
                 self.parsed_pos += len(self.tool_call_start_token)
-                self.is_inside_tool_call = True  # [FIX] 进入工具调用区域
+                self.is_inside_tool_call = True  # [FIX] Enter tool call region
                 continue
 
             # -------------------------------------------------------
@@ -248,11 +247,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     value_start_idx = name_end + 1
                     rest_of_slice = current_slice[value_start_idx:]
 
-                    # 一个参数的结束有多种可能：
-                    # 1. 【正常】遇到 </parameter>
-                    # 2. 【不正常】遇到下一个 <parameter=
-                    # 3. 【不正常】遇到 </function>
-                    # 所以需要找到最小的那个，作为参数的结束位置。
+                    # A parameter can end in multiple ways:
+                    # 1. [Normal] Encounter </parameter>
+                    # 2. [Abnormal] Encounter next <parameter=
+                    # 3. [Abnormal] Encounter </function>
+                    # So we need to find the smallest one as the parameter end position.
                     cand_end_param = rest_of_slice.find(self.parameter_end_token)
                     cand_next_param = rest_of_slice.find(self.parameter_prefix)
                     cand_end_func = rest_of_slice.find(self.function_end_token)
@@ -325,28 +324,28 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             if current_slice.startswith(self.tool_call_end_token):
                 self.parsed_pos += len(self.tool_call_end_token)
-                self.is_inside_tool_call = False  # [FIX] 退出工具调用区域
+                self.is_inside_tool_call = False  # [FIX] Exit tool call region
                 continue
 
             # -------------------------------------------------------
             # 6. Handling content / whitespace / normal text
             # -------------------------------------------------------
-            # 如果当前位置不是 tag 的开始（即不以 < 开头），那么它可能是普通文本，
-            # 或者是两个 tag 之间的换行符。
-            # 但我们需要小心，不要把 "<fun" 这种切断的 tag 当作文本输出了。
+            # If current position is not the start of a tag (i.e., doesn't start with <), it might be plain text,
+            # or a newline between two tags.
+            # But we need to be careful not to output truncated tags like "<fun" as text.
 
             next_open_angle = current_slice.find("<")
 
             if next_open_angle == -1:
-                # 这一段全是普通文本
+                # This entire segment is plain text
                 if not self.is_inside_tool_call:
                     normal_text_chunks.append(current_slice)
-                # [FIX] 如果在 tool call 内部，这段文本（通常是 \n）直接丢弃，不 append
+                # [FIX] If inside tool call, discard this text (usually \n), don't append
                 self.parsed_pos += len(current_slice)
                 continue
 
             elif next_open_angle == 0:
-                # 看起来像 Tag，但不匹配上面任何已知 Tag
+                # Looks like a Tag, but doesn't match any known Tag above
 
                 possible_tags = [
                     self.tool_call_start_token,
@@ -366,23 +365,23 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 if is_potential_tag:
                     break  # Wait for more
                 else:
-                    # 只是个单纯的 '<' 符号
+                    # Just a plain '<' symbol
                     if not self.is_inside_tool_call:
                         normal_text_chunks.append("<")
                     self.parsed_pos += 1
                     continue
 
             else:
-                # '<' 在中间
+                # '<' is in the middle
                 text_segment = current_slice[:next_open_angle]
                 if not self.is_inside_tool_call:
                     normal_text_chunks.append(text_segment)
-                # [FIX] 如果在 tool call 内部，丢弃 Tag 前面的空白/文本
+                # [FIX] If inside tool call, discard whitespace/text before Tag
                 self.parsed_pos += next_open_angle
                 continue
 
         # Memory Cleanup: Slice the buffer
-        # 保留未解析的部分，丢弃已解析的部分
+        # Keep unparsed part, discard parsed part
         if self.parsed_pos > 0:
             self._buffer = self._buffer[self.parsed_pos :]
             self.parsed_pos = 0

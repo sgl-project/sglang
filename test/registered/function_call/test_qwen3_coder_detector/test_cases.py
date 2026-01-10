@@ -9,7 +9,7 @@ class TestCaseRegistry:
         def decorator(func):
             test_name = name or func.__name__
             if test_name.startswith("test_"):
-                test_name = test_name[5:]  # 移除 "test_" 前缀
+                test_name = test_name[5:]  # Remove "test_" prefix
             cls._registry[test_name] = func
             return func
 
@@ -35,23 +35,23 @@ class TestCase:
 
     def run(self, test_name: str, response_text: str, mode: str = "atomic_tags", expected: dict = None):
         """
-        运行单个测试用例
+        Run a single test case
 
         Args:
-            test_name: 测试名称
-            response_text: 响应文本
-            mode: 流式生成模式
-            expected: 期望的解析结果，包含 'text' 和 'tools' 字段
+            test_name: Test name
+            response_text: Response text
+            mode: Streaming generation mode
+            expected: Expected parse result, containing 'text' and 'tools' fields
         """
         return self.runner.run_test(test_name=test_name, response_text=response_text, mode=mode, expected=expected)
 
 @test_case_registry.register("plain_text")
 def test_plain_text(runner: StreamingTestRunner = None):
     test_case = TestCase(runner)
-    text = """这是纯文本测试"""
+    text = """This is plain text test"""
 
     expected = {
-        "text": "这是纯文本测试",
+        "text": "This is plain text test",
         "tools": [],
     }
 
@@ -59,7 +59,7 @@ def test_plain_text(runner: StreamingTestRunner = None):
 
 @test_case_registry.register("single_tool_call")
 def test_single_tool_call(runner: StreamingTestRunner = None):
-    """单个工具调用测试"""
+    """Single tool call test"""
     test_case = TestCase(runner)
     text = """<function=get_current_weather>
 <parameter=location>Boston</parameter>
@@ -74,9 +74,9 @@ def test_single_tool_call(runner: StreamingTestRunner = None):
 
 @test_case_registry.register("single_tool_call_with_text")
 def test_single_tool_call_with_text(runner: StreamingTestRunner = None):
-    """带文本前缀的单个工具调用测试"""
+    """Single tool call test with text prefix"""
     test_case = TestCase(runner)
-    text = """这是文本前缀 + 工具调用测试
+    text = """Text prefix + tool call test
 
 <function=get_current_weather>
 <parameter=location>Boston</parameter>
@@ -84,16 +84,16 @@ def test_single_tool_call_with_text(runner: StreamingTestRunner = None):
 <parameter=days>3</parameter>
 </function>"""
     expected = {
-        "text": "这是文本前缀 + 工具调用测试\n    \n",
+        "text": "Text prefix + tool call test\n    \n",
         "tools": [{"name": "get_current_weather", "args": {"location": "Boston", "unit": "celsius", "days": 3}}],
     }
     return test_case.run("Standard Single Tool with Text", text, mode="atomic_tags", expected=expected)
 
 @test_case_registry.register("double_tool_call")
 def test_double_tool_call(runner: StreamingTestRunner = None):
-    """两个工具调用测试"""
+    """Double tool call test"""
     test_case = TestCase(runner)
-    text = """这是文本前缀 + 两个工具调用测试
+    text = """Text prefix + double tool call test
 
 <function=get_current_weather>
 <parameter=location>New York</parameter>
@@ -104,7 +104,7 @@ def test_double_tool_call(runner: StreamingTestRunner = None):
 </function>
 """
     expected = {
-        "text": "这是文本前缀 + 两个工具调用测试\n\n",
+        "text": "Text prefix + double tool call test\n\n",
         "tools": [
             {"name": "get_current_weather", "args": {"location": "New York"}},
             {"name": "sql_interpreter", "args": {"query": "SELECT * FROM users", "dry_run": True}},
@@ -114,24 +114,24 @@ def test_double_tool_call(runner: StreamingTestRunner = None):
 
 @test_case_registry.register("random_fragmentation")
 def test_random_fragmentation_stress_test(runner: StreamingTestRunner = None):
-    """随机碎片化压力测试"""
+    """Random fragmentation stress test"""
     test_case = TestCase(runner)
-    text = """这是文本前缀 + 随机碎片化压力测试
+    text = """Text prefix + random fragmentation stress test
 
 <function=get_current_weather>
 <parameter=location>San Francisco</parameter>
 </function>"""
     expected = {
-        "text": "这是文本前缀 + 随机碎片化压力测试\n\n",
+        "text": "Text prefix + random fragmentation stress test\n\n",
         "tools": [{"name": "get_current_weather", "args": {"location": "San Francisco"}}],
     }
     return test_case.run("Random Fragmentation Stress Test", text, mode="atomic_tags", expected=expected)
 
 @test_case_registry.register("implicit_parameter_close")
 def test_implicit_parameter_close(runner: StreamingTestRunner = None):
-    """隐式参数关闭测试"""
+    """Implicit parameter close test"""
     test_case = TestCase(runner)
-    text = """这是文本前缀 + 隐式参数关闭测试
+    text = """Text prefix + implicit parameter close test
 
 <function=get_current_weather>
 <parameter=location>Paris
@@ -139,16 +139,16 @@ def test_implicit_parameter_close(runner: StreamingTestRunner = None):
 <parameter=days>3
 </function>"""
     expected = {
-        "text": "这是文本前缀 + 隐式参数关闭测试\n\n",
+        "text": "Text prefix + implicit parameter close test\n\n",
         "tools": [{"name": "get_current_weather", "args": {"location": "Paris", "unit": "celsius", "days": 3}}],
     }
     return test_case.run("Implicit Parameter Close", text, mode="atomic_tags", expected=expected)
 
 @test_case_registry.register("complex_schema")
 def test_complex_schema_toolcall(runner: StreamingTestRunner = None):
-    """复杂 schema 工具调用测试"""
+    """Complex schema tool call test"""
     test_case = TestCase(runner)
-    text = """这是文本前缀 + 复杂 schema 工具调用测试
+    text = """Text prefix + complex schema tool call test
 
 <function=TodoWrite>
 <parameter=todos>
@@ -161,7 +161,7 @@ def test_complex_schema_toolcall(runner: StreamingTestRunner = None):
 
 """
     expected = {
-        "text": "这是文本前缀 + 复杂 schema 工具调用测试\n\n",
+        "text": "Text prefix + complex schema tool call test\n\n",
         "tools": [
             {
                 "name": "TodoWrite",
