@@ -305,7 +305,8 @@ class AscendAttnBackend(AttentionBackend):
         ):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
-
+            self.forward_metadata.seq_lens = forward_batch.seq_lens
+            self.forward_metadata.seq_lens_cum_sum = torch.cumsum(forward_batch.deq_lens, dim=0)
         if forward_batch.forward_mode.is_target_verify():
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
 
@@ -473,6 +474,8 @@ class AscendAttnBackend(AttentionBackend):
         else:
             return self.alibi_bias[:, :q_seq_len, :kv_seq_len]
 
+
+
     def attn_alibi(self,q,k_cache,v_cache,block_tables,seq_lens,query_lens,scale_value,num_heads,slopes,is_extend):
         curr=0
         num_prompts=query_lens.shape[0]
@@ -638,7 +641,7 @@ class AscendAttnBackend(AttentionBackend):
             if self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
             else:
-                actual_seq_qlen = torch.cumsum(forward_batch.seq_lens, dim=0)
+                actual_seq_qlen = self.forward_metadata.seq_lens_cum_sum
         else:
             if self.forward_metadata.actual_seq_lengths_q is None:
                 if (

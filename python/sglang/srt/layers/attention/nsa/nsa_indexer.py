@@ -35,7 +35,11 @@ from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import scattered_to_tp_attn_full
+from sglang.srt.utils import get_bool_env_var
+from sglang.srt.layers.communicator import ScatterMode
 
+_use_ag_after_qlora = get_bool_env_var("SGLANG_USE_AG_AFTER_QLORA")
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
@@ -968,6 +972,7 @@ class Indexer(CustomOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
+        layer_scatter_modes,
     ) -> torch.Tensor:
         if forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = forward_batch.attn_backend.forward_metadata.seq_lens
@@ -987,7 +992,7 @@ class Indexer(CustomOp):
         cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
         sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
 
-        bs = x.shape[0]
+        bs = q_lora.shape[0]
         if self.alt_stream is not None:
             self.alt_stream.wait_stream(torch.npu.current_stream())
             with torch.npu.stream(self.alt_stream):
@@ -1032,6 +1037,12 @@ class Indexer(CustomOp):
 
         k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
         k = self.k_norm(k_proj)
+        if (
+            _use_ag_after_qlora
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            k = scattered_to_tp_attn_full(k, forward_batch)
         k_pe, k_nope = torch.split(
             k,
             [self.rope_head_dim, self.head_dim - self.rope_head_dim],
@@ -1077,7 +1088,7 @@ class Indexer(CustomOp):
                 )
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
-                actual_seq_lengths_q = forward_batch.seq_lens.cumsum(dim=0)
+                actual_seq_lengths_q = forward_batch.attn_backend.forward_metadata.seq_lens_cum_sum
         else:
             if forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q is None:
                 if (
@@ -1111,7 +1122,12 @@ class Indexer(CustomOp):
         if self.alt_stream is not None:
             torch.npu.current_stream().wait_event(q_rope_event)
         torch.npu.current_stream().wait_event(weights_event)
-
+        if (
+            _use_ag_after_qlora
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
         if (
             is_prefill
