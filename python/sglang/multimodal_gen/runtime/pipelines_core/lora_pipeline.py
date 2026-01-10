@@ -189,6 +189,11 @@ class LoRAPipeline(ComposedPipelineBase):
             yield []
             return
 
+        # clear CUDA cache to free up unused memory
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
         offload_disabled_modules = []
         for module_name in module_names:
             module = self.modules.get(module_name)
@@ -480,7 +485,7 @@ class LoRAPipeline(ComposedPipelineBase):
         # not from offloaded placeholder tensors
         if not self.lora_initialized:
             with self._temporarily_disable_offload(
-                target=target, use_module_names_only=True
+                target="all", use_module_names_only=True
             ):
                 self.convert_to_lora_layers()
 
