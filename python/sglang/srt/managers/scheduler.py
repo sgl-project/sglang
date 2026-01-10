@@ -559,10 +559,12 @@ class Scheduler(
             self.cpu_group = self.attn_tp_cpu_group
             self.entry_rank = self.attn_tp_group.first_rank
             self.is_entry_rank = self.attn_tp_rank == 0
+            self.dp_tp_size = self.attn_tp_size
         else:
             self.cpu_group = self.tp_cpu_group
             self.entry_rank = self.tp_group.first_rank
             self.is_entry_rank = self.tp_group.rank_in_group == 0
+            self.dp_tp_size = self.tp_size
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
@@ -1555,18 +1557,11 @@ class Scheduler(
             else:
                 key = ("structural_tag", req.sampling_params.structural_tag)
 
-            if self.server_args.enable_dp_attention:
-                tp_rank = self.attn_tp_rank
-                tp_size = self.attn_tp_size
-            else:
-                tp_rank = self.tp_rank
-                tp_size = self.tp_size
-
-            if tp_rank == 0:
+            if self.is_entry_rank:
                 if self.server_args.grammar_backend == "none":
                     error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
                     req.set_finish_with_abort(error_msg)
-                    if tp_size > 1:
+                    if self.dp_tp_size > 1:
                         add_to_grammar_queue = True
                 else:
                     value, cache_hit = self.grammar_backend.get_cached_or_future_value(
@@ -1580,7 +1575,7 @@ class Scheduler(
                         req.set_finish_with_abort(error_msg)
 
                     # When TP > 1, always add to grammar_queue for synchronization across ranks
-                    if tp_size > 1:
+                    if self.dp_tp_size > 1:
                         add_to_grammar_queue = True
                     elif not cache_hit:
                         # TP == 1: only add to queue if we didn't get a cache hit.
@@ -2386,13 +2381,6 @@ class Scheduler(
         num_timeout_reqs = 0
         invalid_indices = []
 
-        if self.server_args.enable_dp_attention:
-            tp_size = self.attn_tp_size
-            tp_group = self.attn_tp_cpu_group
-        else:
-            tp_size = self.tp_size
-            tp_group = self.tp_cpu_group
-
         # Count how many requests have ready grammars (non-blocking check).
         # For TP>1, only rank 0 actually checks Future completion; others just count.
         for req in self.grammar_queue:
@@ -2401,7 +2389,7 @@ class Scheduler(
                     num_ready_reqs += 1
                     continue
 
-                if tp_size > 1:
+                if self.dp_tp_size > 1:
                     # TP>1: Non-rank-0 workers have req.grammar=None (they don't compile).
                     # They still count requests as "ready" to stay in sync with rank 0.
                     # Rank 0 with cache hits will have a compiled grammar (not a Future).
@@ -2426,7 +2414,7 @@ class Scheduler(
                     num_timeout_reqs = 1
                 break
 
-        if tp_size > 1:
+        if self.dp_tp_size > 1:
             # Rank 0 broadcasts its ready/timeout/invalid counts
             num_invalid = len(invalid_indices)
             tensor = torch.tensor(
@@ -2435,25 +2423,22 @@ class Scheduler(
 
             # Broadcast from local rank 0 within the TP group, using group_src (local rank)
             # rather than src (global rank) to be consistent with other self.tp_rank == 0 checks
-            torch.distributed.broadcast(tensor, group_src=0, group=tp_group)
+            torch.distributed.broadcast(tensor, group_src=0, group=self.cpu_group)
             num_ready_reqs_rank_0, num_timeout_reqs_rank_0, num_invalid = (
                 tensor.tolist()
             )
 
-            if self.server_args.enable_dp_attention:
-                tp_rank = self.attn_tp_rank
-            else:
-                tp_rank = self.tp_rank
-
             # In order to have the consistent abort request state, we must broadcast the invalid indices
             if num_invalid > 0:
-                if tp_rank == 0:
+                if self.is_entry_rank:
                     # On rank 0, we create our tensor with our invalid indices data (to send)
                     invalid_tensor = torch.tensor(invalid_indices, dtype=torch.int32)
                 else:
                     # On non-entry ranks, we create our empty tensors (to receive)
                     invalid_tensor = torch.zeros(num_invalid, dtype=torch.int32)
-                torch.distributed.broadcast(invalid_tensor, group_src=0, group=tp_group)
+                torch.distributed.broadcast(
+                    invalid_tensor, group_src=0, group=self.cpu_group
+                )
 
                 # All ranks abort invalid requests
                 for idx in invalid_tensor.tolist():
@@ -2479,7 +2464,7 @@ class Scheduler(
         ):
             req = self.grammar_queue[i]
             # Only rank 0 has futures to cancel and cache to update
-            if tp_rank == 0 and isinstance(req.grammar, futures.Future):
+            if self.is_entry_rank and isinstance(req.grammar, futures.Future):
                 req.grammar.cancel()
                 self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
             error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
