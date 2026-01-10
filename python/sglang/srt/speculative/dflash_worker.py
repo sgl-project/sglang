@@ -4,12 +4,11 @@
 """DFlash speculative decoding worker using TpModelWorker infrastructure.
 
 DFlash draft model generates a full block of tokens in one forward pass.
-Uses native SGLang RadixAttention with ENCODER_ONLY for non-causal attention.
-Inherits from TpModelWorker for proper model loading, attention backend, and CUDA graphs.
+Uses torch-based non-causal attention for parallel block drafting.
+Inherits from TpModelWorker for proper model loading and memory management.
 """
 
 import logging
-import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -27,7 +26,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
-from sglang.srt.utils import get_available_gpu_memory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -40,9 +38,9 @@ class DFlashWorker(TpModelWorker):
     
     This enables:
     - Proper model loading via ModelRunner
-    - RadixAttention with FlashAttention backend
-    - Native CUDA graph support
-    - Tensor parallelism
+    - Shared memory pools with target model
+    - Tensor parallelism support
+    - Hidden state caching via radix cache
     """
 
     def __init__(
@@ -139,37 +137,22 @@ class DFlashWorker(TpModelWorker):
     def init_attention_backend(self):
         """Initialize attention backend for draft model.
         
-        DFlash uses ENCODER_ONLY attention (non-causal) which is handled
-        automatically by RadixAttention when attn_type is set.
-        
-        Unlike EAGLE, DFlash processes the entire block in a single forward pass,
-        so we use the model_runner's native attention backend directly.
+        DFlash uses torch-based non-causal attention, not the standard
+        attention backend. This method is a no-op but kept for interface
+        consistency with other speculative workers.
         """
-        # Use the model runner's native attention backend for DFlash
-        # This is the backend initialized when ModelRunner is created
-        # RadixAttention will use this backend with ENCODER_ONLY attention type
-        self.draft_attn_backend = self.draft_model_runner.attn_backend
-        
-        # Store for backward compatibility
-        self.draft_extend_attn_backend = self.draft_attn_backend
-        self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
-
-        if self.draft_attn_backend is not None:
-            logger.info(f"DFlash using native attention backend: {type(self.draft_attn_backend).__name__}")
-        else:
-            logger.warning("DFlash attention backend is None, will use torch fallback")
+        # DFlash uses direct torch attention in _batched_draft_forward()
+        # No attention backend initialization needed
+        pass
 
     def init_cuda_graphs(self):
-        """Capture CUDA graphs for draft model."""
+        """Initialize CUDA graphs for draft model.
+        
+        DFlash draft model uses eager execution due to variable-length
+        attention patterns. CUDA graphs are not captured for the draft model.
+        """
         self.cuda_graph_runner = None
-
-        if self.server_args.disable_cuda_graph:
-            logger.info("DFlash CUDA graphs disabled by server args")
-            return
-
-        # TODO: Implement CUDA graph capture using standard CudaGraphRunner
-        # For now, skip CUDA graph capture - will use eager mode
-        logger.info("DFlash CUDA graphs: using standard model runner CUDA graphs")
+        logger.info("DFlash draft model: using eager mode")
 
     def clear_cache_pool(self):
         """Clear all per-request state."""
@@ -184,8 +167,8 @@ class DFlashWorker(TpModelWorker):
 
         # Check if hidden buffer is already enabled (to avoid duplicate allocation)
         if token_to_kv_pool is not None and hasattr(token_to_kv_pool, 'enable_dflash_hidden_buffer'):
-            # Check if already enabled by checking for _dflash_hidden_buffer attribute
-            if not hasattr(token_to_kv_pool, '_dflash_hidden_buffer') or token_to_kv_pool._dflash_hidden_buffer is None:
+            # Check if already enabled by checking for hidden_buffer attribute
+            if not hasattr(token_to_kv_pool, 'hidden_buffer') or token_to_kv_pool.hidden_buffer is None:
                 token_to_kv_pool.enable_dflash_hidden_buffer(
                     hidden_size=hidden_size,
                     num_target_layers=num_selected_layers,
@@ -249,11 +232,11 @@ class DFlashWorker(TpModelWorker):
                 if new_hidden.dim() == 2:
                     new_hidden = new_hidden.unsqueeze(0)
 
-                # Try to get cached hidden states
+                # Try to get cached hidden states from radix cache
                 if cached_count > 0 and self.unified_hidden_cache_enabled:
                     token_to_kv_pool = self.target_worker.model_runner.token_to_kv_pool
-                    if hasattr(req, 'prefix_indices') and req.prefix_indices is not None:
-                        prefix_locs = req.prefix_indices[:cached_count]
+                    if hasattr(req, 'hidden_indices') and req.hidden_indices is not None:
+                        prefix_locs = req.hidden_indices[:cached_count]
                         cached_hidden = token_to_kv_pool.get_all_hidden_states(prefix_locs)
                         if cached_hidden is not None:
                             cached_hidden = cached_hidden.unsqueeze(0)
@@ -272,6 +255,12 @@ class DFlashWorker(TpModelWorker):
                         hidden_to_store = new_hidden.squeeze(0)[-new_token_count:]
                         if hidden_to_store.shape[0] == req_cache_loc.shape[0]:
                             token_to_kv_pool.set_all_hidden_states(req_cache_loc, hidden_to_store)
+                            # Update req.hidden_indices for radix cache insertion
+                            # This ensures cache_finished_req() will store hidden indices in the tree
+                            if not hasattr(req, 'hidden_indices') or req.hidden_indices is None:
+                                req.hidden_indices = req_cache_loc.clone()
+                            else:
+                                req.hidden_indices = torch.cat([req.hidden_indices, req_cache_loc])
 
                 state['verified_id'] = next_token_ids[i].clone()
                 token_offset += new_token_count
@@ -328,6 +317,11 @@ class DFlashWorker(TpModelWorker):
         accept_length_list = verify_input.accept_length.cpu().tolist()
         new_hidden_states = logits_output.hidden_states
 
+        # CRITICAL FIX: After _filter_logits(), hidden_states are FILTERED to only accepted tokens.
+        # The shape is [total_accepted, hidden], NOT [bs * block_size, hidden].
+        # We need to track cumulative offset based on actual accepted tokens per request.
+        hidden_offset = 0
+
         for i, req in enumerate(batch.reqs):
             state = self._get_request_state(req.rid)
             acc_len = accept_length_list[i]
@@ -341,11 +335,14 @@ class DFlashWorker(TpModelWorker):
             # Update hidden states
             if new_hidden_states is not None:
                 num_tokens = acc_len + 1
-                start_idx = i * block_size
+                # Use cumulative offset, not i * block_size (hidden states are filtered!)
+                start_idx = hidden_offset
                 if new_hidden_states.dim() == 2:
                     req_hidden = new_hidden_states[start_idx:start_idx + num_tokens, :]
                 else:
                     req_hidden = new_hidden_states[:, start_idx:start_idx + num_tokens, :]
+                # Update offset for next request
+                hidden_offset += num_tokens
                 if req_hidden.dim() == 2:
                     req_hidden = req_hidden.unsqueeze(0)
 
@@ -384,10 +381,10 @@ class DFlashWorker(TpModelWorker):
         batch: ScheduleBatch,
         all_verified_id: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Draft forward pass using the draft model runner.
+        """Draft forward pass using the draft model.
         
-        Uses ForwardBatch.init_new() and model_runner.forward() for proper
-        RadixAttention integration.
+        Collects target hidden states and verified IDs per request,
+        then runs batched draft forward through model layers.
         """
         bs = len(batch.reqs)
         block_size = self.block_size
@@ -431,9 +428,10 @@ class DFlashWorker(TpModelWorker):
         verified_ids: List[torch.Tensor],
         ctx_lens: List[int],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Batched draft forward using ForwardBatch and RadixAttention.
+        """Batched draft forward using torch-based attention.
         
-        Creates proper ForwardBatch with attention backend for RadixAttention integration.
+        Processes each request through the draft model layers with
+        non-causal attention (Q from noise, K/V from full sequence).
         """
         bs = len(target_hiddens)
         block_size = self.block_size

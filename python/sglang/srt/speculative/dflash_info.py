@@ -17,14 +17,13 @@ Following the NGRAM pattern for fixed-length draft token verification.
 Uses fused verify_tree_greedy kernel for efficient verification.
 """
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, ClassVar, Optional, Tuple
+from dataclasses import dataclass
+from typing import ClassVar, Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
-from sglang.srt.mem_cache.base_prefix_cache import BaseTokenToKVPoolAllocator
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import alloc_token_slots
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -38,8 +37,6 @@ try:
 except ImportError:
     FUSED_KERNEL_AVAILABLE = False
 
-if TYPE_CHECKING:
-    from sglang.srt.managers.overlap_utils import FutureIndices
 
 
 @dataclass
@@ -63,15 +60,6 @@ class DFlashDraftInput(SpecInput):
     
     # Capture mode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
-    
-    # Future indices for overlap scheduling (V2)
-    future_indices: Optional["FutureIndices"] = None
-    
-    # New sequence lengths after this batch (for V2 overlap)
-    new_seq_lens: Optional[torch.Tensor] = None
-    
-    # CUDA event to synchronize verification completion (for V2 overlap)
-    verify_done: Optional[torch.cuda.Event] = None
     
     # Class-level constant for allocation (set by worker) - ClassVar so not a dataclass field
     ALLOC_LEN_PER_DECODE: ClassVar[int] = 16
@@ -126,163 +114,6 @@ class DFlashDraftInput(SpecInput):
                 [self.hidden_states[:, -1:, :], spec_info.hidden_states[:, -1:, :]], dim=0
             )
     
-    def prepare_for_decode(self, batch: "ScheduleBatch"):
-        """
-        Prepare for decode phase (V2 overlap).
-        
-        Allocates token slots and updates batch state for the decode phase.
-        DFlash uses simpler allocation than EAGLE since it doesn't use top-k tree.
-        """
-        from sglang.srt.mem_cache.common import alloc_token_slots
-        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-        
-        bs = batch.batch_size()
-        
-        # Wait for verification to complete
-        batch.maybe_wait_verify_done()
-        
-        # Allocate token slots for next decode iteration
-        # DFlash uses block_size tokens per request per iteration
-        num_needed_tokens = bs * self.block_size
-        
-        page_size = batch.token_to_kv_pool_allocator.page_size
-        cur_kv_lens_cpu = []
-        nxt_kv_lens_cpu = []
-        
-        for r in batch.reqs:
-            # Allocate block_size tokens for draft speculation
-            alloc_len = self.block_size * 2  # Extra headroom
-            cur_kv_lens_cpu.append(r.kv_allocated_len)
-            nxt_kv_lens_cpu.append(r.kv_allocated_len + alloc_len)
-            r.kv_allocated_len += alloc_len
-        
-        cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
-        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")
-        
-        if page_size == 1:
-            out_cache_loc = alloc_token_slots(batch.tree_cache, sum(nxt_kv_lens_cpu - cur_kv_lens_cpu).item())
-        else:
-            from sglang.srt.mem_cache.common import alloc_paged_token_slots_extend, get_last_loc
-            cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device)
-            nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device)
-            last_loc = get_last_loc(
-                batch.req_to_token_pool.req_to_token,
-                batch.req_pool_indices,
-                cur_kv_lens,
-            )
-            out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
-                last_loc,
-                (nxt_kv_lens_cpu - cur_kv_lens_cpu).sum().item(),
-            )
-        
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            cur_kv_lens_cpu.to(device=batch.device),
-            nxt_kv_lens_cpu.to(device=batch.device),
-            out_cache_loc,
-            bs,
-        )
-        
-        # Sync seq_lens to CPU (may not be set in V2 mode)
-        if batch.seq_lens is not None:
-            batch.seq_lens_cpu = batch.seq_lens.cpu()
-            batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
-        else:
-            # Compute from request lengths
-            seq_lens = torch.tensor([len(r.origin_input_ids) + len(r.output_ids) for r in batch.reqs], dtype=torch.int32, device="cpu")
-            batch.seq_lens_cpu = seq_lens
-            batch.seq_lens_sum = seq_lens.sum().item()
-            batch.seq_lens = seq_lens.to(device=batch.device)
-    
-    def prepare_for_v2_draft(
-        self,
-        req_to_token_pool,
-        model_worker_batch: "ModelWorkerBatch",
-        cuda_graph_runner,
-        draft_runner,
-        block_size: int,
-    ) -> Tuple["ForwardBatch", bool]:
-        """
-        Prepare ForwardBatch for V2 draft forward.
-        
-        This method:
-        1. Allocates cache locations for draft tokens
-        2. Builds the concatenated input (target_hidden + noise_embedding)
-        3. Creates ForwardBatch with proper metadata
-        
-        Args:
-            req_to_token_pool: Request to token pool mapping
-            model_worker_batch: Batch from scheduler
-            cuda_graph_runner: CUDA graph runner (if available)
-            draft_runner: Draft model runner
-            block_size: Number of draft tokens to generate
-            
-        Returns:
-            Tuple of (ForwardBatch, can_use_cuda_graph)
-        """
-        from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-        from sglang.srt.mem_cache.common import alloc_token_slots
-        
-        bs = model_worker_batch.batch_size
-        device = self.verified_id.device if self.verified_id is not None else "cuda"
-        
-        # Handle idle mode
-        if model_worker_batch.forward_mode.is_idle():
-            return ForwardBatch.create_empty_for_idle(draft_runner), False
-        
-        # Allocate cache locations for draft tokens
-        num_tokens = bs * block_size
-        out_cache_loc = alloc_token_slots(
-            model_worker_batch.tree_cache,
-            num_tokens,
-        )
-        
-        # Build positions for the concatenated input
-        # Each request: [0, 1, ..., ctx_len + block_size - 1]
-        positions_list = []
-        seq_lens_list = []
-        for i in range(bs):
-            ctx_len = model_worker_batch.seq_lens[i].item()
-            total_len = ctx_len + block_size
-            pos = torch.arange(total_len, device=device, dtype=torch.int64)
-            positions_list.append(pos)
-            seq_lens_list.append(total_len)
-        
-        positions = torch.cat(positions_list)
-        seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=device)
-        
-        # Create ForwardBatch
-        forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.DECODE,
-            batch_size=bs,
-            input_ids=None,  # Will be set by model from input_embeds
-            req_pool_indices=model_worker_batch.req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens.cpu(),
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool=draft_runner.token_to_kv_pool,
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=sum(seq_lens_list),
-            return_logprob=False,
-            positions=positions,
-            spec_algorithm=draft_runner.spec_algorithm,
-            spec_info=self,
-            capture_hidden_mode=self.capture_hidden_mode,
-        )
-        
-        # Check if can use CUDA graph
-        can_cuda_graph = (
-            cuda_graph_runner is not None
-            and cuda_graph_runner.can_run(forward_batch)
-        )
-        
-        return forward_batch, can_cuda_graph
 
 
 @dataclass
@@ -356,45 +187,6 @@ class DFlashVerifyInput(SpecInput):
             end_offset,
             batch.out_cache_loc,
             batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
-
-    def prepare_for_verify_v2(
-        self,
-        batch: ModelWorkerBatch,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        req_to_token_pool,
-    ):
-        """
-        Allocate KV cache slots for draft tokens (V2 version).
-        
-        Works with ModelWorkerBatch instead of ScheduleBatch.
-        """
-        if batch.forward_mode.is_idle():
-            return
-
-        batch.input_ids = self.draft_token
-
-        # Allocate KV cache slots directly using the allocator
-        num_tokens = len(batch.input_ids)
-        out_cache_loc = token_to_kv_pool_allocator.alloc(num_tokens)
-        if out_cache_loc is None:
-            raise RuntimeError(
-                f"Out of memory in V2 verify. Failed to allocate {num_tokens} tokens."
-            )
-        batch.out_cache_loc = out_cache_loc
-        
-        end_offset = batch.seq_lens + self.draft_token_num
-
-        # Assign cache locations to request token pool
-        bs = len(batch.seq_lens)
-        assign_req_to_token_pool[(bs,)](
-            batch.req_pool_indices,
-            req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            end_offset,
-            batch.out_cache_loc,
-            req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
 

@@ -2235,17 +2235,8 @@ class ServerArgs:
             # DFlash doesn't use iterative steps like EAGLE
             self.speculative_num_steps = 1
 
-            # Enable V2 overlap for DFlash when requested
-            if envs.SGLANG_ENABLE_SPEC_V2.get():
-                self.disable_overlap_schedule = False
-                logger.info(
-                    "DFlash V2 (with overlap scheduling) is enabled."
-                )
-            else:
-                self.disable_overlap_schedule = True
-                logger.info(
-                    "DFlash V1 mode. Set SGLANG_ENABLE_SPEC_V2=True for V2 with overlap."
-                )
+            # DFlash V1 only - overlap scheduling not yet supported
+            self.disable_overlap_schedule = True
             self.enable_mixed_chunk = False
 
             logger.info(

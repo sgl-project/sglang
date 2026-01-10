@@ -51,7 +51,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.DFLASH
 
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone() or self.is_dflash()
+        return self.is_eagle() or self.is_standalone()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -107,9 +107,9 @@ class SpeculativeAlgorithm(Enum):
             return NGRAMWorker
         elif self.is_dflash():
             if enable_overlap:
-                from sglang.srt.speculative.dflash_worker_v2 import DFlashSpecWorkerV2
-
-                return DFlashSpecWorkerV2
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap scheduling yet."
+                )
 
             from sglang.srt.speculative.dflash_worker import DFlashWorker
 

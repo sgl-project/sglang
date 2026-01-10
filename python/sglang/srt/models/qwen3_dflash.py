@@ -12,19 +12,17 @@
 # limitations under the License.
 # ==============================================================================
 """
-Qwen3-specific DFlash draft model implementation using RadixAttention.
+Qwen3-specific DFlash draft model implementation.
 
-This module implements DFlash for Qwen3 target models using SGLang's native
-RadixAttention with ENCODER_ONLY for non-causal attention. This enables:
-- Native paged KV cache management
-- CUDA graph support out of the box
-- Tensor parallelism support
-- Prefix caching integration
-
-DFlash uses:
-- Concatenated input attention (target_hidden + noise_embedding)
+This module implements DFlash for Qwen3 target models with:
+- Tensor parallelism support via QKVParallelLinear
 - Non-causal attention for parallel block drafting
 - Multi-layer feature extraction from target model
+
+DFlash attention pattern:
+- Q is projected from noise positions only
+- K/V are projected from concatenated [target_hidden, noise_embedding]
+- Non-causal (bidirectional) attention
 """
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -32,19 +30,15 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import RMSNorm3D, build_target_layer_ids
-from sglang.srt.models.qwen2 import Qwen2MLP
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import add_prefix
 
@@ -77,13 +71,13 @@ class Qwen3DFlashAttention(nn.Module):
     """
     Qwen3-specific DFlash attention matching the original DFlash pattern.
     
-    Original DFlash attention pattern:
+    DFlash attention pattern:
     - Q is projected from noise_embedding only (after input_layernorm)
     - K/V are projected from concatenated [target_hidden, noise_embedding]
     - target_hidden is NOT passed through input_layernorm (already normalized by hidden_norm)
+    - Non-causal (bidirectional) attention
     
-    This implementation uses QKVParallelLinear but applies the correct attention pattern
-    by computing Q only from noise positions.
+    This implementation uses QKVParallelLinear for tensor parallelism.
     """
 
     def __init__(
@@ -156,37 +150,27 @@ class Qwen3DFlashAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
-        # RadixAttention with ENCODER_ONLY for non-causal attention
-        self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            attn_type=AttentionType.ENCODER_ONLY,
-            prefix=add_prefix("attn", prefix),
-        )
-
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        ctx_len: Optional[int] = None,
+        ctx_len: int,
     ) -> torch.Tensor:
         """
         Forward pass matching original DFlash attention pattern.
-        
+
         Args:
             positions: Position IDs for rotary embeddings [total_tokens]
             hidden_states: Concatenated [target_hidden, noise] [total_tokens, hidden]
-            forward_batch: ForwardBatch with attention metadata
-            ctx_len: Length of target_hidden portion (required for torch fallback)
+            forward_batch: Unused, kept for interface compatibility
+            ctx_len: Length of target_hidden portion
             
         Returns:
             Attention output for NOISE positions only [noise_tokens, hidden]
         """
         total_tokens = hidden_states.shape[0]
+        noise_len = total_tokens - ctx_len
         
         # QKV projection on full input
         qkv, _ = self.qkv_proj(hidden_states)
@@ -204,49 +188,7 @@ class Qwen3DFlashAttention(nn.Module):
         # Apply rotary embeddings to full Q and K
         q_full, k = self.rotary_emb(positions, q_full, k)
         
-        # Check if we have a proper attention backend
-        use_radix = (forward_batch is not None and 
-                     hasattr(forward_batch, 'attn_backend') and 
-                     forward_batch.attn_backend is not None)
-        
-        if use_radix:
-            # Use RadixAttention (ENCODER_ONLY = non-causal)
-            # Note: This computes attention for all positions, but we only use noise portion
-            attn_output = self.attn(q_full, k, v, forward_batch)
-            # Extract noise portion if ctx_len is provided
-            if ctx_len is not None and ctx_len > 0:
-                attn_output = attn_output[ctx_len:]
-        else:
-            # Fallback: DFlash-style attention where Q is only from noise
-            if ctx_len is None:
-                ctx_len = 0
-            attn_output = self._dflash_attention(q_full, k, v, ctx_len)
-        
-        # Output projection
-        output, _ = self.o_proj(attn_output)
-        return output
-    
-    def _dflash_attention(
-        self, 
-        q_full: torch.Tensor, 
-        k: torch.Tensor, 
-        v: torch.Tensor,
-        ctx_len: int,
-    ) -> torch.Tensor:
-        """DFlash-style attention: Q from noise only, K/V from full sequence.
-        
-        Args:
-            q_full: [total_tokens, num_heads * head_dim] - Q for all positions
-            k: [total_tokens, num_kv_heads * head_dim]
-            v: [total_tokens, num_kv_heads * head_dim]
-            ctx_len: Length of target_hidden portion
-        
-        Returns:
-            Attention output for noise positions [noise_tokens, num_heads * head_dim]
-        """
-        total_tokens = q_full.shape[0]
-        noise_len = total_tokens - ctx_len
-        
+        # DFlash attention: Q from noise only, K/V from full sequence
         # Extract Q for noise positions only (original DFlash pattern)
         q = q_full[ctx_len:]  # [noise_len, q_size]
         
@@ -263,8 +205,7 @@ class Qwen3DFlashAttention(nn.Module):
         
         # Compute attention: Q [1, heads, noise_len, head_dim] @ K^T [1, heads, head_dim, total_len]
         # Result: [1, heads, noise_len, total_len]
-        scale = 1.0 / (self.head_dim ** 0.5)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
         attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v.dtype)
         
         # Apply attention: [1, heads, noise_len, total_len] @ V [1, heads, total_len, head_dim]
@@ -273,11 +214,14 @@ class Qwen3DFlashAttention(nn.Module):
         
         # Reshape back to [noise_len, num_heads * head_dim]
         attn_output = attn_output.squeeze(0).transpose(0, 1).contiguous().view(noise_len, -1)
-        return attn_output
+        
+        # Output projection
+        output, _ = self.o_proj(attn_output)
+        return output
 
 
 class Qwen3DFlashDecoderLayer(nn.Module):
-    """Qwen3-specific DFlash decoder layer with RadixAttention.
+    """Qwen3-specific DFlash decoder layer.
     
     Matches original DFlash pattern:
     - input_layernorm is applied ONLY to noise, NOT to target_hidden
@@ -388,7 +332,7 @@ class Qwen3DFlashDecoderLayer(nn.Module):
 
 class Qwen3DFlashModel(nn.Module):
     """
-    Qwen3 DFlash draft model body using RadixAttention.
+    Qwen3 DFlash draft model body.
     
     Takes concatenated [target_hidden, noise_embedding] as input,
     returns output for noise positions only.
@@ -416,7 +360,7 @@ class Qwen3DFlashModel(nn.Module):
         self.target_layer_ids = build_target_layer_ids(
             getattr(config, "num_target_layers", 28),
             config.num_hidden_layers,
-        )
+            )
 
         # Feature compression: multi-layer target features → hidden_size
         num_selected_layers = len(self.target_layer_ids)
@@ -514,8 +458,8 @@ class Qwen3DFlashModel(nn.Module):
 
 class Qwen3ForCausalLMDFlash(nn.Module):
     """
-    Qwen3 DFlash draft model wrapper using RadixAttention.
-    
+    Qwen3 DFlash draft model wrapper.
+
     This is the main entry point class that handles:
     - Model initialization
     - Weight loading (separate q/k/v → fused qkv_proj)
@@ -542,8 +486,6 @@ class Qwen3ForCausalLMDFlash(nn.Module):
             config.vocab_size,
             bias=False,
         )
-        
-        self.logits_processor = LogitsProcessor(config)
         
         # Track if embeddings are shared from target model
         self._embed_tokens_from_target = None
@@ -598,21 +540,23 @@ class Qwen3ForCausalLMDFlash(nn.Module):
         """
         Forward pass for DFlash draft model.
         
+        Note: This method is not used by DFlashWorker, which directly accesses
+        model components for better control over the attention pattern.
+        Kept for interface compatibility and potential testing use.
+
         Args:
             input_ids: Token IDs for noise tokens
             positions: Position IDs for full sequence
             forward_batch: ForwardBatch with attention metadata
             input_embeds: Optional pre-computed embeddings
-            
+
         Returns:
-            Logits for next token prediction
+            Logits for next token prediction [seq_len, vocab_size]
         """
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         
-        # Get logits
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        # Simple linear projection to logits
+        return torch.matmul(hidden_states, self.lm_head.weight.t())
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """
