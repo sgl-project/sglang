@@ -618,8 +618,6 @@ class DenoisingStage(PipelineStage):
             ),
         )
 
-        print(f"621 {pos_cond_kwargs=}", flush=True)
-
         if batch.do_classifier_free_guidance:
             neg_cond_kwargs = self.prepare_extra_func_kwargs(
                 getattr(self.transformer, "forward", self.transformer),
@@ -1008,8 +1006,6 @@ class DenoisingStage(PipelineStage):
                             reserved_frames_mask,
                         )
 
-                        print(f"1011 {timestep=}")
-
                         latent_model_input = self.scheduler.scale_model_input(
                             latent_model_input, t_device
                         )
@@ -1063,7 +1059,6 @@ class DenoisingStage(PipelineStage):
                             self.step_profile()
         batch.kv_caches.clear()
         denoising_end_time = time.time()
-        print(f"1066 {latents=}", flush=True)
         if num_timesteps > 0 and not is_warmup:
             self.log_info(
                 "average time per step: %.4f seconds",
@@ -1078,7 +1073,6 @@ class DenoisingStage(PipelineStage):
             server_args=server_args,
             is_warmup=is_warmup,
         )
-        torch.save(latents, f"/sgl-workspace/sgl/latents_final.pt")
         return batch
 
     # TODO: this will extends the preparation stage, should let subclass/passed-in variables decide which to prepare
@@ -1216,7 +1210,6 @@ class DenoisingStage(PipelineStage):
         guidance: torch.Tensor,
         **kwargs,
     ):
-        print(f"1216 {kwargs=}", flush=True)
         return current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
@@ -1285,10 +1278,6 @@ class DenoisingStage(PipelineStage):
                 noise_pred_cond = server_args.pipeline_config.slice_noise_pred(
                     noise_pred_cond, latents
                 )
-                torch.save(
-                    noise_pred_cond,
-                    f"/sgl-workspace/sgl/noise_pred_cond_{timestep_index}.pt",
-                )
         if not batch.do_classifier_free_guidance:
             # If CFG is disabled, we are done. Return the conditional prediction.
             return noise_pred_cond
@@ -1301,7 +1290,6 @@ class DenoisingStage(PipelineStage):
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
             ):
-                print(f"1298 negative pass")
                 batch.kv_caches.set_mode("skip")
                 noise_pred_uncond = self._predict_noise(
                     current_model=current_model,
@@ -1314,10 +1302,6 @@ class DenoisingStage(PipelineStage):
                 )
                 noise_pred_uncond = server_args.pipeline_config.slice_noise_pred(
                     noise_pred_uncond, latents
-                )
-                torch.save(
-                    noise_pred_uncond,
-                    f"/sgl-workspace/sgl/noise_pred_uncond_{timestep_index}.pt",
                 )
 
         # Combine predictions
@@ -1356,14 +1340,9 @@ class DenoisingStage(PipelineStage):
         else:
             # Serial CFG: both cond and uncond are available locally
             assert noise_pred_cond is not None and noise_pred_uncond is not None
-            print(
-                f"1348 noise_pred_cond: {noise_pred_cond.shape}, noise_pred_uncond: {noise_pred_uncond.shape}"
-            )
-            print(f"1349 current_guidance_scale: {current_guidance_scale}")
             noise_pred = noise_pred_uncond + current_guidance_scale * (
                 noise_pred_cond - noise_pred_uncond
             )
-            print(f"1364 {batch.guidance_rescale=}", flush=True)
             if batch.guidance_rescale > 0.0:
                 noise_pred = self.rescale_noise_cfg(
                     noise_pred,

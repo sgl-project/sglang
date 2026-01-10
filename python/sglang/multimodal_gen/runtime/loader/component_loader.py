@@ -797,9 +797,6 @@ class VisionLanguageEncoderLoader(ComponentLoader):
         server_args: ServerArgs,
         transformers_or_diffusers: str,
     ) -> Any:
-        import traceback
-
-        traceback.print_stack()
         if transformers_or_diffusers == "transformers":
             from transformers import AutoModelForImageTextToText
 

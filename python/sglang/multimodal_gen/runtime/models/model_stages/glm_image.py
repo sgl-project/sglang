@@ -271,8 +271,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             )
         else:
             # Image-to-image: append to existing
-            # print(f"274 {existing_grid.shape=}, {token_h=}, {token_w=}", flush=True)
-            print(f"275 {existing_grid.device=}, {device=}", flush=True)
             return torch.cat(
                 [existing_grid, torch.tensor([[1, token_h, token_w]], device=device)],
                 dim=0,
@@ -334,7 +332,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             Upsampled token IDs of shape [1, N*4] where N*4 = (token_h*2) * (token_w*2)
         """
         # Reshape to spatial format: [1, 1, H, W]
-        print(f"337 {token_ids.shape=}, {token_h=}, {token_w=}", flush=True)
         token_ids = token_ids.view(1, 1, token_h, token_w)
 
         # 2x nearest-neighbor upsampling
@@ -844,7 +841,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                 self.vae = self.vae.to(device=device, dtype=prompt_embeds.dtype)
                 #
 
-                print(f"834 {condition_image.dtype=}, {self.vae.dtype=}", flush=True)
                 condition_latent = retrieve_latents(
                     self.vae.encode(condition_image),
                     generator=generator,
