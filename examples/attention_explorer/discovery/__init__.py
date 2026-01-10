@@ -56,6 +56,18 @@ from .spectral_router import (
     create_router_from_fingerprints,
 )
 
+from .rope_derotation import (
+    RoPEDerotator,
+    RoPEConfig,
+    DerotatedAttention,
+    AttentionMode,
+    GLOSSARY as ATTENTION_GLOSSARY,
+    INTERPRETATION_TEMPLATES,
+    get_glossary,
+    get_term_explanation,
+    explain_attention_step,
+)
+
 __all__ = [
     # Classifier
     'ClassificationResult',
