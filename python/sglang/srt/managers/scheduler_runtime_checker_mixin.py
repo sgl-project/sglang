@@ -355,8 +355,9 @@ def create_scheduler_watchdog(
 
     return WatchdogRaw(
         debug_name="Scheduler",
-        get_counter=lambda: scheduler.forward_ct,
-        is_active=lambda: scheduler.is_initializing or scheduler.cur_batch is not None,
+        get_counter=lambda: getattr(scheduler, "forward_ct", 0),
+        is_active=lambda: scheduler.is_initializing
+        or getattr(scheduler, "cur_batch", None) is not None,
         watchdog_timeout=watchdog_timeout,
         soft=soft,
         dump_info=dump_info,
