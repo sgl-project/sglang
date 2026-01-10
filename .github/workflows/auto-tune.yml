@@ -46,10 +46,14 @@ jobs:
         runner: ${{ fromJSON(inputs.runner == 'all' && '["4-gpu-b200","4-gpu-gb200","4-gpu-h100","8-gpu-b200","8-gpu-h20","8-gpu-h200"]' || format('["{0}"]', inputs.runner)) }}
         batch_group:
           - name: "A"
-            sizes: "1 2 4 8 16 24 32 48"
+            sizes: "1 2 4 8"
           - name: "B"
-            sizes: "64 96 128 256 512 1024 1536 2048"
+            sizes: "16 24 32 48"
           - name: "C"
+            sizes: "64 96 128 256"
+          - name: "D"
+            sizes: "512 1024 1536 2048"
+          - name: "E"
             sizes: "3072 4096"
     runs-on: ${{ matrix.runner }}
     steps:
