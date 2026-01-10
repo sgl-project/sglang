@@ -99,10 +99,11 @@ case "${GPU_ARCH}" in
   mi35x)
     echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
     docker exec ci_sglang rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-    install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]" --no-deps # TODO: only for mi35x
+    # Follow the same dependency installation flow as mi30x/mi300/mi325.
+    install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
     # For lmms_evals evaluating MMMU
     docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-    install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e . --no-deps
+    install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
     ;;
   mi30x|mi300|mi325)
     echo "Runner uses ${GPU_ARCH}; will fetch mi30x image."
@@ -179,7 +180,7 @@ echo "[CI-AITER-CHECK] Dockerfile expects AITER_COMMIT=${REPO_AITER_COMMIT}"
 #############################################
 # 2. Check container pre-installed AITER version
 #############################################
-IMAGE_AITER_VERSION=$(docker exec ci_sglang bash -c "pip show aiter 2>/dev/null | grep '^Version:' | awk '{print \$2}'" || echo "none")
+IMAGE_AITER_VERSION=$(docker exec ci_sglang bash -c "pip show amd-aiter 2>/dev/null | grep '^Version:' | awk '{print \$2}'" || echo "none")
 IMAGE_AITER_VERSION="v${IMAGE_AITER_VERSION}"
 echo "[CI-AITER-CHECK] AITER version inside CI image: ${IMAGE_AITER_VERSION}"
 
