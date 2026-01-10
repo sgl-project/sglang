@@ -259,6 +259,9 @@ class GaugeHistogram:
     
     Unlike Prometheus Histogram which uses cumulative buckets, this uses
     non-cumulative buckets (gt < value <= le) suitable for heatmap display.
+    
+    Note: Keep in sync with Rust implementation in
+    sgl-model-gateway/src/observability/gauge_histogram.rs
     """
 
     def __init__(
@@ -284,8 +287,8 @@ class GaugeHistogram:
             multiprocess_mode=multiprocess_mode,
         )
 
-    def set(self, labels: Dict[str, str], bucket_counts: List[int]):
-        for (gt, le), count in zip(self._bucket_labels, bucket_counts):
+    def set(self, labels: Dict[str, str], values: List[int]):
+        for (gt, le), count in zip(self._bucket_labels, values):
             self._gauge.labels(**labels, gt=gt, le=le).set(count)
 
     @property

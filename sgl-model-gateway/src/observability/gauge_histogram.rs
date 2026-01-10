@@ -1,3 +1,11 @@
+//! Gauge with gt/le bucket labels for Grafana heatmap visualization.
+//!
+//! Unlike Prometheus Histogram which uses cumulative buckets, this uses
+//! non-cumulative buckets (gt < value <= le) suitable for heatmap display.
+//!
+//! Note: Keep in sync with Python implementation in
+//! python/sglang/srt/metrics/collector.py (GaugeHistogram class)
+
 use std::sync::LazyLock;
 
 use metrics::gauge;
@@ -55,8 +63,8 @@ impl GaugeHistogram {
         Self { name, buckets }
     }
 
-    pub fn set(&self, counts: &[usize]) {
-        for ((gt, le), &count) in self.buckets.iter().zip(counts.iter()) {
+    pub fn set(&self, values: &[usize]) {
+        for ((gt, le), &count) in self.buckets.iter().zip(values.iter()) {
             gauge!(self.name, "gt" => gt, "le" => le).set(count as f64);
         }
     }
