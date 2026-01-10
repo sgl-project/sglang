@@ -107,9 +107,9 @@ class SpeculativeAlgorithm(Enum):
             return NGRAMWorker
         elif self.is_dflash():
             if enable_overlap:
-                from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+                from sglang.srt.speculative.dflash_worker_v2 import DFlashSpecWorkerV2
 
-                return DFlashWorkerV2
+                return DFlashSpecWorkerV2
 
             from sglang.srt.speculative.dflash_worker import DFlashWorker
 

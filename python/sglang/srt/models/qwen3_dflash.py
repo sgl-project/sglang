@@ -75,10 +75,15 @@ class Qwen3DFlashMLP(nn.Module):
 
 class Qwen3DFlashAttention(nn.Module):
     """
-    Qwen3-specific DFlash attention using RadixAttention with ENCODER_ONLY.
+    Qwen3-specific DFlash attention matching the original DFlash pattern.
     
-    Uses non-causal attention where input is concatenated [target_hidden, noise_embedding].
-    Output is extracted for noise positions only.
+    Original DFlash attention pattern:
+    - Q is projected from noise_embedding only (after input_layernorm)
+    - K/V are projected from concatenated [target_hidden, noise_embedding]
+    - target_hidden is NOT passed through input_layernorm (already normalized by hidden_norm)
+    
+    This implementation uses QKVParallelLinear but applies the correct attention pattern
+    by computing Q only from noise positions.
     """
 
     def __init__(
@@ -167,44 +172,114 @@ class Qwen3DFlashAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        ctx_len: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        Forward pass with concatenated input.
+        Forward pass matching original DFlash attention pattern.
         
         Args:
             positions: Position IDs for rotary embeddings [total_tokens]
             hidden_states: Concatenated [target_hidden, noise] [total_tokens, hidden]
             forward_batch: ForwardBatch with attention metadata
+            ctx_len: Length of target_hidden portion (required for torch fallback)
             
         Returns:
-            Attention output [total_tokens, hidden]
+            Attention output for NOISE positions only [noise_tokens, hidden]
         """
-        # QKV projection
+        total_tokens = hidden_states.shape[0]
+        
+        # QKV projection on full input
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q_full, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         
         # Apply Q/K normalization
-        q, k = apply_qk_norm(
-            q=q,
+        q_full, k = apply_qk_norm(
+            q=q_full,
             k=k,
             q_norm=self.q_norm,
             k_norm=self.k_norm,
             head_dim=self.head_dim,
         )
         
-        # Apply rotary embeddings
-        q, k = self.rotary_emb(positions, q, k)
+        # Apply rotary embeddings to full Q and K
+        q_full, k = self.rotary_emb(positions, q_full, k)
         
-        # RadixAttention (ENCODER_ONLY = non-causal)
-        attn_output = self.attn(q, k, v, forward_batch)
+        # Check if we have a proper attention backend
+        if forward_batch is not None and hasattr(forward_batch, 'attn_backend') and forward_batch.attn_backend is not None:
+            # Use RadixAttention (ENCODER_ONLY = non-causal)
+            # Note: This computes attention for all positions, but we only use noise portion
+            attn_output = self.attn(q_full, k, v, forward_batch)
+            # Extract noise portion if ctx_len is provided
+            if ctx_len is not None and ctx_len > 0:
+                attn_output = attn_output[ctx_len:]
+        else:
+            # Fallback: DFlash-style attention where Q is only from noise
+            if ctx_len is None:
+                ctx_len = 0
+            attn_output = self._dflash_attention(q_full, k, v, ctx_len)
         
         # Output projection
         output, _ = self.o_proj(attn_output)
         return output
+    
+    def _dflash_attention(
+        self, 
+        q_full: torch.Tensor, 
+        k: torch.Tensor, 
+        v: torch.Tensor,
+        ctx_len: int,
+    ) -> torch.Tensor:
+        """DFlash-style attention: Q from noise only, K/V from full sequence.
+        
+        Args:
+            q_full: [total_tokens, num_heads * head_dim] - Q for all positions
+            k: [total_tokens, num_kv_heads * head_dim]
+            v: [total_tokens, num_kv_heads * head_dim]
+            ctx_len: Length of target_hidden portion
+        
+        Returns:
+            Attention output for noise positions [noise_tokens, num_heads * head_dim]
+        """
+        total_tokens = q_full.shape[0]
+        noise_len = total_tokens - ctx_len
+        
+        # Extract Q for noise positions only (original DFlash pattern)
+        q = q_full[ctx_len:]  # [noise_len, q_size]
+        
+        # Reshape to [1, num_heads, seq_len, head_dim]
+        q = q.view(noise_len, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+        k = k.view(total_tokens, self.num_kv_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+        v = v.view(total_tokens, self.num_kv_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+        
+        # Expand KV for GQA
+        num_kv_groups = self.num_heads // self.num_kv_heads
+        if num_kv_groups > 1:
+            k = k.repeat_interleave(num_kv_groups, dim=1)
+            v = v.repeat_interleave(num_kv_groups, dim=1)
+        
+        # Compute attention: Q [1, heads, noise_len, head_dim] @ K^T [1, heads, head_dim, total_len]
+        # Result: [1, heads, noise_len, total_len]
+        scale = 1.0 / (self.head_dim ** 0.5)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v.dtype)
+        
+        # Apply attention: [1, heads, noise_len, total_len] @ V [1, heads, total_len, head_dim]
+        # Result: [1, heads, noise_len, head_dim]
+        attn_output = torch.matmul(attn_weights, v)
+        
+        # Reshape back to [noise_len, num_heads * head_dim]
+        attn_output = attn_output.squeeze(0).transpose(0, 1).contiguous().view(noise_len, -1)
+        return attn_output
 
 
 class Qwen3DFlashDecoderLayer(nn.Module):
-    """Qwen3-specific DFlash decoder layer with RadixAttention."""
+    """Qwen3-specific DFlash decoder layer with RadixAttention.
+    
+    Matches original DFlash pattern:
+    - input_layernorm is applied ONLY to noise, NOT to target_hidden
+    - target_hidden is already normalized by hidden_norm at model level
+    - Residual connection is only for noise portion
+    """
 
     def __init__(
         self,
@@ -250,28 +325,61 @@ class Qwen3DFlashDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        ctx_len: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        Forward pass with pre-norm attention and MLP.
+        Forward pass matching original DFlash pattern.
         
         Args:
             positions: Position IDs [total_tokens]
-            hidden_states: Input [total_tokens, hidden]
+            hidden_states: Concatenated [target_hidden, noise] [total_tokens, hidden]
             forward_batch: ForwardBatch with attention metadata
+            ctx_len: Length of target_hidden portion. Required for correct normalization.
+        
+        Original DFlash pattern:
+        - input_layernorm is applied ONLY to noise
+        - target_hidden is NOT normalized here (already done by hidden_norm)
         """
-        # Pre-norm + attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states, forward_batch)
-        hidden_states = residual + hidden_states
-
-        # Pre-norm + MLP
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return hidden_states
+        if ctx_len is None or ctx_len == 0:
+            # Fallback to standard pre-norm if ctx_len not provided
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            attn_output = self.self_attn(positions, hidden_states, forward_batch, ctx_len=0)
+            hidden_states = residual + attn_output
+            
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+            return hidden_states
+        
+        # Split into target_hidden and noise
+        target_hidden = hidden_states[:ctx_len]  # Already normalized by hidden_norm
+        noise = hidden_states[ctx_len:]  # Needs input_layernorm
+        
+        # Residual is for noise only
+        noise_residual = noise
+        
+        # Apply input_layernorm to NOISE ONLY (matching original DFlash)
+        noise_normed = self.input_layernorm(noise)
+        
+        # Concatenate: target_hidden (already normed) + noise (just normed)
+        combined = torch.cat([target_hidden, noise_normed], dim=0)
+        
+        # Attention - output is for NOISE positions only
+        attn_output = self.self_attn(positions, combined, forward_batch, ctx_len=ctx_len)
+        
+        # Residual connection for noise only
+        noise = noise_residual + attn_output
+        
+        # MLP on noise only
+        noise_residual = noise
+        noise = self.post_attention_layernorm(noise)
+        noise = self.mlp(noise)
+        noise = noise_residual + noise
+        
+        # Return concatenated (target_hidden unchanged, noise updated)
+        return torch.cat([target_hidden, noise], dim=0)
 
 
 class Qwen3DFlashModel(nn.Module):
@@ -340,55 +448,64 @@ class Qwen3DFlashModel(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Forward pass with concatenated input.
-        
-        The input is prepared by the worker:
-        - hidden_states = cat([projected_target_hidden, noise_embedding], dim=0)
-        - positions = [0, 1, ..., ctx_len + q_len - 1]
+        Forward pass matching original DFlash pattern.
         
         Args:
-            input_ids: Token IDs (used only if input_embeds is None)
-            positions: Position IDs for full sequence
+            input_ids: Token IDs for noise (used only if input_embeds is None)
+            positions: Position IDs for full sequence [ctx_len + noise_len]
             forward_batch: ForwardBatch with spec_info containing target hidden states
             input_embeds: Pre-computed embeddings (concatenated target_hidden + noise)
             
         Returns:
             Hidden states for noise positions only [noise_tokens, hidden]
         """
+        ctx_len = 0
+        
         if input_embeds is not None:
             # Input already prepared by worker (concatenated target_hidden + noise_embeds)
             hidden_states = input_embeds
+            # Get ctx_len from spec_info
+            if hasattr(forward_batch, 'spec_info') and forward_batch.spec_info is not None:
+                if hasattr(forward_batch.spec_info, 'ctx_lens') and forward_batch.spec_info.ctx_lens is not None:
+                    # For batched case, use the first (or max) ctx_len
+                    ctx_lens = forward_batch.spec_info.ctx_lens
+                    ctx_len = ctx_lens[0].item() if ctx_lens.dim() > 0 else ctx_lens.item()
         else:
             # Get target hidden from spec_info
             target_hidden = forward_batch.spec_info.hidden_states
             
-            # Project and normalize target hidden
+            # Handle batched target_hidden [bs, seq_len, hidden] -> [seq_len, hidden]
+            if target_hidden.dim() == 3:
+                target_hidden = target_hidden.squeeze(0)
+            
+            ctx_len = target_hidden.shape[0]
+            
+            # Project and normalize target hidden (THIS is the hidden_norm application)
             if target_hidden.shape[-1] != self.hidden_size:
                 target_hidden = self.fc(target_hidden)
             target_hidden = self.hidden_norm(target_hidden)
             
             # Get noise embeddings
             noise_embeds = self.embed_tokens(input_ids)
+            if noise_embeds.dim() == 3:
+                noise_embeds = noise_embeds.squeeze(0)
             
             # Concatenate: [target_hidden, noise]
             hidden_states = torch.cat([target_hidden, noise_embeds], dim=0)
-        
-        # Track context length for output extraction
-        # This comes from spec_info or is computed from shapes
-        if hasattr(forward_batch, 'spec_info') and hasattr(forward_batch.spec_info, 'ctx_lens'):
-            ctx_lens = forward_batch.spec_info.ctx_lens
-        else:
-            # Fallback: assume uniform distribution
-            ctx_lens = None
 
-        # Process through layers
+        # Process through layers, passing ctx_len for correct normalization
         for layer in self.layers:
-            hidden_states = layer(positions, hidden_states, forward_batch)
+            hidden_states = layer(positions, hidden_states, forward_batch, ctx_len=ctx_len)
 
-        # Final norm
-        hidden_states = self.norm(hidden_states)
+        # Extract noise portion and apply final norm
+        if ctx_len > 0:
+            noise_hidden = hidden_states[ctx_len:]
+        else:
+            noise_hidden = hidden_states
+        
+        noise_hidden = self.norm(noise_hidden)
 
-        return hidden_states
+        return noise_hidden
 
 
 class Qwen3ForCausalLMDFlash(nn.Module):
@@ -399,6 +516,8 @@ class Qwen3ForCausalLMDFlash(nn.Module):
     - Model initialization
     - Weight loading (separate q/k/v → fused qkv_proj)
     - Logits processing
+    
+    Compatible with TpModelWorker loading via SGLang model registry.
     """
 
     def __init__(
@@ -421,6 +540,39 @@ class Qwen3ForCausalLMDFlash(nn.Module):
         )
         
         self.logits_processor = LogitsProcessor(config)
+        
+        # Track if embeddings are shared from target model
+        self._embed_tokens_from_target = None
+        self._lm_head_from_target = None
+
+    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get embedding and lm_head for sharing with target model.
+        
+        Returns:
+            Tuple of (embed_weight, lm_head_weight)
+        """
+        embed = self.model.embed_tokens.weight
+        head = self.lm_head.weight
+        return embed, head
+    
+    def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor):
+        """Set embedding and lm_head from target model.
+        
+        Args:
+            embed: Embedding weight from target model
+            head: LM head weight from target model
+        """
+        self._embed_tokens_from_target = embed
+        self._lm_head_from_target = head
+        # Replace the embedding weight
+        self.model.embed_tokens.weight = nn.Parameter(embed, requires_grad=False)
+        # Replace lm_head weight
+        self.lm_head.weight = nn.Parameter(head, requires_grad=False)
+    
+    def set_embed(self, embed: torch.Tensor):
+        """Set only embedding from target model."""
+        self._embed_tokens_from_target = embed
+        self.model.embed_tokens.weight = nn.Parameter(embed, requires_grad=False)
 
     @property
     def target_layer_ids(self) -> List[int]:
@@ -544,8 +696,14 @@ class Qwen3ForCausalLMDFlash(nn.Module):
                     skipped_weights.append({"param": param_name, "reason": "incomplete stacked weights"})
 
 
-# Backward compatibility alias
-DFlashDraftModel = Qwen3ForCausalLMDFlash
+# Create a properly named class for HuggingFace architecture matching
+# The HuggingFace config has "architectures": ["DFlashDraftModel"]
+# This class MUST have __name__ == "DFlashDraftModel" for registry to find it
+class DFlashDraftModel(Qwen3ForCausalLMDFlash):
+    """DFlash draft model - same as Qwen3ForCausalLMDFlash but with matching name."""
+    pass
+
 
 # Register with SGLang's model registry
-EntryClass = [Qwen3ForCausalLMDFlash]
+# Include both names so either architecture name works
+EntryClass = [Qwen3ForCausalLMDFlash, DFlashDraftModel]

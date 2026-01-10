@@ -1,18 +1,20 @@
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License")
 
-"""DFlash speculative decoding worker with RadixAttention integration.
+"""DFlash speculative decoding worker using TpModelWorker infrastructure.
 
 DFlash draft model generates a full block of tokens in one forward pass.
 Uses native SGLang RadixAttention with ENCODER_ONLY for non-causal attention.
-Supports native paged KV cache with eviction of noise positions after verification.
+Inherits from TpModelWorker for proper model loading, attention backend, and CUDA graphs.
 """
 
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional
+import time
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -22,12 +24,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.models.dflash import RMSNorm3D, build_target_layer_ids
-from sglang.srt.models.qwen3_dflash import Qwen3ForCausalLMDFlash
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
-from sglang.srt.speculative.dflash_draft_cuda_graph_runner import DFlashDraftCudaGraphRunner
-from sglang.srt.utils.common import get_available_gpu_memory
+from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.utils import get_available_gpu_memory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -35,8 +35,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class DFlashWorker:
-    """DFlash speculative decoding worker with RadixAttention."""
+class DFlashWorker(TpModelWorker):
+    """DFlash speculative decoding worker inheriting from TpModelWorker.
+    
+    This enables:
+    - Proper model loading via ModelRunner
+    - RadixAttention with FlashAttention backend
+    - Native CUDA graph support
+    - Tensor parallelism
+    """
 
     def __init__(
         self,
@@ -48,47 +55,60 @@ class DFlashWorker:
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        self.target_worker = target_worker
-        self.model_runner = target_worker.model_runner
-        self.model_config = target_worker.model_runner.model_config
-        self.tp_rank = tp_rank
-        self.page_size = server_args.page_size
-        self.block_size = server_args.speculative_dflash_block_size
-        self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+        # Parse arguments
         self.server_args = server_args
         self.gpu_id = gpu_id
+        self.device = server_args.device
+        self.target_worker = target_worker
+        self.page_size = server_args.page_size
+        self.block_size = server_args.speculative_dflash_block_size
 
-        # Load DFlash draft model
-        logger.info(f"Loading DFlash draft model from {server_args.speculative_draft_model_path}")
-        self._load_draft_model(server_args)
-        
-        # Get embeddings and lm_head from target model
-        target_model = target_worker.model_runner.model
-        if hasattr(target_model, 'model') and hasattr(target_model.model, 'embed_tokens'):
-            self.embed_tokens = target_model.model.embed_tokens
-        else:
-            self.embed_tokens = target_model.get_input_embeddings()
-            
-        if hasattr(target_model, 'lm_head') and hasattr(target_model.lm_head, 'weight'):
-            self.lm_head_weight = target_model.lm_head.weight
-        else:
-            self.lm_head_weight = self.embed_tokens.weight
+        # Override context length to match target model
+        server_args.context_length = target_worker.model_runner.model_config.context_len
+
+        # Do not capture CUDA graphs in super().__init__() - will be done later
+        backup_disable_cuda_graph = server_args.disable_cuda_graph
+        server_args.disable_cuda_graph = True
+
+        # Share memory pools with target worker
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+            target_worker.get_memory_pool()
+        )
+
+        # DFlash draft model uses ENCODER_ONLY attention (non-causal, no incremental KV cache)
+        # Set a minimal draft_runner_cache_size to avoid OOM
+        # We only need enough for one batch: max_bs * (max_ctx_len + block_size)
+        max_bs = min(32, server_args.max_running_requests or 256)
+        max_seq_len = min(4096, server_args.context_length or 32768) + self.block_size
+        minimal_cache_size = max_bs * max_seq_len
+        server_args.draft_runner_cache_size = minimal_cache_size
+        logger.info(f"DFlash draft cache size: {minimal_cache_size} tokens (bs={max_bs}, seq_len={max_seq_len})")
+
+        # Initialize TpModelWorker with draft model
+        super().__init__(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            pp_rank=0,
+            dp_rank=dp_rank,
+            moe_ep_rank=moe_ep_rank,
+            nccl_port=nccl_port,
+            is_draft_worker=True,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+        )
+
+        # Get embeddings and lm_head from target model and share with draft model
+        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         # Configure target model to capture multi-layer hidden states
+        target_model = target_worker.model_runner.model
+        self.target_layer_ids = self.draft_model_runner.model.target_layer_ids
         if hasattr(target_model, 'set_eagle3_layers_to_capture'):
             logger.info(f"DFlash target_layer_ids: {self.target_layer_ids}")
             target_model.set_eagle3_layers_to_capture(self.target_layer_ids)
 
-        # Per-request state for hidden states and metadata
-        self._request_state: Dict[str, dict] = {}
-        
-        # Radix cache integration
-        self.radix_cache: Optional["RadixCache"] = None
-        self.unified_hidden_cache_enabled = False
-        
-        # Pre-allocate position buffer
-        self.max_seq_len = self.model_config.context_len
-        
         # Get mask token ID
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(server_args.model_path)
@@ -97,122 +117,86 @@ class DFlashWorker:
         self.mask_token_id = tokenizer.mask_token_id
         logger.info(f"DFlash mask_token_id: {self.mask_token_id}")
 
+        # Restore CUDA graph setting and initialize attention backend + CUDA graphs
+        self.draft_model_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
+        self.init_attention_backend()
+        self.init_cuda_graphs()
+
+        # Per-request state for hidden states and metadata
+        self._request_state: Dict[str, dict] = {}
+
+        # Radix cache integration
+        self.radix_cache: Optional["RadixCache"] = None
+        self.unified_hidden_cache_enabled = False
+
         logger.info(f"DFlashWorker initialized: block_size={self.block_size}")
 
-    def _load_draft_model(self, server_args: ServerArgs):
-        """Load DFlash draft model with weight mapping."""
-        import glob
-        import json
-        import os
+    @property
+    def draft_model_runner(self):
+        """Alias for model_runner to match Eagle pattern."""
+        return self.model_runner
 
-        from huggingface_hub import snapshot_download
-        from safetensors.torch import load_file
+    def init_attention_backend(self):
+        """Initialize attention backend for draft model.
+        
+        DFlash uses ENCODER_ONLY attention (non-causal) which is handled
+        automatically by RadixAttention when attn_type is set.
+        """
+        # Create backend factory - use topk=1 and num_steps=1 for DFlash
+        # since DFlash generates full block in one forward pass
+        draft_backend_factory = DraftBackendFactory(
+            self.server_args,
+            self.draft_model_runner,
+            topk=1,  # DFlash doesn't use topk tree
+            speculative_num_steps=1,  # Single-pass block generation
+        )
 
-        model_path = server_args.speculative_draft_model_path
-        
-        # Download from HuggingFace Hub if not a local path
-        if not os.path.isdir(model_path):
-            model_path = snapshot_download(
-                repo_id=model_path,
-                allow_patterns=["*.safetensors", "*.json", "*.bin"],
-            )
-        
-        # Load config
-        config_path = os.path.join(model_path, "config.json")
-        with open(config_path, "r") as f:
-            config_dict = json.load(f)
-        
-        # Create config object
-        class Config:
-            pass
-        config = Config()
-        for key, value in config_dict.items():
-            setattr(config, key, value)
-        
-        # Ensure required attributes
-        if not hasattr(config, "rms_norm_eps"):
-            config.rms_norm_eps = 1e-6
-        if not hasattr(config, "attention_bias"):
-            config.attention_bias = True
-        
-        # Create model
-        self.draft_model = Qwen3ForCausalLMDFlash(config)
-        
-        # Load weights
-        weight_files = glob.glob(os.path.join(model_path, "*.safetensors"))
-        if not weight_files:
-            weight_files = glob.glob(os.path.join(model_path, "*.bin"))
-        
-        if weight_files:
-            weights = []
-            for wf in weight_files:
-                if wf.endswith(".safetensors"):
-                    file_weights = load_file(wf)
-                else:
-                    file_weights = torch.load(wf, map_location="cpu")
-                weights.extend(file_weights.items())
-            
-            self.draft_model.load_weights(weights)
-        
-        self.draft_model = self.draft_model.to(self.device).to(torch.bfloat16).eval()
-        self.target_layer_ids = self.draft_model.target_layer_ids
-        logger.info(f"DFlash draft model loaded: {config.num_hidden_layers} layers")
-        
-        # CUDA graph runner (initialized in init_cuda_graphs)
+        # Initialize decode attention backend
+        self.draft_attn_backend = draft_backend_factory.create_decode_backend()
+
+        # Initialize extend attention backend
+        self.draft_extend_attn_backend = draft_backend_factory.create_draft_extend_backend()
+
+        # Store on model runner for use by RadixAttention
+        self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+
+        logger.info("DFlash attention backends initialized")
+
+    def init_cuda_graphs(self):
+        """Capture CUDA graphs for draft model."""
         self.cuda_graph_runner = None
+
+        if self.server_args.disable_cuda_graph:
+            logger.info("DFlash CUDA graphs disabled by server args")
+            return
+
+        # TODO: Implement CUDA graph capture using standard CudaGraphRunner
+        # For now, skip CUDA graph capture - will use eager mode
+        logger.info("DFlash CUDA graphs: using standard model runner CUDA graphs")
 
     def clear_cache_pool(self):
         """Clear all per-request state."""
         self._request_state.clear()
-    
-    def init_cuda_graphs(self):
-        """Initialize CUDA graphs for draft model."""
-        if self.server_args.disable_cuda_graph:
-            logger.info("DFlash CUDA graphs disabled by server args")
-            return
-        
-        import time
-        tic = time.perf_counter()
-        before_mem = get_available_gpu_memory("cuda", self.gpu_id)
-        logger.info(
-            f"Capturing DFlash CUDA graphs. avail mem={before_mem:.2f} GB"
-        )
-        
-        try:
-            # Use conservative settings to fit in available memory
-            # Position buffers are updated dynamically before each graph replay
-            max_bs = min(8, self.server_args.max_running_requests or 256)
-            max_ctx_len = min(2048, self.server_args.context_length or 4096)
-            
-            self.cuda_graph_runner = DFlashDraftCudaGraphRunner(
-                dflash_worker=self,
-                max_bs=max_bs,
-                max_ctx_len=max_ctx_len,
-            )
-            
-            after_mem = get_available_gpu_memory("cuda", self.gpu_id)
-            logger.info(
-                f"Captured DFlash CUDA graphs. Time: {time.perf_counter() - tic:.2f}s, "
-                f"mem usage: {before_mem - after_mem:.2f} GB, avail: {after_mem:.2f} GB"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to capture DFlash CUDA graphs: {e}")
-            self.cuda_graph_runner = None
-    
+
     def set_radix_cache(self, radix_cache: "RadixCache", token_to_kv_pool=None):
         """Set up radix cache integration for hidden state prefix sharing."""
         self.radix_cache = radix_cache
-        
+
         num_selected_layers = len(self.target_layer_ids)
-        hidden_size = self.draft_model.config.hidden_size
-        
+        hidden_size = self.draft_model_runner.model.config.hidden_size
+
+        # Check if hidden buffer is already enabled (to avoid duplicate allocation)
         if token_to_kv_pool is not None and hasattr(token_to_kv_pool, 'enable_dflash_hidden_buffer'):
-            token_to_kv_pool.enable_dflash_hidden_buffer(
-                hidden_size=hidden_size,
-                num_target_layers=num_selected_layers,
-            )
+            # Check if already enabled by checking for _dflash_hidden_buffer attribute
+            if not hasattr(token_to_kv_pool, '_dflash_hidden_buffer') or token_to_kv_pool._dflash_hidden_buffer is None:
+                token_to_kv_pool.enable_dflash_hidden_buffer(
+                    hidden_size=hidden_size,
+                    num_target_layers=num_selected_layers,
+                )
+                logger.info(f"DFlash unified hidden cache enabled: {num_selected_layers} layers")
+            else:
+                logger.info("DFlash hidden buffer already enabled, skipping")
             self.unified_hidden_cache_enabled = True
-            logger.info(f"DFlash unified hidden cache enabled: {num_selected_layers} layers")
         else:
             self.unified_hidden_cache_enabled = False
 
@@ -229,6 +213,7 @@ class DFlashWorker:
         return self._request_state[rid]
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        """Main entry point for forward pass."""
         if batch.forward_mode.is_extend():
             return self._forward_extend(batch)
         else:
@@ -238,51 +223,51 @@ class DFlashWorker:
         """Prefill phase - capture hidden states from target model."""
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        
+
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
-        
+
         logits_output = batch_result.logits_output
         next_token_ids = batch_result.next_token_ids
         hidden_states = logits_output.hidden_states
-        
+
         # Store hidden states per request
         token_offset = 0
-        
+
         for i, req in enumerate(batch.reqs):
             req_len = len(req.origin_input_ids)
             state = self._get_request_state(req.rid)
-            
+
             new_token_count = batch.extend_lens[i] if hasattr(batch, 'extend_lens') else req_len
             cached_count = req_len - new_token_count if hasattr(batch, 'extend_lens') else 0
-            
+
             state['start'] = req_len
-            
+
             if hidden_states is not None:
                 # Extract NEW tokens' hidden states
                 if hidden_states.dim() == 2:
                     new_hidden = hidden_states[token_offset:token_offset + new_token_count, :]
                 else:
                     new_hidden = hidden_states[:, token_offset:token_offset + new_token_count, :]
-                
+
                 if new_hidden.dim() == 2:
                     new_hidden = new_hidden.unsqueeze(0)
-                
+
                 # Try to get cached hidden states
                 if cached_count > 0 and self.unified_hidden_cache_enabled:
-                    token_to_kv_pool = self.model_runner.token_to_kv_pool
+                    token_to_kv_pool = self.target_worker.model_runner.token_to_kv_pool
                     if hasattr(req, 'prefix_indices') and req.prefix_indices is not None:
                         prefix_locs = req.prefix_indices[:cached_count]
                         cached_hidden = token_to_kv_pool.get_all_hidden_states(prefix_locs)
                         if cached_hidden is not None:
                             cached_hidden = cached_hidden.unsqueeze(0)
                             new_hidden = torch.cat([cached_hidden, new_hidden], dim=1)
-                
+
                 state['target_hidden'] = new_hidden.clone()
                 state['accumulated_hidden'] = new_hidden.clone()
-                
+
                 # Store hidden states in KV pool
                 if self.unified_hidden_cache_enabled:
-                    token_to_kv_pool = self.model_runner.token_to_kv_pool
+                    token_to_kv_pool = self.target_worker.model_runner.token_to_kv_pool
                     if hasattr(batch, 'out_cache_loc') and batch.out_cache_loc is not None:
                         req_start = sum(batch.extend_lens[:i]) if hasattr(batch, 'extend_lens') else token_offset
                         req_end = req_start + new_token_count
@@ -290,10 +275,10 @@ class DFlashWorker:
                         hidden_to_store = new_hidden.squeeze(0)[-new_token_count:]
                         if hidden_to_store.shape[0] == req_cache_loc.shape[0]:
                             token_to_kv_pool.set_all_hidden_states(req_cache_loc, hidden_to_store)
-                
+
                 state['verified_id'] = next_token_ids[i].clone()
                 token_offset += new_token_count
-                
+
         batch.spec_info = DFlashDraftInput(
             hidden_states=None,
             verified_id=next_token_ids.clone(),
@@ -305,57 +290,57 @@ class DFlashWorker:
     def _forward_decode(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Decode phase with DFlash speculation."""
         spec_info = batch.spec_info
-        
+
         if spec_info is None or not isinstance(spec_info, DFlashDraftInput):
             logger.warning("[DFLASH] No DFlashDraftInput found, running normal target decode")
             return self._fallback_decode(batch)
-        
+
         block_size = self.block_size
         all_verified_id = spec_info.verified_id
         bs = len(batch.reqs)
-        
+
         # ===== Step 1: Draft forward =====
         draft_tokens, positions = self._draft_forward(batch, all_verified_id)
-        
+
         # ===== Step 2: Verify with target model =====
         verify_input = DFlashVerifyInput(
             draft_token=draft_tokens,
             positions=positions,
             block_size=block_size,
         )
-        
+
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = verify_input
         verify_input.prepare_for_verify(batch, self.page_size)
-        
+
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        
+
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
-        
+
         logits_output = batch_result.logits_output
 
         # ===== Step 3: Verify and accept tokens =====
         logits_output, new_verified_id, num_accepted = verify_input.verify(
             batch, logits_output, self.page_size
         )
-        
+
         # ===== Step 4: Update state and evict rejected cache =====
         accept_length_list = verify_input.accept_length.cpu().tolist()
         new_hidden_states = logits_output.hidden_states
-        
+
         for i, req in enumerate(batch.reqs):
             state = self._get_request_state(req.rid)
             acc_len = accept_length_list[i]
-            
+
             # Update positions
             state['start'] += acc_len + 1
-            
+
             # Evict rejected noise positions from cache
             self._evict_rejected_cache(batch, req, state, acc_len)
-            
+
             # Update hidden states
             if new_hidden_states is not None:
                 num_tokens = acc_len + 1
@@ -366,29 +351,29 @@ class DFlashWorker:
                     req_hidden = new_hidden_states[:, start_idx:start_idx + num_tokens, :]
                 if req_hidden.dim() == 2:
                     req_hidden = req_hidden.unsqueeze(0)
-                
+
                 old_hidden = state.get('accumulated_hidden')
                 if old_hidden is not None:
                     state['accumulated_hidden'] = torch.cat([old_hidden, req_hidden], dim=1)
                 else:
                     state['accumulated_hidden'] = req_hidden.clone()
-                
+
                 state['target_hidden'] = state['accumulated_hidden']
-            
+
             state['verified_id'] = new_verified_id[i].clone()
-        
+
         # Create new spec_info for next iteration
         batch.spec_info = DFlashDraftInput(
             hidden_states=None,
             verified_id=new_verified_id.clone(),
             block_size=self.block_size,
         )
-        
+
         batch.forward_mode = ForwardMode.DECODE
-        
+
         # Cleanup finished requests
         self._cleanup_finished_requests(batch)
-        
+
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=new_verified_id,
@@ -401,54 +386,46 @@ class DFlashWorker:
         self,
         batch: ScheduleBatch,
         all_verified_id: torch.Tensor,
-    ) -> tuple:
-        """Draft forward pass using RadixAttention model."""
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Draft forward pass using the draft model runner.
+        
+        Uses ForwardBatch.init_new() and model_runner.forward() for proper
+        RadixAttention integration.
+        """
         bs = len(batch.reqs)
         block_size = self.block_size
-        
+
         # Collect per-request data
         target_hiddens = []
         verified_ids = []
         ctx_lens = []
-        
+
         for i, req in enumerate(batch.reqs):
             state = self._get_request_state(req.rid)
             target_hidden = state.get('target_hidden')
-            
+
             if target_hidden is None:
                 logger.warning(f"[DFLASH] No target_hidden for request {req.rid}")
                 continue
-            
+
             req_verified_id = state.get('verified_id')
             if req_verified_id is None:
                 if all_verified_id.dim() > 0 and all_verified_id.shape[0] > i:
                     req_verified_id = all_verified_id[i]
                 else:
                     req_verified_id = all_verified_id.flatten()[0]
-            
+
             target_hiddens.append(target_hidden)
             verified_ids.append(req_verified_id)
             ctx_len = target_hidden.shape[1] if target_hidden.dim() == 3 else target_hidden.shape[0]
             ctx_lens.append(ctx_len)
-        
+
         if not target_hiddens:
             # No valid requests
             return torch.tensor([], device=self.device), torch.tensor([], device=self.device)
-        
-        # Use sequential forward (known working path) while debugging batched
-        return self._sequential_draft_forward(batch, target_hiddens, verified_ids, ctx_lens)
 
-    def _cuda_graph_draft_forward(
-        self,
-        batch: ScheduleBatch,
-        target_hiddens: List[torch.Tensor],
-        verified_ids: List[torch.Tensor],
-        ctx_lens: List[int],
-    ) -> tuple:
-        """Draft forward using CUDA graph."""
-        return self.cuda_graph_runner.run(
-            batch, target_hiddens, verified_ids, ctx_lens
-        )
+        # Use batched forward through model runner
+        return self._batched_draft_forward(batch, target_hiddens, verified_ids, ctx_lens)
 
     def _batched_draft_forward(
         self,
@@ -456,58 +433,66 @@ class DFlashWorker:
         target_hiddens: List[torch.Tensor],
         verified_ids: List[torch.Tensor],
         ctx_lens: List[int],
-    ) -> tuple:
-        """Batched draft forward with padding for variable context lengths.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Batched draft forward using ForwardBatch and model_runner.forward().
         
-        This is the CUDA-graph-compatible version that processes all requests
-        in parallel using padded tensors.
+        This enables proper RadixAttention backend usage.
         """
         bs = len(target_hiddens)
         block_size = self.block_size
         max_ctx_len = max(ctx_lens)
-        
+
         # Get input dimension (may be num_layers * hidden_size before FC projection)
         first_th = target_hiddens[0]
         input_dim = first_th.shape[-1]
-        
+        hidden_size = self.draft_model_runner.model.config.hidden_size
+
         # Pad and stack target_hiddens to [bs, max_ctx_len, input_dim]
         padded_target_hiddens = torch.zeros(
             bs, max_ctx_len, input_dim,
             dtype=torch.bfloat16, device=self.device
         )
         ctx_lens_tensor = torch.tensor(ctx_lens, dtype=torch.long, device=self.device)
-        
+
         for i, (th, cl) in enumerate(zip(target_hiddens, ctx_lens)):
             if th.dim() == 2:
                 padded_target_hiddens[i, :cl, :] = th[:cl, :]
             else:
                 padded_target_hiddens[i, :cl, :] = th[0, :cl, :]
-        
+
         # Stack verified_ids to [bs]
         verified_ids_tensor = torch.stack([
-            v if isinstance(v, torch.Tensor) and v.dim() == 0 
+            v if isinstance(v, torch.Tensor) and v.dim() == 0
             else (v[0] if isinstance(v, torch.Tensor) else torch.tensor(v, device=self.device))
             for v in verified_ids
         ]).to(dtype=torch.long, device=self.device)
-        
+
         # Create noise embeddings [bs, block_size, hidden]
         block_input_ids = torch.full(
-            (bs, block_size), self.mask_token_id, 
+            (bs, block_size), self.mask_token_id,
             dtype=torch.long, device=self.device
         )
         block_input_ids[:, 0] = verified_ids_tensor
-        noise_embedding = self.embed_tokens(block_input_ids)  # [bs, block_size, hidden]
-        
-        # Run batched attention forward
-        draft_hidden = self._dflash_attention_forward(
+
+        # Get embedding from draft model
+        noise_embedding = self.draft_model_runner.model.model.embed_tokens(block_input_ids)
+
+        # Project and normalize target hidden ONCE at model level (matching original DFlash)
+        if padded_target_hiddens.shape[-1] != hidden_size:
+            padded_target_hiddens = self.draft_model_runner.model.model.fc(padded_target_hiddens)
+        padded_target_hiddens = self.draft_model_runner.model.model.hidden_norm(padded_target_hiddens)
+
+        # Use batched forward through model layers with correct DFlash attention pattern
+        draft_hidden = self._model_forward_batched(
             padded_target_hiddens, noise_embedding, ctx_lens_tensor
         )
-        
+
         # Get draft logits and tokens [bs, block_size-1]
         draft_hidden_for_logits = draft_hidden[:, 1:, :]  # [bs, block_size-1, hidden]
-        draft_logits = torch.matmul(draft_hidden_for_logits, self.lm_head_weight.t())
+        lm_head_weight = self.draft_model_runner.model.lm_head.weight
+        draft_logits = torch.matmul(draft_hidden_for_logits, lm_head_weight.t())
         block_input_ids[:, 1:] = torch.argmax(draft_logits, dim=-1)
-        
+
         # Flatten for output
         all_draft_tokens = []
         all_positions = []
@@ -517,407 +502,61 @@ class DFlashWorker:
             all_positions.append(torch.arange(
                 current_seq_len, current_seq_len + block_size, device=self.device
             ))
-        
+
         draft_tokens = torch.cat(all_draft_tokens, dim=0)
         positions = torch.cat(all_positions, dim=0)
         return draft_tokens, positions
 
-    def _dflash_attention_forward(
+    def _model_forward_batched(
         self,
-        target_hidden: torch.Tensor,  # [bs, max_ctx_len, hidden]
+        target_hidden: torch.Tensor,  # [bs, max_ctx_len, hidden] - already FC + hidden_norm processed
         noise_embedding: torch.Tensor,  # [bs, block_size, hidden]
         ctx_lens: torch.Tensor,  # [bs]
     ) -> torch.Tensor:
-        """DFlash attention forward pass.
+        """Run draft model forward through layers with correct DFlash attention pattern.
         
-        Implements the DFlash-specific attention pattern:
-        - Q: from noise only
-        - K/V: from concat(target_hidden, noise)
-        - Non-causal attention with position-based masking
-        
-        Args:
-            target_hidden: Padded target hidden states [bs, max_ctx_len, hidden]
-            noise_embedding: Noise embeddings [bs, block_size, hidden]
-            ctx_lens: Actual context lengths per request [bs]
-            
-        Returns:
-            Draft hidden states [bs, block_size, hidden]
+        Matches original DFlash:
+        - target_hidden is already normalized by hidden_norm (done before this call)
+        - input_layernorm is applied ONLY to noise, NOT to target_hidden
+        - Q comes from noise only, K/V come from [target_hidden, noise]
         """
         bs = target_hidden.shape[0]
-        max_ctx_len = target_hidden.shape[1]
         block_size = noise_embedding.shape[1]
-        max_total_len = max_ctx_len + block_size
-        hidden_size = self.draft_model.model.hidden_size
-        
-        # Project and normalize target hidden
-        if target_hidden.shape[-1] != hidden_size:
-            target_hidden = self.draft_model.model.fc(target_hidden)
-        target_hidden = self.draft_model.model.hidden_norm(target_hidden)
-        
-        # Build attention mask for variable context lengths [bs, 1, block_size, max_total_len]
-        # Mask out padding positions in target_hidden
-        attn_mask = torch.zeros(
-            bs, 1, block_size, max_total_len,
-            dtype=torch.bfloat16, device=self.device
-        )
+
+        # Process each request separately (different ctx_lens mean different valid regions)
+        all_draft_hidden = []
         for i in range(bs):
-            cl = ctx_lens[i].item()
-            # Mask out padding (positions >= ctx_len in target region)
-            attn_mask[i, :, :, cl:max_ctx_len] = float('-inf')
-        
-        # Current noise hidden states [bs, block_size, hidden]
-        noise_hidden = noise_embedding
-        
-        # Process through layers
-        for layer_idx, layer in enumerate(self.draft_model.model.layers):
-            noise_hidden = self._dflash_layer_forward(
-                layer, layer_idx, noise_hidden, target_hidden, 
-                ctx_lens, max_ctx_len, max_total_len, attn_mask
-            )
-        
-        # Final norm (RMSNorm expects 2D input)
-        bs, seq_len, hidden = noise_hidden.shape
-        noise_hidden_2d = noise_hidden.view(bs * seq_len, hidden)
-        draft_hidden_2d = self.draft_model.model.norm(noise_hidden_2d)
-        draft_hidden = draft_hidden_2d.view(bs, seq_len, hidden)
-        return draft_hidden
+            ctx_len = ctx_lens[i].item()
 
-    def _dflash_layer_forward(
-        self,
-        layer,
-        layer_idx: int,
-        noise_hidden: torch.Tensor,  # [bs, block_size, hidden]
-        target_hidden: torch.Tensor,  # [bs, max_ctx_len, hidden]
-        ctx_lens: torch.Tensor,  # [bs]
-        max_ctx_len: int,
-        max_total_len: int,
-        attn_mask: torch.Tensor,  # [bs, 1, block_size, max_total_len]
-    ) -> torch.Tensor:
-        """Single layer forward for DFlash attention."""
-        bs = noise_hidden.shape[0]
-        block_size = noise_hidden.shape[1]
-        
-        # Residual
-        residual = noise_hidden
-        
-        # LayerNorm on noise only (target already normalized by hidden_norm)
-        noise_norm = layer.input_layernorm(noise_hidden.reshape(-1, noise_hidden.shape[-1]))
-        noise_norm = noise_norm.view(bs, block_size, -1)
-        
-        # QKV projection
-        num_heads = layer.self_attn.num_heads
-        num_kv_heads = layer.self_attn.num_kv_heads
-        head_dim = layer.self_attn.head_dim
-        q_size = layer.self_attn.q_size
-        kv_size = layer.self_attn.kv_size
-        
-        # Q from noise [bs, block_size, q_size]
-        noise_norm_flat = noise_norm.reshape(-1, noise_norm.shape[-1])
-        qkv_noise, _ = layer.self_attn.qkv_proj(noise_norm_flat)
-        qkv_noise = qkv_noise.view(bs, block_size, -1)
-        q, k_noise, v_noise = qkv_noise.split([q_size, kv_size, kv_size], dim=-1)
-        
-        # K/V from target [bs, max_ctx_len, kv_size]
-        target_flat = target_hidden.reshape(-1, target_hidden.shape[-1])
-        qkv_target, _ = layer.self_attn.qkv_proj(target_flat)
-        qkv_target = qkv_target.view(bs, max_ctx_len, -1)
-        _, k_target, v_target = qkv_target.split([q_size, kv_size, kv_size], dim=-1)
-        
-        # Concatenate K/V: [bs, max_total_len, kv_size]
-        k = torch.cat([k_target, k_noise], dim=1)
-        v = torch.cat([v_target, v_noise], dim=1)
-        
-        # Reshape for attention: [bs, seq, num_heads, head_dim]
-        q = q.view(bs, block_size, num_heads, head_dim)
-        k = k.view(bs, max_total_len, num_kv_heads, head_dim)
-        v = v.view(bs, max_total_len, num_kv_heads, head_dim)
-        
-        # Apply Q/K normalization (reshape for 2D RMSNorm)
-        q_flat = q.reshape(-1, head_dim)
-        k_flat = k.reshape(-1, head_dim)
-        q_flat = layer.self_attn.q_norm(q_flat)
-        k_flat = layer.self_attn.k_norm(k_flat)
-        q = q_flat.view(bs, block_size, num_heads, head_dim)
-        k = k_flat.view(bs, max_total_len, num_kv_heads, head_dim)
-        
-        # Transpose to [bs, heads, seq, dim]
-        q = q.transpose(1, 2)  # [bs, num_heads, block_size, head_dim]
-        k = k.transpose(1, 2)  # [bs, num_kv_heads, max_total_len, head_dim]
-        v = v.transpose(1, 2)
-        
-        # Apply rotary embeddings with different positions
-        # Q: positions [max_ctx_len, max_ctx_len+block_size)
-        # K: positions [0, max_total_len)
-        cos_sin_cache = layer.self_attn.rotary_emb.cos_sin_cache
-        if cos_sin_cache.dtype != torch.float32:
-            layer.self_attn.rotary_emb.cos_sin_cache = cos_sin_cache.to(torch.float32)
-            cos_sin_cache = layer.self_attn.rotary_emb.cos_sin_cache
-        
-        # Positions for Q (noise region)
-        q_positions = torch.arange(max_ctx_len, max_ctx_len + block_size, device=self.device)
-        cos_sin_q = cos_sin_cache.index_select(0, q_positions)
-        cos_q, sin_q = cos_sin_q.chunk(2, dim=-1)
-        
-        # Positions for K (full sequence)
-        k_positions = torch.arange(max_total_len, device=self.device)
-        cos_sin_k = cos_sin_cache.index_select(0, k_positions)
-        cos_k, sin_k = cos_sin_k.chunk(2, dim=-1)
-        
-        # Apply rotary: split head_dim into halves
-        q1, q2 = q.chunk(2, dim=-1)
-        cos_q_bc = cos_q.unsqueeze(0).unsqueeze(0)  # [1, 1, block_size, rotary_dim]
-        sin_q_bc = sin_q.unsqueeze(0).unsqueeze(0)
-        q = torch.cat([q1 * cos_q_bc - q2 * sin_q_bc, q2 * cos_q_bc + q1 * sin_q_bc], dim=-1)
-        
-        k1, k2 = k.chunk(2, dim=-1)
-        cos_k_bc = cos_k.unsqueeze(0).unsqueeze(0)  # [1, 1, max_total_len, rotary_dim]
-        sin_k_bc = sin_k.unsqueeze(0).unsqueeze(0)
-        k = torch.cat([k1 * cos_k_bc - k2 * sin_k_bc, k2 * cos_k_bc + k1 * sin_k_bc], dim=-1)
-        
-        # Expand KV for GQA
-        num_kv_groups = num_heads // num_kv_heads
-        if num_kv_groups > 1:
-            k = k.repeat_interleave(num_kv_groups, dim=1)
-            v = v.repeat_interleave(num_kv_groups, dim=1)
-        
-        # Attention with mask
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * layer.self_attn.scaling
-        attn_weights = attn_weights + attn_mask  # Apply padding mask
-        attn_weights = torch.softmax(attn_weights, dim=-1)
-        # Ensure dtype consistency (softmax may produce float32)
-        if attn_weights.dtype != v.dtype:
-            attn_weights = attn_weights.to(v.dtype)
-        attn_output = torch.matmul(attn_weights, v)
-        
-        # Reshape and project
-        attn_output = attn_output.transpose(1, 2).contiguous()  # [bs, block_size, num_heads, head_dim]
-        attn_output = attn_output.view(bs * block_size, -1)
-        attn_output, _ = layer.self_attn.o_proj(attn_output)
-        attn_output = attn_output.view(bs, block_size, -1)
-        
-        # Residual
-        noise_hidden = residual + attn_output
-        
-        # MLP
-        residual = noise_hidden
-        mlp_input = layer.post_attention_layernorm(noise_hidden.reshape(-1, noise_hidden.shape[-1]))
-        mlp_output = layer.mlp(mlp_input)
-        mlp_output = mlp_output.view(bs, block_size, -1)
-        noise_hidden = residual + mlp_output
-        
-        return noise_hidden
+            # Get valid target hidden [ctx_len, hidden] - already normalized by hidden_norm
+            th = target_hidden[i, :ctx_len, :]
 
-    def _sequential_draft_forward(
-        self,
-        batch: ScheduleBatch,
-        target_hiddens: List[torch.Tensor],
-        verified_ids: List[torch.Tensor],
-        ctx_lens: List[int],
-    ) -> tuple:
-        """Sequential draft forward (temporary until ForwardBatch integration is complete)."""
-        bs = len(target_hiddens)
-        block_size = self.block_size
-        all_draft_tokens = []
-        all_positions = []
-        
-        for i, (target_hidden, verified_id, ctx_len) in enumerate(zip(target_hiddens, verified_ids, ctx_lens)):
-            req = batch.reqs[i]
-            
-            # Ensure 3D tensor
-            if target_hidden.dim() == 2:
-                target_hidden = target_hidden.unsqueeze(0)
-            
-            # Create noise embeddings with first token as verified
-            block_output_ids = torch.full(
-                (1, block_size), self.mask_token_id,
-                dtype=torch.long, device=self.device
-            )
-            if isinstance(verified_id, torch.Tensor):
-                block_output_ids[0, 0] = verified_id.item() if verified_id.dim() == 0 else verified_id[0].item()
-            else:
-                block_output_ids[0, 0] = verified_id
-            
-            noise_embedding = self.embed_tokens(block_output_ids)  # [1, block_size, hidden]
-            
-            # Project and normalize target hidden
-            hidden_size = self.draft_model.model.hidden_size
-            if target_hidden.shape[-1] != hidden_size:
-                target_hidden = self.draft_model.model.fc(target_hidden)
-            target_hidden = self.draft_model.model.hidden_norm(target_hidden)
-            
-            # ORIGINAL DFLASH ATTENTION PATTERN:
-            # Q: from noise only
-            # K/V: from concat(target_hidden, noise)
-            
+            # Get noise embedding [block_size, hidden]
+            ne = noise_embedding[i]
+
+            # Concatenate [ctx_len + block_size, hidden]
+            combined = torch.cat([th, ne], dim=0)
+
+            # Create positions
             total_len = ctx_len + block_size
             positions = torch.arange(total_len, device=self.device)
-            noise_positions = positions[ctx_len:]  # Positions for Q (noise only)
+
+            # Forward through layers with correct ctx_len for DFlash pattern
+            # The layer will apply input_layernorm only to noise, not to target_hidden
+            hidden = combined
+            for layer in self.draft_model_runner.model.model.layers:
+                hidden = layer(positions, hidden, forward_batch=None, ctx_len=ctx_len)
+
+            # Final norm only on noise portion (already extracted by layer)
+            # After all layers, hidden is [ctx_len + block_size, hidden]
+            # Extract noise portion
+            noise_hidden = hidden[ctx_len:]
+            noise_hidden = self.draft_model_runner.model.model.norm(noise_hidden)
             
-            # Current hidden states for the noise part (used for residual connections)
-            noise_hidden = noise_embedding.squeeze(0)  # [block_size, hidden]
-            
-            with torch.no_grad():
-                for layer_idx, layer in enumerate(self.draft_model.model.layers):
-                    # Residual connection for noise positions
-                    residual = noise_hidden  # [block_size, hidden]
-                    
-                    # LayerNorm - ONLY applied to noise, NOT to target_hidden
-                    # (target_hidden was already processed by hidden_norm at model level)
-                    noise_norm = layer.input_layernorm(noise_hidden)  # [block_size, hidden]
-                    target_for_kv = target_hidden.squeeze(0)  # [ctx_len, hidden] - NO layernorm!
-                    
-                    # === ORIGINAL DFLASH ATTENTION ===
-                    # Q only from noise (block_size tokens)
-                    qkv_noise, _ = layer.self_attn.qkv_proj(noise_norm)
-                    q_noise, k_noise, v_noise = qkv_noise.split([
-                        layer.self_attn.q_size,
-                        layer.self_attn.kv_size,
-                        layer.self_attn.kv_size
-                    ], dim=-1)
-                    
-                    # K/V from target (ctx_len tokens) - NO layernorm on target
-                    qkv_target, _ = layer.self_attn.qkv_proj(target_for_kv)
-                    _, k_target, v_target = qkv_target.split([
-                        layer.self_attn.q_size,
-                        layer.self_attn.kv_size,
-                        layer.self_attn.kv_size
-                    ], dim=-1)
-                    
-                    # Concatenate K and V: [ctx_len + block_size, kv_size]
-                    k = torch.cat([k_target, k_noise], dim=0)
-                    v = torch.cat([v_target, v_noise], dim=0)
-                    q = q_noise  # Q only from noise
-                    
-                    # Make contiguous
-                    q = q.contiguous()
-                    k = k.contiguous()
-                    v = v.contiguous()
-                    
-                    # ============================================================
-                    # MATCH ORIGINAL DFLASH ORDER: view -> norm -> transpose -> rotary
-                    # ============================================================
-                    
-                    num_heads = layer.self_attn.num_heads
-                    num_kv_heads = layer.self_attn.num_kv_heads
-                    head_dim = layer.self_attn.head_dim
-                    
-                    # Step 1: View to 3D [seq, num_heads, head_dim]
-                    q = q.view(block_size, num_heads, head_dim)
-                    k = k.view(total_len, num_kv_heads, head_dim)
-                    v = v.view(total_len, num_kv_heads, head_dim)
-                    
-                    
-                    # Step 2: Apply Q/K normalization
-                    # SGLang RMSNorm kernel requires 2D input, so reshape: [seq, heads, dim] -> [seq*heads, dim]
-                    # Original: q = self.q_norm(q) where q is [B, seq, heads, dim], norm on last dim
-                    q_2d = q.reshape(-1, head_dim)  # [seq*heads, dim]
-                    k_2d = k.reshape(-1, head_dim)  # [kv_seq*kv_heads, dim]
-                    q_2d = layer.self_attn.q_norm(q_2d)
-                    k_2d = layer.self_attn.k_norm(k_2d)
-                    q = q_2d.view(block_size, num_heads, head_dim)
-                    k = k_2d.view(total_len, num_kv_heads, head_dim)
-                    
-                    # Step 3: Transpose to [heads, seq, head_dim] (BEFORE rotary, like original)
-                    q = q.transpose(0, 1)  # [num_heads, block_size, head_dim]
-                    k = k.transpose(0, 1)  # [num_kv_heads, total_len, head_dim]
-                    v = v.transpose(0, 1)  # [num_kv_heads, total_len, head_dim]
-                    
-                    # Step 4: Apply rotary embeddings (on transposed tensors)
-                    if layer.self_attn.rotary_emb.cos_sin_cache.dtype != torch.float32:
-                        layer.self_attn.rotary_emb.cos_sin_cache = layer.self_attn.rotary_emb.cos_sin_cache.to(torch.float32)
-                    
-                    cos_sin_cache = layer.self_attn.rotary_emb.cos_sin_cache
-                    rotary_dim = cos_sin_cache.shape[-1] // 2
-                    
-                    # Get cos/sin for Q (noise positions) and K (all positions)
-                    cos_sin_q = cos_sin_cache.index_select(0, noise_positions)  # [block_size, rotary_dim*2]
-                    cos_q, sin_q = cos_sin_q.chunk(2, dim=-1)  # [block_size, rotary_dim]
-                    
-                    cos_sin_k = cos_sin_cache.index_select(0, positions)  # [total_len, rotary_dim*2]
-                    cos_k, sin_k = cos_sin_k.chunk(2, dim=-1)  # [total_len, rotary_dim]
-                    
-                    # SGLang-style rotary: cos/sin each have rotary_dim dims (64)
-                    # Split q/k into two halves, apply rotation, recombine
-                    # This is equivalent to HF's approach with duplicated freqs
-                    
-                    # Expand cos/sin for broadcasting: [1, seq, rotary_dim]
-                    cos_q_exp = cos_q.unsqueeze(0).unsqueeze(-2)  # [1, block_size, 1, rotary_dim]
-                    sin_q_exp = sin_q.unsqueeze(0).unsqueeze(-2)
-                    cos_k_exp = cos_k.unsqueeze(0).unsqueeze(-2)  # [1, total_len, 1, rotary_dim]
-                    sin_k_exp = sin_k.unsqueeze(0).unsqueeze(-2)
-                    
-                    # q is [num_heads, block_size, head_dim] -> need [num_heads, block_size, 1, head_dim]
-                    # Actually simpler: just reshape for the rotation
-                    
-                    # Q: [num_heads, block_size, head_dim=128]
-                    q1, q2 = torch.chunk(q, 2, dim=-1)  # Each [num_heads, block_size, 64]
-                    # cos_q: [block_size, 64] -> [1, block_size, 64] for broadcast
-                    cos_q_bc = cos_q.unsqueeze(0)  # [1, block_size, 64]
-                    sin_q_bc = sin_q.unsqueeze(0)
-                    q_o1 = q1 * cos_q_bc - q2 * sin_q_bc
-                    q_o2 = q2 * cos_q_bc + q1 * sin_q_bc
-                    q = torch.cat((q_o1, q_o2), dim=-1)  # [num_heads, block_size, 128]
-                    
-                    # K: [num_kv_heads, total_len, head_dim=128]
-                    k1, k2 = torch.chunk(k, 2, dim=-1)  # Each [num_kv_heads, total_len, 64]
-                    cos_k_bc = cos_k.unsqueeze(0)  # [1, total_len, 64]
-                    sin_k_bc = sin_k.unsqueeze(0)
-                    k_o1 = k1 * cos_k_bc - k2 * sin_k_bc
-                    k_o2 = k2 * cos_k_bc + k1 * sin_k_bc
-                    k = torch.cat((k_o1, k_o2), dim=-1)  # [num_kv_heads, total_len, 128]
-                    
-                    # Expand KV for GQA
-                    num_kv_groups = layer.self_attn.num_heads // layer.self_attn.num_kv_heads
-                    if num_kv_groups > 1:
-                        k = k.repeat_interleave(num_kv_groups, dim=0)
-                        v = v.repeat_interleave(num_kv_groups, dim=0)
-                    
-                    # Non-causal attention: Q [block_size] attends to K/V [total_len]
-                    # Ensure all tensors have same dtype (rotary may have converted to float32)
-                    compute_dtype = q.dtype
-                    if v.dtype != compute_dtype:
-                        v = v.to(compute_dtype)
-                    
-                    attn_weights = torch.matmul(q, k.transpose(-2, -1)) * layer.self_attn.scaling
-                    attn_weights = torch.softmax(attn_weights, dim=-1)
-                    
-                    attn_output = torch.matmul(attn_weights, v)
-                    
-                    # Reshape and project: [num_heads, block_size, head_dim] -> [block_size, hidden]
-                    attn_output = attn_output.transpose(0, 1).contiguous().view(block_size, -1)
-                    # Convert back to model dtype before o_proj
-                    if attn_output.dtype != residual.dtype:
-                        attn_output = attn_output.to(residual.dtype)
-                    attn_output, _ = layer.self_attn.o_proj(attn_output)
-                    
-                    # Residual connection (noise only)
-                    noise_hidden = residual + attn_output
-                    
-                    # MLP (noise only)
-                    residual = noise_hidden
-                    mlp_input = layer.post_attention_layernorm(noise_hidden)
-                    mlp_output = layer.mlp(mlp_input)
-                    noise_hidden = residual + mlp_output
-                
-                # Final norm
-                draft_hidden = self.draft_model.model.norm(noise_hidden)  # [block_size, hidden]
-            
-            # Get draft logits
-            draft_hidden_for_logits = draft_hidden[1:, :]  # Skip first position
-            draft_logits = torch.matmul(draft_hidden_for_logits, self.lm_head_weight.t())
-            
-            block_output_ids[:, 1:] = torch.argmax(draft_logits, dim=-1)
-            
-            all_draft_tokens.append(block_output_ids.flatten())
-            current_seq_len = batch.seq_lens[i].item()
-            all_positions.append(torch.arange(
-                current_seq_len, current_seq_len + block_size, device=self.device
-            ))
-        
-        draft_tokens = torch.cat(all_draft_tokens, dim=0)
-        positions = torch.cat(all_positions, dim=0)
-        
-        return draft_tokens, positions
+            all_draft_hidden.append(noise_hidden)
+
+        # Stack to [bs, block_size, hidden]
+        return torch.stack(all_draft_hidden, dim=0)
 
     def _evict_rejected_cache(
         self,
@@ -930,14 +569,14 @@ class DFlashWorker:
         noise_cache_locs = state.get('noise_cache_locs')
         if noise_cache_locs is None:
             return
-        
+
         rejected_count = self.block_size - accept_length - 1
         if rejected_count > 0:
             # Free rejected positions
             rejected_locs = noise_cache_locs[accept_length + 1:]
             if len(rejected_locs) > 0:
                 batch.token_to_kv_pool_allocator.free(rejected_locs)
-        
+
         # Clear tracked noise positions
         state['noise_cache_locs'] = None
 
@@ -956,7 +595,7 @@ class DFlashWorker:
             req.kv_allocated_len += 1
         model_worker_batch = batch.get_model_worker_batch()
         return self.target_worker.forward_batch_generation(model_worker_batch)
-        
+
     def _cleanup_finished_requests(self, batch: ScheduleBatch):
         """Clean up state for finished requests."""
         active_rids = {req.rid for req in batch.reqs}

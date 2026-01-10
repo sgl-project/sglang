@@ -17,8 +17,8 @@ Following the NGRAM pattern for fixed-length draft token verification.
 Uses fused verify_tree_greedy kernel for efficient verification.
 """
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, ClassVar, Optional, Tuple
 
 import torch
 
@@ -58,6 +58,9 @@ class DFlashDraftInput(SpecInput):
     # Block size
     block_size: int = 16
     
+    # Context lengths per request [batch] (for variable-length batching)
+    ctx_lens: Optional[torch.Tensor] = None
+    
     # Capture mode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
     
@@ -69,6 +72,9 @@ class DFlashDraftInput(SpecInput):
     
     # CUDA event to synchronize verification completion (for V2 overlap)
     verify_done: Optional[torch.cuda.Event] = None
+    
+    # Class-level constant for allocation (set by worker) - ClassVar so not a dataclass field
+    ALLOC_LEN_PER_DECODE: ClassVar[int] = 16
     
     def __post_init__(self):
         super().__init__(SpecInputType.DFLASH_DRAFT)
@@ -183,9 +189,100 @@ class DFlashDraftInput(SpecInput):
             bs,
         )
         
-        # Sync seq_lens to CPU
-        batch.seq_lens_cpu = batch.seq_lens.cpu()
-        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+        # Sync seq_lens to CPU (may not be set in V2 mode)
+        if batch.seq_lens is not None:
+            batch.seq_lens_cpu = batch.seq_lens.cpu()
+            batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+        else:
+            # Compute from request lengths
+            seq_lens = torch.tensor([len(r.origin_input_ids) + len(r.output_ids) for r in batch.reqs], dtype=torch.int32, device="cpu")
+            batch.seq_lens_cpu = seq_lens
+            batch.seq_lens_sum = seq_lens.sum().item()
+            batch.seq_lens = seq_lens.to(device=batch.device)
+    
+    def prepare_for_v2_draft(
+        self,
+        req_to_token_pool,
+        model_worker_batch: "ModelWorkerBatch",
+        cuda_graph_runner,
+        draft_runner,
+        block_size: int,
+    ) -> Tuple["ForwardBatch", bool]:
+        """
+        Prepare ForwardBatch for V2 draft forward.
+        
+        This method:
+        1. Allocates cache locations for draft tokens
+        2. Builds the concatenated input (target_hidden + noise_embedding)
+        3. Creates ForwardBatch with proper metadata
+        
+        Args:
+            req_to_token_pool: Request to token pool mapping
+            model_worker_batch: Batch from scheduler
+            cuda_graph_runner: CUDA graph runner (if available)
+            draft_runner: Draft model runner
+            block_size: Number of draft tokens to generate
+            
+        Returns:
+            Tuple of (ForwardBatch, can_use_cuda_graph)
+        """
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+        from sglang.srt.mem_cache.common import alloc_token_slots
+        
+        bs = model_worker_batch.batch_size
+        device = self.verified_id.device if self.verified_id is not None else "cuda"
+        
+        # Handle idle mode
+        if model_worker_batch.forward_mode.is_idle():
+            return ForwardBatch.create_empty_for_idle(draft_runner), False
+        
+        # Allocate cache locations for draft tokens
+        num_tokens = bs * block_size
+        out_cache_loc = alloc_token_slots(
+            model_worker_batch.tree_cache,
+            num_tokens,
+        )
+        
+        # Build positions for the concatenated input
+        # Each request: [0, 1, ..., ctx_len + block_size - 1]
+        positions_list = []
+        seq_lens_list = []
+        for i in range(bs):
+            ctx_len = model_worker_batch.seq_lens[i].item()
+            total_len = ctx_len + block_size
+            pos = torch.arange(total_len, device=device, dtype=torch.int64)
+            positions_list.append(pos)
+            seq_lens_list.append(total_len)
+        
+        positions = torch.cat(positions_list)
+        seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=device)
+        
+        # Create ForwardBatch
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            input_ids=None,  # Will be set by model from input_embeds
+            req_pool_indices=model_worker_batch.req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.cpu(),
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool=draft_runner.token_to_kv_pool,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=sum(seq_lens_list),
+            return_logprob=False,
+            positions=positions,
+            spec_algorithm=draft_runner.spec_algorithm,
+            spec_info=self,
+            capture_hidden_mode=self.capture_hidden_mode,
+        )
+        
+        # Check if can use CUDA graph
+        can_cuda_graph = (
+            cuda_graph_runner is not None
+            and cuda_graph_runner.can_run(forward_batch)
+        )
+        
+        return forward_batch, can_cuda_graph
 
 
 @dataclass
@@ -202,11 +299,13 @@ class DFlashVerifyInput(SpecInput):
         draft_token: torch.Tensor,  # [bs * block_size]
         positions: torch.Tensor,     # [bs * block_size]
         block_size: int,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL,
     ):
         super().__init__(SpecInputType.DFLASH_VERIFY)
         self.draft_token = draft_token
         self.positions = positions
         self.draft_token_num = block_size
+        self.capture_hidden_mode = capture_hidden_mode
         
         # Set device from draft_token or default to cuda
         if draft_token is not None:
@@ -221,6 +320,15 @@ class DFlashVerifyInput(SpecInput):
         
         # Output tensors from verification
         self.accepted_indices: Optional[torch.Tensor] = None
+    
+    @classmethod
+    def create_idle_input(cls, block_size: int) -> "DFlashVerifyInput":
+        """Create an idle input for when there's nothing to verify."""
+        return cls(
+            draft_token=torch.empty(0, dtype=torch.int64, device="cuda"),
+            positions=torch.empty(0, dtype=torch.int64, device="cuda"),
+            block_size=block_size,
+        )
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num

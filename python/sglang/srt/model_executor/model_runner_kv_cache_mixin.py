@@ -107,12 +107,14 @@ class ModelRunnerKVCacheMixin:
                     * kv_size
                 )
         
-        # Add DFlash hidden state buffer size per token
+        # Add DFlash hidden state buffer size per token (TARGET worker only)
         # Hidden states are stored at the same indices as KV cache for prefix caching
+        # Draft worker doesn't need hidden buffer - it uses target model's hidden states
         if (
             hasattr(self, 'server_args') 
             and self.server_args.speculative_algorithm 
             and self.server_args.speculative_algorithm.upper() == 'DFLASH'
+            and not getattr(self, 'is_draft_worker', False)  # Only for target worker
         ):
             # DFlash stores FC-compressed hidden states for target layers
             # Default: 5 target layers, hidden_size per layer
@@ -576,6 +578,18 @@ class ModelRunnerKVCacheMixin:
                         ),
                     )
                 else:
+                    # Compute DFlash hidden buffer params for target worker
+                    dflash_hidden_size = 0
+                    dflash_num_target_layers = 0
+                    if (
+                        hasattr(self, 'server_args') 
+                        and self.server_args.speculative_algorithm 
+                        and self.server_args.speculative_algorithm.upper() == 'DFLASH'
+                        and not getattr(self, 'is_draft_worker', False)
+                    ):
+                        dflash_num_target_layers = self.server_args.speculative_dflash_num_target_layers or 5
+                        dflash_hidden_size = self.model_config.hf_config.hidden_size
+                    
                     self.token_to_kv_pool = MHATokenToKVPool(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
@@ -593,6 +607,8 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        dflash_hidden_size=dflash_hidden_size,
+                        dflash_num_target_layers=dflash_num_target_layers,
                     )
 
         # Initialize token_to_kv_pool_allocator
