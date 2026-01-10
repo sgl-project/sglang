@@ -249,7 +249,10 @@ class SchedulerStats:
 
     # Routing key metrics
     num_unique_routing_keys: int = 0
-    routing_key_req_counts: List[int] = field(default_factory=list)  # per-key counts
+    routing_key_req_counts: List[int] = field(default_factory=list)  # per-key running counts
+    routing_key_running_and_waiting_req_counts: List[int] = field(
+        default_factory=list
+    )  # per-key running+waiting counts
 
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 5, 10, 20, 50, 100, 200]
@@ -749,6 +752,12 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()),
             bucket_bounds=ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
         )
+        self.routing_key_running_and_waiting_req_count = GaugeHistogram(
+            name="sglang:routing_key_running_and_waiting_req_count",
+            documentation="Distribution of routing keys by running+waiting request count (gt < count <= le).",
+            labelnames=list(labels.keys()),
+            bucket_bounds=ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
+        )
 
         self.new_token_ratio = Gauge(
             name="sglang:new_token_ratio",
@@ -1013,6 +1022,9 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_unique_routing_keys, stats.num_unique_routing_keys)
         self.routing_key_running_req_count.set_by_current_observations(
             self.labels, stats.routing_key_req_counts
+        )
+        self.routing_key_running_and_waiting_req_count.set_by_current_observations(
+            self.labels, stats.routing_key_running_and_waiting_req_counts
         )
 
         self.last_log_time = time.perf_counter()

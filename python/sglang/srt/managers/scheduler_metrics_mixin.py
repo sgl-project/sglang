@@ -255,11 +255,16 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
-            routing_keys = [r.routing_key for r in self.running_batch.reqs]
+            running_routing_keys = [r.routing_key for r in self.running_batch.reqs]
             (
                 self.stats.num_unique_routing_keys,
                 self.stats.routing_key_req_counts,
-            ) = compute_routing_key_stats(routing_keys)
+            ) = compute_routing_key_stats(running_routing_keys)
+
+            waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
+            _, self.stats.routing_key_running_and_waiting_req_counts = (
+                compute_routing_key_stats(running_routing_keys + waiting_routing_keys)
+            )
 
             # Others
             self.calculate_utilization()
@@ -426,11 +431,16 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
-            routing_keys = [r.routing_key for r in batch.reqs]
+            running_routing_keys = [r.routing_key for r in batch.reqs]
             (
                 self.stats.num_unique_routing_keys,
                 self.stats.routing_key_req_counts,
-            ) = compute_routing_key_stats(routing_keys)
+            ) = compute_routing_key_stats(running_routing_keys)
+
+            waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
+            _, self.stats.routing_key_running_and_waiting_req_counts = (
+                compute_routing_key_stats(running_routing_keys + waiting_routing_keys)
+            )
 
             # Others
             self.calculate_utilization()
