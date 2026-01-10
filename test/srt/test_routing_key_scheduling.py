@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 class TestRoutingKeyScheduling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_ROUTING_KEY_DEBUG_LOG"] = "1"
+        os.environ["SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG"] = "1"
 
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
         cls.base_url = DEFAULT_URL_FOR_TEST
