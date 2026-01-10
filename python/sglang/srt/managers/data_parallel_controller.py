@@ -28,6 +28,7 @@ import setproctitle
 import zmq
 
 from sglang.srt.environ import envs
+from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     BlockReqInput,
@@ -208,8 +209,6 @@ class DataParallelController:
         )
 
         if server_args.enable_metrics:
-            from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
-
             start_cpu_monitor_thread("data_parallel_controller")
 
     def send_to_all_workers(self, obj):

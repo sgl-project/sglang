@@ -26,6 +26,7 @@ import setproctitle
 import zmq
 
 from sglang.srt.environ import envs
+from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchMultimodalDecodeReq,
@@ -88,8 +89,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.init_running_status(server_args)
 
         if server_args.enable_metrics:
-            from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
-
             start_cpu_monitor_thread("detokenizer")
 
         # Init dispatcher
