@@ -1,5 +1,6 @@
 import io
 import unittest
+from contextlib import nullcontext
 
 import requests
 
@@ -28,22 +29,19 @@ class BaseTestSoftWatchdog:
         cls.stderr = io.StringIO()
         cls.process = None
 
-        with cls.env_override():
-            try:
-                cls.process = popen_launch_server(
-                    "Qwen/Qwen3-0.6B",
-                    DEFAULT_URL_FOR_TEST,
-                    timeout=cls.timeout,
-                    other_args=[
-                        "--soft-watchdog-timeout",
-                        "20",
-                        "--skip-server-warmup",
-                    ],
-                    return_stdout_stderr=(cls.stdout, cls.stderr),
-                )
-            except TimeoutError:
-                if not cls.triggers_during_init:
-                    raise
+        expect_timeout = unittest.TestCase().assertRaises(TimeoutError) if cls.triggers_during_init else nullcontext()
+        with cls.env_override(), expect_timeout:
+            cls.process = popen_launch_server(
+                "Qwen/Qwen3-0.6B",
+                DEFAULT_URL_FOR_TEST,
+                timeout=cls.timeout,
+                other_args=[
+                    "--soft-watchdog-timeout",
+                    "20",
+                    "--skip-server-warmup",
+                ],
+                return_stdout_stderr=(cls.stdout, cls.stderr),
+            )
 
     @classmethod
     def tearDownClass(cls):
