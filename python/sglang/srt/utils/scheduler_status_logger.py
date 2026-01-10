@@ -10,7 +10,7 @@ class SchedulerStatusLogger:
     DUMP_INTERVAL_S = 60.0
 
     def __init__(self, targets: List[str]):
-        self.loggers = create_log_targets(targets, __name__)
+        self.loggers = create_log_targets(targets=targets, name_prefix=__name__)
         self.last_dump_time = 0.0
 
     def maybe_dump(self, running_rids: List[str], queued_rids: List[str]) -> None:

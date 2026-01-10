@@ -12,7 +12,7 @@ import torch.distributed as dist
 
 
 def create_log_targets(
-    targets: Optional[List[str]], name_prefix: str
+    *, targets: Optional[List[str]], name_prefix: str
 ) -> List[logging.Logger]:
     if not targets:
         return [_create_log_target_stdout(name_prefix)]
