@@ -26,10 +26,10 @@ use super::{
     common::{extract_output_index, get_event_type, parse_sse_block, ChunkProcessor},
     mcp::{
         build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-        prepare_mcp_payload_for_streaming, send_mcp_list_tools_events, ToolLoopState,
+        prepare_mcp_tools_as_functions, send_mcp_list_tools_events, ToolLoopState,
     },
     tool_handler::{StreamAction, StreamingToolHandler},
-    utils::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
+    utils::{mask_tools_as_mcp, patch_response_with_request_metadata, rewrite_streaming_block},
 };
 use crate::{
     protocols::{
@@ -452,7 +452,7 @@ pub(super) fn send_final_response_event(
     }
 
     mask_tools_as_mcp(&mut final_response, ctx.original_request);
-    patch_streaming_response_json(
+    patch_response_with_request_metadata(
         &mut final_response,
         ctx.original_request,
         ctx.previous_response_id,
@@ -590,7 +590,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
             }
             let encountered_error = accumulator.encountered_error().cloned();
             if let Some(mut response_json) = accumulator.into_final_response() {
-                patch_streaming_response_json(
+                patch_response_with_request_metadata(
                     &mut response_json,
                     &original_request,
                     previous_response_id.as_deref(),
@@ -642,7 +642,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
 ) -> Response {
     // Transform MCP tools to function tools in payload
     let mut payload = req.payload;
-    prepare_mcp_payload_for_streaming(&mut payload, active_mcp, &server_keys);
+    prepare_mcp_tools_as_functions(&mut payload, active_mcp, &server_keys);
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
     let should_store = req.original_body.store.unwrap_or(false);
@@ -885,7 +885,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                     );
 
                     mask_tools_as_mcp(&mut response_json, &original_request);
-                    patch_streaming_response_json(
+                    patch_response_with_request_metadata(
                         &mut response_json,
                         &original_request,
                         previous_response_id.as_deref(),

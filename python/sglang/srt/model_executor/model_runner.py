@@ -585,21 +585,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
     def init_routed_experts_capturer(self):
-        # TODO: the redundant logic with TpModelWorker
-        max_running_requests = min(
-            (
-                self.max_total_num_tokens // 2
-                if self.server_args.max_running_requests is None
-                else self.server_args.max_running_requests
-                // (
-                    self.server_args.dp_size
-                    if self.server_args.enable_dp_attention
-                    else 1
-                )
-            ),
-            self.req_to_token_pool.size,
-        )
-
         if not self.server_args.disable_shared_experts_fusion and hasattr(
             self.model, "num_fused_shared_experts"
         ):
@@ -613,7 +598,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
-                max_running_requests=max_running_requests,
+                max_running_requests=self.max_running_requests,
                 device=self.device,
             )
         )
@@ -2325,10 +2310,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ):
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
-
+        has_grammar = sampling_info.grammars is not None
+        # Avoid compiling grammar masks on every TP rank; only the first rank applies them.
+        apply_vocab_mask = has_grammar and self.sampler.tp_rank == 0
         # Calculate logits bias and apply it to next_token_logits.
-        sampling_info.update_regex_vocab_mask()
-        sampling_info.apply_logits_bias(logits_output.next_token_logits)
+        if apply_vocab_mask:
+            sampling_info.update_regex_vocab_mask()
+        else:
+            sampling_info.vocab_mask = None
+            sampling_info.apply_mask_func = None
+        sampling_info.apply_logits_bias(
+            logits_output.next_token_logits,
+            apply_vocab_mask=apply_vocab_mask,
+        )
 
     def sample(
         self,

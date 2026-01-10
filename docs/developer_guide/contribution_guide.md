@@ -90,6 +90,8 @@ If you don’t have permission, please ask maintainers to trigger CI for you.
 
 ### CI rate limits
 
+Due to CI scheduling and limited resources, higher-priority PRs may preempt running jobs. In such cases, you may need to rerun the tests.
+
 We apply CI rate limits to prevent abuse and ensure fair usage of our CI resources.
 
 Each CI workflow has a default limit defined in its workflow configuration file. For example, in [pr-gate.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/pr-gate.yml), the default cooldown period is 120 minutes, and each workflow can override it via the `cool-down-minutes` input parameter:

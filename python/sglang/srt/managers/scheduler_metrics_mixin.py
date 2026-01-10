@@ -95,7 +95,9 @@ class SchedulerMetricsMixin:
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
             self.metrics_collector = SchedulerMetricsCollector(
-                labels=labels, enable_lora=self.enable_lora
+                labels=labels,
+                enable_lora=self.enable_lora,
+                server_args=self.server_args,
             )
 
             if ENABLE_METRICS_DEVICE_TIMER:
@@ -137,7 +139,7 @@ class SchedulerMetricsMixin:
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
 
-        # assert self.temp_prefill_info is None # TODO re-enable
+        assert self.temp_prefill_info is None
         self.temp_prefill_info = dict(
             adder_log_input_tokens=adder.log_input_tokens,
             adder_log_hit_tokens=adder.log_hit_tokens,
