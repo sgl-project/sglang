@@ -63,13 +63,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           artifact_name="config-${{ matrix.runner }}-group${{ matrix.batch_group.name }}"
-          exists=$(gh api repos/${{ github.repository }}/actions/artifacts \
+          echo "Checking for existing artifact: $artifact_name"
+          exists=$(gh api repos/${{ github.repository }}/actions/artifacts --paginate \
             --jq ".artifacts[] | select(.name == \"$artifact_name\" and .expired == false) | .id" \
             2>/dev/null | head -1)
           if [ -n "$exists" ]; then
+            echo "Found existing artifact (id: $exists), skipping group ${{ matrix.batch_group.name }}"
             echo "skip=true" >> $GITHUB_OUTPUT
-            echo "Group ${{ matrix.batch_group.name }} already completed, skipping"
           else
+            echo "No existing artifact found, will run tuning for group ${{ matrix.batch_group.name }}"
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
