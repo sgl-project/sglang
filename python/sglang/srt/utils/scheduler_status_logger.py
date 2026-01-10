@@ -17,6 +17,17 @@ class SchedulerStatusLogger:
         self.dump_interval_s = dump_interval_s
         self.last_dump_time = 0.0
 
+    @staticmethod
+    def maybe_create() -> Optional["SchedulerStatusLogger"]:
+        target = envs.SGLANG_LOG_SCHEDULER_STATUS_TARGET.get()
+        if not target:
+            return None
+
+        return SchedulerStatusLogger(
+            targets=[t.strip() for t in target.split(",") if t.strip()],
+            dump_interval_s=envs.SGLANG_LOG_SCHEDULER_STATUS_INTERVAL_S.get(),
+        )
+
     def maybe_dump(
         self, running_batch: "ScheduleBatch", waiting_queue: List["Req"]
     ) -> None:
@@ -32,15 +43,4 @@ class SchedulerStatusLogger:
                 "running_rids": [r.rid for r in running_batch.reqs],
                 "queued_rids": [r.rid for r in waiting_queue],
             },
-        )
-
-    @staticmethod
-    def maybe_create() -> Optional["SchedulerStatusLogger"]:
-        target = envs.SGLANG_LOG_SCHEDULER_STATUS_TARGET.get()
-        if not target:
-            return None
-
-        return SchedulerStatusLogger(
-            targets=[t.strip() for t in target.split(",") if t.strip()],
-            dump_interval_s=envs.SGLANG_LOG_SCHEDULER_STATUS_INTERVAL_S.get(),
         )
