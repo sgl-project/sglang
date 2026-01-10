@@ -260,7 +260,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     # For EPD-disaggregated inference
     need_wait_for_image: Optional[bool] = None
-    num_items_assigned: Optional[List] = None
+    num_items_assigned: Optional[Dict[Union[str, int], List[int]]] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -752,8 +752,8 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
-    need_wait_for_image: bool = False
-    num_items_assigned: Optional[List] = None
+    need_wait_for_mm_inputs: bool = False
+    num_items_assigned: Optional[Dict[Union[str, int], List[int]]] = None
 
 
 @dataclass
