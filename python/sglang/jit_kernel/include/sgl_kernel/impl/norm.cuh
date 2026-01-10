@@ -21,7 +21,7 @@ inline constexpr bool is_config_supported() {
   if (kDim <= 256) {
     return (kDim == 64 || kDim == 128 || kDim == 256);
   } else {
-    return (kDim % 256 == 0 && kDim <= 4096);
+    return (kDim % 256 == 0 && kDim <= 8192);
   }
 }
 
@@ -85,10 +85,10 @@ SGL_DEVICE AlignedVector<PackedFloat, N> apply_norm_impl(
       const auto tx = threadIdx.x;
       const auto local_sum = tx < num_warps ? smem_buffer[tx] : 0.0f;
       sum_of_squares = warp::reduce_sum(local_sum);
-      smem_buffer[0] = math::rsqrt(sum_of_squares / kDim + eps);
+      smem_buffer[32] = math::rsqrt(sum_of_squares / kDim + eps);
     }
     __syncthreads();
-    norm_factor = smem_buffer[0];
+    norm_factor = smem_buffer[32];
   } else {
     norm_factor = math::rsqrt(sum_of_squares / kDim + eps);
   }
@@ -163,6 +163,6 @@ using StorageType = std::conditional_t<                    // storage type
 /**
  * \brief Minimum shared memory size (in bytes) required for cta norm.
  */
-inline constexpr uint32_t kSmemBufferSize = 32;
+inline constexpr uint32_t kSmemBufferSize = 33;
 
 }  // namespace device::norm

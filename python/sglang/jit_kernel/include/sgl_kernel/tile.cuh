@@ -12,11 +12,11 @@ struct Memory {
   SGL_DEVICE static constexpr Memory thread() {
     return Memory{0, 1};
   }
-  SGL_DEVICE static Memory warp(int nthreads = kWarpThreads) {
-    return Memory{threadIdx.x % nthreads, nthreads};
+  SGL_DEVICE static Memory warp(int warp_threads = kWarpThreads) {
+    return Memory{threadIdx.x % warp_threads, warp_threads};
   }
-  SGL_DEVICE static Memory cta() {
-    return Memory{threadIdx.x, blockDim.x};
+  SGL_DEVICE static Memory cta(int cta_threads = blockDim.x) {
+    return Memory{threadIdx.x, cta_threads};
   }
   SGL_DEVICE T load(const void* ptr, int64_t offset = 0) const {
     return static_cast<const T*>(ptr)[tid + offset * tsize];

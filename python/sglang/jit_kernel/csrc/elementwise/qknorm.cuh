@@ -1,14 +1,11 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/impl/norm.cuh>
-#include <sgl_kernel/math.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tile.cuh>
-#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
-#include <sgl_kernel/vec.cuh>
-#include <sgl_kernel/warp.cuh>
+
+#include <sgl_kernel/impl/norm.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -90,6 +87,7 @@ struct QKNormKernel {
     auto Sq = SymbolicSize{"q_stride"};
     auto Sk = SymbolicSize{"k_stride"};
     auto device = SymbolicDevice{};
+    D.set_value(kHeadDim);
     device.set_options<kDLCUDA>();
 
     TensorMatcher({N, Q, D})  // q input
@@ -111,8 +109,6 @@ struct QKNormKernel {
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     const auto num_qo_heads = static_cast<uint32_t>(Q.unwrap());
     const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
-    const auto head_dim = D.unwrap();
-    RuntimeCheck(head_dim == kHeadDim, "Wrong head_dim: ", head_dim, ". Expected:", kHeadDim);
 
     // NOTE: we offset the k here to reduce computation cost in the kernel
     const auto params = QKNormParams{

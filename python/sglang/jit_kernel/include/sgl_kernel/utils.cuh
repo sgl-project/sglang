@@ -39,7 +39,7 @@ template <bool kUsePDL>
 SGL_DEVICE void PDLWaitPrimary() {
 #ifndef USE_ROCM
   if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.wait;");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
   }
 #endif
 }
@@ -48,7 +48,7 @@ template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
 #ifndef USE_ROCM
   if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.launch_dependents;");
+    asm volatile("griddepcontrol.launch_dependents;" :::);
   }
 #endif
 }
