@@ -51,6 +51,7 @@ class TestSchedulerStatusLogger(CustomTestCase):
         time.sleep(2)
 
         events = list(_find_log_events(self.temp_dir, "scheduler.status"))
+        print(f"{events=}")
         self.assertGreater(len(events), 0, "scheduler.status event not found")
         data = events[0]
         for field in ["timestamp", "rank", "running_rids", "queued_rids"]:
