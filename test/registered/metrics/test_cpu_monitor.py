@@ -16,19 +16,17 @@ class TestCpuMonitor(unittest.TestCase):
         self.assertTrue(thread.is_alive())
         self.assertTrue(thread.daemon)
 
-        for _ in range(100000):
-            pass
+        end_time = time.monotonic() + 0.3
+        while time.monotonic() < end_time:
+            _ = sum(i * i for i in range(1000))
         time.sleep(0.2)
 
-        metrics = REGISTRY.collect()
-        print(f"{metrics=}")
-
         value = None
-        for metric in metrics:
+        for metric in REGISTRY.collect():
             for sample in metric.samples:
-                if "cpu_seconds" in sample.name and sample.labels.get("component") == "test":
-                    print(f"Found: {sample.name} = {sample.value}")
+                if sample.name == "sglang:process_cpu_seconds_total_total" and sample.labels.get("component") == "test":
                     value = sample.value
+        print(f"sglang:process_cpu_seconds_total_total = {value}")
         self.assertIsNotNone(value)
         self.assertGreater(value, 0)
 
