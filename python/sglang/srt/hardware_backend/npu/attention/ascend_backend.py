@@ -212,10 +212,15 @@ class AscendAttnBackend(AttentionBackend):
             self.q_head_dim = (
                 self.qk_rope_head_dim + model_runner.model_config.qk_nope_head_dim
             )
-            if hasattr(model_runner.model_config, "not_use_fused_infer_attention_score"):
+            if hasattr(
+                model_runner.model_config, "not_use_fused_infer_attention_score"
+            ):
                 self.not_use_fused_infer_attention_score = True
         else:
-            self.use_alibi = hasattr(model_runner.model_config, "use_alibi") and model_runner.model_config.use_alibi
+            self.use_alibi = (
+                hasattr(model_runner.model_config, "use_alibi")
+                and model_runner.model_config.use_alibi
+            )
         self.native_attn = TorchNativeAttnBackend(model_runner)
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
@@ -398,18 +403,22 @@ class AscendAttnBackend(AttentionBackend):
         slopes: torch.Tensor,
         num_heads: int,
         device: torch.device,
-        dtype: torch.dtype = torch.bfloat16
+        dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         position_point = torch.arange(seq_len) - seq_len + 1
-        position_point = position_point.unsqueeze(0).unsqueeze(0).expand(num_heads, -1, -1)
+        position_point = (
+            position_point.unsqueeze(0).unsqueeze(0).expand(num_heads, -1, -1)
+        )
         diag = torch.diag(position_point[0])
-        position_point = position_point - diag.unsqueeze(0).unsqueeze(0).transpose(-1, -2)
+        position_point = position_point - diag.unsqueeze(0).unsqueeze(0).transpose(
+            -1, -2
+        )
         position_point = position_point.to(device)
         alibi = slopes.unsqueeze(1).unsqueeze(1) * position_point
         alibi_bias = alibi.view(num_heads, 1, seq_len)
         alibi_bias = alibi_bias.to(device).to(dtype)
         return alibi_bias
-    
+
     def generate_alibi_bias(
         self,
         q_seq_len: int,
@@ -418,32 +427,47 @@ class AscendAttnBackend(AttentionBackend):
         num_heads: int,
         device: torch.device,
         is_extend: bool = True,
-        dtype: torch.dtype = torch.bfloat16
+        dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         if not hasattr(self, "alibi_bias") or self.alibi_bias is None:
-            MAX_LEN_ALB=5000
-            max_seq_len=max(kv_seq_len,q_seq_len)
-            max_seq_len=max(max_seq_len,MAX_LEN_ALB)
-            self.alibi_bias = self._generate_alibi_bias(max_seq_len,slopes,num_heads,device,dtype)
-            
+            MAX_LEN_ALB = 5000
+            max_seq_len = max(kv_seq_len, q_seq_len)
+            max_seq_len = max(max_seq_len, MAX_LEN_ALB)
+            self.alibi_bias = self._generate_alibi_bias(
+                max_seq_len, slopes, num_heads, device, dtype
+            )
+
         if not hasattr(self, "super_mask") or self.super_mask is None:
-            MAX_LEN_ALB=5000
-            max_seq_len=max(kv_seq_len,q_seq_len)
-            max_seq_len=max(max_seq_len,MAX_LEN_ALB)
+            MAX_LEN_ALB = 5000
+            max_seq_len = max(kv_seq_len, q_seq_len)
+            max_seq_len = max(max_seq_len, MAX_LEN_ALB)
             super_mask = torch.ones(size=(1, max_seq_len, max_seq_len), dtype=dtype)
             super_mask = super_mask.float().fill_(float("-inf")).type_as(super_mask)
             super_mask = torch.triu(super_mask, 1).to(device)
             self.super_mask = super_mask
         if is_extend:
-            return self.alibi_bias[:, :q_seq_len, :kv_seq_len] + self.super_mask[:, :q_seq_len, :kv_seq_len]
+            return (
+                self.alibi_bias[:, :q_seq_len, :kv_seq_len]
+                + self.super_mask[:, :q_seq_len, :kv_seq_len]
+            )
         else:
             return self.alibi_bias[:, :q_seq_len, :kv_seq_len]
 
-        
-    
-    def attn_alibi(self,q,k_cache,v_cache,block_tables,seq_lens,query_lens,scale_value,num_heads,slopes,is_extend):
-        curr=0
-        num_prompts=query_lens.shape[0]
+    def attn_alibi(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        query_lens,
+        scale_value,
+        num_heads,
+        slopes,
+        is_extend,
+    ):
+        curr = 0
+        num_prompts = query_lens.shape[0]
         head_size = k_cache.shape[3]
         head_size_v = v_cache.shape[3]
         block_size = k_cache.shape[1]
@@ -452,30 +476,29 @@ class AscendAttnBackend(AttentionBackend):
             seq_len = seq_lens[i].item()
             block_table = block_tables[i]
 
-            j= torch.arange(seq_len,device=block_table.device)
+            j = torch.arange(seq_len, device=block_table.device)
 
             block_number = block_table[j // block_size]
             block_offset = j % block_size
 
-            k = k_cache[block_number,block_offset]
-            v = v_cache[block_number,block_offset]
+            k = k_cache[block_number, block_offset]
+            v = v_cache[block_number, block_offset]
             k = k.view(seq_len, num_heads, head_size)
             v = v.view(seq_len, num_heads, head_size_v)
-            
+
             if is_extend:
                 q_len = query_lens[i].item()
-                querys = q[curr :curr + q_len]
-                assert q_len==seq_len, "Warning: Q sequence length is not consistant with KV sequence length during Prefill phase."
+                query = q[curr : curr + q_len]
             else:
                 q_len = 1
-                querys = q[curr :curr + 1]
-            
-            querys = querys.to(torch.float32)
-            querys = querys * scale_value
-            querys = querys.permute(1, 0, 2)
+                query = q[curr : curr + 1]
+
+            query = query.to(torch.float32)
+            query = query * scale_value
+            query = query.permute(1, 0, 2)
             k = k.permute(1, 2, 0)
 
-            score = torch.bmm(querys, k)
+            score = torch.bmm(query, k)
             score = score.to(torch.float32)
             if slopes is not None:
                 alibi_bias = self.generate_alibi_bias(
@@ -485,14 +508,12 @@ class AscendAttnBackend(AttentionBackend):
                     num_heads=num_heads,
                     device=q.device,
                     is_extend=is_extend,
-                    dtype=querys.dtype
+                    dtype=query.dtype,
                 )
                 score = score + alibi_bias
-            score = torch.max(
-                score, torch.tensor(torch.finfo(score.dtype).min)
-            )
+            score = torch.max(score, torch.tensor(torch.finfo(score.dtype).min))
             p = torch.nn.functional.softmax(score, dim=-1)
-            v = v.permute(1,0,2)
+            v = v.permute(1, 0, 2)
             out = torch.bmm(p, v)
             out = out.permute(1, 0, 2)
             out = out.reshape(-1, num_heads * head_size_v)
@@ -501,7 +522,7 @@ class AscendAttnBackend(AttentionBackend):
         attn_output = torch.cat(attn_output, dim=0).to(q.dtype).to(q.device)
         attn_output = attn_output.view(-1, num_heads * head_size)
         return attn_output
-    
+
     def do_cp_balance_attn(
         self,
         q_nope,
@@ -690,7 +711,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
-        slopes:  Optional[torch.Tensor] = None,
+        slopes: Optional[torch.Tensor] = None,
     ):
         if topk_indices is not None:
             return self.forward_sparse(
@@ -805,7 +826,7 @@ class AscendAttnBackend(AttentionBackend):
                             scale_value=layer.scaling,
                             num_heads=layer.tp_q_head_num,
                             slopes=slopes,
-                            is_extend=True
+                            is_extend=True,
                         )
                 else:
                     if layer.qk_head_dim != layer.v_head_dim:
@@ -951,8 +972,12 @@ class AscendAttnBackend(AttentionBackend):
                     data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
                 ]
 
-                q_nope, q_rope = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
-                k_nope, k_rope = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
+                q_nope, q_rope = q.split(
+                    [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+                )
+                k_nope, k_rope = k.split(
+                    [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+                )
 
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     q_nope,
@@ -970,7 +995,9 @@ class AscendAttnBackend(AttentionBackend):
                     next_tokens=0,
                 )
 
-                attn_output = attn_output.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+                attn_output = attn_output.reshape(
+                    -1, layer.tp_q_head_num, layer.v_head_dim
+                )
                 if num_token_padding != forward_batch.num_token_non_padded_cpu:
                     attn_output = torch.cat(
                         [
@@ -983,48 +1010,58 @@ class AscendAttnBackend(AttentionBackend):
                         dim=0,
                     )
             else:
-                kv_lora_rank = k.shape[-1]-self.qk_rope_head_dim
+                kv_lora_rank = k.shape[-1] - self.qk_rope_head_dim
                 kv_c, k_rope = k.split([kv_lora_rank, self.qk_rope_head_dim], dim=-1)
                 if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, forward_batch.out_cache_loc, kv_c, k_rope)
-                attn_output = q.new_empty((q.shape[0], layer.tp_q_head_num, kv_lora_rank))
-                use_gqa = (layer.tp_q_head_num != layer.tp_k_head_num)
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, forward_batch.out_cache_loc, kv_c, k_rope
+                    )
+                attn_output = q.new_empty(
+                    (q.shape[0], layer.tp_q_head_num, kv_lora_rank)
+                )
+                use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
                 q = q.movedim(0, q.dim() - 2)
                 k = k.movedim(0, q.dim() - 2)
                 v = v.movedim(0, q.dim() - 2)
                 k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
+                    layer.layer_id
+                )
 
-                curr=0
+                curr = 0
                 head_size = k_cache.shape[3]
                 head_size_v = v_cache.shape[3]
                 block_size = k_cache.shape[1]
                 for i in range(forward_batch.seq_lens_cpu.shape[0]):
                     q_len = forward_batch.extend_seq_lens[i]
-                    q_ = q[:, curr:curr + q_len, :]
+                    q_ = q[:, curr : curr + q_len, :]
 
                     block_table = self.forward_metadata.block_tables[i]
                     j = torch.arange(q_len, device=block_table.device)
                     block_number = block_table[j // block_size]
                     block_offset = j % block_size
 
-                    k_ = k_cache[block_number,block_offset]
-                    v_ = v_cache[block_number,block_offset]
+                    k_ = k_cache[block_number, block_offset]
+                    v_ = v_cache[block_number, block_offset]
                     k_ = k_.view(q_len, layer.tp_k_head_num, head_size)
                     v_ = v_.view(q_len, layer.tp_k_head_num, head_size_v)
 
                     k_kpe = torch.cat([k_, v_], dim=-1).transpose(0, 1)
-                    o_ = torch.nn.functional.scaled_dot_product_attention(
-                        q_.unsqueeze(0),
-                        k_kpe.unsqueeze(0),
-                        v.unsqueeze(0),
-                        enable_gqa=use_gqa,
-                        scale=layer.scaling,
-                        is_causal=True,
-                    ).squeeze(0).movedim(0, q.dim() - 2)
+                    o_ = (
+                        torch.nn.functional.scaled_dot_product_attention(
+                            q_.unsqueeze(0),
+                            k_kpe.unsqueeze(0),
+                            v.unsqueeze(0),
+                            enable_gqa=use_gqa,
+                            scale=layer.scaling,
+                            is_causal=True,
+                        )
+                        .squeeze(0)
+                        .movedim(0, q.dim() - 2)
+                    )
 
-                    attn_output[curr: curr + q_len, :, :] = o_
+                    attn_output[curr : curr + q_len, :, :] = o_
                     curr += q_len
 
         return attn_output
@@ -1401,7 +1438,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
-        slopes:  Optional[torch.Tensor] = None,
+        slopes: Optional[torch.Tensor] = None,
     ):
         if is_mla_preprocess_enabled():
             # MLAPO does saving kv_cache
@@ -1468,7 +1505,7 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
                 )
-            else:
+            elif layer.logit_cap == 0:
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
                 if not self.use_alibi:
@@ -1496,11 +1533,11 @@ class AscendAttnBackend(AttentionBackend):
                         v_cache=v_cache,
                         block_tables=self.forward_metadata.block_tables,
                         seq_lens=self.forward_metadata.seq_lens_cpu_int,
-                        query_lens=torch.ones(num_tokens,dtype=torch.int32),
+                        query_lens=torch.ones(num_tokens, dtype=torch.int32),
                         scale_value=layer.scaling,
                         num_heads=layer.tp_q_head_num,
                         slopes=slopes,
-                        is_extend=False
+                        is_extend=False,
                     )
             else:
                 if layer.qk_head_dim != layer.v_head_dim:

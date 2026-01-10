@@ -29,7 +29,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -47,6 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_npu
+
 _is_npu = is_npu()
 
 
@@ -174,8 +174,10 @@ class BaiChuanAttention(nn.Module):
             head_start = tp_rank * self.num_heads
             head_end = (tp_rank + 1) * self.num_heads
             alibi_slopes = _get_alibi_slopes(self.total_num_heads)
-            alibi_slopes = alibi_slopes[head_start: head_end]
-            self.alibi_slopes = torch.tensor(alibi_slopes, dtype=dtype, device="npu" if _is_npu else "cuda")
+            alibi_slopes = alibi_slopes[head_start:head_end]
+            self.alibi_slopes = torch.tensor(
+                alibi_slopes, dtype=dtype, device="npu" if _is_npu else "cuda"
+            )
 
             self.attn = RadixAttention(
                 self.num_heads,
@@ -217,7 +219,7 @@ class BaiChuanAttention(nn.Module):
             attn_output = self.attn(q, k, v, forward_batch)
         else:
             attn_output = self.attn(q, k, v, forward_batch, slopes=self.alibi_slopes)
-            
+
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -301,7 +303,7 @@ class BaiChuanModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
-            prefix=add_prefix("embed_tokens",prefix),
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = nn.ModuleList(
             [
@@ -340,15 +342,9 @@ class BaiChuanModel(nn.Module):
 class BaiChuanBaseForCausalLM(nn.Module):
     packed_modules_mapping = {
         "W_pack": ["W_pack"],
-        "gate_proj": [
-            "gate_proj"
-        ],
-        "up_proj": [
-            "up_proj"
-        ],
-        "down_proj": [
-            "down_proj"
-        ],
+        "gate_proj": ["gate_proj"],
+        "up_proj": ["up_proj"],
+        "down_proj": ["down_proj"],
     }
     # LoRA specific attributes
     supported_lora_modules = [
@@ -358,7 +354,9 @@ class BaiChuanBaseForCausalLM(nn.Module):
         "up_proj",
         "down_proj",
     ]
-    embedding_modules = {"embed_tokens":["embed_tokens"],}
+    embedding_modules = {
+        "embed_tokens": ["embed_tokens"],
+    }
     embedding_padding_modules = []
 
     def __init__(
