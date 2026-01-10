@@ -150,6 +150,7 @@ from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
+    create_scheduler_init_watchdog,
     create_scheduler_watchdog,
 )
 from sglang.srt.managers.scheduler_update_weights_mixin import (
@@ -257,6 +258,10 @@ class Scheduler(
         pp_rank: int,
         dp_rank: Optional[int],
     ):
+        self._initializing = True
+        self._init_counter = 0
+        self.soft_watchdog = create_scheduler_init_watchdog(self, server_args)
+
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
@@ -366,6 +371,8 @@ class Scheduler(
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+        self._initializing = False
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -798,10 +805,6 @@ class Scheduler(
         self.watchdog = create_scheduler_watchdog(
             self, watchdog_timeout=self.server_args.watchdog_timeout
         )
-        if (x := self.server_args.soft_watchdog_timeout) is not None:
-            self.soft_watchdog = create_scheduler_watchdog(
-                self, watchdog_timeout=x, soft=True
-            )
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
