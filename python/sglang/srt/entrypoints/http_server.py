@@ -133,11 +133,21 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.srt.model_loader.inter_node_transfer_engine_comm import (
+    cleanup_transfer_engine_info_comm,
+    get_transfer_engine_info_client,
+    init_transfer_engine_info_client,
+)
+from sglang.srt.model_loader.node_registry import NodeRegistry
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import (
+    INTER_NODE_TRANSFER_ENGINE_INFO_PORT_DELTA,
+    PortArgs,
+    ServerArgs,
+)
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
     add_api_key_middleware,
@@ -174,6 +184,7 @@ class _GlobalState:
     #         )
     # }
     remote_instance_transfer_engine_info: Optional[Dict] = None
+    node_registry: Optional[NodeRegistry] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -438,6 +449,20 @@ async def validate_json_request(raw_request: Request):
                 }
             ]
         )
+
+
+def _get_target_node_zmq_port(target_node, server_args) -> int:
+    """
+    Calculate the expected ZMQ port for inter-node transfer engine info communication
+    on the target node, taking into account custom port configurations.
+    """
+    # If the user specified a custom inter-node transfer engine info port,
+    # we assume all nodes in the cluster use the same custom port
+    if server_args.inter_node_transfer_engine_info_port is not None:
+        return server_args.inter_node_transfer_engine_info_port
+
+    # Otherwise, use the default calculation: target node's HTTP port + delta
+    return target_node.port + INTER_NODE_TRANSFER_ENGINE_INFO_PORT_DELTA
 
 
 ##### Native API endpoints #####
@@ -852,26 +877,91 @@ async def send_weights_to_remote_instance(
 
 @app.get("/get_remote_instance_transfer_engine_info")
 async def get_remote_instance_transfer_engine_info(rank: int = None):
+    """
+    Get remote instance transfer engine info for a given rank.
+
+    This endpoint supports cross-node requests using ZMQ communication - if the requested rank
+    is not available locally, it will automatically communicate with the appropriate node
+    via ZMQ to retrieve the information.
+    """
     if rank is None or rank < 0:
         return Response(status_code=HTTPStatus.BAD_REQUEST)
 
+    # Validate rank is within valid range
+    if (
+        _global_state.node_registry
+        and not _global_state.node_registry.validate_tp_rank(rank)
+    ):
+        logger.error(
+            f"Invalid tp_rank {rank}, must be 0 <= rank < {_global_state.node_registry.server_args.tp_size}"
+        )
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+    # Check if we have any remote instance transfer engine info
     if (
         _global_state.remote_instance_transfer_engine_info is None
         or len(_global_state.remote_instance_transfer_engine_info) == 0
     ):
+        logger.error("No remote instance transfer engine info available")
         return Response(status_code=HTTPStatus.BAD_REQUEST)
 
     try:
-        result = {
-            "rank": rank,
-            "remote_instance_transfer_engine_info": _global_state.remote_instance_transfer_engine_info[
-                rank
-            ],
-        }
-        return result
+        # First, try to serve locally
+        if rank in _global_state.remote_instance_transfer_engine_info:
+            logger.info(f"Serving rank {rank} locally")
+            result = {
+                "rank": rank,
+                "remote_instance_transfer_engine_info": _global_state.remote_instance_transfer_engine_info[
+                    rank
+                ],
+            }
+            return result
+
+        # If not available locally, use ZMQ to communicate with appropriate node
+        if _global_state.node_registry is None:
+            logger.error("Node registry not available for cross-node communication")
+            return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+        target_node = _global_state.node_registry.get_node_for_rank(rank)
+        if target_node is None:
+            logger.error(f"No node found for rank {rank}")
+            return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+        # Use ZMQ communication instead of HTTP forwarding
+        zmq_port = _get_target_node_zmq_port(
+            target_node, _global_state.tokenizer_manager.server_args
+        )
+        logger.info(
+            f"Using ZMQ to request rank {rank} from node {target_node.node_rank} "
+            f"at {target_node.host}:{zmq_port}"
+        )
+
+        # Initialize ZMQ client if not already done
+        client = get_transfer_engine_info_client()
+        if client is None:
+            client = init_transfer_engine_info_client()
+
+        # Request transfer engine info via ZMQ
+        transfer_engine_info = client.get_transfer_engine_info(
+            target_node.host, zmq_port, rank
+        )
+
+        if transfer_engine_info is not None:
+            result = {
+                "rank": rank,
+                "remote_instance_transfer_engine_info": transfer_engine_info,
+            }
+            logger.info(f"Successfully retrieved rank {rank} info via ZMQ")
+            return result
+        else:
+            logger.error(f"Failed to get transfer engine info for rank {rank} via ZMQ")
+            return Response(status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
     except Exception as e:
-        logger.error(f"Exception: {e}")
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
+        logger.error(
+            f"Failed to get remote instance transfer engine info for rank {rank}: {e}"
+        )
+        return Response(status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
 
 @app.post("/init_weights_update_group")
@@ -1702,6 +1792,19 @@ def launch_server(
         parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos)
     )
 
+    # Initialize node registry for cross-node communication
+    node_registry = None
+    try:
+        if server_args.nnodes > 1:
+            logger.info(f"Initializing node registry for {server_args.nnodes} nodes")
+            node_registry = NodeRegistry(server_args)
+            logger.info("Node registry initialized successfully")
+        else:
+            logger.info("Single node setup, skipping node registry initialization")
+    except Exception as e:
+        logger.error(f"Failed to initialize node registry: {e}")
+        # Don't fail the startup, just log the error
+
     # Set global states
     set_global_state(
         _GlobalState(
@@ -1709,6 +1812,7 @@ def launch_server(
             template_manager=template_manager,
             scheduler_info=scheduler_infos[0],
             remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
+            node_registry=node_registry,
         )
     )
 
@@ -1780,3 +1884,4 @@ def launch_server(
         if server_args.tokenizer_worker_num > 1:
             multi_tokenizer_args_shm.unlink()
             _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+        cleanup_transfer_engine_info_comm()

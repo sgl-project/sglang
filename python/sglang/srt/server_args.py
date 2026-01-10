@@ -277,6 +277,9 @@ class ServerArgs:
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
+    inter_node_transfer_engine_info_port: Optional[int] = (
+        None  # Port for ZMQ inter-node transfer engine info communication
+    )
     checkpoint_engine_wait_weights_before_ready: bool = False
 
     # Quantization and data type
@@ -384,6 +387,9 @@ class ServerArgs:
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
+    node_hosts: Optional[str] = (
+        None  # Cross-node communication addresses: "host1:port1,host2:port2,..."
+    )
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
@@ -2655,6 +2661,13 @@ class ServerArgs:
             help="The port for NCCL distributed environment setup. Defaults to a random port.",
         )
         parser.add_argument(
+            "--inter-node-transfer-engine-info-port",
+            type=int,
+            default=ServerArgs.inter_node_transfer_engine_info_port,
+            help="The port for inter-node transfer engine info communication via ZMQ in multi-node setups. "
+            "Defaults to main port + 500 if not specified.",
+        )
+        parser.add_argument(
             "--checkpoint-engine-wait-weights-before-ready",
             action="store_true",
             help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
@@ -3269,6 +3282,16 @@ class ServerArgs:
         )
         parser.add_argument(
             "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
+        )
+        parser.add_argument(
+            "--node-hosts",
+            type=str,
+            default=ServerArgs.node_hosts,
+            help=(
+                "A string representing a mapping of node_rank to node_address for "
+                "cross-node communication, e.g., '{0:host1, 1:host2}'. "
+                "If not provided, the system will attempt automatic discovery."
+            ),
         )
 
         # Model override args
@@ -5063,6 +5086,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 ZMQ_TCP_PORT_DELTA = 233
 DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
+INTER_NODE_TRANSFER_ENGINE_INFO_PORT_DELTA = 500
 
 
 @dataclasses.dataclass
@@ -5085,6 +5109,9 @@ class PortArgs:
 
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
+
+    # The port for inter-node transfer engine info communication (ZMQ)
+    inter_node_transfer_engine_info_port: Optional[int] = None
 
     @staticmethod
     def init_new(
@@ -5142,6 +5169,15 @@ class PortArgs:
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_ipc_name = port_base + 3
+            # Add inter-node transfer engine info port for multi-node communication
+            if server_args.inter_node_transfer_engine_info_port is not None:
+                inter_node_transfer_engine_info_port = (
+                    server_args.inter_node_transfer_engine_info_port
+                )
+            else:
+                inter_node_transfer_engine_info_port = (
+                    server_args.port + INTER_NODE_TRANSFER_ENGINE_INFO_PORT_DELTA
+                )
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -5157,6 +5193,12 @@ class PortArgs:
                     wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_ipc_name, "metrics_ipc_name")
+                    # Check inter-node transfer engine info port availability for multi-node setups
+                    if server_args.nnodes > 1:
+                        wait_port_available(
+                            inter_node_transfer_engine_info_port,
+                            "inter_node_transfer_engine_info_port",
+                        )
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
@@ -5175,6 +5217,11 @@ class PortArgs:
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                inter_node_transfer_engine_info_port=(
+                    inter_node_transfer_engine_info_port
+                    if server_args.nnodes > 1
+                    else None
+                ),
             )
 
 
