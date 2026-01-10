@@ -1215,7 +1215,7 @@ class DenoisingStage(PipelineStage):
             timestep=timestep,
             guidance=guidance,
             **kwargs,
-        ).float()
+        )
 
     def _predict_noise_with_cfg(
         self,

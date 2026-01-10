@@ -769,7 +769,10 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         if not return_dict:
             return (output,)
-        return output
+
+        return output.float()
+        # float()
+        # reference: https://github.com/zRzRzRzRzRzRzR/diffusers/blob/6cfc83b4abc5b083fef56a18ec4700f48ba3aaba/src/diffusers/pipelines/glm_image/pipeline_glm_image.py#L737
 
 
 EntryClass = GlmImageTransformer2DModel

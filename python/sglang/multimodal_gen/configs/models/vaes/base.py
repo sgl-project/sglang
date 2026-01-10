@@ -14,17 +14,11 @@ from sglang.multimodal_gen.utils import StoreBoolean
 
 @dataclass
 class VAEArchConfig(ArchConfig):
-    scaling_factor: float | torch.Tensor = 0.18215
+    scaling_factor: float | torch.Tensor = 0
 
     temporal_compression_ratio: int = 4
     # or vae_scale_factor?
     spatial_compression_ratio: int = 8
-
-    latents_mean: tuple[float, ...] | None = None
-    latents_std: tuple[float, ...] | None = None
-    shift_factor: float | None = None
-    latent_channels: int = 16
-    in_channels: int = 16
 
 
 @dataclass

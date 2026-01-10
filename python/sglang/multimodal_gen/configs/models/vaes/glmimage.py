@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
+import torch
+
 from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAEConfig
 
 
@@ -26,6 +28,14 @@ class GlmImageVAEArchConfig(VAEArchConfig):
     scale_factor_temporal: int = 4
     scale_factor_spatial: int = 8
     clip_output: bool = True
+
+    scaling_factor: float | torch.Tensor = 0
+
+    latents_mean: tuple[float, ...] | None = None
+    latents_std: tuple[float, ...] | None = None
+    shift_factor: float | None = None
+    latent_channels: int = 16
+    in_channels: int = 16
 
 
 @dataclass

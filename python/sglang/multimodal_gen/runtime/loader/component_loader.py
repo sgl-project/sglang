@@ -603,7 +603,6 @@ class VAELoader(ComponentLoader):
     ):
         """Load the VAE based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
-
         class_name = config.pop("_class_name", None)
         assert (
             class_name is not None
