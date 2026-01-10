@@ -271,9 +271,7 @@ class SchedulerMetricsCollector:
         self,
         labels: Dict[str, str],
         enable_lora: bool = False,
-        prefill_delayer_max_delay_passes: int = 30,
-        prefill_delayer_forward_passes_buckets: Optional[List[float]] = None,
-        prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None,
+        server_args: Optional["ServerArgs"] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Gauge, Histogram, Summary
@@ -764,13 +762,14 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
         )
 
+        max_delay = getattr(server_args, "prefill_delayer_max_delay_passes", 30)
         self.prefill_delayer_wait_forward_passes = Histogram(
             name="sglang:prefill_delayer_wait_forward_passes",
             documentation="Histogram of forward passes waited by prefill delayer.",
             labelnames=labels.keys(),
             buckets=sorted(
-                set(prefill_delayer_forward_passes_buckets or [0, 1, 2, 3, 5, 8, 12, 18, 25])
-                | {0, prefill_delayer_max_delay_passes - 1}
+                set(getattr(server_args, "prefill_delayer_forward_passes_buckets", None) or [0, 1, 2, 3, 5, 8, 12, 18, 25])
+                | {0, max_delay - 1}
             ),
         )
         self.prefill_delayer_wait_seconds = Histogram(
@@ -778,7 +777,7 @@ class SchedulerMetricsCollector:
             documentation="Histogram of wait time in seconds by prefill delayer.",
             labelnames=labels.keys(),
             buckets=sorted(
-                set(prefill_delayer_wait_seconds_buckets or [0, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500])
+                set(getattr(server_args, "prefill_delayer_wait_seconds_buckets", None) or [0, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500])
                 | {0}
             ),
         )
