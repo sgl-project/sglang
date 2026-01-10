@@ -73,5 +73,40 @@ class TestSoftWatchdogTokenizer(BaseTestSoftWatchdog, CustomTestCase):
     expected_message = "TokenizerManager watchdog timeout"
 
 
+class TestSoftWatchdogSchedulerInit(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.stdout = io.StringIO()
+        cls.stderr = io.StringIO()
+        cls.process = None
+
+        with envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.override(30):
+            try:
+                cls.process = popen_launch_server(
+                    "Qwen/Qwen3-0.6B",
+                    DEFAULT_URL_FOR_TEST,
+                    timeout=60,
+                    other_args=[
+                        "--soft-watchdog-timeout",
+                        "20",
+                        "--skip-server-warmup",
+                    ],
+                    return_stdout_stderr=(cls.stdout, cls.stderr),
+                )
+            except TimeoutError:
+                pass
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.process:
+            kill_process_tree(cls.process.pid)
+        cls.stdout.close()
+        cls.stderr.close()
+
+    def test_watchdog_triggers(self):
+        combined_output = self.stdout.getvalue() + self.stderr.getvalue()
+        self.assertIn("Scheduler watchdog timeout", combined_output)
+
+
 if __name__ == "__main__":
     unittest.main()
