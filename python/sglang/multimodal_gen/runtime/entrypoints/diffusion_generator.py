@@ -11,7 +11,7 @@ diffusion models.
 import multiprocessing as mp
 import os
 import time
-from typing import Any
+from typing import Any, List, Union
 
 import numpy as np
 
@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
+    format_lora_message,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
@@ -317,23 +318,25 @@ class DiffGenerator:
 
     def set_lora(
         self,
-        lora_nickname: str,
-        lora_path: str | None = None,
-        target: str = "all",
-        strength: float = 1.0,
+        lora_nickname: Union[str, List[str]],
+        lora_path: Union[str, None, List[Union[str, None]]] = None,
+        target: Union[str, List[str]] = "all",
+        strength: Union[float, List[float]] = 1.0,
     ) -> None:
         """
-        Set a LoRA adapter for the specified transformer(s).
+        Set LoRA adapter(s) for the specified transformer(s).
+        Supports both single LoRA (backward compatible) and multiple LoRA adapters.
 
         Args:
-            lora_nickname: The nickname of the adapter.
-            lora_path: Path to the LoRA adapter.
-            target: Which transformer(s) to apply the LoRA to. One of:
+            lora_nickname: The nickname(s) of the adapter(s). Can be a string or a list of strings.
+            lora_path: Path(s) to the LoRA adapter(s). Can be a string, None, or a list of strings/None.
+            target: Which transformer(s) to apply the LoRA to. Can be a string or a list of strings.
+                Valid values:
                 - "all": Apply to all transformers (default)
                 - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model
-            strength: LoRA strength for merge, default 1.0.
+            strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
         """
         req = SetLoraReq(
             lora_nickname=lora_nickname,
@@ -341,9 +344,13 @@ class DiffGenerator:
             target=target,
             strength=strength,
         )
+        nickname_str, target_str, strength_str = format_lora_message(
+            lora_nickname, target, strength
+        )
+
         self._send_lora_request(
             req,
-            f"Successfully set LoRA adapter: {lora_nickname} (target: {target}, strength: {strength})",
+            f"Successfully set LoRA adapter(s): {nickname_str} (target: {target_str}, strength: {strength_str})",
             "Failed to set LoRA adapter",
         )
 

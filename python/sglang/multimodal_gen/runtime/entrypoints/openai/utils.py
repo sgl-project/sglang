@@ -24,10 +24,10 @@ logger = init_logger(__name__)
 
 @dataclasses.dataclass
 class SetLoraReq:
-    lora_nickname: str
-    lora_path: Optional[str] = None
-    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
-    strength: float = 1.0  # LoRA strength for merge, default 1.0
+    lora_nickname: Union[str, List[str]]
+    lora_path: Optional[Union[str, List[Optional[str]]]] = None
+    target: Union[str, List[str]] = "all"
+    strength: Union[float, List[float]] = 1.0  # LoRA strength for merge, default 1.0
 
 
 @dataclasses.dataclass
@@ -45,6 +45,31 @@ class UnmergeLoraWeightsReq:
 class ListLorasReq:
     # Empty payload; used only as a type marker for listing LoRA status
     pass
+
+
+def format_lora_message(
+    lora_nickname: Union[str, List[str]],
+    target: Union[str, List[str]],
+    strength: Union[float, List[float]],
+) -> tuple[str, str, str]:
+    """Format success message for single or multiple LoRAs"""
+    if isinstance(lora_nickname, list):
+        nickname_str = ", ".join(lora_nickname)
+        target_str = ", ".join(target) if isinstance(target, list) else target
+        strength_str = (
+            ", ".join(f"{s:.2f}" for s in strength)
+            if isinstance(strength, list)
+            else f"{strength:.2f}"
+        )
+    else:
+        nickname_str = lora_nickname
+        target_str = target if isinstance(target, str) else ", ".join(target)
+        strength_str = (
+            f"{strength:.2f}"
+            if isinstance(strength, (int, float))
+            else ", ".join(f"{s:.2f}" for s in strength)
+        )
+    return nickname_str, target_str, strength_str
 
 
 def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
