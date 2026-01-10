@@ -11,8 +11,8 @@ from sglang.srt.utils import get_compiler_backend
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.dflash_info import DFlashDraftInput
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -71,7 +71,7 @@ class FutureMap:
 
     def _is_dflash_input(self, draft_input) -> bool:
         """Check if the draft input is DFlash type."""
-        return hasattr(draft_input, 'block_size') and not hasattr(draft_input, 'topk_p')
+        return hasattr(draft_input, "block_size") and not hasattr(draft_input, "topk_p")
 
     def _lazy_init_buf(self, draft_input: Union["EagleDraftInput", "DFlashDraftInput"]):
         self.buf_initialized = True
@@ -123,13 +123,17 @@ class FutureMap:
         # DFlash only needs verified_id in FutureMap
         # Hidden states are managed in worker's per-request state (different shape than EAGLE)
         verified_id0 = draft_input.verified_id[0]
-        
+
         self.verified_id_buf = torch.empty(
-            (self.future_buffer_len, *verified_id0.shape) if verified_id0.dim() > 0 else (self.future_buffer_len,),
+            (
+                (self.future_buffer_len, *verified_id0.shape)
+                if verified_id0.dim() > 0
+                else (self.future_buffer_len,)
+            ),
             dtype=verified_id0.dtype,
             device=self.device,
         )
-        
+
         # Don't allocate hidden_states_buf for DFlash - it has per-token shape, not per-batch
         self.hidden_states_buf = None
 
@@ -151,7 +155,7 @@ class FutureMap:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             indices = draft_input.future_indices.indices
-            
+
             if self._is_dflash_input(draft_input):
                 # DFlash only needs verified_id from FutureMap
                 # Hidden states are managed in worker's per-request state
@@ -183,7 +187,9 @@ class FutureMap:
             self.store_to_map_for_new_batch(future_indices, draft_input)
 
     def store_to_map_for_new_batch(
-        self, future_indices: FutureIndices, draft_input: Union["EagleDraftInput", "DFlashDraftInput"]
+        self,
+        future_indices: FutureIndices,
+        draft_input: Union["EagleDraftInput", "DFlashDraftInput"],
     ):
         intv = future_indices.interval
         if self.is_empty_slice(intv):

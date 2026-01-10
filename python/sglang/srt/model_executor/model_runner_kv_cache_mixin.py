@@ -106,25 +106,29 @@ class ModelRunnerKVCacheMixin:
                     * len(self.model_config.swa_attention_layer_ids)
                     * kv_size
                 )
-        
+
         # Add DFlash hidden state buffer size per token (TARGET worker only)
         # Hidden states are stored at the same indices as KV cache for prefix caching
         # Draft worker doesn't need hidden buffer - it uses target model's hidden states
         if (
-            hasattr(self, 'server_args') 
-            and self.server_args.speculative_algorithm 
-            and self.server_args.speculative_algorithm.upper() == 'DFLASH'
-            and not getattr(self, 'is_draft_worker', False)  # Only for target worker
+            hasattr(self, "server_args")
+            and self.server_args.speculative_algorithm
+            and self.server_args.speculative_algorithm.upper() == "DFLASH"
+            and not getattr(self, "is_draft_worker", False)  # Only for target worker
         ):
             # DFlash stores FC-compressed hidden states for target layers
             # Default: 5 target layers, hidden_size per layer
-            num_target_layers = self.server_args.speculative_dflash_num_target_layers or 5
+            num_target_layers = (
+                self.server_args.speculative_dflash_num_target_layers or 5
+            )
             hidden_size = self.model_config.hf_config.hidden_size
             hidden_state_size = hidden_size * num_target_layers * kv_size
             cell_size += hidden_state_size
-            logger.info(f"[DFlash] Adding {hidden_state_size} bytes per token for hidden buffer "
-                       f"({num_target_layers} layers × {hidden_size} hidden_size)")
-        
+            logger.info(
+                f"[DFlash] Adding {hidden_state_size} bytes per token for hidden buffer "
+                f"({num_target_layers} layers × {hidden_size} hidden_size)"
+            )
+
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):
@@ -582,14 +586,16 @@ class ModelRunnerKVCacheMixin:
                     dflash_hidden_size = 0
                     dflash_num_target_layers = 0
                     if (
-                        hasattr(self, 'server_args') 
-                        and self.server_args.speculative_algorithm 
-                        and self.server_args.speculative_algorithm.upper() == 'DFLASH'
-                        and not getattr(self, 'is_draft_worker', False)
+                        hasattr(self, "server_args")
+                        and self.server_args.speculative_algorithm
+                        and self.server_args.speculative_algorithm.upper() == "DFLASH"
+                        and not getattr(self, "is_draft_worker", False)
                     ):
-                        dflash_num_target_layers = self.server_args.speculative_dflash_num_target_layers or 5
+                        dflash_num_target_layers = (
+                            self.server_args.speculative_dflash_num_target_layers or 5
+                        )
                         dflash_hidden_size = self.model_config.hf_config.hidden_size
-                    
+
                     self.token_to_kv_pool = MHATokenToKVPool(
                         self.max_total_num_tokens,
                         page_size=self.page_size,

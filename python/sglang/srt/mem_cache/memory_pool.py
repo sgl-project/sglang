@@ -932,20 +932,20 @@ class MHATokenToKVPool(KVCache):
     ):
         """
         Enable hidden state buffer for DFlash after pool creation.
-        
+
         This allows the hidden buffer to be created after the draft model is loaded
         and we know the actual hidden size and number of target layers.
-        
+
         Args:
             hidden_size: Size of hidden states per target layer
             num_target_layers: Number of target layers to store
         """
         if self.hidden_buffer is not None:
             return  # Already enabled
-        
+
         self.dflash_hidden_size = hidden_size
         self.dflash_num_target_layers = num_target_layers
-        
+
         # Create hidden buffer with same size as KV cache
         self.hidden_buffer = [
             torch.zeros(
@@ -1037,7 +1037,9 @@ class MHATokenToKVPool(KVCache):
         """
         if self.hidden_buffer is None:
             return None
-        layer_hidden = [self.hidden_buffer[i][loc] for i in range(len(self.hidden_buffer))]
+        layer_hidden = [
+            self.hidden_buffer[i][loc] for i in range(len(self.hidden_buffer))
+        ]
         return torch.cat(layer_hidden, dim=-1)
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):

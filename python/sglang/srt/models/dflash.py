@@ -27,11 +27,11 @@ from torch import nn
 
 class RMSNorm3D(nn.Module):
     """RMSNorm that works with 3D tensors [batch, seq_len, hidden_size].
-    
+
     This is needed because SGLang's RMSNorm only handles 2D tensors,
     but DFlash operates on 3D tensors throughout.
     """
-    
+
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -48,15 +48,15 @@ class RMSNorm3D(nn.Module):
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> List[int]:
     """
     Build target layer IDs for multi-layer feature extraction.
-    
+
     Distributes layer selection evenly across target model depth.
     For example, with 28 target layers and 3 draft layers:
     - Returns [1, 13, 24] (start=1, end=25, spread evenly)
-    
+
     Args:
         num_target_layers: Number of layers in the target model
         num_draft_layers: Number of layers in the draft model
-        
+
     Returns:
         List of layer indices to extract features from
     """

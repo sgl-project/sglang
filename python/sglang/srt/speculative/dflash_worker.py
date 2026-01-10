@@ -13,19 +13,13 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import alloc_for_decode
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
-from sglang.srt.speculative.draft_utils import DraftBackendFactory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -35,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 class DFlashWorker(TpModelWorker):
     """DFlash speculative decoding worker inheriting from TpModelWorker.
-    
+
     This enables:
     - Proper model loading via ModelRunner
     - Shared memory pools with target model
@@ -80,7 +74,9 @@ class DFlashWorker(TpModelWorker):
         max_seq_len = min(4096, server_args.context_length or 32768) + self.block_size
         minimal_cache_size = max_bs * max_seq_len
         server_args.draft_runner_cache_size = minimal_cache_size
-        logger.info(f"DFlash draft cache size: {minimal_cache_size} tokens (bs={max_bs}, seq_len={max_seq_len})")
+        logger.info(
+            f"DFlash draft cache size: {minimal_cache_size} tokens (bs={max_bs}, seq_len={max_seq_len})"
+        )
 
         # Initialize TpModelWorker with draft model
         super().__init__(
@@ -103,12 +99,13 @@ class DFlashWorker(TpModelWorker):
         # Configure target model to capture multi-layer hidden states
         target_model = target_worker.model_runner.model
         self.target_layer_ids = self.draft_model_runner.model.target_layer_ids
-        if hasattr(target_model, 'set_eagle3_layers_to_capture'):
+        if hasattr(target_model, "set_eagle3_layers_to_capture"):
             logger.info(f"DFlash target_layer_ids: {self.target_layer_ids}")
             target_model.set_eagle3_layers_to_capture(self.target_layer_ids)
 
         # Get mask token ID
         from transformers import AutoTokenizer
+
         tokenizer = AutoTokenizer.from_pretrained(server_args.model_path)
         if tokenizer.mask_token_id is None:
             tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
@@ -116,7 +113,9 @@ class DFlashWorker(TpModelWorker):
         logger.info(f"DFlash mask_token_id: {self.mask_token_id}")
 
         # Restore CUDA graph setting and initialize attention backend + CUDA graphs
-        self.draft_model_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
+        self.draft_model_runner.server_args.disable_cuda_graph = (
+            backup_disable_cuda_graph
+        )
         self.init_attention_backend()
         self.init_cuda_graphs()
 
@@ -136,7 +135,7 @@ class DFlashWorker(TpModelWorker):
 
     def init_attention_backend(self):
         """Initialize attention backend for draft model.
-        
+
         DFlash uses torch-based non-causal attention, not the standard
         attention backend. This method is a no-op but kept for interface
         consistency with other speculative workers.
@@ -147,7 +146,7 @@ class DFlashWorker(TpModelWorker):
 
     def init_cuda_graphs(self):
         """Initialize CUDA graphs for draft model.
-        
+
         DFlash draft model uses eager execution due to variable-length
         attention patterns. CUDA graphs are not captured for the draft model.
         """
@@ -166,14 +165,21 @@ class DFlashWorker(TpModelWorker):
         hidden_size = self.draft_model_runner.model.config.hidden_size
 
         # Check if hidden buffer is already enabled (to avoid duplicate allocation)
-        if token_to_kv_pool is not None and hasattr(token_to_kv_pool, 'enable_dflash_hidden_buffer'):
+        if token_to_kv_pool is not None and hasattr(
+            token_to_kv_pool, "enable_dflash_hidden_buffer"
+        ):
             # Check if already enabled by checking for hidden_buffer attribute
-            if not hasattr(token_to_kv_pool, 'hidden_buffer') or token_to_kv_pool.hidden_buffer is None:
+            if (
+                not hasattr(token_to_kv_pool, "hidden_buffer")
+                or token_to_kv_pool.hidden_buffer is None
+            ):
                 token_to_kv_pool.enable_dflash_hidden_buffer(
                     hidden_size=hidden_size,
                     num_target_layers=num_selected_layers,
                 )
-                logger.info(f"DFlash unified hidden cache enabled: {num_selected_layers} layers")
+                logger.info(
+                    f"DFlash unified hidden cache enabled: {num_selected_layers} layers"
+                )
             else:
                 logger.info("DFlash hidden buffer already enabled, skipping")
             self.unified_hidden_cache_enabled = True
@@ -184,11 +190,11 @@ class DFlashWorker(TpModelWorker):
         """Get or create per-request state."""
         if rid not in self._request_state:
             self._request_state[rid] = {
-                'target_hidden': None,
-                'accumulated_hidden': None,
-                'start': 0,
-                'verified_id': None,
-                'noise_cache_locs': None,
+                "target_hidden": None,
+                "accumulated_hidden": None,
+                "start": 0,
+                "verified_id": None,
+                "noise_cache_locs": None,
             }
         return self._request_state[rid]
 
@@ -217,17 +223,25 @@ class DFlashWorker(TpModelWorker):
             req_len = len(req.origin_input_ids)
             state = self._get_request_state(req.rid)
 
-            new_token_count = batch.extend_lens[i] if hasattr(batch, 'extend_lens') else req_len
-            cached_count = req_len - new_token_count if hasattr(batch, 'extend_lens') else 0
+            new_token_count = (
+                batch.extend_lens[i] if hasattr(batch, "extend_lens") else req_len
+            )
+            cached_count = (
+                req_len - new_token_count if hasattr(batch, "extend_lens") else 0
+            )
 
-            state['start'] = req_len
+            state["start"] = req_len
 
             if hidden_states is not None:
                 # Extract NEW tokens' hidden states
                 if hidden_states.dim() == 2:
-                    new_hidden = hidden_states[token_offset:token_offset + new_token_count, :]
+                    new_hidden = hidden_states[
+                        token_offset : token_offset + new_token_count, :
+                    ]
                 else:
-                    new_hidden = hidden_states[:, token_offset:token_offset + new_token_count, :]
+                    new_hidden = hidden_states[
+                        :, token_offset : token_offset + new_token_count, :
+                    ]
 
                 if new_hidden.dim() == 2:
                     new_hidden = new_hidden.unsqueeze(0)
@@ -235,34 +249,53 @@ class DFlashWorker(TpModelWorker):
                 # Try to get cached hidden states from radix cache
                 if cached_count > 0 and self.unified_hidden_cache_enabled:
                     token_to_kv_pool = self.target_worker.model_runner.token_to_kv_pool
-                    if hasattr(req, 'hidden_indices') and req.hidden_indices is not None:
+                    if (
+                        hasattr(req, "hidden_indices")
+                        and req.hidden_indices is not None
+                    ):
                         prefix_locs = req.hidden_indices[:cached_count]
-                        cached_hidden = token_to_kv_pool.get_all_hidden_states(prefix_locs)
+                        cached_hidden = token_to_kv_pool.get_all_hidden_states(
+                            prefix_locs
+                        )
                         if cached_hidden is not None:
                             cached_hidden = cached_hidden.unsqueeze(0)
                             new_hidden = torch.cat([cached_hidden, new_hidden], dim=1)
 
-                state['target_hidden'] = new_hidden.clone()
-                state['accumulated_hidden'] = new_hidden.clone()
+                state["target_hidden"] = new_hidden.clone()
+                state["accumulated_hidden"] = new_hidden.clone()
 
                 # Store hidden states in KV pool
                 if self.unified_hidden_cache_enabled:
                     token_to_kv_pool = self.target_worker.model_runner.token_to_kv_pool
-                    if hasattr(batch, 'out_cache_loc') and batch.out_cache_loc is not None:
-                        req_start = sum(batch.extend_lens[:i]) if hasattr(batch, 'extend_lens') else token_offset
+                    if (
+                        hasattr(batch, "out_cache_loc")
+                        and batch.out_cache_loc is not None
+                    ):
+                        req_start = (
+                            sum(batch.extend_lens[:i])
+                            if hasattr(batch, "extend_lens")
+                            else token_offset
+                        )
                         req_end = req_start + new_token_count
                         req_cache_loc = batch.out_cache_loc[req_start:req_end]
                         hidden_to_store = new_hidden.squeeze(0)[-new_token_count:]
                         if hidden_to_store.shape[0] == req_cache_loc.shape[0]:
-                            token_to_kv_pool.set_all_hidden_states(req_cache_loc, hidden_to_store)
+                            token_to_kv_pool.set_all_hidden_states(
+                                req_cache_loc, hidden_to_store
+                            )
                             # Update req.hidden_indices for radix cache insertion
                             # This ensures cache_finished_req() will store hidden indices in the tree
-                            if not hasattr(req, 'hidden_indices') or req.hidden_indices is None:
+                            if (
+                                not hasattr(req, "hidden_indices")
+                                or req.hidden_indices is None
+                            ):
                                 req.hidden_indices = req_cache_loc.clone()
                             else:
-                                req.hidden_indices = torch.cat([req.hidden_indices, req_cache_loc])
+                                req.hidden_indices = torch.cat(
+                                    [req.hidden_indices, req_cache_loc]
+                                )
 
-                state['verified_id'] = next_token_ids[i].clone()
+                state["verified_id"] = next_token_ids[i].clone()
                 token_offset += new_token_count
 
         batch.spec_info = DFlashDraftInput(
@@ -278,7 +311,9 @@ class DFlashWorker(TpModelWorker):
         spec_info = batch.spec_info
 
         if spec_info is None or not isinstance(spec_info, DFlashDraftInput):
-            logger.warning("[DFLASH] No DFlashDraftInput found, running normal target decode")
+            logger.warning(
+                "[DFLASH] No DFlashDraftInput found, running normal target decode"
+            )
             return self._fallback_decode(batch)
 
         block_size = self.block_size
@@ -327,7 +362,7 @@ class DFlashWorker(TpModelWorker):
             acc_len = accept_length_list[i]
 
             # Update positions
-            state['start'] += acc_len + 1
+            state["start"] += acc_len + 1
 
             # Evict rejected noise positions from cache
             self._evict_rejected_cache(batch, req, state, acc_len)
@@ -338,23 +373,29 @@ class DFlashWorker(TpModelWorker):
                 # Use cumulative offset, not i * block_size (hidden states are filtered!)
                 start_idx = hidden_offset
                 if new_hidden_states.dim() == 2:
-                    req_hidden = new_hidden_states[start_idx:start_idx + num_tokens, :]
+                    req_hidden = new_hidden_states[
+                        start_idx : start_idx + num_tokens, :
+                    ]
                 else:
-                    req_hidden = new_hidden_states[:, start_idx:start_idx + num_tokens, :]
+                    req_hidden = new_hidden_states[
+                        :, start_idx : start_idx + num_tokens, :
+                    ]
                 # Update offset for next request
                 hidden_offset += num_tokens
                 if req_hidden.dim() == 2:
                     req_hidden = req_hidden.unsqueeze(0)
 
-                old_hidden = state.get('accumulated_hidden')
+                old_hidden = state.get("accumulated_hidden")
                 if old_hidden is not None:
-                    state['accumulated_hidden'] = torch.cat([old_hidden, req_hidden], dim=1)
+                    state["accumulated_hidden"] = torch.cat(
+                        [old_hidden, req_hidden], dim=1
+                    )
                 else:
-                    state['accumulated_hidden'] = req_hidden.clone()
+                    state["accumulated_hidden"] = req_hidden.clone()
 
-                state['target_hidden'] = state['accumulated_hidden']
+                state["target_hidden"] = state["accumulated_hidden"]
 
-            state['verified_id'] = new_verified_id[i].clone()
+            state["verified_id"] = new_verified_id[i].clone()
 
         # Create new spec_info for next iteration
         batch.spec_info = DFlashDraftInput(
@@ -382,7 +423,7 @@ class DFlashWorker(TpModelWorker):
         all_verified_id: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Draft forward pass using the draft model.
-        
+
         Collects target hidden states and verified IDs per request,
         then runs batched draft forward through model layers.
         """
@@ -396,13 +437,13 @@ class DFlashWorker(TpModelWorker):
 
         for i, req in enumerate(batch.reqs):
             state = self._get_request_state(req.rid)
-            target_hidden = state.get('target_hidden')
+            target_hidden = state.get("target_hidden")
 
             if target_hidden is None:
                 logger.warning(f"[DFLASH] No target_hidden for request {req.rid}")
                 continue
 
-            req_verified_id = state.get('verified_id')
+            req_verified_id = state.get("verified_id")
             if req_verified_id is None:
                 if all_verified_id.dim() > 0 and all_verified_id.shape[0] > i:
                     req_verified_id = all_verified_id[i]
@@ -411,15 +452,23 @@ class DFlashWorker(TpModelWorker):
 
             target_hiddens.append(target_hidden)
             verified_ids.append(req_verified_id)
-            ctx_len = target_hidden.shape[1] if target_hidden.dim() == 3 else target_hidden.shape[0]
+            ctx_len = (
+                target_hidden.shape[1]
+                if target_hidden.dim() == 3
+                else target_hidden.shape[0]
+            )
             ctx_lens.append(ctx_len)
 
         if not target_hiddens:
             # No valid requests
-            return torch.tensor([], device=self.device), torch.tensor([], device=self.device)
+            return torch.tensor([], device=self.device), torch.tensor(
+                [], device=self.device
+            )
 
         # Use batched forward through model runner
-        return self._batched_draft_forward(batch, target_hiddens, verified_ids, ctx_lens)
+        return self._batched_draft_forward(
+            batch, target_hiddens, verified_ids, ctx_lens
+        )
 
     def _batched_draft_forward(
         self,
@@ -429,7 +478,7 @@ class DFlashWorker(TpModelWorker):
         ctx_lens: List[int],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Batched draft forward using torch-based attention.
-        
+
         Processes each request through the draft model layers with
         non-causal attention (Q from noise, K/V from full sequence).
         """
@@ -444,8 +493,7 @@ class DFlashWorker(TpModelWorker):
 
         # Pad and stack target_hiddens to [bs, max_ctx_len, input_dim]
         padded_target_hiddens = torch.zeros(
-            bs, max_ctx_len, input_dim,
-            dtype=torch.bfloat16, device=self.device
+            bs, max_ctx_len, input_dim, dtype=torch.bfloat16, device=self.device
         )
         ctx_lens_tensor = torch.tensor(ctx_lens, dtype=torch.long, device=self.device)
 
@@ -456,32 +504,46 @@ class DFlashWorker(TpModelWorker):
                 padded_target_hiddens[i, :cl, :] = th[0, :cl, :]
 
         # Stack verified_ids to [bs]
-        verified_ids_tensor = torch.stack([
-            v if isinstance(v, torch.Tensor) and v.dim() == 0
-            else (v[0] if isinstance(v, torch.Tensor) else torch.tensor(v, device=self.device))
-            for v in verified_ids
-        ]).to(dtype=torch.long, device=self.device)
+        verified_ids_tensor = torch.stack(
+            [
+                (
+                    v
+                    if isinstance(v, torch.Tensor) and v.dim() == 0
+                    else (
+                        v[0]
+                        if isinstance(v, torch.Tensor)
+                        else torch.tensor(v, device=self.device)
+                    )
+                )
+                for v in verified_ids
+            ]
+        ).to(dtype=torch.long, device=self.device)
 
         # Create noise input_ids [bs, block_size]
         block_input_ids = torch.full(
-            (bs, block_size), self.mask_token_id,
-            dtype=torch.long, device=self.device
+            (bs, block_size), self.mask_token_id, dtype=torch.long, device=self.device
         )
         block_input_ids[:, 0] = verified_ids_tensor
 
         # Get embedding from draft model
-        noise_embedding = self.draft_model_runner.model.model.embed_tokens(block_input_ids)
+        noise_embedding = self.draft_model_runner.model.model.embed_tokens(
+            block_input_ids
+        )
 
         # Project and normalize target hidden ONCE at model level (matching original DFlash)
         if padded_target_hiddens.shape[-1] != hidden_size:
-            padded_target_hiddens = self.draft_model_runner.model.model.fc(padded_target_hiddens)
-        padded_target_hiddens = self.draft_model_runner.model.model.hidden_norm(padded_target_hiddens)
+            padded_target_hiddens = self.draft_model_runner.model.model.fc(
+                padded_target_hiddens
+            )
+        padded_target_hiddens = self.draft_model_runner.model.model.hidden_norm(
+            padded_target_hiddens
+        )
 
         # Process each request through model layers
         # Using torch fallback attention (forward_batch=None) which correctly implements
         # DFlash pattern: Q from noise only, K/V from full sequence
         all_draft_hidden = []
-        
+
         for i in range(bs):
             ctx_len = ctx_lens[i]
             total_len = ctx_len + block_size
@@ -523,14 +585,15 @@ class DFlashWorker(TpModelWorker):
         for i in range(bs):
             all_draft_tokens.append(block_input_ids[i])
             current_seq_len = batch.seq_lens[i].item()
-            all_positions.append(torch.arange(
-                current_seq_len, current_seq_len + block_size, device=self.device
-            ))
+            all_positions.append(
+                torch.arange(
+                    current_seq_len, current_seq_len + block_size, device=self.device
+                )
+            )
 
         draft_tokens = torch.cat(all_draft_tokens, dim=0)
         positions = torch.cat(all_positions, dim=0)
         return draft_tokens, positions
-
 
     def _evict_rejected_cache(
         self,
@@ -540,19 +603,19 @@ class DFlashWorker(TpModelWorker):
         accept_length: int,
     ):
         """Evict rejected noise positions from cache after verification."""
-        noise_cache_locs = state.get('noise_cache_locs')
+        noise_cache_locs = state.get("noise_cache_locs")
         if noise_cache_locs is None:
             return
 
         rejected_count = self.block_size - accept_length - 1
         if rejected_count > 0:
             # Free rejected positions
-            rejected_locs = noise_cache_locs[accept_length + 1:]
+            rejected_locs = noise_cache_locs[accept_length + 1 :]
             if len(rejected_locs) > 0:
                 batch.token_to_kv_pool_allocator.free(rejected_locs)
 
         # Clear tracked noise positions
-        state['noise_cache_locs'] = None
+        state["noise_cache_locs"] = None
 
     def _fallback_decode(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Fallback decode without speculation."""

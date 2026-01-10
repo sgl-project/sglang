@@ -108,7 +108,7 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
-        
+
         # DFlash hidden state support: indices are now the same as KV cache locations.
         # With unified KV pool, hidden states are stored at the same indices as KV cache.
         # This field is kept for compatibility with tree traversal but not separately managed.
@@ -264,7 +264,7 @@ class RadixCache(BasePrefixCache):
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
-        
+
         # DFlash hidden state support: uses unified KV pool approach
         # Hidden states are stored in MHATokenToKVPool using the same indices as KV cache.
         # No separate hidden_state_pool is needed.
@@ -335,7 +335,7 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self._record_all_cleared_event()
-        
+
         # Note: Hidden state pool is deprecated in favor of unified KV pool approach.
         # Hidden states are now stored in MHATokenToKVPool using the same indices as KV cache.
 
@@ -410,17 +410,19 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return empty_match_result()
 
-        value, last_node, hidden_indices_list = self._match_prefix_helper(self.root_node, key)
+        value, last_node, hidden_indices_list = self._match_prefix_helper(
+            self.root_node, key
+        )
         if value:
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        
+
         # Concatenate hidden indices if any were collected (for DFlash)
         hidden_indices = None
         if hidden_indices_list:
             hidden_indices = torch.cat(hidden_indices_list)
-        
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -429,22 +431,22 @@ class RadixCache(BasePrefixCache):
         )
 
     def insert(
-        self, 
-        key: RadixKey, 
-        value=None, 
-        chunked=False, 
+        self,
+        key: RadixKey,
+        value=None,
+        chunked=False,
         priority: int = 0,
         hidden_indices: Optional[torch.Tensor] = None,
     ):
         """Insert a key-value pair into the radix cache.
-        
+
         Args:
             key: RadixKey containing token ids
             value: KV cache indices (optional, defaults to key.token_ids as tensor)
             chunked: Whether this is a chunked insert
             priority: Priority for eviction
             hidden_indices: Optional hidden state indices for DFlash (same length as value)
-            
+
         Returns:
             Length of matched prefix that was already in tree
         """
@@ -455,10 +457,10 @@ class RadixCache(BasePrefixCache):
             value = torch.tensor(key.token_ids, dtype=torch.int64)
 
         key, value = self.maybe_bigram_convert(key, value)
-        
+
         # Also truncate hidden_indices if bigram conversion happened
         if hidden_indices is not None and len(hidden_indices) > len(value):
-            hidden_indices = hidden_indices[:len(value)]
+            hidden_indices = hidden_indices[: len(value)]
 
         return self._insert_helper(self.root_node, key, value, priority, hidden_indices)
 
@@ -500,7 +502,7 @@ class RadixCache(BasePrefixCache):
             # Get hidden indices for DFlash if available
             hidden_indices = getattr(req, "hidden_indices", None)
             if hidden_indices is not None:
-                hidden_indices = hidden_indices[:len(keys)]
+                hidden_indices = hidden_indices[: len(keys)]
             new_prefix_len = self.insert(
                 radix_key, values, priority=priority, hidden_indices=hidden_indices
             )
@@ -539,8 +541,8 @@ class RadixCache(BasePrefixCache):
         # Get hidden indices for DFlash if available
         hidden_indices = getattr(req, "hidden_indices", None)
         if hidden_indices is not None:
-            hidden_indices = hidden_indices[:len(keys)]
-        
+            hidden_indices = hidden_indices[: len(keys)]
+
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
             radix_key,
@@ -613,11 +615,11 @@ class RadixCache(BasePrefixCache):
             _priority, x = heapq.heappop(eviction_heap)
 
             self.token_to_kv_pool_allocator.free(x.value)
-            
+
             # Note: With unified KV pool approach, hidden states are automatically
             # freed when KV cache slots are freed (same indices).
             x.hidden_indices = None
-            
+
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
@@ -689,7 +691,7 @@ class RadixCache(BasePrefixCache):
 
         value = []
         hidden_indices_list = []  # Collect hidden indices for DFlash
-        
+
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
@@ -731,7 +733,7 @@ class RadixCache(BasePrefixCache):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
-        
+
         # Split hidden_indices for DFlash if present
         if child.hidden_indices is not None:
             new_node.hidden_indices = child.hidden_indices[:split_len]
@@ -740,10 +742,10 @@ class RadixCache(BasePrefixCache):
         return new_node
 
     def _insert_helper(
-        self, 
-        node: TreeNode, 
-        key: RadixKey, 
-        value, 
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value,
         priority: int = 0,
         hidden_indices: Optional[torch.Tensor] = None,
     ):

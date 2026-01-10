@@ -356,10 +356,13 @@ class CudaGraphRunner:
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
         # Speculative_inference - set up aux hidden state capture for EAGLE3 and DFlash
-        is_spec_algo = model_runner.spec_algorithm.is_eagle3() or model_runner.spec_algorithm.is_dflash()
+        is_spec_algo = (
+            model_runner.spec_algorithm.is_eagle3()
+            or model_runner.spec_algorithm.is_dflash()
+        )
         use_aux_hidden = model_runner.eagle_use_aux_hidden_state
-        layer_ids = getattr(model_runner, 'eagle_aux_hidden_state_layer_ids', None)
-        
+        layer_ids = getattr(model_runner, "eagle_aux_hidden_state_layer_ids", None)
+
         if is_spec_algo and use_aux_hidden:
             self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
 

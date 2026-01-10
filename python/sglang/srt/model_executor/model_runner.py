@@ -344,7 +344,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # DFlash also needs aux hidden states from multiple target layers
             # Load draft config to get target_layer_ids
             from transformers import AutoConfig
+
             from sglang.srt.models.dflash import build_target_layer_ids
+
             try:
                 draft_config = AutoConfig.from_pretrained(
                     server_args.speculative_draft_model_path,
@@ -361,12 +363,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     # Uses build_target_layer_ids(num_target_layers, num_draft_layers)
                     num_target_layers = self.model_config.num_hidden_layers
                     num_draft_layers = getattr(draft_config, "num_hidden_layers", 5)
-                    target_layer_ids = build_target_layer_ids(num_target_layers, num_draft_layers)
+                    target_layer_ids = build_target_layer_ids(
+                        num_target_layers, num_draft_layers
+                    )
                     self.eagle_use_aux_hidden_state = True
                     self.eagle_aux_hidden_state_layer_ids = target_layer_ids
-                    logger.info(f"DFlash aux hidden state layers (computed): {target_layer_ids}")
+                    logger.info(
+                        f"DFlash aux hidden state layers (computed): {target_layer_ids}"
+                    )
             except Exception as e:
-                logger.warning(f"Failed to load DFlash draft config for aux layers: {e}")
+                logger.warning(
+                    f"Failed to load DFlash draft config for aux layers: {e}"
+                )
                 self.eagle_aux_hidden_state_layer_ids = None
 
         # Apply the rank zero filter to logger
@@ -1772,7 +1780,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.eagle_use_aux_hidden_state:
             # Pass the configured layer_ids instead of using defaults
-            self.model.set_eagle3_layers_to_capture(self.eagle_aux_hidden_state_layer_ids)
+            self.model.set_eagle3_layers_to_capture(
+                self.eagle_aux_hidden_state_layer_ids
+            )
 
         require_mlp_tp_gather_ = require_mlp_tp_gather(self.server_args)
         if require_gathered_buffer(self.server_args):
