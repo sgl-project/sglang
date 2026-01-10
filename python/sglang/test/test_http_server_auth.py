@@ -2,7 +2,7 @@
 Unit tests for HTTP server admin auth.
 
 Usage:
-    python3 -m pytest test/test_http_server_admin_auth.py -v
+    python3 -m pytest test/test_http_server_auth.py -v
 """
 
 import importlib.util
@@ -33,249 +33,286 @@ def _load_auth_module():
 
 _auth = _load_auth_module()
 decide_request_auth = _auth.decide_request_auth
+AuthLevel = _auth.AuthLevel
 
 
 class TestHttpServerAdminAuth(unittest.TestCase):
-    def test_no_admin_key_backward_compatible(self):
-        optional_paths = {"/clear_hicache_storage_backend"}
-        force_paths = {"/force_auth_demo"}
+    def _decide(
+        self,
+        *,
+        method: str,
+        path: str,
+        authorization_header: str | None,
+        api_key: str | None,
+        admin_api_key: str | None,
+        auth_level: AuthLevel,
+    ):
+        return decide_request_auth(
+            method=method,
+            path=path,
+            authorization_header=authorization_header,
+            api_key=api_key,
+            admin_api_key=admin_api_key,
+            auth_level=auth_level,
+        )
 
-        # No api_key configured -> everything open (legacy)
+    def test_no_keys_configured(self):
+        # No keys configured -> NORMAL + ADMIN_OPTIONAL are open (legacy),
+        # but ADMIN_FORCE must be rejected (403) explicitly.
         self.assertTrue(
-            decide_request_auth(
+            self._decide(
                 method="GET",
                 path="/v1/models",
                 authorization_header=None,
                 api_key=None,
                 admin_api_key=None,
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.NORMAL,
             ).allowed
         )
         self.assertTrue(
-            decide_request_auth(
+            self._decide(
                 method="POST",
-                path="/clear_hicache_storage_backend",
+                path="/admin_optional_demo",
                 authorization_header=None,
                 api_key=None,
                 admin_api_key=None,
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.ADMIN_OPTIONAL,
             ).allowed
         )
 
-        # Force-auth endpoints must be rejected when admin_api_key is not configured
-        d = decide_request_auth(
+        d = self._decide(
             method="POST",
-            path="/force_auth_demo",
+            path="/admin_force_demo",
             authorization_header=None,
             api_key=None,
             admin_api_key=None,
-            admin_optional_auth_paths=optional_paths,
-            admin_force_auth_paths=force_paths,
+            auth_level=AuthLevel.ADMIN_FORCE,
         )
         self.assertFalse(d.allowed)
-        self.assertEqual(d.status_code, 403)
+        self.assertEqual(d.error_status_code, 403)
 
-        # api_key configured -> everything gated by that key (including admin-ish routes) (legacy)
+    def test_api_key_only(self):
+        # api_key configured -> NORMAL requires api_key (legacy).
         self.assertFalse(
-            decide_request_auth(
+            self._decide(
                 method="GET",
                 path="/v1/models",
                 authorization_header=None,
                 api_key="user",
                 admin_api_key=None,
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.NORMAL,
             ).allowed
         )
         self.assertTrue(
-            decide_request_auth(
+            self._decide(
                 method="GET",
                 path="/v1/models",
                 authorization_header="Bearer user",
                 api_key="user",
                 admin_api_key=None,
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.NORMAL,
             ).allowed
         )
+
+        # ADMIN_OPTIONAL requires api_key when only api_key is configured.
         self.assertFalse(
-            decide_request_auth(
+            self._decide(
                 method="POST",
-                path="/clear_hicache_storage_backend",
+                path="/admin_optional_demo",
                 authorization_header="Bearer wrong",
                 api_key="user",
                 admin_api_key=None,
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.ADMIN_OPTIONAL,
             ).allowed
         )
         self.assertTrue(
-            decide_request_auth(
+            self._decide(
                 method="POST",
-                path="/clear_hicache_storage_backend",
+                path="/admin_optional_demo",
                 authorization_header="Bearer user",
                 api_key="user",
                 admin_api_key=None,
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.ADMIN_OPTIONAL,
             ).allowed
         )
 
-        # Force-auth endpoints must still be rejected even if api_key is configured
-        d = decide_request_auth(
+        # ADMIN_FORCE must be rejected even if api_key is configured (403).
+        d = self._decide(
             method="POST",
-            path="/force_auth_demo",
+            path="/admin_force_demo",
             authorization_header="Bearer user",
             api_key="user",
             admin_api_key=None,
-            admin_optional_auth_paths=optional_paths,
-            admin_force_auth_paths=force_paths,
+            auth_level=AuthLevel.ADMIN_FORCE,
         )
         self.assertFalse(d.allowed)
-        self.assertEqual(d.status_code, 403)
+        self.assertEqual(d.error_status_code, 403)
 
-    def test_with_admin_key_admin_routes_require_admin(self):
-        optional_paths = {"/clear_hicache_storage_backend"}
-        force_paths = {"/force_auth_demo"}
-
+    def test_admin_api_key_only(self):
         # admin_api_key only:
         # - normal endpoints open
         # - optional/force endpoints require admin_api_key
         self.assertTrue(
-            decide_request_auth(
+            self._decide(
                 method="GET",
                 path="/v1/models",
                 authorization_header="Bearer user",
                 api_key=None,
                 admin_api_key="admin",
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.NORMAL,
             ).allowed
         )
         self.assertTrue(
-            decide_request_auth(
+            self._decide(
                 method="GET",
                 path="/v1/models",
                 authorization_header=None,
                 api_key=None,
                 admin_api_key="admin",
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.NORMAL,
             ).allowed
         )
 
         # Optional endpoints require admin_api_key when admin_api_key is configured.
         self.assertTrue(
-            decide_request_auth(
+            self._decide(
                 method="POST",
-                path="/clear_hicache_storage_backend",
+                path="/admin_optional_demo",
                 authorization_header="Bearer admin",
                 api_key=None,
                 admin_api_key="admin",
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.ADMIN_OPTIONAL,
             ).allowed
         )
         self.assertFalse(
-            decide_request_auth(
+            self._decide(
                 method="POST",
-                path="/clear_hicache_storage_backend",
+                path="/admin_optional_demo",
                 authorization_header="Bearer user",
                 api_key=None,
                 admin_api_key="admin",
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.ADMIN_OPTIONAL,
             ).allowed
         )
 
-        d = decide_request_auth(
+        d = self._decide(
             method="POST",
-            path="/force_auth_demo",
+            path="/admin_force_demo",
             authorization_header="Bearer admin",
             api_key=None,
             admin_api_key="admin",
-            admin_optional_auth_paths=optional_paths,
-            admin_force_auth_paths=force_paths,
+            auth_level=AuthLevel.ADMIN_FORCE,
         )
         self.assertTrue(d.allowed)
 
     def test_with_both_api_keys(self):
-        optional_paths = {"/clear_hicache_storage_backend"}
-        force_paths = {"/force_auth_demo"}
-
         # both api_key and admin_api_key configured:
         # - normal endpoints require api_key
         # - optional endpoints require admin_api_key (api_key is NOT accepted)
         # - force endpoints require admin_api_key
         self.assertTrue(
-            decide_request_auth(
+            self._decide(
                 method="GET",
                 path="/v1/models",
                 authorization_header="Bearer user",
                 api_key="user",
                 admin_api_key="admin",
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.NORMAL,
             ).allowed
         )
         self.assertFalse(
-            decide_request_auth(
+            self._decide(
                 method="GET",
                 path="/v1/models",
                 authorization_header="Bearer admin",
                 api_key="user",
                 admin_api_key="admin",
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.NORMAL,
             ).allowed
         )
         # Optional endpoints must require admin_api_key when both keys are configured.
         self.assertFalse(
-            decide_request_auth(
+            self._decide(
                 method="POST",
-                path="/clear_hicache_storage_backend",
+                path="/admin_optional_demo",
                 authorization_header="Bearer user",
                 api_key="user",
                 admin_api_key="admin",
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.ADMIN_OPTIONAL,
             ).allowed
         )
         self.assertTrue(
-            decide_request_auth(
+            self._decide(
                 method="POST",
-                path="/clear_hicache_storage_backend",
+                path="/admin_optional_demo",
                 authorization_header="Bearer admin",
                 api_key="user",
                 admin_api_key="admin",
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.ADMIN_OPTIONAL,
             ).allowed
         )
         self.assertFalse(
-            decide_request_auth(
+            self._decide(
                 method="POST",
-                path="/force_auth_demo",
+                path="/admin_force_demo",
                 authorization_header="Bearer user",
                 api_key="user",
                 admin_api_key="admin",
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.ADMIN_FORCE,
             ).allowed
         )
         self.assertTrue(
-            decide_request_auth(
+            self._decide(
                 method="POST",
-                path="/force_auth_demo",
+                path="/admin_force_demo",
                 authorization_header="Bearer admin",
                 api_key="user",
                 admin_api_key="admin",
-                admin_optional_auth_paths=optional_paths,
-                admin_force_auth_paths=force_paths,
+                auth_level=AuthLevel.ADMIN_FORCE,
             ).allowed
         )
+
+    def test_options_is_always_allowed(self):
+        # CORS preflight should never be blocked.
+        self.assertTrue(
+            self._decide(
+                method="OPTIONS",
+                path="/v1/models",
+                authorization_header=None,
+                api_key="user",
+                admin_api_key="admin",
+                auth_level=AuthLevel.ADMIN_FORCE,
+            ).allowed
+        )
+
+    def test_health_and_metrics_are_always_allowed(self):
+        # Health/metrics endpoints are always public by design, regardless of auth level / keys.
+        combos = [
+            dict(api_key=None, admin_api_key=None),
+            dict(api_key="user", admin_api_key=None),
+            dict(api_key=None, admin_api_key="admin"),
+            dict(api_key="user", admin_api_key="admin"),
+        ]
+        paths_allowed = [
+            "/health",
+            "/health_generate",
+            "/metrics",
+            "/metrics/",
+            "/metrics/prometheus",
+        ]
+        for keys in combos:
+            for path in paths_allowed:
+                self.assertTrue(
+                    self._decide(
+                        method="GET",
+                        path=path,
+                        authorization_header=None,
+                        api_key=keys["api_key"],
+                        admin_api_key=keys["admin_api_key"],
+                        auth_level=AuthLevel.ADMIN_FORCE,
+                    ).allowed,
+                    msg=f"expected allowed for {path=} with {keys=}",
+                )
 
 
 if __name__ == "__main__":
