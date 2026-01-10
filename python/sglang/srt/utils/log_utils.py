@@ -11,23 +11,27 @@ from typing import List, Optional, Union
 import torch.distributed as dist
 
 
-def create_log_targets(targets: Optional[List[str]]) -> List[logging.Logger]:
+def create_log_targets(
+    targets: Optional[List[str]], name_prefix: str
+) -> List[logging.Logger]:
     if not targets:
-        return [_create_log_target_stdout()]
-    return [_create_log_target(t) for t in targets]
+        return [_create_log_target_stdout(name_prefix)]
+    return [_create_log_target(t, name_prefix) for t in targets]
 
 
-def _create_log_target(target: str) -> logging.Logger:
+def _create_log_target(target: str, name_prefix: str) -> logging.Logger:
     if target.lower() == "stdout":
-        return _create_log_target_stdout()
-    return _create_log_target_file(target)
+        return _create_log_target_stdout(name_prefix)
+    return _create_log_target_file(target, name_prefix)
 
 
-def _create_log_target_stdout() -> logging.Logger:
-    return _create_logger_with_handler(f"{__name__}.stdout", logging.StreamHandler())
+def _create_log_target_stdout(name_prefix: str) -> logging.Logger:
+    return _create_logger_with_handler(
+        f"{name_prefix}.stdout", logging.StreamHandler()
+    )
 
 
-def _create_log_target_file(directory: str) -> logging.Logger:
+def _create_log_target_file(directory: str, name_prefix: str) -> logging.Logger:
     os.makedirs(directory, exist_ok=True)
     hostname = socket.gethostname()
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -36,7 +40,7 @@ def _create_log_target_file(directory: str) -> logging.Logger:
         filename, when="H", backupCount=0, encoding="utf-8"
     )
     return _create_logger_with_handler(
-        f"{__name__}.file.{directory}.{hostname}_{rank}", handler
+        f"{name_prefix}.file.{directory}.{hostname}_{rank}", handler
     )
 
 
