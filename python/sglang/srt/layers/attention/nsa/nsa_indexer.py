@@ -626,6 +626,7 @@ class Indexer(MultiPlatformOp):
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         assert forward_batch.forward_mode.is_extend_without_speculative()
+        x_meta = x[0] if isinstance(x, tuple) else x
 
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
@@ -651,7 +652,7 @@ class Indexer(MultiPlatformOp):
             seq_lens_expanded.shape[0],
             self.index_topk,
             dtype=torch.float32,
-            device=x.device,
+            device=x_meta.device,
         )
         return metadata.topk_transform(dummy_logits, self.index_topk)
 
@@ -904,6 +905,10 @@ class Indexer(MultiPlatformOp):
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
+        # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
+        # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
+        x_meta = x[0] if isinstance(x, tuple) else x
+
         metadata = forward_batch.attn_backend.get_indexer_metadata(
             layer_id, forward_batch
         )
@@ -969,7 +974,38 @@ class Indexer(MultiPlatformOp):
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
-            weights = self._get_logits_head_gate(x, q_scale)
+            # `_get_logits_head_gate` expects a Tensor. For tuple activations, dequantize
+            # to a float tensor here (callsite), keeping `_get_logits_head_gate` backend-agnostic.
+            if isinstance(x, tuple):
+                assert len(x) in (
+                    2,
+                    3,
+                ), "For tuple input, only (x, x_s) or (x, x_s, y) formats are accepted"
+                x_q, x_s = x[0], x[1]
+                if (
+                    x_s is not None
+                    and x_q.dim() == 2
+                    and x_s.dim() == 2
+                    and x_q.shape[0] == x_s.shape[0]
+                ):
+                    m, n = x_q.shape
+                    ng = x_s.shape[1]
+                    if ng > 0 and n % ng == 0:
+                        group = n // ng
+                        x_for_gate = (
+                            x_q.to(torch.float32)
+                            .view(m, ng, group)
+                            .mul_(x_s.to(torch.float32).unsqueeze(-1))
+                            .view(m, n)
+                        )
+                    else:
+                        x_for_gate = x_q.to(torch.float32)
+                else:
+                    x_for_gate = x_q.to(torch.float32)
+            else:
+                x_for_gate = x
+
+            weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
         # k_fp8: (seq_len, head_dim) fp8_e4m3fn
         # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
@@ -993,7 +1029,10 @@ class Indexer(MultiPlatformOp):
                 #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                 #     )
                 return torch.full(
-                    (x.shape[0], self.index_topk), -1, dtype=torch.int, device="cuda"
+                    (x_meta.shape[0], self.index_topk),
+                    -1,
+                    dtype=torch.int,
+                    device=x_meta.device,
                 )
 
             if (
