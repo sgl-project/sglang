@@ -273,7 +273,6 @@ class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
             model_path=model_path,
             enable_multimodal=True,
             is_embedding=True,
-            enable_piecewise_cuda_graph=True,
             piecewise_cuda_graph_compiler="eager",
         )
         out = engine.encode([text], image_data=[DEFAULT_IMAGE_URL])[0]["embedding"]
@@ -284,7 +283,7 @@ class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
             model_path=model_path,
             enable_multimodal=True,
             is_embedding=True,
-            enable_piecewise_cuda_graph=False,
+            disable_piecewise_cuda_graph=True,
         )
         out_without_pcg = engine.encode([text], image_data=[DEFAULT_IMAGE_URL])[0][
             "embedding"
