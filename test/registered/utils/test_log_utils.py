@@ -24,7 +24,7 @@ class TestLogUtils(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             loggers = create_log_targets(targets=[temp_dir], name_prefix="test_file")
             self.assertEqual(len(loggers), 1)
-            log_json(loggers[0], "file.event", {"data": 123})
+            log_json(loggers, "file.event", {"data": 123})
             loggers[0].handlers[0].flush()
             data = _read_log_file(temp_dir)
             self.assertIn("timestamp", data)
