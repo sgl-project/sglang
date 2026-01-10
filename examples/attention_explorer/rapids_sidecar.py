@@ -123,6 +123,22 @@ try:
 except ImportError:
     HAS_COMPASS = False
 
+# Try to import Manifold Firewall for hallucination detection
+try:
+    from discovery import (
+        ManifoldFirewall,
+        ManifoldBatchAnalyzer,
+        FirewallConfig,
+        FIREWALL_GLOSSARY,
+        create_firewall,
+    )
+    HAS_FIREWALL = True
+    # Global firewall instance for session management
+    _GLOBAL_FIREWALL = ManifoldFirewall()
+except ImportError:
+    HAS_FIREWALL = False
+    _GLOBAL_FIREWALL = None
+
 # Try ZMQ for high-performance streaming
 try:
     import zmq
@@ -1306,6 +1322,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 "has_blessed_configs": self.sidecar._blessed_storage is not None,
                 "has_derotation": HAS_DEROTATION,
                 "has_compass": HAS_COMPASS,
+                "has_firewall": HAS_FIREWALL,
             })
 
         elif parsed.path == "/discovery/status":
@@ -1377,6 +1394,24 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 })
             else:
                 self._send_json_error(501, "Compass router not available")
+
+        elif parsed.path == "/firewall/glossary":
+            # Get firewall educational glossary
+            if HAS_FIREWALL:
+                self._send_json({
+                    "glossary": FIREWALL_GLOSSARY,
+                    "terms": list(FIREWALL_GLOSSARY.keys()),
+                    "version": "1.0.0",
+                })
+            else:
+                self._send_json_error(501, "Firewall not available")
+
+        elif parsed.path == "/firewall/stats":
+            # Get firewall statistics
+            if HAS_FIREWALL and _GLOBAL_FIREWALL:
+                self._send_json(_GLOBAL_FIREWALL.get_statistics())
+            else:
+                self._send_json_error(501, "Firewall not available")
 
         else:
             self.send_error(404)
@@ -1671,6 +1706,122 @@ class SidecarHandler(BaseHTTPRequestHandler):
             decision = router.route_fingerprint(fingerprint, data.get("metadata"))
 
             self._send_json(decision.to_dict())
+
+        elif parsed.path == "/firewall/start":
+            # Start a new firewall monitoring session
+            if not HAS_FIREWALL or not _GLOBAL_FIREWALL:
+                self._send_json_error(501, "Firewall not available")
+                return
+
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                self._send_json_error(400, f"Invalid JSON: {e}")
+                return
+
+            session_id = data.get("session_id", f"session-{time.time()}")
+            _GLOBAL_FIREWALL.start_session(session_id)
+
+            self._send_json({
+                "status": "started",
+                "session_id": session_id,
+            })
+
+        elif parsed.path == "/firewall/check":
+            # Check a fingerprint for drift/hallucination
+            if not HAS_FIREWALL or not _GLOBAL_FIREWALL:
+                self._send_json_error(501, "Firewall not available")
+                return
+
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                self._send_json_error(400, f"Invalid JSON: {e}")
+                return
+
+            # Validate required fields
+            required = ["session_id", "fingerprint", "zone", "entropy", "sink_ratio", "token_position"]
+            missing = [f for f in required if f not in data]
+            if missing:
+                self._send_json_error(400, f"Missing fields: {missing}")
+                return
+
+            result = _GLOBAL_FIREWALL.check(
+                session_id=data["session_id"],
+                fingerprint=np.array(data["fingerprint"]),
+                zone=data["zone"],
+                entropy=data["entropy"],
+                sink_ratio=data["sink_ratio"],
+                token_position=data["token_position"],
+                cluster_id=data.get("cluster_id"),
+                embedding=tuple(data["embedding"]) if data.get("embedding") else None,
+            )
+
+            self._send_json(result.to_dict())
+
+        elif parsed.path == "/firewall/end":
+            # End a firewall session and get summary
+            if not HAS_FIREWALL or not _GLOBAL_FIREWALL:
+                self._send_json_error(501, "Firewall not available")
+                return
+
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                self._send_json_error(400, f"Invalid JSON: {e}")
+                return
+
+            session_id = data.get("session_id")
+            if not session_id:
+                self._send_json_error(400, "Missing 'session_id' field")
+                return
+
+            final_state = _GLOBAL_FIREWALL.end_session(session_id)
+            if final_state:
+                self._send_json({"status": "ended", **final_state})
+            else:
+                self._send_json_error(404, f"Session not found: {session_id}")
+
+        elif parsed.path == "/firewall/analyze":
+            # Batch analyze a complete sequence
+            if not HAS_FIREWALL:
+                self._send_json_error(501, "Firewall not available")
+                return
+
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                self._send_json_error(400, f"Invalid JSON: {e}")
+                return
+
+            # Validate required fields
+            required = ["fingerprints", "zones", "entropies", "sink_ratios"]
+            missing = [f for f in required if f not in data]
+            if missing:
+                self._send_json_error(400, f"Missing fields: {missing}")
+                return
+
+            analyzer = ManifoldBatchAnalyzer()
+            result = analyzer.analyze(
+                fingerprints=[np.array(fp) for fp in data["fingerprints"]],
+                zones=data["zones"],
+                entropies=data["entropies"],
+                sink_ratios=data["sink_ratios"],
+            )
+
+            self._send_json(result)
 
         else:
             self.send_error(404)
