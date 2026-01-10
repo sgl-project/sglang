@@ -273,7 +273,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install \
     datamodel_code_generator \
-    mooncake-transfer-engine==0.3.8 \
     pre-commit \
     pytest \
     black \
@@ -284,7 +283,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     scikit-build-core \
     nixl \
     py-spy \
-    cubloaty
+    cubloaty \
+    google-cloud-storage
+
+# Install mooncake
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$GRACE_BLACKWELL" = "1" ]; then \
+        python3 -m pip install mooncake-transfer-engine==0.3.7.post2; \
+    else \
+        python3 -m pip install mooncake-transfer-engine==0.3.8.post1; \
+    fi
 
 # Build and install sgl-model-gateway (install Rust, build, then remove to save space)
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -411,11 +419,12 @@ RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.
     && git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
     && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
+# These configs are optional; users can override them by mounting their own files
+COPY docker/configs/opt/.vimrc /opt/sglang/.vimrc
+COPY docker/configs/opt/.tmux.conf /opt/sglang/.tmux.conf
+COPY docker/configs/opt/.gitconfig /opt/sglang/.gitconfig
+
 # Configure development environment
-COPY docker/configs/.vimrc /root/.vimrc
-COPY docker/configs/.tmux.conf /root/.tmux.conf
-COPY docker/configs/.gitconfig /tmp/.gitconfig
-RUN cat /tmp/.gitconfig >> /root/.gitconfig && rm /tmp/.gitconfig
 COPY docker/configs/.zshrc /root/.zshrc
 
 # Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)

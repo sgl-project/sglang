@@ -271,6 +271,7 @@ class SchedulerMetricsCollector:
         self,
         labels: Dict[str, str],
         enable_lora: bool = False,
+        server_args: Optional["ServerArgs"] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Gauge, Histogram, Summary
@@ -729,24 +730,79 @@ class SchedulerMetricsCollector:
 
         self.realtime_tokens_total = Counter(
             name="sglang:realtime_tokens_total",
-            documentation="Total number of tokens processed (updated on each log interval).",
+            documentation=(
+                "Total number of tokens processed (updated on each log interval). "
+                "mode: prefill_compute, prefill_cache, decode."
+            ),
             labelnames=list(labels.keys()) + ["mode"],
         )
         self.gpu_execution_seconds_total = Counter(
             name="sglang:gpu_execution_seconds_total",
-            documentation="Total time that GPU is busy executing a workload.",
+            documentation=(
+                "Total time that GPU is busy executing a workload. "
+                "Refer to ForwardMode for category labels."
+            ),
             labelnames=list(labels.keys()) + ["category"],
         )
 
         self.dp_cooperation_realtime_tokens_total = Counter(
             name="sglang:dp_cooperation_realtime_tokens_total",
-            documentation="Total number of tokens processed with labels about DP cooperation.",
+            documentation=(
+                "Total number of tokens processed with labels about DP cooperation. "
+                "mode: prefill_compute, prefill_cache, decode."
+            ),
             labelnames=list(labels.keys()) + ["mode", "num_prefill_ranks"],
         )
         self.dp_cooperation_gpu_execution_seconds_total = Counter(
             name="sglang:dp_cooperation_gpu_execution_seconds_total",
-            documentation="Total time that GPU is busy executing a workload with labels about DP cooperation.",
+            documentation=(
+                "Total time that GPU is busy executing a workload with labels about DP cooperation. "
+                "Refer to ForwardMode for category labels."
+            ),
             labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
+        )
+
+        max_delay = server_args.prefill_delayer_max_delay_passes
+        self.prefill_delayer_wait_forward_passes = Histogram(
+            name="sglang:prefill_delayer_wait_forward_passes",
+            documentation="Histogram of forward passes waited by prefill delayer.",
+            labelnames=labels.keys(),
+            buckets=sorted(
+                set(
+                    x
+                    for x in (
+                        server_args.prefill_delayer_forward_passes_buckets
+                        or [5, 20, 50, 100, 200]
+                    )
+                    if x < max_delay
+                )
+                # Need bucket "<=0" for zero-delay cases, and "max_delay-1" to distinguish "max_delay" timeout passes
+                | {0, max_delay - 1}
+            ),
+        )
+        self.prefill_delayer_wait_seconds = Histogram(
+            name="sglang:prefill_delayer_wait_seconds",
+            documentation="Histogram of wait time in seconds by prefill delayer.",
+            labelnames=labels.keys(),
+            buckets=sorted(
+                set(
+                    server_args.prefill_delayer_wait_seconds_buckets
+                    or [1, 2, 5, 10, 20, 50, 100, 200, 500]
+                )
+                # Need bucket "<=0" for zero-delay cases
+                | {0}
+            ),
+        )
+        self.prefill_delayer_outcomes_total = Counter(
+            name="sglang:prefill_delayer_outcomes_total",
+            documentation="Prefill delayer outcome counts.",
+            labelnames=[
+                *labels.keys(),
+                "input_estimation",
+                "output_allow",
+                "output_reason",
+                "actual_execution",
+            ],
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
@@ -768,6 +824,29 @@ class SchedulerMetricsCollector:
 
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
+
+    def observe_prefill_delayer_outcome(
+        self,
+        forward_passes: int,
+        wait_seconds: float,
+        input_estimation: str,
+        output_allow: bool,
+        output_reason: str,
+        actual_execution: bool,
+    ) -> None:
+        if output_allow and actual_execution:
+            self._log_histogram(
+                self.prefill_delayer_wait_forward_passes, forward_passes
+            )
+            self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
+
+        self.prefill_delayer_outcomes_total.labels(
+            **self.labels,
+            input_estimation=input_estimation,
+            output_allow=str(output_allow).lower(),
+            output_reason=output_reason,
+            actual_execution=str(actual_execution).lower(),
+        ).inc(1)
 
     def increment_retracted_reqs(
         self,

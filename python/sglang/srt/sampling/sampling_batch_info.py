@@ -187,6 +187,10 @@ class SamplingBatchInfo:
     def adjusted_from_schedule_batch(self, batch: ScheduleBatch, vocab_size: int):
         pass
 
+    # placeholder for override
+    def adjusted_merge_batch(self, other: "SamplingBatchInfo"):
+        pass
+
     def __len__(self):
         return len(self.temperatures)
 
@@ -197,7 +201,11 @@ class SamplingBatchInfo:
             return
 
         # Find a grammar from the list
-        first_grammar = next(grammar for grammar in self.grammars if grammar)
+        first_grammar = next((grammar for grammar in self.grammars if grammar), None)
+        if first_grammar is None:
+            self.vocab_mask = None
+            self.apply_mask_func = None
+            return
 
         # TODO(lianmin): Maybe we can reuse the existing mask?
         self.vocab_mask = first_grammar.allocate_vocab_mask(
@@ -228,7 +236,7 @@ class SamplingBatchInfo:
         else:
             self.acc_linear_penalties = None
 
-    def apply_logits_bias(self, logits: torch.Tensor):
+    def apply_logits_bias(self, logits: torch.Tensor, apply_vocab_mask: bool = True):
         if self.acc_linear_penalties is not None:
             # Used in the overlap mode
             logits.add_(self.acc_linear_penalties)
@@ -237,7 +245,7 @@ class SamplingBatchInfo:
             # Used in the non-overlap mode
             self.penalizer_orchestrator.apply(logits)
 
-        if self.vocab_mask is not None:
+        if apply_vocab_mask and self.vocab_mask is not None:
             self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
 
         if self.logit_bias is not None:
@@ -371,6 +379,8 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+
+        self.adjusted_merge_batch(other)
 
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
