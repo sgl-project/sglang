@@ -60,10 +60,14 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.layers.dp_attention import (
+    compute_dp_attention_world_info,
+    get_attention_tp_group,
+)
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.io_struct import (
@@ -546,10 +550,10 @@ class Scheduler(
                 self.max_running_requests // self.pp_size, 1
             )
 
-        self.tp_group = self.tp_worker.get_tp_group()
+        self.tp_group = get_tp_group()
         self.tp_cpu_group = self.tp_group.cpu_group
-        self.attn_tp_group = self.tp_worker.get_attention_tp_group()
-        self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
+        self.attn_tp_group = get_attention_tp_group()
+        self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 

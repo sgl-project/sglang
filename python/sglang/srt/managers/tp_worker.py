@@ -83,15 +83,6 @@ class BaseTpWorker(ABC):
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
-    def get_tp_group(self):
-        return self.model_runner.tp_group
-
-    def get_attention_tp_group(self):
-        return self.model_runner.attention_tp_group
-
-    def get_attention_tp_cpu_group(self):
-        return getattr(self.model_runner.attention_tp_group, "cpu_group", None)
-
     def get_memory_pool(self):
         return (
             self.model_runner.req_to_token_pool,
