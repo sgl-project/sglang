@@ -380,6 +380,10 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
             dit_config = FluxConfig()
             server_args.pipeline_config.dit_config = dit_config
 
+        # Set guidance_embeds to True for ComfyUI Flux models
+        dit_config.arch_config.guidance_embeds = True
+        logger.info("Set guidance_embeds=True for ComfyUI Flux model")
+
         if dit_config.arch_config.param_names_mapping is None:
             dit_config.arch_config.param_names_mapping = {}
 
