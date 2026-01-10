@@ -216,7 +216,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
 
-        # Init CPU monitor
         if self.enable_metrics:
             from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
 
