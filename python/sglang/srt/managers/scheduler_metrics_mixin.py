@@ -20,6 +20,7 @@ from sglang.srt.metrics.collector import (
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer
+from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
@@ -111,6 +112,8 @@ class SchedulerMetricsMixin:
 
         if self.enable_kv_cache_events:
             self.init_kv_events(self.server_args.kv_events_config)
+
+        self.scheduler_status_logger = SchedulerStatusLogger.create_if_enabled()
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
@@ -436,6 +439,11 @@ class SchedulerMetricsMixin:
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
+
+        if self.scheduler_status_logger:
+            running_rids = [r.rid for r in batch.reqs]
+            queued_rids = [r.rid for r in self.waiting_queue]
+            self.scheduler_status_logger.maybe_dump(running_rids, queued_rids)
 
     def log_decode_stats_every_iteration(
         self: Scheduler, batch: ScheduleBatch, num_accepted_tokens: int
