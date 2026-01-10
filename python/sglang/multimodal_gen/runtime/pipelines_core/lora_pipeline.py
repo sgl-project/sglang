@@ -620,13 +620,14 @@ class LoRAPipeline(ComposedPipelineBase):
             return
 
         # Disable layerwise offload if enabled: load all layers to GPU
-        with self._temporarily_disable_offload(target_modules=target_modules):
-            for module_name, lora_layers_dict in target_modules:
-                if not self.is_lora_merged.get(module_name, False):
-                    logger.warning(
-                        "LoRA weights are not merged for %s, skipping", module_name
-                    )
-                    continue
+        
+        for module_name, lora_layers_dict in target_modules:
+            if not self.is_lora_merged.get(module_name, False):
+                logger.warning(
+                    "LoRA weights are not merged for %s, skipping", module_name
+                )
+                continue
+            with self._temporarily_disable_offload(target_modules=target_modules):
                 for name, layer in lora_layers_dict.items():
                     # Check layer-level state to avoid raising exception
                     if hasattr(layer, "merged") and not layer.merged:
