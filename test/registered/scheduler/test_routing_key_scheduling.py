@@ -17,6 +17,9 @@ from sglang.test.test_utils import (
 )
 
 
+register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
+
+
 class TestRoutingKeyScheduling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
