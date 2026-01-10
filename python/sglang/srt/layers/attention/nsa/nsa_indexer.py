@@ -488,8 +488,10 @@ class Indexer(MultiPlatformOp):
             assert page_size == 64, "only support page size 64"
 
         assert len(weights.shape) == 3
-        assert (forward_batch.seq_lens_cpu is not None 
-                and forward_batch.extend_seq_lens_cpu is not None)
+        assert (
+            forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        )
         weights = weights.squeeze(-1)
 
         if _is_hip:
@@ -517,7 +519,11 @@ class Indexer(MultiPlatformOp):
         seq_len_sum = forward_batch.seq_lens_sum
         max_seq_len = torch.max(forward_batch.seq_lens_cpu).item()
         k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
-            layer_id, forward_batch.seq_lens, block_tables, seq_len_sum, max_seq_len,
+            layer_id,
+            forward_batch.seq_lens,
+            block_tables,
+            seq_len_sum,
+            max_seq_len,
         )
         if _is_fp8_fnuz:
             k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
@@ -1107,7 +1113,12 @@ class Indexer(MultiPlatformOp):
                     return torch.cat([topk_result_prev, topk_result_next], dim=0)
                 else:
                     topk_result = self._get_topk_ragged(
-                        enable_dual_stream, forward_batch, layer_id, q_fp8, weights, metadata
+                        enable_dual_stream,
+                        forward_batch,
+                        layer_id,
+                        q_fp8,
+                        weights,
+                        metadata,
                     )
         else:
             topk_result = self.forward_indexer(
