@@ -135,6 +135,12 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_bucket_labels_len() {
+        let buckets = BucketLabels::new(&[10, 30, 60]);
+        assert_eq!(buckets.len(), 4);
+    }
+
     // --- Bucket Counts Tests ---
 
     #[test]
