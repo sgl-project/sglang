@@ -1883,8 +1883,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
 
                 k = forward_batch.token_to_kv_pool.get_key_buffer(
-                        self.attn_mqa.layer_id
-                    )
+                    self.attn_mqa.layer_id
+                )
 
                 q = fused_qk_rope_cat_and_cache_mla(
                     q_nope_out,

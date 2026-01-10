@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    get_torch_compile_disable_decorator,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -49,7 +50,6 @@ from sglang.srt.utils import (
     next_power_of_2,
     round_up,
     set_weight_attrs,
-    get_torch_compile_disable_decorator,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
