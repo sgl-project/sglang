@@ -580,6 +580,11 @@ def run_data_parallel_controller_process(
     parent_process = psutil.Process().parent()
 
     configure_logger(server_args)
+
+    if server_args.enable_metrics:
+        from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
+
+        start_cpu_monitor_thread("data_parallel_controller")
     if server_args.enable_trace:
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
         thread_label = "DP Controller"

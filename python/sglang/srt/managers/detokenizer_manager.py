@@ -416,6 +416,11 @@ def run_detokenizer_process(
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 
+    if server_args.enable_metrics:
+        from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
+
+        start_cpu_monitor_thread("detokenizer")
+
     try:
         manager = detokenizer_manager_class(server_args, port_args)
         if server_args.tokenizer_worker_num == 1:

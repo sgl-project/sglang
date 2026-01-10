@@ -96,7 +96,11 @@ def init_tokenizer_manager(
     port_args: PortArgs,
     TokenizerManagerClass: Optional[TokenizerManager] = None,
 ) -> Tuple[TokenizerManager, TemplateManager]:
-    # Launch tokenizer process
+    if server_args.enable_metrics:
+        from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
+
+        start_cpu_monitor_thread("tokenizer")
+
     TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
     tokenizer_manager = TokenizerManagerClass(server_args, port_args)
 
