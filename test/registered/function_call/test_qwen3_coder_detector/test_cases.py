@@ -1,6 +1,10 @@
 from test.registered.function_call.test_qwen3_coder_detector.test_framework import StreamingTestRunner
 from test.registered.function_call.test_qwen3_coder_detector.test_fixtures import get_test_tools
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(1.0, "default")
+
 class TestCaseRegistry:
     _registry = {}
 

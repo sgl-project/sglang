@@ -1,3 +1,8 @@
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(1.0, "default")
+
+
 import json
 import re
 import random
