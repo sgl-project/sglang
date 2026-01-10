@@ -2334,19 +2334,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ):
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
-        has_grammar = sampling_info.grammars is not None
-        # Avoid compiling grammar masks on every TP rank; only the first rank applies them.
-        apply_vocab_mask = has_grammar and self.sampler.tp_rank == 0
+
         # Calculate logits bias and apply it to next_token_logits.
-        if apply_vocab_mask:
-            sampling_info.update_regex_vocab_mask()
-        else:
-            sampling_info.vocab_mask = None
-            sampling_info.apply_mask_func = None
-        sampling_info.apply_logits_bias(
-            logits_output.next_token_logits,
-            apply_vocab_mask=apply_vocab_mask,
-        )
+        sampling_info.update_regex_vocab_mask()
+        sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
     def sample(
         self,
