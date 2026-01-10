@@ -698,15 +698,10 @@ class Qwen3ForCausalLMDFlash(nn.Module):
                     )
 
 
-# Create a properly named class for HuggingFace architecture matching
-# The HuggingFace config has "architectures": ["DFlashDraftModel"]
-# This class MUST have __name__ == "DFlashDraftModel" for registry to find it
 class DFlashDraftModel(Qwen3ForCausalLMDFlash):
     """DFlash draft model - same as Qwen3ForCausalLMDFlash but with matching name."""
 
     pass
 
 
-# Register with SGLang's model registry
-# Include both names so either architecture name works
 EntryClass = [Qwen3ForCausalLMDFlash, DFlashDraftModel]

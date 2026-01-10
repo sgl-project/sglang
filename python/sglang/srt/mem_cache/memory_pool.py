@@ -743,7 +743,7 @@ class MHATokenToKVPool(KVCache):
                 ]
 
                 # DFlash hidden state buffer (uses same token indices as KV cache)
-                # Stores FC-compressed hidden states from target model layers
+                # Stores hidden states from target model layers
                 if self.dflash_hidden_size > 0 and self.dflash_num_target_layers > 0:
                     self.hidden_buffer = [
                         torch.zeros(
@@ -922,7 +922,7 @@ class MHATokenToKVPool(KVCache):
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
     # ===== DFlash Hidden State Methods =====
-    # These methods store/retrieve FC-compressed hidden states from target model
+    # These methods store/retrieve hidden states from target model
     # using the SAME token indices as the KV cache, enabling unified memory management.
 
     def enable_dflash_hidden_buffer(

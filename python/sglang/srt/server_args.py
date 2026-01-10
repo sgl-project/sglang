@@ -2232,7 +2232,6 @@ class ServerArgs:
             # Set num_draft_tokens = block_size for DFlash
             self.speculative_num_draft_tokens = self.speculative_dflash_block_size
 
-            # DFlash doesn't use iterative steps like EAGLE
             self.speculative_num_steps = 1
 
             # DFlash V1 only - overlap scheduling not yet supported

@@ -288,7 +288,6 @@ class CudaGraphRunner:
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
         elif model_runner.spec_algorithm.is_dflash():
-            # DFlash target model verification - needs hidden states like EAGLE
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
             self.num_tokens_per_bs = (
                 self.model_runner.server_args.speculative_dflash_block_size
@@ -931,7 +930,6 @@ class CudaGraphRunner:
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
         elif self.model_runner.spec_algorithm.is_dflash():
-            # DFlash needs hidden states from target model, similar to EAGLE
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
             spec_info = DFlashVerifyInput(

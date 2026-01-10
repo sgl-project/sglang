@@ -510,14 +510,15 @@ class TestDFlashModelImport(CustomTestCase):
         self.assertIsNotNone(Qwen3ForCausalLMDFlash)
 
     def test_model_alias_import(self):
-        """Test that DFlashDraftModel alias exists for backward compatibility."""
+        """Test that DFlashDraftModel exists and inherits from Qwen3ForCausalLMDFlash."""
         from sglang.srt.models.qwen3_dflash import (
             DFlashDraftModel,
             Qwen3ForCausalLMDFlash,
         )
 
         self.assertIsNotNone(DFlashDraftModel)
-        self.assertIs(DFlashDraftModel, Qwen3ForCausalLMDFlash)
+        # DFlashDraftModel is a subclass for HuggingFace architecture matching
+        self.assertTrue(issubclass(DFlashDraftModel, Qwen3ForCausalLMDFlash))
 
     def test_dflash_worker_import(self):
         """Test that DFlashWorker can be imported."""

@@ -13,7 +13,6 @@
 # ==============================================================================
 """DFlash speculative decoding input/output dataclasses.
 
-Following the NGRAM pattern for fixed-length draft token verification.
 Uses fused verify_tree_greedy kernel for efficient verification.
 """
 
@@ -61,7 +60,7 @@ class DFlashDraftInput(SpecInput):
     # Capture mode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
-    # Class-level constant for allocation (set by worker) - ClassVar so not a dataclass field
+    # Class-level constant for allocation (set by worker)
     ALLOC_LEN_PER_DECODE: ClassVar[int] = 16
 
     def __post_init__(self):
@@ -89,16 +88,10 @@ class DFlashDraftInput(SpecInput):
                 self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: "DFlashDraftInput"):
-        """Merge another batch into this one.
-
-        CRITICAL FIX: Always concatenate verified_id, regardless of hidden_states.
-        DFlash sets hidden_states=None, so the old logic would REPLACE verified_id
-        instead of concatenating, causing decode requests to lose their verified_ids.
-        """
+        """Merge another batch into this one."""
         if spec_info is None:
             return
 
-        # ALWAYS concatenate verified_id - this is critical for batching correctness
         if self.verified_id is None or self.verified_id.numel() == 0:
             self.verified_id = spec_info.verified_id
         elif spec_info.verified_id is not None and spec_info.verified_id.numel() > 0:
@@ -106,7 +99,6 @@ class DFlashDraftInput(SpecInput):
                 [self.verified_id, spec_info.verified_id], dim=0
             )
 
-        # Handle hidden_states separately (DFlash manages these per-request, not in spec_info)
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
         elif spec_info.hidden_states is not None:
@@ -298,7 +290,6 @@ class DFlashVerifyInput(SpecInput):
         self.accept_length = torch.zeros(bs, dtype=torch.int32, device=self.device)
 
         if FUSED_KERNEL_AVAILABLE:
-            # Single fused kernel call - no CPU-GPU sync!
             verify_tree_greedy(
                 predicts=self.predict,
                 accept_index=self.accept_index,
@@ -394,7 +385,7 @@ class DFlashVerifyInput(SpecInput):
         return has_finished
 
     def _free_cache(self, batch: ScheduleBatch, page_size: int):
-        """Free KV cache for rejected tokens - following NGram pattern.
+        """Free KV cache for rejected tokens.
 
         Uses accepted_indices (global flat indices) to determine which cache slots to keep.
         """
@@ -413,9 +404,6 @@ class DFlashVerifyInput(SpecInput):
             req.kv_committed_len += accept_length_cpu[i] + 1
             req.kv_allocated_len = req.kv_committed_len
 
-        # FIX: Get LAST accepted token per request (the bonus token)
-        # accept_index has shape [bs, block_size], find last valid index per row
-        # verified_id must have shape [bs] - one token per request
         last_indices = []
         for i in range(bs):
             row = self.accept_index[i]

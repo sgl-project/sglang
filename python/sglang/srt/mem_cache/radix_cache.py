@@ -265,10 +265,6 @@ class RadixCache(BasePrefixCache):
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
 
-        # DFlash hidden state support: uses unified KV pool approach
-        # Hidden states are stored in MHATokenToKVPool using the same indices as KV cache.
-        # No separate hidden_state_pool is needed.
-
         self.kv_event_queue = []
 
         if params.enable_metrics:
