@@ -35,6 +35,7 @@ class GlmImagePipelineConfig(ImagePipelineConfig):
             "crop_coords": batch.crop_coords,
             "target_size": batch.target_size,
             "kv_caches": batch.kv_caches,
+            "kv_caches_mode": "read",
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -44,6 +45,7 @@ class GlmImagePipelineConfig(ImagePipelineConfig):
             "crop_coords": batch.crop_coords,
             "target_size": batch.target_size,
             "kv_caches": batch.kv_caches,
+            "kv_caches_mode": "skip",
         }
 
     def post_denoising_loop(self, latents, batch):

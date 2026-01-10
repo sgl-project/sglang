@@ -1264,7 +1264,6 @@ class DenoisingStage(PipelineStage):
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
             ):
-                batch.kv_caches.set_mode("read")
                 noise_pred_cond = self._predict_noise(
                     current_model=current_model,
                     latent_model_input=latent_model_input,
@@ -1290,7 +1289,6 @@ class DenoisingStage(PipelineStage):
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
             ):
-                batch.kv_caches.set_mode("skip")
                 noise_pred_uncond = self._predict_noise(
                     current_model=current_model,
                     latent_model_input=latent_model_input,

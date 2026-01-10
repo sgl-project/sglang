@@ -705,6 +705,7 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         return_dict: bool = True,
         attention_mask: Optional[torch.Tensor] = None,
         kv_caches: Optional[GlmImageKVCache] = None,
+        kv_caches_mode: Optional[str] = None,
         freqs_cis: Optional[
             Union[
                 Tuple[torch.Tensor, torch.Tensor],
@@ -714,6 +715,9 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         ###
         guidance: torch.Tensor = None,  # TODO: this should probably be removed
     ) -> Tuple[torch.Tensor]:
+
+        kv_caches.set_mode(kv_caches_mode)
+
         batch_size, num_channels, height, width = hidden_states.shape
 
         timestep -= 1.0

@@ -337,6 +337,7 @@ def get_model_info(
             logger.info("Falling back to diffusers backend")
             return _get_diffusers_model_info(model_path)
         return None
+
     pipeline_cls = _PIPELINE_REGISTRY.get(pipeline_class_name)
     if not pipeline_cls:
         if backend == Backend.AUTO:

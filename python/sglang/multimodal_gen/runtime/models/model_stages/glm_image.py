@@ -819,7 +819,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         kv_caches = GlmImageKVCache(num_layers=self.transformer.config.num_layers)
 
         if ar_condition_images is not None:
-            kv_caches.set_mode("write")
             latents_mean = torch.tensor(self.vae.config.latents_mean).view(
                 1, self.vae.config.latent_channels, 1, 1
             )
@@ -865,6 +864,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                     crop_coords=torch.zeros((1, 2), device=device),
                     attention_kwargs=attention_kwargs,
                     kv_caches=kv_caches,
+                    kv_caches_mode="write",
                 )
 
         # 6. Prepare additional timestep conditions
