@@ -148,7 +148,7 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:e2e_request_latency_seconds",
             "sglang:http_requests_active",
             "sglang:routing_keys_active",
-            "sglang:num_unique_routing_keys",
+            "sglang:num_unique_running_routing_keys",
             "sglang:routing_key_running_req_count",
             "sglang:routing_key_all_req_count",
         ]
