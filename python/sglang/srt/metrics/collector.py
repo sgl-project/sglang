@@ -248,7 +248,7 @@ class SchedulerStats:
     lora_pool_utilization: float = 0.0
 
     # Routing key metrics
-    num_unique_routing_keys: int = 0
+    num_unique_running_routing_keys: int = 0
     routing_key_running_req_counts: List[int] = field(default_factory=list)
     routing_key_all_req_counts: List[int] = field(default_factory=list)
 
@@ -738,8 +738,8 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
-        self.num_unique_routing_keys = Gauge(
-            name="sglang:num_unique_routing_keys",
+        self.num_unique_running_routing_keys = Gauge(
+            name="sglang:num_unique_running_routing_keys",
             documentation="Number of unique routing keys in running batch.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
@@ -1017,7 +1017,7 @@ class SchedulerMetricsCollector:
             self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
             self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
 
-        self._log_gauge(self.num_unique_routing_keys, stats.num_unique_routing_keys)
+        self._log_gauge(self.num_unique_running_routing_keys, stats.num_unique_running_routing_keys)
         self.routing_key_running_req_count.set_by_current_observations(
             self.labels, stats.routing_key_running_req_counts
         )
