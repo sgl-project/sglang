@@ -45,45 +45,24 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# CONSTANTS
+# CONSTANTS - Import from central schema module
 # =============================================================================
 
-# Fingerprint dimension (schema v1 = 20, schema v2 = 21 with rotational_variance)
-FINGERPRINT_DIM = 20  # Base dimension (backwards compatible)
-FINGERPRINT_DIM_V2 = 21  # Extended dimension with rotational_variance
-
-# Fingerprint layout (schema v1)
-FP_LOCAL_MASS = 0
-FP_MID_MASS = 1
-FP_LONG_MASS = 2
-FP_ENTROPY = 3
-FP_HISTOGRAM_START = 4
-FP_HISTOGRAM_END = 12
-FP_LAYER_STATS_START = 12
-FP_LAYER_STATS_END = 20
-
-# Schema v2 extension
-FP_ROTATIONAL_VARIANCE = 20  # Position 20 in v2 fingerprints
-
-# Zone thresholds (updated to use rotational_variance when available)
-# RV measures RoPE de-rotation effect: Low RV = local/nearby, High RV = distant/long-range
-ZONE_THRESHOLDS = {
-    'syntax_floor': {
-        'local_mass_min': 0.5,
-        'entropy_max': 2.5,
-        # Low RV = local attention (nearby tokens, small RoPE angles)
-        'rotational_variance_max': 0.25,
-    },
-    'structure_ripple': {
-        'long_mass_min': 0.25,
-        # High RV = long-range attention (distant tokens, large RoPE angles)
-        'rotational_variance_min': 0.35,
-    },
-    'semantic_bridge': {
-        # Medium RV = balanced local/long-range attention
-        'rotational_variance_range': (0.15, 0.5),
-    },
-}
+from .fingerprint_schema import (
+    V1_DIM as FINGERPRINT_DIM,
+    V2_DIM as FINGERPRINT_DIM_V2,
+    FP_LOCAL_MASS,
+    FP_MID_MASS,
+    FP_LONG_MASS,
+    FP_ENTROPY,
+    FP_HISTOGRAM_START,
+    FP_HISTOGRAM_END,
+    FP_LAYER_STATS_START,
+    FP_LAYER_STATS_END,
+    FP_ROTATIONAL_VARIANCE,
+    ZONE_THRESHOLDS,
+    is_v2,
+)
 
 
 # =============================================================================
@@ -370,13 +349,16 @@ class OnlineClassifier:
         zone classification accuracy:
 
         - syntax_floor: High local mass + low entropy + LOW rotational variance
-          (position-driven attention for grammar/syntax)
+          (attention to nearby tokens for grammar/syntax)
 
         - structure_ripple: High long-range mass + HIGH rotational variance
-          (semantic reasoning across document structure)
+          (attention to distant tokens for structural patterns)
 
         - semantic_bridge: Balanced attention, medium rotational variance
-          (connecting meaning across moderate distances)
+          (mixed-distance attention for coreference/retrieval)
+
+        NOTE: Rotational variance measures attention DISTANCE, not semantic vs positional.
+        See fingerprint_schema.RV_SEMANTICS_DOC for full explanation.
         """
         local_mass = fingerprint[FP_LOCAL_MASS]
         mid_mass = fingerprint[FP_MID_MASS]

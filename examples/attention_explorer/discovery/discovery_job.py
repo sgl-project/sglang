@@ -72,57 +72,24 @@ except ImportError:
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-FINGERPRINT_DIM = 20  # Schema v1 fingerprint dimension (base)
-FINGERPRINT_DIM_V2 = 21  # Schema v2 with rotational_variance
-SCHEMA_VERSION = 1
-
-# Fingerprint layout (schema v1):
-# [0]  local_mass     - attention mass in local window (0-32 tokens)
-# [1]  mid_mass       - attention mass in mid range (32-256 tokens)
-# [2]  long_mass      - attention mass in long range (256+ tokens)
-# [3]  entropy        - attention entropy (higher = more distributed)
-# [4-11] histogram    - 8-bin distance histogram
-# [12-19] layer_stats - per-layer entropy (up to 8 layers)
-# [20] rotational_variance (schema v2) - RoPE de-rotation effect magnitude
-#      Low RV (→0) = attention to nearby tokens (RoPE angles small, de-rotation changes little)
-#      High RV (→1) = attention to distant tokens (RoPE angles large, de-rotation changes a lot)
-#      NOTE: This measures "how long-range is this attention", not "how semantic"
-
-FP_LOCAL_MASS = 0
-FP_MID_MASS = 1
-FP_LONG_MASS = 2
-FP_ENTROPY = 3
-FP_HISTOGRAM_START = 4
-FP_HISTOGRAM_END = 12
-FP_LAYER_STATS_START = 12
-FP_LAYER_STATS_END = 20
-FP_ROTATIONAL_VARIANCE = 20  # Schema v2 extension
-
-# Zone thresholds (tuned for typical LLM attention patterns)
-# Updated to incorporate rotational_variance when available
-ZONE_THRESHOLDS = {
-    'syntax_floor': {
-        'local_mass_min': 0.5,
-        'entropy_max': 2.5,
-        # Low RV = local attention (nearby tokens, small RoPE angles)
-        'rotational_variance_max': 0.25,
-    },
-    'structure_ripple': {
-        'long_mass_min': 0.25,
-        'histogram_variance_min': 0.1,  # Periodic patterns have high variance
-        # High RV = long-range attention (distant tokens, large RoPE angles)
-        'rotational_variance_min': 0.35,
-    },
-    'semantic_bridge': {
-        # Medium RV = balanced local/long-range attention
-        'rotational_variance_range': (0.15, 0.5),
-    },
-    # semantic_bridge is the default when others don't match
-}
+# Import fingerprint schema from central module
+from .fingerprint_schema import (
+    SCHEMA_VERSION,
+    V1_DIM as FINGERPRINT_DIM,
+    V2_DIM as FINGERPRINT_DIM_V2,
+    FP_LOCAL_MASS,
+    FP_MID_MASS,
+    FP_LONG_MASS,
+    FP_ENTROPY,
+    FP_HISTOGRAM_START,
+    FP_HISTOGRAM_END,
+    FP_LAYER_STATS_START,
+    FP_LAYER_STATS_END,
+    FP_ROTATIONAL_VARIANCE,
+    ZONE_THRESHOLDS,
+    is_v2,
+    get_rotational_variance,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -298,11 +265,14 @@ def assign_zone_labels(fingerprints: np.ndarray) -> Tuple[np.ndarray, np.ndarray
 
     The three zones represent different "attention programs":
     - syntax_floor: Local attention, low entropy (JSON repair, brackets, formatting)
-      + LOW rotational variance (position-driven, not semantic)
+      + LOW rotational variance (attention to nearby tokens)
     - semantic_bridge: Mid-range retrieval, balanced (coreference, task routing)
-      + MEDIUM rotational variance (balanced semantic/positional)
+      + MEDIUM rotational variance (balanced short/long-range)
     - structure_ripple: Long-range periodic patterns (counting, tables, indentation)
-      + HIGH rotational variance (semantic reasoning across structure)
+      + HIGH rotational variance (attention to distant tokens)
+
+    NOTE: Rotational variance measures attention DISTANCE, not semantic vs positional.
+    See fingerprint_schema.RV_SEMANTICS_DOC for full explanation.
 
     Args:
         fingerprints: Array of shape (N, 20) or (N, 21) with fingerprint vectors
@@ -349,15 +319,15 @@ def assign_zone_labels(fingerprints: np.ndarray) -> Tuple[np.ndarray, np.ndarray
         # Check syntax_floor first (high local, low entropy, optionally low rotational variance)
         if local_mass[i] > sf_thresh['local_mass_min']:
             if entropy[i] < sf_thresh['entropy_max']:
-                # If rotational variance is available, check it's low (position-driven)
+                # If rotational variance is available, verify it's low (short-range attention)
                 if rv is not None:
                     rv_max = sf_thresh.get('rotational_variance_max', 1.0)
                     if rv <= rv_max:
                         zones[i] = 'syntax_floor'
-                        # High confidence when rotational variance confirms position-driven
+                        # High confidence when RV confirms short-range/local attention
                         confidences[i] = min(1.0, local_mass[i] * (1.0 - entropy[i] / 4.0) * (1.0 - rv))
                         continue
-                    # High rotational variance with local mass = likely semantic bridging, not syntax
+                    # High RV with local mass = long-range pattern, not pure syntax
                     # Fall through to check other zones
                 else:
                     zones[i] = 'syntax_floor'
@@ -367,15 +337,15 @@ def assign_zone_labels(fingerprints: np.ndarray) -> Tuple[np.ndarray, np.ndarray
         # Check structure_ripple (high long-range, periodic patterns, optionally high rotational variance)
         if long_mass[i] > sr_thresh['long_mass_min']:
             if hist_variance[i] > sr_thresh['histogram_variance_min']:
-                # If rotational variance is available, check it's high (semantic reasoning)
+                # If rotational variance is available, verify it's high (long-range attention)
                 if rv is not None:
                     rv_min = sr_thresh.get('rotational_variance_min', 0.0)
                     if rv >= rv_min:
                         zones[i] = 'structure_ripple'
-                        # High confidence when rotational variance confirms semantic reasoning
+                        # High confidence when RV confirms long-range attention pattern
                         confidences[i] = min(1.0, (long_mass[i] + rv) / 2)
                         continue
-                    # Low rotational variance with long mass = structural, still structure_ripple
+                    # Low RV with high long_mass = unusual pattern, still classify as structure_ripple
                     zones[i] = 'structure_ripple'
                     confidences[i] = min(1.0, long_mass[i] * 0.8)
                     continue

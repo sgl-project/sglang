@@ -17,6 +17,23 @@ import unittest
 import numpy as np
 from typing import List, Tuple
 
+# Import the canonical schema module (single source of truth)
+from .fingerprint_schema import (
+    V1_DIM as FINGERPRINT_DIM,
+    V2_DIM as FINGERPRINT_DIM_V2,
+    FP_LOCAL_MASS,
+    FP_MID_MASS,
+    FP_LONG_MASS,
+    FP_ENTROPY,
+    FP_ROTATIONAL_VARIANCE,
+    ZONE_THRESHOLDS,
+    RV_THRESHOLD_LOCAL,
+    RV_THRESHOLD_LONG_RANGE,
+    RV_SEMANTICS_DOC,
+    is_v2,
+    get_rotational_variance,
+)
+
 # Import the modules under test
 from .rope_derotation import (
     RoPEDerotator,
@@ -26,23 +43,8 @@ from .rope_derotation import (
     extend_fingerprint_with_rotational_variance,
     extend_fingerprints_batch,
 )
-from .classifier import (
-    OnlineClassifier,
-    FINGERPRINT_DIM,
-    FINGERPRINT_DIM_V2,
-    FP_LOCAL_MASS,
-    FP_MID_MASS,
-    FP_LONG_MASS,
-    FP_ENTROPY,
-    FP_ROTATIONAL_VARIANCE,
-    ZONE_THRESHOLDS,
-)
-from .discovery_job import (
-    assign_zone_labels,
-    FINGERPRINT_DIM as DJ_FINGERPRINT_DIM,
-    FINGERPRINT_DIM_V2 as DJ_FINGERPRINT_DIM_V2,
-    FP_ROTATIONAL_VARIANCE as DJ_FP_ROTATIONAL_VARIANCE,
-)
+from .classifier import OnlineClassifier
+from .discovery_job import assign_zone_labels
 
 
 # =============================================================================
@@ -444,16 +446,18 @@ class TestEdgeCases:
 # =============================================================================
 
 class TestConsistency:
-    """Tests for consistency between classifier.py and discovery_job.py."""
+    """Tests for consistency of schema constants from fingerprint_schema.py."""
 
     def test_fingerprint_dim_constants_match(self):
-        """Ensure fingerprint dimension constants are consistent."""
-        assert FINGERPRINT_DIM == DJ_FINGERPRINT_DIM
-        assert FINGERPRINT_DIM_V2 == DJ_FINGERPRINT_DIM_V2
+        """Ensure fingerprint dimension constants are valid."""
+        assert FINGERPRINT_DIM == 20  # V1 base
+        assert FINGERPRINT_DIM_V2 == 21  # V2 with RV
+        assert FINGERPRINT_DIM_V2 == FINGERPRINT_DIM + 1
 
     def test_rotational_variance_index_matches(self):
-        """Ensure rotational variance index is consistent."""
-        assert FP_ROTATIONAL_VARIANCE == DJ_FP_ROTATIONAL_VARIANCE
+        """Ensure rotational variance index is at end of v1 fingerprint."""
+        assert FP_ROTATIONAL_VARIANCE == 20  # Position after V1 fingerprint
+        assert FP_ROTATIONAL_VARIANCE == FINGERPRINT_DIM  # Exactly at V1 end
 
     def test_zone_names_are_consistent(self):
         """Ensure zone names are consistent across modules."""

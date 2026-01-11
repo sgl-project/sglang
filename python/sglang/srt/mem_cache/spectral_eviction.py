@@ -58,6 +58,10 @@ except ImportError:
 # =============================================================================
 
 # Manifold zone importance scores (higher = more important to keep)
+# Zones represent attention distance patterns (see fingerprint_schema.py for full docs):
+#   - syntax_floor: local/short-range attention → less important (reconstructible)
+#   - structure_ripple: long-range structural patterns → moderately important
+#   - semantic_bridge: mid-range retrieval anchors → most important (bridging)
 ZONE_IMPORTANCE = {
     "semantic_bridge": 0.95,    # Retrieval anchors - critical
     "long_range": 0.85,         # Long-range dependencies
@@ -67,12 +71,15 @@ ZONE_IMPORTANCE = {
     "unknown": 0.50,            # Default
 }
 
-# Fingerprint feature indices (from decode_attention_with_topk.py)
+# Fingerprint feature indices
+# Schema v1: 20 dimensions, Schema v2: 21 dimensions (adds rotational_variance at [20])
+# See examples/attention_explorer/discovery/fingerprint_schema.py for full documentation
 FP_LOCAL_MASS = 0
 FP_MID_MASS = 1
 FP_LONG_MASS = 2
 FP_ENTROPY = 3
 FP_HISTOGRAM_START = 4
+FP_ROTATIONAL_VARIANCE = 20  # Schema v2 extension (if dim >= 21)
 
 
 # =============================================================================
