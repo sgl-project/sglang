@@ -137,16 +137,29 @@ pub async fn send_request(app: axum::Router, routing_key: &str) -> (String, Stri
 
 #[macro_export]
 macro_rules! manual_routing_all_backend_test {
-    ($name:ident $(, $extra:expr)*) => {
+    ($name:ident, $base_port:expr) => {
         paste::paste! {
             #[tokio::test]
             async fn [<$name _local_backend>]() {
-                [<$name _impl>]($crate::common::manual_routing_test_helpers::TestManualConfig::local() $(, $extra)*).await;
+                [<$name _impl>]($crate::common::manual_routing_test_helpers::TestManualConfig::local(), $base_port).await;
             }
 
             #[tokio::test]
             async fn [<$name _redis_backend>]() {
-                [<$name _impl>]($crate::common::manual_routing_test_helpers::TestManualConfig::redis(stringify!($name)) $(, $extra)*).await;
+                [<$name _impl>]($crate::common::manual_routing_test_helpers::TestManualConfig::redis(stringify!($name)), $base_port + 500).await;
+            }
+        }
+    };
+    ($name:ident) => {
+        paste::paste! {
+            #[tokio::test]
+            async fn [<$name _local_backend>]() {
+                [<$name _impl>]($crate::common::manual_routing_test_helpers::TestManualConfig::local()).await;
+            }
+
+            #[tokio::test]
+            async fn [<$name _redis_backend>]() {
+                [<$name _impl>]($crate::common::manual_routing_test_helpers::TestManualConfig::redis(stringify!($name))).await;
             }
         }
     };
