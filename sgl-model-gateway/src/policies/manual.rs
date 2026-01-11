@@ -1262,12 +1262,11 @@ mod tests {
     }
 
     // ========================================================================
-    // Dual Backend Tests (Local + Redis)
+    // All Backend Tests (Local + Redis + future backends)
     // ========================================================================
     //
-    // These tests run on both LocalBackend and RedisBackend to verify
-    // consistent behavior across backends. Redis tests require TEST_REDIS_URL
-    // environment variable and are marked with #[ignore].
+    // These tests run on all backends to verify consistent behavior.
+    // Redis tests require TEST_REDIS_URL environment variable (defaults to localhost:6379).
 
     fn create_policy_with_redis(redis_url: &str) -> ManualPolicy {
         std::env::set_var("SMG_MANUAL_REDIS_URL", redis_url);
@@ -1276,7 +1275,7 @@ mod tests {
         policy
     }
 
-    macro_rules! dual_backend_test {
+    macro_rules! all_backend_test {
         ($name:ident, $test_fn:ident) => {
             paste::paste! {
                 #[tokio::test]
@@ -1286,7 +1285,6 @@ mod tests {
                 }
 
                 #[tokio::test]
-                #[ignore]
                 async fn [<$name _redis>]() {
                     let redis_url = std::env::var("TEST_REDIS_URL")
                         .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -1297,9 +1295,9 @@ mod tests {
         };
     }
 
-    async fn dual_test_consistent_routing(policy: ManualPolicy) {
+    async fn all_test_consistent_routing(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-        let headers = headers_with_routing_key("dual-test-user");
+        let headers = headers_with_routing_key("all-test-user");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -1313,11 +1311,11 @@ mod tests {
         }
     }
 
-    dual_backend_test!(dual_consistent_routing, dual_test_consistent_routing);
+    all_backend_test!(all_consistent_routing, all_test_consistent_routing);
 
-    async fn dual_test_failover(policy: ManualPolicy) {
+    async fn all_test_failover(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-        let headers = headers_with_routing_key("dual-failover-test");
+        let headers = headers_with_routing_key("all-failover-test");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -1335,11 +1333,11 @@ mod tests {
         }
     }
 
-    dual_backend_test!(dual_failover, dual_test_failover);
+    all_backend_test!(all_failover, all_test_failover);
 
-    async fn dual_test_worker_recovery(policy: ManualPolicy) {
+    async fn all_test_worker_recovery(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-        let headers = headers_with_routing_key("dual-recovery-test");
+        let headers = headers_with_routing_key("all-recovery-test");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -1360,9 +1358,9 @@ mod tests {
         );
     }
 
-    dual_backend_test!(dual_worker_recovery, dual_test_worker_recovery);
+    all_backend_test!(all_worker_recovery, all_test_worker_recovery);
 
-    async fn dual_test_distribution(policy: ManualPolicy) {
+    async fn all_test_distribution(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let mut distribution: HashMap<usize, usize> = HashMap::new();
 
@@ -1383,9 +1381,9 @@ mod tests {
         );
     }
 
-    dual_backend_test!(dual_distribution, dual_test_distribution);
+    all_backend_test!(all_distribution, all_test_distribution);
 
-    async fn dual_test_no_healthy_workers(policy: ManualPolicy) {
+    async fn all_test_no_healthy_workers(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000"]);
         workers[0].set_healthy(false);
 
@@ -1399,5 +1397,5 @@ mod tests {
         assert!(result.is_none(), "Should return None when no healthy workers");
     }
 
-    dual_backend_test!(dual_no_healthy_workers, dual_test_no_healthy_workers);
+    all_backend_test!(all_no_healthy_workers, all_test_no_healthy_workers);
 }

@@ -1,4 +1,6 @@
 //! Integration tests for ManualPolicy with Redis backend
+//!
+//! These tests require a running Redis server. Use RedisTestServer to start one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,7 +43,6 @@ async fn create_redis_policy(redis_url: &str) -> ManualPolicy {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
 async fn test_redis_vacant_to_occupied_hit() {
     let server = RedisTestServer::start().await.unwrap();
     let policy = create_redis_policy(server.url()).await;
@@ -62,7 +63,6 @@ async fn test_redis_vacant_to_occupied_hit() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_redis_different_routing_ids_distribute() {
     let server = RedisTestServer::start().await.unwrap();
     let policy = create_redis_policy(server.url()).await;
@@ -87,7 +87,6 @@ async fn test_redis_different_routing_ids_distribute() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
 async fn test_redis_failover_to_second_candidate() {
     let server = RedisTestServer::start().await.unwrap();
     let policy = create_redis_policy(server.url()).await;
