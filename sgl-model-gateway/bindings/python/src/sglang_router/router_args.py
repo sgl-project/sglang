@@ -37,6 +37,8 @@ class RouterArgs:
     max_tree_size: int = 2**26
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
+    redis_url: Optional[str] = None  # Redis URL for distributed manual policy state
+    redis_key_prefix: Optional[str] = None  # Redis key prefix for manual policy
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
@@ -311,6 +313,18 @@ class RouterArgs:
             default=RouterArgs.assignment_mode,
             choices=["random", "min_load", "min_group"],
             help="Mode for assigning new routing keys in manual policy: random (default), min_load (worker with fewest requests), min_group (worker with fewest routing keys)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}redis-url",
+            type=str,
+            default=RouterArgs.redis_url,
+            help="Redis URL for distributed manual policy state (e.g., redis://localhost:6379)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}redis-key-prefix",
+            type=str,
+            default=RouterArgs.redis_key_prefix,
+            help="Redis key prefix for manual policy to isolate different deployments",
         )
         routing_group.add_argument(
             f"--{prefix}max-payload-size",
