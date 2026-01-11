@@ -518,7 +518,6 @@ impl RedisBackend {
         }
     }
 
-    #[cfg(test)]
     async fn iter_urls(&self) -> Vec<Vec<String>> {
         use redis::AsyncCommands;
 
@@ -658,8 +657,6 @@ fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> u
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
