@@ -52,6 +52,8 @@ from transformers import (
     T5EncoderModel,
 )
 
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 EXAMPLE_DOC_STRING = """
@@ -850,22 +852,25 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                 # Do not remove.
                 # It would be use to run the reference image through a
                 # forward pass at timestep 0 and keep the KV cache.
-                _ = self.transformer(
-                    hidden_states=condition_latent,
-                    encoder_hidden_states=torch.zeros_like(prompt_embeds)[:1, :0, ...],
-                    prior_token_id=condition_image_prior_token_id,
-                    prior_token_drop=torch.full_like(
-                        condition_image_prior_token_id, False, dtype=torch.bool
-                    ),
-                    timestep=torch.zeros((1,), device=device),
-                    target_size=torch.tensor(
-                        [condition_image.shape[-2:]], device=device
-                    ),
-                    crop_coords=torch.zeros((1, 2), device=device),
-                    attention_kwargs=attention_kwargs,
-                    kv_caches=kv_caches,
-                    kv_caches_mode="write",
-                )
+                with set_forward_context(current_timestep=1, attn_metadata=None):
+                    _ = self.transformer(
+                        hidden_states=condition_latent,
+                        encoder_hidden_states=torch.zeros_like(prompt_embeds)[
+                            :1, :0, ...
+                        ],
+                        prior_token_id=condition_image_prior_token_id,
+                        prior_token_drop=torch.full_like(
+                            condition_image_prior_token_id, False, dtype=torch.bool
+                        ),
+                        timestep=torch.zeros((1,), device=device),
+                        target_size=torch.tensor(
+                            [condition_image.shape[-2:]], device=device
+                        ),
+                        crop_coords=torch.zeros((1, 2), device=device),
+                        attention_kwargs=attention_kwargs,
+                        kv_caches=kv_caches,
+                        kv_caches_mode="write",
+                    )
 
         # 6. Prepare additional timestep conditions
         target_size = (height, width)

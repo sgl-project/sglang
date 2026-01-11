@@ -4,6 +4,7 @@
 
 import dataclasses
 import glob
+import importlib.util
 import json
 import os
 import traceback
@@ -16,6 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from diffusers import AutoModel
+from safetensors.torch import load_file as safetensors_load_file
 from torch.distributed import init_device_mesh
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
@@ -617,52 +619,46 @@ class VAELoader(ComponentLoader):
         # NOTE: some post init logics are only available after updated with config
         vae_config.post_init()
 
-        from diffusers import AutoencoderKL
+        should_offload = self.should_offload(server_args)
+        target_device = self.target_device(should_offload)
 
-        vae = AutoencoderKL.from_pretrained(component_model_path)
-        vae = vae.to(get_local_torch_device())
-        return vae
+        # Check for auto_map first (custom VAE classes)
+        auto_map = config.get("auto_map", {})
+        auto_model_map = auto_map.get("AutoModel")
+        if auto_model_map:
+            module_path, cls_name = auto_model_map.rsplit(".", 1)
+            custom_module_file = os.path.join(component_model_path, f"{module_path}.py")
+            spec = importlib.util.spec_from_file_location("_custom", custom_module_file)
+            custom_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(custom_module)
+            vae_cls = getattr(custom_module, cls_name)
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            with set_default_torch_dtype(vae_dtype):
+                vae = vae_cls.from_pretrained(
+                    component_model_path,
+                    revision=server_args.revision,
+                    trust_remote_code=server_args.trust_remote_code,
+                )
+            vae = vae.to(device=target_device, dtype=vae_dtype)
+            return vae.eval()
 
-        # should_offload = self.should_offload(server_args)
-        # target_device = self.target_device(should_offload)
+        # Load from ModelRegistry (standard VAE classes)
+        with (
+            set_default_torch_dtype(
+                PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            ),
+            skip_init_modules(),
+        ):
+            vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+            vae = vae_cls(vae_config).to(target_device)
 
-        # # Check for auto_map first (custom VAE classes)
-        # auto_map = config.get("auto_map", {})
-        # auto_model_map = auto_map.get("AutoModel")
-        # if auto_model_map:
-        #     module_path, cls_name = auto_model_map.rsplit(".", 1)
-        #     custom_module_file = os.path.join(component_model_path, f"{module_path}.py")
-        #     spec = importlib.util.spec_from_file_location("_custom", custom_module_file)
-        #     custom_module = importlib.util.module_from_spec(spec)
-        #     spec.loader.exec_module(custom_module)
-        #     vae_cls = getattr(custom_module, cls_name)
-        #     vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        #     with set_default_torch_dtype(vae_dtype):
-        #         vae = vae_cls.from_pretrained(
-        #             component_model_path,
-        #             revision=server_args.revision,
-        #             trust_remote_code=server_args.trust_remote_code,
-        #         )
-        #     vae = vae.to(device=target_device, dtype=vae_dtype)
-        #     return vae.eval()
-
-        # # Load from ModelRegistry (standard VAE classes)
-        # with (
-        #     set_default_torch_dtype(
-        #         PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        #     ),
-        #     skip_init_modules(),
-        # ):
-        #     vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-        #     vae = vae_cls(vae_config).to(target_device)
-
-        # safetensors_list = _list_safetensors_files(component_model_path)
-        # assert (
-        #     len(safetensors_list) == 1
-        # ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
-        # loaded = safetensors_load_file(safetensors_list[0])
-        # vae.load_state_dict(loaded, strict=False)
-        # return vae.eval()
+        safetensors_list = _list_safetensors_files(component_model_path)
+        assert (
+            len(safetensors_list) == 1
+        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
+        loaded = safetensors_load_file(safetensors_list[0])
+        vae.load_state_dict(loaded, strict=False)
+        return vae.eval()
 
 
 class TransformerLoader(ComponentLoader):

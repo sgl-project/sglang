@@ -225,8 +225,7 @@ class DecodingStage(PipelineStage):
         # TODO: REMOVE
 
         # frames = self.decode(batch.latents, server_args)
-        frames = self.vae.decode(batch.latents, return_dict=False)[0]
-        img = self.image_processor.postprocess(frames, output_type="pil")
+        frames = self.vae.decode(batch.latents)
         frames = self.image_processor.postprocess(frames, output_type="pt")
 
         # decode trajectory latents if needed
