@@ -20,6 +20,7 @@ from sglang.srt.metrics.collector import (
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer
+from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
@@ -111,6 +112,8 @@ class SchedulerMetricsMixin:
 
         if self.enable_kv_cache_events:
             self.init_kv_events(self.server_args.kv_events_config)
+
+        self.scheduler_status_logger = SchedulerStatusLogger.maybe_create()
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
@@ -440,11 +443,15 @@ class SchedulerMetricsMixin:
     def log_decode_stats_every_iteration(
         self: Scheduler, batch: ScheduleBatch, num_accepted_tokens: int
     ):
-        self.metrics_collector.increment_realtime_tokens(
-            # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
-            decode_tokens=batch.batch_size() + num_accepted_tokens,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
+        if self.enable_metrics:
+            self.metrics_collector.increment_realtime_tokens(
+                # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
+                decode_tokens=batch.batch_size() + num_accepted_tokens,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+
+        if x := self.scheduler_status_logger:
+            x.maybe_dump(batch, self.waiting_queue)
 
     def log_batch_result_stats(
         self: Scheduler,
