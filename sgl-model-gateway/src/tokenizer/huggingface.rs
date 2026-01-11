@@ -189,10 +189,10 @@ impl HuggingFaceTokenizer {
         // Get vocab with special tokens included (added_tokens like <|im_start|>)
         let vocab = tokenizer.get_vocab(true);
 
-        let find_token = |patterns: &[&str]| -> Option<String> {
+        let find_token = |patterns: &[String]| -> Option<String> {
             for pattern in patterns {
-                if vocab.contains_key(*pattern) {
-                    return Some(pattern.to_string());
+                if vocab.contains_key(pattern) {
+                    return Some(pattern.clone());
                 }
             }
             None
@@ -206,43 +206,34 @@ impl HuggingFaceTokenizer {
             .map(|(_id, token)| token.content.clone())
             .collect();
 
-
-        let mut potential_bos_tokens = vec!["<s>", "<|startoftext|>", "<BOS>", "[CLS]"];
-        let mut potential_eos_tokens = vec!["</s>", "<|endoftext|>", "<EOS>", "[SEP]"];
-        let mut potential_unk_tokens = vec!["<unk>", "<UNK>", "[UNK]"];
-        let mut potential_sep_tokens = vec!["[SEP]", "<sep>", "<SEP>"];
-        let mut potential_pad_tokens = vec!["<pad>", "<PAD>", "[PAD]"];
-        let mut potential_cls_tokens = vec!["[CLS]", "<cls>", "<CLS>"];
-        let mut potential_mask_tokens = vec!["[MASK]", "<mask>", "<MASK>"];
+        let mut potential_bos_tokens: Vec<String> = vec!["<s>", "<|startoftext|>", "<BOS>", "[CLS]"].into_iter().map(String::from).collect();
+        let mut potential_eos_tokens: Vec<String> = vec!["</s>", "<|endoftext|>", "<EOS>", "[SEP]"].into_iter().map(String::from).collect();
+        let mut potential_unk_tokens: Vec<String> = vec!["<unk>", "<UNK>", "[UNK]"].into_iter().map(String::from).collect();
+        let mut potential_sep_tokens: Vec<String> = vec!["[SEP]", "<sep>", "<SEP>"].into_iter().map(String::from).collect();
+        let mut potential_pad_tokens: Vec<String> = vec!["<pad>", "<PAD>", "[PAD]"].into_iter().map(String::from).collect();
+        let mut potential_cls_tokens: Vec<String> = vec!["[CLS]", "<cls>", "<CLS>"].into_iter().map(String::from).collect();
+        let mut potential_mask_tokens: Vec<String> = vec!["[MASK]", "<mask>", "<MASK>"].into_iter().map(String::from).collect();
 
         let config = if let Some(tokenizer_path) = tokenizer_path {
-            Self::load_config(tokenizer_path).map_or(serde_json::json!({}), |config| config)
+            Self::load_config(tokenizer_path).unwrap_or_else(|| serde_json::json!({}))
         } else {
             serde_json::json!({})
         };
 
         // Respect config file settings
-        if let Some(bos_token) = config.get("bos_token").and_then(|v| v.as_str()) {
-            potential_bos_tokens.insert(0, bos_token);
-        }
-        if let Some(eos_token) = config.get("eos_token").and_then(|v| v.as_str()) {
-            potential_eos_tokens.insert(0, eos_token);
-        }
-        if let Some(unk_token) = config.get("unk_token").and_then(|v| v.as_str()) {
-            potential_unk_tokens.insert(0, unk_token);
-        }
-        if let Some(sep_token) = config.get("sep_token").and_then(|v| v.as_str()) {
-            potential_sep_tokens.insert(0, sep_token);
-        }
-        if let Some(pad_token) = config.get("pad_token").and_then(|v| v.as_str()) {
-            potential_pad_tokens.insert(0, pad_token);
-        }
-        if let Some(cls_token) = config.get("cls_token").and_then(|v| v.as_str()) {
-            potential_cls_tokens.insert(0, cls_token);
-        }
-        if let Some(mask_token) = config.get("mask_token").and_then(|v| v.as_str()) {
-            potential_mask_tokens.insert(0, mask_token);
-        }
+        let prepend_from_config = |key: &str, tokens: &mut Vec<String>| {
+            if let Some(token) = config.get(key).and_then(|v| v.as_str().map(String::from)) {
+                tokens.insert(0, token);
+            }
+        };
+
+        prepend_from_config("bos_token", &mut potential_bos_tokens);
+        prepend_from_config("eos_token", &mut potential_eos_tokens);
+        prepend_from_config("unk_token", &mut potential_unk_tokens);
+        prepend_from_config("sep_token", &mut potential_sep_tokens);
+        prepend_from_config("pad_token", &mut potential_pad_tokens);
+        prepend_from_config("cls_token", &mut potential_cls_tokens);
+        prepend_from_config("mask_token", &mut potential_mask_tokens);
 
         SpecialTokens {
             bos_token: find_token(&potential_bos_tokens),
