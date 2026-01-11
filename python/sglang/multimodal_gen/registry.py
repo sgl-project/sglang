@@ -130,6 +130,7 @@ def _discover_and_register_pipelines():
                         _PIPELINE_REGISTRY[cls.pipeline_name] = cls
 
                         # Auto-register config classes if Pipeline class has them defined
+                        # because comfyui get model from a singe weight file, so we need to register the config classes here
                         if hasattr(cls, "pipeline_config_cls") and hasattr(
                             cls, "sampling_params_cls"
                         ):
@@ -145,34 +146,6 @@ def _discover_and_register_pipelines():
     logger.debug(
         f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
     )
-
-
-def register_pipeline_config_classes(
-    pipeline_class_name: str,
-    pipeline_config_cls: Type[PipelineConfig],
-    sampling_params_cls: Type[Any],
-) -> None:
-    """
-    Manually register configuration classes for a pipeline.
-
-    This is useful for pipelines that don't define pipeline_config_cls and
-    sampling_params_cls as class attributes, or for backward compatibility.
-
-    Args:
-        pipeline_class_name: The name of the pipeline class (e.g., "ComfyUIZImagePipeline")
-        pipeline_config_cls: The PipelineConfig class for this pipeline
-        sampling_params_cls: The SamplingParams class for this pipeline
-    """
-    _PIPELINE_CONFIG_REGISTRY[pipeline_class_name] = (
-        pipeline_config_cls,
-        sampling_params_cls,
-    )
-    logger.debug(
-        f"Manually registered config classes for pipeline '{pipeline_class_name}': "
-        f"PipelineConfig={pipeline_config_cls.__name__}, "
-        f"SamplingParams={sampling_params_cls.__name__}"
-    )
-
 
 def get_pipeline_config_classes(
     pipeline_class_name: str,

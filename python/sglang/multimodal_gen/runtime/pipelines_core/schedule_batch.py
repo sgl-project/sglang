@@ -137,9 +137,6 @@ class Req:
     # results
     output: torch.Tensor | None = None
 
-    # for ComfyUI
-    comfyui_mode: bool = False
-
     def __getattr__(self, name: str) -> Any:
         """
         Delegate attribute access to sampling_params if not found in Req.

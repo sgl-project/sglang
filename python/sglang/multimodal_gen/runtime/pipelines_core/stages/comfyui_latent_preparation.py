@@ -30,6 +30,28 @@ class ComfyUILatentPreparationStage(LatentPreparationStage):
     mismatches for tensor fields on non-source ranks in multi-GPU scenarios.
     """
 
+    @staticmethod
+    def _fix_tensor_device(value, target_device):
+        """Recursively fix tensor device, handling single tensors, lists, and tuples."""
+        if isinstance(value, torch.Tensor):
+            if value.device != target_device:
+                return value.detach().clone().to(target_device)
+            return value
+        elif isinstance(value, list):
+            return [ComfyUILatentPreparationStage._fix_tensor_device(v, target_device) for v in value]
+        elif isinstance(value, tuple):
+            return tuple(ComfyUILatentPreparationStage._fix_tensor_device(v, target_device) for v in value)
+        return value
+
+    @staticmethod
+    def _has_tensor(value):
+        """Check if value contains any tensor."""
+        if isinstance(value, torch.Tensor):
+            return True
+        elif isinstance(value, (list, tuple)):
+            return any(ComfyUILatentPreparationStage._has_tensor(v) for v in value)
+        return False
+
     def forward(self, batch, server_args):
         """
         Prepare latents with device mismatch fix for ComfyUI pipelines.
@@ -43,26 +65,6 @@ class ComfyUILatentPreparationStage(LatentPreparationStage):
             sp_group = get_sp_group()
             target_device = get_local_torch_device()
 
-            def _fix_tensor_device(value, target_device):
-                """Recursively fix tensor device, handling single tensors, lists, and tuples."""
-                if isinstance(value, torch.Tensor):
-                    if value.device != target_device:
-                        return value.detach().clone().to(target_device)
-                    return value
-                elif isinstance(value, list):
-                    return [_fix_tensor_device(v, target_device) for v in value]
-                elif isinstance(value, tuple):
-                    return tuple(_fix_tensor_device(v, target_device) for v in value)
-                return value
-
-            def _has_tensor(value):
-                """Check if value contains any tensor."""
-                if isinstance(value, torch.Tensor):
-                    return True
-                elif isinstance(value, (list, tuple)):
-                    return any(_has_tensor(v) for v in value)
-                return False
-
             if sp_group.rank != 0:
                 logger.debug(
                     f"[ComfyUILatentPreparationStage] Fixing tensor device on rank={sp_group.rank} "
@@ -72,8 +74,8 @@ class ComfyUILatentPreparationStage(LatentPreparationStage):
                 if dataclasses.is_dataclass(batch):
                     for field in dataclasses.fields(batch):
                         value = getattr(batch, field.name, None)
-                        if value is not None and _has_tensor(value):
-                            fixed_value = _fix_tensor_device(value, target_device)
+                        if value is not None and self._has_tensor(value):
+                            fixed_value = self._fix_tensor_device(value, target_device)
                             setattr(batch, field.name, fixed_value)
                 else:
                     for attr_name in dir(batch):
@@ -82,8 +84,8 @@ class ComfyUILatentPreparationStage(LatentPreparationStage):
                         ):
                             try:
                                 value = getattr(batch, attr_name, None)
-                                if value is not None and _has_tensor(value):
-                                    fixed_value = _fix_tensor_device(
+                                if value is not None and self._has_tensor(value):
+                                    fixed_value = self._fix_tensor_device(
                                         value, target_device
                                     )
                                     setattr(batch, attr_name, fixed_value)

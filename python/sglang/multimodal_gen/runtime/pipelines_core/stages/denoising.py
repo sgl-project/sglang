@@ -688,7 +688,7 @@ class DenoisingStage(PipelineStage):
         if (
             get_sp_world_size() > 1
             and getattr(batch, "did_sp_shard_latents", False)
-            and batch.comfyui_mode
+            and batch.sampling_params.comfyui_mode
             and hasattr(batch, "noise_pred")
             and batch.noise_pred is not None
         ):
@@ -1047,7 +1047,7 @@ class DenoisingStage(PipelineStage):
                         )
 
                         # Save noise_pred to batch for external access (e.g., ComfyUI)
-                        if batch.comfyui_mode:
+                        if batch.sampling_params.comfyui_mode:
                             batch.noise_pred = noise_pred
 
                         # Compute the previous noisy sample
