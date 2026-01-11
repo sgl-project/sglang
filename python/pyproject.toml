@@ -72,6 +72,7 @@ dependencies = [
   "transformers==4.57.1",
   "uvicorn",
   "uvloop",
+  "xxhash>=3.0.0",
   "xgrammar==0.1.27",
 
   "grpcio==1.75.1", # keep it align with compile_proto.py
