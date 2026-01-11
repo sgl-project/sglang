@@ -119,6 +119,13 @@ impl futures::Stream for AbortOnDropStream {
     }
 }
 
+/// Tokenizer bundle downloaded from backend
+#[derive(Debug, Clone)]
+pub struct TokenizerBundle {
+    pub metadata: proto::TokenizerMetadata,
+    pub compressed_data: Vec<u8>,
+}
+
 /// gRPC client for SGLang scheduler
 #[derive(Clone)]
 pub struct SglangSchedulerClient {
@@ -278,6 +285,123 @@ impl SglangSchedulerClient {
             log_metrics: log_metrics.unwrap_or(false), // Default to false if not specified
             ..Default::default()
         }
+    }
+
+    /// Get tokenizer bundle from the backend
+    ///
+    /// This method streams a tokenizer bundle from the backend, which consists of:
+    /// 1. A metadata chunk (first message) containing tokenizer information
+    /// 2. One or more file chunks containing compressed tokenizer data
+    ///
+    /// The method validates the streaming protocol:
+    /// - Metadata must arrive first
+    /// - File chunks must have sequential chunk indices
+    /// - The last chunk must be marked with is_last_chunk flag
+    pub async fn get_tokenizer(
+        &self,
+    ) -> Result<TokenizerBundle, Box<dyn std::error::Error + Send + Sync>> {
+        debug!("Requesting tokenizer from backend");
+        let request = Request::new(proto::GetTokenizerRequest {});
+
+        let mut client = self.client.clone();
+        let mut stream = client.get_tokenizer(request).await?.into_inner();
+
+        // First message must be metadata
+        let first_chunk = stream
+            .message()
+            .await?
+            .ok_or("Empty stream: expected metadata chunk")?;
+
+        let metadata = match first_chunk.chunk {
+            Some(proto::get_tokenizer_chunk::Chunk::Metadata(meta)) => {
+                debug!(
+                    "Received tokenizer metadata: model={}, fingerprint={}, files={}, format={}",
+                    meta.model_identifier,
+                    meta.fingerprint,
+                    meta.files.len(),
+                    meta.bundle_format
+                );
+                meta
+            }
+            Some(proto::get_tokenizer_chunk::Chunk::FileChunk(_)) => {
+                return Err("Protocol error: first chunk must be metadata, got file chunk".into());
+            }
+            None => {
+                return Err("Protocol error: first chunk is empty".into());
+            }
+        };
+
+        // Collect file chunks
+        let mut compressed_data = Vec::new();
+        let mut expected_chunk_index = 0u32;
+        let mut last_chunk_received = false;
+
+        debug!("Starting to receive file chunks");
+        while let Some(chunk) = stream.message().await? {
+            match chunk.chunk {
+                Some(proto::get_tokenizer_chunk::Chunk::FileChunk(file_chunk)) => {
+                    // Validate chunk ordering
+                    if file_chunk.chunk_index != expected_chunk_index {
+                        return Err(format!(
+                            "Protocol error: expected chunk index {}, got {}",
+                            expected_chunk_index, file_chunk.chunk_index
+                        )
+                        .into());
+                    }
+
+                    debug!(
+                        "Received file chunk {}: {} bytes, is_last={}",
+                        file_chunk.chunk_index,
+                        file_chunk.data.len(),
+                        file_chunk.is_last_chunk
+                    );
+
+                    // Append data
+                    compressed_data.extend_from_slice(&file_chunk.data);
+
+                    // Check if this is the last chunk
+                    if file_chunk.is_last_chunk {
+                        last_chunk_received = true;
+                        debug!(
+                            "Last chunk received, total data size: {} bytes",
+                            compressed_data.len()
+                        );
+                        break;
+                    }
+
+                    expected_chunk_index += 1;
+                }
+                Some(proto::get_tokenizer_chunk::Chunk::Metadata(_)) => {
+                    return Err(format!(
+                        "Protocol error: unexpected metadata chunk at position {}",
+                        expected_chunk_index
+                    )
+                    .into());
+                }
+                None => {
+                    return Err(format!(
+                        "Protocol error: empty chunk at position {}",
+                        expected_chunk_index
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // Validate that we received the last chunk marker
+        if !last_chunk_received {
+            return Err(format!(
+                "Protocol error: stream ended without is_last_chunk flag (received {} chunks)",
+                expected_chunk_index
+            )
+            .into());
+        }
+
+        debug!("Tokenizer bundle download complete");
+        Ok(TokenizerBundle {
+            metadata,
+            compressed_data,
+        })
     }
 
     /// Build a single SGLang GenerateRequest from OpenAI ChatCompletionRequest
