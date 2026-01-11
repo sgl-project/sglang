@@ -387,6 +387,21 @@ async fn test_min_group_distributes_evenly_impl(
         let load = worker.worker_routing_key_load().value();
         assert_eq!(load, 3, "Each worker should have exactly 3 routing keys");
     }
+
+    let all_urls: Vec<Vec<String>> = policy.iter_urls().await;
+    assert_eq!(all_urls.len(), 9, "Should have 9 routing keys stored");
+
+    let distribution: HashMap<String, usize> = all_urls
+        .iter()
+        .filter_map(|urls: &Vec<String>| urls.first().cloned())
+        .fold(HashMap::new(), |mut acc, url: String| {
+            *acc.entry(url).or_default() += 1;
+            acc
+        });
+    assert_eq!(distribution.len(), 3, "Should use all 3 workers");
+    for count in distribution.values() {
+        assert_eq!(*count, 3, "Each worker should have exactly 3 routing keys in storage");
+    }
 }
 
 all_backend_test!(test_min_group_prefers_fewer_keys);

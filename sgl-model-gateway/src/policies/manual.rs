@@ -154,6 +154,11 @@ impl ManualPolicy {
     fn local_backend(&self) -> Option<&LocalBackend> {
         self.backend.as_local()
     }
+
+    #[cfg(test)]
+    pub async fn iter_urls(&self) -> Vec<Vec<String>> {
+        self.backend.iter_urls().await
+    }
 }
 
 #[async_trait]
@@ -236,6 +241,14 @@ impl Backend {
         match self {
             Backend::Local(b) => Some(b),
             Backend::Redis(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    async fn iter_urls(&self) -> Vec<Vec<String>> {
+        match self {
+            Backend::Local(b) => b.iter_urls(),
+            Backend::Redis(b) => b.iter_urls().await,
         }
     }
 }
@@ -374,10 +387,11 @@ impl LocalBackend {
     }
 
     #[cfg(test)]
-    fn iter_first_candidate_urls(&self) -> impl Iterator<Item = String> + '_ {
+    fn iter_urls(&self) -> Vec<Vec<String>> {
         self.routing_map
             .iter()
-            .filter_map(|e| e.candidates.urls().first().cloned())
+            .map(|e| e.candidates.urls().to_vec())
+            .collect()
     }
 }
 
@@ -504,6 +518,32 @@ impl RedisBackend {
                 (None, ExecutionBranch::RedisCasException)
             }
         }
+    }
+
+    #[cfg(test)]
+    async fn iter_urls(&self) -> Vec<Vec<String>> {
+        use redis::AsyncCommands;
+
+        let mut conn = match self.pool.get().await {
+            Ok(x) => x,
+            Err(_) => return vec![],
+        };
+
+        let pattern = format!("{}*", self.key_prefix);
+        let keys: Vec<String> = match conn.keys(&pattern).await {
+            Ok(x) => x,
+            Err(_) => return vec![],
+        };
+
+        let mut result = Vec::new();
+        for key in keys {
+            let value: Option<String> = conn.get(&key).await.unwrap_or(None);
+            if let Some(data) = value {
+                let candidates = CandidateWorkerUrls::deserialize(&data);
+                result.push(candidates.urls().to_vec());
+            }
+        }
+        result
     }
 }
 
@@ -840,47 +880,5 @@ mod tests {
         std::thread::sleep(Duration::from_secs(3));
 
         assert_eq!(policy.local_backend().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_local_backend_min_group_distributes_evenly() {
-        let config = ManualConfig {
-            assignment_mode: ManualAssignmentMode::MinGroup,
-            ..Default::default()
-        };
-        let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-
-        for i in 0..9 {
-            let routing_key = format!("key-{}", i);
-            let headers = headers_with_routing_key(&routing_key);
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                ..Default::default()
-            };
-
-            let (result, branch) = policy.select_worker_impl(&workers, &info).await;
-            assert!(result.is_some());
-            assert_eq!(branch, ExecutionBranch::Vacant);
-
-            let selected_idx = result.unwrap();
-            workers[selected_idx]
-                .worker_routing_key_load()
-                .increment(&routing_key);
-        }
-
-        let distribution: HashMap<_, usize> = policy
-            .local_backend()
-            .unwrap()
-            .iter_first_candidate_urls()
-            .fold(HashMap::new(), |mut acc, url| {
-                *acc.entry(url).or_default() += 1;
-                acc
-            });
-
-        assert_eq!(distribution.len(), 3, "Should use all 3 workers");
-        for count in distribution.values() {
-            assert_eq!(*count, 3, "Each worker should have exactly 3 routing keys");
-        }
     }
 }
