@@ -32,11 +32,10 @@ use super::{
 };
 use crate::{
     config::{ManualAssignmentMode, RetryConfig},
-    core::Worker,
+    core::{retry::RetryExecutor, Worker},
     observability::metrics::Metrics,
     routers::header_utils::extract_routing_key,
 };
-use crate::core::retry::RetryExecutor;
 
 const MAX_CANDIDATE_WORKERS: usize = 2;
 const REDIS_KEY_PREFIX: &str = "smg:manual:";
@@ -364,8 +363,6 @@ impl RedisBackend {
         healthy_indices: &[usize],
         assignment_mode: ManualAssignmentMode,
     ) -> (Option<usize>, ExecutionBranch) {
-        use crate::core::retry::RetryError;
-
         let retry_config = RetryConfig {
             max_retries: 5,
             initial_backoff_ms: 5,
@@ -374,19 +371,17 @@ impl RedisBackend {
             jitter_factor: 0.2,
         };
 
-        let result = RetryExecutor::execute_with_retry(&retry_config, |attempt| async {
-            if attempt > 0 {
-                Metrics::record_manual_policy_redis_error("retry");
-            }
-            self.select_one_attempt(routing_id, workers, healthy_indices, assignment_mode).await
-        }).await;
+        let result = RetryExecutor::execute_with_retry(
+            &retry_config,
+            |_attempt| self.select_one_attempt(routing_id, workers, healthy_indices, assignment_mode),
+            |(idx, branch), _attempt| idx.is_none() && *branch == ExecutionBranch::RedisCasRace,
+            |_delay, _attempt| Metrics::record_manual_policy_redis_error("retry"),
+            || warn!("Max retries exceeded for routing_id={}", routing_id),
+        ).await;
 
         match result {
             Ok((idx, branch)) => (idx, branch),
-            Err(RetryError::MaxRetriesExceeded) => {
-                warn!("Max retries exceeded for routing_id={}", routing_id);
-                (None, ExecutionBranch::RedisBackendMaxRetries)
-            }
+            Err(crate::core::retry::MaxRetriesExceeded { last: (idx, branch) }) => (idx, branch),
         }
     }
 
