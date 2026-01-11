@@ -21,6 +21,42 @@ class Token:
     end: int
 
 
+class SemanticBuffer:
+    """
+    Buffer that understands Harmony format semantics.
+    Maintains events to track parsing state in streaming.
+    """
+
+    def __init__(self):
+        self._buffer: str = ""
+        self._emitted_events: List[Event] = []
+
+    def append(self, text: str):
+        """Add text to buffer."""
+        self._buffer += text
+
+    def add_emitted_event(self, event: Event):
+        """Track an event that has been emitted."""
+        self._emitted_events.append(event)
+
+    def reset(self):
+        """Reset the buffer state."""
+        self._buffer = ""
+        self._emitted_events = []
+
+    def get_emitted_events(self) -> List[Event]:
+        """Get all events that have been emitted."""
+        return self._emitted_events.copy()
+
+    def get_buffer(self) -> str:
+        """Get the full buffer content."""
+        return self._buffer
+
+    def set_buffer(self, buffer: str):
+        """Set the buffer content (used after strategy returns remaining)."""
+        self._buffer = buffer
+
+
 def prefix_hold(text: str, tokens: List[str]) -> Tuple[str, str]:
     """
     Holds back the longest suffix of `text` that could be a prefix of any token.
@@ -135,6 +171,7 @@ class CanonicalStrategy:
         ]
 
     def parse(self, text: str) -> Tuple[List[Event], str]:
+        """Parse text and return (events, remaining)."""
         events = []
         tokens = list(iter_tokens(text))
 
@@ -238,6 +275,9 @@ class CanonicalStrategy:
         # Extract partial content after <|message|>
         content_start = tokens[message_pos].end
         content = text[content_start:]
+        # Only emit event if there's actual content
+        if not content:
+            return None, text[tokens[start_pos].start : content_start]
 
         # Return partial reasoning content and preserve the channel structure for next parse
         remaining_text = text[tokens[start_pos].start : content_start]
@@ -329,7 +369,11 @@ class CanonicalStrategy:
             if channel_type == "final":
                 # Final blocks can end at end of input without requiring <|return|>
                 content = text[content_start:]
-                return Event("normal", content), end_pos
+                # Only emit event if there's actual content
+                if content.strip():
+                    return Event("normal", content), end_pos
+                else:
+                    return None, content_start
             return None  # Analysis and commentary need proper end tokens
 
         end_token = tokens[end_pos]
@@ -342,7 +386,12 @@ class CanonicalStrategy:
                 raw_text = text[tokens[start_pos].start : end_token.end]
                 return Event("tool_call", content.strip(), raw_text), end_pos + 1
             else:
-                return Event("reasoning", content), end_pos + 1
+                # Only emit reasoning event if there's actual content
+                if content.strip():
+                    return Event("reasoning", content), end_pos + 1
+                else:
+                    # Empty analysis block - skip event, just advance position
+                    return None, end_pos + 1
         elif channel_type == "commentary":
             if end_token.type == "CALL":
                 raw_text = text[tokens[start_pos].start : end_token.end]
@@ -498,91 +547,238 @@ class TextStrategy:
         return events, hold
 
 
+class EndMarkerOnlyStrategy:
+    """Strategy for handling content with only <|end|> marker (no <|channel|>)."""
+
+    def __init__(self):
+        self._end_marker_seen = False
+
+    def parse(self, buffer: str) -> Tuple[List[Event], str]:
+        """
+        Parse buffer that contains <|end|> marker without preceding <|channel|>.
+
+        This handles the fallback case where the model outputs:
+        [reasoning content]<|end|>[normal content]
+
+        Returns:
+            Tuple of (events list, remaining buffer)
+        """
+        events = []
+
+        if self._end_marker_seen:
+            # Already seen <|end|>, all subsequent content is normal
+            if buffer:
+                events.append(
+                    Event(
+                        event_type="normal",
+                        content=buffer,
+                        raw_text=buffer,
+                    )
+                )
+            remaining = ""
+        elif "<|end|>" in buffer:
+            # First time seeing <|end|>, split the content
+            self._end_marker_seen = True
+            splits = buffer.split("<|end|>", maxsplit=1)
+            reasoning_text = splits[0]
+            normal_text = splits[1]
+
+            # Create reasoning event if there's content before <|end|>
+            if reasoning_text:
+                events.append(
+                    Event(
+                        event_type="reasoning",
+                        content=reasoning_text,
+                        raw_text=reasoning_text,
+                    )
+                )
+
+            # Create normal event if there's content after <|end|>
+            if normal_text:
+                events.append(
+                    Event(
+                        event_type="normal",
+                        content=normal_text,
+                        raw_text=normal_text,
+                    )
+                )
+
+            # Consume entire buffer since we've parsed it all
+            remaining = ""
+        else:
+            # Haven't seen <|end|> yet, hold the buffer
+            remaining = buffer
+
+        return events, remaining
+
+
 class HarmonyParser:
     """Facade for parsing Harmony format, switching between strategies."""
 
     def __init__(self):
         self.strategy = None
-        self._buffer = ""
-        self._should_filter_commentary = (
-            False  # Track if we should filter commentary in next chunks
-        )
+        self._buffer = SemanticBuffer()
         self._partial_commentary = (
             ""  # Track partial commentary being built across chunks
         )
 
     def parse(self, chunk: str) -> List[Event]:
-        self._buffer += chunk
+        # Append new chunk to semantic buffer
+        self._buffer.append(chunk)
 
         if self.strategy is None:
-            if "<|channel|>" in self._buffer or "<|start|>" in self._buffer:
+            if (
+                "<|channel|>" in self._buffer.get_buffer()
+                or "<|start|>" in self._buffer.get_buffer()
+            ):
                 self.strategy = CanonicalStrategy()
             elif re.search(
                 r"(?:^|\s)(?:assistant)?\s*(analysis|commentary|assistantfinal)",
-                self._buffer,
+                self._buffer.get_buffer(),
                 re.IGNORECASE,
             ):
                 self.strategy = TextStrategy()
+            elif "<|end|>" in self._buffer.get_buffer():
+                # Fallback: EndMarkerOnlyStrategy for content with only <|end|> marker
+                self.strategy = EndMarkerOnlyStrategy()
             else:
                 # Not yet determined, hold
                 return []
 
         if hasattr(self.strategy, "set_buffer_context"):
             # Provide full buffer context to strategy for smarter whitespace handling
-            self.strategy.set_buffer_context(self._buffer)
+            self.strategy.set_buffer_context(self._buffer.get_buffer())
 
-        events, remaining = self.strategy.parse(self._buffer)
+        # Parse the buffer content
+        buffer = self._buffer.get_buffer()
+        events, remaining = self.strategy.parse(buffer)
 
         # Check if we should start filtering commentary (after <|call|> token or tool_call event)
-        buffer_has_call_token = self._buffer.rstrip().endswith("<|call|>")
+        buffer_has_call_token = self._buffer.get_buffer().rstrip().endswith("<|call|>")
 
-        self._buffer = remaining
+        # Update buffer with the remaining unparsed content for the next chunk.
+        self._buffer.set_buffer(remaining)
 
-        # Filter events for streaming case
-        filtered_events = []
+        # Filter events using unified filtering logic
+        filtered_events = self._filter_events(events, buffer_has_call_token)
+
+        # Filter out duplicate tool_call events within this parse() call only
+        # (Don't dedupe across calls - model may legitimately repeat tool calls)
+        seen_in_this_call = set()
+        final_filtered = []
+        for event in filtered_events:
+            if event.event_type == "tool_call":
+                # Use a normalized identifier for tool calls to handle duplicates
+                # Strip leading <|start|> token which may vary between occurrences
+                tool_call_id = event.raw_text if event.raw_text else event.content
+                if tool_call_id:
+                    # Normalize by stripping optional <|start|> token
+                    if tool_call_id.startswith("<|start|>assistant"):
+                        tool_call_id = tool_call_id.replace("<|start|>assistant", "", 1)
+                    elif tool_call_id.startswith("<|start|>"):
+                        tool_call_id = tool_call_id.replace("<|start|>", "", 1)
+
+                if tool_call_id and tool_call_id in seen_in_this_call:
+                    # Skip duplicate within this parse() call
+                    continue
+                if tool_call_id:
+                    seen_in_this_call.add(tool_call_id)
+            final_filtered.append(event)
+
+        # Track all filtered events in the semantic buffer
+        for event in final_filtered:
+            self._buffer.add_emitted_event(event)
+
+        return final_filtered
+
+    def _filter_events(
+        self, events: List[Event], buffer_has_call_token: bool
+    ) -> List[Event]:
+        """
+        Filter events, handling commentary filler and other filtering logic.
+        Uses event history to determine filtering state.
+        """
+        filtered = []
+        emitted_history = self._buffer.get_emitted_events()
+
         for event in events:
-            should_filter = False
-
-            if event.event_type == "normal":
-                # Check if we're in a commentary filtering state
-                if self._should_filter_commentary or self._partial_commentary:
-                    # Try to build partial commentary
-                    potential_commentary = (
-                        self._partial_commentary + event.content.strip().lower()
-                    )
-
-                    if potential_commentary == "commentary":
-                        # Complete commentary found - filter it
-                        should_filter = True
-                        self._partial_commentary = ""  # Reset
-                        self._should_filter_commentary = False  # Done filtering
-                    elif "commentary".startswith(potential_commentary):
-                        # Partial match - accumulate and filter this chunk
-                        should_filter = True
-                        self._partial_commentary = potential_commentary
-                    else:
-                        # Not commentary - reset and keep the event
-                        self._partial_commentary = ""
-                        self._should_filter_commentary = False
-                else:
-                    # Not in commentary filtering state - reset partial state
-                    self._partial_commentary = ""
-
-            if should_filter:
-                # Skip this commentary filler
+            if event is None:
                 continue
 
-            # Update filtering state based on events and buffer state
+            # Check if this commentary event should be filtered
+            if self._should_filter_commentary_event(event, emitted_history):
+                continue
+
+            # Update partial commentary state based on filtering result
             if event.event_type == "tool_call":
-                self._should_filter_commentary = (
-                    True  # Filter commentary after tool calls
-                )
-                self._partial_commentary = ""  # Reset on tool call
-            elif buffer_has_call_token:
-                self._should_filter_commentary = (
-                    True  # Filter commentary after <|call|> token
-                )
+                self._partial_commentary = ""  # Reset partial commentary on tool call
+            elif buffer_has_call_token and event.event_type == "normal":
+                # If buffer ends with <||call|>, we're in a filtering state
+                # Keep _partial_commentary as-is for cross-chunk matching
+                pass
 
-            filtered_events.append(event)
+            filtered.append(event)
 
-        return filtered_events
+        return filtered
+
+    def _should_filter_commentary_event(
+        self, event: Event, history: List[Event]
+    ) -> bool:
+        """
+        Determine if a commentary event should be filtered.
+        Uses both event history and partial commentary state for cross-chunk matching.
+        """
+        if event.event_type != "normal":
+            return False
+
+        # Check if we're in a commentary filtering state based on history
+        should_filter = self._is_in_commentary_filtering_state(history)
+
+        if not should_filter and not self._partial_commentary:
+            # Not in filtering state and no partial commentary - don't filter
+            self._partial_commentary = ""
+            return False
+
+        # Try to match "commentary" keyword across chunks
+        potential_commentary = self._partial_commentary + event.content.strip().lower()
+
+        if potential_commentary == "commentary":
+            # Complete "commentary" keyword found - filter it and reset state
+            self._partial_commentary = ""
+            return True
+        elif "commentary".startswith(potential_commentary):
+            # Partial match - accumulate and filter this chunk
+            self._partial_commentary = potential_commentary
+            return True
+        else:
+            # Not a commentary keyword - reset and keep the event
+            self._partial_commentary = ""
+            return False
+
+    def _is_in_commentary_filtering_state(self, history: List[Event]) -> bool:
+        """
+        Determine if we should be filtering commentary based on event history.
+        Returns True if we recently emitted a tool_call event or content ending with <|call|>.
+        """
+        # Check the last few events in history (most recent ones first)
+        # We only need to check a small window to avoid expensive full scans
+        check_limit = min(5, len(history))
+
+        for event in reversed(history[-check_limit:]):
+            if event.event_type == "tool_call":
+                return True
+            if event.event_type == "normal" and "<|call|>" in event.content:
+                return True
+            # Found a non-tool_call, non-call-content event - stop checking
+            if event.event_type in ("reasoning", "normal"):
+                # Only stop if it's actual content (not empty)
+                if event.content.strip():
+                    break
+
+        return False
+
+    def reset(self):
+        """Reset the parser state for a new parsing session."""
+        self.strategy = None
+        self._buffer = SemanticBuffer()
+        self._partial_commentary = ""
