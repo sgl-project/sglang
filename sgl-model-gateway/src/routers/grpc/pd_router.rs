@@ -91,7 +91,7 @@ impl GrpcPDRouter {
         let components = self.shared_components.clone();
         let pipeline = &self.pipeline;
 
-        RetryExecutor::execute_response_with_retry(
+        RetryExecutor::execute_with_retry_or_last(
             &self.retry_config,
             |_attempt| {
                 let request = Arc::clone(&request);
@@ -149,7 +149,7 @@ impl GrpcPDRouter {
         let components = self.shared_components.clone();
         let pipeline = &self.pipeline;
 
-        RetryExecutor::execute_response_with_retry(
+        RetryExecutor::execute_with_retry_or_last(
             &self.retry_config,
             |_attempt| {
                 let request = Arc::clone(&request);

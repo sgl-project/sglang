@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use axum::{http::StatusCode, response::Response};
+use axum::http::StatusCode;
 use rand::Rng;
 use tracing::debug;
 
@@ -45,9 +45,9 @@ impl BackoffCalculator {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum RetryError {
-    #[error("maximum retry attempts exceeded")]
-    MaxRetriesExceeded,
+#[error("maximum retry attempts exceeded")]
+pub struct MaxRetriesExceeded<T> {
+    pub last: T,
 }
 
 /// A thin async retry executor for generic operations.
@@ -56,88 +56,41 @@ pub struct RetryExecutor;
 
 impl RetryExecutor {
     /// Execute an async operation with retries and backoff.
-    /// The `operation` closure is invoked each attempt with the attempt index.
-    pub async fn execute_with_retry<F, Fut, T>(
-        config: &RetryConfig,
-        mut operation: F,
-    ) -> Result<T, RetryError>
-    where
-        F: FnMut(u32) -> Fut,
-        Fut: std::future::Future<Output = Result<T, ()>>,
-    {
-        let max = config.max_retries.max(1);
-        let mut attempt: u32 = 0;
-        loop {
-            match operation(attempt).await {
-                Ok(val) => return Ok(val),
-                Err(_) => {
-                    let is_last = attempt + 1 >= max;
-                    if is_last {
-                        return Err(RetryError::MaxRetriesExceeded);
-                    }
-                    let delay = BackoffCalculator::calculate_delay(config, attempt);
-                    attempt += 1;
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
-    }
-
-    /// Execute an operation that returns an HTTP Response with retries and backoff.
     ///
-    /// Usage pattern:
-    /// - `operation(attempt)`: perform one attempt (0-based). Construct and send the request,
-    ///   then return the `Response`. Do any per-attempt bookkeeping (e.g., load tracking,
-    ///   circuit-breaker outcome recording) inside this closure.
-    /// - `should_retry(&response, attempt)`: decide if the given response should be retried
-    ///   (e.g., based on HTTP status). Returning false short-circuits and returns the response.
+    /// Returns `Ok(T)` on success, or `Err(MaxRetriesExceeded { last: T })` when exhausted.
+    ///
+    /// - `operation(attempt)`: perform one attempt (0-based), return the output.
+    /// - `should_retry(&output, attempt)`: return true to retry, false to accept.
     /// - `on_backoff(delay, next_attempt)`: called before sleeping between attempts.
-    ///   Use this to record metrics.
-    /// - `on_exhausted()`: called when the executor has exhausted all retry attempts.
-    ///
-    /// Example:
-    /// ```ignore
-    /// let resp = RetryExecutor::execute_response_with_retry(
-    ///     &retry_cfg,
-    ///     |attempt| async move {
-    ///         let worker = select_cb_aware_worker()?;
-    ///         let resp = send_request(worker).await;
-    ///         worker.record_outcome(resp.status().is_success());
-    ///         resp
-    ///     },
-    ///     |res, _| matches!(res.status(), StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS | StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT),
-    ///     |delay, _attempt| { /* record backoff metrics */ },
-    ///     || { /* record retries exhausted */ },
-    /// ).await;
-    /// ```
-    pub async fn execute_response_with_retry<Op, Fut, ShouldRetry, OnBackoff, OnExhausted>(
+    /// - `on_exhausted()`: called when retries are exhausted.
+    pub async fn execute_with_retry<Op, Fut, T, ShouldRetry, OnBackoff, OnExhausted>(
         config: &RetryConfig,
         mut operation: Op,
         should_retry: ShouldRetry,
         on_backoff: OnBackoff,
         mut on_exhausted: OnExhausted,
-    ) -> Response
+    ) -> Result<T, MaxRetriesExceeded<T>>
     where
         Op: FnMut(u32) -> Fut,
-        Fut: std::future::Future<Output = Response>,
-        ShouldRetry: Fn(&Response, u32) -> bool,
+        Fut: std::future::Future<Output = T>,
+        ShouldRetry: Fn(&T, u32) -> bool,
         OnBackoff: Fn(Duration, u32),
         OnExhausted: FnMut(),
     {
         let max = config.max_retries.max(1);
-
         let mut attempt: u32 = 0;
+
         loop {
-            let response = operation(attempt).await;
+            let output = operation(attempt).await;
             let is_last = attempt + 1 >= max;
 
-            if !should_retry(&response, attempt) {
-                return response;
+            if !should_retry(&output, attempt) {
+                return Ok(output);
             }
 
             if is_last {
                 on_exhausted();
-                return response;
+                return Err(MaxRetriesExceeded { last: output });
             }
 
             let next_attempt = attempt + 1;
@@ -153,6 +106,27 @@ impl RetryExecutor {
 
             attempt = next_attempt;
         }
+    }
+
+    /// Like `execute_with_retry`, but returns the last output directly when exhausted.
+    ///
+    /// Useful for HTTP responses where you always need to return something.
+    pub async fn execute_with_retry_or_last<Op, Fut, T, ShouldRetry, OnBackoff, OnExhausted>(
+        config: &RetryConfig,
+        operation: Op,
+        should_retry: ShouldRetry,
+        on_backoff: OnBackoff,
+        on_exhausted: OnExhausted,
+    ) -> T
+    where
+        Op: FnMut(u32) -> Fut,
+        Fut: std::future::Future<Output = T>,
+        ShouldRetry: Fn(&T, u32) -> bool,
+        OnBackoff: Fn(Duration, u32),
+        OnExhausted: FnMut(),
+    {
+        Self::execute_with_retry(config, operation, should_retry, on_backoff, on_exhausted).await
+            .unwrap_or_else(|MaxRetriesExceeded { last }| last)
     }
 }
 

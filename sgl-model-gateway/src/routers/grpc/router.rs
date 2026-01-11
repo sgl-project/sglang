@@ -167,7 +167,7 @@ impl GrpcRouter {
         let model_id_cloned = model_id.map(|s| s.to_string());
         let components = self.shared_components.clone();
 
-        RetryExecutor::execute_response_with_retry(
+        RetryExecutor::execute_with_retry_or_last(
             &self.retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {
@@ -221,7 +221,7 @@ impl GrpcRouter {
         let components = self.shared_components.clone();
         let pipeline = &self.pipeline;
 
-        RetryExecutor::execute_response_with_retry(
+        RetryExecutor::execute_with_retry_or_last(
             &self.retry_config,
             // Operation: execute pipeline (creates fresh context each attempt)
             |_attempt| {

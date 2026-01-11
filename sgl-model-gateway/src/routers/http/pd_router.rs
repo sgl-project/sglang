@@ -296,7 +296,7 @@ impl PDRouter {
         // Clone request once outside the retry loop, then use Arc to share across attempts
         // This avoids O(retries) clones by sharing the same data
         let shared_request = Arc::new(original_request.clone());
-        let response = RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_with_retry_or_last(
             &self.retry_config,
             {
                 move |attempt: u32| {

@@ -211,7 +211,7 @@ impl Router {
             bool_to_static_str(is_stream),
         );
 
-        let response = RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_with_retry_or_last(
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
