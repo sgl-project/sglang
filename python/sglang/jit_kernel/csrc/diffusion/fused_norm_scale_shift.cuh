@@ -15,7 +15,6 @@ namespace {
 
 namespace ffi = tvm::ffi;
 
-// Use aligned_vector<T, 4> for vectorized memory access
 template <typename T>
 using Vec4 = device::aligned_vector<T, 4>;
 
@@ -24,26 +23,9 @@ enum NormType : int {
   RMSNorm = 1,
 };
 
-// gate_mode:
-// NoGate: no gate (scalar 1.0), residual_output = residual + x
-// Gate2D: 2D gate [M, N] or [1, N]
-// GateB1N: Bx1xN gate [B, 1, N]
-// GateBF1N: BxFx1xN gate [B, F, 1, N]
-enum class GateMode : int {
-  NoGate = 0,
-  Gate2D = 1,
-  GateB1N = 2,
-  GateBF1N = 3,
-};
-
 template <NormType NT>
 struct NormTag {
   static constexpr NormType value = NT;
-};
-
-template <GateMode GM>
-struct GateModeTag {
-  static constexpr GateMode value = GM;
 };
 
 template <int V>
@@ -56,7 +38,6 @@ struct DTypeTag {
   using T = T_;
 };
 
-// Minimal warp/block reduction helpers (sum) for small arrays
 template <typename T, int NumVals>
 __device__ __forceinline__ void warpReduceSum(T (&vals)[NumVals]) {
   unsigned mask = 0xffffffffu;
@@ -139,17 +120,37 @@ __device__ __forceinline__ float vec4_variance_sum(const Vec4<T>& v, float mean)
   return sum;
 }
 
-// both scale and shift are scalar
-template <typename T, int ITEM_PER_THREAD, NormType norm_type>
-__global__ void norm_twoPassAlgo_stored_locally_e4(
-    T* output,
-    const T* input,
-    const T* gamma,
-    const T* beta,
-    const T* scale,
-    const T* shift,
+// IndexMode for scale/shift/gate tensor indexing
+// Scalar: [1] - single value for all
+// Broadcast1N: [1, N] or [1, 1, N] - broadcast across M dimension
+// FullMN: [M, N] - per-row values
+// BroadcastB1N: [B, 1, N] - broadcast within each batch (for gate only)
+// FullBF1N: [B, F, 1, N] - per-(batch, frame) values
+enum class IndexMode : int {
+  Scalar = 0,
+  Broadcast1N = 1,
+  FullMN = 2,
+  BroadcastB1N = 3,  // [B, 1, N] gate - per-batch broadcast
+  FullBF1N = 4,
+};
+
+template <IndexMode IM>
+struct IndexModeTag {
+  static constexpr IndexMode value = IM;
+};
+
+template <typename T, int ITEM_PER_THREAD, NormType norm_type, IndexMode scale_mode, IndexMode shift_mode>
+__global__ void norm_fused_scale_shift_kernel(
+    T* __restrict__ output,
+    const T* __restrict__ input,
+    const T* __restrict__ gamma,
+    const T* __restrict__ beta,
+    const T* __restrict__ scale,
+    const T* __restrict__ shift,
     const int m,
     const int n,
+    const int F,
+    const int L,
     bool affine,
     float eps) {
   const int m_idx = blockIdx.x;
@@ -159,10 +160,22 @@ __global__ void norm_twoPassAlgo_stored_locally_e4(
   float local_sums[1] = {0.0f};
   Vec4<T> local_val[ITEM_PER_THREAD];
   const int n_4 = n / 4;
-  int offset = m_idx * n_4;
+  const int offset = m_idx * n_4;
 
+  // Compute (b, f) indices only when needed for 4D indexing
+  int scale_base = 0, shift_base = 0;
+  if constexpr (scale_mode == IndexMode::FullBF1N || shift_mode == IndexMode::FullBF1N) {
+    const int rows_per_b = F * L;
+    const int b = m_idx / rows_per_b;
+    const int f = (m_idx % rows_per_b) / L;
+    const int bf_offset = (b * F + f) * n_4;
+    if constexpr (scale_mode == IndexMode::FullBF1N) scale_base = bf_offset;
+    if constexpr (shift_mode == IndexMode::FullBF1N) shift_base = bf_offset;
+  }
+
+  // Pass 1: Load input and compute sum (LayerNorm) or sum_sq (RMSNorm)
 #pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
+  for (int i = 0; i < ITEM_PER_THREAD; ++i) {
     const int index = i * bdimx + tid;
     if (index < n_4) {
       local_val[i].load(input, offset + index);
@@ -176,6 +189,7 @@ __global__ void norm_twoPassAlgo_stored_locally_e4(
     }
   }
 
+  // Reduce and compute mean
   if (blockDim.x <= 32) {
     warpReduceSum<float, 1>(local_sums);
   } else {
@@ -186,10 +200,11 @@ __global__ void norm_twoPassAlgo_stored_locally_e4(
   }
   __syncthreads();
 
+  // Pass 2 (LayerNorm only): Compute variance
   if constexpr (norm_type == NormType::LayerNorm) {
     local_sums[0] = 0.0f;
 #pragma unroll
-    for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
+    for (int i = 0; i < ITEM_PER_THREAD; ++i) {
       const int index = i * bdimx + tid;
       if (index < n_4) {
         local_sums[0] += vec4_variance_sum(local_val[i], s_mean);
@@ -202,17 +217,18 @@ __global__ void norm_twoPassAlgo_stored_locally_e4(
     }
   }
   if (threadIdx.x == 0) {
-    // In rms norm, s_variance represents rsqrtf(x^2/n+eps).
     s_variance = rsqrtf(local_sums[0] / n + eps);
   }
   __syncthreads();
 
-  // Load scalar scale/shift once
-  const float scale_v = static_cast<float>(scale[0]);
-  const float shift_v = static_cast<float>(shift[0]);
+  // Pre-load scalar scale/shift if needed
+  float scalar_scale = 0.0f, scalar_shift = 0.0f;
+  if constexpr (scale_mode == IndexMode::Scalar) scalar_scale = static_cast<float>(scale[0]);
+  if constexpr (shift_mode == IndexMode::Scalar) scalar_shift = static_cast<float>(shift[0]);
 
+    // Pass 3: Apply normalization, affine, scale/shift
 #pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
+  for (int i = 0; i < ITEM_PER_THREAD; ++i) {
     const int index = i * bdimx + tid;
     if (index < n_4) {
       Vec4<T> gamma_val, beta_val;
@@ -224,246 +240,56 @@ __global__ void norm_twoPassAlgo_stored_locally_e4(
         beta_val.fill(T(0.0f));
       }
 
+      // Load scale/shift based on IndexMode
+      Vec4<T> scale_val, shift_val;
+      if constexpr (scale_mode == IndexMode::Scalar) {
+        scale_val.fill(T(scalar_scale));
+      } else if constexpr (scale_mode == IndexMode::Broadcast1N) {
+        scale_val.load(scale, index);
+      } else if constexpr (scale_mode == IndexMode::FullMN) {
+        scale_val.load(scale, offset + index);
+      } else {  // FullBF1N
+        scale_val.load(scale, scale_base + index);
+      }
+
+      if constexpr (shift_mode == IndexMode::Scalar) {
+        shift_val.fill(T(scalar_shift));
+      } else if constexpr (shift_mode == IndexMode::Broadcast1N) {
+        shift_val.load(shift, index);
+      } else if constexpr (shift_mode == IndexMode::FullMN) {
+        shift_val.load(shift, offset + index);
+      } else {  // FullBF1N
+        shift_val.load(shift, shift_base + index);
+      }
+
       Vec4<T> tmp;
-      if constexpr (norm_type == NormType::LayerNorm) {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          float normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
-          float affine_out = normalized * static_cast<float>(gamma_val[j]) + static_cast<float>(beta_val[j]);
-          tmp[j] = T(affine_out * (1.0f + scale_v) + shift_v);
+      for (int j = 0; j < 4; ++j) {
+        float normalized;
+        if constexpr (norm_type == NormType::LayerNorm) {
+          normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
+        } else {
+          normalized = static_cast<float>(local_val[i][j]) * s_variance;
         }
-      } else {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          float normalized = static_cast<float>(local_val[i][j]) * s_variance;
-          float affine_out = normalized * static_cast<float>(gamma_val[j]);
-          tmp[j] = T(affine_out * (1.0f + scale_v) + shift_v);
+        float affine_out = normalized * static_cast<float>(gamma_val[j]);
+        if constexpr (norm_type == NormType::LayerNorm) {
+          affine_out += static_cast<float>(beta_val[j]);
         }
+        tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
       }
       tmp.store(output, offset + index);
     }
   }
 }
 
-template <typename T, int ITEM_PER_THREAD, NormType norm_type>
-__global__ void norm_twoPassAlgo_stored_locally_e4_fused_scale_shift(
-    T* output,
-    const T* input,
-    const T* gamma,
-    const T* beta,
-    const T* scale,
-    const T* shift,
-    const int m,
-    const int n,
-    bool affine,
-    bool is_scale_c_1,
-    bool is_shift_c_1,
-    float eps) {
-  const int m_idx = blockIdx.x;
-  const int tid = threadIdx.x;
-  const int bdimx = blockDim.x;
-  __shared__ float s_mean, s_variance;
-  float local_sums[1] = {0.0f};
-  Vec4<T> local_val[ITEM_PER_THREAD];
-  const int n_4 = n / 4;
-  int offset = m_idx * n_4;
-  int scale_offset = is_scale_c_1 ? 0 : offset;
-  int shift_offset = is_shift_c_1 ? 0 : offset;
-
-#pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
-    const int index = i * bdimx + tid;
-    if (index < n_4) {
-      local_val[i].load(input, offset + index);
-    } else {
-      local_val[i].fill(T(0.0f));
-    }
-    if constexpr (norm_type == NormType::LayerNorm) {
-      local_sums[0] += vec4_sum(local_val[i]);
-    } else {
-      local_sums[0] += vec4_sum_sq(local_val[i]);
-    }
-  }
-
-  if (blockDim.x <= 32) {
-    warpReduceSum<float, 1>(local_sums);
-  } else {
-    blockReduceSum<float, 1>(local_sums);
-  }
-  if (threadIdx.x == 0) {
-    s_mean = local_sums[0] / n;
-  }
-  __syncthreads();
-
-  if constexpr (norm_type == NormType::LayerNorm) {
-    local_sums[0] = 0.0f;
-#pragma unroll
-    for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
-      const int index = i * bdimx + tid;
-      if (index < n_4) {
-        local_sums[0] += vec4_variance_sum(local_val[i], s_mean);
-      }
-    }
-    if (blockDim.x <= 32) {
-      warpReduceSum<float, 1>(local_sums);
-    } else {
-      blockReduceSum<float, 1>(local_sums);
-    }
-  }
-  if (threadIdx.x == 0) {
-    // In rms norm, s_variance represents rsqrtf(x^2/n+eps).
-    s_variance = rsqrtf(local_sums[0] / n + eps);
-  }
-  __syncthreads();
-
-#pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
-    const int index = i * bdimx + tid;
-    if (index < n_4) {
-      Vec4<T> gamma_val, beta_val, scale_val, shift_val;
-      if (affine) {
-        gamma_val.load(gamma, index);
-        beta_val.load(beta, index);
-      } else {
-        gamma_val.fill(T(1.0f));
-        beta_val.fill(T(0.0f));
-      }
-      scale_val.load(scale, scale_offset + index);
-      shift_val.load(shift, shift_offset + index);
-
-      Vec4<T> tmp;
-      if constexpr (norm_type == NormType::LayerNorm) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          float normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
-          float affine_out = normalized * static_cast<float>(gamma_val[j]) + static_cast<float>(beta_val[j]);
-          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
-        }
-      } else {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          float normalized = static_cast<float>(local_val[i][j]) * s_variance;
-          float affine_out = normalized * static_cast<float>(gamma_val[j]);
-          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
-        }
-      }
-      tmp.store(output, offset + index);
-    }
-  }
-}
-
-// 4D scale/shift variant: scale/shift shape [B, F, 1, N]
-template <typename T, int ITEM_PER_THREAD, NormType norm_type>
-__global__ void norm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d(
-    T* output,
-    const T* input,
-    const T* gamma,
-    const T* beta,
-    const T* scale4d,
-    const T* shift4d,
-    const int m,
-    const int n,
-    const int B,
-    const int F,
-    const int frame_seqlen,
-    bool affine,
-    float eps) {
-  const int m_idx = blockIdx.x;
-  const int tid = threadIdx.x;
-  const int bdimx = blockDim.x;
-  __shared__ float s_mean, s_variance;
-  float local_sums[1] = {0.0f};
-  Vec4<T> local_val[ITEM_PER_THREAD];
-  const int n_4 = n / 4;
-  int offset = m_idx * n_4;
-
-  // Compute (b, f) indices for this row
-  const int rows_per_b = F * frame_seqlen;
-  const int b = m_idx / rows_per_b;
-  const int s_in_b = m_idx - b * rows_per_b;
-  const int f = s_in_b / frame_seqlen;
-  const int base4d = (b * F + f) * n_4;
-
-#pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
-    const int index = i * bdimx + tid;
-    if (index < n_4) {
-      local_val[i].load(input, offset + index);
-    } else {
-      local_val[i].fill(T(0.0f));
-    }
-    if constexpr (norm_type == NormType::LayerNorm) {
-      local_sums[0] += vec4_sum(local_val[i]);
-    } else {
-      local_sums[0] += vec4_sum_sq(local_val[i]);
-    }
-  }
-
-  if (blockDim.x <= 32) {
-    warpReduceSum<float, 1>(local_sums);
-  } else {
-    blockReduceSum<float, 1>(local_sums);
-  }
-  if (threadIdx.x == 0) {
-    s_mean = local_sums[0] / n;
-  }
-  __syncthreads();
-
-  if constexpr (norm_type == NormType::LayerNorm) {
-    local_sums[0] = 0.0f;
-#pragma unroll
-    for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
-      const int index = i * bdimx + tid;
-      if (index < n_4) {
-        local_sums[0] += vec4_variance_sum(local_val[i], s_mean);
-      }
-    }
-    if (blockDim.x <= 32) {
-      warpReduceSum<float, 1>(local_sums);
-    } else {
-      blockReduceSum<float, 1>(local_sums);
-    }
-  }
-  if (threadIdx.x == 0) {
-    // In rms norm, s_variance represents rsqrtf(x^2/n+eps).
-    s_variance = rsqrtf(local_sums[0] / n + eps);
-  }
-  __syncthreads();
-
-#pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
-    const int index = i * bdimx + tid;
-    if (index < n_4) {
-      Vec4<T> gamma_val, beta_val, scale_val, shift_val;
-      if (affine) {
-        gamma_val.load(gamma, index);
-        beta_val.load(beta, index);
-      } else {
-        gamma_val.fill(T(1.0f));
-        beta_val.fill(T(0.0f));
-      }
-      scale_val.load(scale4d, base4d + index);
-      shift_val.load(shift4d, base4d + index);
-
-      Vec4<T> tmp;
-      if constexpr (norm_type == NormType::LayerNorm) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          float normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
-          float affine_out = normalized * static_cast<float>(gamma_val[j]) + static_cast<float>(beta_val[j]);
-          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
-        }
-      } else {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          float normalized = static_cast<float>(local_val[i][j]) * s_variance;
-          float affine_out = normalized * static_cast<float>(gamma_val[j]);
-          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
-        }
-      }
-      tmp.store(output, offset + index);
-    }
-  }
+// Helper to determine IndexMode from tensor shape
+inline IndexMode get_index_mode(const ffi::TensorView& t, int64_t M, int64_t N) {
+  if (t.ndim() == 1 && t.numel() == 1) return IndexMode::Scalar;
+  if (t.ndim() == 3 && t.size(0) == 1 && t.size(1) == 1) return IndexMode::Broadcast1N;
+  if (t.ndim() == 2 && t.size(0) == 1) return IndexMode::Broadcast1N;
+  if (t.ndim() == 2 && t.size(0) == M) return IndexMode::FullMN;
+  if (t.ndim() == 4) return IndexMode::FullBF1N;
+  return IndexMode::FullMN;  // fallback
 }
 
 static void norm_fused_scale_shift_launch(
@@ -477,58 +303,70 @@ static void norm_fused_scale_shift_launch(
     float eps) {
   using namespace host;
 
-  bool has_gamma = gamma_opt.has_value();
-  bool has_beta = beta_opt.has_value();
-  // layermorm requires gamma and beta to be either both defined or both undefined.
-  bool affine = has_gamma;
-  auto gamma_ptr = has_gamma ? gamma_opt.value().data_ptr() : nullptr;
-  auto beta_ptr = has_beta ? beta_opt.value().data_ptr() : nullptr;
+  bool affine = gamma_opt.has_value();
+  auto gamma_ptr = gamma_opt.has_value() ? gamma_opt.value().data_ptr() : nullptr;
+  auto beta_ptr = beta_opt.has_value() ? beta_opt.value().data_ptr() : nullptr;
 
   const int64_t M = x.size(0);
   const int64_t N = x.size(1);
   dim3 grid((unsigned)M);
-  RuntimeCheck((N % 4) == 0, "N must be divisible by 4");
   dim3 block(0);
 
-  auto is_broadcast_2d = [&](const ffi::TensorView& t) {
-    if (t.ndim() == 2) return (t.size(0) == M || t.size(0) == 1) && t.size(1) == N;
-    if (t.ndim() == 3) return t.size(0) == 1 && t.size(1) == 1 && t.size(2) == N;
-    return false;
-  };
+  // Determine IndexMode for scale and shift
+  IndexMode scale_mode = get_index_mode(scale, M, N);
+  IndexMode shift_mode = get_index_mode(shift, M, N);
 
-  bool use_2d = is_broadcast_2d(scale) && is_broadcast_2d(shift);
-  bool is_scale_c_1 = false;
-  bool is_shift_c_1 = false;
-  if (use_2d) {
-    is_scale_c_1 = (scale.ndim() == 3) || (scale.size(0) == 1);
-    is_shift_c_1 = (shift.ndim() == 3) || (shift.size(0) == 1);
+  // Compute F and L for 4D indexing (needed even if not used, passed as dummy)
+  int F = 1, L = (int)M;
+  if (scale_mode == IndexMode::FullBF1N || shift_mode == IndexMode::FullBF1N) {
+    const auto& t4d = (scale.ndim() == 4) ? scale : shift;
+    const int64_t B = t4d.size(0);
+    F = (int)t4d.size(1);
+    L = (int)(M / (B * F));
   }
 
-  const bool use_4d = (scale.ndim() == 4 && shift.ndim() == 4);
-  const bool scalar_both = (scale.ndim() == 1 && scale.numel() == 1 && shift.ndim() == 1 && shift.numel() == 1);
-  RuntimeCheck(use_2d || use_4d || scalar_both, "scale/shift must be 2D [M, N], 4D [B, F, 1, N], or 1D [1]");
+  // Dispatch helper with IndexMode
+  auto dispatch = [&](auto scale_mode_tag, auto shift_mode_tag) {
+    auto dispatch_dtype = [&](auto dtype_tag) {
+      auto dispatch_ipt = [&](auto ipt_tag) {
+        auto dispatch_norm = [&](auto norm_tag) {
+          using T = typename decltype(dtype_tag)::T;
+          LaunchKernel(grid, block, x.device())(
+              norm_fused_scale_shift_kernel<
+                  T,
+                  decltype(ipt_tag)::value,
+                  decltype(norm_tag)::value,
+                  decltype(scale_mode_tag)::value,
+                  decltype(shift_mode_tag)::value>,
+              (T*)out.data_ptr(),
+              (const T*)x.data_ptr(),
+              (const T*)gamma_ptr,
+              (const T*)beta_ptr,
+              (const T*)scale.data_ptr(),
+              (const T*)shift.data_ptr(),
+              (int)M,
+              (int)N,
+              F,
+              L,
+              affine,
+              eps);
+        };
 
-  auto dispatch = [&](auto launch_kernel) {
-    auto dispatch_dtype = [&](auto dtype) {
-      auto dispatch_item_per_thread = [&](auto item_per_thread_tag) {
-        auto dispatch_norm_type = [&](auto norm_tag) { launch_kernel(dtype, item_per_thread_tag, norm_tag); };
-
-        if (norm_type == 0) {
-          dispatch_norm_type(NormTag<NormType::LayerNorm>{});
+        if (norm_type == NormType::LayerNorm) {
+          dispatch_norm(NormTag<NormType::LayerNorm>{});
         } else {
-          dispatch_norm_type(NormTag<NormType::RMSNorm>{});
+          dispatch_norm(NormTag<NormType::RMSNorm>{});
         }
       };
 
       if (N <= 4096) {
         block.x = (int)((N / 4 + 31) / 32 * 32);
         if (block.x > 1024) block.x = 1024;
-        dispatch_item_per_thread(ItemPerThreadTag<1>{});
+        dispatch_ipt(ItemPerThreadTag<1>{});
       } else {
-        // For all N > 4096, use the configuration previously used for 4096 < N <= 8192.
         block.x = (int)(((N + 7) / 8 + 31) / 32 * 32);
         if (block.x > 1024) block.x = 1024;
-        dispatch_item_per_thread(ItemPerThreadTag<8>{});
+        dispatch_ipt(ItemPerThreadTag<8>{});
       }
     };
 
@@ -544,84 +382,39 @@ static void norm_fused_scale_shift_launch(
     }
   };
 
-  // If both scale and shift are scalar, launch the below kernel.
-  if (scalar_both) {
-    auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
-      using T = typename decltype(dtype_tag)::T;
-      using IPT = decltype(ipt_tag);
-      using NT = decltype(norm_tag);
-      LaunchKernel(grid, block, x.device())(
-          norm_twoPassAlgo_stored_locally_e4<T, IPT::value, NT::value>,
-          (T*)out.data_ptr(),
-          (const T*)x.data_ptr(),
-          (const T*)gamma_ptr,
-          (const T*)beta_ptr,
-          (const T*)scale.data_ptr(),
-          (const T*)shift.data_ptr(),
-          (int)M,
-          (int)N,
-          affine,
-          eps);
-    };
-
-    dispatch(launch_kernel);
-    return;
-  }
-
-  if (use_2d) {
-    auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
-      using T = typename decltype(dtype_tag)::T;
-      using IPT = decltype(ipt_tag);
-      using NT = decltype(norm_tag);
-      LaunchKernel(grid, block, x.device())(
-          norm_twoPassAlgo_stored_locally_e4_fused_scale_shift<T, IPT::value, NT::value>,
-          (T*)out.data_ptr(),
-          (const T*)x.data_ptr(),
-          (const T*)gamma_ptr,
-          (const T*)beta_ptr,
-          (const T*)scale.data_ptr(),
-          (const T*)shift.data_ptr(),
-          (int)M,
-          (int)N,
-          affine,
-          is_scale_c_1,
-          is_shift_c_1,
-          eps);
-    };
-
-    dispatch(launch_kernel);
-    return;
-  }
-
-  // 4D launcher path
-  RuntimeCheck(scale.size(2) == 1 && shift.size(2) == 1, "scale/shift 4D must have size 1 at dim=2");
-  RuntimeCheck(scale.size(3) == N && shift.size(3) == N, "scale/shift last dim must be N");
-  const int64_t B = scale.size(0);
-  const int64_t F = scale.size(1);
-  const int frame_seqlen = (int)(M / (B * F));
-
-  auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag) {
-    using T = typename decltype(dtype_tag)::T;
-    using IPT = decltype(ipt_tag);
-    using NT = decltype(norm_tag);
-    LaunchKernel(grid, block, x.device())(
-        norm_twoPassAlgo_stored_locally_e4_fused_scale_shift_4d<T, IPT::value, NT::value>,
-        (T*)out.data_ptr(),
-        (const T*)x.data_ptr(),
-        (const T*)gamma_ptr,
-        (const T*)beta_ptr,
-        (const T*)scale.data_ptr(),
-        (const T*)shift.data_ptr(),
-        (int)M,
-        (int)N,
-        (int)B,
-        (int)F,
-        (int)frame_seqlen,
-        affine,
-        eps);
+  // Dispatch based on IndexMode combinations
+  // We only instantiate commonly used combinations to limit template explosion
+  auto dispatch_shift = [&](auto scale_mode_tag) {
+    switch (shift_mode) {
+      case IndexMode::Scalar:
+        dispatch(scale_mode_tag, IndexModeTag<IndexMode::Scalar>{});
+        break;
+      case IndexMode::Broadcast1N:
+        dispatch(scale_mode_tag, IndexModeTag<IndexMode::Broadcast1N>{});
+        break;
+      case IndexMode::FullMN:
+        dispatch(scale_mode_tag, IndexModeTag<IndexMode::FullMN>{});
+        break;
+      case IndexMode::FullBF1N:
+        dispatch(scale_mode_tag, IndexModeTag<IndexMode::FullBF1N>{});
+        break;
+    }
   };
 
-  dispatch(launch_kernel);
+  switch (scale_mode) {
+    case IndexMode::Scalar:
+      dispatch_shift(IndexModeTag<IndexMode::Scalar>{});
+      break;
+    case IndexMode::Broadcast1N:
+      dispatch_shift(IndexModeTag<IndexMode::Broadcast1N>{});
+      break;
+    case IndexMode::FullMN:
+      dispatch_shift(IndexModeTag<IndexMode::FullMN>{});
+      break;
+    case IndexMode::FullBF1N:
+      dispatch_shift(IndexModeTag<IndexMode::FullBF1N>{});
+      break;
+  }
 }
 
 template <int norm_type>
@@ -637,11 +430,10 @@ void fused_norm_scale_shift(
 
   SymbolicSize M_ = {"M"};
   SymbolicSize N_ = {"N"};
-  SymbolicDevice device_;
   TensorMatcher({M_, N_})  // 2D tensor, must be contiguous
       .with_dtype<float, half, nv_bfloat16>()
       .with_strides({N_, 1})
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLCUDA>()
       .verify(x)
       .verify(out);
 
@@ -670,14 +462,14 @@ void fused_norm_scale_shift(
     const auto& gamma = gamma_opt.value();
     TensorMatcher({N_})  // 1D tensor, must be contiguous
         .with_dtype<float, half, nv_bfloat16>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA>()
         .verify(gamma);
     RuntimeCheck(x.dtype() == gamma.dtype(), "x, gamma must have same dtype");
     if (beta_opt.has_value()) {
       const auto& beta = beta_opt.value();
       TensorMatcher({N_})  // 1D tensor, must be contiguous
           .with_dtype<float, half, nv_bfloat16>()
-          .with_device<kDLCUDA>(device_)
+          .with_device<kDLCUDA>()
           .verify(beta);
       RuntimeCheck(x.dtype() == beta.dtype(), "x, beta must have same dtype");
     }
@@ -710,13 +502,15 @@ void fused_rmsnorm_scale_shift(
   fused_norm_scale_shift<1>(out, x, gamma_opt, beta_opt, scale, shift, eps);
 }
 
-// =========================
-// Fused Residual + Gate + LayerNorm/RMSNorm + Scale/Shift
-// =========================
-
-// See GateMode enum for gate mode definitions.
-template <typename T, int ITEM_PER_THREAD, NormType norm_type, bool scalar_both, GateMode gate_mode>
-__global__ void norm_e4_fused_res_gate_scale_shift_2d(
+// Unified kernel for residual + gate + norm + scale/shift
+template <
+    typename T,
+    int ITEM_PER_THREAD,
+    NormType norm_type,
+    IndexMode scale_mode,
+    IndexMode shift_mode,
+    IndexMode gate_mode>
+__global__ void norm_fused_res_gate_scale_shift_kernel(
     T* __restrict__ output,
     T* __restrict__ residual_out,
     const T* __restrict__ x,
@@ -725,15 +519,12 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
     const T* __restrict__ beta,
     const T* __restrict__ scale,
     const T* __restrict__ shift,
-    const T* __restrict__ gate_mn,  // used when gate_mode == Gate2D
-    const T* __restrict__ gate_b1,  // used when gate_mode == GateB1N (flattened [B,1,N] -> [B,N])
+    const T* __restrict__ gate,  // nullptr means NoGate (use 1.0)
     const int m,
     const int n,
-    const int rows_per_b,  // valid when gate_mode == GateB1N
+    const int F,
+    const int L,
     bool affine,
-    bool is_scale_c_1,
-    bool is_shift_c_1,
-    bool is_gate_c_1,
     float eps) {
   const int m_idx = blockIdx.x;
   const int tid = threadIdx.x;
@@ -744,27 +535,52 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
   const int n_4 = n / 4;
   const int offset = m_idx * n_4;
 
-  int b = 0;
-  int gate_b_base = 0;
-  if constexpr (gate_mode == GateMode::GateB1N) {
-    b = m_idx / rows_per_b;
-    gate_b_base = b * n_4;
+  // Compute (b, f) indices for 4D indexing (FullBF1N mode) and BroadcastB1N gate
+  int scale_base = 0, shift_base = 0, gate_base = 0;
+  constexpr bool need_bf =
+      (scale_mode == IndexMode::FullBF1N || shift_mode == IndexMode::FullBF1N || gate_mode == IndexMode::FullBF1N);
+  constexpr bool need_b1n = (gate_mode == IndexMode::BroadcastB1N);
+  if constexpr (need_bf) {
+    const int rows_per_b = F * L;
+    const int b = m_idx / rows_per_b;
+    const int f = (m_idx % rows_per_b) / L;
+    const int bf_offset = (b * F + f) * n_4;
+    if constexpr (scale_mode == IndexMode::FullBF1N) scale_base = bf_offset;
+    if constexpr (shift_mode == IndexMode::FullBF1N) shift_base = bf_offset;
+    if constexpr (gate_mode == IndexMode::FullBF1N) gate_base = bf_offset;
   }
 
+  // For BroadcastB1N mode with gate ([B, 1, N] - per-batch broadcast)
+  // L here represents rows_per_b (number of rows per batch)
+  if constexpr (need_b1n) {
+    gate_base = (m_idx / L) * n_4;
+  }
+
+  // Pass 1: Load x, residual, gate and compute residual + x * gate
 #pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
+  for (int i = 0; i < ITEM_PER_THREAD; ++i) {
     const int index = i * bdimx + tid;
     if (index < n_4) {
       Vec4<T> x_v, r_v, g_v;
       x_v.load(x, offset + index);
       r_v.load(residual, offset + index);
 
-      if constexpr (gate_mode == GateMode::NoGate) {
+      // Load gate based on IndexMode (nullptr means NoGate)
+      if (gate == nullptr) {
         g_v.fill(T(1.0f));
-      } else if constexpr (gate_mode == GateMode::Gate2D) {
-        g_v.load(gate_mn, is_gate_c_1 ? index : (offset + index));
-      } else {  // gate_mode == GateMode::GateB1N
-        g_v.load(gate_b1, gate_b_base + index);
+      } else if constexpr (gate_mode == IndexMode::Scalar) {
+        g_v.load(gate, index);
+      } else if constexpr (gate_mode == IndexMode::Broadcast1N) {
+        // [1, N] or [1, 1, N] - same value for all rows
+        g_v.load(gate, index);
+      } else if constexpr (gate_mode == IndexMode::FullMN) {
+        // [M, N] - per-row gate, use offset like scale/shift
+        g_v.load(gate, offset + index);
+      } else if constexpr (gate_mode == IndexMode::BroadcastB1N) {
+        // [B, 1, N] - per-batch gate
+        g_v.load(gate, gate_base + index);
+      } else {  // FullBF1N
+        g_v.load(gate, gate_base + index);
       }
 
       Vec4<T> sum_v;
@@ -788,6 +604,7 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
     }
   }
 
+  // Reduce and compute mean
   if (blockDim.x <= 32) {
     warpReduceSum<float, 1>(local_sums);
   } else {
@@ -798,10 +615,11 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
   }
   __syncthreads();
 
+  // Pass 2 (LayerNorm only): Compute variance
   if constexpr (norm_type == NormType::LayerNorm) {
     local_sums[0] = 0.0f;
 #pragma unroll
-    for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
+    for (int i = 0; i < ITEM_PER_THREAD; ++i) {
       const int index = i * bdimx + tid;
       if (index < n_4) {
         local_sums[0] += vec4_variance_sum(local_val[i], s_mean);
@@ -814,24 +632,21 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
     }
   }
   if (threadIdx.x == 0) {
-    // In rms norm, s_variance represents rsqrtf(x^2/n+eps).
     s_variance = rsqrtf(local_sums[0] / n + eps);
   }
   __syncthreads();
 
   // Pre-load scalar scale/shift if needed
-  float scalar_scale_v = 0.0f, scalar_shift_v = 0.0f;
-  if constexpr (scalar_both) {
-    scalar_scale_v = static_cast<float>(scale[0]);
-    scalar_shift_v = static_cast<float>(shift[0]);
-  }
+  float scalar_scale = 0.0f, scalar_shift = 0.0f;
+  if constexpr (scale_mode == IndexMode::Scalar) scalar_scale = static_cast<float>(scale[0]);
+  if constexpr (shift_mode == IndexMode::Scalar) scalar_shift = static_cast<float>(shift[0]);
 
+    // Pass 3: Apply normalization, affine, scale/shift
 #pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
+  for (int i = 0; i < ITEM_PER_THREAD; ++i) {
     const int index = i * bdimx + tid;
     if (index < n_4) {
-      Vec4<T> gamma_val, beta_val, scale_val, shift_val;
-
+      Vec4<T> gamma_val, beta_val;
       if (affine) {
         gamma_val.load(gamma, index);
         beta_val.load(beta, index);
@@ -840,170 +655,60 @@ __global__ void norm_e4_fused_res_gate_scale_shift_2d(
         beta_val.fill(T(0.0f));
       }
 
-      if constexpr (scalar_both) {
-        scale_val.fill(T(scalar_scale_v));
-        shift_val.fill(T(scalar_shift_v));
-      } else {
-        scale_val.load(scale, is_scale_c_1 ? index : (offset + index));
-        shift_val.load(shift, is_shift_c_1 ? index : (offset + index));
+      // Load scale/shift based on IndexMode
+      Vec4<T> scale_val, shift_val;
+      if constexpr (scale_mode == IndexMode::Scalar) {
+        scale_val.fill(T(scalar_scale));
+      } else if constexpr (scale_mode == IndexMode::Broadcast1N) {
+        scale_val.load(scale, index);
+      } else if constexpr (scale_mode == IndexMode::FullMN) {
+        scale_val.load(scale, offset + index);
+      } else {  // FullBF1N
+        scale_val.load(scale, scale_base + index);
+      }
+
+      if constexpr (shift_mode == IndexMode::Scalar) {
+        shift_val.fill(T(scalar_shift));
+      } else if constexpr (shift_mode == IndexMode::Broadcast1N) {
+        shift_val.load(shift, index);
+      } else if constexpr (shift_mode == IndexMode::FullMN) {
+        shift_val.load(shift, offset + index);
+      } else {  // FullBF1N
+        shift_val.load(shift, shift_base + index);
       }
 
       Vec4<T> tmp;
-      if constexpr (norm_type == NormType::LayerNorm) {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          float normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
-          float affine_out = normalized * static_cast<float>(gamma_val[j]) + static_cast<float>(beta_val[j]);
-          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
+      for (int j = 0; j < 4; ++j) {
+        float normalized;
+        if constexpr (norm_type == NormType::LayerNorm) {
+          normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
+        } else {
+          normalized = static_cast<float>(local_val[i][j]) * s_variance;
         }
-      } else {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          float normalized = static_cast<float>(local_val[i][j]) * s_variance;
-          float affine_out = normalized * static_cast<float>(gamma_val[j]);
-          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
+        float affine_out = normalized * static_cast<float>(gamma_val[j]);
+        if constexpr (norm_type == NormType::LayerNorm) {
+          affine_out += static_cast<float>(beta_val[j]);
         }
+        tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
       }
       tmp.store(output, offset + index);
     }
   }
 }
 
-template <typename T, int ITEM_PER_THREAD, NormType norm_type, GateMode gate_mode>
-__global__ void norm_e4_fused_res_gate_scale_shift_4d(
-    T* __restrict__ output,
-    T* __restrict__ residual_out,
-    const T* __restrict__ x,
-    const T* __restrict__ residual,
-    const T* __restrict__ gamma,
-    const T* __restrict__ beta,
-    const T* __restrict__ scale4d,
-    const T* __restrict__ shift4d,
-    const T* __restrict__ gate4d,  // used when gate_mode == GateBF1N
-    const int m,
-    const int n,
-    const int B,
-    const int F,
-    const int frame_seqlen,
-    bool affine,
-    float eps) {
-  const int m_idx = blockIdx.x;
-  const int tid = threadIdx.x;
-  const int bdimx = blockDim.x;
-  __shared__ float s_mean, s_variance;
-  float local_sums[1] = {0.0f};
-  Vec4<T> local_val[ITEM_PER_THREAD];
-  const int n_4 = n / 4;
-  const int offset = m_idx * n_4;
-
-  // Compute (b, f) for this row to index 4D tensors
-  const int rows_per_b = F * frame_seqlen;
-  const int b = m_idx / rows_per_b;
-  const int s_in_b = m_idx - b * rows_per_b;
-  const int f = s_in_b / frame_seqlen;
-  const int base4d = (b * F + f) * n_4;
-
-#pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
-    const int index = i * bdimx + tid;
-    if (index < n_4) {
-      Vec4<T> x_v, r_v, g_v;
-      x_v.load(x, offset + index);
-      r_v.load(residual, offset + index);
-
-      if constexpr (gate_mode == GateMode::NoGate) {
-        g_v.fill(T(1.0f));
-      } else {  // gate_mode == GateBF1N
-        g_v.load(gate4d, base4d + index);
-      }
-
-      Vec4<T> sum_v;
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        sum_v[j] = T(static_cast<float>(r_v[j]) + static_cast<float>(x_v[j]) * static_cast<float>(g_v[j]));
-      }
-      local_val[i] = sum_v;
-
-      if (residual_out != nullptr) {
-        sum_v.store(residual_out, offset + index);
-      }
-
-      if constexpr (norm_type == NormType::LayerNorm) {
-        local_sums[0] += vec4_sum(sum_v);
-      } else {
-        local_sums[0] += vec4_sum_sq(sum_v);
-      }
-    } else {
-      local_val[i].fill(T(0.0f));
-    }
-  }
-
-  if (blockDim.x <= 32) {
-    warpReduceSum<float, 1>(local_sums);
-  } else {
-    blockReduceSum<float, 1>(local_sums);
-  }
-  if (threadIdx.x == 0) {
-    s_mean = local_sums[0] / n;
-  }
-  __syncthreads();
-
-  if constexpr (norm_type == NormType::LayerNorm) {
-    local_sums[0] = 0.0f;
-#pragma unroll
-    for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
-      const int index = i * bdimx + tid;
-      if (index < n_4) {
-        local_sums[0] += vec4_variance_sum(local_val[i], s_mean);
-      }
-    }
-    if (blockDim.x <= 32) {
-      warpReduceSum<float, 1>(local_sums);
-    } else {
-      blockReduceSum<float, 1>(local_sums);
-    }
-  }
-  if (threadIdx.x == 0) {
-    // In rms norm, s_variance represents rsqrtf(x^2/n+eps).
-    s_variance = rsqrtf(local_sums[0] / n + eps);
-  }
-  __syncthreads();
-
-#pragma unroll
-  for (int i = 0; i < ITEM_PER_THREAD; i += 1) {
-    const int index = i * bdimx + tid;
-    if (index < n_4) {
-      Vec4<T> gamma_val, beta_val, scale_val, shift_val;
-
-      if (affine) {
-        gamma_val.load(gamma, index);
-        beta_val.load(beta, index);
-      } else {
-        gamma_val.fill(T(1.0f));
-        beta_val.fill(T(0.0f));
-      }
-      scale_val.load(scale4d, base4d + index);
-      shift_val.load(shift4d, base4d + index);
-
-      Vec4<T> tmp;
-      if constexpr (norm_type == NormType::LayerNorm) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          float normalized = (static_cast<float>(local_val[i][j]) - s_mean) * s_variance;
-          float affine_out = normalized * static_cast<float>(gamma_val[j]) + static_cast<float>(beta_val[j]);
-          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
-        }
-      } else {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          float normalized = static_cast<float>(local_val[i][j]) * s_variance;
-          float affine_out = normalized * static_cast<float>(gamma_val[j]);
-          tmp[j] = T(affine_out * (1.0f + static_cast<float>(scale_val[j])) + static_cast<float>(shift_val[j]));
-        }
-      }
-      tmp.store(output, offset + index);
-    }
-  }
+// Helper to determine IndexMode for gate tensor
+// For gate: NoGate -> nullptr, [1,N]/[1,1,N] -> Broadcast1N, [M,N] -> FullMN, [B,1,N] -> BroadcastB1N, [B,F,1,N] ->
+// FullBF1N
+inline IndexMode get_gate_index_mode(const ffi::Optional<ffi::TensorView>& gate_opt, int64_t M, int64_t N) {
+  if (!gate_opt.has_value()) return IndexMode::Scalar;  // NoGate case, will use nullptr
+  const auto& g = gate_opt.value();
+  if (g.ndim() == 2 && g.size(0) == 1) return IndexMode::Broadcast1N;                    // [1, N]
+  if (g.ndim() == 2 && g.size(0) == M) return IndexMode::FullMN;                         // [M, N] - per-row gate
+  if (g.ndim() == 3 && g.size(0) == 1 && g.size(1) == 1) return IndexMode::Broadcast1N;  // [1, 1, N]
+  if (g.ndim() == 3 && g.size(1) == 1) return IndexMode::BroadcastB1N;                   // [B, 1, N] - per-batch gate
+  if (g.ndim() == 4) return IndexMode::FullBF1N;
+  return IndexMode::FullMN;  // fallback for any 2D gate
 }
 
 static void norm_fused_res_gate_scale_shift_launch_with_residual(
@@ -1020,9 +725,10 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
     float eps) {
   using namespace host;
 
+  bool affine = gamma_opt.has_value();
   auto gamma_ptr = gamma_opt.has_value() ? gamma_opt.value().data_ptr() : nullptr;
   auto beta_ptr = beta_opt.has_value() ? beta_opt.value().data_ptr() : nullptr;
-  bool affine = gamma_opt.has_value();
+  auto gate_ptr = gate_opt.has_value() ? gate_opt.value().data_ptr() : nullptr;
 
   const int64_t M = x.size(0);
   const int64_t N = x.size(1);
@@ -1033,99 +739,79 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
   if (N <= 4096) {
     block.x = (int)((N / 4 + 31) / 32 * 32);
   } else {
-    // For all N > 4096, use the configuration previously used for 4096 < N <= 8192.
     block.x = (int)(((N + 7) / 8 + 31) / 32 * 32);
   }
   if (block.x > 1024) block.x = 1024;
 
-  auto is_broadcast_2d = [&](const ffi::TensorView& t) {
-    if (t.ndim() == 2) return (t.size(0) == M || t.size(0) == 1) && t.size(1) == N;
-    if (t.ndim() == 3) return t.size(0) == 1 && t.size(1) == 1 && t.size(2) == N;
-    return false;
-  };
+  // Determine IndexMode for scale, shift, and gate
+  IndexMode scale_mode = get_index_mode(scale, M, N);
+  IndexMode shift_mode = get_index_mode(shift, M, N);
+  IndexMode gate_mode_idx = get_gate_index_mode(gate_opt, M, N);
 
-  bool use_2d = is_broadcast_2d(scale) && is_broadcast_2d(shift);
-  bool is_scale_c_1 = false;
-  bool is_shift_c_1 = false;
-  if (use_2d) {
-    is_scale_c_1 = (scale.ndim() == 3) || (scale.size(0) == 1);
-    is_shift_c_1 = (shift.ndim() == 3) || (shift.size(0) == 1);
-  }
-
-  const bool use_4d = (scale.ndim() == 4 && shift.ndim() == 4);
-  const bool scalar_both = (scale.ndim() == 1 && scale.numel() == 1 && shift.ndim() == 1 && shift.numel() == 1);
-  RuntimeCheck(
-      use_2d || use_4d || scalar_both,
-      "scale/shift must be 2D [M, N] , 2D [1, N], 3D [1, 1, N], 4D [B, F, 1, N], or scalar");
-
-  // Determine gate mode
-  GateMode gate_mode = GateMode::NoGate;
-  bool is_gate_c_1 = false;
-  if (gate_opt.has_value()) {
-    const auto& gate = gate_opt.value();
-    RuntimeCheck(gate.dtype() == x.dtype(), "gate must have same dtype as x");
-    if (gate.ndim() == 2) {
-      if (gate.size(0) == M && gate.size(1) == N) {
-        gate_mode = GateMode::Gate2D;
-      } else if (gate.size(0) == 1 && gate.size(1) == N) {
-        gate_mode = GateMode::Gate2D;
-        is_gate_c_1 = true;
-      } else {
-        RuntimeCheck(false, "2D gate must be [M, N] or [1, N]");
-      }
-    } else if (gate.ndim() == 3) {
-      if (gate.size(0) == 1 && gate.size(1) == 1 && gate.size(2) == N) {
-        gate_mode = GateMode::Gate2D;
-        is_gate_c_1 = true;
-      } else {
-        RuntimeCheck(gate.size(1) == 1 && gate.size(2) == N, "3D gate must be [B, 1, N]");
-        const int64_t B = gate.size(0);
-        RuntimeCheck((M % B) == 0, "M must be divisible by B for 3D gate [B,1,N]");
-        gate_mode = GateMode::GateB1N;
-      }
-    } else if (gate.ndim() == 4) {
-      RuntimeCheck(gate.size(2) == 1 && gate.size(3) == N, "4D gate must be [B, F, 1, N]");
-      gate_mode = GateMode::GateBF1N;
-    } else {
-      RuntimeCheck(false, "Unsupported gate shape. Use [M,N], [B,1,N], [B,F,1,N] , 2D [1, N], 3D [1, 1, N]");
+  // Compute F and L for 4D indexing
+  int F = 1, L = (int)M;
+  if (scale_mode == IndexMode::FullBF1N || shift_mode == IndexMode::FullBF1N || gate_mode_idx == IndexMode::FullBF1N) {
+    // Find a 4D tensor to get B and F
+    const ffi::TensorView* t4d = nullptr;
+    if (scale.ndim() == 4)
+      t4d = &scale;
+    else if (shift.ndim() == 4)
+      t4d = &shift;
+    else if (gate_opt.has_value() && gate_opt.value().ndim() == 4)
+      t4d = &gate_opt.value();
+    if (t4d) {
+      const int64_t B = t4d->size(0);
+      F = (int)t4d->size(1);
+      L = (int)(M / (B * F));
     }
   }
+  // For gate [B, 1, N] case (BroadcastB1N mode), L represents rows_per_b
+  if (gate_mode_idx == IndexMode::BroadcastB1N && gate_opt.has_value()) {
+    L = (int)(M / gate_opt.value().size(0));
+  }
 
-  auto dispatch = [&](auto launch_kernel) {
-    auto dispatch_dtype = [&](auto dtype) {
-      auto dispatch_item_per_thread = [&](auto item_per_thread_tag) {
-        auto dispatch_norm_type = [&](auto norm_tag) {
-          auto dispatch_gate_mode = [&](auto gate_mode_tag) {
-            launch_kernel(dtype, item_per_thread_tag, norm_tag, gate_mode_tag);
-          };
-
-          switch (gate_mode) {
-            case GateMode::NoGate:
-              dispatch_gate_mode(GateModeTag<GateMode::NoGate>{});
-              break;
-            case GateMode::Gate2D:
-              dispatch_gate_mode(GateModeTag<GateMode::Gate2D>{});
-              break;
-            case GateMode::GateB1N:
-              dispatch_gate_mode(GateModeTag<GateMode::GateB1N>{});
-              break;
-            case GateMode::GateBF1N:
-              dispatch_gate_mode(GateModeTag<GateMode::GateBF1N>{});
-              break;
-          }
+  // Dispatch with IndexMode for scale, shift, and gate
+  auto dispatch = [&](auto scale_mode_tag, auto shift_mode_tag, auto gate_mode_tag) {
+    auto dispatch_dtype = [&](auto dtype_tag) {
+      auto dispatch_ipt = [&](auto ipt_tag) {
+        auto dispatch_norm = [&](auto norm_tag) {
+          using T = typename decltype(dtype_tag)::T;
+          LaunchKernel(grid, block, x.device())(
+              norm_fused_res_gate_scale_shift_kernel<
+                  T,
+                  decltype(ipt_tag)::value,
+                  decltype(norm_tag)::value,
+                  decltype(scale_mode_tag)::value,
+                  decltype(shift_mode_tag)::value,
+                  decltype(gate_mode_tag)::value>,
+              (T*)y.data_ptr(),
+              (T*)residual_out.data_ptr(),
+              (const T*)x.data_ptr(),
+              (const T*)residual.data_ptr(),
+              (const T*)gamma_ptr,
+              (const T*)beta_ptr,
+              (const T*)scale.data_ptr(),
+              (const T*)shift.data_ptr(),
+              (const T*)gate_ptr,
+              (int)M,
+              (int)N,
+              F,
+              L,
+              affine,
+              eps);
         };
 
-        if (norm_type == 0) {
-          dispatch_norm_type(NormTag<NormType::LayerNorm>{});
+        if (norm_type == NormType::LayerNorm) {
+          dispatch_norm(NormTag<NormType::LayerNorm>{});
         } else {
-          dispatch_norm_type(NormTag<NormType::RMSNorm>{});
+          dispatch_norm(NormTag<NormType::RMSNorm>{});
         }
       };
 
       if (N <= 4096) {
-        dispatch_item_per_thread(ItemPerThreadTag<1>{});
+        dispatch_ipt(ItemPerThreadTag<1>{});
       } else {
-        dispatch_item_per_thread(ItemPerThreadTag<8>{});
+        dispatch_ipt(ItemPerThreadTag<8>{});
       }
     };
 
@@ -1141,102 +827,58 @@ static void norm_fused_res_gate_scale_shift_launch_with_residual(
     }
   };
 
-  if (use_2d || scalar_both) {
-    const int rows_per_b = (gate_mode == GateMode::GateB1N) ? (int)(M / gate_opt.value().size(0)) : 0;
-    if (scalar_both) {
-      RuntimeCheck(
-          gate_mode != GateMode::GateBF1N,
-          "When skipping with scalar scale/shift, 4D gate is not supported. Provide 2D/3D gate or 4D scale/shift.");
+  // Dispatch based on IndexMode combinations
+  auto dispatch_gate = [&](auto scale_mode_tag, auto shift_mode_tag) {
+    switch (gate_mode_idx) {
+      case IndexMode::Scalar:
+        dispatch(scale_mode_tag, shift_mode_tag, IndexModeTag<IndexMode::Scalar>{});
+        break;
+      case IndexMode::Broadcast1N:
+        dispatch(scale_mode_tag, shift_mode_tag, IndexModeTag<IndexMode::Broadcast1N>{});
+        break;
+      case IndexMode::FullMN:
+        dispatch(scale_mode_tag, shift_mode_tag, IndexModeTag<IndexMode::FullMN>{});
+        break;
+      case IndexMode::BroadcastB1N:
+        dispatch(scale_mode_tag, shift_mode_tag, IndexModeTag<IndexMode::BroadcastB1N>{});
+        break;
+      case IndexMode::FullBF1N:
+        dispatch(scale_mode_tag, shift_mode_tag, IndexModeTag<IndexMode::FullBF1N>{});
+        break;
     }
-
-    auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag, auto gate_mode_tag) {
-      using T = typename decltype(dtype_tag)::T;
-      using IPT = decltype(ipt_tag);
-      using NT = decltype(norm_tag);
-      using GM = decltype(gate_mode_tag);
-      if (scalar_both) {
-        LaunchKernel(grid, block, x.device())(
-            norm_e4_fused_res_gate_scale_shift_2d<T, IPT::value, NT::value, true, GM::value>,
-            (T*)y.data_ptr(),
-            (T*)residual_out.data_ptr(),
-            (const T*)x.data_ptr(),
-            (const T*)residual.data_ptr(),
-            (const T*)gamma_ptr,
-            (const T*)beta_ptr,
-            (const T*)scale.data_ptr(),
-            (const T*)shift.data_ptr(),
-            (gate_mode == GateMode::Gate2D) ? (const T*)gate_opt.value().data_ptr() : nullptr,
-            (gate_mode == GateMode::GateB1N) ? (const T*)gate_opt.value().data_ptr() : nullptr,
-            (int)M,
-            (int)N,
-            rows_per_b,
-            affine,
-            is_scale_c_1,
-            is_shift_c_1,
-            is_gate_c_1,
-            eps);
-      } else {
-        LaunchKernel(grid, block, x.device())(
-            norm_e4_fused_res_gate_scale_shift_2d<T, IPT::value, NT::value, false, GM::value>,
-            (T*)y.data_ptr(),
-            (T*)residual_out.data_ptr(),
-            (const T*)x.data_ptr(),
-            (const T*)residual.data_ptr(),
-            (const T*)gamma_ptr,
-            (const T*)beta_ptr,
-            (const T*)scale.data_ptr(),
-            (const T*)shift.data_ptr(),
-            (gate_mode == GateMode::Gate2D) ? (const T*)gate_opt.value().data_ptr() : nullptr,
-            (gate_mode == GateMode::GateB1N) ? (const T*)gate_opt.value().data_ptr() : nullptr,
-            (int)M,
-            (int)N,
-            rows_per_b,
-            affine,
-            is_scale_c_1,
-            is_shift_c_1,
-            is_gate_c_1,
-            eps);
-      }
-    };
-
-    dispatch(launch_kernel);
-    return;
-  }
-
-  // 4D path with residual_out
-  const int64_t B = scale.size(0);
-  const int64_t F = scale.size(1);
-  const int frame_seqlen = (int)(M / (B * F));
-  RuntimeCheck(
-      gate_mode == GateMode::NoGate || gate_mode == GateMode::GateBF1N,
-      "When scale/shift are 4D, gate must be none or 4D [B,F,1,N]");
-
-  auto launch_kernel = [&](auto dtype_tag, auto ipt_tag, auto norm_tag, auto gate_mode_tag) {
-    using T = typename decltype(dtype_tag)::T;
-    using IPT = decltype(ipt_tag);
-    using NT = decltype(norm_tag);
-    using GM = decltype(gate_mode_tag);
-    LaunchKernel(grid, block, x.device())(
-        norm_e4_fused_res_gate_scale_shift_4d<T, IPT::value, NT::value, GM::value>,
-        (T*)y.data_ptr(),
-        (T*)residual_out.data_ptr(),
-        (const T*)x.data_ptr(),
-        (const T*)residual.data_ptr(),
-        (const T*)gamma_ptr,
-        (const T*)beta_ptr,
-        (const T*)scale.data_ptr(),
-        (const T*)shift.data_ptr(),
-        (gate_mode == GateMode::GateBF1N) ? (const T*)gate_opt.value().data_ptr() : nullptr,
-        (int)M,
-        (int)N,
-        (int)B,
-        (int)F,
-        frame_seqlen,
-        affine,
-        eps);
   };
 
-  dispatch(launch_kernel);
+  auto dispatch_shift = [&](auto scale_mode_tag) {
+    switch (shift_mode) {
+      case IndexMode::Scalar:
+        dispatch_gate(scale_mode_tag, IndexModeTag<IndexMode::Scalar>{});
+        break;
+      case IndexMode::Broadcast1N:
+        dispatch_gate(scale_mode_tag, IndexModeTag<IndexMode::Broadcast1N>{});
+        break;
+      case IndexMode::FullMN:
+        dispatch_gate(scale_mode_tag, IndexModeTag<IndexMode::FullMN>{});
+        break;
+      case IndexMode::FullBF1N:
+        dispatch_gate(scale_mode_tag, IndexModeTag<IndexMode::FullBF1N>{});
+        break;
+    }
+  };
+
+  switch (scale_mode) {
+    case IndexMode::Scalar:
+      dispatch_shift(IndexModeTag<IndexMode::Scalar>{});
+      break;
+    case IndexMode::Broadcast1N:
+      dispatch_shift(IndexModeTag<IndexMode::Broadcast1N>{});
+      break;
+    case IndexMode::FullMN:
+      dispatch_shift(IndexModeTag<IndexMode::FullMN>{});
+      break;
+    case IndexMode::FullBF1N:
+      dispatch_shift(IndexModeTag<IndexMode::FullBF1N>{});
+      break;
+  }
 }
 
 template <int norm_type>
@@ -1253,13 +895,11 @@ void fused_scale_residual_norm_scale_shift(
     double eps) {
   using namespace host;
 
-  SymbolicSize M_ = {"M"};
   SymbolicSize N_ = {"N"};
-  SymbolicDevice device_;
-  TensorMatcher({M_, N_})  // 2D tensor, must be contiguous
+  TensorMatcher({-1, N_})  // 2D tensor, must be contiguous
       .with_dtype<float, half, nv_bfloat16>()
       .with_strides({N_, 1})
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLCUDA>()
       .verify(residual)
       .verify(x)
       .verify(y)
@@ -1314,14 +954,14 @@ void fused_scale_residual_norm_scale_shift(
     const auto& gamma = gamma_opt.value();
     TensorMatcher({N_})  // 1D tensor, must be contiguous
         .with_dtype<float, half, nv_bfloat16>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLCUDA>()
         .verify(gamma);
     RuntimeCheck(x.dtype() == gamma.dtype(), "x, gamma must have same dtype");
     if (beta_opt.has_value()) {
       const auto& beta = beta_opt.value();
       TensorMatcher({N_})  // 1D tensor, must be contiguous
           .with_dtype<float, half, nv_bfloat16>()
-          .with_device<kDLCUDA>(device_)
+          .with_device<kDLCUDA>()
           .verify(beta);
       RuntimeCheck(x.dtype() == beta.dtype(), "x, beta must have same dtype");
     }
