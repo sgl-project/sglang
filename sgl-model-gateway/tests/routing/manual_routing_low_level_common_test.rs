@@ -2,33 +2,16 @@
 //!
 //! These tests verify the core policy behavior (select_worker_impl) across both backends.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use smg::{
     config::ManualAssignmentMode,
-    core::{BasicWorkerBuilder, Worker, WorkerType},
     policies::{LoadBalancingPolicy, ManualConfig, ManualPolicy, SelectWorkerInfo},
 };
 
-use crate::common::redis_test_server::get_shared_server;
-
-fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
-    urls.iter()
-        .map(|url| {
-            Arc::new(
-                BasicWorkerBuilder::new(*url)
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ) as Arc<dyn Worker>
-        })
-        .collect()
-}
-
-fn headers_with_routing_key(key: &str) -> http::HeaderMap {
-    let mut headers = http::HeaderMap::new();
-    headers.insert("x-smg-routing-key", key.parse().unwrap());
-    headers
-}
+use crate::common::manual_test_helpers::{
+    create_workers, get_redis_config, headers_with_routing_key,
+};
 
 fn create_policy(redis_url: Option<String>, redis_key_prefix: Option<String>) -> ManualPolicy {
     ManualPolicy::with_config(ManualConfig {
@@ -36,15 +19,6 @@ fn create_policy(redis_url: Option<String>, redis_key_prefix: Option<String>) ->
         redis_key_prefix,
         ..Default::default()
     })
-}
-
-fn get_redis_config(test_name: &str) -> (Option<String>, Option<String>) {
-    let server = get_shared_server();
-    let random_id: u64 = rand::random();
-    (
-        Some(server.url().to_string()),
-        Some(format!("test:{}:{}:", test_name, random_id)),
-    )
 }
 
 macro_rules! all_backend_test {
