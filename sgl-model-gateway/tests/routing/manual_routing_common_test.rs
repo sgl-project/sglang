@@ -22,7 +22,7 @@ const ROUTING_KEY_HEADER: &str = "X-SMG-Routing-Key";
 /// Get Redis URL for tests (None for local backend)
 fn get_redis_url_for_test(use_redis: bool) -> Option<String> {
     if use_redis {
-        Some(get_shared_server().url())
+        Some(get_shared_server().url().to_string())
     } else {
         None
     }

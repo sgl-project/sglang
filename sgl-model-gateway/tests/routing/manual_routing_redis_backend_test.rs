@@ -240,7 +240,7 @@ async fn test_redis_concurrent_same_key() {
     let workers = Arc::new(workers);
 
     let mut handles = Vec::new();
-    for i in 0..10 {
+    for _ in 0..10 {
         let redis_url = server.url().to_string();
         let workers_clone = Arc::clone(&workers);
         let handle = tokio::spawn(async move {
