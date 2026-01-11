@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use tracing::warn;
+use tracing::{info, warn};
 
 static SHARED_SERVER: OnceLock<RedisTestServer> = OnceLock::new();
 
@@ -51,6 +51,7 @@ impl RedisTestServer {
             }
         }
 
+        info!("starting redis server... cmd={cmd:?}");
         let process = cmd.spawn().map_err(|e| {
             format!(
                 "Failed to start redis-server: {}. Is redis-server installed?",
