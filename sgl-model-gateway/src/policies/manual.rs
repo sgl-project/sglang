@@ -156,7 +156,7 @@ impl ManualPolicy {
     }
 
     /// Iterate over all stored candidate URLs. Used for testing.
-    pub async fn iter_urls(&self) -> Vec<Vec<String>> {
+    pub async fn iter_urls(&self) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
         self.backend.iter_urls().await
     }
 }
@@ -244,9 +244,9 @@ impl Backend {
         }
     }
 
-    async fn iter_urls(&self) -> Vec<Vec<String>> {
+    async fn iter_urls(&self) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
         match self {
-            Backend::Local(b) => b.iter_urls(),
+            Backend::Local(b) => Ok(b.iter_urls()),
             Backend::Redis(b) => b.iter_urls().await,
         }
     }
@@ -518,29 +518,18 @@ impl RedisBackend {
         }
     }
 
-    async fn iter_urls(&self) -> Vec<Vec<String>> {
-        use redis::AsyncCommands;
-
-        let mut conn = match self.pool.get().await {
-            Ok(x) => x,
-            Err(_) => return vec![],
-        };
-
+    async fn iter_urls(&self) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.pool.get().await?;
         let pattern = format!("{}*", self.key_prefix);
-        let keys: Vec<String> = match conn.keys(&pattern).await {
-            Ok(x) => x,
-            Err(_) => return vec![],
-        };
+        let keys: Vec<String> = conn.keys(&pattern).await?;
 
         let mut result = Vec::new();
-        for key in keys {
-            let value: Option<String> = conn.get(&key).await.unwrap_or(None);
-            if let Some(data) = value {
-                let candidates = CandidateWorkerUrls::deserialize(&data);
-                result.push(candidates.urls().to_vec());
+        for key in &keys {
+            if let Some(data) = conn.get::<_, Option<String>>(key).await? {
+                result.push(CandidateWorkerUrls::deserialize(&data).urls().to_vec());
             }
         }
-        result
+        Ok(result)
     }
 }
 

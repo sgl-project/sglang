@@ -335,7 +335,7 @@ async fn test_min_group_distributes_evenly_impl(
         assert_eq!(load, 3, "Each worker should have exactly 3 routing keys");
     }
 
-    let all_urls: Vec<Vec<String>> = policy.iter_urls().await;
+    let all_urls: Vec<Vec<String>> = policy.iter_urls().await.unwrap();
     assert_eq!(all_urls.len(), 9, "Should have 9 routing keys stored");
 
     let distribution: HashMap<String, usize> = all_urls
