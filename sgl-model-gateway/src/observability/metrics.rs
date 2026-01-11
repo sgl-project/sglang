@@ -897,11 +897,10 @@ impl Metrics {
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
     }
 
-    /// Record manual policy Redis operation failure
-    pub fn record_manual_policy_redis_error(operation: &'static str) {
+    pub fn record_manual_policy_attempt_error(branch: &'static str) {
         counter!(
-            "smg_manual_policy_redis_error_total",
-            "operation" => operation
+            "smg_manual_policy_attempt_error_total",
+            "branch" => branch
         )
         .increment(1);
     }
