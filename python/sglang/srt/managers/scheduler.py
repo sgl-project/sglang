@@ -1537,7 +1537,9 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        self.grammar_manager.process_req_with_grammar(req)
+        added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
+        if not added_to_grammar_queue:
+            self._add_request_to_queue(req)
 
     def handle_batch_generate_request(
         self,
@@ -1836,7 +1838,9 @@ class Scheduler(
     ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.grammar_queue:
-            self.grammar_manager.move_ready_grammar_requests()
+            ready_grammar_requests = self.grammar_manager.move_ready_grammar_requests()
+            for req in ready_grammar_requests:
+                self._add_request_to_queue(req)
 
         if self.try_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.

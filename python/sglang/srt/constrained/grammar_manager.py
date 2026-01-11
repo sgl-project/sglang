@@ -34,7 +34,7 @@ class GrammarManager:
         else:
             self.grammar_backend = None
 
-    def process_req_with_grammar(self, req: Req):
+    def process_req_with_grammar(self, req: Req) -> bool:
         # Init grammar cache for this request
         add_to_grammar_queue = False
         if (
@@ -71,10 +71,10 @@ class GrammarManager:
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
-        else:
-            self.scheduler._add_request_to_queue(req)
 
-    def move_ready_grammar_requests(self):
+        return add_to_grammar_queue
+
+    def move_ready_grammar_requests(self) -> List[Req]:
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
 
         num_ready_reqs = 0
@@ -137,6 +137,7 @@ class GrammarManager:
 
         num_ready_reqs = num_ready_reqs_max + num_timeout_reqs_max
 
-        for req in self.grammar_queue[:num_ready_reqs]:
-            self.scheduler._add_request_to_queue(req)
+        ready_grammar_reqs = self.grammar_queue[:num_ready_reqs]
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
+
+        return ready_grammar_reqs
