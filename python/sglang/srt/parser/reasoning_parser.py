@@ -204,7 +204,6 @@ class GptOssDetector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
         )
         self.parser = HarmonyParser()
-        self._accumulated_reasoning = []  # Track accumulated reasoning across chunks
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         events = self.parser.parse(text)
@@ -223,9 +222,6 @@ class GptOssDetector(BaseReasoningFormatDetector):
                 normal_parts.append(e.raw_text if e.raw_text else e.content)
         normal_text = "".join(normal_parts)
         # Tool call events preserve raw text with structural markers
-
-        # Reset accumulated reasoning for next request
-        self._accumulated_reasoning = []
 
         return StreamingParseResult(
             normal_text=normal_text,
@@ -252,18 +248,9 @@ class GptOssDetector(BaseReasoningFormatDetector):
                 normal_parts.append(e.raw_text if e.raw_text else e.content)
         normal_text = "".join(normal_parts)
 
-        # Accumulate reasoning text across chunks
-        if reasoning_text:
-            self._accumulated_reasoning.append(reasoning_text)
-
-        # Return accumulated reasoning and reset if we just finished
-        result_reasoning = "".join(self._accumulated_reasoning)
-        if "<|end|>" in new_text:
-            self._accumulated_reasoning = []  # Reset after <|end|>
-
         return StreamingParseResult(
             normal_text=normal_text,
-            reasoning_text=result_reasoning,
+            reasoning_text=reasoning_text,
         )
 
 

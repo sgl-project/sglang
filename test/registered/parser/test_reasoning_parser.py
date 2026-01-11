@@ -682,8 +682,9 @@ class TestGptOssDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "")
 
         result = self.detector.parse_streaming_increment("<|end|>")
-        # End token flushes the reasoning content
-        self.assertIn("Let me think", result.reasoning_text)
+        # End token flushes the reasoning content, but if it was already emitted, this should be empty
+        # Content "Let me think" was emitted in previous chunk
+        self.assertEqual(result.reasoning_text, "")
 
         result = self.detector.parse_streaming_increment("Answer: 42")
         self.assertEqual(result.normal_text, "Answer: 42")
