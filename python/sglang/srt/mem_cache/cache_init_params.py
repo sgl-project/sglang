@@ -22,6 +22,10 @@ class CacheInitParams:
     eviction_policy: str = "lru"
     disable_finished_insert: bool = False
 
+    # Spectral eviction parameters (for --radix-eviction-policy spectral)
+    spectral_retention_ratio: float = 0.3  # Fraction of tokens to keep (0.3 = 30%)
+    spectral_weight: float = 0.7  # Weight of spectral vs LRU score (0.7 = 70% spectral)
+
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
 

@@ -44,3 +44,17 @@ class PriorityStrategy(EvictionStrategy):
     def get_priority(self, node: "TreeNode") -> Tuple[int, float]:
         # Return (priority, last_access_time) so lower priority nodes are evicted first
         return (node.priority, node.last_access_time)
+
+
+# Spectral eviction is imported lazily to avoid circular imports
+# and sklearn dependency at module load time
+_spectral_strategy_class = None
+
+
+def get_spectral_strategy_class():
+    """Lazily import SpectralEvictionStrategy to avoid circular imports."""
+    global _spectral_strategy_class
+    if _spectral_strategy_class is None:
+        from sglang.srt.mem_cache.spectral_eviction import SpectralEvictionStrategy
+        _spectral_strategy_class = SpectralEvictionStrategy
+    return _spectral_strategy_class
