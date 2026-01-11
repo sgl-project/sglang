@@ -333,7 +333,6 @@ class SamplingParams:
 
         if not server_args.comfyui_mode:
             self._set_output_file_name()
-            self.log(server_args=server_args)
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
