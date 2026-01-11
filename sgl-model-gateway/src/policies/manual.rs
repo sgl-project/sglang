@@ -362,7 +362,7 @@ impl RedisBackend {
         workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
         assignment_mode: ManualAssignmentMode,
-    ) -> (usize, ExecutionBranch) {
+    ) -> (Option<usize>, ExecutionBranch) {
         use crate::core::retry::RetryError;
 
         let key = format!("{}{}", REDIS_KEY_PREFIX, routing_id);
@@ -389,7 +389,7 @@ impl RedisBackend {
             Ok((idx, branch)) => (idx, branch),
             Err(RetryError::MaxRetriesExceeded) => {
                 warn!("Max retries exceeded for routing_id={}", routing_id);
-                (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisBackendMaxRetries)
+                (None, ExecutionBranch::RedisBackendMaxRetries)
             }
         }
     }
