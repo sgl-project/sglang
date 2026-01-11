@@ -274,6 +274,10 @@ impl HarmonyPreparationStage {
                 let tag = Self::build_tool_call_structural_tag(tools, Some(&function.name))?;
                 Ok(Some(("structural_tag".to_string(), tag)))
             }
+            ToolChoice::Value(ToolChoiceValue::Auto) => {
+                let tag = Self::build_tool_call_structural_tag(tools, None)?;
+                Ok(Some(("structural_tag".to_string(), tag)))
+            }
             ToolChoice::Value(ToolChoiceValue::Required) => {
                 let tag = Self::build_tool_call_structural_tag(tools, None)?;
                 Ok(Some(("structural_tag".to_string(), tag)))

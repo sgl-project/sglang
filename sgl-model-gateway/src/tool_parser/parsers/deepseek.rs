@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::{
     protocols::common::Tool,
@@ -324,5 +324,58 @@ impl ToolParser for DeepSeekParser {
         self.current_tool_id = -1;
         self.current_tool_name_sent = false;
         self.streamed_args_for_tool.clear();
+    }
+
+    fn get_format_info(&self, tool_name: &str) -> (String, String, String) {
+        // Not used for structural tag (overridden), but needed for parsing
+        let begin = format!(r#"{{"name":"{}", "arguments":"#, tool_name);
+        let end = "\"}".to_string();
+        let trigger = "<｜tool▁calls▁begin｜>".to_string();
+        (begin, end, trigger)
+    }
+
+    fn build_structural_tag(
+        &self,
+        tools: &[Tool],
+        at_least_one: bool,
+        stop_after_first: bool,
+    ) -> Result<String, String> {
+        let mut tool_tags = Vec::new();
+
+        for tool in tools {
+            let schema = tool.function.parameters.clone();
+
+            tool_tags.push(json!({
+                "format": "tag",
+                "begin": "<｜tool▁call▁begin｜>\\n```jsonc\\n{",
+                "content": {
+                    "format": "json_schema",
+                    "schema": schema
+                },
+                "end": "}\\n```\\n<｜tool▁call▁end｜>"
+            }));
+        }
+
+        let structural_tag = json!({
+            "format": "triggered_tags",
+            "triggers": ["<｜tool▁calls▁begin｜>"],
+            "tags": [{
+                "format": "tag",
+                "begin": "<｜tool▁calls▁begin｜>\\n",
+                "content": {
+                    "format": "tags_with_separator",
+                    "tags": tool_tags,
+                    "separator": "\\n",
+                    "at_least_one": at_least_one,
+                    "stop_after_first": stop_after_first
+                },
+                "end": "\\n<｜tool▁calls▁end｜>"
+            }],
+            "at_least_one": false,
+            "stop_after_first": false
+        });
+
+        serde_json::to_string(&structural_tag)
+            .map_err(|e| format!("Failed to serialize structural tag: {}", e))
     }
 }

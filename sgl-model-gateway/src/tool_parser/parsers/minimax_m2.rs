@@ -546,4 +546,11 @@ impl ToolParser for MinimaxM2Parser {
         self.function_name_sent = false;
         self.waiting_for_tool_call_end = false;
     }
+
+    fn get_format_info(&self, tool_name: &str) -> (String, String, String) {
+        let begin = format!(r#"{{"name":"{}", "arguments":"#, tool_name);
+        let end = "\"}".to_string();
+        let trigger = "<|tool_calls_section_begin|>".to_string();
+        (begin, end, trigger)
+    }
 }
