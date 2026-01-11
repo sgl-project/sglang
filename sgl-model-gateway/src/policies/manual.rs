@@ -200,10 +200,11 @@ impl Backend {
             let backend = RedisBackend::new(redis_url, config.max_idle_secs, key_prefix)
                 .expect("redis_url is set but failed to connect to Redis");
             info!("ManualPolicy using Redis backend: {}", redis_url);
-            return Backend::Redis(backend);
+            Backend::Redis(backend)
+        } else {
+            info!("ManualPolicy using local DashMap backend");
+            Backend::Local(LocalBackend::new(config))
         }
-        info!("ManualPolicy using local DashMap backend");
-        Backend::Local(LocalBackend::new(config))
     }
 
     async fn select_by_routing_id(
