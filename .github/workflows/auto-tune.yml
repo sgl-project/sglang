@@ -131,7 +131,6 @@ jobs:
         with:
           pattern: config-*
           path: ./downloaded_configs/
-          merge-multiple: true
 
       - name: Download existing artifacts from previous runs
         env:
@@ -139,9 +138,9 @@ jobs:
         run: |
           mkdir -p ./downloaded_configs/
 
-          # Get all non-expired config-*-group* artifacts
+          # Get all non-expired config-* artifacts, sorted by created_at (oldest first so newest wins on overwrite)
           gh api repos/${{ github.repository }}/actions/artifacts \
-            --jq '.artifacts[] | select(.name | startswith("config-")) | select(.expired == false) | "\(.id) \(.name)"' \
+            --jq '.artifacts | sort_by(.created_at) | .[] | select(.name | startswith("config-")) | select(.expired == false) | "\(.id) \(.name)"' \
             2>/dev/null | while read -r id name; do
             if [ -z "$id" ]; then
               continue
@@ -149,7 +148,7 @@ jobs:
 
             echo "Downloading artifact: $name (id: $id)"
             gh api repos/${{ github.repository }}/actions/artifacts/$id/zip > artifact.zip 2>/dev/null || continue
-            unzip -o artifact.zip -d ./downloaded_configs/ 2>/dev/null || true
+            unzip -o artifact.zip -d "./downloaded_configs/$name/" 2>/dev/null || true
             rm -f artifact.zip
           done
 
@@ -157,14 +156,20 @@ jobs:
           find ./downloaded_configs -name "*.json" 2>/dev/null | head -20 || echo "No configs found"
 
       - name: Merge configs
-        run: python3 scripts/merge_tuned_configs.py --input-dir ./downloaded_configs/ --output-dir ${{ env.CONFIG_DIR }}
+        run: |
+          mkdir -p ./merged_output/
+          python3 scripts/merge_tuned_configs.py --input-dir ./downloaded_configs/ --output-dir ./merged_output/
 
       - name: Upload merged configs
         uses: actions/upload-artifact@v4
         with:
           name: merged-configs-all
-          path: ./downloaded_configs/**
+          path: ./merged_output/**
           if-no-files-found: warn
+
+      - name: Copy merged configs to repo location for PR
+        if: inputs.create_pr == 'true'
+        run: cp -r ./merged_output/* ${{ env.CONFIG_DIR }}/
 
       - name: Create PR with tuned configs
         if: inputs.create_pr == 'true'
