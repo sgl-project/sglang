@@ -56,7 +56,6 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
@@ -67,8 +66,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -193,13 +190,7 @@ if _use_aiter_gfx95:
     )
 
 if _is_cuda:
-    from sgl_kernel import (
-        awq_dequantize,
-        bmm_fp8,
-        concat_mla_k,
-        dsv3_fused_a_gemm,
-        dsv3_router_gemm,
-    )
+    from sgl_kernel import awq_dequantize, bmm_fp8, dsv3_fused_a_gemm, dsv3_router_gemm
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -2190,88 +2181,6 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
             )
-
-    def _get_mla_kv_buffer(
-        self,
-        kv_indices: torch.Tensor,
-        dst_dtype: torch.dtype,
-        forward_batch: ForwardBatch,
-    ):
-        if _is_cuda or _use_aiter_gfx95:
-            kv_a, k_pe = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
-                self.attn_mha, kv_indices, dst_dtype
-            )
-            kv_a = kv_a.squeeze(1)
-        else:
-            latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
-                self.attn_mha.layer_id
-            )
-            latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
-
-            kv_a, k_pe = latent_cache.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
-            kv_a = kv_a.squeeze(1).contiguous()
-        return kv_a, k_pe
-
-    def _get_mla_kv_buffer_from_fp8(
-        self,
-        forward_batch: ForwardBatch,
-    ):
-        """
-        Dequantize FP8 KV cache to BF16 for MLA attention (NSA-specific format).
-
-        Returns: (kv_a, k_pe) both in BF16
-        """
-        backend = forward_batch.attn_backend
-        if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
-            backend = backend.primary
-        kv_indices = backend.forward_metadata.page_table_1_flattened
-        assert (
-            kv_indices is not None
-        ), "page_table_1_flattened should have been generated for FP8 MHA path"
-
-        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_key_buffer(
-            self.attn_mha.layer_id
-        )
-
-        kv_latent_bf16 = dequantize_k_cache_paged(kv_cache_fp8, kv_indices)
-
-        kv_a = kv_latent_bf16[:, :, : self.kv_lora_rank].squeeze(1).contiguous()
-        k_pe = kv_latent_bf16[:, :, self.kv_lora_rank :]
-
-        return kv_a, k_pe
-
-    def _concat_and_cast_mha_k(self, k_nope, k_pe, forward_batch):
-        # Temporary for DeepSeek V3/R1 only, but can generalize if needed
-        k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
-        if (
-            _is_cuda
-            and (self.num_local_heads == 128)
-            and (self.qk_nope_head_dim == 128)
-            and (self.qk_rope_head_dim == 64)
-        ):
-            k = k_nope.new_empty(*k_shape)
-            concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
-        elif _is_cuda:
-            # fa3 mha support fp8 inputs
-            if (
-                self.current_attention_backend == "fa3"
-                and self.kv_cache_dtype != "auto"
-            ):
-                attn_dtype = forward_batch.token_to_kv_pool.dtype
-            else:
-                attn_dtype = k_nope.dtype
-            k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
-            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
-        elif _is_hip and self.current_attention_backend == "aiter":
-            k = k_nope.new_empty(*k_shape)
-            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
-        else:
-            k = k_nope.new_empty(*k_shape)
-            k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_pe
-        return k
 
     @staticmethod
     def _get_q_b_proj_quant_config(quant_config):

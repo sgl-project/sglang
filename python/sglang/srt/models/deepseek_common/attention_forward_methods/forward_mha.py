@@ -1,15 +1,18 @@
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter_gfx95
+from sglang.srt.models.deepseek_common.utils import _is_cuda, _is_hip, _use_aiter_gfx95
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator
 
 if _is_cuda:
-    from sgl_kernel import merge_state_v2
+    from sgl_kernel import concat_mla_k, merge_state_v2
 
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -152,7 +155,13 @@ class DeepseekMHAForwardMixin:
         k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
 
-    def forward_normal_core(self: DeepseekV2AttentionMLA, q, k, v, forward_batch):
+    def forward_normal_core(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
@@ -177,8 +186,12 @@ class DeepseekMHAForwardMixin:
         )
 
     def forward_normal_chunked_kv_core(
-        self: DeepseekV2AttentionMLA, q, k, v, forward_batch
-    ):
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
         has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
             forward_batch.extend_prefix_lens_cpu
         )
@@ -220,7 +233,13 @@ class DeepseekMHAForwardMixin:
             positions, hidden_states, forward_batch, zero_allocator
         )
 
-    def forward_normal_one_shot_core(self, q, k, v, forward_batch):
+    def forward_normal_one_shot_core(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
@@ -276,3 +295,85 @@ class DeepseekMHAForwardMixin:
             del kv, k, v, output, lse, tmp_output, tmp_lse
 
         return accum_output
+
+    def _get_mla_kv_buffer(
+        self,
+        kv_indices: torch.Tensor,
+        dst_dtype: torch.dtype,
+        forward_batch: ForwardBatch,
+    ):
+        if _is_cuda or _use_aiter_gfx95:
+            kv_a, k_pe = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
+                self.attn_mha, kv_indices, dst_dtype
+            )
+            kv_a = kv_a.squeeze(1)
+        else:
+            latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
+                self.attn_mha.layer_id
+            )
+            latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
+
+            kv_a, k_pe = latent_cache.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            kv_a = kv_a.squeeze(1).contiguous()
+        return kv_a, k_pe
+
+    def _get_mla_kv_buffer_from_fp8(
+        self,
+        forward_batch: ForwardBatch,
+    ):
+        """
+        Dequantize FP8 KV cache to BF16 for MLA attention (NSA-specific format).
+
+        Returns: (kv_a, k_pe) both in BF16
+        """
+        backend = forward_batch.attn_backend
+        if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
+            backend = backend.primary
+        kv_indices = backend.forward_metadata.page_table_1_flattened
+        assert (
+            kv_indices is not None
+        ), "page_table_1_flattened should have been generated for FP8 MHA path"
+
+        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_key_buffer(
+            self.attn_mha.layer_id
+        )
+
+        kv_latent_bf16 = dequantize_k_cache_paged(kv_cache_fp8, kv_indices)
+
+        kv_a = kv_latent_bf16[:, :, : self.kv_lora_rank].squeeze(1).contiguous()
+        k_pe = kv_latent_bf16[:, :, self.kv_lora_rank :]
+
+        return kv_a, k_pe
+
+    def _concat_and_cast_mha_k(self, k_nope, k_pe, forward_batch):
+        # Temporary for DeepSeek V3/R1 only, but can generalize if needed
+        k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
+        if (
+            _is_cuda
+            and (self.num_local_heads == 128)
+            and (self.qk_nope_head_dim == 128)
+            and (self.qk_rope_head_dim == 64)
+        ):
+            k = k_nope.new_empty(*k_shape)
+            concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
+        elif _is_cuda:
+            # fa3 mha support fp8 inputs
+            if (
+                self.current_attention_backend == "fa3"
+                and self.kv_cache_dtype != "auto"
+            ):
+                attn_dtype = forward_batch.token_to_kv_pool.dtype
+            else:
+                attn_dtype = k_nope.dtype
+            k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
+            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+        elif _is_hip and self.current_attention_backend == "aiter":
+            k = k_nope.new_empty(*k_shape)
+            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+        else:
+            k = k_nope.new_empty(*k_shape)
+            k[..., : self.qk_nope_head_dim] = k_nope
+            k[..., self.qk_nope_head_dim :] = k_pe
+        return k
