@@ -2452,6 +2452,11 @@ def set_cuda_arch():
         )
 
 
+def cdiv(a: int, b: int) -> int:
+    """Ceiling division."""
+    return -(a // -b)
+
+
 def next_power_of_2(n: int):
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
