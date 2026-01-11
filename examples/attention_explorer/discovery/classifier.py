@@ -66,20 +66,21 @@ FP_LAYER_STATS_END = 20
 FP_ROTATIONAL_VARIANCE = 20  # Position 20 in v2 fingerprints
 
 # Zone thresholds (updated to use rotational_variance when available)
+# RV measures RoPE de-rotation effect: Low RV = local/nearby, High RV = distant/long-range
 ZONE_THRESHOLDS = {
     'syntax_floor': {
         'local_mass_min': 0.5,
         'entropy_max': 2.5,
-        # Low rotational variance suggests position-driven attention (syntax)
+        # Low RV = local attention (nearby tokens, small RoPE angles)
         'rotational_variance_max': 0.25,
     },
     'structure_ripple': {
         'long_mass_min': 0.25,
-        # High rotational variance suggests semantic attention (reasoning)
+        # High RV = long-range attention (distant tokens, large RoPE angles)
         'rotational_variance_min': 0.35,
     },
     'semantic_bridge': {
-        # Medium rotational variance - balanced semantic/positional
+        # Medium RV = balanced local/long-range attention
         'rotational_variance_range': (0.15, 0.5),
     },
 }
@@ -392,13 +393,13 @@ class OnlineClassifier:
         sf_thresh = ZONE_THRESHOLDS['syntax_floor']
         if local_mass > sf_thresh['local_mass_min']:
             if entropy < sf_thresh['entropy_max']:
-                # If we have rotational variance, verify it's low (position-driven)
+                # If we have rotational variance, verify it's low (local attention to nearby tokens)
                 if rotational_variance is not None:
                     if rotational_variance <= sf_thresh.get('rotational_variance_max', 1.0):
-                        # Strong confidence when rotational variance confirms position-driven
+                        # Strong confidence when RV confirms local/short-range attention
                         confidence = min(1.0, local_mass * (1.0 - entropy / 4.0) * (1.0 - rotational_variance))
                         return 'syntax_floor', confidence
-                    # High rotational variance with local mass = semantic, not syntax
+                    # High RV with local mass suggests mixed pattern - fall through
                     # Fall through to check other zones
                 else:
                     # No rotational variance, use original heuristic
@@ -408,14 +409,14 @@ class OnlineClassifier:
         # Check structure_ripple (high long-range, optionally high rotational variance)
         sr_thresh = ZONE_THRESHOLDS['structure_ripple']
         if long_mass > sr_thresh['long_mass_min']:
-            # If we have rotational variance, verify it's high (semantic reasoning)
+            # If we have rotational variance, verify it's high (long-range attention)
             if rotational_variance is not None:
                 rv_min = sr_thresh.get('rotational_variance_min', 0.0)
                 if rotational_variance >= rv_min:
-                    # High confidence when rotational variance confirms semantic reasoning
+                    # High confidence when RV confirms long-range attention pattern
                     confidence = min(1.0, (long_mass + rotational_variance) / 2)
                     return 'structure_ripple', confidence
-                # Low rotational variance with long mass = structural, not semantic
+                # Low RV with long mass = unusual pattern, still classify but lower confidence
                 # Still return structure_ripple but with lower confidence
                 confidence = min(1.0, long_mass * 0.8)
                 return 'structure_ripple', confidence
