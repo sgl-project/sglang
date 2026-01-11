@@ -3,6 +3,9 @@ from types import SimpleNamespace
 
 from sglang.srt.environ import envs
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMinxin
+from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
+from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -14,7 +17,12 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDisaggregationDPAttention(PDDisaggregationServerBase):
+class TestDisaggregationDPAttention(
+    PDDisaggregationServerBase,
+    TestJSONConstrainedMixin,
+    TestEBNFConstrainedMinxin,
+    TestRegexConstrainedMixin,
+):
     PREFILL_DP_SIZE = 4
     DECODE_DP_SIZE = 4
 
