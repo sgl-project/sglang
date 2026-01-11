@@ -1,0 +1,117 @@
+################################################################################
+# IMPORTANT
+# 1. to enable a plugin, add "active = true" in the corresponding section
+# 2. the configs inside plugin.posix (i.e., use_aio, use_uring, use_posix_aio)
+#    are mutually exclusive
+################################################################################
+
+
+########################################
+# POSIX FILE SYSTEM BACKEND
+########################################
+[plugin.posix]
+# Configuration for the POSIX file-based backend.
+#
+# The supported backends include:
+# 1. AIO (`use_aio = "true"`)
+# 2. io_uring (`use_uring = "true"`)
+# 3. POSIX AIO (`use_posix_aio = "true"`)
+#
+# If not specified, NIXL will automatically detect and use available backends based on the following default priority: AIO > io_uring > POSIX AIO
+
+# Enable Linux io_uring for async I/O (recommended if supported)
+use_uring = "true"
+
+# Enable POSIX AIO (alternative async I/O mechanism)
+# use_posix_aio = "true"
+
+# Enable generic AIO
+# use_aio = "true"
+
+# Whether this plugin is eligible for selection
+active = true
+
+
+########################################
+# NVIDIA GDS (GPUDirect Storage) BACKEND
+########################################
+[plugin.gds]
+# Configuration for NVIDIA GPUDirect Storage
+# Requires compatible GPU, driver, and filesystem support
+
+# Number of requests per batch, default: 128
+batch_pool_size = 128
+
+# Maximum number of requests issued at once, default: 128
+batch_limit = 128
+
+# Maximum size of a single request (bytes), default: 16MB
+max_request_size = 16777216  # 16 MB
+
+
+########################################
+# MULTI-THREADED GDS BACKEND
+########################################
+[plugin.gds_mt]
+# Multi-threaded variant of the GDS backend
+
+# Number of worker threads, default: 4
+thread_count = 4
+
+
+########################################
+# 3FS (THIRD-PARTY FILE SYSTEM) BACKEND
+########################################
+[plugin.3fs]
+# Configuration for 3FS backend
+# Requires the 3FS library to be installed and mounted
+
+# Mount point of the 3FS filesystem
+mount_point = "/mnt/3fs"
+
+# Memory configuration mode:
+#   dram     - use DRAM
+#   dram_zc  - DRAM with zero-copy
+#   auto     - let backend decide
+mem_config = "dram"
+
+# Size of the I/O pool
+# Valid range: [2^6, 2^20]
+iopool_size = 64
+
+
+########################################
+# OBJECT STORAGE BACKEND (S3 / COMPATIBLE)
+########################################
+[plugin.obj]
+# Object storage backend (e.g., S3-compatible services)
+
+# Number of client worker threads, default: 4
+num_threads = 4
+
+# Override endpoint (useful for non-AWS S3 services)
+endpoint_override = ""
+
+# Connection scheme: http or https, default: http
+scheme = "http"
+
+# Cloud region (if applicable)
+region = ""
+
+# Request checksum behavior:
+#   required, supported
+req_checksum = "required"
+
+# Custom CA bundle path (if needed)
+ca_bundle = ""
+
+# Credentials
+access_key = ""
+secrete_key = ""
+session_token = ""
+
+# Use virtual-hosted-style addressing (true/false), default: true
+use_virtual_addressing = "true"
+
+# Default bucket name
+bucket = ""
