@@ -50,8 +50,7 @@ python -m sglang.launch_server [args] \
 
 ### Multi-node scenarios
 
-when users are trying to launch servers with multi-node settings,  `weight` R-fork will use zmq to build the communication between different nodes,
-so that the api call `get_remote_instance_transfer_engine_info` could also work for the gpus of nodes with the `node_rank > 1`.
+when users are trying to launch servers with multi-node settings, R-fork will use zmq to build the communication between different nodes, so that the api call `get_remote_instance_transfer_engine_info` could also work for the gpus of nodes with the `node_rank > 1`.
 
 Users need to add `--node-hosts` and `--inter-node-transfer-engine-info-port`.
 
