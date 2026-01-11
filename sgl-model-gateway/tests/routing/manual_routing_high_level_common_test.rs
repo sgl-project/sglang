@@ -14,20 +14,11 @@ use serde_json::json;
 use tower::ServiceExt;
 
 use crate::common::{
-    manual_routing_test_helpers::{random_prefix, RedisConfig},
-    redis_test_server::get_shared_server,
-    AppTestContext, TestRouterConfig, TestWorkerConfig,
+    manual_routing_test_helpers::get_redis_config, AppTestContext, TestRouterConfig,
+    TestWorkerConfig,
 };
 
 const ROUTING_KEY_HEADER: &str = "X-SMG-Routing-Key";
-
-fn get_redis_config(test_name: &str) -> RedisConfig {
-    let server = get_shared_server();
-    RedisConfig {
-        url: server.url().to_string(),
-        key_prefix: random_prefix(test_name),
-    }
-}
 
 macro_rules! all_backend_e2e_test {
     ($name:ident, $base_port:expr) => {
