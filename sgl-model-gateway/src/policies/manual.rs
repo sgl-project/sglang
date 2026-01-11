@@ -1023,8 +1023,8 @@ mod tests {
         use std::time::Duration;
 
         let config = ManualConfig {
-            eviction_interval_secs: 2,
-            max_idle_secs: 2,
+            eviction_interval_secs: 1,
+            max_idle_secs: 1,
             assignment_mode: ManualAssignmentMode::Random,
         };
         let policy = ManualPolicy::with_config(config);
@@ -1039,7 +1039,7 @@ mod tests {
 
         assert_eq!(policy.local_backend().unwrap().len(), 1);
 
-        std::thread::sleep(Duration::from_secs(4));
+        std::thread::sleep(Duration::from_secs(3));
 
         assert_eq!(policy.local_backend().unwrap().len(), 0);
     }

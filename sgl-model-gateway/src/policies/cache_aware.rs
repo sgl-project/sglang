@@ -418,6 +418,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         // Same request should go to same worker (cache hit)
@@ -429,6 +430,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(idx1, idx2);
 
@@ -441,6 +443,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(idx1, idx3);
     }
@@ -511,14 +514,14 @@ mod tests {
                 request_text: Some("test1"),
                 ..Default::default()
             },
-        );
+        ).await;
         policy.select_worker(
             &workers,
             &SelectWorkerInfo {
                 request_text: Some("test2"),
                 ..Default::default()
             },
-        );
+        ).await;
 
         // Remove a worker
         policy.remove_worker_by_url("http://w1:8000");
@@ -533,6 +536,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(idx, 1);
     }

@@ -5,8 +5,8 @@ use smg::{
     policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
 };
 
-#[test]
-fn test_backward_compatibility_with_empty_model_id() {
+#[tokio::test]
+async fn test_backward_compatibility_with_empty_model_id() {
     let config = CacheAwareConfig {
         cache_threshold: 0.5,
         balance_abs_threshold: 2,
@@ -46,7 +46,7 @@ fn test_backward_compatibility_with_empty_model_id() {
             request_text: Some("test request"),
             ..Default::default()
         },
-    );
+    ).await;
     assert!(selected.is_some(), "Should select a worker");
 
     // Remove workers - should work without errors
@@ -54,8 +54,8 @@ fn test_backward_compatibility_with_empty_model_id() {
     policy.remove_worker(&worker2);
 }
 
-#[test]
-fn test_mixed_model_ids() {
+#[tokio::test]
+async fn test_mixed_model_ids() {
     let config = CacheAwareConfig {
         cache_threshold: 0.5,
         balance_abs_threshold: 2,
@@ -107,12 +107,12 @@ fn test_mixed_model_ids() {
         request_text: Some("test request"),
         ..Default::default()
     };
-    let selected = policy.select_worker(&default_workers, &info);
+    let selected = policy.select_worker(&default_workers, &info).await;
     assert!(selected.is_some(), "Should select from default workers");
 
     let llama_workers: Vec<Arc<dyn Worker>> =
         vec![Arc::new(worker2.clone()), Arc::new(worker4.clone())];
-    let selected = policy.select_worker(&llama_workers, &info);
+    let selected = policy.select_worker(&llama_workers, &info).await;
     assert!(selected.is_some(), "Should select from llama-3 workers");
 
     let all_workers: Vec<Arc<dyn Worker>> = vec![
@@ -121,12 +121,12 @@ fn test_mixed_model_ids() {
         Arc::new(worker3.clone()),
         Arc::new(worker4.clone()),
     ];
-    let selected = policy.select_worker(&all_workers, &info);
+    let selected = policy.select_worker(&all_workers, &info).await;
     assert!(selected.is_some(), "Should select from all workers");
 }
 
-#[test]
-fn test_remove_worker_by_url_backward_compat() {
+#[tokio::test]
+async fn test_remove_worker_by_url_backward_compat() {
     let config = CacheAwareConfig::default();
     let policy = CacheAwarePolicy::with_config(config);
 
@@ -160,6 +160,6 @@ fn test_remove_worker_by_url_backward_compat() {
             request_text: Some("test"),
             ..Default::default()
         },
-    );
+    ).await;
     assert_eq!(selected, Some(0), "Should only have worker2 left");
 }

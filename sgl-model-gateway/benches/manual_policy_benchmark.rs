@@ -5,10 +5,7 @@ use smg::{
     core::{BasicWorkerBuilder, Worker, WorkerType},
     policies::{LoadBalancingPolicy, ManualPolicy, SelectWorkerInfo},
 };
-
-// ============================================================================
-// Test Helpers
-// ============================================================================
+use tokio::runtime::Runtime;
 
 fn create_workers(count: usize) -> Vec<Arc<dyn Worker>> {
     (0..count)
@@ -22,19 +19,19 @@ fn create_workers(count: usize) -> Vec<Arc<dyn Worker>> {
         .collect()
 }
 
-fn select_with_key(policy: &ManualPolicy, workers: &[Arc<dyn Worker>], key: &str) -> Option<usize> {
+fn select_with_key(rt: &Runtime, policy: &ManualPolicy, workers: &[Arc<dyn Worker>], key: &str) -> Option<usize> {
     let mut headers = http::HeaderMap::new();
     headers.insert("x-smg-routing-key", key.parse().unwrap());
     let info = SelectWorkerInfo {
         headers: Some(&headers),
         ..Default::default()
     };
-    policy.select_worker(workers, &info)
+    rt.block_on(policy.select_worker(workers, &info))
 }
 
-fn warmup_keys(policy: &ManualPolicy, workers: &[Arc<dyn Worker>], keys: &[String]) {
+fn warmup_keys(rt: &Runtime, policy: &ManualPolicy, workers: &[Arc<dyn Worker>], keys: &[String]) {
     for key in keys {
-        select_with_key(policy, workers, key);
+        select_with_key(rt, policy, workers, key);
     }
 }
 
@@ -42,18 +39,15 @@ fn gen_keys(count: usize, prefix: &str) -> Vec<String> {
     (0..count).map(|i| format!("{}{}", prefix, i)).collect()
 }
 
-// ============================================================================
-// Benchmarks
-// ============================================================================
-
 fn bench_fast_path_hit(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("manual_policy/fast_path");
 
     for worker_count in [4, 16, 64, 256] {
         let policy = ManualPolicy::new();
         let workers = create_workers(worker_count);
         let keys = gen_keys(1000, "user-");
-        warmup_keys(&policy, &workers, &keys);
+        warmup_keys(&rt, &policy, &workers, &keys);
 
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(
@@ -62,7 +56,7 @@ fn bench_fast_path_hit(c: &mut Criterion) {
             |b, _| {
                 let mut idx = 0;
                 b.iter(|| {
-                    let result = select_with_key(&policy, &workers, &keys[idx % keys.len()]);
+                    let result = select_with_key(&rt, &policy, &workers, &keys[idx % keys.len()]);
                     idx += 1;
                     black_box(result)
                 });
@@ -73,6 +67,7 @@ fn bench_fast_path_hit(c: &mut Criterion) {
 }
 
 fn bench_slow_path_vacant(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("manual_policy/slow_path_vacant");
 
     for worker_count in [4, 16, 64, 256] {
@@ -87,7 +82,7 @@ fn bench_slow_path_vacant(c: &mut Criterion) {
                 let mut idx = 0;
                 b.iter(|| {
                     let key = format!("new-user-{}", idx);
-                    let result = select_with_key(&policy, &workers, &key);
+                    let result = select_with_key(&rt, &policy, &workers, &key);
                     idx += 1;
                     black_box(result)
                 });
@@ -98,6 +93,7 @@ fn bench_slow_path_vacant(c: &mut Criterion) {
 }
 
 fn bench_no_routing_key(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("manual_policy/no_routing_key");
 
     for worker_count in [4, 16, 64, 256] {
@@ -110,7 +106,7 @@ fn bench_no_routing_key(c: &mut Criterion) {
             &worker_count,
             |b, _| {
                 let info = SelectWorkerInfo::default();
-                b.iter(|| black_box(policy.select_worker(&workers, &info)));
+                b.iter(|| black_box(rt.block_on(policy.select_worker(&workers, &info))));
             },
         );
     }
@@ -118,6 +114,7 @@ fn bench_no_routing_key(c: &mut Criterion) {
 }
 
 fn bench_failover(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("manual_policy/failover");
     group.sample_size(50);
 
@@ -130,12 +127,12 @@ fn bench_failover(c: &mut Criterion) {
                     || {
                         let policy = ManualPolicy::new();
                         let workers = create_workers(count);
-                        let idx = select_with_key(&policy, &workers, "failover-test").unwrap();
+                        let idx = select_with_key(&rt, &policy, &workers, "failover-test").unwrap();
                         workers[idx].set_healthy(false);
                         (policy, workers)
                     },
                     |(policy, workers)| {
-                        black_box(select_with_key(&policy, &workers, "failover-test"))
+                        black_box(select_with_key(&rt, &policy, &workers, "failover-test"))
                     },
                 );
             },
@@ -162,6 +159,7 @@ fn bench_concurrent(c: &mut Criterion) {
                             let policy = Arc::clone(&policy);
                             let workers = Arc::clone(&workers);
                             thread::spawn(move || {
+                                let rt = Runtime::new().unwrap();
                                 for i in 0..500 {
                                     let key = if i % 5 == 0 {
                                         format!("thread{}_user{}", t, i)
@@ -174,7 +172,7 @@ fn bench_concurrent(c: &mut Criterion) {
                                         headers: Some(&headers),
                                         ..Default::default()
                                     };
-                                    let _ = black_box(policy.select_worker(&workers, &info));
+                                    let _ = black_box(rt.block_on(policy.select_worker(&workers, &info)));
                                 }
                             })
                         })
@@ -191,19 +189,20 @@ fn bench_concurrent(c: &mut Criterion) {
 }
 
 fn bench_cache_size_impact(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("manual_policy/cache_size");
 
     for cache_size in [100, 1000, 10000, 100000] {
         let policy = ManualPolicy::new();
         let workers = create_workers(16);
         let keys = gen_keys(cache_size, "user-");
-        warmup_keys(&policy, &workers, &keys);
+        warmup_keys(&rt, &policy, &workers, &keys);
 
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(BenchmarkId::new("keys", cache_size), &cache_size, |b, _| {
             let mut idx = 0;
             b.iter(|| {
-                let result = select_with_key(&policy, &workers, &keys[idx % keys.len()]);
+                let result = select_with_key(&rt, &policy, &workers, &keys[idx % keys.len()]);
                 idx += 1;
                 black_box(result)
             });
@@ -218,7 +217,6 @@ fn bench_comparison_baseline(c: &mut Criterion) {
     let mut group = c.benchmark_group("manual_policy/vs_baseline");
     let workers = create_workers(16);
 
-    // Baseline: raw random selection without any policy overhead
     group.bench_function("raw_random", |b| {
         let mut rng = rand::rng();
         b.iter(|| black_box(rng.random_range(0..workers.len())));
