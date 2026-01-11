@@ -404,7 +404,7 @@ impl RedisBackend {
         workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
         assignment_mode: ManualAssignmentMode,
-    ) -> Result<(usize, ExecutionBranch), ()> {
+    ) -> Result<(Option<usize>, ExecutionBranch), ()> {
         let mut conn = self.pool.get().await.map_err(|e| {
             error!("Redis pool.get failed: {}", e);
             Metrics::record_manual_policy_redis_error("conn");
@@ -418,7 +418,7 @@ impl RedisBackend {
         if let Some(ref data) = old_data {
             let candidates = CandidateWorkerUrls::deserialize(data);
             if let Some(idx) = find_healthy_worker(candidates.urls(), workers, healthy_indices) {
-                return Ok((idx, ExecutionBranch::OccupiedHit));
+                return Ok((Some(idx), ExecutionBranch::OccupiedHit));
             }
         }
 
@@ -441,7 +441,7 @@ impl RedisBackend {
             })?;
 
         if success {
-            Ok((selected_idx, branch))
+            Ok((Some(selected_idx), branch))
         } else {
             Err(())
         }
