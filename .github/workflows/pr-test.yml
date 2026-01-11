@@ -114,8 +114,8 @@ jobs:
             echo "max_parallel=15" >> $GITHUB_OUTPUT
             echo "High priority PR detected, setting max_parallel to 15"
           else
-            echo "max_parallel=4" >> $GITHUB_OUTPUT
-            echo "Using default max_parallel of 4"
+            echo "max_parallel=3" >> $GITHUB_OUTPUT
+            echo "Using default max_parallel of 3"
           fi
 
       - name: Set B200 runner tag
@@ -595,6 +595,7 @@ jobs:
       fail-fast: false
       matrix:
         partition: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+      max-parallel: ${{ needs.check-changes.outputs.max_parallel }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
