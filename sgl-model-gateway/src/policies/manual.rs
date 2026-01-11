@@ -155,6 +155,7 @@ enum Backend {
 
 impl Backend {
     fn from_env(config: &ManualConfig) -> Self {
+        // TODO: use flag later
         if let Ok(redis_url) = std::env::var("SMG_MANUAL_REDIS_URL") {
             match RedisBackend::new(&redis_url, config.max_idle_secs) {
                 Ok(backend) => {
