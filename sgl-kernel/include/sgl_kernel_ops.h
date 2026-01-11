@@ -506,7 +506,21 @@ void tree_speculative_sampling_target_only(
     at::Tensor uniform_samples,
     at::Tensor uniform_samples_for_final_sampling,
     at::Tensor target_probs,
-    at::Tensor draft_probs,
+    double threshold_single = 1,
+    double threshold_acc = 1,
+    bool deterministic = true);
+
+void tree_speculative_sampling_target_only_rejmask(
+    at::Tensor predicts,          // mutable
+    at::Tensor accept_index,      // mutable
+    at::Tensor accept_token_num,  // mutable
+    at::Tensor candidates,
+    at::Tensor retrive_index,
+    at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling,
+    at::Tensor uniform_samples,
+    at::Tensor uniform_samples_for_final_sampling,
+    at::Tensor target_probs,
     double threshold_single = 1,
     double threshold_acc = 1,
     bool deterministic = true);
