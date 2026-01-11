@@ -606,6 +606,8 @@ impl Router {
         max_tree_size = 2usize.pow(26),
         max_idle_secs = 14400,
         assignment_mode = String::from("random"),
+        redis_url = None,
+        redis_key_prefix = None,
         max_payload_size = 512 * 1024 * 1024,
         dp_aware = false,
         api_key = None,
