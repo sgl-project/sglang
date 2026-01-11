@@ -143,9 +143,13 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import (
+    FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
+    NVFP4_CKPT_FP8_ATTN_QUANT_MODULES,
     _device_sm,
+    _get_llama_4_scaling,
     _is_cpu,
     _is_cpu_amx_available,
+    _is_cublas_ge_129,
     _is_cuda,
     _is_fp8_fnuz,
     _is_gfx95_supported,
@@ -153,6 +157,9 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_npu,
     _use_aiter,
     _use_aiter_gfx95,
+    add_forward_absorb_core_attention_backend,
+    enable_nextn_moe_bf16_cast_to_fp8,
+    yarn_get_mscale,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -224,38 +231,7 @@ elif _is_npu:
 else:
     pass
 
-_is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
-
 logger = logging.getLogger(__name__)
-
-
-# Optional quantization for DeepSeek nvfp4 checkpoint
-NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
-
-
-def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
-    return (
-        envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get()
-        and quant_config is not None
-        and quant_config.get_name() == "modelopt_fp4"
-        and get_moe_runner_backend().is_deep_gemm()
-    )
-
-
-FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
-    "fa3",
-    "nsa",
-    "flashinfer",
-    "cutlass_mla",
-    "trtllm_mla",
-    "ascend",
-]
-
-
-def add_forward_absorb_core_attention_backend(backend_name):
-    if backend_name not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-        FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append(backend_name)
-        logger.info(f"Added {backend_name} to FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.")
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1048,24 +1024,6 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
 
         state.hidden_states_mlp_output = final_hidden_states
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    import math
-
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def _get_llama_4_scaling(
-    original_max_position_embeddings: int, scaling_beta: float, positions: torch.Tensor
-) -> torch.Tensor:
-    scaling = 1 + scaling_beta * torch.log(
-        1 + torch.floor(positions / original_max_position_embeddings)
-    )
-    # Broadcast over num_heads and head_dim
-    return scaling[..., None, None]
 
 
 class DeepseekV2AttentionMLA(nn.Module):
