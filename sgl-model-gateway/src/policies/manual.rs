@@ -416,7 +416,7 @@ impl RedisBackend {
                 return (None, ExecutionBranch::RedisGetexException);
             }
         };
-        let old_candidates = old_data.as_ref().map(|x| CandidateWorkerUrls::deserialize(x));
+        let old_candidates = old_data.as_deref().map(CandidateWorkerUrls::deserialize);
 
         if let Some(ref old_candidates) = old_candidates {
             if let Some(idx) = find_healthy_worker(old_candidates.urls(), workers, healthy_indices) {
