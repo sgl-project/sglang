@@ -128,7 +128,12 @@ impl TestRouterConfig {
         assignment_mode: ManualAssignmentMode,
         redis_url: Option<String>,
     ) -> RouterConfig {
-        Self::manual_with_full_options(port, assignment_mode, redis_url, None)
+        let cfg = super::manual_routing_test_helpers::TestManualConfig {
+            redis_url,
+            redis_key_prefix: None,
+            max_idle_secs: 4 * 3600,
+        };
+        Self::manual_with_full_options(port, assignment_mode, &cfg)
     }
 
     /// Create a manual routing config with full options including redis key prefix
