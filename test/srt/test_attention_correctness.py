@@ -184,34 +184,41 @@ class TestGQABroadcastCorrectness(unittest.TestCase):
     Test that GQA (Grouped Query Attention) head broadcasting is handled correctly.
 
     In GQA, multiple query heads share the same KV head. The attention extraction
-    must correctly map query heads to their corresponding KV groups.
+    averages across all query heads before finding top-k, correctly handling the
+    GQA head mapping.
     """
 
     def setUp(self):
         """Check if we can import the required modules."""
         try:
             from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
-                decode_forward_with_topk_gqa,
+                compute_topk_attention_chunked,
             )
             self.gqa_available = True
         except ImportError:
             self.gqa_available = False
 
-    def test_gqa_head_group_mapping(self):
+    def test_gqa_head_averaging(self):
         """
-        Test that GQA correctly maps query heads to KV groups.
+        Test that GQA correctly averages attention scores across query heads.
 
-        Example: 8 query heads, 2 KV heads → groups of 4 query heads share 1 KV head.
+        The compute_topk_attention_chunked function averages scores across all
+        query heads before finding top-k positions. This test verifies that
+        the averaged output correctly reflects contributions from all heads.
         """
         if not self.gqa_available:
-            self.skipTest("GQA attention kernel not available")
+            self.skipTest("compute_topk_attention_chunked not available")
 
         import torch
 
         if not torch.cuda.is_available():
             self.skipTest("CUDA not available")
 
-        # GQA setup: 8 query heads, 2 KV heads
+        from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
+            compute_topk_attention_chunked,
+        )
+
+        # GQA setup: 8 query heads, 2 KV heads (ratio 4:1)
         batch_size = 1
         num_q_heads = 8
         num_kv_heads = 2
@@ -219,59 +226,71 @@ class TestGQABroadcastCorrectness(unittest.TestCase):
         seq_len = 32
         top_k = 5
 
-        # Each KV head is shared by 4 query heads
-        group_size = num_q_heads // num_kv_heads
-
         # Create query [B, num_q_heads, D]
         q = torch.randn(batch_size, num_q_heads, head_dim, dtype=torch.float16, device="cuda")
 
-        # Create KV cache [B, num_kv_heads, seq_len, D]
-        k_cache = torch.randn(batch_size, num_kv_heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
-        v_cache = torch.randn(batch_size, num_kv_heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+        # Create KV buffer in paged format: [total_kv, num_kv_heads, D]
+        # For single sequence, total_kv = seq_len
+        k_buffer = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
 
-        # Put a distinctive pattern in each KV head
-        needle_pos_group0 = 10  # Position for KV head 0
-        needle_pos_group1 = 20  # Position for KV head 1
+        # Put a strong signal at position 15 that should be detected after averaging
+        needle_pos = 15
+        # Make position 15 have keys that match multiple query heads
+        for kv_h in range(num_kv_heads):
+            # Average of 4 query heads per KV head
+            q_start = kv_h * 4
+            avg_query = q[0, q_start:q_start+4, :].mean(dim=0)
+            k_buffer[needle_pos, kv_h, :] = avg_query * 2  # Strong match
 
-        # Make query heads 0-3 match the needle in KV head 0
-        k_cache[0, 0, needle_pos_group0, :] = q[0, 0, :]  # KV head 0, position 10
-        k_cache[0, 1, needle_pos_group1, :] = q[0, 4, :]  # KV head 1, position 20
+        # Create indptr and indices for paged attention
+        kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+        kv_indices = torch.arange(seq_len, dtype=torch.int32, device="cuda")
 
-        seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+        sm_scale = 1.0 / (head_dim ** 0.5)
 
-        from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
-            decode_forward_with_topk_gqa,
-        )
-
-        output, topk_values, topk_indices = decode_forward_with_topk_gqa(
-            q,
-            k_cache,
-            v_cache,
-            seq_lens,
-            num_kv_heads=num_kv_heads,
+        # Run chunked attention extraction
+        topk_scores, topk_indices, topk_logits, logsumexp = compute_topk_attention_chunked(
+            q,  # [B, num_q_heads, D]
+            k_buffer,  # [total_kv, num_kv_heads, D]
+            kv_indptr,
+            kv_indices,
+            sm_scale,
             top_k=top_k,
-            sm_scale=1.0 / (head_dim ** 0.5),
+            chunk_size=8,
         )
 
-        # Verify:
-        # - Query heads 0-3 (group 0) should attend to position 10 (their needle in KV head 0)
-        # - Query heads 4-7 (group 1) should attend to position 20 (their needle in KV head 1)
-        indices = topk_indices[0].cpu().numpy()  # [num_q_heads, K]
+        # Verify output shapes: averaged across heads, so [batch, top_k]
+        self.assertEqual(topk_scores.shape, (batch_size, top_k))
+        self.assertEqual(topk_indices.shape, (batch_size, top_k))
 
-        # Check group 0 (query heads 0-3, KV head 0)
-        for qh in range(0, 4):
-            self.assertIn(
-                needle_pos_group0,
-                indices[qh],
-                f"Query head {qh} (group 0) should attend to position {needle_pos_group0}"
-            )
+        # The needle position should be in top-k (averaged across all heads)
+        indices = topk_indices[0].cpu().numpy()
+        # Filter out invalid (-1) indices
+        valid_indices = indices[indices >= 0]
 
-        # Check group 1 (query heads 4-7, KV head 1)
-        for qh in range(4, 8):
-            self.assertIn(
-                needle_pos_group1,
-                indices[qh],
-                f"Query head {qh} (group 1) should attend to position {needle_pos_group1}"
+        # The strong signal at position 15 should appear in top-k
+        self.assertIn(
+            needle_pos,
+            valid_indices,
+            f"Needle position {needle_pos} should be in top-k after averaging: {valid_indices}"
+        )
+
+    def test_gqa_ratio_computation(self):
+        """Test that GQA ratio is correctly computed."""
+        # Common GQA configurations
+        test_cases = [
+            (32, 8, 4),   # Llama-3: 32 Q heads, 8 KV heads, ratio 4
+            (32, 4, 8),   # Some models: 32 Q heads, 4 KV heads, ratio 8
+            (8, 8, 1),    # MHA: equal Q and KV heads, ratio 1
+            (8, 1, 8),    # MQA: 1 KV head, ratio 8
+        ]
+
+        for num_q_heads, num_kv_heads, expected_ratio in test_cases:
+            actual_ratio = num_q_heads // num_kv_heads
+            self.assertEqual(
+                actual_ratio,
+                expected_ratio,
+                f"GQA ratio mismatch: {num_q_heads} Q / {num_kv_heads} KV = {actual_ratio}, expected {expected_ratio}"
             )
 
 
@@ -433,8 +452,8 @@ What is the secret code?"""
         self.assertIn("ALPHA-7749", content, "Model should retrieve the needle")
 
         # If attention tokens available, verify they include positions near the needle
-        meta_info = data["choices"][0].get("meta_info", {})
-        attention_tokens = meta_info.get("attention_tokens", [])
+        # attention_tokens is directly in choices[0], not meta_info
+        attention_tokens = data["choices"][0].get("attention_tokens", [])
 
         if attention_tokens:
             # The needle is around token position 30-35 (rough estimate)

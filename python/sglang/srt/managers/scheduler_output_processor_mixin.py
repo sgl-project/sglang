@@ -688,6 +688,16 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
+        # Pre-transfer fingerprint tensors to CPU (bulk transfer optimization)
+        # This avoids N separate GPU->CPU transfers in the per-request loop
+        fingerprints_cpu = None
+        if (
+            getattr(self.server_args, "attention_fingerprint_mode", False)
+            and logits_output is not None
+            and logits_output.attention_fingerprint is not None
+        ):
+            fingerprints_cpu = logits_output.attention_fingerprint.cpu()
+
         if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
@@ -799,15 +809,16 @@ class SchedulerOutputProcessorMixin:
             if req.return_attention_tokens:
                 req.attention_tokens_decode_step += 1
 
-            if fingerprint_mode and logits_output.attention_fingerprint is not None:
+            if fingerprint_mode and fingerprints_cpu is not None:
                 # FINGERPRINT MODE: Stream compressed fingerprint to sidecar
                 # This is the production path - 64 bytes vs ~200KB per step
                 if req.return_attention_tokens:
                     # Store fingerprint info (much smaller than raw indices)
+                    # Use pre-transferred CPU tensor (bulk transfer optimization)
                     fingerprint_info = {
                         "schema_version": 1,  # Version for UI compatibility
                         "mode": "fingerprint",
-                        "fingerprint": logits_output.attention_fingerprint[i].cpu().tolist(),
+                        "fingerprint": fingerprints_cpu[i].tolist(),
                         "manifold": logits_output.attention_manifold[i] if logits_output.attention_manifold else "unknown",
                         "step": req.attention_tokens_decode_step,
                         "think_phase": req.attention_think_phase,

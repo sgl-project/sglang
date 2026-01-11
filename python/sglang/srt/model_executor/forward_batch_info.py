@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -67,6 +68,11 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
+
+logger = logging.getLogger(__name__)
+
+# Attention capture warning tracker (to avoid repeated warnings)
+_attention_backend_warned = False
 
 
 class ForwardMode(IntEnum):
@@ -615,7 +621,28 @@ class ForwardBatch:
 
         # Init attention token capture (per-request gating)
         # Only capture if feature is enabled on server AND at least one request in batch wants it
+        _should_capture_attention = False
         if model_runner.server_args.return_attention_tokens and batch.capture_attention_tokens:
+            # Backend compatibility guard: attention capture only works with Triton backend
+            # FlashInfer and other backends don't have the top-k capture kernel implemented
+            global _attention_backend_warned
+            decode_backend = getattr(model_runner, 'decode_attention_backend_str', None)
+            if decode_backend is None:
+                decode_backend = model_runner.server_args.attention_backend
+
+            if decode_backend != "triton":
+                if not _attention_backend_warned:
+                    logger.warning(
+                        f"Attention visualization is only supported with --attention-backend triton. "
+                        f"Current backend: {decode_backend}. Ignoring attention capture request."
+                    )
+                    _attention_backend_warned = True
+                # Skip capture setup - leave ret.capture_attention_tokens as False
+            else:
+                # Backend is triton - proceed with capture setup
+                _should_capture_attention = True
+
+        if _should_capture_attention:
             ret.capture_attention_tokens = True
             ret.attention_top_k = batch.attention_top_k
             ret.attention_window = model_runner.server_args.attention_tokens_window
