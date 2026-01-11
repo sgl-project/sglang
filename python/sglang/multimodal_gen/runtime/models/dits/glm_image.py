@@ -23,10 +23,12 @@ from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbed
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 
 # from diffusers.models.normalization import LayerNorm, RMSNorm
+from sglang.multimodal_gen.runtime.layers.attention import UlyssesAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -246,23 +248,18 @@ class GlmImageAttention(torch.nn.Module):
         qk_norm,
         elementwise_affine,
         eps,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        prefix: str = "",
     ):
         super().__init__()
 
-        ### TO REMOVE##
-        kv_heads = None
-        ### TO REMOVE##
-
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError(
-                "GlmImageAttnProcessor requires PyTorch 2.0. To use it, please upgrade PyTorch to 2.0."
-            )
         self.k_cache = None
         self.v_cache = None
 
         self.heads = out_dim // dim_head if out_dim is not None else heads
+        self.dim_head = dim_head
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
-        self.inner_kv_dim = self.inner_dim if kv_heads is None else dim_head * kv_heads
+        self.inner_kv_dim = self.inner_dim
         self.out_dim = out_dim if out_dim is not None else query_dim
 
         self.to_q = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
@@ -289,6 +286,15 @@ class GlmImageAttention(torch.nn.Module):
                 f"unknown qk_norm: {qk_norm}. Should be one of None, 'layer_norm', 'fp32_layer_norm', 'layer_norm_across_heads', 'rms_norm', 'rms_norm_across_heads', 'l2'."
             )
 
+        # Use UlyssesAttention for distributed attention
+        self.ulysses_attn = UlyssesAttention(
+            num_heads=self.heads,
+            head_size=dim_head,
+            causal=False,
+            supported_attention_backends=supported_attention_backends,
+            prefix=f"{prefix}.ulysses_attn",
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -301,88 +307,119 @@ class GlmImageAttention(torch.nn.Module):
 
         batch_size, text_seq_length, embed_dim = encoder_hidden_states.shape
         batch_size, image_seq_length, embed_dim = hidden_states.shape
-        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
-        # 1. QKV projections
-        query, _ = self.to_q(hidden_states)
-        key, _ = self.to_k(hidden_states)
-        value, _ = self.to_v(hidden_states)
+        # 1. QKV projections for image (hidden_states)
+        img_query, _ = self.to_q(hidden_states)
+        img_key, _ = self.to_k(hidden_states)
+        img_value, _ = self.to_v(hidden_states)
 
-        query = query.unflatten(2, (self.heads, -1))
-        key = key.unflatten(2, (self.heads, -1))
-        value = value.unflatten(2, (self.heads, -1))
+        # Reshape to [B, S, H, D] for UlyssesAttention
+        img_query = img_query.view(batch_size, image_seq_length, self.heads, self.dim_head)
+        img_key = img_key.view(batch_size, image_seq_length, self.heads, self.dim_head)
+        img_value = img_value.view(batch_size, image_seq_length, self.heads, self.dim_head)
+
+        # 1b. QKV projections for text (encoder_hidden_states)
+        txt_query, _ = self.to_q(encoder_hidden_states)
+        txt_key, _ = self.to_k(encoder_hidden_states)
+        txt_value, _ = self.to_v(encoder_hidden_states)
+
+        # Reshape to [B, S, H, D] for UlyssesAttention
+        txt_query = txt_query.view(batch_size, text_seq_length, self.heads, self.dim_head)
+        txt_key = txt_key.view(batch_size, text_seq_length, self.heads, self.dim_head)
+        txt_value = txt_value.view(batch_size, text_seq_length, self.heads, self.dim_head)
 
         # 2. QK normalization
         if self.norm_q is not None:
-            query = self.norm_q(query).to(dtype=dtype)
+            img_query = self.norm_q(img_query).to(dtype=dtype)
+            txt_query = self.norm_q(txt_query).to(dtype=dtype)
         if self.norm_k is not None:
-            key = self.norm_k(key).to(dtype=dtype)
+            img_key = self.norm_k(img_key).to(dtype=dtype)
+            txt_key = self.norm_k(txt_key).to(dtype=dtype)
 
-        # 3. Rotational positional embeddings applied to latent stream
+        # 3. Rotational positional embeddings applied to image latent stream only
         if image_rotary_emb is not None:
             from diffusers.models.embeddings import apply_rotary_emb
 
-            query[:, text_seq_length:, :, :] = apply_rotary_emb(
-                query[:, text_seq_length:, :, :],
+            img_query = apply_rotary_emb(
+                img_query,
                 image_rotary_emb,
                 sequence_dim=1,
                 use_real_unbind_dim=-2,
             )
-            key[:, text_seq_length:, :, :] = apply_rotary_emb(
-                key[:, text_seq_length:, :, :],
+            img_key = apply_rotary_emb(
+                img_key,
                 image_rotary_emb,
                 sequence_dim=1,
                 use_real_unbind_dim=-2,
             )
 
-        if kv_cache is not None:
+        # Handle KV caching - when cache is used, fall back to SDPA
+        use_kv_cache = kv_cache is not None and kv_cache.mode in ["write", "read"]
+
+        if use_kv_cache:
+            # Combine text and image for caching (original approach)
+            query = torch.cat([txt_query, img_query], dim=1)  # [B, S_txt+S_img, H, D]
+            key = torch.cat([txt_key, img_key], dim=1)
+            value = torch.cat([txt_value, img_value], dim=1)
+
             if kv_cache.mode == "write":
                 kv_cache.store(key, value)
             elif kv_cache.mode == "read":
                 k_cache, v_cache = kv_cache.get()
                 print(f"349 {k_cache.shape=}, {key.shape=}", flush=True)
                 key = torch.cat([k_cache, key], dim=1) if k_cache is not None else key
-                value = (
-                    torch.cat([v_cache, value], dim=1) if v_cache is not None else value
-                )
-                print(f"350 {key.shape=}, {value.shape=}", flush=True)
-            elif kv_cache.mode == "skip":
-                pass
+                value = torch.cat([v_cache, value], dim=1) if v_cache is not None else value
 
-        # 4. Attention
-        if attention_mask is not None:
-            text_attn_mask = attention_mask
-            assert (
-                text_attn_mask.dim() == 2
-            ), "the shape of text_attn_mask should be (batch_size, text_seq_length)"
-            text_attn_mask = text_attn_mask.float().to(query.device)
-            mix_attn_mask = torch.ones(
-                (batch_size, text_seq_length + image_seq_length), device=query.device
+            # 4. Attention with SDPA (for KV cache compatibility)
+            if attention_mask is not None:
+                text_attn_mask = attention_mask
+                assert text_attn_mask.dim() == 2
+                text_attn_mask = text_attn_mask.float().to(query.device)
+                mix_attn_mask = torch.ones(
+                    (batch_size, text_seq_length + image_seq_length), device=query.device
+                )
+                mix_attn_mask[:, :text_seq_length] = text_attn_mask
+                mix_attn_mask = mix_attn_mask.unsqueeze(2)
+                attn_mask_matrix = mix_attn_mask @ mix_attn_mask.transpose(1, 2)
+                attention_mask = (attn_mask_matrix > 0).unsqueeze(1).to(query.dtype)
+
+            query = query.transpose(1, 2)  # [B, H, S, D]
+            key = key.transpose(1, 2)
+            value = value.transpose(1, 2)
+
+            print(f"{query.shape=}, {key.shape=}, {value.shape=}", flush=True)
+            out = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
             )
-            mix_attn_mask[:, :text_seq_length] = text_attn_mask
-            mix_attn_mask = mix_attn_mask.unsqueeze(2)
-            attn_mask_matrix = mix_attn_mask @ mix_attn_mask.transpose(1, 2)
-            attention_mask = (attn_mask_matrix > 0).unsqueeze(1).to(query.dtype)
-        print(f"360 {query.shape=}, {key.shape=}, {value.shape=}", flush=True)
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
-        print(f"362 {query.shape=}, {key.shape=}, {value.shape=}", flush=True)
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+            out = out.transpose(1, 2).flatten(2, 3)  # [B, S, H*D]
+            out = out.to(query.dtype)
+
+            # 5. Output projection
+            out, _ = self.to_out[0](out)
+
+            encoder_hidden_states_out, hidden_states_out = out.split(
+                [text_seq_length, out.size(1) - text_seq_length], dim=1
+            )
+            return hidden_states_out, encoder_hidden_states_out
+
+        # 4. Attention using UlyssesAttention (no KV cache)
+        # img_q/k/v: [B, S_img, H, D], txt_q/k/v: [B, S_txt, H, D]
+        img_attn_output, txt_attn_output = self.ulysses_attn(
+            img_query, img_key, img_value,
+            replicated_q=txt_query,
+            replicated_k=txt_key,
+            replicated_v=txt_value,
         )
-        hidden_states = hidden_states.transpose(1, 2)
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.to(query.dtype)
+
+        # Reshape outputs: [B, S, H, D] -> [B, S, H*D]
+        img_attn_output = img_attn_output.view(batch_size, image_seq_length, -1)
+        txt_attn_output = txt_attn_output.view(batch_size, text_seq_length, -1)
 
         # 5. Output projection
-        hidden_states, _ = self.to_out[0](hidden_states)
-        # hidden_states = self.to_out[1](hidden_states)         # (dropout omitted)
+        hidden_states_out, _ = self.to_out[0](img_attn_output)
+        encoder_hidden_states_out, _ = self.to_out[0](txt_attn_output)
 
-        encoder_hidden_states, hidden_states = hidden_states.split(
-            [text_seq_length, hidden_states.size(1) - text_seq_length], dim=1
-        )
-        return hidden_states, encoder_hidden_states
+        return hidden_states_out, encoder_hidden_states_out
 
 
 class GlmImageTransformerBlock(nn.Module):
@@ -392,22 +429,13 @@ class GlmImageTransformerBlock(nn.Module):
         num_attention_heads: int = 64,
         attention_head_dim: int = 40,
         time_embed_dim: int = 512,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
         # 1. Attention
         self.norm1 = GlmImageAdaLayerNormZero(time_embed_dim, dim)
-        # self.attn1 = Attention(
-        #     query_dim=dim,
-        #     heads=num_attention_heads,
-        #     dim_head=attention_head_dim,
-        #     out_dim=dim,
-        #     bias=True,
-        #     qk_norm="layer_norm",
-        #     elementwise_affine=False,
-        #     eps=1e-5,
-        #     processor=GlmImageAttnProcessor(),
-        # )
 
         self.attn1 = GlmImageAttention(
             query_dim=dim,
@@ -418,6 +446,8 @@ class GlmImageTransformerBlock(nn.Module):
             qk_norm="layer_norm",
             elementwise_affine=False,
             eps=1e-5,
+            supported_attention_backends=supported_attention_backends,
+            prefix=f"{prefix}.attn1",
         )
 
         # 2. Feedforward
@@ -668,6 +698,7 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         # 3. Transformer blocks
+        self._supported_attention_backends = arch_config._supported_attention_backends
         self.transformer_blocks = nn.ModuleList(
             [
                 GlmImageTransformerBlock(
@@ -675,8 +706,10 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     arch_config.num_attention_heads,
                     arch_config.attention_head_dim,
                     arch_config.time_embed_dim,
+                    supported_attention_backends=self._supported_attention_backends,
+                    prefix=f"transformer_blocks.{i}",
                 )
-                for _ in range(arch_config.num_layers)
+                for i in range(arch_config.num_layers)
             ]
         )
 
