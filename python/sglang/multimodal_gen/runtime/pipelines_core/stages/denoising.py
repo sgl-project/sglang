@@ -1060,7 +1060,7 @@ class DenoisingStage(PipelineStage):
 
                             # TODO: combine condition:
                             # simple for now.
-                            latent_model_input = latent_model_input
+                            latent_model_input = x_combined
 
                         # Predict noise residual
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)

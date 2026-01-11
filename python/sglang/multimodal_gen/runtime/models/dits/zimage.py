@@ -685,6 +685,9 @@ class ZImageTransformer2DModel(CachableDiT):
         assert len(all_image) == len(all_cap_feats) == 1
         bsz = len(all_image)
 
+        device = all_image[0][-1].device
+        dtype = all_image[0][-1].dtype
+
         images = all_image[0]  # List of [C, F, H, W]
         cap_feats = all_cap_feats[0]  # List of [L, D]
         siglips = all_siglip_feats[0]  # List of [H, W, C] TODO: review
@@ -730,11 +733,11 @@ class ZImageTransformer2DModel(CachableDiT):
             )
 
             all_cap_feat_list.append(cap_padded_feat)
-            all_cap_noise_mask_list.append(cap_nm)
+            all_cap_noise_mask_list.extend(cap_nm)
             cap_lens.append(cap_len)
 
         all_cap_feats_out.append(torch.cat(all_cap_feat_list, dim=0))
-        all_cap_noise_mask.append(torch.cat(all_cap_noise_mask_list, dim=0))
+        all_cap_noise_mask.append(all_cap_noise_mask_list)
         all_cap_len.append(cap_lens)
 
         # ------------ Process Image ------------
@@ -762,10 +765,10 @@ class ZImageTransformer2DModel(CachableDiT):
             )
 
             all_image_padded_feat_list.append(image_padded_feat)
-            all_image_noise_mask_list.append(image_nm)
+            all_image_noise_mask_list.extend(image_nm)
             image_lens.append(image_len)
         all_image_out.append(torch.cat(all_image_padded_feat_list, dim=0))
-        all_image_noise_mask.append(torch.cat(all_image_noise_mask_list, dim=0))
+        all_image_noise_mask.append(all_image_noise_mask_list)
         all_image_len.append(image_lens)
 
         # ------------ Process Siglip ------------
@@ -773,38 +776,46 @@ class ZImageTransformer2DModel(CachableDiT):
         all_sig_noise_mask_list = []
         sig_lens = []
         for j, sig_item in enumerate(siglips):
-            sig_H, sig_W, sig_C = sig_item.size()
-            # TODO: review.
-            # why reshape(sig_H * sig_W, sig_C) after permute
-            # "patchify"
-            sig_flat = sig_item.permute(2, 0, 1).reshape(sig_H * sig_W, sig_C)
-
-            # sig_out, sig_pos, sig_mask, sig_len, sig_nm = self._pad_with_ids(
-            #     sig_flat, (1, sig_H, sig_W), (cap_end_pos[j] + 1, 0, 0), device, noise_val
-            # )
-
-            # TODO: nm
-            # noise mask
-
-            # sig_ori_len = sig_flat.size(0)
-            # sig_padding_len = (-sig_ori_len) % SEQ_MULTI_OF
-            # # padded feature
-            # sig_padded_feat = torch.cat(
-            #     [sig_flat, sig_flat[-1:].repeat(sig_padding_len, 1)],
-            #     dim=0,
-            # )
-
             noise_val = images_noise_mask[i][j]
-            sig_padded_feat, sig_len, sig_nm = self._pad_and_prepare_noise_mask(
-                sig_flat,
-                noise_val,
-            )
+            if sig_item is None:
+                sig_len = SEQ_MULTI_OF
+                sig_padded_feat = torch.zeros(
+                    (sig_len, self.config.siglip_feat_dim), dtype=dtype, device=device
+                )
+                sig_nm = [noise_val] * sig_len
+
+            else:
+                sig_H, sig_W, sig_C = sig_item.size()
+                # TODO: review.
+                # why reshape(sig_H * sig_W, sig_C) after permute
+                # "patchify"
+                sig_flat = sig_item.permute(2, 0, 1).reshape(sig_H * sig_W, sig_C)
+
+                # sig_out, sig_pos, sig_mask, sig_len, sig_nm = self._pad_with_ids(
+                #     sig_flat, (1, sig_H, sig_W), (cap_end_pos[j] + 1, 0, 0), device, noise_val
+                # )
+
+                # TODO: nm
+                # noise mask
+
+                # sig_ori_len = sig_flat.size(0)
+                # sig_padding_len = (-sig_ori_len) % SEQ_MULTI_OF
+                # # padded feature
+                # sig_padded_feat = torch.cat(
+                #     [sig_flat, sig_flat[-1:].repeat(sig_padding_len, 1)],
+                #     dim=0,
+                # )
+
+                sig_padded_feat, sig_len, sig_nm = self._pad_and_prepare_noise_mask(
+                    sig_flat,
+                    noise_val,
+                )
 
             all_sig_feats_list.append(sig_padded_feat)
-            all_sig_noise_mask_list.append(sig_nm)
+            all_sig_noise_mask_list.extend(sig_nm)
             sig_lens.append(sig_len)
         all_sig_out.append(torch.cat(all_sig_feats_list, dim=0))
-        all_sig_noise_mask.append(torch.cat(all_sig_noise_mask_list, dim=0))
+        all_sig_noise_mask.append(all_sig_noise_mask_list)
         all_sig_len.append(sig_lens)
 
         # Compute x position offsets
@@ -1033,10 +1044,8 @@ class ZImageTransformer2DModel(CachableDiT):
         # Noise mask
         noise_mask_tensor = None
         if omni_mode:
-            assert len(unified_noise_mask) == 0, "Single batch only for now."
-            noise_mask_tensor = unified_noise_mask[0][:, : unified.shape[1]].unsqueeze(
-                0
-            )
+            assert len(unified_noise_mask) == 1, "Single batch only for now."
+            noise_mask_tensor = unified_noise_mask[0][: unified.shape[1]].unsqueeze(0)
 
         return unified, unified_freqs, noise_mask_tensor
 
@@ -1144,8 +1153,11 @@ class ZImageTransformer2DModel(CachableDiT):
 
             image_pos_ids_list.append(image_pos)
 
-        for j, sig_item in siglips:
+        for j, sig_item in enumerate(siglips):
             if sig_item is not None:
+                # TODO: review
+                # diff
+                # shape = (1, xx , xx)???
                 sig_H, sig_W, sig_C = sig_item.size()
                 sig_flat = sig_item.permute(2, 0, 1).reshape(sig_H * sig_W, sig_C)
                 sig_pos = _get_pos_ids(
@@ -1217,6 +1229,17 @@ class ZImageTransformer2DModel(CachableDiT):
             adaln_input = self.t_embedder(t * self.t_scale).type_as(x[0])
             t_noisy = t_clean = None
 
+        # TODO: overwrite freqs_cis for debug
+        # TODO: single batch only
+        # compute freqs before patchify
+        freqs_cis = self.get_freqs_cis(
+            prompt_embeds=encoder_hidden_states[0],
+            images=hidden_states[0],
+            siglips=siglip_feats[0] if siglip_feats is not None else None,
+            device=device,
+            rotary_emb=getattr(self, "rotary_emb", None),
+        )
+
         # Patchify
         if omni_mode:
             (
@@ -1244,39 +1267,34 @@ class ZImageTransformer2DModel(CachableDiT):
             ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
             x_pos_offsets = x_noise_mask = cap_noise_mask = siglip_noise_mask = None
 
-        # TODO: overwrite freqs_cis for debug
-        # TODO: single batch only
-        freqs_cis = self.get_freqs_cis(
-            prompt_embeds=encoder_hidden_states[0],
-            images=hidden_states[0],
-            siglips=siglip_feats[0] if siglip_feats is not None else None,
-            device=device,
-            rotary_emb=getattr(self, "rotary_emb", None),
-        )
-
         x = torch.cat(x, dim=0)
         x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
-        x_freqs_cis = freqs_cis[1]
+        x_freqs_cis = torch.stack(freqs_cis[1])
 
         x = x.unsqueeze(0)
         x_freqs_cis = x_freqs_cis
+        x_noise_tensor = torch.stack(
+            [torch.tensor(m, dtype=torch.long, device=device) for m in x_noise_mask]
+        )
         for layer in self.noise_refiner:
-            x = layer(x, x_freqs_cis, adaln_input)
+            x = layer(x, x_freqs_cis, adaln_input, x_noise_tensor, t_noisy, t_clean)
 
         cap_feats = torch.cat(cap_feats, dim=0)
 
         cap_feats, _ = self.cap_embedder(cap_feats)
 
-        cap_freqs_cis = freqs_cis[0]
+        cap_freqs_cis = torch.stack(freqs_cis[0])
 
         cap_feats = cap_feats.unsqueeze(0)
         for layer in self.context_refiner:
             cap_feats = layer(cap_feats, cap_freqs_cis)
 
-        siglip_freqs_cis = freqs_cis[2]
+        siglip_freqs_cis = torch.stack(freqs_cis[2])
 
         # process siglip
         siglip_seqlens = siglip_freqs = None
+        siglip_feats = torch.cat(siglip_feats, dim=0)
+        siglip_feats = siglip_feats.unsqueeze(0)
         if (
             omni_mode
             and siglip_feats[0] is not None
@@ -1284,7 +1302,7 @@ class ZImageTransformer2DModel(CachableDiT):
         ):
             siglip_seqlens = [len(si) for si in siglip_feats]
             # embed
-            siglip_feats = self.siglip_embedder(torch.cat(siglip_feats, dim=0))
+            siglip_feats = self.siglip_embedder(siglip_feats)
             # TODO:
             # single batch
             # no pad

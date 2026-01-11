@@ -4,8 +4,6 @@
 """
 Latent preparation stage for diffusion pipelines.
 """
-from typing import List
-
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -62,7 +60,7 @@ class LatentPreparationStage(PipelineStage):
         # Get required parameters
         dtype = (
             batch.prompt_embeds[0].dtype
-            if not isinstance(batch.prompt_embeds[0], List)
+            if not isinstance(batch.prompt_embeds[0], list)
             else batch.prompt_embeds[0][0].dtype
         )
         device = get_local_torch_device()

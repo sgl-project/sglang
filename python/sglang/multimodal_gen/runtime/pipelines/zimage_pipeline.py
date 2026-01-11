@@ -4,6 +4,7 @@
 
 import torch
 
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -56,7 +57,8 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
 
 
 class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
-    pipeline_name = "ZImagePipeline"
+    # TODO: debug hack
+    pipeline_name = "ZImageOmniPipeline"
 
     _required_config_modules = [
         "text_encoder",
@@ -145,6 +147,9 @@ class _ImageProcessStage(PipelineStage):
             batch.original_condition_image_size
         """
 
+        # TODO: review
+        # self.image_processor = self.image_processor.to(get_local_torch_device())
+
         # 3. Process condition images. Copied from diffusers.pipelines.flux2.pipeline_flux2
         condition_image = []
         resized_images = []
@@ -229,10 +234,18 @@ class _PrepareImageLatentsStage(PipelineStage):
         images = batch.condition_image
         num_images_per_prompt = len(batch.image_path)
         batch_size = batch.batch_size * num_images_per_prompt
+        # TODO: hardcode debug
+        # a graceful way to do that?
+        dtype = (
+            batch.prompt_embeds[0].dtype
+            if not isinstance(batch.prompt_embeds[0], list)
+            else batch.prompt_embeds[0][0].dtype
+        )
+        device = get_local_torch_device()
+
+        self.vae = self.vae.to(device)
+
         for image in images:
-            # TODO: hardcode debug
-            dtype = image.dtype
-            device = image.device
             image = image.to(device=device, dtype=dtype)
             image_latent = (
                 # TODO: hard code to vae(fp32) dtype. reivew
@@ -251,7 +264,7 @@ class _PrepareImageLatentsStage(PipelineStage):
         #  len(l) == batch size
         #  len(l[0]) == image nums
         condition_latents = [
-            [lat.to(lat.dtype) for lat in lats] for lats in condition_latents
+            [lat.to(dtype) for lat in lats] for lats in condition_latents
         ]
 
         # TODO: debug remove
@@ -291,7 +304,11 @@ class _PrepareSiglipStage(PipelineStage):
         images = batch.resized_images
 
         # TODO: hard code
-        device = batch.generator_device
+        device = get_local_torch_device()
+        # TODO: review?
+        # self.siglip_processor = self.siglip_processor.to(device)
+        self.siglip = self.siglip.to(device)
+
         num_images_per_prompt = len(batch.image_path)
         batch_size = batch.batch_size * num_images_per_prompt
         # TODO: hard code
@@ -352,7 +369,8 @@ class _PrepareSiglipStage(PipelineStage):
 
 # TODO: placeholder for now
 class ZImageOmniPipeline(LoRAPipeline, ComposedPipelineBase):
-    pipeline_name = "ZImageOmniPipeline"
+    # pipeline_name = "ZImageOmniPipeline"
+    pipeline_name = "ZImagePipeline"
 
     # TODO: review how to add extra component?
     _extra_config_module_map = {
@@ -371,6 +389,12 @@ class ZImageOmniPipeline(LoRAPipeline, ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         """Set up pipeline stages with proper dependency injection."""
+
+        import debugpy
+
+        debugpy.listen(("127.0.0.1", 9901))
+        print("Waiting for debugger attach")
+        debugpy.wait_for_client()
 
         # copy from diffusers
         from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
