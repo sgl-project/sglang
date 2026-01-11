@@ -356,10 +356,6 @@ impl RedisBackend {
         Ok(Self { pool, ttl_secs })
     }
 
-    fn key(&self, routing_id: &str) -> String {
-        format!("{}{}", REDIS_KEY_PREFIX, routing_id)
-    }
-
     fn retry_config() -> RetryConfig {
         RetryConfig {
             max_retries: 5,
@@ -379,7 +375,7 @@ impl RedisBackend {
     ) -> (usize, ExecutionBranch) {
         use crate::core::retry::RetryError;
 
-        let key = self.key(routing_id);
+        let key = format!("{}{}", REDIS_KEY_PREFIX, routing_id);
         let config = Self::retry_config();
 
         let result = crate::core::retry::RetryExecutor::execute_with_retry(&config, |attempt| {
