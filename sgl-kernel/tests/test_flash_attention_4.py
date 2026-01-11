@@ -23,6 +23,9 @@ from sgl_kernel.testing.rotary_embedding import _apply_rotary_emb as apply_rotar
 
 # Force sgl_kernel.flash_attn wrappers to use FA4 (Cute-DSL) implementations.
 # The wrappers accept a superset of args; for FA4, extra args are ignored.
+compiled_flash_attn_varlen_func = torch.compile(
+    partial(flash_attn_varlen_func, ver=4), fullgraph=False, mode="reduce-overhead"
+)
 flash_attn_varlen_func = partial(flash_attn_varlen_func, ver=4)
 flash_attn_with_kvcache = partial(flash_attn_with_kvcache, ver=4)
 
@@ -503,6 +506,7 @@ def attention_ref(
     skip_condition, reason="FA4 Requires compute capability of 10 or above."
 )
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("enable_torch_compile", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mqa"])
@@ -566,6 +570,7 @@ def test_flash_attn_varlen_output(
     has_learnable_sink,
     mha_type,
     dtype,
+    enable_torch_compile,
 ):
     if (
         causal or local
@@ -757,8 +762,12 @@ def test_flash_attn_varlen_output(
         pack_gqa_vals = [False, True, None]
         # num_splits_vals = [1, 3]
         num_splits_vals = [1]
+        if enable_torch_compile:
+            flash_attn_varlen_func_op = compiled_flash_attn_varlen_func
+        else:
+            flash_attn_varlen_func_op = flash_attn_varlen_func
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            out_unpad, lse = flash_attn_varlen_func(
+            out_unpad, lse = flash_attn_varlen_func_op(
                 q_unpad,
                 k_unpad,
                 v_unpad,
@@ -892,6 +901,7 @@ def test_flash_attn_varlen_output(
     skip_condition, reason="FA4 Requires compute capability of 10 or above."
 )
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("enable_torch_compile", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -965,6 +975,7 @@ def test_flash_attn_kvcache(
     has_learnable_sink,
     mha_type,
     dtype,
+    enable_torch_compile,
 ):
     if page_size is not None and seqlen_k % page_size != 0:
         pytest.skip()
@@ -1292,6 +1303,10 @@ def test_flash_attn_kvcache(
         num_splits_vals = [1]
         # precompute_metadata_vals = [False, True]
         precompute_metadata_vals = [False]
+        if enable_torch_compile:
+            flash_attn_varlen_func_op = compiled_flash_attn_varlen_func
+        else:
+            flash_attn_varlen_func_op = flash_attn_varlen_func
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
@@ -1317,7 +1332,7 @@ def test_flash_attn_kvcache(
                     v_cache_paged.copy_(v_cache_saved)
                 # For FA4, use flash_attn_varlen_func directly instead of flash_attn_with_kvcache
                 # This matches the pattern from the original FA4 test
-                out, lse = flash_attn_varlen_func(
+                out, lse = flash_attn_varlen_func_op(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
