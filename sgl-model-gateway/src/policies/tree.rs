@@ -1010,8 +1010,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn test_tenant_char_count() {
+    #[tokio::test]
+    async fn test_tenant_char_count() {
         let tree = Tree::new();
 
         tree.insert("apple", "tenant1");
@@ -1086,8 +1086,8 @@ mod tests {
         Alphanumeric.sample_string(&mut thread_rng(), len)
     }
 
-    #[test]
-    fn test_cold_start() {
+    #[tokio::test]
+    async fn test_cold_start() {
         let tree = Tree::new();
 
         let (matched_text, tenant) = tree.prefix_match("hello");
@@ -1096,8 +1096,8 @@ mod tests {
         assert_eq!(tenant, "empty");
     }
 
-    #[test]
-    fn test_exact_match_seq() {
+    #[tokio::test]
+    async fn test_exact_match_seq() {
         let tree = Tree::new();
         tree.insert("hello", "tenant1");
         tree.pretty_print();
@@ -1119,8 +1119,8 @@ mod tests {
         assert_eq!(tenant, "tenant3");
     }
 
-    #[test]
-    fn test_exact_match_concurrent() {
+    #[tokio::test]
+    async fn test_exact_match_concurrent() {
         let tree = Arc::new(Tree::new());
 
         // spawn 3 threads for insert
@@ -1173,8 +1173,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_partial_match_concurrent() {
+    #[tokio::test]
+    async fn test_partial_match_concurrent() {
         let tree = Arc::new(Tree::new());
 
         // spawn 3 threads for insert
@@ -1224,8 +1224,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_group_prefix_insert_match_concurrent() {
+    #[tokio::test]
+    async fn test_group_prefix_insert_match_concurrent() {
         static PREFIXES: [&str; 4] = [
             "Clock strikes midnight, I'm still wide awake",
             "Got dreams bigger than these city lights",
@@ -1283,8 +1283,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_mixed_concurrent_insert_match() {
+    #[tokio::test]
+    async fn test_mixed_concurrent_insert_match() {
         // ensure it does not deadlock instead of doing correctness check
 
         static PREFIXES: [&str; 4] = [
@@ -1332,8 +1332,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_utf8_split_seq() {
+    #[tokio::test]
+    async fn test_utf8_split_seq() {
         // The string should be indexed and split by a utf-8 value basis instead of byte basis
         // use .chars() to get the iterator of the utf-8 value
         let tree = Arc::new(Tree::new());
@@ -1358,8 +1358,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_utf8_split_concurrent() {
+    #[tokio::test]
+    async fn test_utf8_split_concurrent() {
         let tree = Arc::new(Tree::new());
 
         static TEST_PAIRS: [(&str, &str); 3] = [
@@ -1409,8 +1409,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_simple_eviction() {
+    #[tokio::test]
+    async fn test_simple_eviction() {
         let tree = Tree::new();
         let max_size = 5;
 
@@ -1441,8 +1441,8 @@ mod tests {
         assert_eq!(tenant, "tenant2");
     }
 
-    #[test]
-    fn test_advanced_eviction() {
+    #[tokio::test]
+    async fn test_advanced_eviction() {
         let tree = Tree::new();
 
         // Set limits for each tenant
@@ -1477,8 +1477,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_concurrent_operations_with_eviction() {
+    #[tokio::test]
+    async fn test_concurrent_operations_with_eviction() {
         // Ensure eviction works fine with concurrent insert and match operations for a given period
 
         let tree = Arc::new(Tree::new());
@@ -1554,8 +1554,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_leaf_of() {
+    #[tokio::test]
+    async fn test_leaf_of() {
         let tree = Tree::new();
 
         // Helper to convert leaves to strings for easier assertion
@@ -1581,8 +1581,8 @@ mod tests {
         assert!(leaves.is_empty());
     }
 
-    #[test]
-    fn test_get_used_size_per_tenant() {
+    #[tokio::test]
+    async fn test_get_used_size_per_tenant() {
         let tree = Tree::new();
 
         // Single tenant
@@ -1614,8 +1614,8 @@ mod tests {
         tree.pretty_print();
     }
 
-    #[test]
-    fn test_prefix_match_tenant() {
+    #[tokio::test]
+    async fn test_prefix_match_tenant() {
         let tree = Tree::new();
 
         // Insert overlapping prefixes for different tenants
@@ -1647,8 +1647,8 @@ mod tests {
         assert_eq!(tree.prefix_match_tenant("help", "tenant3"), ""); // Non-existent tenant
     }
 
-    #[test]
-    fn test_simple_tenant_eviction() {
+    #[tokio::test]
+    async fn test_simple_tenant_eviction() {
         let tree = Tree::new();
 
         // Insert data for multiple tenants
@@ -1682,8 +1682,8 @@ mod tests {
         assert_eq!(tree.prefix_match_tenant("help", "tenant2"), "help");
     }
 
-    #[test]
-    fn test_complex_tenant_eviction() {
+    #[tokio::test]
+    async fn test_complex_tenant_eviction() {
         let tree = Tree::new();
 
         // Create a more complex tree structure with shared prefixes
@@ -1726,8 +1726,8 @@ mod tests {
 
     // ==================== Edge Case Tests ====================
 
-    #[test]
-    fn test_empty_string_input() {
+    #[tokio::test]
+    async fn test_empty_string_input() {
         let tree = Tree::new();
 
         // Insert empty string
@@ -1745,8 +1745,8 @@ mod tests {
         assert_eq!(tenant, "tenant1");
     }
 
-    #[test]
-    fn test_single_character_operations() {
+    #[tokio::test]
+    async fn test_single_character_operations() {
         let tree = Tree::new();
 
         // Insert single characters
@@ -1768,8 +1768,8 @@ mod tests {
         assert_eq!(tenant, "tenant1");
     }
 
-    #[test]
-    fn test_prefix_is_subset_of_existing() {
+    #[tokio::test]
+    async fn test_prefix_is_subset_of_existing() {
         let tree = Tree::new();
 
         // Insert longer string first
@@ -1794,8 +1794,8 @@ mod tests {
         assert_eq!(matched, "appl");
     }
 
-    #[test]
-    fn test_existing_is_prefix_of_new() {
+    #[tokio::test]
+    async fn test_existing_is_prefix_of_new() {
         let tree = Tree::new();
 
         // Insert shorter string first
@@ -1820,8 +1820,8 @@ mod tests {
 
     // ==================== prefix_match_with_counts Tests ====================
 
-    #[test]
-    fn test_prefix_match_with_counts_accuracy() {
+    #[tokio::test]
+    async fn test_prefix_match_with_counts_accuracy() {
         let tree = Tree::new();
 
         tree.insert("hello world", "tenant1");
@@ -1848,8 +1848,8 @@ mod tests {
         assert_eq!(result.input_char_count, 7);
     }
 
-    #[test]
-    fn test_prefix_match_with_counts_utf8() {
+    #[tokio::test]
+    async fn test_prefix_match_with_counts_utf8() {
         let tree = Tree::new();
 
         // UTF-8 string: 5 characters, more bytes
@@ -1872,8 +1872,8 @@ mod tests {
 
     // ==================== Node Splitting Edge Cases ====================
 
-    #[test]
-    fn test_split_at_first_character() {
+    #[tokio::test]
+    async fn test_split_at_first_character() {
         let tree = Tree::new();
 
         // Insert "abc"
@@ -1894,8 +1894,8 @@ mod tests {
         assert_eq!(matched, "a");
     }
 
-    #[test]
-    fn test_split_at_last_character() {
+    #[tokio::test]
+    async fn test_split_at_last_character() {
         let tree = Tree::new();
 
         // Insert "abcd"
@@ -1916,8 +1916,8 @@ mod tests {
         assert_eq!(matched, "abc");
     }
 
-    #[test]
-    fn test_multiple_splits_same_path() {
+    #[tokio::test]
+    async fn test_multiple_splits_same_path() {
         let tree = Tree::new();
 
         // Create a chain of splits
@@ -1936,8 +1936,8 @@ mod tests {
 
     // ==================== High Contention Stress Tests ====================
 
-    #[test]
-    fn test_high_contention_same_prefix() {
+    #[tokio::test]
+    async fn test_high_contention_same_prefix() {
         let tree = Arc::new(Tree::new());
         let num_threads = 16;
         let ops_per_thread = 100;
@@ -1972,8 +1972,8 @@ mod tests {
         assert!(!sizes.is_empty(), "Tree should have entries");
     }
 
-    #[test]
-    fn test_rapid_insert_remove_cycles() {
+    #[tokio::test]
+    async fn test_rapid_insert_remove_cycles() {
         let tree = Arc::new(Tree::new());
         let num_cycles = 50;
 
@@ -2002,8 +2002,8 @@ mod tests {
 
     // ==================== ASCII/UTF-8 Consistency Tests ====================
 
-    #[test]
-    fn test_ascii_utf8_consistency() {
+    #[tokio::test]
+    async fn test_ascii_utf8_consistency() {
         let tree = Tree::new();
 
         // Insert ASCII
@@ -2034,8 +2034,8 @@ mod tests {
         assert_eq!(result.input_char_count, 7);
     }
 
-    #[test]
-    fn test_emoji_handling() {
+    #[tokio::test]
+    async fn test_emoji_handling() {
         let tree = Tree::new();
 
         // Emoji are multi-byte UTF-8
@@ -2058,8 +2058,8 @@ mod tests {
 
     // ==================== Eviction Edge Cases ====================
 
-    #[test]
-    fn test_eviction_empty_tree() {
+    #[tokio::test]
+    async fn test_eviction_empty_tree() {
         let tree = Tree::new();
 
         // Should not panic on empty tree
@@ -2069,8 +2069,8 @@ mod tests {
         assert!(sizes.is_empty());
     }
 
-    #[test]
-    fn test_eviction_zero_max_size() {
+    #[tokio::test]
+    async fn test_eviction_zero_max_size() {
         let tree = Tree::new();
 
         tree.insert("hello", "tenant1");
@@ -2086,8 +2086,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_eviction_single_tenant_all_entries() {
+    #[tokio::test]
+    async fn test_eviction_single_tenant_all_entries() {
         let tree = Tree::new();
 
         // Insert many entries for single tenant
@@ -2112,8 +2112,8 @@ mod tests {
 
     // ==================== Last Tenant Cache Tests ====================
 
-    #[test]
-    fn test_last_tenant_cache_update() {
+    #[tokio::test]
+    async fn test_last_tenant_cache_update() {
         let tree = Tree::new();
 
         // Insert for tenant1
@@ -2131,8 +2131,8 @@ mod tests {
         assert_eq!(matched, "hello");
     }
 
-    #[test]
-    fn test_stale_cache_after_tenant_removal() {
+    #[tokio::test]
+    async fn test_stale_cache_after_tenant_removal() {
         let tree = Tree::new();
 
         tree.insert("hello", "tenant1");
@@ -2152,8 +2152,8 @@ mod tests {
 
     // ==================== Consistency Verification Tests ====================
 
-    #[test]
-    fn test_char_count_consistency_after_operations() {
+    #[tokio::test]
+    async fn test_char_count_consistency_after_operations() {
         let tree = Tree::new();
 
         // Helper to verify consistency
@@ -2188,8 +2188,8 @@ mod tests {
         verify_consistency(&tree);
     }
 
-    #[test]
-    fn test_tree_structure_integrity_after_stress() {
+    #[tokio::test]
+    async fn test_tree_structure_integrity_after_stress() {
         let tree = Arc::new(Tree::new());
         let num_threads = 8;
         let mut handles = vec![];
@@ -2244,8 +2244,8 @@ mod tests {
 
     // ==================== Boundary Condition Tests ====================
 
-    #[test]
-    fn test_very_long_strings() {
+    #[tokio::test]
+    async fn test_very_long_strings() {
         let tree = Tree::new();
 
         // Create a very long string (10KB)
@@ -2265,8 +2265,8 @@ mod tests {
         assert_eq!(matched, partial);
     }
 
-    #[test]
-    fn test_many_tenants_same_path() {
+    #[tokio::test]
+    async fn test_many_tenants_same_path() {
         let tree = Tree::new();
 
         // 100 tenants all insert same string
@@ -2283,8 +2283,8 @@ mod tests {
         assert_eq!(sizes.len(), 100, "Should have 100 tenants");
     }
 
-    #[test]
-    fn test_special_characters() {
+    #[tokio::test]
+    async fn test_special_characters() {
         let tree = Tree::new();
 
         // Various special characters

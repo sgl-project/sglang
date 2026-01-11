@@ -168,8 +168,8 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
-    #[test]
-    fn test_get_healthy_worker_indices() {
+    #[tokio::test]
+    async fn test_get_healthy_worker_indices() {
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")

@@ -383,8 +383,8 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
-    #[test]
-    fn test_cache_aware_with_balanced_load() {
+    #[tokio::test]
+    async fn test_cache_aware_with_balanced_load() {
         // Create policy without eviction thread for testing
         let config = CacheAwareConfig {
             eviction_interval_secs: 0, // Disable eviction thread
@@ -445,8 +445,8 @@ mod tests {
         assert_eq!(idx1, idx3);
     }
 
-    #[test]
-    fn test_cache_aware_with_imbalanced_load() {
+    #[tokio::test]
+    async fn test_cache_aware_with_imbalanced_load() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 5,
@@ -477,13 +477,13 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..5 {
-            let idx = policy.select_worker(&workers, &info).unwrap();
+            let idx = policy.select_worker(&workers, &info).await.unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
     }
 
-    #[test]
-    fn test_cache_aware_worker_removal() {
+    #[tokio::test]
+    async fn test_cache_aware_worker_removal() {
         let config = CacheAwareConfig {
             eviction_interval_secs: 0, // Disable eviction thread
             ..Default::default()

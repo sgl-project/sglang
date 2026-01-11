@@ -65,7 +65,7 @@ mod tests {
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
     #[tokio::test]
-    async fn test_round_robin_selection() {
+    async async fn test_round_robin_selection() {
         let policy = RoundRobinPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -86,15 +86,15 @@ mod tests {
         ];
 
         let info = SelectWorkerInfo::default();
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(2));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
+        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(1));
+        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(2));
+        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(1));
     }
 
     #[tokio::test]
-    async fn test_round_robin_with_unhealthy_workers() {
+    async async fn test_round_robin_with_unhealthy_workers() {
         let policy = RoundRobinPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -117,14 +117,14 @@ mod tests {
         workers[1].set_healthy(false);
 
         let info = SelectWorkerInfo::default();
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(2));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(2));
+        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(2));
+        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(2));
     }
 
     #[tokio::test]
-    async fn test_round_robin_reset() {
+    async async fn test_round_robin_reset() {
         let policy = RoundRobinPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -140,10 +140,10 @@ mod tests {
         ];
 
         let info = SelectWorkerInfo::default();
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
+        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(1));
 
         policy.reset();
-        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(0));
     }
 }

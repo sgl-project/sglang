@@ -56,7 +56,7 @@ mod tests {
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
     #[tokio::test]
-    async fn test_random_selection() {
+    async async fn test_random_selection() {
         let policy = RandomPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -78,7 +78,7 @@ mod tests {
 
         let mut counts = HashMap::new();
         for _ in 0..100 {
-            if let Some(idx) = policy.select_worker(&workers, &SelectWorkerInfo::default()).await {
+            if let Some(idx) = policy.select_worker(&workers, &SelectWorkerInfo::default().await).await {
                 *counts.entry(idx).or_insert(0) += 1;
             }
         }
@@ -88,7 +88,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_random_with_unhealthy_workers() {
+    async async fn test_random_with_unhealthy_workers() {
         let policy = RandomPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -107,14 +107,14 @@ mod tests {
 
         for _ in 0..10 {
             assert_eq!(
-                policy.select_worker(&workers, &SelectWorkerInfo::default()).await,
+                policy.select_worker(&workers, &SelectWorkerInfo::default().await).await,
                 Some(1)
             );
         }
     }
 
     #[tokio::test]
-    async fn test_random_no_healthy_workers() {
+    async async fn test_random_no_healthy_workers() {
         let policy = RandomPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
             BasicWorkerBuilder::new("http://w1:8000")
@@ -124,7 +124,7 @@ mod tests {
 
         workers[0].set_healthy(false);
         assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default()).await,
+            policy.select_worker(&workers, &SelectWorkerInfo::default().await).await,
             None
         );
     }

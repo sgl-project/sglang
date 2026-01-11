@@ -47,6 +47,23 @@ impl Default for ManualPolicy {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ManualConfig {
+    pub eviction_interval_secs: u64,
+    pub max_idle_secs: u64,
+    pub assignment_mode: ManualAssignmentMode,
+}
+
+impl Default for ManualConfig {
+    fn default() -> Self {
+        Self {
+            eviction_interval_secs: 60,
+            max_idle_secs: 4 * 3600,
+            assignment_mode: ManualAssignmentMode::Random,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionBranch {
     NoHealthyWorkers,
@@ -68,22 +85,6 @@ impl ExecutionBranch {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ManualConfig {
-    pub eviction_interval_secs: u64,
-    pub max_idle_secs: u64,
-    pub assignment_mode: ManualAssignmentMode,
-}
-
-impl Default for ManualConfig {
-    fn default() -> Self {
-        Self {
-            eviction_interval_secs: 60,
-            max_idle_secs: 4 * 3600,
-            assignment_mode: ManualAssignmentMode::Random,
-        }
-    }
-}
 impl ManualPolicy {
     pub fn new() -> Self {
         Self::with_config(ManualConfig::default())
@@ -488,8 +489,8 @@ mod tests {
         headers
     }
 
-    #[test]
-    fn test_manual_consistent_routing() {
+    #[tokio::test]
+    async fn test_manual_consistent_routing() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
@@ -514,8 +515,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_manual_different_routing_ids() {
+    #[tokio::test]
+    async fn test_manual_different_routing_ids() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
@@ -537,8 +538,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_manual_fallback_random() {
+    #[tokio::test]
+    async fn test_manual_fallback_random() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
@@ -555,8 +556,8 @@ mod tests {
         assert_eq!(counts.len(), 2, "Random fallback should use all workers");
     }
 
-    #[test]
-    fn test_manual_with_unhealthy_workers() {
+    #[tokio::test]
+    async fn test_manual_with_unhealthy_workers() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
@@ -579,8 +580,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_manual_no_healthy_workers() {
+    #[tokio::test]
+    async fn test_manual_no_healthy_workers() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000"]);
 
@@ -595,8 +596,8 @@ mod tests {
         assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
     }
 
-    #[test]
-    fn test_manual_empty_routing_id() {
+    #[tokio::test]
+    async fn test_manual_empty_routing_id() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
@@ -621,8 +622,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_manual_remaps_when_worker_becomes_unhealthy() {
+    #[tokio::test]
+    async fn test_manual_remaps_when_worker_becomes_unhealthy() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
@@ -654,8 +655,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_manual_empty_workers() {
+    #[tokio::test]
+    async fn test_manual_empty_workers() {
         let policy = ManualPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![];
         let headers = headers_with_routing_key("test");
@@ -668,8 +669,8 @@ mod tests {
         assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
     }
 
-    #[test]
-    fn test_manual_single_worker() {
+    #[tokio::test]
+    async fn test_manual_single_worker() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000"]);
 
@@ -690,8 +691,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_manual_worker_recovery() {
+    #[tokio::test]
+    async fn test_manual_worker_recovery() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
@@ -723,8 +724,8 @@ mod tests {
         assert_eq!(branch, ExecutionBranch::OccupiedHit);
     }
 
-    #[test]
-    fn test_manual_max_candidate_workers_eviction() {
+    #[tokio::test]
+    async fn test_manual_max_candidate_workers_eviction() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
@@ -767,14 +768,14 @@ mod tests {
         assert_eq!(branch, ExecutionBranch::OccupiedHit);
     }
 
-    #[test]
-    fn test_manual_policy_name() {
+    #[tokio::test]
+    async fn test_manual_policy_name() {
         let policy = ManualPolicy::new();
         assert_eq!(policy.name(), "manual");
     }
 
-    #[test]
-    fn test_manual_routing_info_push_bounded() {
+    #[tokio::test]
+    async fn test_manual_routing_info_push_bounded() {
         let mut info = Node {
             candi_worker_urls: vec!["http://w1:8000".to_string()],
             last_access: Instant::now(),
@@ -794,8 +795,8 @@ mod tests {
         assert_eq!(info.candi_worker_urls[1], "http://w3:8000");
     }
 
-    #[test]
-    fn test_manual_find_healthy_worker_priority() {
+    #[tokio::test]
+    async fn test_manual_find_healthy_worker_priority() {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let urls = vec![
@@ -828,8 +829,8 @@ mod tests {
         assert_eq!(result, None, "Should return None when no healthy workers");
     }
 
-    #[test]
-    fn test_manual_find_worker_index_by_url() {
+    #[tokio::test]
+    async fn test_manual_find_worker_index_by_url() {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         assert_eq!(
@@ -847,15 +848,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_manual_config_default() {
+    #[tokio::test]
+    async fn test_manual_config_default() {
         let config = ManualConfig::default();
         assert_eq!(config.eviction_interval_secs, 60);
         assert_eq!(config.max_idle_secs, 4 * 3600);
     }
 
-    #[test]
-    fn test_manual_with_disabled_eviction() {
+    #[tokio::test]
+    async fn test_manual_with_disabled_eviction() {
         let config = ManualConfig {
             eviction_interval_secs: 0,
             max_idle_secs: 3600,
@@ -865,8 +866,8 @@ mod tests {
         assert!(policy._eviction_task.is_none());
     }
 
-    #[test]
-    fn test_manual_last_access_updates() {
+    #[tokio::test]
+    async fn test_manual_last_access_updates() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
         let headers = headers_with_routing_key("test-key");
@@ -901,8 +902,8 @@ mod tests {
         assert!(access_after_miss > access_after_hit);
     }
 
-    #[test]
-    fn test_manual_ttl_eviction_logic() {
+    #[tokio::test]
+    async fn test_manual_ttl_eviction_logic() {
         use std::time::Duration;
 
         let config = ManualConfig {
@@ -927,8 +928,8 @@ mod tests {
         assert_eq!(policy.routing_map.len(), 0);
     }
 
-    #[test]
-    fn test_min_group_select_distributes_evenly() {
+    #[tokio::test]
+    async fn test_min_group_select_distributes_evenly() {
         let config = ManualConfig {
             assignment_mode: ManualAssignmentMode::MinGroup,
             ..Default::default()
@@ -969,8 +970,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_min_group_select_prefers_worker_with_fewer_routing_keys() {
+    #[tokio::test]
+    async fn test_min_group_select_prefers_worker_with_fewer_routing_keys() {
         let config = ManualConfig {
             assignment_mode: ManualAssignmentMode::MinGroup,
             ..Default::default()
@@ -997,8 +998,8 @@ mod tests {
         assert_eq!(selected_idx, 2, "Should select worker with 0 routing keys");
     }
 
-    #[test]
-    fn test_min_load_select_prefers_worker_with_fewer_requests() {
+    #[tokio::test]
+    async fn test_min_load_select_prefers_worker_with_fewer_requests() {
         let config = ManualConfig {
             assignment_mode: ManualAssignmentMode::MinLoad,
             ..Default::default()
@@ -1025,8 +1026,8 @@ mod tests {
         assert_eq!(selected_idx, 2, "Should select worker with 0 load");
     }
 
-    #[test]
-    fn test_min_group_sticky_after_assignment() {
+    #[tokio::test]
+    async fn test_min_group_sticky_after_assignment() {
         let config = ManualConfig {
             assignment_mode: ManualAssignmentMode::MinGroup,
             ..Default::default()
@@ -1063,8 +1064,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_random_mode_does_not_consider_load() {
+    #[tokio::test]
+    async fn test_random_mode_does_not_consider_load() {
         let config = ManualConfig {
             assignment_mode: ManualAssignmentMode::Random,
             ..Default::default()

@@ -257,8 +257,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn test_prefix_hash_consistent_routing() {
+    #[tokio::test]
+    async fn test_prefix_hash_consistent_routing() {
         let policy = PrefixHashPolicy::with_defaults();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(&workers));
@@ -281,8 +281,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_different_prefixes_distribute() {
+    #[tokio::test]
+    async fn test_different_prefixes_distribute() {
         let policy = PrefixHashPolicy::with_defaults();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(&workers));
@@ -309,8 +309,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_shared_prefix_routes_same() {
+    #[tokio::test]
+    async fn test_shared_prefix_routes_same() {
         let policy = PrefixHashPolicy::new(PrefixHashConfig {
             prefix_token_count: 5, // Only look at first 5 tokens
             ..Default::default()
@@ -339,8 +339,8 @@ mod tests {
         assert_eq!(result1, result2, "Same prefix should route to same worker");
     }
 
-    #[test]
-    fn test_no_tokens_returns_none() {
+    #[tokio::test]
+    async fn test_no_tokens_returns_none() {
         let policy = PrefixHashPolicy::with_defaults();
         let workers = create_workers(&["http://w1:8000"]);
         let ring = Arc::new(HashRing::new(&workers));
@@ -369,8 +369,8 @@ mod tests {
         assert_eq!(branch2, Branch::NoTokens);
     }
 
-    #[test]
-    fn test_no_healthy_workers() {
+    #[tokio::test]
+    async fn test_no_healthy_workers() {
         let policy = PrefixHashPolicy::with_defaults();
         let workers = create_workers(&["http://w1:8000"]);
         workers[0].set_healthy(false);
@@ -388,8 +388,8 @@ mod tests {
         assert_eq!(branch, Branch::NoHealthyWorkers);
     }
 
-    #[test]
-    fn test_load_ok_calculation() {
+    #[tokio::test]
+    async fn test_load_ok_calculation() {
         let policy = PrefixHashPolicy::new(PrefixHashConfig {
             load_factor: 1.25,
             ..Default::default()
@@ -404,8 +404,8 @@ mod tests {
         assert!(policy.load_ok(100, 0, 0)); // No workers = OK (shouldn't happen)
     }
 
-    #[test]
-    fn test_policy_name() {
+    #[tokio::test]
+    async fn test_policy_name() {
         let policy = PrefixHashPolicy::with_defaults();
         assert_eq!(policy.name(), "prefix_hash");
     }
