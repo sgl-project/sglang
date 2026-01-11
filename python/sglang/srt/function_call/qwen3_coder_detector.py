@@ -20,12 +20,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
         super().__init__()
 
         # Sentinel tokens
-        self.tool_call_start_token = "<tool_call>"
-        self.tool_call_end_token = "</tool_call>"
-        self.tool_call_prefix = "<function="
-        self.function_end_token = "</function>"
-        self.parameter_prefix = "<parameter="
-        self.parameter_end_token = "</parameter>"
+        self.tool_call_start_token: str = "<tool_call>"
+        self.tool_call_end_token: str = "</tool_call>"
+        self.tool_call_prefix: str = "<function="
+        self.function_end_token: str = "</function>"
+        self.parameter_prefix: str = "<parameter="
+        self.parameter_end_token: str = "</parameter>"
 
         # Regex for non-streaming fallback
         self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
@@ -38,20 +38,21 @@ class Qwen3CoderDetector(BaseFormatDetector):
         )
 
         # Streaming State
-        # Override parent class _buffer management, or work with parent class.
-        # SGLang BaseFormatDetector usually has its own _buffer, but we explicitly manage it here to ensure logic clarity
-        if not hasattr(self, "_buffer"):
-            self._buffer = ""
+        # Base class already initializes _buffer, we just use it directly
+        # No need to check with hasattr - we control the lifecycle through inheritance
 
         # Index pointing to the next character to be processed in buffer
-        self.parsed_pos = 0
+        self.parsed_pos: int = 0
         # Parameter count inside the current tool being processed, used to determine whether to add comma
-        self.current_tool_param_count = 0
+        self.current_tool_param_count: int = 0
         # Flag indicating whether current tool has already sent '{'
-        self.json_started = False
+        self.json_started: bool = False
 
         # [FIX] New state flag: mark whether inside tool_call structure block
-        self.is_inside_tool_call = False
+        self.is_inside_tool_call: bool = False
+
+        # Initialize attributes that were missing in the original PR
+        self.current_func_name: Optional[str] = None
 
     def _reset_streaming_state(self):
         """Reset internal streaming cursors."""
@@ -62,7 +63,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # Base class state reset is handled by base class logic mostly,
         # but we ensure our cursor aligns with buffer resets.
-        if hasattr(self, "_buffer") and not self._buffer:
+        # _buffer is always present from base class, no need for hasattr check
+        if not self._buffer:
             self.parsed_pos = 0
 
     def has_tool_call(self, text: str) -> bool:
@@ -75,14 +77,19 @@ class Qwen3CoderDetector(BaseFormatDetector):
         if tools is None:
             return {}
         for config in tools:
-            if not hasattr(config, "type") or not (
-                hasattr(config, "function") and hasattr(config.function, "name")
-            ):
+            try:
+                config_type = config.type
+                config_function = config.function
+                config_function_name = config_function.name
+            except AttributeError:
                 continue
-            if config.type == "function" and config.function.name == func_name:
-                if not hasattr(config.function, "parameters"):
+
+            if config_type == "function" and config_function_name == func_name:
+                try:
+                    params = config_function.parameters
+                except AttributeError:
                     return {}
-                params = config.function.parameters
+
                 if isinstance(params, dict) and "properties" in params:
                     return params["properties"]
                 elif isinstance(params, dict):
@@ -126,7 +133,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
         ):
             try:
                 param_value = int(param_value)
-            except:
+            except Exception:
                 logger.warning(
                     f"Parsed value '{param_value}' of parameter '{param_name}' is not an integer in tool "
                     f"'{func_name}', degenerating to string."
@@ -140,7 +147,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 param_value: float = float(param_value)
                 if maybe_convert and param_value.is_integer():
                     param_value = int(param_value)
-            except:
+            except Exception:
                 logger.warning(
                     f"Parsed value '{param_value}' of parameter '{param_name}' is not a float in tool "
                     f"'{func_name}', degenerating to string."
@@ -162,14 +169,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 try:
                     param_value = json.loads(param_value)
                     return param_value
-                except:
+                except Exception:
                     logger.warning(
                         f"Parsed value '{param_value}' of parameter '{param_name}' cannot be parsed with json.loads in tool "
                         f"'{func_name}', will try other methods to parse it."
                     )
             try:
                 param_value = ast.literal_eval(param_value)  # safer
-            except:
+            except Exception:
                 logger.warning(
                     f"Parsed value '{param_value}' of parameter '{param_name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
                 )
