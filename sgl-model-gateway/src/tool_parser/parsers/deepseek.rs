@@ -8,7 +8,7 @@ use crate::{
         errors::{ParserError, ParserResult},
         parsers::helpers,
         traits::ToolParser,
-        types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+        types::{FormatInfo, FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
     },
 };
 
@@ -324,5 +324,20 @@ impl ToolParser for DeepSeekParser {
         self.current_tool_id = -1;
         self.current_tool_name_sent = false;
         self.streamed_args_for_tool.clear();
+    }
+
+    fn get_format_info(&self) -> Option<FormatInfo> {
+        Some(FormatInfo {
+            begin_pattern: Box::new(|name, _index| {
+                format!(
+                    "<｜tool▁call▁begin｜>function<｜tool▁sep｜>{}\n```json\n",
+                    name
+                )
+            }),
+            end_pattern: "\n```<｜tool▁call▁end｜>".to_string(),
+            trigger: "<｜tool▁calls▁begin｜>".to_string(),
+            begin_pattern_subsequent: None,
+            trigger_subsequent: None,
+        })
     }
 }

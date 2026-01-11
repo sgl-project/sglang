@@ -25,7 +25,7 @@ use crate::{
         errors::{ParserError, ParserResult},
         parsers::helpers,
         traits::ToolParser,
-        types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+        types::{FormatInfo, FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
     },
 };
 
@@ -215,6 +215,12 @@ impl ToolParser for PythonicParser {
         }
 
         false
+    }
+
+    fn get_format_info(&self) -> Option<FormatInfo> {
+        // This parser does not support structural tags
+        // (Python implementation: supports_structural_tag() = False, structure_info() raises NotImplementedError)
+        None
     }
 }
 

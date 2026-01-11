@@ -2,6 +2,7 @@
 ///
 /// This module provides infrastructure for parsing tool calls from various model formats.
 // Core modules
+pub mod constraints;
 pub mod errors;
 pub mod factory;
 pub mod partial_json;
