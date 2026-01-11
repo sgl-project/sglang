@@ -156,6 +156,23 @@ impl BasicWorkerBuilder {
             }
         };
 
+        let metrics_url = if matches!(self.connection_mode, ConnectionMode::Http) {
+            self.url.clone()
+        } else {
+            let default_port = match url::Url::parse(&self.url) {
+                Ok(parsed) => parsed.port().unwrap_or(8080).to_string(),
+                Err(_) => {
+                    tracing::warn!(
+                        "Failed to parse port '{}', defaulting to 8080",
+                        self.url
+                    );
+                    "8080".to_string()
+                }
+            };
+            let metrics_port = self.labels.get("metrics_port").unwrap_or(&default_port);
+            format!("http://{}:{}", bootstrap_host, metrics_port)
+        };
+
         let bootstrap_port = match self.worker_type {
             WorkerType::Prefill { bootstrap_port } => bootstrap_port,
             _ => None,
@@ -163,6 +180,7 @@ impl BasicWorkerBuilder {
 
         let metadata = WorkerMetadata {
             url: self.url.clone(),
+            metrics_url: metrics_url,
             api_key: self.api_key,
             worker_type: self.worker_type,
             connection_mode: self.connection_mode,

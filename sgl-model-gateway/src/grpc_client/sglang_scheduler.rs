@@ -306,6 +306,8 @@ impl SglangSchedulerClient {
             logprob_start_len: -1,
             top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
             return_hidden_states: body.return_hidden_states,
+            data_parallel_rank: body.data_parallel_rank,
+            data_parallel_rank_decode: body.data_parallel_rank_decode,
             stream: body.stream,
             ..Default::default()
         };
@@ -338,6 +340,8 @@ impl SglangSchedulerClient {
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
             log_metrics: body.log_metrics,
+            data_parallel_rank: body.data_parallel_rank,
+            data_parallel_rank_decode: body.data_parallel_rank_decode,
             ..Default::default()
         };
 
@@ -775,7 +779,7 @@ mod tests {
                 input_ids: vec![2028, 374, 264, 1296, 11914, 369, 28537], // Mock token IDs
             }),
             log_metrics: true,
-            data_parallel_rank: 0,
+            data_parallel_rank: Some(0),
             ..Default::default()
         };
 
@@ -787,7 +791,7 @@ mod tests {
             );
         }
         assert!(embed_req.log_metrics);
-        assert_eq!(embed_req.data_parallel_rank, 0);
+        assert_eq!(embed_req.data_parallel_rank, Some(0));
     }
 
     #[tokio::test]

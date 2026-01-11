@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
 
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
@@ -29,6 +32,9 @@ pub struct PolicyRegistry {
 
     /// Decode policy for PD mode (set once at startup, lock-free reads via OnceLock)
     decode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
+
+    /// Enable minimum tokens scheduler for dp group
+    dp_minimum_tokens_scheduler: Arc<AtomicBool>,
 }
 
 impl PolicyRegistry {
@@ -42,7 +48,17 @@ impl PolicyRegistry {
             default_policy,
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
+            dp_minimum_tokens_scheduler: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn enable_dp_minimum_tokens_scheduler(&self) {
+        self.dp_minimum_tokens_scheduler
+            .store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_dp_minimum_tokens_scheduler_enabled(&self) -> bool {
+        self.dp_minimum_tokens_scheduler.load(Ordering::Relaxed)
     }
 
     /// Called when a worker is added

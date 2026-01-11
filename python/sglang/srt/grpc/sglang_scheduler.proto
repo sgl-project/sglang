@@ -123,10 +123,13 @@ message GenerateRequest {
   string lora_id = 15;
 
   // Data parallel routing
-  int32 data_parallel_rank = 16;
+  optional int32 data_parallel_rank = 16;
+
+  // Data parallel decode routing
+  optional int32 data_parallel_rank_decode = 17;
 
   // Whether client wants streaming response
-  bool stream = 17;
+  bool stream = 18;
 }
 
 message TokenizedInput {
@@ -283,11 +286,12 @@ message EmbedRequest {
   repeated int32 token_type_ids = 7;
 
   // Data parallel routing
-  int32 data_parallel_rank = 8;
+  optional int32 data_parallel_rank = 8;
+  optional int32 data_parallel_rank_decode = 9;
 
   // For cross-encoder requests
-  bool is_cross_encoder = 9;
-  repeated string texts = 10;  // For cross-encoder batch
+  bool is_cross_encoder = 10;
+  repeated string texts = 11;  // For cross-encoder batch
 }
 
 message EmbedResponse {
@@ -434,6 +438,7 @@ message GetModelInfoResponse {
   string id2label_json = 16;
   // Number of classification labels (0 if not a classifier)
   int32 num_labels = 17;
+  int32 metrics_port = 18;
 }
 
 // Get server information

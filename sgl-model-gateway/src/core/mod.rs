@@ -15,7 +15,7 @@ pub use crate::protocols::UNKNOWN_MODEL_ID;
 pub mod circuit_breaker;
 pub mod error;
 pub mod job_queue;
-pub mod metrics_aggregator;
+pub mod metrics_manager;
 pub mod model_card;
 pub mod model_type;
 pub mod retry;
@@ -23,6 +23,7 @@ pub mod steps;
 pub mod token_bucket;
 pub mod worker;
 pub mod worker_builder;
+pub mod worker_load;
 pub mod worker_manager;
 pub mod worker_registry;
 pub mod worker_service;
@@ -38,6 +39,7 @@ pub use worker::{
     WorkerType,
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
+pub use worker_load::WorkerLoadManager;
 pub use worker_manager::{LoadMonitor, WorkerManager};
 pub use worker_registry::{HashRing, WorkerRegistry};
 pub use worker_service::WorkerService;

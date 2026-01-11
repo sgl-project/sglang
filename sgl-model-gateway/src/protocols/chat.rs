@@ -359,6 +359,13 @@ pub struct ChatCompletionRequest {
     /// Random seed for sampling for deterministic outputs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_seed: Option<u64>,
+
+    /// Data parallel rank routing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_parallel_rank: Option<i32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_parallel_rank_decode: Option<i32>,
 }
 
 // ============================================================================

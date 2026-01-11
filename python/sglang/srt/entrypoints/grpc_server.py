@@ -338,6 +338,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             # Classification model support
             id2label_json=self.model_info.get("id2label_json") or "",
             num_labels=self.model_info.get("num_labels") or 0,
+            metrics_port=self.server_args.metrics_port,
         )
 
     async def GetServerInfo(
@@ -452,6 +453,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            data_parallel_rank=(
+                grpc_req.data_parallel_rank
+                if grpc_req.HasField("data_parallel_rank")
+                else None
+            ),
+            data_parallel_rank_decode=(
+                grpc_req.data_parallel_rank_decode
+                if grpc_req.HasField("data_parallel_rank_decode")
+                else None
+            ),
         )
 
     def _convert_embed_request(
