@@ -1,6 +1,9 @@
-use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::{
+    process::{Child, Command, Stdio},
+    sync::OnceLock,
+    time::Duration,
+};
+
 use tokio::net::TcpStream;
 use tracing::warn;
 
@@ -82,7 +85,12 @@ impl RedisTestServer {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("Failed to start redis-server: {}. Is redis-server installed?", e))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to start redis-server: {}. Is redis-server installed?",
+                    e
+                )
+            })?;
 
         let server = Self {
             process: Some(process),
@@ -103,7 +111,10 @@ impl RedisTestServer {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Err(format!("Redis server failed to start on port {}", self.port))
+        Err(format!(
+            "Redis server failed to start on port {}",
+            self.port
+        ))
     }
 
     pub fn url(&self) -> &str {

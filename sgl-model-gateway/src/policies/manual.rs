@@ -1286,5 +1286,4 @@ mod tests {
             "Random mode should sometimes select worker 0 despite higher load"
         );
     }
-
 }

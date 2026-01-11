@@ -101,7 +101,11 @@ impl TestRouterConfig {
 
     /// Create a manual routing config with Redis backend
     pub fn manual_with_redis(port: u16, redis_url: &str) -> RouterConfig {
-        Self::manual_with_options(port, ManualAssignmentMode::Random, Some(redis_url.to_string()))
+        Self::manual_with_options(
+            port,
+            ManualAssignmentMode::Random,
+            Some(redis_url.to_string()),
+        )
     }
 
     /// Create a manual routing config with min_group assignment mode
@@ -111,7 +115,11 @@ impl TestRouterConfig {
 
     /// Create a manual routing config with min_group and Redis backend
     pub fn manual_min_group_with_redis(port: u16, redis_url: &str) -> RouterConfig {
-        Self::manual_with_options(port, ManualAssignmentMode::MinGroup, Some(redis_url.to_string()))
+        Self::manual_with_options(
+            port,
+            ManualAssignmentMode::MinGroup,
+            Some(redis_url.to_string()),
+        )
     }
 
     /// Create a manual routing config with specified options

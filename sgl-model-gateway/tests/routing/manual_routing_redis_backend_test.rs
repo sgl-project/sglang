@@ -2,8 +2,7 @@
 //!
 //! These tests require a running Redis server. Use RedisTestServer to start one.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use smg::{
     core::{BasicWorkerBuilder, Worker, WorkerType},
@@ -58,7 +57,10 @@ async fn test_redis_vacant_to_occupied_hit() {
 
     for _ in 0..5 {
         let idx = policy.select_worker(&workers, &info).await.unwrap();
-        assert_eq!(idx, first_idx, "Same routing key should route to same worker");
+        assert_eq!(
+            idx, first_idx,
+            "Same routing key should route to same worker"
+        );
     }
 }
 
@@ -79,7 +81,10 @@ async fn test_redis_different_routing_ids_distribute() {
         *distribution.entry(idx).or_insert(0) += 1;
     }
 
-    assert!(distribution.len() > 1, "Should distribute across multiple workers");
+    assert!(
+        distribution.len() > 1,
+        "Should distribute across multiple workers"
+    );
 }
 
 // ============================================================================
@@ -276,7 +281,10 @@ async fn test_redis_concurrent_different_keys() {
                 headers: Some(&headers),
                 ..Default::default()
             };
-            (key, policy.select_worker(&workers_clone, &info).await.unwrap())
+            (
+                key,
+                policy.select_worker(&workers_clone, &info).await.unwrap(),
+            )
         });
         handles.push(handle);
     }
@@ -292,7 +300,10 @@ async fn test_redis_concurrent_different_keys() {
         *distribution.entry(idx).or_insert(0) += 1;
     }
 
-    assert!(distribution.len() > 1, "Different keys should distribute across workers");
+    assert!(
+        distribution.len() > 1,
+        "Different keys should distribute across workers"
+    );
 }
 
 // ============================================================================
@@ -343,5 +354,8 @@ async fn test_redis_fallback_on_no_healthy_workers() {
     };
 
     let result = policy.select_worker(&workers, &info).await;
-    assert!(result.is_none(), "Should return None when no healthy workers");
+    assert!(
+        result.is_none(),
+        "Should return None when no healthy workers"
+    );
 }
