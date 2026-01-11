@@ -207,6 +207,8 @@ jobs:
         runner: [linux-mi325-gpu-1]
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     runs-on: ${{matrix.runner}}
+    env:
+      METRICS_DIR: ${{ github.workspace }}/.ci_metrics
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -224,10 +226,27 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
+      - name: Setup metrics directory
+        run: |
+          rm -rf $METRICS_DIR || true
+          mkdir -p $METRICS_DIR
+
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 12
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_TEST_METRICS_OUTPUT=/sglang-checkout/.ci_metrics/test_metrics -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 12
+
+      - name: Merge metrics
+        if: always()
+        run: |
+          python3 scripts/ci/merge_metrics.py "$METRICS_DIR/test_metrics" "$METRICS_DIR/test_metrics.jsonl"
+
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-metrics-${{ github.run_id }}-${{ github.job }}-partition-${{ matrix.part }}
+          path: ${{ env.METRICS_DIR }}/
 
   stage-b-test-small-1-gpu-amd-mi35x:
     needs: [check-changes, stage-a-test-1-amd]
@@ -268,6 +287,7 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd-mi35x
 
+
   stage-b-test-large-2-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
     if: |
@@ -285,6 +305,8 @@ jobs:
       matrix:
         runner: [linux-mi325-gpu-2]
     runs-on: ${{matrix.runner}}
+    env:
+      METRICS_DIR: ${{ github.workspace }}/.ci_metrics
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -302,10 +324,27 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
+      - name: Setup metrics directory
+        run: |
+          rm -rf $METRICS_DIR || true
+          mkdir -p $METRICS_DIR
+
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-amd
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_TEST_METRICS_OUTPUT=/sglang-checkout/.ci_metrics/test_metrics -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-amd
+
+      - name: Merge metrics
+        if: always()
+        run: |
+          python3 scripts/ci/merge_metrics.py "$METRICS_DIR/test_metrics" "$METRICS_DIR/test_metrics.jsonl"
+
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-metrics-${{ github.run_id }}-${{ github.job }}
+          path: ${{ env.METRICS_DIR }}/
 
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
