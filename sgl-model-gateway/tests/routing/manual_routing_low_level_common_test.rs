@@ -40,9 +40,10 @@ fn create_policy(redis_url: Option<String>, redis_key_prefix: Option<String>) ->
 
 fn get_redis_config(test_name: &str) -> (Option<String>, Option<String>) {
     let server = get_shared_server();
+    let random_id: u64 = rand::random();
     (
         Some(server.url().to_string()),
-        Some(format!("test:{}:", test_name)),
+        Some(format!("test:{}:{}:", test_name, random_id)),
     )
 }
 

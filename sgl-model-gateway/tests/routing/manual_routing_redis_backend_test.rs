@@ -31,7 +31,16 @@ fn headers_with_routing_key(key: &str) -> http::HeaderMap {
     headers
 }
 
-fn create_redis_policy_with_prefix(prefix: &str) -> ManualPolicy {
+fn random_prefix(test_name: &str) -> String {
+    let random_id: u64 = rand::random();
+    format!("{}:{}:", test_name, random_id)
+}
+
+fn create_redis_policy(test_name: &str) -> ManualPolicy {
+    create_redis_policy_with_explicit_prefix(&random_prefix(test_name))
+}
+
+fn create_redis_policy_with_explicit_prefix(prefix: &str) -> ManualPolicy {
     let server = get_shared_server();
     let config = ManualConfig {
         redis_url: Some(server.url().to_string()),
@@ -41,11 +50,11 @@ fn create_redis_policy_with_prefix(prefix: &str) -> ManualPolicy {
     ManualPolicy::with_config(config)
 }
 
-fn create_redis_policy_with_prefix_and_ttl(prefix: &str, max_idle_secs: u64) -> ManualPolicy {
+fn create_redis_policy_with_ttl(test_name: &str, max_idle_secs: u64) -> ManualPolicy {
     let server = get_shared_server();
     let config = ManualConfig {
         redis_url: Some(server.url().to_string()),
-        redis_key_prefix: Some(prefix.to_string()),
+        redis_key_prefix: Some(random_prefix(test_name)),
         max_idle_secs,
         ..Default::default()
     };
@@ -58,7 +67,7 @@ fn create_redis_policy_with_prefix_and_ttl(prefix: &str, max_idle_secs: u64) -> 
 
 #[tokio::test]
 async fn test_redis_vacant_to_occupied_hit() {
-    let policy = create_redis_policy_with_prefix("test_vacant_hit:");
+    let policy = create_redis_policy("test_vacant_hit");
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("user-123");
@@ -80,7 +89,7 @@ async fn test_redis_vacant_to_occupied_hit() {
 
 #[tokio::test]
 async fn test_redis_different_routing_ids_distribute() {
-    let policy = create_redis_policy_with_prefix("test_distribute:");
+    let policy = create_redis_policy("test_distribute");
     let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
     let mut distribution: HashMap<usize, usize> = HashMap::new();
@@ -106,7 +115,7 @@ async fn test_redis_different_routing_ids_distribute() {
 
 #[tokio::test]
 async fn test_redis_failover_to_second_candidate() {
-    let policy = create_redis_policy_with_prefix("test_failover:");
+    let policy = create_redis_policy("test_failover");
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("failover-test");
@@ -129,7 +138,7 @@ async fn test_redis_failover_to_second_candidate() {
 
 #[tokio::test]
 async fn test_redis_worker_recovery() {
-    let policy = create_redis_policy_with_prefix("test_recovery:");
+    let policy = create_redis_policy("test_recovery");
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("recovery-test");
@@ -155,7 +164,7 @@ async fn test_redis_worker_recovery() {
 
 #[tokio::test]
 async fn test_redis_both_candidates_unhealthy() {
-    let policy = create_redis_policy_with_prefix("test_both_unhealthy:");
+    let policy = create_redis_policy("test_both_unhealthy");
     let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
     let headers = headers_with_routing_key("both-unhealthy");
@@ -183,9 +192,9 @@ async fn test_redis_both_candidates_unhealthy() {
 
 #[tokio::test]
 async fn test_redis_multi_instance_consistency() {
-    let prefix = "test_multi_instance:";
-    let policy1 = create_redis_policy_with_prefix(prefix);
-    let policy2 = create_redis_policy_with_prefix(prefix);
+    let prefix = random_prefix("test_multi_instance");
+    let policy1 = create_redis_policy_with_explicit_prefix(&prefix);
+    let policy2 = create_redis_policy_with_explicit_prefix(&prefix);
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("shared-key");
@@ -205,9 +214,9 @@ async fn test_redis_multi_instance_consistency() {
 
 #[tokio::test]
 async fn test_redis_cross_instance_failover() {
-    let prefix = "test_cross_failover:";
-    let policy1 = create_redis_policy_with_prefix(prefix);
-    let policy2 = create_redis_policy_with_prefix(prefix);
+    let prefix = random_prefix("test_cross_failover");
+    let policy1 = create_redis_policy_with_explicit_prefix(&prefix);
+    let policy2 = create_redis_policy_with_explicit_prefix(&prefix);
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("cross-failover");
@@ -236,17 +245,19 @@ async fn test_redis_cross_instance_failover() {
 #[tokio::test]
 async fn test_redis_concurrent_same_key() {
     let server = get_shared_server();
+    let prefix = random_prefix("test_concurrent_same");
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
     let workers = Arc::new(workers);
 
     let mut handles = Vec::new();
     for _ in 0..10 {
         let redis_url = server.url().to_string();
+        let prefix_clone = prefix.clone();
         let workers_clone = Arc::clone(&workers);
         let handle = tokio::spawn(async move {
             let config = ManualConfig {
                 redis_url: Some(redis_url),
-                redis_key_prefix: Some("test_concurrent_same:".to_string()),
+                redis_key_prefix: Some(prefix_clone),
                 ..Default::default()
             };
             let policy = ManualPolicy::with_config(config);
@@ -280,18 +291,20 @@ async fn test_redis_concurrent_same_key() {
 #[tokio::test]
 async fn test_redis_concurrent_different_keys() {
     let server = get_shared_server();
+    let prefix = random_prefix("test_concurrent_diff");
     let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
     let workers = Arc::new(workers);
 
     let mut handles = Vec::new();
     for i in 0..30 {
         let redis_url = server.url().to_string();
+        let prefix_clone = prefix.clone();
         let workers_clone = Arc::clone(&workers);
         let key = format!("key-{}", i);
         let handle = tokio::spawn(async move {
             let config = ManualConfig {
                 redis_url: Some(redis_url),
-                redis_key_prefix: Some("test_concurrent_diff:".to_string()),
+                redis_key_prefix: Some(prefix_clone),
                 ..Default::default()
             };
             let policy = ManualPolicy::with_config(config);
@@ -332,7 +345,7 @@ async fn test_redis_concurrent_different_keys() {
 
 #[tokio::test]
 async fn test_redis_ttl_expiry() {
-    let policy = create_redis_policy_with_prefix_and_ttl("test_ttl:", 2);
+    let policy = create_redis_policy_with_ttl("test_ttl", 2);
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("ttl-test");
@@ -354,7 +367,7 @@ async fn test_redis_ttl_expiry() {
 
 #[tokio::test]
 async fn test_redis_fallback_on_no_healthy_workers() {
-    let policy = create_redis_policy_with_prefix("test_no_healthy:");
+    let policy = create_redis_policy("test_no_healthy");
     let workers = create_workers(&["http://w1:8000"]);
     workers[0].set_healthy(false);
 
