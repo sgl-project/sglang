@@ -92,8 +92,19 @@ pub fn headers_with_routing_key(key: &str) -> http::HeaderMap {
 }
 
 pub fn random_prefix(test_name: &str) -> String {
-    let random_id: u64 = rand::random();
-    format!("{}:{}:", test_name, random_id)
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let thread_id = std::thread::current().id();
+
+    format!("{}:{:x}:{:x}:{:?}:", test_name, timestamp, count, thread_id)
 }
 
 pub async fn send_request(app: axum::Router, routing_key: &str) -> (String, String) {
