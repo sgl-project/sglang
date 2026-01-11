@@ -1,5 +1,6 @@
 use std::{
-    process::{Child, Command, Stdio},
+    net::TcpStream as StdTcpStream,
+    process::{Child, Command},
     sync::OnceLock,
     time::Duration,
 };
@@ -10,7 +11,11 @@ use tracing::warn;
 static SHARED_SERVER: OnceLock<RedisTestServer> = OnceLock::new();
 
 pub fn get_shared_server() -> &'static RedisTestServer {
-    SHARED_SERVER.get_or_init(|| RedisTestServer::start_sync().expect("Failed to start shared Redis server"))
+    SHARED_SERVER.get_or_init(|| {
+        let server = RedisTestServer::start_sync().expect("Failed to start shared Redis server");
+        server.wait_ready_sync();
+        server
+    })
 }
 
 pub struct RedisTestServer {
@@ -41,9 +46,7 @@ impl RedisTestServer {
             "no",
             "--daemonize",
             "no",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        ]);
 
         #[cfg(target_os = "linux")]
         {
@@ -63,13 +66,23 @@ impl RedisTestServer {
             )
         })?;
 
-        std::thread::sleep(Duration::from_millis(500));
-
         Ok(Self {
             process: Some(process),
             port,
             url,
         })
+    }
+
+    fn wait_ready_sync(&self) {
+        let addr = format!("127.0.0.1:{}", self.port);
+        for _ in 0..50 {
+            if StdTcpStream::connect(&addr).is_ok() {
+                std::thread::sleep(Duration::from_millis(50));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("Redis server failed to start on port {}", self.port);
     }
 
     async fn wait_ready(&self) -> Result<(), String> {
