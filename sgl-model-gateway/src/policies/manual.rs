@@ -129,6 +129,11 @@ impl ManualPolicy {
             ExecutionBranch::NoRoutingId,
         )
     }
+
+    #[cfg(test)]
+    fn local_backend(&self) -> Option<&LocalBackend> {
+        self.backend.as_local()
+    }
 }
 
 #[async_trait]
@@ -187,6 +192,14 @@ impl Backend {
     fn len(&self) -> Option<usize> {
         match self {
             Backend::Local(b) => Some(b.len()),
+            Backend::Redis(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn as_local(&self) -> Option<&LocalBackend> {
+        match self {
+            Backend::Local(b) => Some(b),
             Backend::Redis(_) => None,
         }
     }
@@ -948,7 +961,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_manual_branch_transitions() {
+    async fn test_manual_with_disabled_eviction() {
+        let config = ManualConfig {
+            eviction_interval_secs: 0,
+            max_idle_secs: 3600,
+            assignment_mode: ManualAssignmentMode::Random,
+        };
+        let policy = ManualPolicy::with_config(config);
+        assert!(!policy.local_backend().unwrap().has_eviction_task());
+    }
+
+    #[tokio::test]
+    async fn test_manual_last_access_updates() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
         let headers = headers_with_routing_key("test-key");
@@ -960,13 +984,49 @@ mod tests {
         let (result, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(branch, ExecutionBranch::Vacant);
         let first_idx = result.unwrap();
+        let access_after_vacant = policy.local_backend().unwrap().get_last_access("test-key").unwrap();
+        assert!(access_after_vacant.elapsed().as_millis() < 100);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
         let (_, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(branch, ExecutionBranch::OccupiedHit);
+        let access_after_hit = policy.local_backend().unwrap().get_last_access("test-key").unwrap();
+        assert!(access_after_hit > access_after_vacant);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
         workers[first_idx].set_healthy(false);
         let (_, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(branch, ExecutionBranch::OccupiedMiss);
+        let access_after_miss = policy.local_backend().unwrap().get_last_access("test-key").unwrap();
+        assert!(access_after_miss > access_after_hit);
+    }
+
+    #[tokio::test]
+    async fn test_manual_ttl_eviction_logic() {
+        use std::time::Duration;
+
+        let config = ManualConfig {
+            eviction_interval_secs: 2,
+            max_idle_secs: 2,
+            assignment_mode: ManualAssignmentMode::Random,
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        let headers = headers_with_routing_key("key-0");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        policy.select_worker_impl(&workers, &info).await;
+
+        assert_eq!(policy.local_backend().unwrap().len(), 1);
+
+        std::thread::sleep(Duration::from_secs(4));
+
+        assert_eq!(policy.local_backend().unwrap().len(), 0);
     }
 
     #[tokio::test]
