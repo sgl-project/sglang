@@ -794,4 +794,13 @@ class InternLM3ForCausalLM(LlamaForCausalLM):
     pass
 
 
-EntryClass = [LlamaForCausalLM, Phi3ForCausalLM, InternLM3ForCausalLM]
+class IQuestCoderForCausalLM(LlamaForCausalLM):
+    pass
+
+
+EntryClass = [
+    LlamaForCausalLM,
+    Phi3ForCausalLM,
+    InternLM3ForCausalLM,
+    IQuestCoderForCausalLM,
+]
