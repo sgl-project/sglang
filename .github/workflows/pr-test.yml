@@ -618,6 +618,7 @@ jobs:
 
       - name: Setup metrics directory
         run: |
+          rm -rf $METRICS_DIR || true
           mkdir -p $METRICS_DIR
 
       - name: Run test
@@ -680,6 +681,7 @@ jobs:
 
       - name: Setup metrics directory
         run: |
+          rm -rf $METRICS_DIR || true
           mkdir -p $METRICS_DIR
 
       - name: Run test
@@ -746,6 +748,7 @@ jobs:
 
       - name: Setup metrics directory
         run: |
+          rm -rf $METRICS_DIR || true
           mkdir -p $METRICS_DIR
 
       - name: Run test
@@ -1041,6 +1044,7 @@ jobs:
 
       - name: Setup metrics directory
         run: |
+          rm -rf $METRICS_DIR || true
           mkdir -p $METRICS_DIR
 
       - name: Run test
