@@ -202,6 +202,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # Whether to return dsa topk indices
+    return_dsa_topk_indices: bool = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -637,6 +639,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            return_dsa_topk_indices=self.return_dsa_topk_indices,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -709,6 +712,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+
+    # Whether to return dsa topk indices
+    return_dsa_topk_indices: bool = False
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
@@ -984,6 +990,9 @@ class BatchTokenIDOutput(
     # The routed experts for each output token
     output_routed_experts: List[torch.Tensor]
 
+    # The dsa topk indices for each output token
+    output_dsa_topk_indices: List[torch.Tensor]
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -1070,6 +1079,9 @@ class BatchStrOutput(
 
     # The routed experts for each output token
     output_routed_experts: List[List[int]]
+
+    # The dsa topk indices for each output token
+    output_dsa_topk_indices: List[List[int]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.

@@ -34,6 +34,8 @@ class _RoutedExpertsDeviceCache:
         num_experts_per_tok: int,
         num_fused_shared_experts: int,
         device: str,
+        enable_capture_dsa_topk_indices: bool = False,
+        num_dsa_topk_indices: int = 2048,
     ) -> None:
         self.buffer = torch.zeros(
             (
@@ -48,16 +50,42 @@ class _RoutedExpertsDeviceCache:
             dtype=torch.int32,
             device=device,
         )
+        self.dsa_topk_indices_buffer = None
+        if enable_capture_dsa_topk_indices:
+            self.dsa_topk_indices_buffer = torch.zeros(
+                (
+                    max(
+                        get_global_server_args().chunked_prefill_size
+                        * get_global_server_args().dp_size,
+                        max_running_requests,
+                    ),
+                    num_hidden_layers,
+                    num_dsa_topk_indices,
+                ),
+                dtype=torch.int32,
+                device=device,
+            )
         self._finalize_allocation_log()
 
     def get_buffer_size_bytes(self):
         assert hasattr(self, "buffer")
         return get_tensor_size_bytes(self.buffer)
 
+    def get_dsa_topk_indices_buffer_size_bytes(self):
+        assert hasattr(self, "dsa_topk_indices_buffer")
+        return get_tensor_size_bytes(self.dsa_topk_indices_buffer)
+
     def capture_fwd_routed_experts(self, layer_id: int, topk_ids: torch.Tensor):
         assert layer_id is not None, "capturing routing experts but get layer_id None"
         batch, _ = topk_ids.shape
         self.buffer[:batch, layer_id, :] = topk_ids
+
+    def capture_fwd_dsa_topk_indices(
+        self, layer_id: int, dsa_topk_indices: torch.Tensor
+    ):
+        assert layer_id is not None, "capturing dsa topk indices but get layer_id None"
+        batch, _ = dsa_topk_indices.shape
+        self.dsa_topk_indices_buffer[:batch, layer_id, :] = dsa_topk_indices
 
     def _finalize_allocation_log(self):
         """Common logging and memory usage computation for captured experts buffers."""
@@ -65,6 +93,13 @@ class _RoutedExpertsDeviceCache:
         logger.info(
             f"Routing experts device buffer allocated. #shape: {tuple(self.buffer.shape)}, size: {buffer_size_MB:.2f} MB"
         )
+        if self.dsa_topk_indices_buffer is not None:
+            dsa_topk_indices_size_MB = (
+                self.get_dsa_topk_indices_buffer_size_bytes() / _MB
+            )
+            logger.info(
+                f"DSA topk indices device buffer allocated. #shape: {tuple(self.dsa_topk_indices_buffer.shape)}, size: {dsa_topk_indices_size_MB:.2f} MB"
+            )
 
 
 class _RoutedExpertsHostCache:
@@ -73,6 +108,8 @@ class _RoutedExpertsHostCache:
         num_tokens: int,
         num_hidden_layers: int,
         num_experts_per_tok: int,
+        enable_capture_dsa_topk_indices: bool = False,
+        num_dsa_topk_indices: int = 2048,
     ) -> None:
         self.num_tokens = num_tokens
         self.buffer = torch.zeros(
@@ -85,11 +122,27 @@ class _RoutedExpertsHostCache:
             device="cpu",
             pin_memory=True,
         )
+        self.dsa_topk_indices_buffer = None
+        if enable_capture_dsa_topk_indices:
+            self.dsa_topk_indices_buffer = torch.zeros(
+                (
+                    num_tokens,
+                    num_hidden_layers,
+                    num_dsa_topk_indices,
+                ),
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            )
         self._finalize_allocation_log()
 
     def get_buffer_size_bytes(self):
         assert hasattr(self, "buffer")
         return get_tensor_size_bytes(self.buffer)
+
+    def get_dsa_topk_indices_buffer_size_bytes(self):
+        assert hasattr(self, "dsa_topk_indices_buffer")
+        return get_tensor_size_bytes(self.dsa_topk_indices_buffer)
 
     def set_experts_buffer(self, layer_id: int, loc: torch.Tensor, top_k: torch.Tensor):
         self.buffer[layer_id, loc, :] = top_k.to(device="cpu", non_blocking=True)
@@ -100,6 +153,13 @@ class _RoutedExpertsHostCache:
         logger.info(
             f"Routing experts host buffer allocated. #tokens: {self.num_tokens}, size: {buffer_size_GB:.2f} GB"
         )
+        if self.dsa_topk_indices_buffer is not None:
+            dsa_topk_indices_size_GB = (
+                self.get_dsa_topk_indices_buffer_size_bytes() / _GB
+            )
+            logger.info(
+                f"DSA topk indices host buffer allocated. #tokens: {self.num_tokens}, size: {dsa_topk_indices_size_GB:.2f} GB"
+            )
 
 
 class RoutedExpertsCapturer(ABC):
@@ -111,6 +171,7 @@ class RoutedExpertsCapturer(ABC):
         num_tokens: int,
         max_running_requests: int,
         device: str,
+        enable_capture_dsa_topk_indices: bool = False,
     ):
         if enable:
             return _RoutedExpertsCapturerReal(
@@ -119,6 +180,7 @@ class RoutedExpertsCapturer(ABC):
                 max_running_requests=max_running_requests,
                 num_fused_shared_experts=num_fused_shared_experts,
                 device=device,
+                enable_capture_dsa_topk_indices=enable_capture_dsa_topk_indices,
             )
         else:
             return _RoutedExpertsCapturerNoop()
@@ -134,7 +196,18 @@ class RoutedExpertsCapturer(ABC):
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         raise NotImplementedError
 
+    def capture_dsa_topk_indices(self, layer_id: int, dsa_topk_indices: torch.Tensor):
+        raise NotImplementedError
+
     def get_routed_experts(
+        self,
+        req_pool_idx: int,
+        seqlen: int,
+        req_to_token_pool: ReqToTokenPool,
+    ):
+        raise NotImplementedError
+
+    def get_dsa_topk_indices(
         self,
         req_pool_idx: int,
         seqlen: int,
@@ -162,15 +235,24 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         max_running_requests: int,
         num_fused_shared_experts: int,
         device: str,
+        enable_capture_dsa_topk_indices: bool = False,
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
         self.num_hidden_layers = model_config.hf_text_config.num_hidden_layers
         self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
 
+        self.enable_capture_dsa_topk_indices = enable_capture_dsa_topk_indices
+        if enable_capture_dsa_topk_indices:
+            self.num_dsa_topk_indices = model_config.hf_text_config.index_topk
+        else:
+            self.num_dsa_topk_indices = None
+
         self.host_cache = _RoutedExpertsHostCache(
             num_tokens=num_tokens,
             num_hidden_layers=self.num_hidden_layers,
             num_experts_per_tok=self.num_experts_per_tok,
+            enable_capture_dsa_topk_indices=self.enable_capture_dsa_topk_indices,
+            num_dsa_topk_indices=self.num_dsa_topk_indices,
         )
 
         self.device_cache = _RoutedExpertsDeviceCache(
@@ -179,6 +261,8 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             num_experts_per_tok=self.num_experts_per_tok,
             num_fused_shared_experts=self.num_fused_shared_experts,
             device=device,
+            enable_capture_dsa_topk_indices=self.enable_capture_dsa_topk_indices,
+            num_dsa_topk_indices=self.num_dsa_topk_indices,
         )
 
     def _sync_fwd_experts_buffer_DtoH(
@@ -205,8 +289,19 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             local_start_pos:local_end_pos, :, : self.num_experts_per_tok
         ].cpu()
 
+        if self.enable_capture_dsa_topk_indices:
+            self.host_cache.dsa_topk_indices_buffer[out_cache_loc_cpu] = (
+                self.device_cache.dsa_topk_indices_buffer[
+                    local_start_pos:local_end_pos, :, : self.num_dsa_topk_indices
+                ].cpu()
+            )
+
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
+
+    def capture_dsa_topk_indices(self, layer_id: int, dsa_topk_indices: torch.Tensor):
+        if self.enable_capture_dsa_topk_indices:
+            self.device_cache.capture_fwd_dsa_topk_indices(layer_id, dsa_topk_indices)
 
     def get_routed_experts(
         self,
@@ -218,6 +313,18 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             req_to_token_pool.req_to_token[req_pool_idx][: seqlen - 1].cpu().clone()
         )
         return self.get_host_cache().buffer[cache_pool_idx]
+
+    def get_dsa_topk_indices(
+        self,
+        req_pool_idx: int,
+        seqlen: int,
+        req_to_token_pool: ReqToTokenPool,
+    ):
+        if self.enable_capture_dsa_topk_indices:
+            cache_pool_idx = (
+                req_to_token_pool.req_to_token[req_pool_idx][: seqlen - 1].cpu().clone()
+            )
+            return self.get_host_cache().dsa_topk_indices_buffer[cache_pool_idx]
 
     def on_forward_end(self, forward_batch, can_run_graph, cuda_graph_batch):
         self._sync_fwd_experts_buffer_DtoH(
@@ -248,7 +355,18 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         pass
 
+    def capture_dsa_topk_indices(self, layer_id: int, dsa_topk_indices: torch.Tensor):
+        pass
+
     def get_routed_experts(
+        self,
+        req_pool_idx: int,
+        seqlen: int,
+        req_to_token_pool: ReqToTokenPool,
+    ):
+        pass
+
+    def get_dsa_topk_indices(
         self,
         req_pool_idx: int,
         seqlen: int,

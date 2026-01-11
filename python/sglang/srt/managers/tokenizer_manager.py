@@ -926,6 +926,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
+                return_dsa_topk_indices=obj.return_dsa_topk_indices,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
@@ -1523,6 +1524,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "output_routed_experts", None):
                 meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
+            if getattr(recv_obj, "output_dsa_topk_indices", None):
+                meta_info["dsa_topk_indices"] = recv_obj.output_dsa_topk_indices[i]
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]

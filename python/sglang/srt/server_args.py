@@ -580,6 +580,7 @@ class ServerArgs:
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
+    enable_return_dsa_topk_indices: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -4311,6 +4312,11 @@ class ServerArgs:
             "--enable-return-routed-experts",
             action="store_true",
             help="Enable returning routed experts of each layer with responses.",
+        )
+        parser.add_argument(
+            "--enable-return-dsa-topk-indices",
+            action="store_true",
+            help="Enable returning DSA topk indices of each layer with responses.",
         )
         parser.add_argument(
             "--scheduler-recv-interval",

@@ -328,6 +328,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def _extract_routed_experts(self, recv_obj: BatchTokenIDOutput) -> List[List[int]]:
         output_routed_experts = None
+        output_dsa_topk_indices = None
         if recv_obj.output_routed_experts is not None:
             output_routed_experts = [
                 (
@@ -339,7 +340,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 )
                 for output_routed_experts in recv_obj.output_routed_experts
             ]
-        return output_routed_experts
+        if recv_obj.output_dsa_topk_indices is not None:
+            output_dsa_topk_indices = [
+                (
+                    pybase64.b64encode(
+                        output_dsa_topk_indices.numpy().tobytes()
+                    ).decode("utf-8")
+                    if output_dsa_topk_indices is not None
+                    else []
+                )
+                for output_dsa_topk_indices in recv_obj.output_dsa_topk_indices
+            ]
+        return output_routed_experts, output_dsa_topk_indices
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
@@ -348,7 +360,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
-        output_routed_experts = self._extract_routed_experts(recv_obj)
+        output_routed_experts, output_dsa_topk_indices = self._extract_routed_experts(
+            recv_obj
+        )
 
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -376,6 +390,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
             output_routed_experts=output_routed_experts,
+            output_dsa_topk_indices=output_dsa_topk_indices,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

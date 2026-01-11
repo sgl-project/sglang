@@ -97,6 +97,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -1856,6 +1857,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
             )
+
+        get_global_experts_capturer().capture_dsa_topk_indices(
+            layer_id=self.layer_id,
+            dsa_topk_indices=topk_indices,
+        )
 
         return (
             q_pe,

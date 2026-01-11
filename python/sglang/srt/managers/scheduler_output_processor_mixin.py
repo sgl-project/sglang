@@ -71,6 +71,14 @@ class SchedulerOutputProcessorMixin:
             req_to_token_pool=self.req_to_token_pool,
         )
 
+    def maybe_collect_dsa_topk_indices(self: Scheduler, req: Req):
+        """Collect DSA topk indices for a finished request."""
+        req.dsa_topk_indices = get_global_experts_capturer().get_dsa_topk_indices(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )
+
     def maybe_collect_customized_info(
         self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
     ):
@@ -137,6 +145,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
+                        self.maybe_collect_dsa_topk_indices(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -411,6 +420,7 @@ class SchedulerOutputProcessorMixin:
 
             if req.finished():
                 self.maybe_collect_routed_experts(req)
+                self.maybe_collect_dsa_topk_indices(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
@@ -853,6 +863,7 @@ class SchedulerOutputProcessorMixin:
         output_hidden_states = None
         load = self.get_load()
         output_routed_experts = None
+        output_dsa_topk_indices = None
         customized_info = {}
 
         queue_times = []
@@ -1052,6 +1063,10 @@ class SchedulerOutputProcessorMixin:
                     if output_routed_experts is None:
                         output_routed_experts = []
                     output_routed_experts.append(req.routed_experts)
+                if req.return_dsa_topk_indices:
+                    if output_dsa_topk_indices is None:
+                        output_dsa_topk_indices = []
+                    output_dsa_topk_indices.append(req.dsa_topk_indices)
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
@@ -1108,6 +1123,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     output_routed_experts=output_routed_experts,
+                    output_dsa_topk_indices=output_dsa_topk_indices,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,

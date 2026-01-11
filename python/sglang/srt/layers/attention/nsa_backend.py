@@ -1239,6 +1239,7 @@ class NativeSparseAttnBackend(
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
+            # zianglih: non fused path, need to transform the topk indices to indices to the page table (page_size = 1)
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 topk_indices_offset = metadata.topk_indices_offset
                 assert topk_indices_offset is not None
@@ -1376,6 +1377,7 @@ class NativeSparseAttnBackend(
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
+            # zianglih: non fused path, need to transform the topk indices to indices to the page table (page_size = 1)
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,

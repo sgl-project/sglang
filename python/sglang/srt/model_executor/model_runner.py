@@ -600,6 +600,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
+                enable_capture_dsa_topk_indices=get_global_server_args().enable_return_dsa_topk_indices,
             )
         )
 
