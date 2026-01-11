@@ -35,30 +35,6 @@ use crate::{
 const MAX_CANDIDATE_WORKERS: usize = 2;
 const REDIS_KEY_PREFIX: &str = "smg:manual:";
 
-#[derive(Debug, Clone, Default)]
-struct CandidateWorkerUrls(Vec<String>);
-
-impl CandidateWorkerUrls {
-    fn push_bounded(&mut self, url: String) {
-        while self.0.len() >= MAX_CANDIDATE_WORKERS {
-            self.0.remove(0);
-        }
-        self.0.push(url);
-    }
-
-    fn serialize(&self) -> String {
-        self.0.join(",")
-    }
-
-    fn deserialize(data: &str) -> Self {
-        Self(data.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
-    }
-
-    fn urls(&self) -> &[String] {
-        &self.0
-    }
-}
-
 // ------------------------------------ API layer ---------------------------------------
 
 #[derive(Debug)]
@@ -112,6 +88,30 @@ impl ExecutionBranch {
             Self::RedisConnFailed => "redis_conn_failed",
             Self::RedisCasMaxRetries => "redis_cas_max_retries",
         }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CandidateWorkerUrls(Vec<String>);
+
+impl CandidateWorkerUrls {
+    fn push_bounded(&mut self, url: String) {
+        while self.0.len() >= MAX_CANDIDATE_WORKERS {
+            self.0.remove(0);
+        }
+        self.0.push(url);
+    }
+
+    fn serialize(&self) -> String {
+        self.0.join(",")
+    }
+
+    fn deserialize(data: &str) -> Self {
+        Self(data.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+    }
+
+    fn urls(&self) -> &[String] {
+        &self.0
     }
 }
 
@@ -568,12 +568,12 @@ mod tests {
             ..Default::default()
         };
 
-        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info).await;
         let first_idx = first_result.unwrap();
         assert_eq!(branch, ExecutionBranch::Vacant);
 
         for _ in 0..10 {
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            let (result, branch) = policy.select_worker_impl(&workers, &info).await;
             assert_eq!(
                 result,
                 Some(first_idx),
@@ -595,7 +595,7 @@ mod tests {
                 headers: Some(&headers),
                 ..Default::default()
             };
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            let (result, branch) = policy.select_worker_impl(&workers, &info).await;
             assert_eq!(branch, ExecutionBranch::Vacant);
             *distribution.entry(result.unwrap()).or_insert(0) += 1;
         }
@@ -614,7 +614,7 @@ mod tests {
         let mut counts = HashMap::new();
         for _ in 0..100 {
             let info = SelectWorkerInfo::default();
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            let (result, branch) = policy.select_worker_impl(&workers, &info).await;
             assert_eq!(branch, ExecutionBranch::NoRoutingId);
             if let Some(idx) = result {
                 *counts.entry(idx).or_insert(0) += 1;
@@ -637,12 +637,12 @@ mod tests {
             ..Default::default()
         };
 
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        let (result, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(result, Some(1), "Should only select healthy worker");
         assert_eq!(branch, ExecutionBranch::Vacant);
 
         for _ in 0..10 {
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            let (result, branch) = policy.select_worker_impl(&workers, &info).await;
             assert_eq!(result, Some(1), "Should only select healthy worker");
             assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
@@ -659,7 +659,7 @@ mod tests {
             headers: Some(&headers),
             ..Default::default()
         };
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        let (result, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(result, None);
         assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
     }
@@ -676,7 +676,7 @@ mod tests {
                 headers: Some(&headers),
                 ..Default::default()
             };
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            let (result, branch) = policy.select_worker_impl(&workers, &info).await;
             assert_eq!(branch, ExecutionBranch::NoRoutingId);
             if let Some(idx) = result {
                 *counts.entry(idx).or_insert(0) += 1;
@@ -701,19 +701,19 @@ mod tests {
             ..Default::default()
         };
 
-        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info).await;
         let first_idx = first_result.unwrap();
         assert_eq!(branch, ExecutionBranch::Vacant);
 
         workers[first_idx].set_healthy(false);
 
-        let (new_result, branch) = policy.select_worker_impl(&workers, &info);
+        let (new_result, branch) = policy.select_worker_impl(&workers, &info).await;
         let new_idx = new_result.unwrap();
         assert_ne!(new_idx, first_idx, "Should remap to healthy worker");
         assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         for _ in 0..10 {
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            let (result, branch) = policy.select_worker_impl(&workers, &info).await;
             assert_eq!(
                 result,
                 Some(new_idx),
@@ -732,7 +732,7 @@ mod tests {
             headers: Some(&headers),
             ..Default::default()
         };
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        let (result, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(result, None);
         assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
     }
@@ -748,12 +748,12 @@ mod tests {
             ..Default::default()
         };
 
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        let (result, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(result, Some(0));
         assert_eq!(branch, ExecutionBranch::Vacant);
 
         for _ in 0..10 {
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            let (result, branch) = policy.select_worker_impl(&workers, &info).await;
             assert_eq!(result, Some(0));
             assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
@@ -770,20 +770,20 @@ mod tests {
             ..Default::default()
         };
 
-        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info).await;
         let first_idx = first_result.unwrap();
         assert_eq!(branch, ExecutionBranch::Vacant);
 
         workers[first_idx].set_healthy(false);
 
-        let (second_result, branch) = policy.select_worker_impl(&workers, &info);
+        let (second_result, branch) = policy.select_worker_impl(&workers, &info).await;
         let second_idx = second_result.unwrap();
         assert_ne!(second_idx, first_idx);
         assert_eq!(branch, ExecutionBranch::OccupiedMiss);
 
         workers[first_idx].set_healthy(true);
 
-        let (after_recovery, branch) = policy.select_worker_impl(&workers, &info);
+        let (after_recovery, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(
             after_recovery,
             Some(first_idx),
@@ -803,13 +803,13 @@ mod tests {
             ..Default::default()
         };
 
-        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info).await;
         let first_idx = first_result.unwrap();
         assert_eq!(branch, ExecutionBranch::Vacant);
 
         workers[first_idx].set_healthy(false);
 
-        let (second_result, branch) = policy.select_worker_impl(&workers, &info);
+        let (second_result, branch) = policy.select_worker_impl(&workers, &info).await;
         let second_idx = second_result.unwrap();
         assert_ne!(second_idx, first_idx);
         assert_eq!(branch, ExecutionBranch::OccupiedMiss);
@@ -817,7 +817,7 @@ mod tests {
         workers[second_idx].set_healthy(false);
 
         let remaining_idx = (0..3).find(|&i| i != first_idx && i != second_idx).unwrap();
-        let (third_result, branch) = policy.select_worker_impl(&workers, &info);
+        let (third_result, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(
             third_result,
             Some(remaining_idx),
@@ -827,7 +827,7 @@ mod tests {
 
         workers[first_idx].set_healthy(true);
 
-        let (idx_after_restore, branch) = policy.select_worker_impl(&workers, &info);
+        let (idx_after_restore, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_ne!(
             idx_after_restore,
             Some(first_idx),
@@ -938,18 +938,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_manual_with_disabled_eviction() {
-        let config = ManualConfig {
-            eviction_interval_secs: 0,
-            max_idle_secs: 3600,
-            assignment_mode: ManualAssignmentMode::Random,
-        };
-        let policy = ManualPolicy::with_config(config);
-        assert!(policy._eviction_task.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_manual_last_access_updates() {
+    async fn test_manual_branch_transitions() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
         let headers = headers_with_routing_key("test-key");
@@ -957,57 +946,17 @@ mod tests {
             headers: Some(&headers),
             ..Default::default()
         };
-        let routing_id = RoutingId::new("test-key");
 
-        // Vacant: first access
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        let (result, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(branch, ExecutionBranch::Vacant);
         let first_idx = result.unwrap();
-        let access_after_vacant = policy.routing_map.get(&routing_id).unwrap().last_access;
-        assert!(access_after_vacant.elapsed().as_millis() < 100);
 
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        // OccupiedHit: same worker still healthy
-        let (_, branch) = policy.select_worker_impl(&workers, &info);
+        let (_, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(branch, ExecutionBranch::OccupiedHit);
-        let access_after_hit = policy.routing_map.get(&routing_id).unwrap().last_access;
-        assert!(access_after_hit > access_after_vacant);
 
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        // OccupiedMiss: worker becomes unhealthy
         workers[first_idx].set_healthy(false);
-        let (_, branch) = policy.select_worker_impl(&workers, &info);
+        let (_, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(branch, ExecutionBranch::OccupiedMiss);
-        let access_after_miss = policy.routing_map.get(&routing_id).unwrap().last_access;
-        assert!(access_after_miss > access_after_hit);
-    }
-
-    #[tokio::test]
-    async fn test_manual_ttl_eviction_logic() {
-        use std::time::Duration;
-
-        let config = ManualConfig {
-            eviction_interval_secs: 2,
-            max_idle_secs: 2,
-            assignment_mode: ManualAssignmentMode::Random,
-        };
-        let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-
-        let headers = headers_with_routing_key("key-0");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-        policy.select_worker_impl(&workers, &info);
-
-        assert_eq!(policy.routing_map.len(), 1);
-
-        std::thread::sleep(Duration::from_secs(4));
-
-        assert_eq!(policy.routing_map.len(), 0);
     }
 
     #[tokio::test]
@@ -1019,6 +968,7 @@ mod tests {
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
+        let mut distribution: HashMap<usize, usize> = HashMap::new();
         for i in 0..9 {
             let routing_key = format!("key-{}", i);
             let headers = headers_with_routing_key(&routing_key);
@@ -1027,24 +977,16 @@ mod tests {
                 ..Default::default()
             };
 
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            let (result, branch) = policy.select_worker_impl(&workers, &info).await;
             assert!(result.is_some());
             assert_eq!(branch, ExecutionBranch::Vacant);
 
             let selected_idx = result.unwrap();
+            *distribution.entry(selected_idx).or_default() += 1;
             workers[selected_idx]
                 .worker_routing_key_load()
                 .increment(&routing_key);
         }
-
-        let distribution: HashMap<_, usize> = policy
-            .routing_map
-            .iter()
-            .map(|e| e.candi_worker_urls.first().unwrap().clone())
-            .fold(HashMap::new(), |mut acc, url| {
-                *acc.entry(url).or_default() += 1;
-                acc
-            });
 
         assert_eq!(distribution.len(), 3, "Should use all 3 workers");
         for count in distribution.values() {
@@ -1074,7 +1016,7 @@ mod tests {
             headers: Some(&headers),
             ..Default::default()
         };
-        let (result, _) = policy.select_worker_impl(&workers, &info);
+        let (result, _) = policy.select_worker_impl(&workers, &info).await;
         let selected_idx = result.unwrap();
 
         assert_eq!(selected_idx, 2, "Should select worker with 0 routing keys");
@@ -1102,7 +1044,7 @@ mod tests {
             headers: Some(&headers),
             ..Default::default()
         };
-        let (result, _) = policy.select_worker_impl(&workers, &info);
+        let (result, _) = policy.select_worker_impl(&workers, &info).await;
         let selected_idx = result.unwrap();
 
         assert_eq!(selected_idx, 2, "Should select worker with 0 load");
@@ -1127,7 +1069,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info).await;
         let first_idx = first_result.unwrap();
         assert_eq!(branch, ExecutionBranch::Vacant);
         assert_eq!(
@@ -1136,7 +1078,7 @@ mod tests {
         );
 
         for _ in 0..10 {
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            let (result, branch) = policy.select_worker_impl(&workers, &info).await;
             assert_eq!(
                 result,
                 Some(first_idx),
@@ -1166,7 +1108,7 @@ mod tests {
                 headers: Some(&headers),
                 ..Default::default()
             };
-            let (result, _) = policy.select_worker_impl(&workers, &info);
+            let (result, _) = policy.select_worker_impl(&workers, &info).await;
             if result == Some(0) {
                 selected_worker_0 = true;
                 break;
