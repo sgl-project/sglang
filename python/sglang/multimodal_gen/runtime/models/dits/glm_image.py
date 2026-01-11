@@ -377,9 +377,13 @@ class GlmImageAttention(torch.nn.Module):
         img_value, _ = self.to_v(hidden_states)
 
         # Reshape to [B, S, H, D] for UlyssesAttention
-        img_query = img_query.view(batch_size, image_seq_length, self.heads, self.dim_head)
+        img_query = img_query.view(
+            batch_size, image_seq_length, self.heads, self.dim_head
+        )
         img_key = img_key.view(batch_size, image_seq_length, self.heads, self.dim_head)
-        img_value = img_value.view(batch_size, image_seq_length, self.heads, self.dim_head)
+        img_value = img_value.view(
+            batch_size, image_seq_length, self.heads, self.dim_head
+        )
 
         # 1b. QKV projections for text (encoder_hidden_states)
         txt_query, _ = self.to_q(encoder_hidden_states)
@@ -387,9 +391,13 @@ class GlmImageAttention(torch.nn.Module):
         txt_value, _ = self.to_v(encoder_hidden_states)
 
         # Reshape to [B, S, H, D] for UlyssesAttention
-        txt_query = txt_query.view(batch_size, text_seq_length, self.heads, self.dim_head)
+        txt_query = txt_query.view(
+            batch_size, text_seq_length, self.heads, self.dim_head
+        )
         txt_key = txt_key.view(batch_size, text_seq_length, self.heads, self.dim_head)
-        txt_value = txt_value.view(batch_size, text_seq_length, self.heads, self.dim_head)
+        txt_value = txt_value.view(
+            batch_size, text_seq_length, self.heads, self.dim_head
+        )
 
         # 2. QK normalization
         if self.norm_q is not None:
@@ -402,8 +410,8 @@ class GlmImageAttention(torch.nn.Module):
         # 3. Rotational positional embeddings applied to image latent stream only
         if image_rotary_emb is not None:
             cos, sin = image_rotary_emb
-            img_query = _apply_rotary_emb(img_query, cos, sin, is_neox_style=False)
-            img_key = _apply_rotary_emb(img_key, cos, sin, is_neox_style=False)
+            img_query = _apply_rotary_emb(img_query, cos, sin, is_neox_style=True)
+            img_key = _apply_rotary_emb(img_key, cos, sin, is_neox_style=True)
 
         # Handle KV caching - when cache is used, fall back to SDPA
         use_kv_cache = kv_cache is not None and kv_cache.mode in ["write", "read"]
@@ -418,9 +426,10 @@ class GlmImageAttention(torch.nn.Module):
                 kv_cache.store(key, value)
             elif kv_cache.mode == "read":
                 k_cache, v_cache = kv_cache.get()
-                print(f"349 {k_cache.shape=}, {key.shape=}", flush=True)
                 key = torch.cat([k_cache, key], dim=1) if k_cache is not None else key
-                value = torch.cat([v_cache, value], dim=1) if v_cache is not None else value
+                value = (
+                    torch.cat([v_cache, value], dim=1) if v_cache is not None else value
+                )
 
             # 4. Attention with SDPA (for KV cache compatibility)
             if attention_mask is not None:
@@ -428,7 +437,8 @@ class GlmImageAttention(torch.nn.Module):
                 assert text_attn_mask.dim() == 2
                 text_attn_mask = text_attn_mask.float().to(query.device)
                 mix_attn_mask = torch.ones(
-                    (batch_size, text_seq_length + image_seq_length), device=query.device
+                    (batch_size, text_seq_length + image_seq_length),
+                    device=query.device,
                 )
                 mix_attn_mask[:, :text_seq_length] = text_attn_mask
                 mix_attn_mask = mix_attn_mask.unsqueeze(2)
@@ -441,7 +451,12 @@ class GlmImageAttention(torch.nn.Module):
 
             print(f"{query.shape=}, {key.shape=}, {value.shape=}", flush=True)
             out = F.scaled_dot_product_attention(
-                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
             )
             out = out.transpose(1, 2).flatten(2, 3)  # [B, S, H*D]
             out = out.to(query.dtype)
@@ -457,7 +472,9 @@ class GlmImageAttention(torch.nn.Module):
         # 4. Attention using UlyssesAttention (no KV cache)
         # img_q/k/v: [B, S_img, H, D], txt_q/k/v: [B, S_txt, H, D]
         img_attn_output, txt_attn_output = self.ulysses_attn(
-            img_query, img_key, img_value,
+            img_query,
+            img_key,
+            img_value,
             replicated_q=txt_query,
             replicated_k=txt_key,
             replicated_v=txt_value,
@@ -590,24 +607,29 @@ class GlmImageRotaryPosEmbed(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_channels, height, width = hidden_states.shape
         height, width = height // self.patch_size, width // self.patch_size
+        device = hidden_states.device
 
         dim_h, dim_w = self.dim // 2, self.dim // 2
         h_inv_freq = 1.0 / (
             self.theta
             ** (
-                torch.arange(0, dim_h, 2, dtype=torch.float32)[: (dim_h // 2)].float()
+                torch.arange(0, dim_h, 2, dtype=torch.float32, device=device)[
+                    : (dim_h // 2)
+                ].float()
                 / dim_h
             )
         )
         w_inv_freq = 1.0 / (
             self.theta
             ** (
-                torch.arange(0, dim_w, 2, dtype=torch.float32)[: (dim_w // 2)].float()
+                torch.arange(0, dim_w, 2, dtype=torch.float32, device=device)[
+                    : (dim_w // 2)
+                ].float()
                 / dim_w
             )
         )
-        h_seq = torch.arange(height)
-        w_seq = torch.arange(width)
+        h_seq = torch.arange(height, device=device)
+        w_seq = torch.arange(width, device=device)
         freqs_h = torch.outer(h_seq, h_inv_freq)
         freqs_w = torch.outer(w_seq, w_inv_freq)
 
