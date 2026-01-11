@@ -662,11 +662,34 @@ class HarmonyParser:
         # Filter events using unified filtering logic
         filtered_events = self._filter_events(events, buffer_has_call_token)
 
-        # Track all filtered events in the semantic buffer
+        # Filter out duplicate tool_call events within this parse() call only
+        # (Don't dedupe across calls - model may legitimately repeat tool calls)
+        seen_in_this_call = set()
+        final_filtered = []
         for event in filtered_events:
+            if event.event_type == "tool_call":
+                # Use a normalized identifier for tool calls to handle duplicates
+                # Strip leading <|start|> token which may vary between occurrences
+                tool_call_id = event.raw_text if event.raw_text else event.content
+                if tool_call_id:
+                    # Normalize by stripping optional <|start|> token
+                    if tool_call_id.startswith("<|start|>assistant"):
+                        tool_call_id = tool_call_id.replace("<|start|>assistant", "", 1)
+                    elif tool_call_id.startswith("<|start|>"):
+                        tool_call_id = tool_call_id.replace("<|start|>", "", 1)
+
+                if tool_call_id and tool_call_id in seen_in_this_call:
+                    # Skip duplicate within this parse() call
+                    continue
+                if tool_call_id:
+                    seen_in_this_call.add(tool_call_id)
+            final_filtered.append(event)
+
+        # Track all filtered events in the semantic buffer
+        for event in final_filtered:
             self._buffer.add_emitted_event(event)
 
-        return filtered_events
+        return final_filtered
 
     def _filter_events(
         self, events: List[Event], buffer_has_call_token: bool

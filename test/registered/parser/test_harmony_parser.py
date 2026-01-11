@@ -574,7 +574,14 @@ class TestHarmonyParser(CustomTestCase):
         self.assertEqual(normal_events[0].content, "Done")
 
     def test_repetitive_tool_calls_with_commentary_filler(self):
-        """Test handling of repetitive tool calls with 'commentary' filler text."""
+        """Test that repetitive tool calls are deduplicated in single parse.
+
+        This tests that when the model outputs the same tool call multiple times
+        in a single parse() call (malformed output), they are deduplicated.
+
+        This is correct behavior because sending the same tool call multiple times
+        to downstream would cause errors.
+        """
         # This simulates malformed output with repeated tool calls and commentary filler
         text = (
             "<|channel|>analysis<|message|>Need to get weather<|end|>"
@@ -596,7 +603,9 @@ class TestHarmonyParser(CustomTestCase):
 
         # Verify correct number of each type
         self.assertEqual(len(reasoning_events), 2, "Should have 2 reasoning events")
-        self.assertEqual(len(tool_events), 3, "Should have 3 tool calls")
+        self.assertEqual(
+            len(tool_events), 1, "Should have 1 tool call (duplicates removed)"
+        )
         self.assertEqual(
             len(normal_events), 1, "Should have 1 normal event (final message)"
         )
@@ -1137,6 +1146,59 @@ class TestStreamingBufferManagement(CustomTestCase):
             combined_reasoning,
             "Second partial reasoning should be present",
         )
+
+
+class TestDuplicateToolCallPrevention(CustomTestCase):
+    """Test cases for preventing duplicate tool calls in HarmonyParser."""
+
+    def test_tool_call_not_reemitted_after_buffer_cleared(self):
+        """Test incremental streaming where buffer is cleared between chunks.
+
+        This simulates the exact bug scenario:
+        1. Tool call completes, buffer is cleared (remaining="")
+        2. Next chunk arrives with new content
+        3. Tool call should NOT be re-emitted
+
+        The bug: When buffer is cleared, subsequent parse() calls
+        may re-process and re-emit the tool call if it's
+        still in the input stream.
+        """
+        parser = HarmonyParser()
+
+        all_events = []
+
+        # Simulate streaming
+        chunks = [
+            "<|start|>assistant<|channel|>commentary to=functions.list_files<|message|>",
+            '{"path":"docs"}<|call|>',  # Tool call completes here, buffer should be cleared
+            "<|start|>assistant<|channel|>analysis<|message|>Processing...<|end|>",  # Should NOT re-emit tool call
+            "<|start|>assistant<|channel|>analysis<|message|>Done.<|end|>",  # Should NOT re-emit tool call
+        ]
+
+        for i, chunk in enumerate(chunks):
+            events = parser.parse(chunk)
+            all_events.extend(events)
+
+            tool_calls_so_far = len(
+                [e for e in all_events if e.event_type == "tool_call"]
+            )
+
+            # After chunk 1 (with <|call|>), should have 1 tool call
+            # All later chunks should NOT add more
+            if i == 1:
+                self.assertEqual(
+                    tool_calls_so_far, 1, "Tool call should be emitted at chunk 1"
+                )
+            elif i > 1:
+                self.assertEqual(
+                    tool_calls_so_far,
+                    1,
+                    f"Tool call re-emitted at chunk {i}! (got {tool_calls_so_far}) - BUG!",
+                )
+
+        # Final verification
+        tool_events = [e for e in all_events if e.event_type == "tool_call"]
+        self.assertEqual(len(tool_events), 1, "Should have exactly 1 tool call total")
 
 
 if __name__ == "__main__":
