@@ -19,7 +19,7 @@ def main(
     conv = chat_templates[server_args.chat_template].copy()
     image_token = conv.image_token
 
-    image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+    image_url = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
 
     prompt = f"What's in this image?\n{image_token}"
 

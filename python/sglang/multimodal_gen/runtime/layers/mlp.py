@@ -6,7 +6,10 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 
 
 class MLP(nn.Module):
@@ -25,18 +28,21 @@ class MLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.fc_in = ReplicatedLinear(
+        self.fc_in = ColumnParallelLinear(
             input_dim,
-            mlp_hidden_dim,  # For activation func like SiLU that need 2x width
-            bias=bias,
-            params_dtype=dtype,
+            mlp_hidden_dim,
+            bias=True,
+            gather_output=False,
         )
 
         self.act = get_act_fn(act_type)
         if output_dim is None:
             output_dim = input_dim
-        self.fc_out = ReplicatedLinear(
-            mlp_hidden_dim, output_dim, bias=bias, params_dtype=dtype
+        self.fc_out = RowParallelLinear(
+            mlp_hidden_dim,
+            output_dim,
+            bias=True,
+            input_is_parallel=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

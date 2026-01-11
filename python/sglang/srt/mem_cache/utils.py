@@ -13,7 +13,7 @@
 # ==============================================================================
 """Common utilities."""
 
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 import triton
@@ -43,20 +43,41 @@ def set_mla_kv_buffer_kernel(
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
 
-    loc = tl.load(loc_ptr + pid_loc)
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
 
+    # Three-way branch to handle boundary correctly while preserving fast path
     if base + BLOCK <= nope_dim:
+        # Fast path: entire block is in nope region
         src = tl.load(
             cache_k_nope_ptr + pid_loc * nope_stride + offs,
             mask=mask,
         )
-    else:
+    elif base >= nope_dim:
+        # Fast path: entire block is in rope region
         offs_rope = offs - nope_dim
         src = tl.load(
             cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
             mask=mask,
         )
+    else:
+        # Boundary case: block spans nope/rope boundary (e.g., FP8 with nope_dim=528)
+        # Handle each offset individually to avoid negative indexing
+        is_nope = offs < nope_dim
+        is_rope = (offs >= nope_dim) & (offs < (nope_dim + rope_dim))
+
+        src_nope = tl.load(
+            cache_k_nope_ptr + pid_loc * nope_stride + offs,
+            mask=mask & is_nope,
+            other=0,
+        )
+        src_rope = tl.load(
+            cache_k_rope_ptr + pid_loc * rope_stride + (offs - nope_dim),
+            mask=mask & is_rope,
+            other=0,
+        )
+
+        src = tl.where(is_nope, src_nope, src_rope)
 
     tl.store(dst_ptr, src, mask=mask)
 
@@ -168,7 +189,7 @@ def get_mla_kv_buffer_kernel(
     rope_dim: tl.constexpr,
 ):
     pid_loc = tl.program_id(0)
-    loc = tl.load(loc_ptr + pid_loc)
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     loc_src_ptr = kv_buffer_ptr + loc * buffer_stride
 
     nope_offs = tl.arange(0, nope_dim)
@@ -241,3 +262,13 @@ def maybe_init_custom_mem_pool(
         return init_mooncake_custom_mem_pool(device)
     else:
         return False, None, None
+
+
+def convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
+    # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
+    # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]
+    if len(tokens) and isinstance(tokens[0], tuple):
+        return tokens
+    if len(tokens) < 2:
+        return []
+    return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -19,7 +19,7 @@ from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.utils import get_int_env_var
 
 if TYPE_CHECKING:
-    from sglang.srt.single_batch_overlap import CombineOverlapArgs
+    from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
 from enum import Enum, auto
 
@@ -302,6 +302,8 @@ class MooncakeEPDispatcher(BaseDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
+        super().__init__()
+
         self.deepep_mode = deepep_mode
 
         if self.deepep_mode.enable_low_latency():
@@ -321,8 +323,12 @@ class MooncakeEPDispatcher(BaseDispatcher):
 
         self._stage = _Stage.INITIAL
 
-    def dispatch(self, *args, **kwargs) -> DispatchOutput:
-        self.dispatch_a(*args, **kwargs)
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> DispatchOutput:
+        self.dispatch_a(hidden_states, topk_output)
         ret = self.dispatch_b()
         return ret
 
@@ -347,16 +353,14 @@ class MooncakeEPDispatcher(BaseDispatcher):
     def combine(
         self,
         combine_input: CombineInput,
-        overlap_args: Optional[CombineOverlapArgs] = None,
-    ) -> Tuple:
-        self.combine_a(combine_input, overlap_args)
+    ) -> torch.Tensor:
+        self.combine_a(combine_input)
         ret = self.combine_b()
         return ret
 
     def combine_a(
         self,
         combine_input: CombineInput,
-        overlap_args: Optional[CombineOverlapArgs] = None,
     ):
         hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
@@ -364,7 +368,7 @@ class MooncakeEPDispatcher(BaseDispatcher):
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
-            overlap_args=overlap_args,
+            overlap_args=self.overlap_args,
         )
         self._combine_intermediate_state = inner_state
 
@@ -387,6 +391,3 @@ class MooncakeEPDispatcher(BaseDispatcher):
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage
         self._stage = new_stage
-
-    def set_quant_config(self, quant_config: dict):
-        pass

@@ -313,11 +313,6 @@ class SglFunction:
         backend = backend or global_config.default_backend
         return cache_program(self, backend)
 
-    def compile(self, *, backend=None):
-        from sglang.lang.compiler import compile_func
-
-        return compile_func(self, backend)
-
     def __call__(self, *args, **kwargs):
         from sglang.lang.tracer import TracingScope
 
