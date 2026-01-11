@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnu
 from sglang.srt.layers.quantization.utils import all_close_1d, per_tensor_dequantize
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_torch_compile_disable_decorator,
     is_gfx95_supported,
     is_hip,
     set_weight_attrs,
@@ -202,6 +203,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
     ):
         self.moe_runner_config = moe_runner_config
 
+    @get_torch_compile_disable_decorator(_is_hip)
     def apply(
         self,
         layer: torch.nn.Module,
