@@ -155,6 +155,9 @@ class DiffusionServerArgs:
     dynamic_lora_path: str | None = (
         None  # LoRA path for dynamic loading test (loaded via set_lora after startup)
     )
+    second_lora_path: str | None = (
+        None  # Second LoRA adapter path for multi-LoRA testing
+    )
     # misc
     enable_warmup: bool = False
 
@@ -358,6 +361,17 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         "zimage_image_t2i_warmup",
         DiffusionServerArgs(
             model_path="Tongyi-MAI/Z-Image-Turbo", modality="image", enable_warmup=True
+        ),
+        T2I_sampling_params,
+    ),
+    # Multi-LoRA test case for Z-Image-Turbo
+    DiffusionTestCase(
+        "zimage_image_t2i_multi_lora",
+        DiffusionServerArgs(
+            model_path="Tongyi-MAI/Z-Image-Turbo",
+            modality="image",
+            lora_path="reverentelusarca/elusarca-anime-style-lora-z-image-turbo",
+            second_lora_path="tarn59/pixel_art_style_lora_z_image_turbo",
         ),
         T2I_sampling_params,
     ),
