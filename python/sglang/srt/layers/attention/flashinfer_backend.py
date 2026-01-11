@@ -487,7 +487,6 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
                 prefix_lens,
                 prefill_wrappers=self.prefill_wrappers_paged,
@@ -602,7 +601,6 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=prefill_wrappers,
@@ -632,7 +630,6 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=prefill_wrappers,
@@ -661,7 +658,6 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=prefill_wrappers,
@@ -701,7 +697,6 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
@@ -713,7 +708,6 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
@@ -725,7 +719,6 @@ class FlashInferAttnBackend(AttentionBackend):
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
@@ -1192,7 +1185,6 @@ class FlashInferIndicesUpdaterPrefill:
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
@@ -1208,7 +1200,6 @@ class FlashInferIndicesUpdaterPrefill:
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
@@ -1248,7 +1239,6 @@ class FlashInferIndicesUpdaterPrefill:
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
@@ -1297,7 +1287,6 @@ class FlashInferIndicesUpdaterPrefill:
         self,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
