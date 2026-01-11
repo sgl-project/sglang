@@ -791,6 +791,8 @@ impl Router {
             max_tree_size,
             max_idle_secs,
             assignment_mode,
+            redis_url,
+            redis_key_prefix,
             max_payload_size,
             dp_aware,
             api_key,
