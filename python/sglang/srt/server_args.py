@@ -1846,9 +1846,13 @@ class ServerArgs:
         
         if self.moe_a2a_backend == "pplx":
             self.ep_size = self.tp_size
+            if self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "triton"
             logger.warning(
-                f"PPLX MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+                f"PPLX MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]. "
+                f"Using runner backend: {self.moe_runner_backend}"
             )
+
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):

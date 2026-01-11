@@ -26,6 +26,10 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.pplx import (
+        PPLXCombineInput,
+        PPLXDispatchOutput,
+    )
 
 
 _is_hip = is_hip()
@@ -358,6 +362,74 @@ def fused_experts_none_to_triton(
 
     return StandardCombineInput(
         hidden_states=output,
+    )
+
+@register_fused_func("pplx", "triton")
+def fused_experts_pplx_to_triton(
+    dispatch_output: PPLXDispatchOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> PPLXCombineInput:
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+    from sglang.srt.layers.moe.token_dispatcher.pplx import PPLXCombineInput
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    out_expert_num_tokens = dispatch_output.expert_num_tokens
+    expert_offsets = torch.cumsum(out_expert_num_tokens, dim=0)
+    zeros = torch.zeros(1, dtype=expert_offsets.dtype, device=expert_offsets.device)
+    expert_offsets = torch.cat([zeros, expert_offsets])
+
+    num_local_experts = dispatch_output.hidden_states.size(0)
+    capacity = dispatch_output.hidden_states.size(1)
+    
+    range_vector = torch.arange(capacity, device=dispatch_output.hidden_states.device)
+    mask = range_vector < out_expert_num_tokens.unsqueeze(1)
+
+    # dispatch_output.hidden_states.shape = (num_local_experts, max_num_tokens * num_dispatchers, hidden_dim)
+    fused_moe_input = dispatch_output.hidden_states[mask]
+
+    fake_topk_ids = torch.repeat_interleave(
+        torch.arange(num_local_experts, device=dispatch_output.hidden_states.device, dtype=torch.int32),
+        out_expert_num_tokens.long(),
+        dim=0
+    ).unsqueeze(1) # (total_tokens, 1)
+
+    fake_topk_weights = torch.ones_like(fake_topk_ids, dtype=torch.float32)
+    fake_topk_output = StandardTopKOutput(
+        topk_weights=fake_topk_weights,
+        topk_ids=fake_topk_ids,
+        router_logits=None
+    )
+
+    output = fused_experts(
+        hidden_states=fused_moe_input,
+        w1=quant_info.w13_weight,
+        w2=quant_info.w2_weight,
+        topk_output=fake_topk_output,
+        moe_runner_config=runner_config,
+        b1=quant_info.b13,
+        b2=quant_info.b2,
+        use_fp8_w8a8=quant_info.use_fp8_w8a8,
+        use_int8_w8a8=quant_info.use_int8_w8a8,
+        use_int8_w8a16=quant_info.use_int8_w8a16,
+        use_int4_w4a16=quant_info.use_int4_w4a16,
+        per_channel_quant=quant_info.per_channel_quant,
+        w1_scale=quant_info.w13_scale,
+        w2_scale=quant_info.w2_scale,
+        w1_zp=quant_info.w13_zp,
+        w2_zp=quant_info.w2_zp,
+        a1_scale=quant_info.a13_scale,
+        a2_scale=quant_info.a2_scale,
+        block_shape=quant_info.block_shape,
+    )
+    # Scatter back to the full shape (E, C, H)
+    expert_y = torch.empty_like(dispatch_output.hidden_states)
+    expert_y[mask] = output
+
+    return PPLXCombineInput(
+        hidden_states=expert_y,
+        topk_ids=dispatch_output.topk_output.topk_ids,
+        topk_weights=dispatch_output.topk_output.topk_weights,
     )
 
 

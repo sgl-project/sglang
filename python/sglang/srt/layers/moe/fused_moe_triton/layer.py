@@ -119,30 +119,13 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         )
     elif a2a_backend.is_pplx():
         from sglang.srt.layers.moe.token_dispatcher.pplx import PPLXDispatcher
-
-        hidden_dim_bytes = (
-            moe_runner_config.hidden_size * moe_runner_config.params_dtype.itemsize
-        )
-        hidden_dim_scale_bytes = 0
-        if moe_runner_config.params_dtype.itemsize == 1: # FP8
-            block_size = 128
-            hidden_dim_scale_bytes = (
-                (moe_runner_config.hidden_size + block_size - 1)
-                // block_size
-                * 4
-            )
         
-        # PPLX needs a group that supports CPU operations for internal sync
-        # The cpu_group uses gloo backend which supports CPU
-        tp_group = get_tp_group()
         return PPLXDispatcher(
-            group=tp_group.cpu_group,
-            device_group=tp_group.device_group,
             num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
             experts_per_token=moe_runner_config.top_k,
             hidden_dim=moe_runner_config.hidden_size,
-            hidden_dim_bytes=hidden_dim_bytes,
-            hidden_dim_scale_bytes=hidden_dim_scale_bytes,
+            params_dtype=moe_runner_config.params_dtype,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
