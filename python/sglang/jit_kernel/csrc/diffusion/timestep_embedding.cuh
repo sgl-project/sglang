@@ -151,7 +151,9 @@ void timestep_embedding(
 
   RuntimeCheck(D.unwrap() == dim, "Output dim mismatch: ", D.unwrap(), " vs ", dim);
   RuntimeCheck(dim % 8 == 0, "dim must align to 8, got ", dim);
-  
+
+  const DLDataType in_dtype = input.dtype();
+
   const bool in_ok =
       (in_dtype.code == kDLFloat && in_dtype.bits == 16) ||
       (in_dtype.code == kDLBfloat && in_dtype.bits == 16) ||
