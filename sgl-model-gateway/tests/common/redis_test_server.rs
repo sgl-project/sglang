@@ -70,7 +70,7 @@ impl RedisTestServer {
             if self.is_ready().is_ok() {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(200));
         }
         panic!("Timeout waiting Redis server ready on port {}", self.port);
     }
