@@ -416,10 +416,10 @@ impl RedisBackend {
                 return (None, ExecutionBranch::RedisGetexException);
             }
         };
+        let old_candidates = old_data.as_ref().map(|x| CandidateWorkerUrls::deserialize(x));
 
-        if let Some(ref data) = old_data {
-            let candidates = CandidateWorkerUrls::deserialize(data);
-            if let Some(idx) = find_healthy_worker(candidates.urls(), workers, healthy_indices) {
+        if let Some(ref old_candidates) = old_candidates {
+            if let Some(idx) = find_healthy_worker(old_candidates.urls(), workers, healthy_indices) {
                 return (Some(idx), ExecutionBranch::OccupiedHit);
             }
         }
@@ -427,8 +427,7 @@ impl RedisBackend {
         let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
         let new_url = workers[selected_idx].url();
 
-        let (new_candidates, branch) = if let Some(ref data) = old_data {
-            let mut candidates = CandidateWorkerUrls::deserialize(data);
+        let (new_candidates, branch) = if let Some(mut candidates) = old_candidates {
             candidates.push_bounded(new_url.to_string());
             (candidates, ExecutionBranch::OccupiedMiss)
         } else {
