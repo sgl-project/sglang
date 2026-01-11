@@ -155,7 +155,7 @@ impl ManualPolicy {
         self.backend.as_local()
     }
 
-    #[cfg(test)]
+    /// Iterate over all stored candidate URLs. Used for testing.
     pub async fn iter_urls(&self) -> Vec<Vec<String>> {
         self.backend.iter_urls().await
     }
@@ -244,7 +244,6 @@ impl Backend {
         }
     }
 
-    #[cfg(test)]
     async fn iter_urls(&self) -> Vec<Vec<String>> {
         match self {
             Backend::Local(b) => b.iter_urls(),
@@ -386,7 +385,6 @@ impl LocalBackend {
         self._eviction_task.is_some()
     }
 
-    #[cfg(test)]
     fn iter_urls(&self) -> Vec<Vec<String>> {
         self.routing_map
             .iter()
