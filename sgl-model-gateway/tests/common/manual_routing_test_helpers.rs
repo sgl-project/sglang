@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use smg::core::{BasicWorkerBuilder, Worker, WorkerType};
+use smg::{
+    core::{BasicWorkerBuilder, Worker, WorkerType},
+    policies::{ManualConfig, ManualPolicy},
+};
 
 use super::redis_test_server::get_shared_server;
 
@@ -40,4 +43,12 @@ pub fn get_redis_config(test_name: &str) -> RedisConfig {
         url: server.url().to_string(),
         key_prefix: random_prefix(test_name),
     }
+}
+
+pub fn create_policy(redis_url: Option<String>, redis_key_prefix: Option<String>) -> ManualPolicy {
+    ManualPolicy::with_config(ManualConfig {
+        redis_url,
+        redis_key_prefix,
+        ..Default::default()
+    })
 }

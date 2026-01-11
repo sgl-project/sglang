@@ -362,11 +362,16 @@ async fn test_min_group_sticky_routing_impl(
 
 all_backend_e2e_test!(test_min_group_sticky_routing, 3920);
 
-async fn test_min_group_mixed_concurrent_routing_impl(base_port: u16, redis_url: Option<String>) {
-    let config = TestRouterConfig::manual_with_options(
+async fn test_min_group_mixed_concurrent_routing_impl(
+    base_port: u16,
+    redis_url: Option<String>,
+    redis_key_prefix: Option<String>,
+) {
+    let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::MinGroup,
         redis_url,
+        redis_key_prefix,
     );
     let ctx = AppTestContext::new_with_config(
         config,
