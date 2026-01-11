@@ -760,7 +760,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
-                torch_compile=self.server_args.enable_piecewise_cuda_graph,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -1432,6 +1431,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
+        return result
+
+    def load_lora_adapter_from_tensors(
+        self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
+    ):
+        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
+        result = self.lora_manager.load_lora_adapter_from_tensors(
+            lora_ref, tensors, config_dict, added_tokens_config
+        )
+        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
         return result
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
@@ -2154,6 +2163,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # In DP Attention, IDLE batches are padded (batch_size > 0) for MLP sync.
+        # in this case, we need to reinit the forward metadata, otherwise the stale
+        # metadata causes batch_size mismatch in attention kernel(e.g. NSA Indexer).
+        if forward_batch.batch_size > 0:
+            self.attn_backend.init_forward_metadata(forward_batch)
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors

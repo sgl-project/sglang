@@ -2,12 +2,81 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 
 import requests
 from github import Auth, Github
 
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
+
+
+def find_workflow_run_url(
+    gh_repo, workflow_id, ref, target_stage, token, dispatch_time, max_wait=30
+):
+    """
+    Poll for the workflow run URL after dispatch.
+
+    Args:
+        gh_repo: PyGithub repository object
+        workflow_id: ID of the workflow that was dispatched
+        ref: Branch/ref the workflow was dispatched on
+        target_stage: The stage name we're looking for
+        token: GitHub API token
+        dispatch_time: Unix timestamp when dispatch was triggered
+        max_wait: Maximum seconds to wait for the run to appear
+
+    Returns:
+        The workflow run URL if found, None otherwise.
+    """
+    for attempt in range(max_wait // 5):
+        time.sleep(5)
+
+        # Get recent workflow_dispatch runs for this workflow
+        runs_url = f"https://api.github.com/repos/{gh_repo.full_name}/actions/workflows/{workflow_id}/runs"
+        runs_resp = requests.get(
+            runs_url,
+            params={"event": "workflow_dispatch", "branch": ref, "per_page": 10},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+
+        if runs_resp.status_code != 200:
+            print(f"Failed to fetch workflow runs: {runs_resp.status_code}")
+            continue
+
+        for run in runs_resp.json().get("workflow_runs", []):
+            # Skip runs created before our dispatch (with 10s tolerance)
+            run_created = datetime.fromisoformat(
+                run["created_at"].replace("Z", "+00:00")
+            ).timestamp()
+            if run_created < dispatch_time - 10:
+                continue
+
+            # Verify: check if target_stage job exists and is NOT skipped
+            # This distinguishes our run from other workflow_dispatch runs
+            jobs_resp = requests.get(
+                f"https://api.github.com/repos/{gh_repo.full_name}/actions/runs/{run['id']}/jobs",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+            )
+
+            if jobs_resp.status_code == 200:
+                for job in jobs_resp.json().get("jobs", []):
+                    # Match job name containing target_stage
+                    # Job names may include partition suffix like "stage-b-test-small-1-gpu (0)"
+                    if target_stage in job["name"] and job["conclusion"] != "skipped":
+                        print(
+                            f"Found matching workflow run: {run['id']} with job {job['name']}"
+                        )
+                        return run["html_url"]
+
+    print(f"Could not find workflow run after {max_wait} seconds")
+    return None
 
 
 def get_env_var(name):
@@ -154,7 +223,6 @@ def handle_rerun_stage(
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
         "quantization-test",
-        "unit-test-backend-1-gpu",
         "stage-b-test-4-gpu-b200",
         "unit-test-backend-4-gpu",
         "unit-test-backend-8-gpu-h200",
@@ -251,6 +319,9 @@ def handle_rerun_stage(
             else:
                 inputs = {"version": "release", "target_stage": stage_name}
 
+        # Record dispatch time before triggering
+        dispatch_time = time.time()
+
         # Use requests directly as PyGithub's create_dispatch only accepts HTTP 204
         dispatch_url = f"https://api.github.com/repos/{gh_repo.full_name}/actions/workflows/{target_workflow.id}/dispatches"
         dispatch_resp = requests.post(
@@ -270,9 +341,26 @@ def handle_rerun_stage(
             if react_on_success:
                 comment.create_reaction("+1")
                 pr.create_issue_comment(
-                    f"✅ Triggered `{stage_name}` to run independently (skipping dependencies).\n\n"
-                    f"It will not be shown in this page. Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
+                    f"✅ Triggered `{stage_name}` to run independently (skipping dependencies)."
                 )
+
+                # Poll for the workflow run URL and post follow-up comment
+                run_url = find_workflow_run_url(
+                    gh_repo,
+                    target_workflow.id,
+                    ref,
+                    stage_name,
+                    token,
+                    dispatch_time,
+                    max_wait=30,
+                )
+                if run_url:
+                    pr.create_issue_comment(f"🔗 [View workflow run]({run_url})")
+                else:
+                    pr.create_issue_comment(
+                        f"⚠️ Could not retrieve workflow run URL. "
+                        f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
+                    )
             return True
         else:
             print("Failed to trigger workflow_dispatch")
