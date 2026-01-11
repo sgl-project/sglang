@@ -315,6 +315,13 @@ class DecodePreallocQueue:
         )
         return kv_manager
 
+    def release_memory_occupation(self):
+        if hasattr(self.kv_manager, "close"):
+            self.kv_manager.close()
+
+    def resume_memory_occupation(self):
+        self.kv_manager = self._init_kv_manager()
+
     def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
         if self._check_if_req_exceed_kv_capacity(req):
