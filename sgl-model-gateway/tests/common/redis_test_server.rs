@@ -65,16 +65,17 @@ impl RedisTestServer {
         })
     }
 
-    pub fn wait_ready(&self) {
-        let client = redis::Client::open(self.url.as_str())
-            .expect("Failed to create Redis client for health check");
+    pub fn is_ready(&self) -> Result<(), redis::RedisError> {
+        let client = redis::Client::open(self.url.as_str())?;
+        let mut conn = client.get_connection()?;
+        redis::cmd("PING").query::<String>(&mut conn)?;
+        Ok(())
+    }
 
+    pub fn wait_ready(&self) {
         for _ in 0..50 {
-            if let Ok(mut conn) = client.get_connection() {
-                let result: Result<String, _> = redis::cmd("PING").query(&mut conn);
-                if result.is_ok() {
-                    return;
-                }
+            if self.is_ready().is_ok() {
+                return;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
