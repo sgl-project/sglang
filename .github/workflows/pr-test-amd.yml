@@ -24,6 +24,11 @@ on:
         required: false
         type: string
         default: ""
+      pr_head_sha:
+        description: "PR head SHA to checkout (for /rerun-stage on fork PRs)"
+        required: false
+        type: string
+        default: ""
   workflow_call:
     inputs:
       ref:
@@ -36,8 +41,10 @@ on:
         required: false
         type: boolean
         default: false
+
 concurrency:
-  group: pr-test-amd-${{ inputs.ref || github.ref }}
+  # Include pr_head_sha in group for /rerun-stage dispatches to avoid collisions with main branch runs
+  group: pr-test-amd-${{ inputs.pr_head_sha || inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
@@ -55,7 +62,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Determine run mode
         id: run-mode
@@ -110,7 +117,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -158,7 +165,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -175,7 +182,86 @@ jobs:
       - name: Run test
         timeout-minutes: 10
         run: |
-          docker exec -w /sglang-checkout/test ci_sglang python3 run_suite.py --hw amd --suite stage-a-test-1
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1
+
+  stage-b-test-small-1-gpu-amd:
+    needs: [check-changes, stage-a-test-1-amd]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi325-gpu-1]
+        part: [0, 1, 2, 3]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 4
+
+  stage-b-test-large-2-gpu-amd:
+    needs: [check-changes, stage-a-test-1-amd]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-b-test-large-2-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi325-gpu-2]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-amd
 
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
@@ -191,7 +277,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -312,7 +398,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -439,7 +525,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -479,7 +565,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -521,7 +607,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -566,7 +652,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -621,7 +707,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -670,7 +756,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -729,7 +815,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -746,8 +832,6 @@ jobs:
         timeout-minutes: 30
         run: |
           bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
-          bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
-          bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py
 
   accuracy-test-2-gpu-amd:
     needs: [check-changes, accuracy-test-1-gpu-amd]
@@ -771,7 +855,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -800,6 +884,8 @@ jobs:
         multimodal-gen-test-2-gpu-amd,
 
         stage-a-test-1-amd,
+        stage-b-test-small-1-gpu-amd,
+        stage-b-test-large-2-gpu-amd,
         unit-test-backend-1-gpu-amd,
         unit-test-backend-2-gpu-amd,
         unit-test-backend-8-gpu-amd,
@@ -807,7 +893,7 @@ jobs:
         performance-test-1-gpu-part-2-amd,
         performance-test-2-gpu-amd,
         accuracy-test-1-gpu-amd,
-        accuracy-test-2-gpu-amd, # Temporarily disabled
+        accuracy-test-2-gpu-amd,
       ]
     if: always()
     runs-on: ubuntu-latest

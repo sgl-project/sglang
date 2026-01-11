@@ -149,6 +149,8 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
+NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
+
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 NSA_CHOICES = [
@@ -306,7 +308,6 @@ class ServerArgs:
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
-    hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
@@ -337,6 +338,7 @@ class ServerArgs:
     log_requests: bool = False
     log_requests_level: int = 2
     log_requests_format: str = "text"
+    log_requests_target: Optional[List[str]] = None
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -480,6 +482,10 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
+
+    # Hierarchical sparse attention
+    hierarchical_sparse_attention_extra_config: Optional[str] = None
+
     # LMCache
     enable_lmcache: bool = False
 
@@ -575,6 +581,7 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
+    nsa_prefill_cp_mode: str = "in-seq-split"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
 
@@ -1059,17 +1066,29 @@ class ServerArgs:
             if is_deepseek_nsa(hf_config):  # DeepSeek 3.2
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
-                    logger.info("Use nsa attention backend for DeepSeek NSA.")
+                    logger.info("Use nsa attention backend for DeepSeek with DSA.")
 
                 if not is_npu():  # CUDA GPU
-                    self.enable_dp_attention = True
-                    logger.warning("DP attention is enabled for DeepSeek NSA.")
                     if self.enable_nsa_prefill_context_parallel:
-                        # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
-                        self.moe_dense_tp_size = 1
-                        self.moe_a2a_backend = "deepep"
-                        self.ep_size = self.tp_size
-                        self.kv_cache_dtype = "bf16"
+                        logger.warning(
+                            f"Context parallel feature is still under experiment. It has only been verified on Hopper platform."
+                        )
+                        if self.nsa_prefill_cp_mode == "in-seq-split":
+                            # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
+                            self.enable_dp_attention = True
+                            self.moe_dense_tp_size = 1
+                            self.moe_a2a_backend = "deepep"
+                            self.ep_size = self.tp_size
+                            self.kv_cache_dtype = "bf16"
+                            logger.warning(
+                                f"For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, kv_cache_dtype == bf16, batch_size == 1"
+                            )
+                        else:
+                            self.enable_dp_attention = True
+                            self.moe_dense_tp_size = 1
+                            assert (
+                                self.dp_size == 1
+                            ), "For round-robin split mode, dp attention is not supported."
                         assert (
                             self.tp_size == 8
                         ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
@@ -1081,12 +1100,12 @@ class ServerArgs:
                         # Pure TP and partial DP Attention mode is active for NSA, logging a warning
                         if self.dp_size < self.tp_size:
                             logger.warning(
-                                f"NSA with TP mode is active, dp_size={self.dp_size}, tp_size={self.tp_size}, "
+                                f"DSA with TP mode is active, dp_size={self.dp_size}, tp_size={self.tp_size}, "
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
                     self.page_size = 64
-                    logger.warning("Setting page size to 64 for DeepSeek NSA.")
+                    logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     # For Hopper, we support both bf16 and fp8 kv cache; for Blackwell, we support fp8 only currently
                     import torch
@@ -1095,34 +1114,29 @@ class ServerArgs:
                     if self.kv_cache_dtype == "auto":
                         self.kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
                         logger.warning(
-                            f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek NSA."
+                            f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
                         )
                     if self.kv_cache_dtype == "bf16":
                         self.kv_cache_dtype = "bfloat16"
                     assert self.kv_cache_dtype in [
                         "bfloat16",
                         "fp8_e4m3",
-                    ], "DeepSeek NSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+                    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
                     if self.kv_cache_dtype == "fp8_e4m3":
                         # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
                         self.nsa_prefill_backend = "flashmla_auto"
                         self.nsa_decode_backend = "flashmla_kv"
                         logger.warning(
-                            "Setting NSA backend to flashmla_auto for prefill and flashmla_kv for decode for FP8 KV Cache."
+                            "Setting DSA backend to flashmla_auto for prefill and flashmla_kv for decode for FP8 KV Cache."
                         )
                     else:
-                        # set prefill/decode backends for Blackwell. The default settings are for Hopper.
+                        # set prefill/decode backends to flashmla_sparse for Blackwell.
+                        # The default settings (P=flashmla_sparse, D=fa3) are for Hopper.
                         if major >= 10:
                             self.nsa_prefill_backend = "flashmla_sparse"
                             self.nsa_decode_backend = "flashmla_sparse"
 
-                    # Logging env vars for NSA
-                    from sglang.srt.layers.attention.nsa.utils import (
-                        print_nsa_bool_env_vars,
-                    )
-
-                    print_nsa_bool_env_vars()
                 if self.enable_nsa_prefill_context_parallel:
                     assert (
                         self.disaggregation_mode != "decode"
@@ -1501,7 +1515,7 @@ class ServerArgs:
                 f"Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
-        # TRTLLM AllReduce Fusion supports SM90/100/120, enable it by default
+        # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
@@ -1518,7 +1532,7 @@ class ServerArgs:
                 "Glm4MoeForCausalLM",
                 "Qwen3MoeForCausalLM",
             ]
-            and (is_sm90_supported() or is_blackwell_supported())
+            and (is_sm90_supported() or is_sm100_supported())
             and not self.enable_dp_attention
             and self.nnodes == 1
             and not is_h20_device
@@ -2410,7 +2424,19 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
-        if not self.disable_cuda_graph:
+        # On AMD/HIP, disable cuda graph for DLLM and use triton backend
+        if is_hip():
+            if not self.disable_cuda_graph:
+                logger.warning(
+                    "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
+                )
+                self.disable_cuda_graph = True
+            if self.attention_backend not in ["triton", "aiter"]:
+                logger.warning(
+                    "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
+                )
+                self.attention_backend = "triton"
+        elif not self.disable_cuda_graph:
             if self.cuda_graph_bs != [1]:
                 logger.warning(
                     "Cuda graph bs is set to [1] because of using diffusion LLM inference"
@@ -2817,15 +2843,8 @@ class ServerArgs:
         )
         parser.add_argument(
             "--hybrid-kvcache-ratio",
-            nargs="?",
-            const=0.5,
-            type=float,
-            default=ServerArgs.hybrid_kvcache_ratio,
-            help=(
-                "Mix ratio in [0,1] between uniform and hybrid kv buffers "
-                "(0.0 = pure uniform: swa_size / full_size = 1)"
-                "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
-            ),
+            action=DeprecatedAction,
+            help="Note: --hybrid-kvcache-ratio is deprecated now. Please use --swa-full-tokens-ratio instead.",
         )
         parser.add_argument(
             "--swa-full-tokens-ratio",
@@ -2985,6 +3004,14 @@ class ServerArgs:
             default=ServerArgs.log_requests_format,
             choices=["text", "json"],
             help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
+        )
+        parser.add_argument(
+            "--log-requests-target",
+            type=str,
+            nargs="+",
+            default=ServerArgs.log_requests_target,
+            help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
+            "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
         )
         parser.add_argument(
             "--crash-dump-folder",
@@ -3780,6 +3807,18 @@ class ServerArgs:
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
         )
+
+        # Hierarchical sparse attention
+        parser.add_argument(
+            "--hierarchical-sparse-attention-extra-config",
+            type=str,
+            default=ServerArgs.hierarchical_sparse_attention_extra_config,
+            help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
+            "Required fields: algorithm (str), backend (str). "
+            "All other fields are algorithm-specific and passed to the algorithm constructor. "
+            'Example: \'{"algorithm": "quest", "backend": "flashattention", "sparsity_ratio": 0.7, "min_sparse_prompt_len": 2048}\'',
+        )
+
         # LMCache
         parser.add_argument(
             "--enable-lmcache",
@@ -4217,6 +4256,14 @@ class ServerArgs:
             "--enable-nsa-prefill-context-parallel",
             action="store_true",
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
+        )
+        parser.add_argument(
+            "--nsa-prefill-cp-mode",
+            type=str,
+            default=ServerArgs.nsa_prefill_cp_mode,
+            choices=NSA_PREFILL_CP_SPLIT_CHOICES,
+            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'in-seq-split' (default), 'round-robin-split'. "
+            "'round-robin-split' distributes tokens across ranks based on token_idx % cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
         )
         parser.add_argument(
             "--enable-fused-qk-norm-rope",
