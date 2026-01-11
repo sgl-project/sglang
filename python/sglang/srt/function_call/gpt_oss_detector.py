@@ -237,5 +237,8 @@ class GptOssDetector(BaseFormatDetector):
             parameters=json.dumps(arguments, ensure_ascii=False),
         )
 
+    def supports_structural_tag(self) -> bool:
+        return False
+
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError("structure_info not used with HarmonyParser")
