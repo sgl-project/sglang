@@ -10,7 +10,7 @@ use tower::ServiceExt;
 
 use crate::common::{
     manual_routing_test_helpers::{
-        all_backend_e2e_test, get_redis_config, send_request, ROUTING_KEY_HEADER,
+        manual_routing_all_backend_e2e_test, get_redis_config, send_request, ROUTING_KEY_HEADER,
     },
     AppTestContext, TestRouterConfig, TestWorkerConfig,
 };
@@ -82,7 +82,7 @@ async fn test_routing_with_header_impl(
     ctx.shutdown().await;
 }
 
-all_backend_e2e_test!(test_routing_with_header, 3700);
+manual_routing_all_backend_e2e_test!(test_routing_with_header, 3700);
 
 async fn test_routing_without_header_impl(
     base_port: u16,
@@ -131,7 +131,7 @@ async fn test_routing_without_header_impl(
     ctx.shutdown().await;
 }
 
-all_backend_e2e_test!(test_routing_without_header, 3710);
+manual_routing_all_backend_e2e_test!(test_routing_without_header, 3710);
 
 async fn test_routing_consistency_impl(
     base_port: u16,
@@ -189,7 +189,7 @@ async fn test_routing_consistency_impl(
     ctx.shutdown().await;
 }
 
-all_backend_e2e_test!(test_routing_consistency, 3720);
+manual_routing_all_backend_e2e_test!(test_routing_consistency, 3720);
 
 // ============================================================================
 // Min Group Mode Tests
@@ -253,7 +253,7 @@ async fn test_min_group_concurrent_distribution_impl(
     ctx.shutdown().await;
 }
 
-all_backend_e2e_test!(test_min_group_concurrent_distribution, 3910);
+manual_routing_all_backend_e2e_test!(test_min_group_concurrent_distribution, 3910);
 
 async fn test_min_group_sticky_routing_impl(
     base_port: u16,
@@ -301,7 +301,7 @@ async fn test_min_group_sticky_routing_impl(
     ctx.shutdown().await;
 }
 
-all_backend_e2e_test!(test_min_group_sticky_routing, 3920);
+manual_routing_all_backend_e2e_test!(test_min_group_sticky_routing, 3920);
 
 async fn test_min_group_mixed_concurrent_routing_impl(
     base_port: u16,
@@ -364,4 +364,4 @@ async fn test_min_group_mixed_concurrent_routing_impl(
     ctx.shutdown().await;
 }
 
-all_backend_e2e_test!(test_min_group_mixed_concurrent_routing, 3930);
+manual_routing_all_backend_e2e_test!(test_min_group_mixed_concurrent_routing, 3930);

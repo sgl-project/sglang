@@ -111,7 +111,7 @@ pub async fn send_request(app: axum::Router, routing_key: &str) -> (String, Stri
 }
 
 #[macro_export]
-macro_rules! all_backend_test {
+macro_rules! manual_routing_all_backend_test {
     ($name:ident) => {
         paste::paste! {
             #[tokio::test]
@@ -129,7 +129,7 @@ macro_rules! all_backend_test {
 }
 
 #[macro_export]
-macro_rules! all_backend_e2e_test {
+macro_rules! manual_routing_all_backend_e2e_test {
     ($name:ident, $base_port:expr) => {
         paste::paste! {
             #[tokio::test]
@@ -146,5 +146,5 @@ macro_rules! all_backend_e2e_test {
     };
 }
 
-pub use all_backend_e2e_test;
-pub use all_backend_test;
+pub use manual_routing_all_backend_e2e_test;
+pub use manual_routing_all_backend_test;
