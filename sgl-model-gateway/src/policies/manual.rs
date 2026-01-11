@@ -346,61 +346,49 @@ impl RedisBackend {
         let mut conn = match self.get_conn_with_retry().await {
             Some(c) => c,
             None => {
-                return (random_select(healthy_indices), ExecutionBranch::Vacant);
+                return (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::Vacant);
             }
         };
 
-        let existing: Option<String> = match redis::cmd("GET").arg(&key).query_async(&mut conn).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Redis GET failed: {}", e);
-                return (random_select(healthy_indices), ExecutionBranch::Vacant);
-            }
-        };
-
-        if let Some(data) = existing {
+        // Fast path: read-only GET, check if we have a healthy cached worker
+        if let Ok(Some(data)) = redis::cmd("GET").arg(&key).query_async::<Option<String>>(&mut conn).await {
             let candidates = Self::parse_candidates(&data);
             if let Some(idx) = find_healthy_worker(&candidates, workers, healthy_indices) {
                 let _ = redis::cmd("EXPIRE").arg(&key).arg(self.ttl_secs).query_async::<()>(&mut conn).await;
                 return (idx, ExecutionBranch::OccupiedHit);
             }
-            let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
-            let new_url = workers[selected_idx].url();
-            let mut new_candidates = candidates;
-            while new_candidates.len() >= MAX_CANDIDATE_WORKERS {
-                new_candidates.remove(0);
-            }
-            new_candidates.push(new_url.to_string());
-            let new_data = Self::serialize_candidates(&new_candidates);
-            let _ = redis::cmd("SET").arg(&key).arg(&new_data).arg("EX").arg(self.ttl_secs).query_async::<()>(&mut conn).await;
-            return (selected_idx, ExecutionBranch::OccupiedMiss);
+            // Fall through to slow path - key exists but no healthy worker
         }
 
-        let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
-        let new_url = workers[selected_idx].url();
+        // Slow path: need to write
+        // Re-GET to handle race condition (similar to DashMap entry pattern)
+        let existing: Option<String> = redis::cmd("GET").arg(&key).query_async(&mut conn).await.ok().flatten();
 
-        let set_result: Result<Option<String>, _> = redis::cmd("SET")
-            .arg(&key)
-            .arg(new_url)
-            .arg("NX")
-            .arg("EX")
-            .arg(self.ttl_secs)
-            .arg("GET")
-            .query_async(&mut conn)
-            .await;
-
-        match set_result {
-            Ok(None) => (selected_idx, ExecutionBranch::Vacant),
-            Ok(Some(existing_data)) => {
-                let candidates = Self::parse_candidates(&existing_data);
+        match existing {
+            Some(data) => {
+                // Occupied: re-check health (may have changed between fast and slow path)
+                let candidates = Self::parse_candidates(&data);
                 if let Some(idx) = find_healthy_worker(&candidates, workers, healthy_indices) {
-                    (idx, ExecutionBranch::OccupiedHit)
-                } else {
-                    (selected_idx, ExecutionBranch::OccupiedMiss)
+                    let _ = redis::cmd("EXPIRE").arg(&key).arg(self.ttl_secs).query_async::<()>(&mut conn).await;
+                    return (idx, ExecutionBranch::OccupiedHit);
                 }
+                // No healthy worker, select new one and append to candidates
+                let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
+                let new_url = workers[selected_idx].url();
+                let mut new_candidates = candidates;
+                while new_candidates.len() >= MAX_CANDIDATE_WORKERS {
+                    new_candidates.remove(0);
+                }
+                new_candidates.push(new_url.to_string());
+                let new_data = Self::serialize_candidates(&new_candidates);
+                let _ = redis::cmd("SET").arg(&key).arg(&new_data).arg("EX").arg(self.ttl_secs).query_async::<()>(&mut conn).await;
+                (selected_idx, ExecutionBranch::OccupiedMiss)
             }
-            Err(e) => {
-                warn!("Redis SET NX failed: {}", e);
+            None => {
+                // Vacant: create new entry
+                let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
+                let new_url = workers[selected_idx].url();
+                let _ = redis::cmd("SET").arg(&key).arg(new_url).arg("EX").arg(self.ttl_secs).query_async::<()>(&mut conn).await;
                 (selected_idx, ExecutionBranch::Vacant)
             }
         }
