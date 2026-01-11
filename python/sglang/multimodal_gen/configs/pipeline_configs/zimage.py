@@ -1,6 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, List
 
 import torch
 
@@ -25,9 +25,55 @@ def zimage_preprocess_text(prompt: str):
 
 
 def zimage_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
-    device = outputs.hidden_states[-2].device
-    prompt_mask = _text_inputs.attention_mask.to(device).bool()
-    return outputs.hidden_states[-2][0][prompt_mask[0]]
+    """
+    Basic mode:
+        single text embeds
+        which assert batch_size == 1
+
+        torch.tensor
+
+    Omni mode:
+        Omni mode text embedding require a fregment pattern
+        which break a single text into fregments(split by <|vision_start|>).
+        number of fregments is num_image + 2
+
+        mask flatten embeds and reconstruct batch into
+        List[List[torch.Tensor]]
+
+    Returns:
+        (torch.tensor | List[List[torch.Tensor]])
+            torch.tensor: single batch embed
+            List[List[torch.Tensor]]: single batch fregs of embeds.
+            where len(d) == batch size. len(d[bid]) == num_image + 2
+    """
+
+    prompt_list_lengths = getattr(_text_inputs, "prompt_list_lengths", None)
+    if prompt_list_lengths is None:
+        # Basic mode
+        device = outputs.hidden_states[-2].device
+        prompt_mask = _text_inputs.attention_mask.to(device).bool()
+        embeds = outputs.hidden_states[-2][0][prompt_mask[0]]
+    else:
+        # Omni mode
+        # from flatten to batching
+        # List[List[torch.Tensor]]
+
+        device = outputs.hidden_states[-2].device
+        embeddings_list = []
+        start_idx = 0
+        for i in range(len(prompt_list_lengths)):
+            batch_embeddings = []
+            end_idx = start_idx + prompt_list_lengths[i]
+            prompt_embeds = outputs.hidden_states[-2]
+            prompt_masks = _text_inputs.attention_mask.to(device).bool()
+            for j in range(start_idx, end_idx):
+                batch_embeddings.append(prompt_embeds[j][prompt_masks[j]])
+            embeddings_list.append(batch_embeddings)
+            start_idx = end_idx
+        # TODO: hard code debug.
+        embeds = embeddings_list
+
+    return embeds
 
 
 class TransformersModelConfig(EncoderConfig):
@@ -55,18 +101,45 @@ class ZImagePipelineConfig(ImagePipelineConfig):
     )
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
-        # flatten to 1-d list
-        inputs = tokenizer.apply_chat_template(
-            prompts,
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=True,
-            padding="max_length",
-            max_length=512,  # TODO (yhyang201): set max length according to config
-            truncation=True,
-            return_tensors="pt",
-            return_dict=True,
-        )
+        num_condition_images = tok_kwargs.get("num_condition_images", 0)
+        # TODO: review condition by num_condition_images looks bad
+        if num_condition_images == 0:
+            # flatten to 1-d list
+            inputs = tokenizer.apply_chat_template(
+                prompts,
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=True,
+                padding="max_length",
+                max_length=512,  # TODO (yhyang201): set max length according to config
+                truncation=True,
+                return_tensors="pt",
+                return_dict=True,
+            )
+        else:
+            # all batch flattened
+            flattened_prompt = []
+            prompt_list_lengths = []
+
+            # do flatten and record metadata
+            for i in range(len(prompts)):
+                # record freg numbers
+                prompt_list_lengths.append(len(prompts[i]))
+                # NOTE: all batch flattened
+                flattened_prompt.extend(prompts[i])
+
+            inputs = tokenizer(
+                flattened_prompt,
+                padding="max_length",
+                # TODO: review ?
+                max_length=512,  # TODO (yhyang201): set max length according to config
+                truncation=True,
+                return_tensors="pt",
+            )
+
+            # TODO: hack
+            # prompt_list_lengths is used to reconstruct flattened_prompt into batching
+            inputs.prompt_list_lengths = prompt_list_lengths
         return inputs
 
     def post_denoising_loop(self, latents, batch):
@@ -139,4 +212,36 @@ class ZImagePipelineConfig(ImagePipelineConfig):
                 rotary_emb,
                 batch,
             ),
+        }
+
+
+@dataclass
+class ZImageOmniPipelineConfig(ZImagePipelineConfig):
+    def get_freqs_cis(
+        self,
+        prompt_embeds: List[torch.Tensor],
+        width,
+        height,
+        device,
+        rotary_emb,
+        batch,
+    ):
+        # TODO: online compute for now
+        # since a sequence of prompt is break into numbers of fregs
+        return [None]
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        return {
+            "freqs_cis": [
+                self.get_freqs_cis(
+                    # TODO: hard code batch size = 1
+                    # and single batch into fregs
+                    batch.prompt_embeds[0],
+                    batch.width,
+                    batch.height,
+                    device,
+                    rotary_emb,
+                    batch,
+                )
+            ],
         }

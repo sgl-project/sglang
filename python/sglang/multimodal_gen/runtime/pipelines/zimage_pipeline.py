@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import torch
+
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -15,6 +17,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -113,4 +116,346 @@ class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
 
-EntryClass = ZImagePipeline
+from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
+
+
+# TODO:
+# standalone for debug for now
+class _ImageProcessStage(PipelineStage):
+    def __init__(
+        self,
+        image_processor,
+        vae_scale_factor,
+    ) -> None:
+        self.image_processor = image_processor
+        self.vae_scale_factor = vae_scale_factor
+
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        """
+        Args:
+            batch.height
+            batch.width
+            batch.image_path
+        Returns:
+            batch.condition_image
+            batch.original_condition_image_size
+        """
+
+        # 3. Process condition images. Copied from diffusers.pipelines.flux2.pipeline_flux2
+        condition_image = []
+        resized_images = []
+        height = batch.height
+        width = batch.width
+
+        if batch.image_path is not None:
+            for path in batch.image_path:
+                if path.endswith(".mp4"):
+                    raise NotImplementedError("unimplemented")
+                    img = load_video(path)[0]
+                else:
+                    img = load_image(path)
+
+                # check img input
+                self.image_processor.check_image_input(img)
+
+                image_width, image_height = img.size
+                # TODO: useless?
+                original_condition_image_size = (image_width, image_height)
+                if image_width * image_height > 1024 * 1024:
+                    if height is not None and width is not None:
+                        img = self.image_processor._resize_to_target_area(
+                            img, height * width
+                        )
+                    else:
+                        img = self.image_processor._resize_to_target_area(
+                            img, 1024 * 1024
+                        )
+                    image_width, image_height = img.size
+                resized_images.append(img)
+
+                multiple_of = self.vae_scale_factor * 2
+                image_width = (image_width // multiple_of) * multiple_of
+                image_height = (image_height // multiple_of) * multiple_of
+                img = self.image_processor.preprocess(
+                    img, height=image_height, width=image_width, resize_mode="crop"
+                )
+                condition_image.append(img)
+
+            if len(condition_image) > 0:
+                height = height or image_height
+                width = width or image_width
+
+        vae_scale = self.vae_scale_factor * 2
+        if height % vae_scale != 0:
+            raise ValueError(
+                f"Height must be divisible by {vae_scale} (got {height}). "
+                f"Please adjust the height to a multiple of {vae_scale}."
+            )
+        if width % vae_scale != 0:
+            raise ValueError(
+                f"Width must be divisible by {vae_scale} (got {width}). "
+                f"Please adjust the width to a multiple of {vae_scale}."
+            )
+
+        # TODO: hard code
+        # should be condition_images
+        # condition_images -> prepare_image_latents
+        batch.condition_image = condition_image
+        # resized_images -> prepare_siglip_embeds
+        batch.resized_images = resized_images
+        return batch
+
+
+class _PrepareImageLatentsStage(PipelineStage):
+    def __init__(self, vae) -> None:
+        self.vae = vae
+
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        """
+        Args:
+            batch.condition_image
+        Returns
+            TODO
+        """
+        image_latents = []
+        images = batch.condition_image
+        num_images_per_prompt = len(batch.image_path)
+        batch_size = batch.batch_size * num_images_per_prompt
+        for image in images:
+            # TODO: hardcode debug
+            dtype = image.dtype
+            device = image.device
+            image = image.to(device=device, dtype=dtype)
+            image_latent = (
+                # TODO: hard code to vae(fp32) dtype. reivew
+                self.vae.encode(image.to(torch.float32)).latent_dist.mode()[0]
+                - self.vae.config.shift_factor
+            ) * self.vae.config.scaling_factor
+            image_latent = image_latent.unsqueeze(1).to(dtype)
+            image_latents.append(image_latent)  # (16, 128, 128)
+
+        # image_latents = [image_latents] * batch_size
+        # TODO: review no copy
+        condition_latents = [image_latents.copy() for _ in range(batch_size)]
+
+        # TODO: 2D list.
+        # where
+        #  len(l) == batch size
+        #  len(l[0]) == image nums
+        condition_latents = [
+            [lat.to(lat.dtype) for lat in lats] for lats in condition_latents
+        ]
+
+        # TODO: debug remove
+        # if batch.do_classifier_free_guidance:
+        #     negative_condition_latents = [
+        #         [lat.clone() for lat in batch] for batch in condition_latents
+        #     ]
+
+        # TODO: comment usage
+        # for condition_latents_model_input = condition_latents + negative_condition_latents
+        # in denoising loop
+        batch.condition_latents = condition_latents
+        # TODO: debug remove
+        # batch.negative_condition_latents = negative_condition_latents
+
+        return batch
+
+
+class _PrepareSiglipStage(PipelineStage):
+    def __init__(self, transformer, siglip, siglip_processor) -> None:
+        self.transformer = transformer
+        self.siglip = siglip
+        self.siglip_processor = siglip_processor
+
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        """
+        Args:
+            batch.resized_images
+        Returns:
+            TODO
+        """
+        siglip_embeds = []
+        images = batch.resized_images
+
+        # TODO: hard code
+        device = batch.generator_device
+        num_images_per_prompt = len(batch.image_path)
+        batch_size = batch.batch_size * num_images_per_prompt
+        # TODO: hard code
+        dtype = torch.bfloat16
+        do_classifier_free_guidance = batch.do_classifier_free_guidance
+
+        for image in images:
+            siglip_inputs = (
+                self.siglip_processor(images=[image], return_tensors="pt")
+                .to(device)
+                .to(dtype)
+            )
+            # TODO:
+            # shape = siglip_inputs.spatial_shapes[0]
+            # TODO: test
+            shape = list(siglip_inputs.pixel_values.shape)
+            hidden_state = self.siglip(**siglip_inputs).last_hidden_state
+            B, N, C = hidden_state.shape
+            hidden_state = hidden_state[:, : shape[0] * shape[1]]
+            hidden_state = hidden_state.view(shape[0], shape[1], C)
+            siglip_embeds.append(hidden_state)
+
+        # siglip_embeds = [siglip_embeds] * batch_size
+        # TODO: 2D list.
+        # where
+        #  len(l) == batch size
+        #  len(l[0]) == image nums
+        condition_siglip_embeds = [siglip_embeds.copy() for _ in range(batch_size)]
+
+        # TODO: review
+        ## ====================
+        # dtype cast
+        condition_siglip_embeds = [
+            [se for se in sels] for sels in condition_siglip_embeds
+        ]
+        if do_classifier_free_guidance:
+            negative_condition_siglip_embeds = [
+                [se.clone() for se in batch] for batch in condition_siglip_embeds
+            ]
+
+        # TODO: placeholder and end with None
+        condition_siglip_embeds = [
+            None if sels == [] else sels + [None] for sels in condition_siglip_embeds
+        ]
+        # TODO: debug remove
+        # negative_condition_siglip_embeds = [
+        #     None if sels == [] else sels + [None]
+        #     for sels in negative_condition_siglip_embeds
+        # ]
+
+        # TODO: for siglip_feats = pos + neg
+        # in denoising loop
+        batch.condition_siglip_embeds = condition_siglip_embeds
+        # TODO: debug remove
+        # batch.negative_condition_siglip_embeds = negative_condition_siglip_embeds
+        return batch
+
+
+# TODO: placeholder for now
+class ZImageOmniPipeline(LoRAPipeline, ComposedPipelineBase):
+    pipeline_name = "ZImageOmniPipeline"
+
+    # TODO: review how to add extra component?
+    _extra_config_module_map = {
+        "siglip": "image_encoder",
+        "siglip_processor": "processor",
+    }
+    _required_config_modules = [
+        "text_encoder",
+        "tokenizer",
+        "vae",
+        "transformer",
+        "scheduler",
+        "siglip",
+        "siglip_processor",
+    ]
+
+    def create_pipeline_stages(self, server_args: ServerArgs):
+        """Set up pipeline stages with proper dependency injection."""
+
+        # copy from diffusers
+        from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
+
+        vae_scale_factor = server_args.pipeline_config.vae_config.vae_scale_factor
+        # NOTE: replace vae with Flux in zimage-omni
+        self.image_processor = Flux2ImageProcessor(
+            vae_scale_factor=vae_scale_factor * 2
+        )
+
+        self.add_stage(
+            stage_name="input_validation_stage", stage=InputValidationStage()
+        )
+
+        self.add_stage(
+            stage_name="prompt_encoding_stage_primary",
+            stage=TextEncodingStage(
+                text_encoders=[
+                    self.get_module("text_encoder"),
+                ],
+                tokenizers=[
+                    self.get_module("tokenizer"),
+                ],
+            ),
+        )
+
+        # TODO: dulplicate with InputValidationStage:229
+        # refactory later
+        self.add_stage(
+            stage_name="image_process",
+            stage=_ImageProcessStage(
+                image_processor=self.image_processor,
+                vae_scale_factor=vae_scale_factor,
+            ),
+        )
+
+        # NOTE: skip for now. which batch -> batch
+        self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
+
+        self.add_stage(
+            stage_name="timestep_preparation_stage",
+            stage=TimestepPreparationStage(
+                scheduler=self.get_module("scheduler"),
+                prepare_extra_set_timesteps_kwargs=[prepare_mu],
+            ),
+        )
+
+        self.add_stage(
+            stage_name="latent_preparation_stage",
+            stage=LatentPreparationStage(
+                scheduler=self.get_module("scheduler"),
+                transformer=self.get_module("transformer"),
+            ),
+        )
+
+        self.add_stage(
+            stage_name="image_siglip_preparation_stage",
+            stage=_PrepareSiglipStage(
+                transformer=self.get_module("transformer"),
+                siglip=self.get_module("siglip"),
+                siglip_processor=self.get_module("siglip_processor"),
+            ),
+        )
+
+        self.add_stage(
+            stage_name="image_latent_preparation_stage",
+            stage=_PrepareImageLatentsStage(
+                vae=self.get_module("vae"),
+            ),
+        )
+
+        self.add_stage(
+            stage_name="denoising_stage",
+            stage=DenoisingStage(
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+            ),
+        )
+
+        self.add_stage(
+            stage_name="decoding_stage", stage=DecodingStage(vae=self.get_module("vae"))
+        )
+
+
+EntryClass = [
+    ZImagePipeline,
+    ZImageOmniPipeline,
+]

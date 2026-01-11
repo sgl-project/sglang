@@ -996,6 +996,72 @@ class DenoisingStage(PipelineStage):
                             latent_model_input, t_device
                         )
 
+                        # TODO: zimage omni
+                        # 1. latent_model_input = condition latent + latent_model_input
+                        # 2. image_noise_mask
+                        # TODO:: transformer fwd here
+                        # TODO: expand condition for zimage omni ?
+                        # 1. combined_x: condition + ...
+                        # 2. siglip_feats: ...
+                        # 3. image_noise_mask: ...
+                        # TODO: review
+                        if batch.condition_siglip_embeds is not None:
+                            # TODO: review
+                            # assert "siglip_feats" not in image_kwargs, "Should not overwrite siglip_feats."
+                            # assert "image_noise_mask" not in image_kwargs, "Should not overwrite image_noise_mask."
+
+                            assert (
+                                batch.condition_latents is not None
+                            ), "batch.condition_latents is missing."
+
+                            # TODO: hard code False
+                            apply_cfg = False
+                            if apply_cfg:
+                                raise NotImplementedError
+                            else:
+                                # NOTE: pos + neg
+                                # TODO: note shape = ...
+                                # image_latents = [image_latents] * batch_size
+                                condition_latents_model_input = batch.condition_latents
+                                # a 2D list. len(l) == batch size, len(l[0]) == num images
+                                condition_siglip_embeds_model_input = (
+                                    batch.condition_siglip_embeds
+                                )
+
+                            current_batch_size = len(latent_model_input)
+
+                            # NOTE:
+                            # TODO:
+                            # len[condition_latents_model_input] = batch_size
+                            # len[condition_latents_model_input[0]] = num_image
+                            # condition_latents_model_input[0][0].shape =  16, 1, 88, 128
+                            # latent_model_input.shape = e.g. [1, 16, 1, 90, 160]
+                            # x_combined (list): list of batch. len = batch_size
+                            # x_combined[0] (list): list of [condition * num_image, latent_model_input[bsz_id]]
+
+                            # NOTE: 最后的三个shape看起来想f w h??
+
+                            x_combined = [
+                                condition_latents_model_input[i]
+                                + [latent_model_input[i]]
+                                for i in range(current_batch_size)
+                            ]
+
+                            # Create noise mask: 0 for condition images (clean), 1 for target image (noisy)
+                            image_noise_mask = [
+                                [0] * len(condition_latents_model_input[i]) + [1]
+                                for i in range(current_batch_size)
+                            ]
+
+                            image_kwargs["siglip_feats"] = (
+                                condition_siglip_embeds_model_input
+                            )
+                            image_kwargs["image_noise_mask"] = image_noise_mask
+
+                            # TODO: combine condition:
+                            # simple for now.
+                            latent_model_input = latent_model_input
+
                         # Predict noise residual
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)
                         noise_pred = self._predict_noise_with_cfg(

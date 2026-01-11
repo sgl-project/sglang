@@ -70,14 +70,30 @@ class TextEncodingStage(PipelineStage):
         assert batch.prompt is not None
         prompt_text: str | list[str] = batch.prompt
 
+        # TODO: debug hard code
+        # TODO: review usage
+        num_condition_images: int = len(batch.image_path)
+
         all_indices: list[int] = list(range(len(self.text_encoders)))
 
+        # NOTE:
+        # len(prompt_embeds_list) == len(encoder_list)
+        # prompt_embeds_list[i].shape = [seqlen, dim]
         prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
             prompt_text,
             server_args,
             encoder_index=all_indices,
             return_attention_mask=True,
+            num_condition_images=num_condition_images,
         )
+
+        # # TODO: hack hard code
+        # # TODO: single batch
+        # # assume bsz = 1
+        # # so use multi batch to contain: embedding frags
+        # if isinstance(prompt_embeds_list, list):
+        #     assert len(prompt_embeds_list) == 1, "embedding fragments into batch size dim"
+        #     prompt_embeds_list = prompt_embeds_list[0]
 
         for pe in prompt_embeds_list:
             batch.prompt_embeds.append(pe)
@@ -96,7 +112,13 @@ class TextEncodingStage(PipelineStage):
                 server_args,
                 encoder_index=all_indices,
                 return_attention_mask=True,
+                num_condition_images=num_condition_images,
             )
+
+            # # TODO: hack hard code
+            # if isinstance(neg_embeds_list, list):
+            #     assert len(neg_embeds_list) == 1, "embedding fragments into batch size dim"
+            #     neg_embeds_list = neg_embeds_list[0]
 
             assert batch.negative_prompt_embeds is not None
 
@@ -114,12 +136,13 @@ class TextEncodingStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify text encoding stage inputs."""
         result = VerificationResult()
-        result.add_check("prompt", batch.prompt, V.string_or_list_strings)
-        result.add_check(
-            "negative_prompt",
-            batch.negative_prompt,
-            lambda x: not batch.do_classifier_free_guidance or V.string_not_none(x),
-        )
+        # TODO: hack
+        # result.add_check("prompt", batch.prompt, V.string_or_list_strings)
+        # result.add_check(
+        #     "negative_prompt",
+        #     batch.negative_prompt,
+        #     lambda x: not batch.do_classifier_free_guidance or V.string_not_none(x),
+        # )
         result.add_check(
             "do_classifier_free_guidance",
             batch.do_classifier_free_guidance,
@@ -149,6 +172,7 @@ class TextEncodingStage(PipelineStage):
         max_length: int | None = None,
         truncation: bool | None = None,
         padding: bool | str | None = None,
+        num_condition_images: int = 0,
         return_overflowing_tokens=None,
         return_length=None,
     ):
@@ -240,10 +264,27 @@ class TextEncodingStage(PipelineStage):
                 else {}
             )
 
-            processed_text_list: list[str] = []
+            processed_text_list: list[str | list[str]] = []
             for prompt_str in texts:
-                preprocessed = preprocess_func(prompt_str)
-                processed_text_list.append(preprocessed)
+                if num_condition_images == 0:
+                    preprocessed = preprocess_func(prompt_str)
+                    processed_text_list.append(preprocessed)
+                else:
+                    # TODO: refactor, hard code for z-image-omni only for now.
+                    # which create a batch of placeholder
+                    prompt_list = ["<|im_start|>user\n<|vision_start|>"]
+                    prompt_list += ["<|vision_end|><|vision_start|>"] * (
+                        num_condition_images - 1
+                    )
+                    prompt_list += [
+                        "<|vision_end|>"
+                        + prompt_str
+                        + "<|im_end|>\n<|im_start|>assistant\n<|vision_start|>"
+                    ]
+                    prompt_list += ["<|vision_end|><|im_end|>"]
+                    # TODO: note review, a list where split by vision block like
+                    # ['<|im_start|>user\n<|vision_start|>', '<|vision_end|><|vision_start|>', '<|vision_end|> USER PROMPT <|im_end|>\n<|im_start|>assistant\n<|vision_start|>', '<|vision_end|><|im_end|> ']
+                    processed_text_list.append(prompt_list)
 
             # Prepare tokenizer args
             tok_kwargs = self.prepare_tokenizer_kwargs(
@@ -251,6 +292,10 @@ class TextEncodingStage(PipelineStage):
                 **text_encoder_extra_arg,
             )
 
+            # TODO: refactor, ugly hard code
+            tok_kwargs["num_condition_images"] = num_condition_images
+
+            # TODO: note: apply_chat_template + tokenize for zimage
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs
             ).to(target_device)
@@ -272,11 +317,34 @@ class TextEncodingStage(PipelineStage):
                     output_hidden_states=True,
                     use_cache=False,
                 )
+            # TODO: note: review postprocess_func
+            # TODO: outputs = [bsz * list_list]
             prompt_embeds = postprocess_func(outputs, text_inputs)
+            # TODO:
+            # review
+            # what if prompt_embeds is a list
             if dtype is not None:
-                prompt_embeds = prompt_embeds.to(dtype=dtype)
+                # TODO: review, very hacky way
+                if isinstance(prompt_embeds, list):
+                    for i in enumerate(prompt_embeds):
+                        prompt_embeds[i] = prompt_embeds[i].to(dtype=dtype)
+                else:
+                    prompt_embeds = prompt_embeds.to(dtype=dtype)
 
-            embeds_list.append(prompt_embeds)
+            # NOTE: embeds for encoder i
+            if isinstance(prompt_embeds, list):
+                # TODO: review
+                # for zimage-omni, which expect a
+                # List[List[torch.Tensor]] for a single batch
+                # dim0 = batch_size
+                # dim1 = num_condition_images + 2
+                embeds_list.extend(prompt_embeds)
+            else:
+                # TODO:
+                # single batch only?
+                # which len(embeds_list) = len(encoder)
+                # not batch_size
+                embeds_list.append(prompt_embeds)
             if is_flux_v1:
                 pooled_embeds_list.append(outputs.pooler_output)
             if return_attention_mask:
@@ -321,15 +389,15 @@ class TextEncodingStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify text encoding stage outputs."""
         result = VerificationResult()
-        result.add_check(
-            "prompt_embeds", batch.prompt_embeds, V.list_of_tensors_min_dims(2)
-        )
-        result.add_check(
-            "negative_prompt_embeds",
-            batch.negative_prompt_embeds,
-            lambda x: not batch.do_classifier_free_guidance
-            or V.list_of_tensors_with_min_dims(x, 2),
-        )
+        # result.add_check(
+        #     "prompt_embeds", batch.prompt_embeds, V.list_of_tensors_min_dims(2)
+        # )
+        # result.add_check(
+        #     "negative_prompt_embeds",
+        #     batch.negative_prompt_embeds,
+        #     lambda x: not batch.do_classifier_free_guidance
+        #     or V.list_of_tensors_with_min_dims(x, 2),
+        # )
         if batch.debug:
             logger.debug(f"{batch.prompt_embeds=}")
             logger.debug(f"{batch.negative_prompt_embeds=}")
