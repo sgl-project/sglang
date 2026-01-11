@@ -80,6 +80,7 @@ enum ExecutionBranch {
     RedisGetexException,
     RedisCasRace,
     RedisCasException,
+    RedisBackendMaxRetriesExceeded,
 }
 
 impl ExecutionBranch {
@@ -94,6 +95,7 @@ impl ExecutionBranch {
             Self::RedisGetexException => "redis_getex_exception",
             Self::RedisCasRace => "redis_cas_race",
             Self::RedisCasException => "redis_cas_exception",
+            Self::RedisBackendMaxRetriesExceeded => "redis_backend_max_retries_exceeded",
         }
     }
 }
@@ -386,7 +388,7 @@ impl RedisBackend {
 
         match result {
             Ok((idx, branch)) => (idx, branch),
-            Err(MaxRetriesExceeded { last: (idx, branch) }) => (idx, branch),
+            Err(MaxRetriesExceeded { .. }) => (None, ExecutionBranch::RedisBackendMaxRetriesExceeded),
         }
     }
 
