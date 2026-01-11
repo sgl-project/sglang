@@ -80,6 +80,7 @@ enum ExecutionBranch {
     Vacant,
     RedisPoolGetFailed,
     RedisGetexFailed,
+    RedisCasRace,
     RedisCasFailed,
     RedisCasMaxRetries,
 }
@@ -418,7 +419,7 @@ impl RedisBackend {
         let mut conn = match self.pool.get().await {
             Ok(x) => x,
             Err(e) => {
-                warn!("Redis pool.get failed: {}", e);
+                warn!("Redis pool.get exception: {}", e);
                 return (None, ExecutionBranch::RedisPoolGetFailed);
             }
         };
@@ -426,7 +427,7 @@ impl RedisBackend {
         let old_data = match RedisCommandUtil::getex(&mut conn, key, self.ttl_secs).await {
             Ok(x) => x,
             Err(e) => {
-                warn!("Redis getex failed: {}", e);
+                warn!("Redis getex exception: {}", e);
                 return (None, ExecutionBranch::RedisGetexFailed);
             }
         };
@@ -449,17 +450,13 @@ impl RedisBackend {
             (new_url.to_string(), ExecutionBranch::Vacant)
         };
 
-        let success = RedisCommandUtil::cas(&mut conn, key, old_data.as_deref(), &new_data, self.ttl_secs)
-            .await
-            .map_err(|e| {
-                warn!("Redis CAS failed: {}", e);
-                Metrics::record_manual_policy_redis_error("cas");
-            })?;
-
-        if success {
-            (Some(selected_idx), branch)
-        } else {
-            (None, ExecutionBranch::RedisCasFailed)
+        match RedisCommandUtil::cas(&mut conn, key, old_data.as_deref(), &new_data, self.ttl_secs).await {
+            Ok(true) => (Some(selected_idx), branch),
+            Ok(false) => (None, ExecutionBranch::RedisCasRace),
+            Err(e) => {
+                warn!("Redis cas exception: {}", e);
+                (None, ExecutionBranch::RedisCasFailed)
+            }
         }
     }
 }
