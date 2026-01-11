@@ -13,31 +13,33 @@ use axum::{
 use serde_json::json;
 use tower::ServiceExt;
 
-use crate::common::redis_test_server::RedisTestServer;
+use crate::common::redis_test_server::get_shared_server;
 use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
 
 const ROUTING_KEY_HEADER: &str = "X-SMG-Routing-Key";
 
 struct TestEnv {
-    _redis_server: Option<RedisTestServer>,
+    is_redis: bool,
 }
 
 impl TestEnv {
-    async fn local() -> Self {
+    fn local() -> Self {
         std::env::remove_var("SMG_MANUAL_REDIS_URL");
-        Self { _redis_server: None }
+        Self { is_redis: false }
     }
 
-    async fn redis() -> Self {
-        let server = RedisTestServer::start().await.unwrap();
+    fn redis() -> Self {
+        let server = get_shared_server();
         std::env::set_var("SMG_MANUAL_REDIS_URL", server.url());
-        Self { _redis_server: Some(server) }
+        Self { is_redis: true }
     }
 }
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
-        std::env::remove_var("SMG_MANUAL_REDIS_URL");
+        if self.is_redis {
+            std::env::remove_var("SMG_MANUAL_REDIS_URL");
+        }
     }
 }
 
@@ -46,13 +48,13 @@ macro_rules! all_backend_e2e_test {
         paste::paste! {
             #[tokio::test]
             async fn [<$name _local_backend>]() {
-                let _env = TestEnv::local().await;
+                let _env = TestEnv::local();
                 [<$name _impl>]($base_port).await;
             }
 
             #[tokio::test]
             async fn [<$name _redis_backend>]() {
-                let _env = TestEnv::redis().await;
+                let _env = TestEnv::redis();
                 [<$name _impl>]($base_port + 1000).await;
             }
         }

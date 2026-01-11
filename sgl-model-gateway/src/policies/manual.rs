@@ -627,76 +627,6 @@ mod tests {
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
     // ========================================================================
-    // All Backend Test Infrastructure
-    // ========================================================================
-
-    mod test_redis_server {
-        use std::process::{Child, Command, Stdio};
-        use std::sync::OnceLock;
-        use std::time::Duration;
-
-        static SHARED_SERVER: OnceLock<SharedRedisServer> = OnceLock::new();
-
-        pub struct SharedRedisServer {
-            _process: Child,
-            pub port: u16,
-        }
-
-        impl SharedRedisServer {
-            fn start() -> Self {
-                let port = portpicker::pick_unused_port().expect("No available port");
-                let process = Command::new("redis-server")
-                    .args(["--port", &port.to_string(), "--save", "", "--appendonly", "no", "--daemonize", "no"])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .expect("Failed to start redis-server. Is redis-server installed?");
-
-                std::thread::sleep(Duration::from_millis(500));
-                Self { _process: process, port }
-            }
-
-            pub fn url(&self) -> String {
-                format!("redis://127.0.0.1:{}", self.port)
-            }
-        }
-
-        pub fn get_shared_server() -> &'static SharedRedisServer {
-            SHARED_SERVER.get_or_init(SharedRedisServer::start)
-        }
-    }
-
-    fn create_policy_with_redis(redis_url: &str, key_prefix: &str) -> ManualPolicy {
-        std::env::set_var("SMG_MANUAL_REDIS_URL", redis_url);
-        let config = ManualConfig {
-            redis_key_prefix: Some(key_prefix.to_string()),
-            ..Default::default()
-        };
-        let policy = ManualPolicy::with_config(config);
-        std::env::remove_var("SMG_MANUAL_REDIS_URL");
-        policy
-    }
-
-    macro_rules! all_backend_test {
-        ($name:ident) => {
-            paste::paste! {
-                #[tokio::test]
-                async fn [<$name _local_backend>]() {
-                    [<$name _impl>](ManualPolicy::new()).await;
-                }
-
-                #[tokio::test]
-                async fn [<$name _redis_backend>]() {
-                    let server = test_redis_server::get_shared_server();
-                    let key_prefix = stringify!($name);
-                    let policy = create_policy_with_redis(&server.url(), key_prefix);
-                    [<$name _impl>](policy).await;
-                }
-            }
-        };
-    }
-
-    // ========================================================================
     // Test Helpers
     // ========================================================================
 
@@ -718,7 +648,9 @@ mod tests {
         headers
     }
 
-    async fn test_consistent_routing_with_branch_impl(policy: ManualPolicy) {
+    #[tokio::test]
+    async fn test_consistent_routing_with_branch() {
+        let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let headers = headers_with_routing_key("user-123");
@@ -741,9 +673,10 @@ mod tests {
             assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
     }
-    all_backend_test!(test_consistent_routing_with_branch);
 
-    async fn test_different_routing_ids_impl(policy: ManualPolicy) {
+    #[tokio::test]
+    async fn test_different_routing_ids() {
+        let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let mut distribution = HashMap::new();
@@ -763,9 +696,10 @@ mod tests {
             "Should distribute across multiple workers"
         );
     }
-    all_backend_test!(test_different_routing_ids);
 
-    async fn test_fallback_random_impl(policy: ManualPolicy) {
+    #[tokio::test]
+    async fn test_fallback_random() {
+        let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let mut counts = HashMap::new();
@@ -780,7 +714,6 @@ mod tests {
 
         assert_eq!(counts.len(), 2, "Random fallback should use all workers");
     }
-    all_backend_test!(test_fallback_random);
 
     async fn test_with_unhealthy_workers_impl(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
