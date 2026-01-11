@@ -116,13 +116,28 @@ We explored attention patterns in two Qwen3 models to understand how model size 
 
 ## Methodology
 
-### Fingerprint Structure (20 dimensions)
+### Fingerprint Structure
+
+**Schema v1 (20 dimensions)** - used in this exploration:
 - `[0-2]` local_mass, mid_mass, long_mass
 - `[3]` entropy
 - `[4-11]` 8-bin attention histogram
 - `[12-19]` 8 layer entropies
 
+**Schema v2 (21 dimensions)** - adds rotational variance:
+- `[0-19]` Same as v1
+- `[20]` rotational_variance (RoPE de-rotation effect)
+  - Low RV (→0) = local/short-range attention
+  - High RV (→1) = long-range/distant attention
+
 ### Zone Classification
+
+With rotational variance (v2):
+- **syntax_floor:** local_mass > 0.5 AND entropy < 2.5 AND RV ≤ 0.25
+- **structure_ripple:** long_mass > 0.25 AND RV ≥ 0.35
+- **semantic_bridge:** Everything else (balanced, RV 0.15-0.5)
+
+Legacy (v1, used in this exploration):
 - **syntax_floor:** local_mass > 0.5 AND entropy < 2.0
 - **structure_ripple:** long_mass > 0.4 OR entropy > 3.5
 - **semantic_bridge:** Everything else (balanced mid-range)
