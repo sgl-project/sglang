@@ -257,13 +257,13 @@ class TestTopkAttention(CustomTestCase):
             q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k
         )
 
-        # Should return zeros for empty sequences
+        # Should return zeros for scores/logits, -1 for indices (sentinel convention)
         self.assertEqual(topk_scores.shape, (batch_size, top_k))
         self.assertEqual(topk_indices.shape, (batch_size, top_k))
         self.assertEqual(topk_logits.shape, (batch_size, top_k))
         self.assertEqual(logsumexp_all.shape, (batch_size,))
         self.assertTrue(torch.all(topk_scores == 0))
-        self.assertTrue(torch.all(topk_indices == 0))
+        self.assertTrue(torch.all(topk_indices == -1))  # -1 = invalid/padding
 
     def test_large_sequence_memory_efficiency(self):
         """

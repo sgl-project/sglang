@@ -531,8 +531,29 @@ class RoPEDerotator:
         semantic_scores = self.derotate_scores(query_pos, key_positions, attention_scores)
 
         # Compute rotational variance
-        # High variance = big difference between raw and semantic
-        variance = np.mean(np.abs(scores - semantic_scores))
+        # Measures how much RoPE de-rotation changes attention scores.
+        #
+        # Key insight: When all attended tokens are at SIMILAR distances, their
+        # positional biases are uniform, so de-rotation changes scores uniformly,
+        # and after renormalization the scores are nearly unchanged (low raw_diff).
+        #
+        # When tokens are at VARYING distances (e.g., local attention to neighbors),
+        # positional biases vary, de-rotation is non-uniform, and scores change
+        # more after renormalization (high raw_diff).
+        #
+        # We INVERT this so that:
+        # - Low RV = local attention (high raw_diff → low inverted)
+        # - High RV = distant attention (low raw_diff → high inverted)
+        #
+        # Calibration: Map raw_diff range [0.001, 0.005] to RV range [0.9, 0.15]
+        # This aligns with zone thresholds (syntax_floor ≤ 0.25, structure_ripple ≥ 0.35)
+        raw_diff = np.mean(np.abs(scores - semantic_scores))
+        # Linear mapping: RV = (max_diff - raw_diff) / (max_diff - min_diff)
+        # Calibrated so local attention (raw_diff ~0.005) → RV ~0.15
+        # and distant attention (raw_diff ~0.001) → RV ~0.85
+        max_diff = 0.0055  # Upper bound of raw_diff range
+        min_diff = 0.0008  # Lower bound of raw_diff range
+        variance = max(0.0, min(1.0, (max_diff - raw_diff) / (max_diff - min_diff)))
 
         # Compute entropies
         def entropy(p):

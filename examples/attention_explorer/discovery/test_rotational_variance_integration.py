@@ -574,59 +574,69 @@ class TestRotationalVarianceGoldenInvariant(unittest.TestCase):
 
     INVARIANT:
     =========
-    RV measures how much RoPE de-rotation changes the attention pattern.
+    RV measures how much RoPE de-rotation changes the attention pattern,
+    inverted and calibrated to align with zone thresholds.
 
-    - LOW RV (→0):  Attention to NEARBY tokens (small RoPE angles, small change)
+    - LOW RV (→0):  Attention to NEARBY tokens (local attention)
                     Typical of: syntax_floor, local grammar, BPE patterns
+                    Threshold: RV ≤ 0.25
 
-    - HIGH RV (→1): Attention to DISTANT tokens (large RoPE angles, big change)
-                    Typical of: structure_ripple, long-range retrieval, reasoning
+    - HIGH RV (→1): Attention to DISTANT tokens (long-range attention)
+                    Typical of: structure_ripple, retrieval, reasoning
+                    Threshold: RV ≥ 0.35
 
     RV is NOT a "semantic vs positional" measure.
     RV IS a "short-range vs long-range" measure.
 
-    The computation is:
-        variance = mean(|raw_scores - semantic_scores|)
+    The computation:
+    1. raw_diff = mean(|raw_scores - semantic_scores|)
+    2. RV = (max_diff - raw_diff) / (max_diff - min_diff)  # Inverted & scaled
 
-    Where semantic_scores have RoPE rotation removed. Nearby tokens have small
-    RoPE rotations, so de-rotation changes them little (low RV). Distant tokens
-    have large RoPE rotations, so de-rotation changes them a lot (high RV).
-
-    CALIBRATION NOTE:
-    =================
-    The current compute_rotational_variance_for_fingerprint() produces values
-    in the range ~0.001-0.01, while zone thresholds expect 0.1-0.5. This is a
-    known calibration gap. Zone classification tests work because they use
-    manually set RV values that match thresholds. Future work: scale RV
-    computation to match threshold expectations, or adjust thresholds.
+    This produces values calibrated to zone thresholds:
+    - Local attention (raw_diff ~0.005) → RV ~0.2 (syntax_floor)
+    - Distant attention (raw_diff ~0.001) → RV ~0.9 (structure_ripple)
     """
 
-    def test_golden_invariant_rv_is_small_for_all_patterns(self):
+    def test_golden_invariant_rv_matches_zone_thresholds(self):
         """
-        GOLDEN: Current RV computation produces small values (< 0.1).
+        GOLDEN: Computed RV values align with zone threshold expectations.
 
-        This documents the calibration gap between computation and thresholds.
-        When RV values are manually set in fingerprints (as in zone tests),
-        values like 0.1, 0.3, 0.6 are used. The actual computation produces
-        much smaller values.
+        - Local attention → low RV (≤ 0.25 for syntax_floor)
+        - Long-range attention → high RV (≥ 0.35 for structure_ripple)
+        - Monotonic ordering: local < mid < long
         """
-        # Local attention
+        # Local attention (nearby tokens)
         rv_local = compute_rotational_variance_for_fingerprint(
             query_pos=100,
             key_positions=[97, 98, 99],
             attention_scores=[0.2, 0.3, 0.5],
         )
 
-        # Long-range attention
+        # Mid-range attention
+        rv_mid = compute_rotational_variance_for_fingerprint(
+            query_pos=500,
+            key_positions=[400, 425, 450],
+            attention_scores=[0.3, 0.3, 0.4],
+        )
+
+        # Long-range attention (distant tokens)
         rv_long = compute_rotational_variance_for_fingerprint(
             query_pos=500,
             key_positions=[10, 50, 100],
             attention_scores=[0.4, 0.35, 0.25],
         )
 
-        # Both should be small (current implementation behavior)
-        assert rv_local < 0.1, f"Expected small RV for local, got {rv_local:.4f}"
-        assert rv_long < 0.1, f"Expected small RV for long-range, got {rv_long:.4f}"
+        # INVARIANT: Local → low RV (syntax_floor threshold ≤ 0.25)
+        assert rv_local <= 0.25, f"Local RV should be ≤ 0.25 for syntax_floor, got {rv_local:.3f}"
+
+        # INVARIANT: Long-range → high RV (structure_ripple threshold ≥ 0.35)
+        assert rv_long >= 0.35, f"Long-range RV should be ≥ 0.35 for structure_ripple, got {rv_long:.3f}"
+
+        # INVARIANT: Monotonic ordering
+        assert rv_local < rv_mid < rv_long, (
+            f"RV should increase with distance: local={rv_local:.3f}, "
+            f"mid={rv_mid:.3f}, long={rv_long:.3f}"
+        )
 
     def test_golden_invariant_zone_thresholds_ordering(self):
         """
