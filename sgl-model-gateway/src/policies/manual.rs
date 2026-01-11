@@ -88,15 +88,7 @@ enum ExecutionBranch {
 impl ExecutionBranch {
     fn as_str(&self) -> &'static str {
         match self {
-            Self::NoHealthyWorkers => "no_healthy_workers",
-            Self::NoRoutingId => "no_routing_id",
-            Self::OccupiedHit => "occupied_hit",
-            Self::OccupiedMiss => "occupied_miss",
-            Self::Vacant => "vacant",
-            Self::RedisPoolGetException => "redis_pool_get_failed",
-            Self::RedisGetexException => "redis_getex_failed",
-            Self::RedisCasException => "redis_cas_failed",
-            Self::RedisCasMaxRetries => "redis_cas_max_retries",
+            // TODO
         }
     }
 }
