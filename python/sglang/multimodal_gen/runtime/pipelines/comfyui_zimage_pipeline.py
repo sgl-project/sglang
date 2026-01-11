@@ -18,14 +18,11 @@ from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     set_default_dtype,
     shard_model,
 )
-from sglang.multimodal_gen.runtime.loader.utils import (
-    get_param_names_mapping,
-)
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
-from sglang.multimodal_gen.utils import set_mixed_precision_policy
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_comfyui_passthrough import (
     ComfyUIPassThroughScheduler,
 )
@@ -36,7 +33,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, set_mixed_precision_policy
 
 logger = init_logger(__name__)
 
@@ -128,13 +125,13 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         """
         Convert ComfyUI zimage qkv weights to SGLang format.
         Splits merged qkv.weight into separate to_q, to_k, to_v weights.
-        
+
         Args:
             weight_iterator: Iterator yielding (name, tensor) pairs from safetensors
             dim: Model dimension
             num_heads: Number of attention heads
             num_kv_heads: Number of key-value heads
-            
+
         Yields:
             (name, tensor) pairs with qkv weights split into to_q, to_k, to_v
         """
@@ -142,7 +139,7 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         q_size = dim
         k_size = head_dim * num_kv_heads
         v_size = head_dim * num_kv_heads
-        
+
         for name, tensor in weight_iterator:
             # Match qkv weights in layers, noise_refiner, or context_refiner
             # Pattern: (layers|noise_refiner|context_refiner).{i}.attention.qkv.(weight|bias)
@@ -153,19 +150,19 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
             if match:
                 module_name, layer_idx, param_type = match.groups()
                 base_name = f"{module_name}.{layer_idx}.attention"
-                
+
                 if param_type == "weight":
                     # Weight shape: (q_size + k_size + v_size, dim)
                     # Split into q, k, v
                     q_weight = tensor[:q_size, :]
                     k_weight = tensor[q_size : q_size + k_size, :]
                     v_weight = tensor[q_size + k_size :, :]
-                    
+
                     logger.debug(
                         f"Splitting {name} (shape {tensor.shape}) into "
                         f"to_q ({q_weight.shape}), to_k ({k_weight.shape}), to_v ({v_weight.shape})"
                     )
-                    
+
                     yield f"{base_name}.to_q.weight", q_weight
                     yield f"{base_name}.to_k.weight", k_weight
                     yield f"{base_name}.to_v.weight", v_weight
@@ -175,12 +172,12 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                     q_bias = tensor[:q_size]
                     k_bias = tensor[q_size : q_size + k_size]
                     v_bias = tensor[q_size + k_size :]
-                    
+
                     logger.debug(
                         f"Splitting {name} (shape {tensor.shape}) into "
                         f"to_q ({q_bias.shape}), to_k ({k_bias.shape}), to_v ({v_bias.shape})"
                     )
-                    
+
                     yield f"{base_name}.to_q.bias", q_bias
                     yield f"{base_name}.to_k.bias", k_bias
                     yield f"{base_name}.to_v.bias", v_bias
@@ -312,7 +309,10 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 world_size = server_args.hsdp_replicate_dim * server_args.hsdp_shard_dim
                 device_mesh = init_device_mesh(
                     current_platform.device_type,
-                    mesh_shape=(server_args.hsdp_replicate_dim, server_args.hsdp_shard_dim),
+                    mesh_shape=(
+                        server_args.hsdp_replicate_dim,
+                        server_args.hsdp_shard_dim,
+                    ),
                     mesh_dim_names=("replicate", "shard"),
                 )
                 shard_model(
@@ -352,7 +352,9 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
             # Check for meta parameters
             for n, p in chain(model.named_parameters(), model.named_buffers()):
                 if p.is_meta:
-                    raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")
+                    raise RuntimeError(
+                        f"Unexpected param or buffer {n} on meta device."
+                    )
                 if isinstance(p, torch.nn.Parameter):
                     p.requires_grad = False
         finally:
