@@ -167,15 +167,15 @@ pub(crate) enum LoadGuards {
     },
 }
 
-impl From<&WorkerSelection> for LoadGuards {
-    fn from(selection: &WorkerSelection) -> Self {
+impl LoadGuards {
+    pub fn new(selection: &WorkerSelection, headers: Option<&HeaderMap>) -> Self {
         match selection {
             WorkerSelection::Single { worker } => LoadGuards::Single {
-                _guard: WorkerLoadGuard::new(worker.clone()),
+                _guard: WorkerLoadGuard::new(worker.clone(), headers),
             },
             WorkerSelection::Dual { prefill, decode } => LoadGuards::Dual {
-                _prefill: WorkerLoadGuard::new(prefill.clone()),
-                _decode: WorkerLoadGuard::new(decode.clone()),
+                _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
+                _decode: WorkerLoadGuard::new(decode.clone(), headers),
             },
         }
     }
