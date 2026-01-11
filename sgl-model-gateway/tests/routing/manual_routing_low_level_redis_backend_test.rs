@@ -9,21 +9,20 @@ use std::{collections::HashMap, sync::Arc};
 use smg::policies::{LoadBalancingPolicy, ManualConfig, ManualPolicy, SelectWorkerInfo};
 
 use crate::common::{
-    manual_routing_test_helpers::{create_workers, headers_with_routing_key, random_prefix},
+    manual_routing_test_helpers::{
+        create_policy, create_workers, get_redis_config, headers_with_routing_key, random_prefix,
+    },
     redis_test_server::get_shared_server,
 };
 
 fn create_redis_policy(test_name: &str) -> ManualPolicy {
-    create_redis_policy_with_explicit_prefix(&random_prefix(test_name))
+    let cfg = get_redis_config(test_name);
+    create_policy(Some(cfg.url), Some(cfg.key_prefix))
 }
 
 fn create_redis_policy_with_explicit_prefix(prefix: &str) -> ManualPolicy {
     let server = get_shared_server();
-    ManualPolicy::with_config(ManualConfig {
-        redis_url: Some(server.url().to_string()),
-        redis_key_prefix: Some(prefix.to_string()),
-        ..Default::default()
-    })
+    create_policy(Some(server.url().to_string()), Some(prefix.to_string()))
 }
 
 fn create_redis_policy_with_ttl(test_name: &str, max_idle_secs: u64) -> ManualPolicy {

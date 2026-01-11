@@ -710,6 +710,7 @@ impl CliArgs {
                     other => panic!("Unknown assignment mode: {}", other),
                 },
                 redis_url: self.redis_url.clone(),
+                redis_key_prefix: None,
             },
             _ => PolicyConfig::RoundRobin,
         }
