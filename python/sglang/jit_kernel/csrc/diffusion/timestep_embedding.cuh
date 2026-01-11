@@ -142,10 +142,7 @@ void timestep_embedding(
   auto D = SymbolicSize{"dim"};
   auto device = SymbolicDevice{};
 
-  TensorMatcher({B})
-      .with_strides({1})
-      .template with_device<kDLCUDA>(device)
-      .verify(input);
+  TensorMatcher({B}).with_strides({1}).template with_device<kDLCUDA>(device).verify(input);
 
   TensorMatcher({B, D}).with_strides({D, 1}).with_dtype<float>().template with_device<kDLCUDA>(device).verify(output);
 
@@ -154,14 +151,10 @@ void timestep_embedding(
 
   const DLDataType in_dtype = input.dtype();
 
-  const bool input_dtype_supported =
-      (in_dtype.code == kDLFloat && in_dtype.bits == 16) ||
-      (in_dtype.code == kDLBfloat && in_dtype.bits == 16) ||
-      (in_dtype.code == kDLFloat && in_dtype.bits == 32);
-  RuntimeCheck(
-      input_dtype_supported,
-      "input dtype must be fp16/bf16/fp32, but got ",
-      in_dtype);
+  const bool input_dtype_supported = (in_dtype.code == kDLFloat && in_dtype.bits == 16) ||
+                                     (in_dtype.code == kDLBfloat && in_dtype.bits == 16) ||
+                                     (in_dtype.code == kDLFloat && in_dtype.bits == 32);
+  RuntimeCheck(input_dtype_supported, "input dtype must be fp16/bf16/fp32, but got ", in_dtype);
 
   auto launch = [&]<typename TIn>() {
     launch_timestep_embedding<TIn>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);

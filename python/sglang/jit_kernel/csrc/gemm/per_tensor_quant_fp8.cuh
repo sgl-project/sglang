@@ -133,8 +133,8 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView outpu
 
   const DLDataType in_dtype = input.dtype();
   const bool input_dtype_supported = (in_dtype.code == kDLFloat && in_dtype.bits == 32) ||
-                     (in_dtype.code == kDLFloat && in_dtype.bits == 16) ||
-                     (in_dtype.code == kDLBfloat && in_dtype.bits == 16);
+                                     (in_dtype.code == kDLFloat && in_dtype.bits == 16) ||
+                                     (in_dtype.code == kDLBfloat && in_dtype.bits == 16);
   RuntimeCheck(input_dtype_supported, "input dtype must be fp32/fp16/bf16, but got ", in_dtype);
 
   const DLDataType out_dtype = output_q.dtype();

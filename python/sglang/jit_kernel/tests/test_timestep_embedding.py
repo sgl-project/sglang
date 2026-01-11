@@ -3,8 +3,10 @@ import pytest
 import tabulate
 import torch
 from diffusers.models.embeddings import get_timestep_embedding
-from sglang.jit_kernel.timestep_embedding import timestep_embedding as timestep_embedding_cuda
 
+from sglang.jit_kernel.timestep_embedding import (
+    timestep_embedding as timestep_embedding_cuda,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
 
 
@@ -12,9 +14,7 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embed
     "batch_size", [1, 2, 8, 128, 256, 512, 1536, 2048, 4096, 11008, 16384]
 )
 @pytest.mark.parametrize("dim", [32, 128, 256, 512, 1536, 2048, 4096, 8192])
-@pytest.mark.parametrize(
-    "dtype", [torch.float16, torch.bfloat16, torch.float32]
-)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
     device = "cuda"
     t = torch.randint(low=0, high=1000, size=(batch_size,), device=device).to(dtype)
