@@ -27,7 +27,7 @@ DTYPE = torch.bfloat16
 @pytest.mark.parametrize(
     "batch_size,hidden_size", list(itertools.product(BS_LIST, HIDDEN_SIZE_LIST))
 )
-def test_qknorm(batch_size: int, hidden_size: int) -> None:
+def test_rmsnorm(batch_size: int, hidden_size: int) -> None:
     input = torch.randn(batch_size, hidden_size, device=DEVICE, dtype=DTYPE)
     weight = torch.randn(hidden_size, device=DEVICE, dtype=DTYPE)
     input_sglang = input.clone()
