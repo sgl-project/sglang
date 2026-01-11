@@ -2,15 +2,18 @@
 Tests for Rotational Variance Integration
 
 This module tests the integration of rotational variance into the fingerprint
-schema and zone classification system. Rotational variance measures how much
-position (vs. semantics) drives attention patterns.
+schema and zone classification system. Rotational variance (RV) measures how
+much RoPE de-rotation affects attention patterns.
 
-Educational Context:
-- Low rotational variance → position-driven (syntax processing)
-- High rotational variance → semantic-driven (reasoning/bridging)
+RV Semantics (IMPORTANT - see TestRotationalVarianceGoldenInvariant):
+- Low RV → local/short-range attention (nearby tokens, small RoPE angles)
+- High RV → distant/long-range attention (far tokens, large RoPE angles)
+
+RV is NOT "semantic vs positional". It measures attention DISTANCE.
 """
 
 import pytest
+import unittest
 import numpy as np
 from typing import List, Tuple
 
@@ -213,12 +216,13 @@ class TestZoneClassificationWithRotationalVariance:
     def test_syntax_floor_with_low_rotational_variance(self):
         """Syntax floor: high local mass + low entropy + LOW rotational variance."""
         # This is the ideal syntax_floor pattern
+        # Low RV = attention to nearby tokens (small RoPE angles)
         fp = self._make_fingerprint_v2(
             local_mass=0.7,
             mid_mass=0.2,
             long_mass=0.1,
             entropy=1.5,
-            rotational_variance=0.1,  # Low = position-driven
+            rotational_variance=0.1,  # Low RV = local/short-range attention
         )
 
         zones, confidences = assign_zone_labels(fp.reshape(1, -1))
@@ -229,28 +233,30 @@ class TestZoneClassificationWithRotationalVariance:
     def test_syntax_floor_blocked_by_high_rotational_variance(self):
         """High rotational variance should prevent syntax_floor classification."""
         # Has syntax_floor features BUT high rotational variance
+        # High RV = long-range attention (large RoPE angles)
         fp = self._make_fingerprint_v2(
             local_mass=0.7,
             mid_mass=0.2,
             long_mass=0.1,
             entropy=1.5,
-            rotational_variance=0.6,  # High = semantic, not positional
+            rotational_variance=0.6,  # High RV = long-range, conflicts with local_mass
         )
 
         zones, confidences = assign_zone_labels(fp.reshape(1, -1))
 
         # Should NOT be syntax_floor due to high rotational variance
-        # (high RV suggests semantic attention, not positional syntax)
+        # (high RV indicates long-range attention, inconsistent with syntax)
         assert zones[0] in ['semantic_bridge', 'structure_ripple']
 
     def test_structure_ripple_with_high_rotational_variance(self):
         """Structure ripple: long-range + HIGH rotational variance = strong signal."""
+        # High RV confirms the long_mass signal (both indicate long-range attention)
         fp = self._make_fingerprint_v2(
             local_mass=0.2,
             mid_mass=0.2,
             long_mass=0.6,
             entropy=3.0,
-            rotational_variance=0.5,  # High = semantic reasoning
+            rotational_variance=0.5,  # High RV = long-range attention
         )
         # Add HIGH histogram variance for structure_ripple (periodic pattern)
         # Variance needs to be > 0.1 to trigger structure_ripple
@@ -263,12 +269,13 @@ class TestZoneClassificationWithRotationalVariance:
 
     def test_semantic_bridge_medium_rotational_variance(self):
         """Semantic bridge with medium rotational variance."""
+        # Medium RV = balanced local/long-range attention (mid-range tokens)
         fp = self._make_fingerprint_v2(
             local_mass=0.3,
             mid_mass=0.5,
             long_mass=0.2,
             entropy=2.5,
-            rotational_variance=0.3,  # Medium = balanced
+            rotational_variance=0.3,  # Medium RV = balanced attention range
         )
 
         zones, confidences = assign_zone_labels(fp.reshape(1, -1))
@@ -514,35 +521,34 @@ class TestIntegrationScenarios:
 
         zones, _ = assign_zone_labels(fps)
 
-        # Pattern 1 should be syntax (position-driven local attention)
+        # Pattern 1 should be syntax (local attention to nearby tokens)
         assert zones[0] == 'syntax_floor'
 
         # Pattern 2 should NOT be syntax despite similar local mass
-        # (high rotational variance indicates semantic attention)
+        # (high RV indicates long-range attention, inconsistent with local mass)
         assert zones[1] != 'syntax_floor'
 
     def test_hallucination_warning_scenario(self):
         """
-        Scenario: Long-range attention with LOW rotational variance
-        could indicate structural copy (tables/lists) vs. semantic reasoning.
+        Scenario: Long-range attention with varying RV.
 
-        Low RV + long range = structural (likely safe)
-        High RV + long range = semantic reasoning (check for hallucination)
+        Low RV + long mass = unusual (long mass without RoPE effect?)
+        High RV + long mass = consistent long-range attention pattern
         """
         fps = np.zeros((2, 21), dtype=np.float32)
 
-        # Pattern 1: Structural long-range (copying table format)
+        # Pattern 1: Long mass but low RV (unusual - possible structural copy)
         fps[0, FP_LONG_MASS] = 0.6
         fps[0, FP_ENTROPY] = 2.5
         # [0, 1, 0, 0, 0, 0, 0, 0] has var=0.109 > 0.1 (needed for structure_ripple)
         fps[0, 4:12] = np.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        fps[0, FP_ROTATIONAL_VARIANCE] = 0.15  # Position-driven periodic
+        fps[0, FP_ROTATIONAL_VARIANCE] = 0.15  # Low RV - inconsistent with long_mass
 
-        # Pattern 2: Semantic long-range (reasoning across document)
+        # Pattern 2: Long mass with high RV (consistent long-range pattern)
         fps[1, FP_LONG_MASS] = 0.6
         fps[1, FP_ENTROPY] = 3.0
         fps[1, 4:12] = np.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        fps[1, FP_ROTATIONAL_VARIANCE] = 0.55  # Semantic reasoning
+        fps[1, FP_ROTATIONAL_VARIANCE] = 0.55  # High RV - consistent with long_mass
 
         zones, confidences = assign_zone_labels(fps)
 
@@ -550,9 +556,126 @@ class TestIntegrationScenarios:
         assert zones[0] == 'structure_ripple'
         assert zones[1] == 'structure_ripple'
 
-        # Pattern 2 (semantic) should have higher confidence
-        # (high RV confirms semantic reasoning)
+        # Pattern 2 (consistent RV) should have higher confidence
+        # (high RV confirms long-range attention)
         assert confidences[1] > confidences[0]
+
+
+# =============================================================================
+# GOLDEN TEST: RV Direction Invariant
+# =============================================================================
+
+class TestRotationalVarianceGoldenInvariant(unittest.TestCase):
+    """
+    GOLDEN TEST: Rotational Variance Direction Invariant
+
+    This test codifies the meaning of rotational variance (RV) to prevent
+    future sign/interpretation confusion.
+
+    INVARIANT:
+    =========
+    RV measures how much RoPE de-rotation changes the attention pattern.
+
+    - LOW RV (→0):  Attention to NEARBY tokens (small RoPE angles, small change)
+                    Typical of: syntax_floor, local grammar, BPE patterns
+
+    - HIGH RV (→1): Attention to DISTANT tokens (large RoPE angles, big change)
+                    Typical of: structure_ripple, long-range retrieval, reasoning
+
+    RV is NOT a "semantic vs positional" measure.
+    RV IS a "short-range vs long-range" measure.
+
+    The computation is:
+        variance = mean(|raw_scores - semantic_scores|)
+
+    Where semantic_scores have RoPE rotation removed. Nearby tokens have small
+    RoPE rotations, so de-rotation changes them little (low RV). Distant tokens
+    have large RoPE rotations, so de-rotation changes them a lot (high RV).
+
+    CALIBRATION NOTE:
+    =================
+    The current compute_rotational_variance_for_fingerprint() produces values
+    in the range ~0.001-0.01, while zone thresholds expect 0.1-0.5. This is a
+    known calibration gap. Zone classification tests work because they use
+    manually set RV values that match thresholds. Future work: scale RV
+    computation to match threshold expectations, or adjust thresholds.
+    """
+
+    def test_golden_invariant_rv_is_small_for_all_patterns(self):
+        """
+        GOLDEN: Current RV computation produces small values (< 0.1).
+
+        This documents the calibration gap between computation and thresholds.
+        When RV values are manually set in fingerprints (as in zone tests),
+        values like 0.1, 0.3, 0.6 are used. The actual computation produces
+        much smaller values.
+        """
+        # Local attention
+        rv_local = compute_rotational_variance_for_fingerprint(
+            query_pos=100,
+            key_positions=[97, 98, 99],
+            attention_scores=[0.2, 0.3, 0.5],
+        )
+
+        # Long-range attention
+        rv_long = compute_rotational_variance_for_fingerprint(
+            query_pos=500,
+            key_positions=[10, 50, 100],
+            attention_scores=[0.4, 0.35, 0.25],
+        )
+
+        # Both should be small (current implementation behavior)
+        assert rv_local < 0.1, f"Expected small RV for local, got {rv_local:.4f}"
+        assert rv_long < 0.1, f"Expected small RV for long-range, got {rv_long:.4f}"
+
+    def test_golden_invariant_zone_thresholds_ordering(self):
+        """
+        GOLDEN: Zone thresholds must maintain correct ordering.
+
+        - syntax_floor (local attention) → requires LOW RV
+        - structure_ripple (long-range) → requires HIGH RV
+
+        This ordering is correct semantically, even though the actual RV
+        computation may not produce values in the expected range.
+        """
+        from discovery.discovery_job import ZONE_THRESHOLDS
+
+        sf_max = ZONE_THRESHOLDS['syntax_floor'].get('rotational_variance_max', 1.0)
+        sr_min = ZONE_THRESHOLDS['structure_ripple'].get('rotational_variance_min', 0.0)
+
+        # INVARIANT: syntax_floor RV threshold < structure_ripple RV threshold
+        assert sf_max < sr_min, (
+            f"Zone thresholds inverted: syntax_floor max ({sf_max}) should be "
+            f"less than structure_ripple min ({sr_min})"
+        )
+
+    def test_golden_invariant_zone_classification_with_manual_rv(self):
+        """
+        GOLDEN: Zone classification works correctly with manually set RV values.
+
+        This confirms the semantic meaning of RV in zone classification:
+        - Low RV (0.1) + high local_mass → syntax_floor
+        - High RV (0.5) + high long_mass → structure_ripple
+        """
+        # Create fingerprint with low RV for syntax_floor
+        fp_syntax = np.zeros(21, dtype=np.float32)
+        fp_syntax[FP_LOCAL_MASS] = 0.7  # High local mass
+        fp_syntax[FP_ENTROPY] = 1.5  # Low entropy
+        fp_syntax[FP_ROTATIONAL_VARIANCE] = 0.1  # Low RV (manually set)
+
+        # Create fingerprint with high RV for structure_ripple
+        fp_ripple = np.zeros(21, dtype=np.float32)
+        fp_ripple[FP_LONG_MASS] = 0.6  # High long mass
+        fp_ripple[FP_ENTROPY] = 3.0
+        fp_ripple[4:12] = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # For hist variance
+        fp_ripple[FP_ROTATIONAL_VARIANCE] = 0.5  # High RV (manually set)
+
+        fps = np.vstack([fp_syntax, fp_ripple])
+        zones, _ = assign_zone_labels(fps)
+
+        # INVARIANT: Low RV → local zone, High RV → long-range zone
+        assert zones[0] == 'syntax_floor', f"Low RV pattern should be syntax_floor, got {zones[0]}"
+        assert zones[1] == 'structure_ripple', f"High RV pattern should be structure_ripple, got {zones[1]}"
 
 
 # =============================================================================

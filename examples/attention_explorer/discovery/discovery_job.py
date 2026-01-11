@@ -87,7 +87,10 @@ SCHEMA_VERSION = 1
 # [3]  entropy        - attention entropy (higher = more distributed)
 # [4-11] histogram    - 8-bin distance histogram
 # [12-19] layer_stats - per-layer entropy (up to 8 layers)
-# [20] rotational_variance (schema v2) - how much position affects attention (0=semantic, 1=positional)
+# [20] rotational_variance (schema v2) - RoPE de-rotation effect magnitude
+#      Low RV (→0) = attention to nearby tokens (RoPE angles small, de-rotation changes little)
+#      High RV (→1) = attention to distant tokens (RoPE angles large, de-rotation changes a lot)
+#      NOTE: This measures "how long-range is this attention", not "how semantic"
 
 FP_LOCAL_MASS = 0
 FP_MID_MASS = 1
@@ -105,17 +108,17 @@ ZONE_THRESHOLDS = {
     'syntax_floor': {
         'local_mass_min': 0.5,
         'entropy_max': 2.5,
-        # Low rotational variance = position-driven (syntax)
+        # Low RV = local attention (nearby tokens, small RoPE angles)
         'rotational_variance_max': 0.25,
     },
     'structure_ripple': {
         'long_mass_min': 0.25,
         'histogram_variance_min': 0.1,  # Periodic patterns have high variance
-        # High rotational variance = semantic reasoning
+        # High RV = long-range attention (distant tokens, large RoPE angles)
         'rotational_variance_min': 0.35,
     },
     'semantic_bridge': {
-        # Medium rotational variance = balanced semantic/positional
+        # Medium RV = balanced local/long-range attention
         'rotational_variance_range': (0.15, 0.5),
     },
     # semantic_bridge is the default when others don't match
