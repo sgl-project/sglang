@@ -608,6 +608,8 @@ fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> u
 mod tests {
     use std::collections::HashMap;
 
+    use paste::paste;
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
@@ -1258,4 +1260,144 @@ mod tests {
             "Random mode should sometimes select worker 0 despite higher load"
         );
     }
+
+    // ========================================================================
+    // Dual Backend Tests (Local + Redis)
+    // ========================================================================
+    //
+    // These tests run on both LocalBackend and RedisBackend to verify
+    // consistent behavior across backends. Redis tests require TEST_REDIS_URL
+    // environment variable and are marked with #[ignore].
+
+    fn create_policy_with_redis(redis_url: &str) -> ManualPolicy {
+        std::env::set_var("SMG_MANUAL_REDIS_URL", redis_url);
+        let policy = ManualPolicy::new();
+        std::env::remove_var("SMG_MANUAL_REDIS_URL");
+        policy
+    }
+
+    macro_rules! dual_backend_test {
+        ($name:ident, $test_fn:ident) => {
+            paste::paste! {
+                #[tokio::test]
+                async fn [<$name _local>]() {
+                    let policy = ManualPolicy::new();
+                    $test_fn(policy).await;
+                }
+
+                #[tokio::test]
+                #[ignore]
+                async fn [<$name _redis>]() {
+                    let redis_url = std::env::var("TEST_REDIS_URL")
+                        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+                    let policy = create_policy_with_redis(&redis_url);
+                    $test_fn(policy).await;
+                }
+            }
+        };
+    }
+
+    async fn dual_test_consistent_routing(policy: ManualPolicy) {
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let headers = headers_with_routing_key("dual-test-user");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let first_idx = policy.select_worker(&workers, &info).await.unwrap();
+
+        for _ in 0..5 {
+            let idx = policy.select_worker(&workers, &info).await.unwrap();
+            assert_eq!(idx, first_idx, "Same routing key should route to same worker");
+        }
+    }
+
+    dual_backend_test!(dual_consistent_routing, dual_test_consistent_routing);
+
+    async fn dual_test_failover(policy: ManualPolicy) {
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let headers = headers_with_routing_key("dual-failover-test");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let first_idx = policy.select_worker(&workers, &info).await.unwrap();
+        workers[first_idx].set_healthy(false);
+
+        let second_idx = policy.select_worker(&workers, &info).await.unwrap();
+        assert_ne!(second_idx, first_idx, "Should failover to different worker");
+
+        for _ in 0..3 {
+            let idx = policy.select_worker(&workers, &info).await.unwrap();
+            assert_eq!(idx, second_idx, "Should stick to new worker");
+        }
+    }
+
+    dual_backend_test!(dual_failover, dual_test_failover);
+
+    async fn dual_test_worker_recovery(policy: ManualPolicy) {
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let headers = headers_with_routing_key("dual-recovery-test");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let first_idx = policy.select_worker(&workers, &info).await.unwrap();
+        workers[first_idx].set_healthy(false);
+
+        let second_idx = policy.select_worker(&workers, &info).await.unwrap();
+        assert_ne!(second_idx, first_idx);
+
+        workers[first_idx].set_healthy(true);
+
+        let after_recovery = policy.select_worker(&workers, &info).await.unwrap();
+        assert_eq!(
+            after_recovery, first_idx,
+            "Should return to original worker (first in candidate list)"
+        );
+    }
+
+    dual_backend_test!(dual_worker_recovery, dual_test_worker_recovery);
+
+    async fn dual_test_distribution(policy: ManualPolicy) {
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let mut distribution: HashMap<usize, usize> = HashMap::new();
+
+        for i in 0..30 {
+            let headers = headers_with_routing_key(&format!("dist-user-{}", i));
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            let idx = policy.select_worker(&workers, &info).await.unwrap();
+            *distribution.entry(idx).or_insert(0) += 1;
+        }
+
+        assert!(
+            distribution.len() > 1,
+            "Should distribute across multiple workers, got {:?}",
+            distribution
+        );
+    }
+
+    dual_backend_test!(dual_distribution, dual_test_distribution);
+
+    async fn dual_test_no_healthy_workers(policy: ManualPolicy) {
+        let workers = create_workers(&["http://w1:8000"]);
+        workers[0].set_healthy(false);
+
+        let headers = headers_with_routing_key("no-healthy");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let result = policy.select_worker(&workers, &info).await;
+        assert!(result.is_none(), "Should return None when no healthy workers");
+    }
+
+    dual_backend_test!(dual_no_healthy_workers, dual_test_no_healthy_workers);
 }
