@@ -29,11 +29,13 @@ use super::{
 };
 use crate::{
     config::{ManualAssignmentMode, RetryConfig},
-    core::{retry::RetryExecutor, Worker},
+    core::{
+        retry::{MaxRetriesExceeded, RetryExecutor},
+        Worker,
+    },
     observability::metrics::Metrics,
     routers::header_utils::extract_routing_key,
 };
-use crate::core::retry::MaxRetriesExceeded;
 
 const MAX_CANDIDATE_WORKERS: usize = 2;
 const REDIS_KEY_PREFIX: &str = "smg:manual_policy:";
@@ -124,13 +126,14 @@ impl ManualPolicy {
         }
 
         if let Some(routing_id) = extract_routing_key(info.headers) {
-            let (idx, branch) = self.backend.select_by_routing_id(
-                routing_id,
-                workers,
-                &healthy_indices,
-                self.assignment_mode,
-            ).await;
-            return (idx.or_else(|| Some(random_select(&healthy_indices))), branch);
+            let (idx, branch) = self
+                .backend
+                .select_by_routing_id(routing_id, workers, &healthy_indices, self.assignment_mode)
+                .await;
+            return (
+                idx.or_else(|| Some(random_select(&healthy_indices))),
+                branch,
+            );
         }
 
         (
@@ -147,7 +150,11 @@ impl ManualPolicy {
 
 #[async_trait]
 impl LoadBalancingPolicy for ManualPolicy {
-    async fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo<'_>) -> Option<usize> {
+    async fn select_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info).await;
         Metrics::record_worker_manual_policy_branch(branch.as_str());
         if let Some(len) = self.backend.len() {
@@ -194,10 +201,14 @@ impl Backend {
     ) -> (Option<usize>, ExecutionBranch) {
         match self {
             Backend::Local(b) => {
-                let (idx, branch) = b.select_by_routing_id(routing_id, workers, healthy_indices, assignment_mode);
+                let (idx, branch) =
+                    b.select_by_routing_id(routing_id, workers, healthy_indices, assignment_mode);
                 (Some(idx), branch)
             }
-            Backend::Redis(b) => b.select_by_routing_id(routing_id, workers, healthy_indices, assignment_mode).await,
+            Backend::Redis(b) => {
+                b.select_by_routing_id(routing_id, workers, healthy_indices, assignment_mode)
+                    .await
+            }
         }
     }
 
@@ -233,7 +244,12 @@ impl CandidateWorkerUrls {
     }
 
     fn deserialize(data: &str) -> Self {
-        Self(data.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+        Self(
+            data.split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect(),
+        )
     }
 
     fn urls(&self) -> &[String] {
@@ -307,11 +323,14 @@ impl LocalBackend {
             Entry::Occupied(mut entry) => {
                 let node = entry.get_mut();
                 node.last_access = Instant::now();
-                if let Some(idx) = find_healthy_worker(node.candidates.urls(), workers, healthy_indices) {
+                if let Some(idx) =
+                    find_healthy_worker(node.candidates.urls(), workers, healthy_indices)
+                {
                     (idx, ExecutionBranch::OccupiedHit)
                 } else {
                     let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
-                    node.candidates.push_bounded(workers[selected_idx].url().to_string());
+                    node.candidates
+                        .push_bounded(workers[selected_idx].url().to_string());
                     (selected_idx, ExecutionBranch::OccupiedMiss)
                 }
             }
@@ -344,7 +363,9 @@ impl LocalBackend {
 
     #[cfg(test)]
     fn iter_first_candidate_urls(&self) -> impl Iterator<Item = String> + '_ {
-        self.routing_map.iter().filter_map(|e| e.candidates.urls().first().cloned())
+        self.routing_map
+            .iter()
+            .filter_map(|e| e.candidates.urls().first().cloned())
     }
 }
 
@@ -380,15 +401,22 @@ impl RedisBackend {
 
         let result = RetryExecutor::execute_with_retry(
             &retry_config,
-            |_attempt| self.select_one_attempt(routing_id, workers, healthy_indices, assignment_mode),
+            |_attempt| {
+                self.select_one_attempt(routing_id, workers, healthy_indices, assignment_mode)
+            },
             |(idx, _branch), _attempt| idx.is_none(),
-            |(_idx, branch), _delay, _attempt| Metrics::record_manual_policy_attempt_error(branch.as_str()),
+            |(_idx, branch), _delay, _attempt| {
+                Metrics::record_manual_policy_attempt_error(branch.as_str())
+            },
             || warn!("Max retries exceeded for routing_id={}", routing_id),
-        ).await;
+        )
+        .await;
 
         match result {
             Ok((idx, branch)) => (idx, branch),
-            Err(MaxRetriesExceeded { .. }) => (None, ExecutionBranch::RedisBackendMaxRetriesExceeded),
+            Err(MaxRetriesExceeded { .. }) => {
+                (None, ExecutionBranch::RedisBackendMaxRetriesExceeded)
+            }
         }
     }
 
@@ -419,7 +447,8 @@ impl RedisBackend {
         let old_candidates = old_data.as_deref().map(CandidateWorkerUrls::deserialize);
 
         if let Some(ref old_candidates) = old_candidates {
-            if let Some(idx) = find_healthy_worker(old_candidates.urls(), workers, healthy_indices) {
+            if let Some(idx) = find_healthy_worker(old_candidates.urls(), workers, healthy_indices)
+            {
                 return (Some(idx), ExecutionBranch::OccupiedHit);
             }
         }
@@ -431,11 +460,22 @@ impl RedisBackend {
             candidates.push_bounded(new_url.to_string());
             (candidates, ExecutionBranch::OccupiedMiss)
         } else {
-            (CandidateWorkerUrls(vec![new_url.to_string()]), ExecutionBranch::Vacant)
+            (
+                CandidateWorkerUrls(vec![new_url.to_string()]),
+                ExecutionBranch::Vacant,
+            )
         };
         let new_data = new_candidates.serialize();
 
-        match RedisCommandUtil::cas(&mut conn, &key, old_data.as_deref(), &new_data, self.ttl_secs).await {
+        match RedisCommandUtil::cas(
+            &mut conn,
+            &key,
+            old_data.as_deref(),
+            &new_data,
+            self.ttl_secs,
+        )
+        .await
+        {
             Ok(true) => (Some(selected_idx), branch),
             Ok(false) => (None, ExecutionBranch::RedisCasRace),
             Err(e) => {
@@ -451,7 +491,11 @@ impl RedisBackend {
 struct RedisCommandUtil;
 
 impl RedisCommandUtil {
-    async fn getex(conn: &mut deadpool_redis::Connection, key: &str, ttl_secs: u64) -> Result<Option<String>, redis::RedisError> {
+    async fn getex(
+        conn: &mut deadpool_redis::Connection,
+        key: &str,
+        ttl_secs: u64,
+    ) -> Result<Option<String>, redis::RedisError> {
         redis::cmd("GETEX")
             .arg(key)
             .arg("EX")
@@ -468,14 +512,16 @@ impl RedisCommandUtil {
         ttl_secs: u64,
     ) -> Result<bool, redis::RedisError> {
         static CAS_SCRIPT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
-            redis::Script::new(r#"
+            redis::Script::new(
+                r#"
 local old = redis.call('GET', KEYS[1])
 local expected = ARGV[1]
 local match = (expected == '' and old == false) or (old == expected)
 if not match then return 0 end
 redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
 return 1
-"#)
+"#,
+            )
         });
 
         let result: i32 = CAS_SCRIPT
@@ -569,7 +615,6 @@ fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> u
         workers[idx].worker_routing_key_load().value()
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -894,7 +939,8 @@ mod tests {
         candidates.push_bounded("http://w3:8000".to_string());
         assert_eq!(candidates.urls().len(), 2);
         assert_eq!(
-            candidates.urls()[0], "http://w2:8000",
+            candidates.urls()[0],
+            "http://w2:8000",
             "Oldest entry should be removed"
         );
         assert_eq!(candidates.urls()[1], "http://w3:8000");
@@ -1000,14 +1046,22 @@ mod tests {
         let (result, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(branch, ExecutionBranch::Vacant);
         let first_idx = result.unwrap();
-        let access_after_vacant = policy.local_backend().unwrap().get_last_access("test-key").unwrap();
+        let access_after_vacant = policy
+            .local_backend()
+            .unwrap()
+            .get_last_access("test-key")
+            .unwrap();
         assert!(access_after_vacant.elapsed().as_millis() < 100);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         let (_, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(branch, ExecutionBranch::OccupiedHit);
-        let access_after_hit = policy.local_backend().unwrap().get_last_access("test-key").unwrap();
+        let access_after_hit = policy
+            .local_backend()
+            .unwrap()
+            .get_last_access("test-key")
+            .unwrap();
         assert!(access_after_hit > access_after_vacant);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1015,7 +1069,11 @@ mod tests {
         workers[first_idx].set_healthy(false);
         let (_, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(branch, ExecutionBranch::OccupiedMiss);
-        let access_after_miss = policy.local_backend().unwrap().get_last_access("test-key").unwrap();
+        let access_after_miss = policy
+            .local_backend()
+            .unwrap()
+            .get_last_access("test-key")
+            .unwrap();
         assert!(access_after_miss > access_after_hit);
     }
 

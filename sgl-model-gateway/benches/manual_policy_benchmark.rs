@@ -19,7 +19,12 @@ fn create_workers(count: usize) -> Vec<Arc<dyn Worker>> {
         .collect()
 }
 
-fn select_with_key(rt: &Runtime, policy: &ManualPolicy, workers: &[Arc<dyn Worker>], key: &str) -> Option<usize> {
+fn select_with_key(
+    rt: &Runtime,
+    policy: &ManualPolicy,
+    workers: &[Arc<dyn Worker>],
+    key: &str,
+) -> Option<usize> {
     let mut headers = http::HeaderMap::new();
     headers.insert("x-smg-routing-key", key.parse().unwrap());
     let info = SelectWorkerInfo {
@@ -172,7 +177,9 @@ fn bench_concurrent(c: &mut Criterion) {
                                         headers: Some(&headers),
                                         ..Default::default()
                                     };
-                                    let _ = black_box(rt.block_on(policy.select_worker(&workers, &info)));
+                                    let _ = black_box(
+                                        rt.block_on(policy.select_worker(&workers, &info)),
+                                    );
                                 }
                             })
                         })

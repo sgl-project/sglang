@@ -124,7 +124,8 @@ impl RetryExecutor {
         OnBackoff: Fn(&T, Duration, u32),
         OnExhausted: FnMut(),
     {
-        Self::execute_with_retry(config, operation, should_retry, on_backoff, on_exhausted).await
+        Self::execute_with_retry(config, operation, should_retry, on_backoff, on_exhausted)
+            .await
             .unwrap_or_else(|MaxRetriesExceeded { last }| last)
     }
 }

@@ -47,7 +47,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// # Arguments
     /// * `workers` - Available workers to select from
     /// * `info` - Additional information for routing decisions
-    async fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo<'_>) -> Option<usize>;
+    async fn select_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize>;
 
     /// Update policy state after request completion
     ///

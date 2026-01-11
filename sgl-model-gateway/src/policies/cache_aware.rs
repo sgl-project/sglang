@@ -248,7 +248,11 @@ impl CacheAwarePolicy {
 
 #[async_trait]
 impl LoadBalancingPolicy for CacheAwarePolicy {
-    async fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo<'_>) -> Option<usize> {
+    async fn select_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
         let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -508,20 +512,24 @@ mod tests {
         policy.init_workers(&workers);
 
         // Route some requests
-        policy.select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("test1"),
-                ..Default::default()
-            },
-        ).await;
-        policy.select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("test2"),
-                ..Default::default()
-            },
-        ).await;
+        policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("test1"),
+                    ..Default::default()
+                },
+            )
+            .await;
+        policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("test2"),
+                    ..Default::default()
+                },
+            )
+            .await;
 
         // Remove a worker
         policy.remove_worker_by_url("http://w1:8000");

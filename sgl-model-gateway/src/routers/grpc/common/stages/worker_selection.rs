@@ -78,12 +78,10 @@ impl PipelineStage for WorkerSelectionStage {
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(
-                    ctx.input.model_id.as_deref(),
-                    text,
-                    tokens,
-                    headers,
-                ).await {
+                match self
+                    .select_single_worker(ctx.input.model_id.as_deref(), text, tokens, headers)
+                    .await
+                {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
                         let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
@@ -101,7 +99,10 @@ impl PipelineStage for WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
-                match self.select_pd_pair(ctx.input.model_id.as_deref(), text, tokens, headers).await {
+                match self
+                    .select_pd_pair(ctx.input.model_id.as_deref(), text, tokens, headers)
+                    .await
+                {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
                     None => {
                         let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
@@ -166,15 +167,17 @@ impl WorkerSelectionStage {
             .get_hash_ring(model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
         // Select worker using the policy
-        let idx = policy.select_worker(
-            &available,
-            &SelectWorkerInfo {
-                request_text: text,
-                tokens,
-                headers,
-                hash_ring,
-            },
-        ).await?;
+        let idx = policy
+            .select_worker(
+                &available,
+                &SelectWorkerInfo {
+                    request_text: text,
+                    tokens,
+                    headers,
+                    hash_ring,
+                },
+            )
+            .await?;
         let selected = available[idx].clone();
 
         // Record worker selection metric

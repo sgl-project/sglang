@@ -170,7 +170,11 @@ impl ConsistentHashingPolicy {
 
 #[async_trait]
 impl LoadBalancingPolicy for ConsistentHashingPolicy {
-    async fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo<'_>) -> Option<usize> {
+    async fn select_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info);
         Metrics::record_worker_consistent_hashing_policy_branch(branch.as_str());
         result

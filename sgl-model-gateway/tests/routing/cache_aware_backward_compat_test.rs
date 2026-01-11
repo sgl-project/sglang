@@ -40,13 +40,15 @@ async fn test_backward_compatibility_with_empty_model_id() {
     let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1.clone()), Arc::new(worker2.clone())];
 
     // Select worker - should work without errors
-    let selected = policy.select_worker(
-        &workers,
-        &SelectWorkerInfo {
-            request_text: Some("test request"),
-            ..Default::default()
-        },
-    ).await;
+    let selected = policy
+        .select_worker(
+            &workers,
+            &SelectWorkerInfo {
+                request_text: Some("test request"),
+                ..Default::default()
+            },
+        )
+        .await;
     assert!(selected.is_some(), "Should select a worker");
 
     // Remove workers - should work without errors
@@ -154,12 +156,14 @@ async fn test_remove_worker_by_url_backward_compat() {
     policy.remove_worker_by_url("http://worker1:8080");
 
     let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker2.clone())];
-    let selected = policy.select_worker(
-        &workers,
-        &SelectWorkerInfo {
-            request_text: Some("test"),
-            ..Default::default()
-        },
-    ).await;
+    let selected = policy
+        .select_worker(
+            &workers,
+            &SelectWorkerInfo {
+                request_text: Some("test"),
+                ..Default::default()
+            },
+        )
+        .await;
     assert_eq!(selected, Some(0), "Should only have worker2 left");
 }

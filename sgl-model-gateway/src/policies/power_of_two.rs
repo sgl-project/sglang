@@ -219,7 +219,9 @@ mod tests {
 
         // With single worker, should always select it
         assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default()).await,
+            policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .await,
             Some(0)
         );
     }

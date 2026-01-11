@@ -745,7 +745,8 @@ impl PDRouter {
             headers,
             hash_ring.clone(),
             "prefill",
-        ).await?;
+        )
+        .await?;
 
         let decode = Self::pick_worker_by_policy_arc(
             &decode_workers,
@@ -754,7 +755,8 @@ impl PDRouter {
             headers,
             hash_ring,
             "decode",
-        ).await?;
+        )
+        .await?;
 
         // Record worker selection metrics (Layer 3)
         let model = model_id.unwrap_or("default");
