@@ -843,24 +843,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_manual_routing_info_push_bounded() {
-        let mut info = Node {
-            candi_worker_urls: vec!["http://w1:8000".to_string()],
-            last_access: Instant::now(),
-        };
+    async fn test_candidate_worker_urls_push_bounded() {
+        let mut candidates = CandidateWorkerUrls::default();
+        candidates.push_bounded("http://w1:8000".to_string());
 
-        info.push_bounded("http://w2:8000".to_string());
-        assert_eq!(info.candi_worker_urls.len(), 2);
-        assert_eq!(info.candi_worker_urls[0], "http://w1:8000");
-        assert_eq!(info.candi_worker_urls[1], "http://w2:8000");
+        candidates.push_bounded("http://w2:8000".to_string());
+        assert_eq!(candidates.urls().len(), 2);
+        assert_eq!(candidates.urls()[0], "http://w1:8000");
+        assert_eq!(candidates.urls()[1], "http://w2:8000");
 
-        info.push_bounded("http://w3:8000".to_string());
-        assert_eq!(info.candi_worker_urls.len(), 2);
+        candidates.push_bounded("http://w3:8000".to_string());
+        assert_eq!(candidates.urls().len(), 2);
         assert_eq!(
-            info.candi_worker_urls[0], "http://w2:8000",
+            candidates.urls()[0], "http://w2:8000",
             "Oldest entry should be removed"
         );
-        assert_eq!(info.candi_worker_urls[1], "http://w3:8000");
+        assert_eq!(candidates.urls()[1], "http://w3:8000");
+    }
+
+    #[tokio::test]
+    async fn test_candidate_worker_urls_serialize_deserialize() {
+        let mut candidates = CandidateWorkerUrls::default();
+        candidates.push_bounded("http://w1:8000".to_string());
+        candidates.push_bounded("http://w2:8000".to_string());
+
+        let serialized = candidates.serialize();
+        assert_eq!(serialized, "http://w1:8000,http://w2:8000");
+
+        let deserialized = CandidateWorkerUrls::deserialize(&serialized);
+        assert_eq!(deserialized.urls(), candidates.urls());
+
+        let empty = CandidateWorkerUrls::deserialize("");
+        assert!(empty.urls().is_empty());
     }
 
     #[tokio::test]
