@@ -423,15 +423,18 @@ impl RedisBackend {
             }
         };
 
-        let old_data = RedisCommandUtil::getex(&mut conn, key, self.ttl_secs).await.map_err(|e| {
-            warn!("Redis GETEX failed: {}", e);
-            Metrics::record_manual_policy_redis_error("getex");
-        })?;
+        let old_data = match RedisCommandUtil::getex(&mut conn, key, self.ttl_secs).await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!("Redis getex failed: {}", e);
+                return (None, ExecutionBranch::RedisGetexFailed);
+            }
+        };
 
         if let Some(ref data) = old_data {
             let candidates = CandidateWorkerUrls::deserialize(data);
             if let Some(idx) = find_healthy_worker(candidates.urls(), workers, healthy_indices) {
-                return Ok((Some(idx), ExecutionBranch::OccupiedHit));
+                return (Some(idx), ExecutionBranch::OccupiedHit);
             }
         }
 
@@ -454,9 +457,9 @@ impl RedisBackend {
             })?;
 
         if success {
-            Ok((Some(selected_idx), branch))
+            (Some(selected_idx), branch)
         } else {
-            Err(())
+            (None, ExecutionBranch::RedisCasFailed)
         }
     }
 }
