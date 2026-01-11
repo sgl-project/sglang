@@ -21,7 +21,10 @@ use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
+use deadpool::managed::PoolError;
+use deadpool_redis::Connection;
 use rand::Rng;
+use redis::RedisError;
 use tracing::{info, warn};
 
 use super::{
@@ -404,11 +407,14 @@ impl RedisBackend {
         workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
         assignment_mode: ManualAssignmentMode,
-    ) -> Result<(Option<usize>, ExecutionBranch), ()> {
-        let mut conn = self.pool.get().await.map_err(|e| {
-            warn!("Redis pool.get failed: {}", e);
-            Metrics::record_manual_policy_redis_error("conn");
-        })?;
+    ) -> (Option<usize>, ExecutionBranch) {
+        let mut conn = match self.pool.get().await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!("Redis pool.get failed: {}", e);
+                return Ok((None, ExecutionBranch::RedisPoolGetFailed));
+            }
+        };
 
         let old_data = RedisCommandUtil::getex(&mut conn, key, self.ttl_secs).await.map_err(|e| {
             warn!("Redis GETEX failed: {}", e);
