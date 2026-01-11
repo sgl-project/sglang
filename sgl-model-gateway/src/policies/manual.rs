@@ -39,7 +39,14 @@ use crate::{
 };
 
 const MAX_CANDIDATE_WORKERS: usize = 2;
-const REDIS_KEY_PREFIX: &str = "smg:manual_policy:";
+const REDIS_KEY_PREFIX_BASE: &str = "smg:manual_policy:";
+
+fn redis_key_prefix() -> String {
+    match std::env::var("SMG_MANUAL_REDIS_KEY_PREFIX") {
+        Ok(prefix) => format!("{}{}:", REDIS_KEY_PREFIX_BASE, prefix),
+        Err(_) => REDIS_KEY_PREFIX_BASE.to_string(),
+    }
+}
 
 // ------------------------------------ API layer ---------------------------------------
 
@@ -428,7 +435,7 @@ impl RedisBackend {
         healthy_indices: &[usize],
         assignment_mode: ManualAssignmentMode,
     ) -> (Option<usize>, ExecutionBranch) {
-        let key = format!("{}{}", REDIS_KEY_PREFIX, routing_id).clone();
+        let key = format!("{}{}", redis_key_prefix(), routing_id);
 
         let mut conn = match self.pool.get().await {
             Ok(x) => x,
@@ -1260,16 +1267,54 @@ mod tests {
     }
 
     // ========================================================================
-    // All Backend Tests (Local + Redis + future backends)
+    // All Backend Tests (Local + Redis)
     // ========================================================================
     //
-    // These tests run on all backends to verify consistent behavior.
-    // Redis tests require TEST_REDIS_URL environment variable (defaults to localhost:6379).
+    // These tests run on both LocalBackend and RedisBackend.
+    // A shared Redis server is started once for all redis tests.
 
-    fn create_policy_with_redis(redis_url: &str) -> ManualPolicy {
+    mod test_redis_server {
+        use std::process::{Child, Command, Stdio};
+        use std::sync::OnceLock;
+        use std::time::Duration;
+
+        static SHARED_SERVER: OnceLock<SharedRedisServer> = OnceLock::new();
+
+        pub struct SharedRedisServer {
+            _process: Child,
+            pub port: u16,
+        }
+
+        impl SharedRedisServer {
+            fn start() -> Self {
+                let port = portpicker::pick_unused_port().expect("No available port");
+                let process = Command::new("redis-server")
+                    .args(["--port", &port.to_string(), "--save", "", "--appendonly", "no", "--daemonize", "no"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("Failed to start redis-server. Is redis-server installed?");
+
+                std::thread::sleep(Duration::from_millis(500));
+                Self { _process: process, port }
+            }
+
+            pub fn url(&self) -> String {
+                format!("redis://127.0.0.1:{}", self.port)
+            }
+        }
+
+        pub fn get_shared_server() -> &'static SharedRedisServer {
+            SHARED_SERVER.get_or_init(SharedRedisServer::start)
+        }
+    }
+
+    fn create_policy_with_redis(redis_url: &str, key_prefix: &str) -> ManualPolicy {
         std::env::set_var("SMG_MANUAL_REDIS_URL", redis_url);
+        std::env::set_var("SMG_MANUAL_REDIS_KEY_PREFIX", key_prefix);
         let policy = ManualPolicy::new();
         std::env::remove_var("SMG_MANUAL_REDIS_URL");
+        std::env::remove_var("SMG_MANUAL_REDIS_KEY_PREFIX");
         policy
     }
 
@@ -1277,25 +1322,24 @@ mod tests {
         ($name:ident, $test_fn:ident) => {
             paste::paste! {
                 #[tokio::test]
-                async fn [<$name _local>]() {
-                    let policy = ManualPolicy::new();
-                    $test_fn(policy).await;
+                async fn [<$name _local_backend>]() {
+                    $test_fn(ManualPolicy::new()).await;
                 }
 
                 #[tokio::test]
-                async fn [<$name _redis>]() {
-                    let redis_url = std::env::var("TEST_REDIS_URL")
-                        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-                    let policy = create_policy_with_redis(&redis_url);
+                async fn [<$name _redis_backend>]() {
+                    let server = test_redis_server::get_shared_server();
+                    let key_prefix = stringify!($name);
+                    let policy = create_policy_with_redis(&server.url(), key_prefix);
                     $test_fn(policy).await;
                 }
             }
         };
     }
 
-    async fn all_test_consistent_routing(policy: ManualPolicy) {
+    async fn test_consistent_routing_impl(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-        let headers = headers_with_routing_key("all-test-user");
+        let headers = headers_with_routing_key("user-123");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -1309,11 +1353,11 @@ mod tests {
         }
     }
 
-    all_backend_test!(all_consistent_routing, all_test_consistent_routing);
+    all_backend_test!(all_backend_consistent_routing, test_consistent_routing_impl);
 
-    async fn all_test_failover(policy: ManualPolicy) {
+    async fn test_failover_impl(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-        let headers = headers_with_routing_key("all-failover-test");
+        let headers = headers_with_routing_key("failover-key");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -1331,11 +1375,11 @@ mod tests {
         }
     }
 
-    all_backend_test!(all_failover, all_test_failover);
+    all_backend_test!(all_backend_failover, test_failover_impl);
 
-    async fn all_test_worker_recovery(policy: ManualPolicy) {
+    async fn test_worker_recovery_impl(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-        let headers = headers_with_routing_key("all-recovery-test");
+        let headers = headers_with_routing_key("recovery-key");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -1356,9 +1400,9 @@ mod tests {
         );
     }
 
-    all_backend_test!(all_worker_recovery, all_test_worker_recovery);
+    all_backend_test!(all_backend_worker_recovery, test_worker_recovery_impl);
 
-    async fn all_test_distribution(policy: ManualPolicy) {
+    async fn test_distribution_impl(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let mut distribution: HashMap<usize, usize> = HashMap::new();
 
@@ -1379,13 +1423,13 @@ mod tests {
         );
     }
 
-    all_backend_test!(all_distribution, all_test_distribution);
+    all_backend_test!(all_backend_distribution, test_distribution_impl);
 
-    async fn all_test_no_healthy_workers(policy: ManualPolicy) {
+    async fn test_no_healthy_workers_impl(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000"]);
         workers[0].set_healthy(false);
 
-        let headers = headers_with_routing_key("no-healthy");
+        let headers = headers_with_routing_key("no-healthy-key");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -1395,5 +1439,5 @@ mod tests {
         assert!(result.is_none(), "Should return None when no healthy workers");
     }
 
-    all_backend_test!(all_no_healthy_workers, all_test_no_healthy_workers);
+    all_backend_test!(all_backend_no_healthy_workers, test_no_healthy_workers_impl);
 }
