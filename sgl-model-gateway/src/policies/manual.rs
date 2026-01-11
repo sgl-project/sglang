@@ -226,6 +226,7 @@ fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> u
     })
 }
 
+// ------------------------------------ base backend ---------------------------------------
 
 #[derive(Debug)]
 enum Backend {
@@ -270,6 +271,8 @@ impl Backend {
         }
     }
 }
+
+// ------------------------------------ local backend ---------------------------------------
 
 #[derive(Debug)]
 struct LocalBackend {
@@ -367,6 +370,8 @@ impl LocalBackend {
         self.routing_map.len()
     }
 }
+
+// ------------------------------------ redis backend ---------------------------------------
 
 #[derive(Debug)]
 struct RedisBackend {
