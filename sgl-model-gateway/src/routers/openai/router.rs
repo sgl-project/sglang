@@ -659,7 +659,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 }
             },
             |res, _attempt| is_retryable_status(res.status()),
-            |delay, attempt| {
+            |_output, delay, attempt| {
                 Metrics::record_worker_retry(
                     metrics_labels::BACKEND_EXTERNAL,
                     metrics_labels::ENDPOINT_CHAT,

@@ -231,7 +231,7 @@ impl Router {
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
             // on_backoff hook
-            |delay, attempt| {
+            |_output, delay, attempt| {
                 // Layer 3 worker metrics
                 Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
                 Metrics::record_worker_retry_backoff(attempt, delay);

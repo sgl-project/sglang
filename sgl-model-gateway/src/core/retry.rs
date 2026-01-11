@@ -60,7 +60,7 @@ impl RetryExecutor {
     ///
     /// - `operation(attempt)`: perform one attempt (0-based), return the output.
     /// - `should_retry(&output, attempt)`: return true to retry, false to accept.
-    /// - `on_backoff(delay, next_attempt)`: called before sleeping between attempts.
+    /// - `on_backoff(&output, delay, next_attempt)`: called before sleeping between attempts.
     /// - `on_exhausted()`: called when retries are exhausted.
     pub async fn execute_with_retry<Op, Fut, T, ShouldRetry, OnBackoff, OnExhausted>(
         config: &RetryConfig,
@@ -73,7 +73,7 @@ impl RetryExecutor {
         Op: FnMut(u32) -> Fut,
         Fut: std::future::Future<Output = T>,
         ShouldRetry: Fn(&T, u32) -> bool,
-        OnBackoff: Fn(Duration, u32),
+        OnBackoff: Fn(&T, Duration, u32),
         OnExhausted: FnMut(),
     {
         let max = config.max_retries.max(1);
@@ -100,7 +100,7 @@ impl RetryExecutor {
                 delay_ms = delay.as_millis() as u64,
                 "Retry backoff"
             );
-            on_backoff(delay, next_attempt);
+            on_backoff(&output, delay, next_attempt);
             tokio::time::sleep(delay).await;
 
             attempt = next_attempt;
@@ -121,7 +121,7 @@ impl RetryExecutor {
         Op: FnMut(u32) -> Fut,
         Fut: std::future::Future<Output = T>,
         ShouldRetry: Fn(&T, u32) -> bool,
-        OnBackoff: Fn(Duration, u32),
+        OnBackoff: Fn(&T, Duration, u32),
         OnExhausted: FnMut(),
     {
         Self::execute_with_retry(config, operation, should_retry, on_backoff, on_exhausted).await
@@ -223,7 +223,7 @@ mod tests {
             |output, _attempt| output.is_none(),
             {
                 let backoffs = backoffs.clone();
-                move |_delay, _next_attempt| {
+                move |_output, _delay, _next_attempt| {
                     backoffs.fetch_add(1, Ordering::Relaxed);
                 }
             },
@@ -253,7 +253,7 @@ mod tests {
                 }
             },
             |output, _attempt| output.is_none(),
-            |_delay, _next_attempt| {},
+            |_output, _delay, _next_attempt| {},
             {
                 let exhausted = exhausted.clone();
                 move || {
@@ -299,7 +299,7 @@ mod tests {
             |res, _attempt| !res.status().is_success(),
             {
                 let backoffs = backoffs.clone();
-                move |_delay, _next_attempt| {
+                move |_output, _delay, _next_attempt| {
                     backoffs.fetch_add(1, Ordering::Relaxed);
                 }
             },
@@ -337,7 +337,7 @@ mod tests {
             |_res, _attempt| false,
             {
                 let backoffs = backoffs.clone();
-                move |_delay, _next_attempt| {
+                move |_output, _delay, _next_attempt| {
                     backoffs.fetch_add(1, Ordering::Relaxed);
                 }
             },
@@ -375,7 +375,7 @@ mod tests {
             |_res, _attempt| true,
             {
                 let backoffs = backoffs.clone();
-                move |_delay, _next_attempt| {
+                move |_output, _delay, _next_attempt| {
                     backoffs.fetch_add(1, Ordering::Relaxed);
                 }
             },

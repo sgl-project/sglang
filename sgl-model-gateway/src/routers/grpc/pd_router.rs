@@ -105,7 +105,7 @@ impl GrpcPDRouter {
                 }
             },
             |res, _attempt| is_retryable_status(res.status()),
-            |delay, attempt| {
+            |_output, delay, attempt| {
                 Metrics::record_worker_retry(
                     metrics_labels::WORKER_PREFILL,
                     metrics_labels::ENDPOINT_GENERATE,
@@ -163,7 +163,7 @@ impl GrpcPDRouter {
                 }
             },
             |res, _attempt| is_retryable_status(res.status()),
-            |delay, attempt| {
+            |_output, delay, attempt| {
                 Metrics::record_worker_retry(
                     metrics_labels::WORKER_PREFILL,
                     metrics_labels::ENDPOINT_CHAT,

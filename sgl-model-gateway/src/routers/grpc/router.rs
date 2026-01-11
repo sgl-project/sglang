@@ -184,7 +184,7 @@ impl GrpcRouter {
             // Should retry: check if status is retryable
             |res, _attempt| is_retryable_status(res.status()),
             // On backoff: record retry metrics
-            |delay, attempt| {
+            |_output, delay, attempt| {
                 Metrics::record_worker_retry(
                     metrics_labels::WORKER_REGULAR,
                     metrics_labels::ENDPOINT_CHAT,
@@ -238,7 +238,7 @@ impl GrpcRouter {
             // Should retry: check if status is retryable
             |res, _attempt| is_retryable_status(res.status()),
             // On backoff: record retry metrics
-            |delay, attempt| {
+            |_output, delay, attempt| {
                 Metrics::record_worker_retry(
                     metrics_labels::WORKER_REGULAR,
                     metrics_labels::ENDPOINT_GENERATE,
