@@ -16,9 +16,11 @@ from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbed
 from diffusers.models.embeddings import Timesteps as _Timesteps
 
 try:
-    from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
+    from sglang.jit_kernel.timestep_embedding import (
+        timestep_embedding as timestep_embedding_cuda,
+    )
 except Exception as _e:
-    pass
+    timestep_embedding_cuda = None
 
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
@@ -81,14 +83,15 @@ class PatchEmbed(nn.Module):
 
 class Timesteps(_Timesteps):
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        t_emb = timestep_embedding_cuda(
+        if timestep_embedding_cuda is None:
+            return super().forward(timesteps)
+        return timestep_embedding_cuda(
             timesteps,
             self.num_channels,
             flip_sin_to_cos=self.flip_sin_to_cos,
             downscale_freq_shift=self.downscale_freq_shift,
             scale=self.scale,
         )
-        return t_emb
 
 
 class CombinedTimestepGuidanceTextProjEmbeddings(
