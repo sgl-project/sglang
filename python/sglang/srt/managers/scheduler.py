@@ -60,10 +60,14 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.layers.dp_attention import (
+    compute_dp_attention_world_info,
+    get_attention_tp_group,
+)
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.io_struct import (
@@ -546,25 +550,24 @@ class Scheduler(
                 self.max_running_requests // self.pp_size, 1
             )
 
-        self.tp_group = self.tp_worker.get_tp_group()
+        self.tp_group = get_tp_group()
         self.tp_cpu_group = self.tp_group.cpu_group
-        self.attn_tp_group = self.tp_worker.get_attention_tp_group()
-        self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
+        self.attn_tp_group = get_attention_tp_group()
+        self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
-        # With DP attention enabled, the entry rank is attn_tp_rank==0;
-        # otherwise the entry rank is TP group local rank 0.
-        # For #11910, use the CPU communication group to broadcast VLM Python objects,
-        # avoiding any coupling with CUDA streams/devices.
-        if self.server_args.enable_dp_attention:
-            self.cpu_group = self.attn_tp_cpu_group
-            self.entry_rank = self.attn_tp_group.first_rank
-            self.is_entry_rank = self.attn_tp_rank == 0
-        else:
-            self.cpu_group = self.tp_cpu_group
-            self.entry_rank = self.tp_group.first_rank
-            self.is_entry_rank = self.tp_group.rank_in_group == 0
+        # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
+        # When DP attention is enabled, scope to the attention-TP group; otherwise use
+        # the base TP group. Entry rank is the local rank 0 in that group.
+        # Use the CPU (gloo) group to broadcast VLM Python objects and avoid CUDA
+        # stream/device coupling (#11910).
+        self.dp_tp_group = (
+            self.attn_tp_group
+            if self.server_args.enable_dp_attention
+            else self.tp_group
+        )
+        self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
@@ -1358,10 +1361,10 @@ class Scheduler(
             if (
                 torch.distributed.is_available()
                 and torch.distributed.is_initialized()
-                and self.cpu_group is not None
+                and self.dp_tp_cpu_group is not None
             ):
                 group_world_size = torch.distributed.get_world_size(
-                    group=self.cpu_group
+                    group=self.dp_tp_cpu_group
                 )
         except Exception as e:
             logger.warning(
@@ -1374,14 +1377,16 @@ class Scheduler(
         # Since the Scheduler is single-threaded, any large CPU cost will impact
         # handling of other messages. For example, CPU hits 99.9% can significantly
         # increase the CUDA kernel launch time.
-        if self.is_entry_rank:
+        if self.dp_tp_group.rank_in_group == 0:
             # Only the entry rank materializes once from dict.
             image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
             # Broadcast to other TP ranks (use src=0 within the group).
             if group_world_size > 1:
                 obj_list = [image_inputs]
                 torch.distributed.broadcast_object_list(
-                    obj_list, src=self.entry_rank, group=self.cpu_group
+                    obj_list,
+                    src=self.dp_tp_group.first_rank,
+                    group=self.dp_tp_cpu_group,
                 )
                 image_inputs = obj_list[0]
         else:
@@ -1389,7 +1394,9 @@ class Scheduler(
             if group_world_size > 1:
                 obj_list = [None]
                 torch.distributed.broadcast_object_list(
-                    obj_list, src=self.entry_rank, group=self.cpu_group
+                    obj_list,
+                    src=self.dp_tp_group.first_rank,
+                    group=self.dp_tp_cpu_group,
                 )
                 image_inputs = obj_list[0]
             else:
