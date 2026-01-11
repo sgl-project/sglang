@@ -21,10 +21,7 @@ use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
-use deadpool::managed::PoolError;
-use deadpool_redis::Connection;
 use rand::Rng;
-use redis::RedisError;
 use tracing::{info, warn};
 
 use super::{
@@ -82,7 +79,6 @@ enum ExecutionBranch {
     RedisGetexException,
     RedisCasRace,
     RedisCasException,
-    RedisBackendMaxRetries,
 }
 
 impl ExecutionBranch {
@@ -97,7 +93,6 @@ impl ExecutionBranch {
             Self::RedisGetexException => "redis_getex_exception",
             Self::RedisCasRace => "redis_cas_race",
             Self::RedisCasException => "redis_cas_exception",
-            Self::RedisBackendMaxRetries => "redis_backend_max_retries",
         }
     }
 }
