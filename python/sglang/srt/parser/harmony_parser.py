@@ -592,7 +592,7 @@ class EndMarkerOnlyStrategy:
             self._end_marker_seen = True
             splits = buffer.split("<|end|>", maxsplit=1)
             reasoning_text = splits[0]
-            normal_text = splits[1] if len(splits) > 1 else ""
+            normal_text = splits[1]
 
             # Create reasoning event if there's content before <|end|>
             if reasoning_text:
