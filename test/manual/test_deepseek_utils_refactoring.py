@@ -3,6 +3,7 @@ Unit tests for DeepSeek utility functions after refactoring.
 Run: python test/manual/test_deepseek_utils_refactoring.py
 """
 import torch
+import traceback
 from sglang.srt.models.deepseek_common.utils import (
     enable_nextn_moe_bf16_cast_to_fp8,
     add_forward_absorb_core_attention_backend,
@@ -130,7 +131,7 @@ def main():
         return 1
     except Exception as e:
         print(f"\n UNEXPECTED ERROR: {e}\n")
-        import traceback
+
         traceback.print_exc()
         return 1
 

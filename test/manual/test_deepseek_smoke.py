@@ -4,7 +4,7 @@ Quick smoke test for DeepSeek refactoring changes.
 Run: python test/manual/test_deepseek_smoke.py
 """
 import torch
-
+import traceback
 
 def main():
     
@@ -63,7 +63,7 @@ def main():
         
     except Exception as e:
         print(f"Function test failed: {e}")
-        import traceback
+
         traceback.print_exc()
         return 1
     

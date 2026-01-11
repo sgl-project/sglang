@@ -4,8 +4,10 @@ Requires: GPU with sufficient VRAM
 Run: python test/manual/test_deepseek_model_loading.py
 """
 import torch
-from transformers import AutoTokenizer, AutoConfig
+import traceback
+from transformers import AutoConfig
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
+
 
 
 def test_model_loading():
@@ -19,19 +21,12 @@ def test_model_loading():
         # Test model instantiation
         model = DeepseekV3ForCausalLM(config, quant_config=None)
         print("Model instantiated successfully")
-        
-        # Verify utilities are accessible from model
-        from sglang.srt.models.deepseek_common.utils import (
-            FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
-            yarn_get_mscale,
-        )
-        print("Utilities accessible from model context")
-        
+
         return True
         
     except Exception as e:
         print(f"Model loading failed: {e}")
-        import traceback
+        
         traceback.print_exc()
         return False
 
