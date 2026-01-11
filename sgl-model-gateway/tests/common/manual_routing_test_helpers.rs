@@ -54,17 +54,16 @@ pub fn get_redis_config(test_name: &str) -> RedisConfig {
     }
 }
 
-pub fn create_policy(redis_url: Option<String>, redis_key_prefix: Option<String>) -> ManualPolicy {
+pub fn create_policy(redis_cfg: Option<RedisConfig>) -> ManualPolicy {
     ManualPolicy::with_config(ManualConfig {
-        redis_url,
-        redis_key_prefix,
+        redis_url: redis_cfg.as_ref().map(|c| c.url.clone()),
+        redis_key_prefix: redis_cfg.as_ref().map(|c| c.key_prefix.clone()),
         ..Default::default()
     })
 }
 
 pub fn create_redis_policy(test_name: &str) -> ManualPolicy {
-    let cfg = get_redis_config(test_name);
-    create_policy(Some(cfg.url), Some(cfg.key_prefix))
+    create_policy(Some(get_redis_config(test_name)))
 }
 
 pub fn create_redis_policy_with_explicit_prefix(prefix: &str) -> ManualPolicy {
@@ -116,13 +115,13 @@ macro_rules! manual_routing_all_backend_test {
         paste::paste! {
             #[tokio::test]
             async fn [<$name _local_backend>]() {
-                [<$name _impl>](None, None).await;
+                [<$name _impl>](None).await;
             }
 
             #[tokio::test]
             async fn [<$name _redis_backend>]() {
                 let cfg = $crate::common::manual_routing_test_helpers::get_redis_config(stringify!($name));
-                [<$name _impl>](Some(cfg.url), Some(cfg.key_prefix)).await;
+                [<$name _impl>](Some(cfg)).await;
             }
         }
     };
@@ -134,13 +133,13 @@ macro_rules! manual_routing_all_backend_e2e_test {
         paste::paste! {
             #[tokio::test]
             async fn [<$name _local_backend>]() {
-                [<$name _impl>]($base_port, None, None).await;
+                [<$name _impl>]($base_port, None).await;
             }
 
             #[tokio::test]
             async fn [<$name _redis_backend>]() {
                 let cfg = $crate::common::manual_routing_test_helpers::get_redis_config(stringify!($name));
-                [<$name _impl>]($base_port + 1000, Some(cfg.url), Some(cfg.key_prefix)).await;
+                [<$name _impl>]($base_port + 1000, Some(cfg)).await;
             }
         }
     };
