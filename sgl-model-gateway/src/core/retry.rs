@@ -44,8 +44,7 @@ impl BackoffCalculator {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("maximum retry attempts exceeded")]
+#[derive(Debug)]
 pub struct MaxRetriesExceeded<T> {
     pub last: T,
 }
