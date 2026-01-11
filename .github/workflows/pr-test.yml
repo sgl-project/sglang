@@ -47,12 +47,18 @@ on:
         default: false
 
 concurrency:
-  # Include pr_head_sha in group for /rerun-stage dispatches to avoid collisions with main branch runs
-  group: pr-test-${{ inputs.pr_head_sha || inputs.ref || github.ref }}
+  # Include pr_head_sha and target_stage in group to avoid collisions
+  # - target_stage ensures each stage dispatch runs independently
+  # - pr_head_sha ensures /rerun-stage dispatches don't conflict with main branch runs
+  group: pr-test-${{ inputs.target_stage || inputs.pr_head_sha || inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
   SGLANG_IS_IN_CI: true
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   # =============================================== check changes ====================================================
@@ -165,14 +171,158 @@ jobs:
             echo "| continue_on_error | ${{ steps.set-continue-on-error.outputs.continue_on_error }} |"
           } >> $GITHUB_STEP_SUMMARY
 
+  # =============================================== Wait Jobs for Sequential PR Execution ====================================================
+  # These jobs poll GitHub API to wait for previous stages to complete.
+  # For PR runs: wait jobs run and enforce sequential execution via polling.
+  # For scheduled runs: wait jobs are skipped, enabling parallel execution for easier retry.
+
+  wait-for-stage-a:
+    needs: [check-changes]
+    # Only run for PRs (not scheduled) and when not targeting a specific stage
+    if: |
+      github.event_name == 'pull_request' &&
+      !inputs.target_stage &&
+      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true')
+    runs-on: ubuntu-latest
+    outputs:
+      stage_a_result: ${{ steps.wait.outputs.result }}
+    steps:
+      - name: Wait for stage-a-test-1 to complete
+        id: wait
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const maxWaitMinutes = 60;
+            const pollIntervalSeconds = 30;
+            const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
+
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+              const { data: jobs } = await github.rest.actions.listJobsForWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: context.runId,
+              });
+
+              const stageAJob = jobs.jobs.find(job => job.name === 'stage-a-test-1');
+
+              if (stageAJob) {
+                console.log(`stage-a-test-1 status: ${stageAJob.status}, conclusion: ${stageAJob.conclusion}`);
+
+                if (stageAJob.status === 'completed') {
+                  if (stageAJob.conclusion === 'success') {
+                    core.setOutput('result', 'success');
+                    return;
+                  } else {
+                    core.setOutput('result', 'failure');
+                    core.setFailed(`stage-a-test-1 ${stageAJob.conclusion}`);
+                    return;
+                  }
+                }
+              } else {
+                console.log('stage-a-test-1 job not found yet');
+              }
+
+              console.log(`Waiting ${pollIntervalSeconds}s... (attempt ${attempt + 1}/${maxAttempts})`);
+              await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
+            }
+
+            core.setFailed('Timeout waiting for stage-a-test-1');
+            core.setOutput('result', 'timeout');
+
+  wait-for-stage-b:
+    needs: [check-changes, wait-for-stage-a]
+    # Only run for PRs (not scheduled) and when not targeting a specific stage
+    if: |
+      always() &&
+      github.event_name == 'pull_request' &&
+      !inputs.target_stage &&
+      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
+      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      stage_b_result: ${{ steps.wait.outputs.result }}
+    steps:
+      - name: Wait for stage-b jobs to complete
+        id: wait
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const maxWaitMinutes = 90;
+            const pollIntervalSeconds = 30;
+            const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
+
+            // Stage-b jobs to wait for
+            const stageBJobs = [
+              'stage-b-test-small-1-gpu',
+              'stage-b-test-large-1-gpu',
+              'stage-b-test-large-2-gpu',
+              'stage-b-test-4-gpu-b200'
+            ];
+
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+              const { data: jobs } = await github.rest.actions.listJobsForWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: context.runId,
+              });
+
+              let allCompleted = true;
+              let anyFailed = false;
+              let completedCount = 0;
+              let totalCount = 0;
+
+              for (const jobName of stageBJobs) {
+                // Find all jobs that start with this name (handles matrix jobs like "stage-b-test-small-1-gpu (0)")
+                const matchingJobs = jobs.jobs.filter(job => job.name.startsWith(jobName));
+
+                for (const job of matchingJobs) {
+                  totalCount++;
+                  console.log(`${job.name}: status=${job.status}, conclusion=${job.conclusion}`);
+
+                  if (job.status !== 'completed') {
+                    allCompleted = false;
+                  } else {
+                    completedCount++;
+                    if (job.conclusion !== 'success' && job.conclusion !== 'skipped') {
+                      anyFailed = true;
+                    }
+                  }
+                }
+              }
+
+              console.log(`Progress: ${completedCount}/${totalCount} jobs completed`);
+
+              if (allCompleted && totalCount > 0) {
+                if (anyFailed) {
+                  core.setOutput('result', 'failure');
+                  core.setFailed('One or more stage-b jobs failed');
+                  return;
+                } else {
+                  core.setOutput('result', 'success');
+                  return;
+                }
+              }
+
+              console.log(`Waiting ${pollIntervalSeconds}s... (attempt ${attempt + 1}/${maxAttempts})`);
+              await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
+            }
+
+            core.setFailed('Timeout waiting for stage-b jobs');
+            core.setOutput('result', 'timeout');
+
   # =============================================== PR Gate ====================================================
   call-gate:
     needs: check-changes
+    # Skip for scheduled runs (they run all tests) and when target_stage is specified
     if: |
-      needs.check-changes.outputs.main_package == 'true' ||
-      needs.check-changes.outputs.sgl_kernel == 'true' ||
-      needs.check-changes.outputs.jit_kernel == 'true' ||
-      needs.check-changes.outputs.multimodal_gen == 'true'
+      github.event_name != 'schedule' &&
+      !inputs.target_stage &&
+      (
+        needs.check-changes.outputs.main_package == 'true' ||
+        needs.check-changes.outputs.sgl_kernel == 'true' ||
+        needs.check-changes.outputs.jit_kernel == 'true' ||
+        needs.check-changes.outputs.multimodal_gen == 'true'
+      )
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
@@ -180,7 +330,8 @@ jobs:
 
   sgl-kernel-build-wheels:
     needs: [check-changes, call-gate]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    # Skip for scheduled runs (they run stages independently) and when target_stage is set
+    if: github.event_name != 'schedule' && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: x64-kernel-build-node
     strategy:
       matrix:
@@ -227,7 +378,8 @@ jobs:
 
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    # Skip for scheduled runs (they run stages independently) and when target_stage is set
+    if: github.event_name != 'schedule' && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: arm-kernel-build-node
     strategy:
       matrix:
@@ -275,7 +427,9 @@ jobs:
 
   sgl-kernel-unit-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    # Skip for scheduled runs and when target_stage is set
     if: |
+      github.event_name != 'schedule' &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
@@ -311,7 +465,9 @@ jobs:
 
   sgl-kernel-mla-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    # Skip for scheduled runs and when target_stage is set
     if: |
+      github.event_name != 'schedule' &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
@@ -347,7 +503,9 @@ jobs:
 
   sgl-kernel-benchmark-test:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    # Skip for scheduled runs and when target_stage is set
     if: |
+      github.event_name != 'schedule' &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
@@ -396,7 +554,9 @@ jobs:
 
   sgl-kernel-b200-test:
     needs: [check-changes, sgl-kernel-build-wheels]
+    # Skip for scheduled runs and when target_stage is set
     if: |
+      github.event_name != 'schedule' &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
@@ -465,7 +625,9 @@ jobs:
 
   jit-kernel-unit-test:
     needs: [check-changes, call-gate]
+    # Skip for scheduled runs and when target_stage is set
     if: |
+      github.event_name != 'schedule' &&
       !inputs.target_stage &&
       needs.check-changes.outputs.jit_kernel == 'true'
     runs-on: 1-gpu-runner
@@ -497,7 +659,7 @@ jobs:
         (inputs.target_stage == 'stage-a-test-1') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -543,7 +705,7 @@ jobs:
         (inputs.target_stage == 'stage-a-cpu-only') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
           (needs.check-changes.outputs.main_package == 'true')
         )
       )
@@ -580,14 +742,15 @@ jobs:
           python3 run_suite.py --hw cpu --suite stage-a-cpu-only $CONTINUE_ON_ERROR_FLAG
 
   stage-b-test-small-1-gpu:
-    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
         (inputs.target_stage == 'stage-b-test-small-1-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -629,14 +792,15 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 $CONTINUE_ON_ERROR_FLAG
 
   stage-b-test-large-1-gpu:
-    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
         (inputs.target_stage == 'stage-b-test-large-1-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -673,14 +837,15 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu $CONTINUE_ON_ERROR_FLAG
 
   stage-b-test-large-2-gpu:
-    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
         (inputs.target_stage == 'stage-b-test-large-2-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -721,14 +886,15 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG
 
   stage-c-test-large-4-gpu:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
         (inputs.target_stage == 'stage-c-test-large-4-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-b.result == 'success' || needs.wait-for-stage-b.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -765,14 +931,15 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-large-4-gpu $CONTINUE_ON_ERROR_FLAG
 
   stage-c-test-large-4-gpu-b200:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
         (inputs.target_stage == 'stage-c-test-large-4-gpu-b200') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-b.result == 'success' || needs.wait-for-stage-b.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -812,7 +979,7 @@ jobs:
         (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
@@ -862,7 +1029,7 @@ jobs:
         (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
@@ -905,14 +1072,14 @@ jobs:
             $CONTINUE_ON_ERROR_FLAG
 
   quantization-test:
-      needs: [check-changes, call-gate, stage-a-test-1]
+      needs: [check-changes, call-gate, wait-for-stage-a]
       if: |
         always() &&
         (
           (inputs.target_stage == 'quantization-test') ||
           (
             !inputs.target_stage &&
-            (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+            (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
             ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
           )
         )
@@ -951,14 +1118,15 @@ jobs:
             python3 run_suite.py --suite quantization_test $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   stage-b-test-4-gpu-b200:
-    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
         (inputs.target_stage == 'stage-b-test-4-gpu-b200') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -998,14 +1166,15 @@ jobs:
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-4-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-b.result == 'success' || needs.wait-for-stage-b.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1050,14 +1219,15 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-8-gpu-h200:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-8-gpu-h200') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-b.result == 'success' || needs.wait-for-stage-b.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1108,14 +1278,15 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-8-gpu-h20:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-8-gpu-h20') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-b.result == 'success' || needs.wait-for-stage-b.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1161,14 +1332,15 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   performance-test-1-gpu-part-1:
-    needs: [check-changes, call-gate, stage-a-test-1]
+    needs: [check-changes, call-gate, wait-for-stage-a]
     if: |
       always() &&
       (
         (inputs.target_stage == 'performance-test-1-gpu-part-1') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1233,14 +1405,15 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_lora_online_latency_with_concurrent_adapter_updates
 
   performance-test-1-gpu-part-2:
-    needs: [check-changes, call-gate, stage-a-test-1]
+    needs: [check-changes, call-gate, wait-for-stage-a]
     if: |
       always() &&
       (
         (inputs.target_stage == 'performance-test-1-gpu-part-2') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1297,14 +1470,15 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
 
   performance-test-1-gpu-part-3:
-    needs: [check-changes, call-gate, stage-a-test-1]
+    needs: [check-changes, call-gate, wait-for-stage-a]
     if: |
       always() &&
       (
         (inputs.target_stage == 'performance-test-1-gpu-part-3') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1355,14 +1529,15 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_batch_scaling
 
   performance-test-2-gpu:
-    needs: [check-changes, call-gate, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
         (inputs.target_stage == 'performance-test-2-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-b.result == 'success' || needs.wait-for-stage-b.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1425,14 +1600,15 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_pp_long_context_prefill
 
   accuracy-test-1-gpu:
-    needs: [check-changes, call-gate, stage-a-test-1]
+    needs: [check-changes, call-gate, wait-for-stage-a]
     if: |
       always() &&
       (
         (inputs.target_stage == 'accuracy-test-1-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1475,7 +1651,7 @@ jobs:
         (inputs.target_stage == 'accuracy-test-2-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (needs.accuracy-test-1-gpu.result == 'success' || needs.accuracy-test-1-gpu.result == 'skipped' || github.event_name == 'schedule') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1511,14 +1687,15 @@ jobs:
           python3 -m sglang.test.ci.run_with_retry test_moe_eval_accuracy_large.py
 
   unit-test-deepep-4-gpu:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-deepep-4-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-b.result == 'success' || needs.wait-for-stage-b.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1559,14 +1736,15 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-deepep-8-gpu:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-deepep-8-gpu') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-b.result == 'success' || needs.wait-for-stage-b.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1607,14 +1785,15 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu-b200:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-4-gpu-b200') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-b.result == 'success' || needs.wait-for-stage-b.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1660,14 +1839,15 @@ jobs:
           IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu-gb200:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels-arm]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
     if: |
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-4-gpu-gb200') ||
         (
           !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          (!failure() && !cancelled()) &&
+          (needs.wait-for-stage-b.result == 'success' || needs.wait-for-stage-b.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -1714,6 +1894,8 @@ jobs:
       [
         call-gate,
         check-changes,
+        wait-for-stage-a,
+        wait-for-stage-b,
 
         sgl-kernel-build-wheels,
         sgl-kernel-unit-test,
@@ -1732,6 +1914,7 @@ jobs:
         stage-b-test-large-1-gpu,
         stage-b-test-large-2-gpu,
         stage-c-test-large-4-gpu,
+        stage-c-test-large-4-gpu-b200,
         quantization-test,
         stage-b-test-4-gpu-b200,
         unit-test-backend-4-gpu,
