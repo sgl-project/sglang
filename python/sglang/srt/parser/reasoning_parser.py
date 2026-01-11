@@ -204,7 +204,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
         )
         self.parser = HarmonyParser()
-        self._fallback_triggered = False
+        self._accumulated_reasoning = []  # Track accumulated reasoning across chunks
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         events = self.parser.parse(text)
@@ -224,14 +224,8 @@ class GptOssDetector(BaseReasoningFormatDetector):
         normal_text = "".join(normal_parts)
         # Tool call events preserve raw text with structural markers
 
-        # Fallback: if HarmonyParser didn't detect events but we have <|end|> marker,
-        # manually split the content. This happens when tool_choice='required' with xgrammars
-        # but model still outputs Harmony format with only <|end|> marker.
-        if not reasoning_text and not normal_text and "<|end|>" in text:
-            splits = text.split("<|end|>", maxsplit=1)
-            if len(splits) == 2:
-                reasoning_text = splits[0]
-                normal_text = splits[1].strip()
+        # Reset accumulated reasoning for next request
+        self._accumulated_reasoning = []
 
         return StreamingParseResult(
             normal_text=normal_text,
@@ -239,10 +233,12 @@ class GptOssDetector(BaseReasoningFormatDetector):
         )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
-        if self._fallback_triggered:
-            return StreamingParseResult(normal_text=new_text)
-
         events = self.parser.parse(new_text)
+
+        # If <|end|> is in new text, flush buffer to emit any cached content
+        # This ensures that partial content received before <|end|> is properly emitted
+        if "<|end|>" in new_text:
+            events += self.parser.parse("")
 
         reasoning_text = "".join(
             [e.content for e in events if e.event_type == "reasoning"]
@@ -256,34 +252,18 @@ class GptOssDetector(BaseReasoningFormatDetector):
                 normal_parts.append(e.raw_text if e.raw_text else e.content)
         normal_text = "".join(normal_parts)
 
-        if reasoning_text or normal_text:
-            return StreamingParseResult(
-                normal_text=normal_text,
-                reasoning_text=reasoning_text,
-            )
+        # Accumulate reasoning text across chunks
+        if reasoning_text:
+            self._accumulated_reasoning.append(reasoning_text)
 
-        # Fallback: if HarmonyParser didn't detect events (strategy is None)
-        # but we have <|end|> marker in the buffer.
-        if self.parser.strategy is None and "<|end|>" in self.parser._buffer:
-            splits = self.parser._buffer.split("<|end|>", maxsplit=1)
-            if len(splits) == 2:
-                reasoning_text = splits[0]
-                normal_text = splits[1]
-
-                # Consume the buffer since we manually parsed it
-                self.parser._buffer = ""
-
-                # Enable fallback mode for future chunks to bypass parser
-                self._fallback_triggered = True
-
-                return StreamingParseResult(
-                    normal_text=normal_text,
-                    reasoning_text=reasoning_text,
-                )
+        # Return accumulated reasoning and reset if we just finished
+        result_reasoning = "".join(self._accumulated_reasoning)
+        if "<|end|>" in new_text:
+            self._accumulated_reasoning = []  # Reset after <|end|>
 
         return StreamingParseResult(
             normal_text=normal_text,
-            reasoning_text=reasoning_text,
+            reasoning_text=result_reasoning,
         )
 
 

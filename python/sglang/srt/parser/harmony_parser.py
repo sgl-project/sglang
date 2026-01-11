@@ -498,6 +498,71 @@ class TextStrategy:
         return events, hold
 
 
+class EndMarkerOnlyStrategy:
+    """Strategy for handling content with only <|end|> marker (no <|channel|>)."""
+
+    def __init__(self):
+        self._end_marker_seen = False
+
+    def parse(self, buffer: str) -> Tuple[List[Event], str]:
+        """
+        Parse buffer that contains <|end|> marker without preceding <|channel|>.
+
+        This handles the fallback case where the model outputs:
+        [reasoning content]<|end|>[normal content]
+
+        Returns:
+            Tuple of (events list, remaining buffer)
+        """
+        events = []
+
+        if self._end_marker_seen:
+            # Already seen <|end|>, all subsequent content is normal
+            if buffer:
+                events.append(
+                    Event(
+                        event_type="normal",
+                        content=buffer,
+                        raw_text=buffer,
+                    )
+                )
+            remaining = ""
+        elif "<|end|>" in buffer:
+            # First time seeing <|end|>, split the content
+            self._end_marker_seen = True
+            splits = buffer.split("<|end|>", maxsplit=1)
+            reasoning_text = splits[0]
+            normal_text = splits[1] if len(splits) > 1 else ""
+
+            # Create reasoning event if there's content before <|end|>
+            if reasoning_text:
+                events.append(
+                    Event(
+                        event_type="reasoning",
+                        content=reasoning_text,
+                        raw_text=reasoning_text,
+                    )
+                )
+
+            # Create normal event if there's content after <|end|>
+            if normal_text:
+                events.append(
+                    Event(
+                        event_type="normal",
+                        content=normal_text,
+                        raw_text=normal_text,
+                    )
+                )
+
+            # Consume entire buffer since we've parsed it all
+            remaining = ""
+        else:
+            # Haven't seen <|end|> yet, hold the buffer
+            remaining = buffer
+
+        return events, remaining
+
+
 class HarmonyParser:
     """Facade for parsing Harmony format, switching between strategies."""
 
@@ -523,6 +588,9 @@ class HarmonyParser:
                 re.IGNORECASE,
             ):
                 self.strategy = TextStrategy()
+            elif "<|end|>" in self._buffer:
+                # Fallback: EndMarkerOnlyStrategy for content with only <|end|> marker
+                self.strategy = EndMarkerOnlyStrategy()
             else:
                 # Not yet determined, hold
                 return []
