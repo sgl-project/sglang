@@ -6,6 +6,11 @@ use smg::core::{BasicWorkerBuilder, Worker, WorkerType};
 
 use super::redis_test_server::get_shared_server;
 
+pub struct RedisConfig {
+    pub url: String,
+    pub key_prefix: String,
+}
+
 pub fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
     urls.iter()
         .map(|url| {
@@ -29,10 +34,10 @@ pub fn random_prefix(test_name: &str) -> String {
     format!("{}:{}:", test_name, random_id)
 }
 
-pub fn get_redis_config(test_name: &str) -> (Option<String>, Option<String>) {
+pub fn get_redis_config(test_name: &str) -> RedisConfig {
     let server = get_shared_server();
-    (
-        Some(server.url().to_string()),
-        Some(random_prefix(test_name)),
-    )
+    RedisConfig {
+        url: server.url().to_string(),
+        key_prefix: random_prefix(test_name),
+    }
 }

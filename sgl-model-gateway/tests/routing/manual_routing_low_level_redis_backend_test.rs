@@ -14,10 +14,7 @@ use crate::common::{
 };
 
 fn create_redis_policy(test_name: &str) -> ManualPolicy {
-    create_redis_policy_with_explicit_prefix(&random_prefix(test_name))
-}
-
-fn create_redis_policy_with_explicit_prefix(prefix: &str) -> ManualPolicy {
+    let prefix = random_prefix(test_name);
     let server = get_shared_server();
     let config = ManualConfig {
         redis_url: Some(server.url().to_string()),
