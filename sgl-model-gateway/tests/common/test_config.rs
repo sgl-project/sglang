@@ -99,6 +99,7 @@ impl TestRouterConfig {
             .policy(PolicyConfig::Manual {
                 eviction_interval_secs: 60,
                 max_idle_secs: 3600,
+                assignment_mode: Default::default(),
             })
             .host(defaults::HOST)
             .port(port)
