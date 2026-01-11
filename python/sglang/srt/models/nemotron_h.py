@@ -191,12 +191,11 @@ class NemotronHMoE(nn.Module):
             self.shared_experts = None
 
         if self.use_latent_moe:
-            self.fc1_latent_proj = ColumnParallelLinear(
+            self.fc1_latent_proj = ReplicatedLinear(
                 input_size=config.hidden_size,
                 output_size=self.moe_hidden_size,
                 bias=config.mlp_bias,
                 quant_config=quant_config,
-                gather_output=True,
                 prefix=f"{prefix}.fc1_latent_proj",
             )
             self.fc2_latent_proj = ReplicatedLinear(
