@@ -48,8 +48,8 @@ macro_rules! all_backend_e2e_test {
 // Basic Manual Routing Tests
 // ============================================================================
 
-async fn test_routing_with_header_impl(base_port: u16) {
-    let config = TestRouterConfig::manual(base_port);
+async fn test_routing_with_header_impl(base_port: u16, redis_url: Option<String>) {
+    let config = TestRouterConfig::manual_with_options(base_port, smg::config::ManualAssignmentMode::Random, redis_url);
     let ctx = AppTestContext::new_with_config(
         config,
         TestWorkerConfig::healthy_workers(base_port + 16000, 2),
@@ -104,8 +104,8 @@ async fn test_routing_with_header_impl(base_port: u16) {
 
 all_backend_e2e_test!(test_routing_with_header, 3700);
 
-async fn test_routing_without_header_impl(base_port: u16) {
-    let config = TestRouterConfig::manual(base_port);
+async fn test_routing_without_header_impl(base_port: u16, redis_url: Option<String>) {
+    let config = TestRouterConfig::manual_with_options(base_port, smg::config::ManualAssignmentMode::Random, redis_url);
     let ctx = AppTestContext::new_with_config(
         config,
         TestWorkerConfig::healthy_workers(base_port + 16000, 2),
@@ -144,8 +144,8 @@ async fn test_routing_without_header_impl(base_port: u16) {
 
 all_backend_e2e_test!(test_routing_without_header, 3710);
 
-async fn test_routing_consistency_impl(base_port: u16) {
-    let config = TestRouterConfig::manual(base_port);
+async fn test_routing_consistency_impl(base_port: u16, redis_url: Option<String>) {
+    let config = TestRouterConfig::manual_with_options(base_port, smg::config::ManualAssignmentMode::Random, redis_url);
     let ctx = AppTestContext::new_with_config(
         config,
         TestWorkerConfig::healthy_workers(base_port + 16000, 3),
