@@ -1,9 +1,3 @@
-//! Integration tests for ManualPolicy with Redis backend
-//!
-//! These tests verify Redis-specific behavior like multi-instance consistency,
-//! CAS races, and TTL expiry. Uses a shared Redis server with unique key prefixes
-//! for test isolation.
-
 use std::{collections::HashMap, sync::Arc};
 
 use smg::policies::{LoadBalancingPolicy, ManualConfig, ManualPolicy, SelectWorkerInfo};

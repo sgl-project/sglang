@@ -1,8 +1,3 @@
-//! Manual routing policy integration tests
-//!
-//! Tests for the manual routing policy with sticky sessions using X-SMG-Routing-Key header.
-//! Tests run on both LocalBackend and RedisBackend.
-
 use std::collections::{HashMap, HashSet};
 
 use axum::{

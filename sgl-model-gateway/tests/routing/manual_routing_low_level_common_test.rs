@@ -1,7 +1,3 @@
-//! Low-level ManualPolicy tests that run on both LocalBackend and RedisBackend.
-//!
-//! These tests verify the core policy behavior (select_worker_impl) across both backends.
-
 use std::{collections::HashMap, sync::Arc};
 
 use smg::{
