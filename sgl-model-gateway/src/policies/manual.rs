@@ -379,7 +379,7 @@ impl RedisBackend {
             &retry_config,
             |_attempt| self.select_one_attempt(routing_id, workers, healthy_indices, assignment_mode),
             |(idx, _branch), _attempt| idx.is_none(),
-            |_delay, _attempt| Metrics::record_manual_policy_attempt_error(branch),
+            |(_idx, branch), _delay, _attempt| Metrics::record_manual_policy_attempt_error(branch),
             || warn!("Max retries exceeded for routing_id={}", routing_id),
         ).await;
 
