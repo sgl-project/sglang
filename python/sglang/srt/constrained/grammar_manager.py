@@ -36,6 +36,10 @@ class GrammarManager:
         else:
             self.grammar_backend = None
 
+        self.grammar_sync_group = scheduler.dp_tp_cpu_group
+        self.grammar_sync_size = scheduler.dp_tp_group.world_size
+        self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
+
     def __len__(self):
         return len(self.grammar_queue)
 
@@ -120,18 +124,11 @@ class GrammarManager:
                     num_timeout_reqs = 1
                 break
 
-        if self.server_args.enable_dp_attention:
-            tp_size = self.scheduler.attn_tp_size
-            tp_group = self.scheduler.attn_tp_cpu_group
-        else:
-            tp_size = self.scheduler.tp_size
-            tp_group = self.scheduler.tp_cpu_group
-
-        if tp_size > 1:
+        if self.grammar_sync_size > 1:
             # Sync across TP ranks to make sure they have the same number of ready requests
             tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
             torch.distributed.all_reduce(
-                tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
+                tensor, op=torch.distributed.ReduceOp.MAX, group=self.grammar_sync_group
             )
             num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
 
