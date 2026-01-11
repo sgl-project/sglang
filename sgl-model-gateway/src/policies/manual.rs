@@ -404,25 +404,6 @@ impl RedisBackend {
 struct RedisCommandUtil;
 
 impl RedisCommandUtil {
-    /// Lua script for CAS (Compare-And-Swap)
-    /// KEYS[1] = key
-    /// ARGV[1] = expected_old (empty string = nil)
-    /// ARGV[2] = new_value
-    /// ARGV[3] = ttl_secs
-    /// Returns: [1, ""] on success, [0, current_value] on CAS failure
-    const CAS_LUA: &'static str = r#"
-local old = redis.call('GET', KEYS[1])
-local expected = ARGV[1]
-if expected == '' then expected = false end
-
-if old ~= expected then
-    return {0, old or ''}
-end
-
-redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
-return {1, ''}
-"#;
-
     /// GET + refresh TTL in one call (Redis 6.2+)
     async fn getex(conn: &mut deadpool_redis::Connection, key: &str, ttl_secs: u64) -> Option<String> {
         redis::cmd("GETEX")
@@ -435,7 +416,7 @@ return {1, ''}
             .flatten()
     }
 
-    /// Compare-And-Swap using Lua script
+    /// Compare-And-Swap using Lua script (auto EVALSHA with fallback to EVAL)
     /// Returns (success, current_value_if_failed)
     async fn cas(
         conn: &mut deadpool_redis::Connection,
@@ -444,24 +425,36 @@ return {1, ''}
         new_value: &str,
         ttl_secs: u64,
     ) -> (bool, Option<String>) {
+        // Lua CAS script:
+        // - ARGV[1] = expected (empty string means expecting key to not exist)
+        // - ARGV[2] = new_value
+        // - ARGV[3] = ttl_secs
+        // - Returns: {1, ""} on success, {0, current_value} on mismatch
+        static CAS_SCRIPT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+            redis::Script::new(r#"
+local old = redis.call('GET', KEYS[1])
+local expected = ARGV[1]
+local match = (expected == '' and old == false) or (old == expected)
+if not match then
+    return {0, old or ''}
+end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+return {1, ''}
+"#)
+        });
+
         let expected_arg = expected.unwrap_or("");
-        let result: Result<(i32, String), _> = redis::cmd("EVAL")
-            .arg(Self::CAS_LUA)
-            .arg(1) // number of keys
-            .arg(key)
+        let result: Result<(i32, String), _> = CAS_SCRIPT
+            .key(key)
             .arg(expected_arg)
             .arg(new_value)
             .arg(ttl_secs)
-            .query_async(conn)
+            .invoke_async(conn)
             .await;
 
         match result {
             Ok((1, _)) => (true, None),
-            Ok((0, current)) => (false, if current.is_empty() { None } else { Some(current) }),
-            Ok((_, current)) => {
-                warn!("Redis CAS Lua unexpected return value");
-                (false, if current.is_empty() { None } else { Some(current) })
-            }
+            Ok((_, current)) => (false, if current.is_empty() { None } else { Some(current) }),
             Err(e) => {
                 warn!("Redis CAS Lua error: {}", e);
                 (false, None)
