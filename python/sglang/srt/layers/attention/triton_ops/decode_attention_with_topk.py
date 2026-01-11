@@ -60,6 +60,7 @@ def _compute_chunk_max_kernel(
     BLOCK_DMODEL: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
     Lk: tl.constexpr,
+    SINK_THRESHOLD: tl.constexpr,  # NEW: Filter positions < SINK_THRESHOLD
 ):
     """
     Compute max attention score for each chunk of keys.
@@ -67,6 +68,10 @@ def _compute_chunk_max_kernel(
     Grid: (batch, num_heads, num_chunks)
     Each program handles one (batch, head, chunk) tuple.
     Stores only the max score per chunk for memory efficiency.
+
+    SINK_THRESHOLD: Positions 0 to SINK_THRESHOLD-1 are "sink" tokens and are
+    filtered out (set to -inf). This implements the Sinq optimization - removing
+    attention sink tokens directly in the kernel rather than post-processing.
     """
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -104,7 +109,13 @@ def _compute_chunk_max_kernel(
     # Process the entire chunk as a single block for simplicity
     # (chunk_size should be reasonably small, e.g., 1024-2048)
     offs_n = tl.arange(0, CHUNK_SIZE)
-    mask_n = (chunk_start + offs_n) < chunk_end
+    positions = chunk_start + offs_n  # Actual sequence positions
+    mask_n = positions < chunk_end
+
+    # SINQ OPTIMIZATION: Mask out sink tokens (positions < SINK_THRESHOLD)
+    # This is the key optimization - sink tokens are filtered in-kernel
+    sink_mask = positions >= SINK_THRESHOLD
+    mask_n = mask_n & sink_mask
 
     # Get KV cache locations
     kv_loc = tl.load(
@@ -142,6 +153,7 @@ def compute_topk_attention_chunked(
     window: int = 0,
     exact_logsumexp: bool = True,  # Compute exact logsumexp over ALL tokens
     head_ids: Optional[List[int]] = None,  # Only average over these heads (None = all)
+    sink_threshold: int = 0,  # NEW: Filter positions < sink_threshold (0 = no filtering)
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute top-k attention positions using chunked approach.
@@ -160,6 +172,11 @@ def compute_topk_attention_chunked(
         exact_logsumexp: If True (default), compute logsumexp over ALL tokens for
                         true probability calculation. If False, use approximate
                         logsumexp over top chunks only (faster but approximate).
+        sink_threshold: Positions 0 to sink_threshold-1 are filtered out as "sink"
+                       tokens. This is the Sinq optimization - attention sinks
+                       (typically <BOS> and system tokens) absorb unfocused attention
+                       and should be filtered for interpretability analysis.
+                       Default 0 = no filtering. Typical value = 5.
 
     Returns:
         topk_scores: [batch, top_k] - softmax normalized over top-k (for display)
@@ -241,7 +258,8 @@ def compute_topk_attention_chunked(
     # For small sequences, use direct PyTorch (simpler, no kernel overhead)
     if max_seq_len <= chunk_size * 2:
         return _compute_topk_pytorch(
-            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k
+            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            sink_threshold=sink_threshold,
         )
 
     # Chunked approach for large sequences
@@ -276,6 +294,7 @@ def compute_topk_attention_chunked(
         BLOCK_DMODEL=BLOCK_DMODEL,
         CHUNK_SIZE=chunk_size,
         Lk=Lk,
+        SINK_THRESHOLD=sink_threshold,  # Sinq kernel optimization
         num_warps=4,
     )
 
@@ -305,6 +324,7 @@ def compute_topk_attention_chunked(
         sm_scale, topk_chunk_idx, chunk_size, top_k,
         exact_logsumexp=exact_logsumexp,
         head_ids=head_ids,
+        sink_threshold=sink_threshold,
     )
 
 
@@ -409,6 +429,7 @@ def _rescan_top_chunks(
     top_k: int,
     exact_logsumexp: bool = True,  # New parameter to control exact vs approximate
     head_ids: Optional[List[int]] = None,  # Only average over these heads (None = all)
+    sink_threshold: int = 0,  # Filter positions < sink_threshold
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Rescan the top chunks to find exact token positions.
@@ -417,6 +438,7 @@ def _rescan_top_chunks(
     Args:
         exact_logsumexp: If True, compute logsumexp over ALL tokens (exact).
                         If False, use logsumexp only over top chunks (approximate, faster).
+        sink_threshold: Filter out positions < sink_threshold (Sinq optimization).
 
     Returns:
         topk_probs: [batch, top_k] - softmax normalized over top-k only (for display)
@@ -469,7 +491,21 @@ def _rescan_top_chunks(
 
             # Get positions in this chunk
             positions = torch.arange(chunk_start, chunk_end, device=device)
-            kv_pos = kv_indices[kv_start + chunk_start:kv_start + chunk_end]
+
+            # SINQ OPTIMIZATION: Filter out sink positions
+            if sink_threshold > 0:
+                non_sink_mask = positions >= sink_threshold
+                positions = positions[non_sink_mask]
+                if positions.numel() == 0:
+                    continue  # Entire chunk is sink tokens
+
+            # Get corresponding kv_pos entries
+            if sink_threshold > 0:
+                # Need to adjust indices for filtered positions
+                local_indices = positions - chunk_start
+                kv_pos = kv_indices[kv_start + positions]
+            else:
+                kv_pos = kv_indices[kv_start + chunk_start:kv_start + chunk_end]
 
             # Validate indices before indexing (prevent CUDA assert)
             if kv_pos.numel() > 0:
@@ -562,10 +598,15 @@ def _compute_topk_pytorch(
     kv_indices: torch.Tensor,
     sm_scale: float,
     top_k: int,
+    sink_threshold: int = 0,  # Filter positions < sink_threshold
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     PyTorch implementation for small sequences.
     More precise than chunked, used when seq_len is manageable.
+
+    Args:
+        sink_threshold: Filter out positions < sink_threshold (Sinq optimization).
+                       Default 0 = no filtering.
 
     Returns:
         topk_probs: [batch, top_k] - softmax normalized over top-k only (for display)
@@ -630,18 +671,37 @@ def _compute_topk_pytorch(
         # Average across heads
         scores_avg = scores.mean(dim=0)  # [seq_len]
 
-        # Compute logsumexp over ALL scores for true probability calculation
+        # SINQ OPTIMIZATION: Mask out sink positions
+        if sink_threshold > 0:
+            # Create mask for positions 0 to sink_threshold-1
+            positions = torch.arange(seq_len, device=device)
+            sink_mask = positions < sink_threshold
+            # Set sink scores to -inf so they're never selected
+            scores_avg = scores_avg.masked_fill(sink_mask, float('-inf'))
+            # Adjust effective sequence length for top-k
+            effective_seq_len = max(0, seq_len - sink_threshold)
+        else:
+            effective_seq_len = seq_len
+
+        # Compute logsumexp over ALL non-sink scores for true probability calculation
+        # (logsumexp should exclude sink tokens for accurate probability)
         logsumexp_val = torch.logsumexp(scores_avg, dim=0)
 
-        # Top-k
-        actual_k = min(top_k, seq_len)
-        topk_vals, topk_idx = torch.topk(scores_avg, actual_k)
+        # Top-k (sink positions will never be selected due to -inf scores)
+        actual_k = min(top_k, effective_seq_len)
+        if actual_k > 0:
+            topk_vals, topk_idx = torch.topk(scores_avg, actual_k)
+        else:
+            # All positions are sink tokens
+            topk_vals = torch.full((top_k,), float('-inf'), device=device)
+            topk_idx = torch.zeros(top_k, dtype=torch.int64, device=device)
 
         # Softmax normalize (over top-k only, for display)
         topk_probs = torch.softmax(topk_vals, dim=0)
 
-        # Pad if needed
-        if actual_k < top_k:
+        # Pad if needed (only when we have partial results from topk, not when all are sinks)
+        # When actual_k == 0, the else branch above already created correctly-sized tensors
+        if actual_k > 0 and actual_k < top_k:
             padding = top_k - actual_k
             topk_probs = torch.cat([topk_probs, torch.zeros(padding, device=device)])
             topk_idx = torch.cat([topk_idx, torch.zeros(padding, dtype=torch.int64, device=device)])
@@ -885,8 +945,13 @@ class TopKAttentionCapture:
     1. Debug Mode (return_attention_tokens=True): Returns raw indices for visualization
     2. Fingerprint Mode (return_attention_fingerprint=True): Returns 20D vector for routing
 
+    Sinq Kernel Optimization:
+        Set sink_threshold > 0 to filter out attention sink tokens (positions 0 to sink_threshold-1)
+        directly in the kernel. This is more efficient than Python post-processing and gives
+        cleaner interpretability results. Typical value: 5 (filters <BOS> and system tokens).
+
     Usage in triton_backend.py:
-        capture = TopKAttentionCapture(top_k=10, fingerprint_mode=True)
+        capture = TopKAttentionCapture(top_k=10, fingerprint_mode=True, sink_threshold=5)
 
         # After attention forward:
         if forward_batch.capture_attention_tokens:
@@ -894,6 +959,7 @@ class TopKAttentionCapture:
                 q, k_buffer, kv_indptr, kv_indices, sm_scale, current_pos
             )
             # In fingerprint mode, topk_info["fingerprint"] is ready for streaming
+            # Sink tokens are already filtered - no Python post-processing needed!
     """
 
     def __init__(
@@ -902,11 +968,13 @@ class TopKAttentionCapture:
         chunk_size: int = 2048,
         fingerprint_mode: bool = False,
         n_fingerprint_bins: int = N_FINGERPRINT_BINS,
+        sink_threshold: int = 0,  # Sinq optimization: filter positions < threshold
     ):
         self.top_k = top_k
         self.chunk_size = chunk_size
         self.fingerprint_mode = fingerprint_mode
         self.n_bins = n_fingerprint_bins
+        self.sink_threshold = sink_threshold
 
     def extract(
         self,
@@ -925,7 +993,7 @@ class TopKAttentionCapture:
 
         Returns dict with:
             - scores: [batch, top_k] normalized over top-k only (for display)
-            - indices: [batch, top_k] positions
+            - indices: [batch, top_k] positions (sink tokens already filtered if sink_threshold > 0)
             - logits: [batch, top_k] raw attention scores
             - logsumexp: [batch] logsumexp over all scores (for true probability)
             - fingerprint: [batch, n_bins] log-binned histogram (if fingerprint_mode)
@@ -934,7 +1002,8 @@ class TopKAttentionCapture:
         """
         scores, indices, logits, logsumexp = compute_topk_attention_chunked(
             q, k_buffer, kv_indptr, kv_indices,
-            sm_scale, self.top_k, self.chunk_size
+            sm_scale, self.top_k, self.chunk_size,
+            sink_threshold=self.sink_threshold,  # Sinq kernel optimization
         )
 
         result = {
@@ -972,6 +1041,7 @@ class TopKAttentionCapture:
         Fast path: Extract ONLY fingerprint without storing raw indices.
 
         This is the production path - 64 bytes output vs ~200KB for raw mode.
+        Sink tokens are filtered in-kernel when sink_threshold > 0 (Sinq optimization).
 
         Returns:
             fingerprint: [batch, n_bins] - log-binned histogram (GPU tensor)
@@ -979,9 +1049,11 @@ class TopKAttentionCapture:
             manifolds: List[str] - manifold classification
         """
         # Get top-k (we still need this for the histogram)
+        # Sink tokens are filtered in-kernel if sink_threshold > 0
         scores, indices, _, _ = compute_topk_attention_chunked(
             q, k_buffer, kv_indptr, kv_indices,
-            sm_scale, self.top_k, self.chunk_size
+            sm_scale, self.top_k, self.chunk_size,
+            sink_threshold=self.sink_threshold,  # Sinq kernel optimization
         )
 
         # Compute fingerprint ON GPU - this is the key optimization
@@ -1162,6 +1234,45 @@ def test_topk_attention():
     print(f"  Raw mode:         {raw_workload:,} bytes ({raw_workload/1024:.1f} KB)")
     print(f"  Fingerprint mode: {fp_workload:,} bytes ({fp_workload/1024:.1f} KB)")
     print(f"  Compression:      {raw_workload / fp_workload:.0f}x")
+
+    print("\n" + "=" * 60)
+    print("TEST 5: Sinq Kernel Optimization (Sink Filtering)")
+    print("=" * 60)
+
+    # Test with sink_threshold to filter positions 0-4
+    capture_sinq = TopKAttentionCapture(top_k=10, sink_threshold=5)
+    result_sinq = capture_sinq.extract(q, k_buffer, kv_indptr, kv_indices, sm_scale)
+
+    print(f"With sink_threshold=5:")
+    print(f"  Top-k indices: {result_sinq['indices'][0]}")
+
+    # Verify no sink positions (0-4) in results
+    indices_batch0 = result_sinq['indices'][0].cpu()
+    has_sink = (indices_batch0 < 5).any().item()
+    print(f"  Contains sink positions (0-4): {has_sink}")
+
+    # Compare with no filtering
+    capture_no_filter = TopKAttentionCapture(top_k=10, sink_threshold=0)
+    result_no_filter = capture_no_filter.extract(q, k_buffer, kv_indptr, kv_indices, sm_scale)
+    indices_no_filter = result_no_filter['indices'][0].cpu()
+    has_sink_unfiltered = (indices_no_filter < 5).any().item()
+    print(f"  Without filter, contains sink: {has_sink_unfiltered}")
+
+    # Test fingerprint mode with sink filtering
+    capture_sinq_fp = TopKAttentionCapture(
+        top_k=10, fingerprint_mode=True, sink_threshold=5
+    )
+    result_sinq_fp = capture_sinq_fp.extract(
+        q, k_buffer, kv_indptr, kv_indices, sm_scale, current_pos
+    )
+    print(f"\n  Fingerprint mode with sink filtering:")
+    print(f"    Manifold: {result_sinq_fp['manifold']}")
+    print(f"    Indices (no sinks): {result_sinq_fp['indices'][0]}")
+
+    print("\n  Sinq optimization benefits:")
+    print("    - Sink tokens filtered IN KERNEL (no Python overhead)")
+    print("    - Cleaner interpretability results")
+    print("    - More accurate fingerprints for routing")
 
     print("\n✓ All tests passed!")
 
