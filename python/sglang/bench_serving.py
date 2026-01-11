@@ -414,8 +414,12 @@ async def async_request_openai_chat_completions(
                         retrieve_url = f"{base_url}/query_maybe_retrieve"
                         retrieve_payload = {"receipt_id": receipt_id}
                         while True:
-                            async with session.post(retrieve_url, json=retrieve_payload) as poll_resp:
-                                print(f"hi call /query_maybe_retrieve {retrieve_payload=} {poll_resp.status=}")
+                            async with session.post(
+                                retrieve_url, json=retrieve_payload
+                            ) as poll_resp:
+                                print(
+                                    f"hi call /query_maybe_retrieve {retrieve_payload=} {poll_resp.status=}"
+                                )
                                 if poll_resp.status == 200:
                                     poll_text = await poll_resp.text()
                                     try:
@@ -426,11 +430,15 @@ async def async_request_openai_chat_completions(
                                     except JSONDecodeError:
                                         pass
                                     response_json = json.loads(poll_text)
-                                    output.generated_text = response_json["choices"][0]["message"]["content"]
+                                    output.generated_text = response_json["choices"][0][
+                                        "message"
+                                    ]["content"]
                                     output.success = True
                                     output.latency = time.perf_counter() - st
                                     output.ttft = output.latency
-                                    output.output_len = response_json.get("usage", {}).get("completion_tokens", output_len)
+                                    output.output_len = response_json.get(
+                                        "usage", {}
+                                    ).get("completion_tokens", output_len)
                                     break
                                 else:
                                     output.error = f"Poll failed: {poll_resp.status}"
