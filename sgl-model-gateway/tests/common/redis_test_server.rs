@@ -65,21 +65,21 @@ impl RedisTestServer {
         })
     }
 
-    pub fn is_ready(&self) -> Result<(), redis::RedisError> {
-        let client = redis::Client::open(self.url.as_str())?;
-        let mut conn = client.get_connection()?;
-        redis::cmd("PING").query::<String>(&mut conn)?;
-        Ok(())
-    }
-
     pub fn wait_ready(&self) {
-        for _ in 0..50 {
+        for _ in 0..100 {
             if self.is_ready().is_ok() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!("Timeout waiting Redis server ready on port {}", self.port);
+    }
+
+    pub fn is_ready(&self) -> Result<(), redis::RedisError> {
+        let client = redis::Client::open(self.url.as_str())?;
+        let mut conn = client.get_connection()?;
+        redis::cmd("PING").query::<String>(&mut conn)?;
+        Ok(())
     }
 
     pub fn url(&self) -> &str {
