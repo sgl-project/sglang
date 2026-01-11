@@ -593,9 +593,9 @@ jobs:
       RUNNER_LABELS: 1-gpu-runner
     strategy:
       fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel) }}
       matrix:
         partition: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-      max-parallel: ${{ needs.check-changes.outputs.max_parallel }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
