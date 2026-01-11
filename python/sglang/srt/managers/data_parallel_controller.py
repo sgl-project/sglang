@@ -34,7 +34,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.schedule_batch import Req, RequestStage
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import (
@@ -42,13 +42,11 @@ from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
 )
-from sglang.srt.tracing.trace import (
-    process_tracing_init,
-    trace_get_proc_propagate_context,
-    trace_set_proc_propagate_context,
-    trace_set_thread_info,
-    trace_slice_end,
-    trace_slice_start,
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.tracing.trace_metric_wrapper import (
+    NullContext,
+    RequestStage,
+    TraceMetricContext,
 )
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
@@ -191,15 +189,16 @@ class DataParallelController:
         self.dp_budget.update_budget(obj)
 
     def dispatching_with_trace(self, req: Req):
-        if self.server_args.enable_trace:
-            trace_set_proc_propagate_context(req.rid, req.trace_context)
-            trace_slice_start(RequestStage.DC_DISPATCH, req.rid)
-            req.trace_context = trace_get_proc_propagate_context(req.rid)
+        if isinstance(req.trace_metric_ctx, TraceMetricContext):
+            req.trace_metric_ctx.rebuild_thread_context()
+        else:
+            req.trace_metric_ctx = NullContext()
 
+        req.trace_metric_ctx.slice_start(RequestStage.DC_DISPATCH)
         self.dispatching(req)
-
-        if self.server_args.enable_trace:
-            trace_slice_end(RequestStage.DC_DISPATCH, req.rid, thread_finish_flag=True)
+        req.trace_metric_ctx.slice_end(
+            RequestStage.DC_DISPATCH, thread_finish_flag=True
+        )
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -538,7 +537,7 @@ def run_data_parallel_controller_process(
     parent_process = psutil.Process().parent()
 
     configure_logger(server_args)
-    if server_args.enable_trace:
+    if server_args.trace_level > 0:
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
         thread_label = "DP Controller"
         if server_args.disaggregation_mode == "prefill":
