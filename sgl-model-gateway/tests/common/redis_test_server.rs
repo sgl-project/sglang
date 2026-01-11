@@ -7,10 +7,6 @@ use std::{
 use tokio::net::TcpStream;
 use tracing::warn;
 
-// ============================================================================
-// Shared Redis Server (singleton for all tests)
-// ============================================================================
-
 static SHARED_SERVER: OnceLock<SharedRedisServer> = OnceLock::new();
 
 pub struct SharedRedisServer {
@@ -49,15 +45,9 @@ impl SharedRedisServer {
     }
 }
 
-/// Get or create a shared Redis server for tests.
-/// Multiple tests can use this server with different key prefixes.
 pub fn get_shared_server() -> &'static SharedRedisServer {
     SHARED_SERVER.get_or_init(SharedRedisServer::start)
 }
-
-// ============================================================================
-// Per-test Redis Server (for tests that need isolated instances)
-// ============================================================================
 
 pub struct RedisTestServer {
     process: Option<Child>,
