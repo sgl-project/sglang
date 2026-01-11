@@ -370,8 +370,8 @@ impl RedisBackend {
     ) -> (Option<usize>, ExecutionBranch) {
         let retry_config = RetryConfig {
             max_retries: 5,
-            initial_backoff_ms: 5,
-            max_backoff_ms: 50,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 500,
             backoff_multiplier: 2.0,
             jitter_factor: 0.2,
         };
