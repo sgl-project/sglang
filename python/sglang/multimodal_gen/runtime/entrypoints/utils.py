@@ -9,6 +9,7 @@ diffusion models.
 """
 
 import os
+from typing import Any, Optional
 
 import imageio
 import torch
@@ -49,15 +50,19 @@ def prepare_request(
 
 
 def post_process_sample(
-    sample: torch.Tensor,
+    sample: Any,
     data_type: DataType,
     fps: int,
     save_output: bool = True,
-    save_file_path: str = None,
+    save_file_path: Optional[str] = None,
 ):
     """
     Process sample output and save video if necessary
     """
+    audio = None
+    if isinstance(sample, (tuple, list)) and len(sample) == 2:
+        sample, audio = sample
+
     # 1. Vectorized processing on GPU/CPU tensor
     if sample.dim() == 3:
         # for images, dim t is missing
@@ -86,6 +91,39 @@ def post_process_sample(
                     codec="libx264",
                     quality=quality,
                 )
+                
+                if audio is not None:
+                    # Save audio
+                    import scipy.io.wavfile
+                    audio_path = save_file_path.rsplit(".", 1)[0] + ".wav"
+                    # Audio is likely (C, L) or (L,). LTX audio is (C, L) latent -> decoded audio (1, L)
+                    # We need to check shape.
+                    if isinstance(audio, torch.Tensor):
+                        audio_np = (
+                            audio.detach()
+                            .squeeze()
+                            .float()
+                            .clamp(-1.0, 1.0)
+                            .cpu()
+                            .numpy()
+                        )
+                        # LTX default sample rate is 24000
+                        scipy.io.wavfile.write(audio_path, 24000, audio_np)
+                        logger.info(f"Audio saved to {CYAN}{audio_path}{RESET}")
+                        
+                        # Try to merge if ffmpeg is available
+                        try:
+                            import subprocess
+                            merged_path = save_file_path.rsplit(".", 1)[0] + "_merged.mp4"
+                            subprocess.run([
+                                "ffmpeg", "-y", "-i", save_file_path, "-i", audio_path,
+                                "-c:v", "copy", "-c:a", "aac", "-strict", "experimental",
+                                merged_path
+                            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            logger.info(f"Merged video saved to {CYAN}{merged_path}{RESET}")
+                        except Exception:
+                            pass
+
             else:
                 quality = 75
                 if len(frames) > 1:
