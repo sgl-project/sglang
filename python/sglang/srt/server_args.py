@@ -69,6 +69,7 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 # Define constants
+DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ("/metrics",)
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -345,6 +346,10 @@ class ServerArgs:
     log_requests_level: int = 2
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
+    enable_uvicorn_access_log_filter: bool = True
+    uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
+        default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
+    )
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
@@ -3101,6 +3106,24 @@ class ServerArgs:
             default=ServerArgs.log_requests_target,
             help="Target(s) for request logging: 'stdout' and/or directory path(s) for file output. "
             "Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
+        )
+        parser.add_argument(
+            "--uvicorn-access-log-exclude-prefixes",
+            type=str,
+            nargs="*",
+            default=list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES),
+            help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
+            "Defaults to '/metrics' to reduce noise. "
+            "Pass an empty list to restore the original behavior (no filtering), e.g. "
+            "'--uvicorn-access-log-exclude-prefixes' (no values). "
+            "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
+        )
+        parser.add_argument(
+            "--disable-uvicorn-access-log-filter",
+            dest="enable_uvicorn_access_log_filter",
+            action="store_false",
+            default=ServerArgs.enable_uvicorn_access_log_filter,
+            help="Disable uvicorn access-log path filtering entirely (restore original behavior).",
         )
         parser.add_argument(
             "--crash-dump-folder",
