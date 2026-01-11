@@ -41,12 +41,12 @@ conda activate sglang_npu
 
 Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.3.RC2 or higher, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
 
-#### MemFabric Adaptor
+#### MemFabric-Hybrid
 
-If you want to use PD disaggregation mode, you need to install MemFabric Adaptor. MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
+If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid. MemFabric-Hybrid is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
 
 ```shell
-pip install mf-adapter==1.0.0
+pip install memfabric-hybrid==1.0.0
 ```
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
