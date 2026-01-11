@@ -1,4 +1,5 @@
 import inspect
+import time
 from typing import List, Optional, Union
 
 import numpy as np
@@ -15,22 +16,6 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-
-# Copyright 2025 The CogVideoX team, Tsinghua University & ZhipuAI and The HuggingFace Team.
-# All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import inspect
 import re
@@ -54,22 +39,7 @@ from transformers import (
 
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-
-EXAMPLE_DOC_STRING = """
-    Examples:
-        ```python
-        >>> import torch
-        >>> from diffusers import GlmImagePipeline
-
-        >>> pipe = GlmImagePipeline.from_pretrained("zai-org/GLM-Image", torch_dtype=torch.bfloat16)
-        >>> pipe.to("cuda")
-
-        >>> prompt = "A photo of an astronaut riding a horse on mars<sop>36 24<eop>"
-        >>> image = pipe(prompt).images[0]
-        >>> image.save("output.png")
-        ```
-"""
+logger = logging.get_logger(__name__)
 
 
 def calculate_shift(
@@ -176,10 +146,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         scheduler ([`SchedulerMixin`]):
             A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
     """
-
-    _optional_components = []
-    model_cpu_offload_seq = "transformer->vae"
-    _callback_tensor_inputs = ["latents", "prompt_embeds"]
 
     def __init__(
         self,
@@ -530,7 +496,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         self,
         prompt: Union[str, List[str]],
         do_classifier_free_guidance: bool = True,
-        num_images_per_prompt: int = 1,
         prompt_embeds: Optional[torch.Tensor] = None,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
@@ -544,8 +509,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                 prompt to be encoded
             do_classifier_free_guidance (`bool`, *optional*, defaults to `True`):
                 Whether to use classifier free guidance or not.
-            num_images_per_prompt (`int`, *optional*, defaults to 1):
-                Number of images that should be generated per prompt. torch device to place the resulting embeddings on
             prompt_embeds (`torch.Tensor`, *optional*):
                 Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
                 provided, text embeddings will be generated from `prompt` input argument.
@@ -570,10 +533,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             )
 
         seq_len = prompt_embeds.size(1)
-        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(
-            batch_size * num_images_per_prompt, seq_len, -1
-        )
+        prompt_embeds = prompt_embeds.repeat(1, 1, 1)
+        prompt_embeds = prompt_embeds.view(1, seq_len, -1)
 
         negative_prompt_embeds = None
         if do_classifier_free_guidance:
@@ -601,12 +562,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             )
 
             seq_len = negative_prompt_embeds.size(1)
-            negative_prompt_embeds = negative_prompt_embeds.repeat(
-                1, num_images_per_prompt, 1
-            )
-            negative_prompt_embeds = negative_prompt_embeds.view(
-                batch_size * num_images_per_prompt, seq_len, -1
-            )
+            negative_prompt_embeds = negative_prompt_embeds.repeat(1, 1, 1)
+            negative_prompt_embeds = negative_prompt_embeds.view(1, seq_len, -1)
 
         return prompt_embeds, negative_prompt_embeds
 
@@ -619,10 +576,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         dtype,
         device,
         generator,
-        latents=None,
     ):
-        if latents is not None:
-            return latents.to(device)
 
         shape = (
             batch_size,
@@ -725,25 +679,13 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         height = batch.height
         width = batch.width
 
-        ### TODO: remove
         device = get_local_torch_device()
-        num_images_per_prompt = 1
         max_sequence_length = 1024
-        generator = torch.Generator(device=device).manual_seed(42)
+        generator = torch.Generator(device=device).manual_seed(batch.seed)
         attention_kwargs = {}
-        callback_on_step_end = None
-        callback_on_step_end_tensor_inputs = {}
-        output_type = "pil"
-        return_dict = True
         prompt_embeds = None
         do_classifier_free_guidance = True
         dtype = torch.bfloat16
-        latents = None
-        crops_coords_top_left = (0, 0)
-        timesteps = None
-        sigmas = None
-        condition_images = None
-        ###
 
         self._guidance_scale = guidance_scale
         self._current_timestep = None
@@ -751,13 +693,9 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
         batch_size = 1
 
-        # device = self._execution_device
         device = get_local_torch_device()
 
-        import time
-
         time_start = time.time()
-        # prior_token_id, ar_height, ar_width = self.generate_prior_tokens(
         prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
             prompt=prompt,
             image=ar_condition_images,
@@ -766,16 +704,12 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         )
         prior_token_id = prior_token_id.to(device=device)
         time_end = time.time()
-        print(f"generate_prior_tokens time: {time_end - time_start}", flush=True)
-
-        height = height
-        width = width
+        logger.info(f"generate_prior_tokens time: {time_end - time_start}")
 
         # 3. Encode input prompt
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt,
             do_classifier_free_guidance,
-            num_images_per_prompt=num_images_per_prompt,
             prompt_embeds=prompt_embeds,
             max_sequence_length=max_sequence_length,
             device=device,
@@ -808,14 +742,13 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         # 5. Prepare latents and (optional) condition_images kv cache
         latent_channels = self.transformer.config.in_channels
         latents = self.prepare_latents(
-            batch_size=batch_size * num_images_per_prompt,
+            batch_size=1,
             num_channels_latents=latent_channels,
             height=height,
             width=width,
             dtype=torch.float32,
             device=device,
             generator=generator,
-            latents=latents,
         )
 
         kv_caches = GlmImageKVCache(num_layers=self.transformer.config.num_layers)
@@ -874,31 +807,18 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             [target_size], dtype=prompt_embeds.dtype, device=device
         )
         crops_coords_top_left = torch.tensor(
-            [crops_coords_top_left], dtype=prompt_embeds.dtype, device=device
-        )
-
-        target_size = target_size.repeat(batch_size * num_images_per_prompt, 1)
-        crops_coords_top_left = crops_coords_top_left.repeat(
-            batch_size * num_images_per_prompt, 1
+            [(0, 0)], dtype=prompt_embeds.dtype, device=device
         )
 
         # Prepare timesteps
         image_seq_len = (
             (height // self.vae_scale_factor) * (width // self.vae_scale_factor)
         ) // (self.transformer.config.patch_size**2)
-        timesteps = (
-            np.linspace(
-                self.scheduler.config.num_train_timesteps, 1.0, num_inference_steps + 1
-            )[:-1]
-            if timesteps is None
-            else np.array(timesteps)
-        )
+        timesteps = np.linspace(
+            self.scheduler.config.num_train_timesteps, 1.0, num_inference_steps + 1
+        )[:-1]
         timesteps = timesteps.astype(np.int64).astype(np.float32)
-        sigmas = (
-            timesteps / self.scheduler.config.num_train_timesteps
-            if sigmas is None
-            else sigmas
-        )
+        sigmas = timesteps / self.scheduler.config.num_train_timesteps
         mu = calculate_shift(
             image_seq_len,
             self.scheduler.config.get("base_image_seq_len", 256),
@@ -910,18 +830,15 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         )
         self._num_timesteps = len(timesteps)
 
-        # 7. Denoising loop
+        # 7. Prepare for denoising loop
 
         batch.prompt_embeds = [prompt_embeds]
-        # batch.prompt_embeds_mask = [prompt_embeds_mask]
         batch.negative_prompt_embeds = [negative_prompt_embeds]
-        # batch.negative_prompt_embeds_mask = [negative_prompt_embeds_mask]
         batch.latents = latents
         batch.timesteps = timesteps
         batch.num_inference_steps = num_inference_steps
         batch.sigmas = sigmas.tolist()  # Convert numpy array to list for validation
         batch.generator = generator
-        # batch.original_condition_image_size = image_size
         batch.raw_latent_shape = latents.shape
 
         batch.prior_token_id = prior_token_id
@@ -937,119 +854,3 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         batch.kv_caches = kv_caches
 
         return batch
-
-        transformer_dtype = self.transformer.dtype
-        num_warmup_steps = max(
-            len(timesteps) - num_inference_steps * self.scheduler.order, 0
-        )
-
-        prior_token_drop_cond = torch.full_like(prior_token_id, False, dtype=torch.bool)
-        prior_token_drop_uncond = torch.full_like(
-            prior_token_id, True, dtype=torch.bool
-        )
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
-
-                self._current_timestep = t
-                latent_model_input = latents.to(transformer_dtype)
-
-                timestep = t.expand(latents.shape[0]) - 1
-
-                if condition_images is not None:
-                    self.transformer.set_attention_processors_state(
-                        # GlmImageAttenProcessorState.ImageEditReadKV
-                    )
-
-                noise_pred_cond = self.transformer(
-                    hidden_states=latent_model_input,
-                    encoder_hidden_states=prompt_embeds,
-                    prior_token_id=prior_token_id,
-                    prior_token_drop=prior_token_drop_cond,
-                    timestep=timestep,
-                    target_size=target_size,
-                    crop_coords=crops_coords_top_left,
-                    attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0].float()
-
-                # perform guidance
-                if self.do_classifier_free_guidance:
-                    if condition_images is not None:
-                        self.transformer.set_attention_processors_state(
-                            # GlmImageAttenProcessorState.ImageEditDontReadKV
-                        )
-                    noise_pred_uncond = self.transformer(
-                        hidden_states=latent_model_input,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        prior_token_id=prior_token_id,
-                        prior_token_drop=prior_token_drop_uncond,
-                        timestep=timestep,
-                        target_size=target_size,
-                        crop_coords=crops_coords_top_left,
-                        attention_kwargs=attention_kwargs,
-                        return_dict=False,
-                    )[0].float()
-
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (
-                        noise_pred_cond - noise_pred_uncond
-                    )
-                else:
-                    noise_pred = noise_pred_cond
-
-                latents = self.scheduler.step(
-                    noise_pred, t, latents, return_dict=False
-                )[0]
-
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(
-                        self, i, self.scheduler.sigmas[i], callback_kwargs
-                    )
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-
-                if i == len(timesteps) - 1 or (
-                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
-                ):
-                    progress_bar.update()
-
-        self._current_timestep = None
-        self.transformer.set_attention_processors_state(
-            # GlmImageAttenProcessorState.ImageGen
-        )
-        self.transformer.clear_attention_processors_cache()
-
-        if not output_type == "latent":
-            latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.latent_channels, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = (
-                torch.tensor(self.vae.config.latents_std)
-                .view(1, self.vae.config.latent_channels, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents = latents * latents_std + latents_mean
-            condition_images = self.vae.decode(
-                latents, return_dict=False, generator=generator
-            )[0]
-        else:
-            condition_images = latents
-
-        condition_images = self.image_processor.postprocess(
-            condition_images, output_type=output_type
-        )
-
-        # Offload all models
-        self.maybe_free_model_hooks()
-
-        if not return_dict:
-            return (condition_images,)
-
-        return None

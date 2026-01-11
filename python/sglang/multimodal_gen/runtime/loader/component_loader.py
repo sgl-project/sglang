@@ -786,13 +786,13 @@ class GenericComponentLoader(ComponentLoader):
 class VisionLanguageEncoderLoader(ComponentLoader):
     """Loader for vision language encoder (typically Causal LM or Vision2Seq)."""
 
-    def load_native(
+    def load_customized(
         self,
         component_model_path: str,
         server_args: ServerArgs,
-        transformers_or_diffusers: str,
+        transformers_or_diffusers: str = "vision_language_encoder",
     ) -> Any:
-        if transformers_or_diffusers == "transformers":
+        if transformers_or_diffusers == "vision_language_encoder":
             from transformers import AutoModelForImageTextToText
 
             config = get_hf_config(
@@ -805,7 +805,7 @@ class VisionLanguageEncoderLoader(ComponentLoader):
                 config=config,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-            ).to("cpu")
+            ).to(get_local_torch_device())
         else:
             raise ValueError(
                 f"Unsupported library for VisionLanguageEncoder: {transformers_or_diffusers}"
