@@ -227,7 +227,7 @@ class SchedulerMetricsMixin:
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
             self.stats.num_queue_reqs = len(self.waiting_queue)
-            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
@@ -393,7 +393,7 @@ class SchedulerMetricsMixin:
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
-            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens

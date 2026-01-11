@@ -171,6 +171,10 @@ class Envs:
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
+    # Constrained Decoding (Grammar)
+    SGLANG_GRAMMAR_SIMULATE_TIMEOUT = EnvFloat(-1)
+    SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.03)
+
     # Test & Debug
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
