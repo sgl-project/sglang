@@ -169,6 +169,7 @@ class LTX2Pipeline(ComposedPipelineBase):
             stage=LTX2AVLatentPreparationStage(
                 scheduler=scheduler,
                 transformer=transformer,
+                audio_vae=audio_vae,
             )
         )
 

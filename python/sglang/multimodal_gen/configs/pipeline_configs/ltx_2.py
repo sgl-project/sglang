@@ -10,14 +10,26 @@ from sglang.multimodal_gen.configs.models.encoders.gemma import GemmaConfig
 from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2Config
 
 
-def _gemma_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
-    # Prefer LTX-2 style outputs when available.
-    if hasattr(outputs, "video_context"):
-        return getattr(outputs, "video_context")
+def _gemma_postprocess_video(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+    # Support both ltx-core style and transformers/diffusers style outputs.
+    for key in ("video_context", "video_encoding"):
+        if hasattr(outputs, key):
+            return getattr(outputs, key)
     if hasattr(outputs, "last_hidden_state"):
         return outputs.last_hidden_state
     raise AttributeError(
-        "Unsupported text encoder output: expected `video_context` or `last_hidden_state`."
+        "Unsupported text encoder output: expected `video_context`/`video_encoding` or `last_hidden_state`."
+    )
+
+
+def _gemma_postprocess_audio(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+    for key in ("audio_context", "audio_encoding"):
+        if hasattr(outputs, key):
+            return getattr(outputs, key)
+    if hasattr(outputs, "last_hidden_state"):
+        return outputs.last_hidden_state
+    raise AttributeError(
+        "Unsupported text encoder output: expected `audio_context`/`audio_encoding` or `last_hidden_state`."
     )
 
 
@@ -49,12 +61,14 @@ class LTX2PipelineConfig(PipelineConfig):
     vae_temporal_compression: int = 8
     
     # Text encoding stage (Gemma)
+    # LTX-2 needs separate contexts for video/audio streams. We model this as
+    # two logical encoders sharing the same underlying `text_encoder` module.
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (GemmaConfig(),)
+        default_factory=lambda: (GemmaConfig(), GemmaConfig())
     )
     postprocess_text_funcs: tuple[
         Callable[[BaseEncoderOutput, dict], torch.Tensor], ...
-    ] = field(default_factory=lambda: (_gemma_postprocess_text,))
+    ] = field(default_factory=lambda: (_gemma_postprocess_video, _gemma_postprocess_audio))
     
     def __post_init__(self):
         super().__post_init__()

@@ -13,7 +13,9 @@ class LTX2ArchConfig(DiTArchConfig):
     attention_head_dim: int = 128
     num_layers: int = 28
     cross_attention_dim: int = 4096
-    caption_channels: int = 4096
+    # In LTX-2, text encoder features are projected to modality dims.
+    # ltx-core defaults to 3840 here.
+    caption_channels: int = 3840
     
     # Audio specific
     audio_in_channels: int = 128
