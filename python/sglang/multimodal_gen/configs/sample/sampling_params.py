@@ -149,8 +149,6 @@ class SamplingParams:
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
     adjust_frames: bool = True
-    # for ComfyUI integration
-    comfyui_mode: bool = False
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -333,7 +331,7 @@ class SamplingParams:
                 )
                 self.num_frames = new_num_frames
 
-        if not self.comfyui_mode:
+        if not server_args.comfyui_mode:
             self._set_output_file_name()
             self.log(server_args=server_args)
 

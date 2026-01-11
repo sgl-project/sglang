@@ -36,7 +36,6 @@ class ZImageExecutor(SGLDiffusionExecutor):
             num_frames=1,  # For images
             num_inference_steps=1,  # Single step for ComfyUI
             save_output=False,
-            comfyui_mode=True,
         )
 
         # Prepare request (converts SamplingParams to Req)

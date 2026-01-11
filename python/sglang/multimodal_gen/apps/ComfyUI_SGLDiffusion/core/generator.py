@@ -56,6 +56,8 @@ class SGLDiffusionGenerator:
             return self.generator
         if kwargs is None:
             kwargs = {}
+        # Set comfyui_mode for ComfyUI integration
+        kwargs["comfyui_mode"] = True
         self.generator = DiffGenerator.from_pretrained(
             model_path=model_path,
             pipeline_class_name=pipeline_class_name,

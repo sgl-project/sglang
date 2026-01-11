@@ -290,6 +290,9 @@ class ServerArgs:
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
 
+    # ComfyUI integration
+    comfyui_mode: bool = False
+
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
     STA_mode: STA_Mode = STA_Mode.STA_INFERENCE

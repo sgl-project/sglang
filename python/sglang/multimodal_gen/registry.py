@@ -130,7 +130,7 @@ def _discover_and_register_pipelines():
                         _PIPELINE_REGISTRY[cls.pipeline_name] = cls
 
                         # Auto-register config classes if Pipeline class has them defined
-                        # because comfyui get model from a singe weight file, so we need to register the config classes here
+                        # because comfyui get model from a single weight file, so we need to register the config classes here
                         if hasattr(cls, "pipeline_config_cls") and hasattr(
                             cls, "sampling_params_cls"
                         ):
