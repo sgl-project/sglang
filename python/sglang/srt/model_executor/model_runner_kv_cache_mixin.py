@@ -45,7 +45,8 @@ _is_npu = is_npu()
 
 class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
-        kv_size = torch._utils._element_size(self.kv_cache_dtype)
+        if self.kv_cache_dtype not in ("int4", "int8"):
+            kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
@@ -79,33 +80,65 @@ class ModelRunnerKVCacheMixin:
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
-            cell_size = (
-                self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * (self.model_config.head_dim + self.model_config.v_head_dim)
-                * num_layers
-                * kv_size
-            )
-
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                # kv_scale_buffer
-                scale_block_size = 16
-
-                n = self.model_config.get_num_kv_heads(get_attention_tp_size())
-                k = self.model_config.head_dim
-                cell_size = (cell_size // 2) + (
-                    (n * k * num_layers * 2 * kv_size) // scale_block_size
-                )
-
-            if "MiMoV2FlashForCausalLM" in self.model_config.hf_config.architectures:
-                cell_size += (
-                    self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
-                    * (
-                        self.model_config.hf_text_config.swa_head_dim
-                        + self.model_config.hf_text_config.swa_v_head_dim
+            if self.kv_cache_dtype in ("int4", "int8"):
+                if self.kv_cache_dtype == "int4":
+                    cell_size = (
+                        self.model_config.get_num_kv_heads(get_attention_tp_size())
+                        * (self.model_config.head_dim + 1)
+                        // 2  # two neighbour dims are packed into one byte, equal to ceil(head_dim/2)
+                        * num_layers
+                        * 2  # key and value
+                        * 1  # two int4 pack to one byte
                     )
-                    * len(self.model_config.swa_attention_layer_ids)
+                else:
+                    cell_size = (
+                        self.model_config.get_num_kv_heads(get_attention_tp_size())
+                        * self.model_config.head_dim
+                        * num_layers
+                        * 2  # key and value
+                        * 1  # int8 is one byte
+                    )
+                # quantize on head dimension, so need add scale buffer
+                cell_size = cell_size + (
+                    (
+                        self.model_config.get_num_kv_heads(get_attention_tp_size())
+                        * num_layers
+                        * 2  # key and value
+                        * 2  # scale and zero
+                    )
+                    * torch._utils._element_size(torch.float32)
+                )
+            else:
+                cell_size = (
+                    self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    * (self.model_config.head_dim + self.model_config.v_head_dim)
+                    * num_layers
                     * kv_size
                 )
+
+                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                    # kv_scale_buffer
+                    scale_block_size = 16
+
+                    n = self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    k = self.model_config.head_dim
+                    cell_size = (cell_size // 2) + (
+                        (n * k * num_layers * 2 * kv_size) // scale_block_size
+                    )
+
+                if (
+                    "MiMoV2FlashForCausalLM"
+                    in self.model_config.hf_config.architectures
+                ):
+                    cell_size += (
+                        self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
+                        * (
+                            self.model_config.hf_text_config.swa_head_dim
+                            + self.model_config.hf_text_config.swa_v_head_dim
+                        )
+                        * len(self.model_config.swa_attention_layer_ids)
+                        * kv_size
+                    )
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):
@@ -576,6 +609,7 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        model_dtype=self.dtype,
                     )
 
         # Initialize token_to_kv_pool_allocator

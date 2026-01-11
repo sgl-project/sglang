@@ -179,6 +179,942 @@ def _fwd_kernel_stage1(
         )
 
 
+@triton.jit
+def _fwd_kernel_stage1_quant_int8(
+    Q,
+    K_Buffer,  # Quantized INT8 [cache_size, num_heads, head_dim] uint8
+    V_Buffer,  # Quantized INT8 [cache_size, num_heads, head_dim] uint8
+    K_Scales_Zeros,  # [cache_size, num_heads, 2] float32, [..., 0]=scale, [..., 1]=zero
+    V_Scales_Zeros,  # [cache_size, num_heads, 2] float32
+    sm_scale,
+    kv_indptr,
+    kv_indices,
+    Att_Out,
+    Att_Lse,
+    num_kv_splits,
+    stride_qbs,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    stride_sz_kbs,  # scales_zeros stride for cache
+    stride_sz_kh,  # scales_zeros stride for head
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    kv_group_num: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
+    logit_cap: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+    xai_temperature_len: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+
+    cur_kv_head = cur_head // kv_group_num
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lk
+    mask_dv = offs_dv < Lv
+
+    cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
+    kv_splits = tl.load(num_kv_splits + cur_batch)
+
+    if xai_temperature_len > 0:
+        offs_qidx = cur_batch_seq_len - 1
+        xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
+        _qtemp = tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale
+        xai_temperature_reg = tl.where(offs_qidx > xai_temperature_len, _qtemp, 1.0)
+
+    off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
+
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+    e_max = -float("inf")
+    e_sum = 0.0
+    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+
+    if split_kv_end > split_kv_start:
+        q = tl.load(Q + off_q, mask=mask_d, other=0.0)
+        for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            kv_loc = tl.load(
+                kv_indices + cur_batch_kv_start_idx + offs_n,
+                mask=offs_n < split_kv_end,
+                other=0,
+            )
+
+            # Load quantized K (uint8)
+            offs_buf_k = (
+                kv_loc[:, None] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+                + offs_d[None, :]
+            )
+            k_quant = tl.load(
+                K_Buffer + offs_buf_k,
+                mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
+                other=0,
+            )
+
+            # Load scales and zeros for K
+            offs_sz_k = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
+            k_scales = tl.load(
+                K_Scales_Zeros + offs_sz_k + 0,
+                mask=offs_n < split_kv_end,
+                other=1.0,
+            )
+            k_zeros = tl.load(
+                K_Scales_Zeros + offs_sz_k + 1,
+                mask=offs_n < split_kv_end,
+                other=0.0,
+            )
+
+            # Dequantize K: k = (k_quant - zeros) * scales
+            # k_quant: [BLOCK_N, BLOCK_DMODEL], k_scales/k_zeros: [BLOCK_N]
+            k = ((k_quant.to(tl.float32) - k_zeros[:, None]) * k_scales[:, None]).to(
+                q.dtype
+            )
+
+            qk = tl.sum(q[None, :] * k, 1)
+            qk *= sm_scale
+
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
+
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg
+
+            qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
+
+            # Load quantized V (uint8)
+            offs_buf_v = (
+                kv_loc[:, None] * stride_buf_vbs
+                + cur_kv_head * stride_buf_vh
+                + offs_dv[None, :]
+            )
+            v_quant = tl.load(
+                V_Buffer + offs_buf_v,
+                mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                other=0,
+            )
+
+            # Load scales and zeros for V
+            offs_sz_v = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
+            v_scales = tl.load(
+                V_Scales_Zeros + offs_sz_v + 0,
+                mask=offs_n < split_kv_end,
+                other=1.0,
+            )
+            v_zeros = tl.load(
+                V_Scales_Zeros + offs_sz_v + 1,
+                mask=offs_n < split_kv_end,
+                other=0.0,
+            )
+
+            # Dequantize V inline: v = (v_quant - zeros) * scales
+            # v_quant: [BLOCK_N, BLOCK_DV], v_scales/v_zeros: [BLOCK_N]
+            v = ((v_quant.to(tl.float32) - v_zeros[:, None]) * v_scales[:, None]).to(
+                q.dtype
+            )
+
+            n_e_max = tl.maximum(tl.max(qk, 0), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max)
+            acc *= re_scale
+            acc += tl.sum(p[:, None] * v, 0)
+
+            e_sum = e_sum * re_scale + tl.sum(p, 0)
+            e_max = n_e_max
+
+        offs_mid_o = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_kv_id * stride_mid_os
+            + offs_dv
+        )
+
+        tl.store(
+            Att_Out + offs_mid_o,
+            acc / e_sum,
+            mask=(mask_dv),
+        )
+
+        offs_mid_o_1 = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_kv_id * stride_mid_os
+        ) // Lv
+
+        tl.store(
+            Att_Lse + offs_mid_o_1,
+            e_max + tl.log(e_sum),
+        )
+
+
+@triton.jit
+def _fwd_kernel_stage1_quant_int4(
+    Q,
+    K_Buffer,  # Quantized INT4 [cache_size, num_heads, head_dim//2] uint8 (packed)
+    V_Buffer,  # Quantized INT4 [cache_size, num_heads, head_dim//2] uint8 (packed)
+    K_Scales_Zeros,  # [cache_size, num_heads, 2] float32, [..., 0]=scale, [..., 1]=zero
+    V_Scales_Zeros,  # [cache_size, num_heads, 2] float32
+    sm_scale,
+    kv_indptr,
+    kv_indices,
+    Att_Out,
+    Att_Lse,
+    num_kv_splits,
+    stride_qbs,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    stride_sz_kbs,  # scales_zeros stride for cache
+    stride_sz_kh,  # scales_zeros stride for head
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    kv_group_num: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
+    logit_cap: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+    xai_temperature_len: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+
+    cur_kv_head = cur_head // kv_group_num
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lk
+    mask_dv = offs_dv < Lv
+
+    cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
+    kv_splits = tl.load(num_kv_splits + cur_batch)
+
+    if xai_temperature_len > 0:
+        offs_qidx = cur_batch_seq_len - 1
+        xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
+        _qtemp = tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale
+        xai_temperature_reg = tl.where(offs_qidx > xai_temperature_len, _qtemp, 1.0)
+
+    off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
+
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+    e_max = -float("inf")
+    e_sum = 0.0
+    # For INT4, work with first half and second half separately
+    acc_first = tl.zeros([BLOCK_DV // 2], dtype=tl.float32)
+    acc_second = tl.zeros([BLOCK_DV // 2], dtype=tl.float32)
+
+    if split_kv_end > split_kv_start:
+        # Load q split into first half and second half for INT4
+        offs_d_first = tl.arange(0, BLOCK_DMODEL // 2)
+        offs_d_second = tl.arange(0, BLOCK_DMODEL // 2)
+        mask_d_first = offs_d_first < (Lk // 2)
+        mask_d_second = offs_d_second < (Lk - Lk // 2)
+
+        off_q_first = cur_batch * stride_qbs + cur_head * stride_qh + offs_d_first
+        off_q_second = (
+            cur_batch * stride_qbs + cur_head * stride_qh + (Lk // 2) + offs_d_second
+        )
+
+        q_first = tl.load(Q + off_q_first, mask=mask_d_first, other=0.0)
+        q_second = tl.load(Q + off_q_second, mask=mask_d_second, other=0.0)
+
+        for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            kv_loc = tl.load(
+                kv_indices + cur_batch_kv_start_idx + offs_n,
+                mask=offs_n < split_kv_end,
+                other=0,
+            )
+
+            # Load packed INT4 K (uint8, 2 values per byte)
+            offs_d_packed = tl.arange(0, BLOCK_DMODEL // 2)
+            mask_d_packed = offs_d_packed < (Lk // 2)
+
+            offs_buf_k_packed = (
+                kv_loc[:, None] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+                + offs_d_packed[None, :]
+            )
+            k_quant_packed = tl.load(
+                K_Buffer + offs_buf_k_packed,
+                mask=(offs_n[:, None] < split_kv_end) & (mask_d_packed[None, :]),
+                other=0,
+            )
+
+            # Load scales and zeros for K
+            offs_sz_k = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
+            k_scales = tl.load(
+                K_Scales_Zeros + offs_sz_k + 0,
+                mask=offs_n < split_kv_end,
+                other=1.0,
+            )
+            k_zeros = tl.load(
+                K_Scales_Zeros + offs_sz_k + 1,
+                mask=offs_n < split_kv_end,
+                other=0.0,
+            )
+
+            # Dequantize INT4 K inline: unpack and dequantize
+            # k_quant_packed: [BLOCK_N, BLOCK_DMODEL//2], k_scales/k_zeros: [BLOCK_N]
+            # Unpack lower and upper 4 bits, then dequantize: (q - zero) * scale
+            k_lower = (
+                ((k_quant_packed & 0x0F).to(tl.float32) - k_zeros[:, None])
+                * k_scales[:, None]
+            ).to(q_first.dtype)
+            k_upper = (
+                (((k_quant_packed >> 4) & 0x0F).to(tl.float32) - k_zeros[:, None])
+                * k_scales[:, None]
+            ).to(q_first.dtype)
+            # Compute QK in q.dtype for efficiency, then convert to float32 for accumulation
+            qk = tl.sum(q_first[None, :] * k_lower, 1) + tl.sum(
+                q_second[None, :] * k_upper, 1
+            )
+            qk *= sm_scale
+
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
+
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg
+
+            qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
+
+            # Load packed INT4 V
+            offs_dv_packed = tl.arange(0, BLOCK_DV // 2)
+            mask_dv_packed = offs_dv_packed < (Lv // 2)
+
+            offs_buf_v_packed = (
+                kv_loc[:, None] * stride_buf_vbs
+                + cur_kv_head * stride_buf_vh
+                + offs_dv_packed[None, :]
+            )
+            v_quant_packed = tl.load(
+                V_Buffer + offs_buf_v_packed,
+                mask=(offs_n[:, None] < split_kv_end) & (mask_dv_packed[None, :]),
+                other=0,
+            )
+
+            # Load scales and zeros for V
+            offs_sz_v = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
+            v_scales = tl.load(
+                V_Scales_Zeros + offs_sz_v + 0,
+                mask=offs_n < split_kv_end,
+                other=1.0,
+            )
+            v_zeros = tl.load(
+                V_Scales_Zeros + offs_sz_v + 1,
+                mask=offs_n < split_kv_end,
+                other=0.0,
+            )
+
+            # Dequantize INT4 V inline: unpack and dequantize
+            # v_quant_packed: [BLOCK_N, BLOCK_DV//2], v_scales/v_zeros: [BLOCK_N]
+            # Unpack lower and upper 4 bits, then dequantize: (q - zero) * scale
+            v_lower = (
+                ((v_quant_packed & 0x0F).to(tl.float32) - v_zeros[:, None])
+                * v_scales[:, None]
+            ).to(q_first.dtype)
+            v_upper = (
+                (((v_quant_packed >> 4) & 0x0F).to(tl.float32) - v_zeros[:, None])
+                * v_scales[:, None]
+            ).to(q_first.dtype)
+
+            n_e_max = tl.maximum(tl.max(qk, 0), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max)
+
+            # Accumulate separately for first half and second half
+            # Convert p to q.dtype for efficient multiplication with v
+            acc_first *= re_scale
+            acc_second *= re_scale
+            acc_first += tl.sum(p[:, None] * v_lower, 0)
+            acc_second += tl.sum(p[:, None] * v_upper, 0)
+
+            e_sum = e_sum * re_scale + tl.sum(p, 0)
+            e_max = n_e_max
+
+        # Store first half and second half separately
+        # First half: indices [0, Lv//2)
+        offs_dv_first = tl.arange(0, BLOCK_DV // 2)
+        mask_dv_first = offs_dv_first < (Lv // 2)
+        offs_mid_o_first = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_kv_id * stride_mid_os
+            + offs_dv_first
+        )
+        tl.store(
+            Att_Out + offs_mid_o_first,
+            acc_first / e_sum,
+            mask=mask_dv_first,
+        )
+
+        # Second half: indices [Lv//2, Lv)
+        offs_dv_second = tl.arange(0, BLOCK_DV // 2)
+        mask_dv_second = (offs_dv_second + Lv // 2) < Lv
+        offs_mid_o_second = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_kv_id * stride_mid_os
+            + offs_dv_second
+            + Lv // 2
+        )
+        tl.store(
+            Att_Out + offs_mid_o_second,
+            acc_second / e_sum,
+            mask=mask_dv_second,
+        )
+
+        offs_mid_o_1 = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_kv_id * stride_mid_os
+        ) // Lv
+
+        tl.store(
+            Att_Lse + offs_mid_o_1,
+            e_max + tl.log(e_sum),
+        )
+
+
+@triton.jit
+def _fwd_grouped_kernel_stage1_quant_int8(
+    Q,
+    K_Buffer,  # Quantized INT8 [cache_size, num_heads, head_dim] int8
+    V_Buffer,  # Quantized INT8 [cache_size, num_heads, head_dim] int8
+    K_Scales_Zeros,  # [cache_size, num_heads, 2] float32, [..., 0]=scale, [..., 1]=zero
+    V_Scales_Zeros,  # [cache_size, num_heads, 2] float32
+    sm_scale,
+    kv_indptr,
+    kv_indices,
+    Att_Out,
+    Att_Lse,
+    num_kv_splits,
+    stride_qbs,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    stride_sz_kbs,  # scales_zeros stride for cache
+    stride_sz_kh,  # scales_zeros stride for head
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    kv_group_num: tl.constexpr,
+    q_head_num: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
+    logit_cap: tl.constexpr,
+    xai_temperature_len: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
+    split_kv_id = tl.program_id(2)
+
+    if BLOCK_H < kv_group_num:
+        VALID_BLOCK_H: tl.constexpr = BLOCK_H
+    else:
+        VALID_BLOCK_H: tl.constexpr = kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
+    mask_h = mask_h & (cur_head < q_head_num)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lk
+    mask_dv = offs_dv < Lv
+
+    cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
+    kv_splits = tl.load(num_kv_splits + cur_batch)
+
+    if xai_temperature_len > 0:
+        offs_qidx = cur_batch_seq_len - 1
+        xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
+        _qtemp = tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale
+        xai_temperature_reg = tl.where(offs_qidx > xai_temperature_len, _qtemp, 1.0)
+
+    offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        mask_dpe = offs_dpe < Lk
+        off_qpe = (
+            cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
+        )
+
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    if split_kv_end > split_kv_start:
+        q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
+        if BLOCK_DPE > 0:
+            qpe = tl.load(
+                Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
+            )
+        for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            kv_loc = tl.load(
+                kv_indices + cur_batch_kv_start_idx + offs_n,
+                mask=offs_n < split_kv_end,
+                other=0,
+            )
+
+            # Load quantized K and dequantize
+            offs_buf_k = (
+                kv_loc[None, :] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+                + offs_d[:, None]
+            )
+            k_quant = tl.load(
+                K_Buffer + offs_buf_k,
+                mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+                other=0,
+            )
+
+            # Load K scales and zeros for dequantization
+            offs_sz_k = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
+            k_scale = tl.load(
+                K_Scales_Zeros + offs_sz_k + 0, mask=offs_n < split_kv_end, other=1.0
+            )
+            k_zero = tl.load(
+                K_Scales_Zeros + offs_sz_k + 1, mask=offs_n < split_kv_end, other=0.0
+            )
+
+            # Dequantize K: k = (k_quant - zero) * scale
+            # k_quant shape: [BLOCK_DMODEL, BLOCK_N] (transposed), k_scale/k_zero: [BLOCK_N]
+            k = ((k_quant.to(tl.float32) - k_zero[None, :]) * k_scale[None, :]).to(
+                q.dtype
+            )
+
+            # q: [BLOCK_H, BLOCK_DMODEL], k: [BLOCK_DMODEL, BLOCK_N]
+            # Compute qk = q @ k
+            qk = tl.dot(q, k)
+            if BLOCK_DPE > 0:
+                offs_buf_kpe = (
+                    kv_loc[:, None] * stride_buf_kbs
+                    + cur_kv_head * stride_buf_kh
+                    + offs_dpe[None, :]
+                )
+                kpe_quant = tl.load(
+                    K_Buffer + offs_buf_kpe,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_dpe[None, :]),
+                    other=0,
+                )
+                # Dequantize DPE: kpe = (kpe_quant - zero) * scale
+                # kpe_quant shape: [BLOCK_N, BLOCK_DPE], k_scale/k_zero: [BLOCK_N]
+                kpe = (
+                    (kpe_quant.to(tl.float32) - k_zero[:, None]) * k_scale[:, None]
+                ).to(qpe.dtype)
+                qk += tl.dot(qpe, kpe)
+            qk *= sm_scale
+
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
+
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg[:, None]
+
+            qk = tl.where(
+                mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
+            )
+
+            # Load quantized V and dequantize
+            offs_buf_v = (
+                kv_loc[:, None] * stride_buf_vbs
+                + cur_kv_head * stride_buf_vh
+                + offs_dv[None, :]
+            )
+            v_quant = tl.load(
+                V_Buffer + offs_buf_v,
+                mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                other=0,
+            )
+
+            # Load V scales and zeros for dequantization
+            offs_sz_v = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
+            v_scale = tl.load(
+                V_Scales_Zeros + offs_sz_v + 0, mask=offs_n < split_kv_end, other=1.0
+            )
+            v_zero = tl.load(
+                V_Scales_Zeros + offs_sz_v + 1, mask=offs_n < split_kv_end, other=0.0
+            )
+
+            # Dequantize V: v = (v_quant - zero) * scale
+            # v_quant shape: [BLOCK_N, BLOCK_DV], v_scale/v_zero: [BLOCK_N]
+            v = ((v_quant.to(tl.float32) - v_zero[:, None]) * v_scale[:, None]).to(
+                q.dtype
+            )
+
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+            acc *= re_scale[:, None]
+            acc += tl.dot(p.to(v.dtype), v)
+
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+        offs_mid_o = (
+            cur_batch * stride_mid_ob
+            + cur_head[:, None] * stride_mid_oh
+            + split_kv_id * stride_mid_os
+            + offs_dv[None, :]
+        )
+
+        tl.store(
+            Att_Out + offs_mid_o,
+            acc / e_sum[:, None],
+            mask=(mask_h[:, None]) & (mask_dv[None, :]),
+        )
+
+        offs_mid_o_1 = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_kv_id * stride_mid_os
+        ) // Lv
+
+        tl.store(
+            Att_Lse + offs_mid_o_1,
+            e_max + tl.log(e_sum),
+            mask=mask_h,
+        )
+
+
+@triton.jit
+def _fwd_grouped_kernel_stage1_quant_int4(
+    Q,
+    K_Buffer,  # Quantized INT4 [cache_size, num_heads, head_dim//2] uint8 (packed)
+    V_Buffer,  # Quantized INT4 [cache_size, num_heads, head_dim//2] uint8 (packed)
+    K_Scales_Zeros,  # [cache_size, num_heads, 2] float32, [..., 0]=scale, [..., 1]=zero
+    V_Scales_Zeros,  # [cache_size, num_heads, 2] float32
+    sm_scale,
+    kv_indptr,
+    kv_indices,
+    Att_Out,
+    Att_Lse,
+    num_kv_splits,
+    stride_qbs,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    stride_sz_kbs,  # scales_zeros stride for cache
+    stride_sz_kh,  # scales_zeros stride for head
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    kv_group_num: tl.constexpr,
+    q_head_num: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
+    logit_cap: tl.constexpr,
+    xai_temperature_len: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
+    split_kv_id = tl.program_id(2)
+
+    if BLOCK_H < kv_group_num:
+        VALID_BLOCK_H: tl.constexpr = BLOCK_H
+    else:
+        VALID_BLOCK_H: tl.constexpr = kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
+    mask_h = mask_h & (cur_head < q_head_num)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lk
+    mask_dv = offs_dv < Lv
+
+    cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
+    kv_splits = tl.load(num_kv_splits + cur_batch)
+
+    if xai_temperature_len > 0:
+        offs_qidx = cur_batch_seq_len - 1
+        xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
+        _qtemp = tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale
+        xai_temperature_reg = tl.where(offs_qidx > xai_temperature_len, _qtemp, 1.0)
+
+    offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        mask_dpe = offs_dpe < Lk
+        off_qpe = (
+            cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
+        )
+
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    # Use separate accumulators for first and second halves (INT4 unpacks to two halves)
+    acc_first = tl.zeros([BLOCK_H, BLOCK_DV // 2], dtype=tl.float32)
+    acc_second = tl.zeros([BLOCK_H, BLOCK_DV // 2], dtype=tl.float32)
+
+    if split_kv_end > split_kv_start:
+        # Split Q into first and second halves for INT4 dot product
+        offs_d_first = tl.arange(0, BLOCK_DMODEL // 2)
+        offs_d_second = tl.arange(BLOCK_DMODEL // 2, BLOCK_DMODEL)
+        mask_d_first = offs_d_first < (Lk // 2)
+        mask_d_second = offs_d_second < Lk
+
+        offs_q_first = (
+            cur_batch * stride_qbs
+            + cur_head[:, None] * stride_qh
+            + offs_d_first[None, :]
+        )
+        offs_q_second = (
+            cur_batch * stride_qbs
+            + cur_head[:, None] * stride_qh
+            + offs_d_second[None, :]
+        )
+
+        q_first = tl.load(
+            Q + offs_q_first,
+            mask=(mask_h[:, None]) & (mask_d_first[None, :]),
+            other=0.0,
+        )
+        q_second = tl.load(
+            Q + offs_q_second,
+            mask=(mask_h[:, None]) & (mask_d_second[None, :]),
+            other=0.0,
+        )
+
+        if BLOCK_DPE > 0:
+            qpe = tl.load(
+                Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
+            )
+
+        for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            kv_loc = tl.load(
+                kv_indices + cur_batch_kv_start_idx + offs_n,
+                mask=offs_n < split_kv_end,
+                other=0,
+            )
+
+            # Load packed INT4 K in transposed format for efficient dot product
+            offs_d_packed = tl.arange(0, BLOCK_DMODEL // 2)
+            mask_d_packed = offs_d_packed < (Lk // 2)
+
+            offs_buf_k_packed = (
+                kv_loc[None, :] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+                + offs_d_packed[:, None]
+            )
+            k_packed = tl.load(
+                K_Buffer + offs_buf_k_packed,
+                mask=(offs_n[None, :] < split_kv_end) & (mask_d_packed[:, None]),
+                other=0,
+            )
+
+            # Load K scales and zeros for dequantization
+            offs_sz_k = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
+            k_scale = tl.load(
+                K_Scales_Zeros + offs_sz_k + 0, mask=offs_n < split_kv_end, other=1.0
+            )
+            k_zero = tl.load(
+                K_Scales_Zeros + offs_sz_k + 1, mask=offs_n < split_kv_end, other=0.0
+            )
+
+            # Dequantize INT4 K inline: unpack and dequantize
+            # k_packed shape: [BLOCK_DMODEL//2, BLOCK_N] (transposed), k_scale/k_zero: [BLOCK_N]
+            # Unpack lower and upper 4 bits, then dequantize: (q - zero) * scale
+            k_lower = (
+                ((k_packed & 0x0F).to(tl.float32) - k_zero[None, :]) * k_scale[None, :]
+            ).to(q_first.dtype)
+            k_upper = (
+                (((k_packed >> 4) & 0x0F).to(tl.float32) - k_zero[None, :])
+                * k_scale[None, :]
+            ).to(q_first.dtype)
+
+            # Compute QK for both halves
+            # q_first: [BLOCK_H, BLOCK_DMODEL//2], k_lower: [BLOCK_DMODEL//2, BLOCK_N]
+            # qk = q_first @ k_lower + q_second @ k_upper
+            qk = tl.dot(q_first, k_lower) + tl.dot(q_second, k_upper)
+
+            if BLOCK_DPE > 0:
+                offs_buf_kpe = (
+                    kv_loc[None, :] * stride_buf_kbs
+                    + cur_kv_head * stride_buf_kh
+                    + offs_dpe[:, None]
+                )
+                kpe_quant = tl.load(
+                    K_Buffer + offs_buf_kpe,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                    other=0,
+                )
+                # Dequantize DPE: kpe = (kpe_quant - zero) * scale
+                # kpe_quant shape: [BLOCK_DPE, BLOCK_N] (transposed), k_scale/k_zero: [BLOCK_N]
+                kpe = (
+                    (kpe_quant.to(tl.float32) - k_zero[None, :]) * k_scale[None, :]
+                ).to(qpe.dtype)
+                qk += tl.dot(qpe, kpe)
+
+            qk *= sm_scale
+
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
+
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg[:, None]
+
+            qk = tl.where(
+                mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
+            )
+
+            # Load packed INT4 V and dequantize
+            offs_buf_v_packed = (
+                kv_loc[:, None] * stride_buf_vbs
+                + cur_kv_head * stride_buf_vh
+                + tl.arange(0, BLOCK_DV // 2)[None, :]
+            )
+            v_packed = tl.load(
+                V_Buffer + offs_buf_v_packed,
+                mask=(offs_n[:, None] < split_kv_end)
+                & (tl.arange(0, BLOCK_DV // 2)[None, :] < (Lv // 2)),
+                other=0,
+            )
+
+            # Load V scales and zeros for dequantization
+            offs_sz_v = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
+            v_scale = tl.load(
+                V_Scales_Zeros + offs_sz_v + 0, mask=offs_n < split_kv_end, other=1.0
+            )
+            v_zero = tl.load(
+                V_Scales_Zeros + offs_sz_v + 1, mask=offs_n < split_kv_end, other=0.0
+            )
+
+            # Dequantize INT4 V inline: unpack and dequantize
+            # v_packed shape: [BLOCK_N, BLOCK_DV//2], v_scale/v_zero: [BLOCK_N]
+            # Unpack lower and upper 4 bits, then dequantize: (q - zero) * scale
+            v_lower = (
+                ((v_packed & 0x0F).to(tl.float32) - v_zero[:, None]) * v_scale[:, None]
+            ).to(q_first.dtype)
+            v_upper = (
+                (((v_packed >> 4) & 0x0F).to(tl.float32) - v_zero[:, None])
+                * v_scale[:, None]
+            ).to(q_first.dtype)
+
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+
+            # Scale existing accumulators
+            acc_first *= re_scale[:, None]
+            acc_second *= re_scale[:, None]
+
+            # Accumulate attention-weighted V for both halves
+            acc_first += tl.dot(p.to(v_lower.dtype), v_lower)
+            acc_second += tl.dot(p.to(v_upper.dtype), v_upper)
+
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+        # Store first half and second half separately
+        # First half: indices [0, Lv//2)
+        offs_dv_first = tl.arange(0, BLOCK_DV // 2)
+        mask_dv_first = offs_dv_first < (Lv // 2)
+        offs_mid_o_first = (
+            cur_batch * stride_mid_ob
+            + cur_head[:, None] * stride_mid_oh
+            + split_kv_id * stride_mid_os
+            + offs_dv_first[None, :]
+        )
+        tl.store(
+            Att_Out + offs_mid_o_first,
+            acc_first / e_sum[:, None],
+            mask=(mask_h[:, None]) & (mask_dv_first[None, :]),
+        )
+
+        # Second half: indices [Lv//2, Lv)
+        offs_dv_second = tl.arange(0, BLOCK_DV // 2)
+        mask_dv_second = (offs_dv_second + Lv // 2) < Lv
+        offs_mid_o_second = (
+            cur_batch * stride_mid_ob
+            + cur_head[:, None] * stride_mid_oh
+            + split_kv_id * stride_mid_os
+            + (offs_dv_second + Lv // 2)[None, :]
+        )
+        tl.store(
+            Att_Out + offs_mid_o_second,
+            acc_second / e_sum[:, None],
+            mask=(mask_h[:, None]) & (mask_dv_second[None, :]),
+        )
+
+        offs_mid_o_1 = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_kv_id * stride_mid_os
+        ) // Lv
+
+        tl.store(
+            Att_Lse + offs_mid_o_1,
+            e_max + tl.log(e_sum),
+            mask=mask_h,
+        )
+
+
 def _decode_att_m_fwd(
     q,
     k_buffer,
@@ -232,6 +1168,168 @@ def _decode_att_m_fwd(
         k_buffer.stride(1),
         v_buffer.stride(0),
         v_buffer.stride(1),
+        att_out.stride(0),
+        att_out.stride(1),
+        att_out.stride(2),
+        kv_group_num=kv_group_num,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DV=BLOCK_DV,
+        BLOCK_N=BLOCK,
+        MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
+        num_warps=num_warps,
+        num_stages=2,
+        Lk=Lk,
+        Lv=Lv,
+    )
+
+
+def _decode_att_m_fwd_quant_int8(
+    q,
+    k_buffer,  # Quantized INT8
+    v_buffer,  # Quantized INT8
+    k_scales_zeros,  # Scales and zeros for K
+    v_scales_zeros,  # Scales and zeros for V
+    att_out,
+    att_lse,
+    kv_indptr,
+    kv_indices,
+    num_kv_splits,
+    max_kv_splits,
+    sm_scale,
+    logit_cap,
+    xai_temperature_len=-1,
+):
+    """
+    INT8 quantized KV cache attention wrapper.
+    Dequantizes KV cache on-the-fly inside the kernel.
+    """
+    BLOCK = 64
+    # [TODO] work around SGPR limit on MI3xx
+    if _is_hip:
+        BLOCK = 8
+    MAX_KV_SPLITS = max_kv_splits
+    Lk = k_buffer.shape[-1]
+    Lv = v_buffer.shape[-1]
+
+    batch, head_num = q.shape[0], q.shape[1]
+
+    grid = (batch, head_num, MAX_KV_SPLITS)
+    kv_group_num = q.shape[1] // k_buffer.shape[1]
+
+    if kv_group_num == 1:
+        num_warps = 4
+    else:
+        num_warps = 2
+        if _is_hip:
+            num_warps = 1
+
+    BLOCK_DMODEL = triton.next_power_of_2(Lk)
+    BLOCK_DV = triton.next_power_of_2(Lv)
+
+    _fwd_kernel_stage1_quant_int8[grid](
+        q,
+        k_buffer,
+        v_buffer,
+        k_scales_zeros,
+        v_scales_zeros,
+        sm_scale,
+        kv_indptr,
+        kv_indices,
+        att_out,
+        att_lse,
+        num_kv_splits,
+        q.stride(0),
+        q.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        k_scales_zeros.stride(0),
+        k_scales_zeros.stride(1),
+        att_out.stride(0),
+        att_out.stride(1),
+        att_out.stride(2),
+        kv_group_num=kv_group_num,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DV=BLOCK_DV,
+        BLOCK_N=BLOCK,
+        MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
+        num_warps=num_warps,
+        num_stages=2,
+        Lk=Lk,
+        Lv=Lv,
+    )
+
+
+def _decode_att_m_fwd_quant_int4(
+    q,
+    k_buffer,  # Quantized INT4 (packed)
+    v_buffer,  # Quantized INT4 (packed)
+    k_scales_zeros,  # Scales and zeros for K
+    v_scales_zeros,  # Scales and zeros for V
+    att_out,
+    att_lse,
+    kv_indptr,
+    kv_indices,
+    num_kv_splits,
+    max_kv_splits,
+    sm_scale,
+    logit_cap,
+    xai_temperature_len=-1,
+):
+    """
+    INT4 quantized KV cache attention wrapper.
+    Dequantizes KV cache on-the-fly inside the kernel.
+    """
+    BLOCK = 64
+    # [TODO] work around SGPR limit on MI3xx
+    if _is_hip:
+        BLOCK = 8
+    MAX_KV_SPLITS = max_kv_splits
+    # For INT4, the buffer stores packed values (head_dim//2)
+    # But we need to work with the actual head_dim
+    Lk = k_buffer.shape[-1] * 2  # Unpack to get real dimension
+    Lv = v_buffer.shape[-1] * 2
+
+    batch, head_num = q.shape[0], q.shape[1]
+
+    grid = (batch, head_num, MAX_KV_SPLITS)
+    kv_group_num = q.shape[1] // k_buffer.shape[1]
+
+    if kv_group_num == 1:
+        num_warps = 4
+    else:
+        num_warps = 2
+        if _is_hip:
+            num_warps = 1
+
+    BLOCK_DMODEL = triton.next_power_of_2(Lk)
+    BLOCK_DV = triton.next_power_of_2(Lv)
+
+    _fwd_kernel_stage1_quant_int4[grid](
+        q,
+        k_buffer,
+        v_buffer,
+        k_scales_zeros,
+        v_scales_zeros,
+        sm_scale,
+        kv_indptr,
+        kv_indices,
+        att_out,
+        att_lse,
+        num_kv_splits,
+        q.stride(0),
+        q.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        k_scales_zeros.stride(0),
+        k_scales_zeros.stride(1),
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -512,6 +1610,193 @@ def _decode_grouped_att_m_fwd(
     )
 
 
+def _decode_grouped_att_m_fwd_quant_int8(
+    q,
+    k_buffer,  # Quantized INT8
+    v_buffer,  # Quantized INT8
+    k_scales_zeros,  # Scales and zeros for K
+    v_scales_zeros,  # Scales and zeros for V
+    att_out,
+    att_lse,
+    kv_indptr,
+    kv_indices,
+    num_kv_splits,
+    max_kv_splits,
+    sm_scale,
+    logit_cap,
+    xai_temperature_len=-1,
+):
+    BLOCK = 32
+    Lk = k_buffer.shape[-1]
+    Lv = v_buffer.shape[-1]
+
+    # [TODO] work around shmem limit on MI3xx
+    if _is_hip and Lk >= 576:
+        BLOCK = 16
+
+    if Lk == 576:
+        BLOCK_DMODEL = 512
+        BLOCK_DPE = 64
+    elif Lk == 288:
+        BLOCK_DMODEL = 256
+        BLOCK_DPE = 32
+    else:
+        BLOCK_DMODEL = triton.next_power_of_2(Lk)
+        BLOCK_DPE = 0
+    BLOCK_DV = triton.next_power_of_2(Lv)
+
+    batch, head_num = q.shape[0], q.shape[1]
+    kv_group_num = q.shape[1] // k_buffer.shape[1]
+
+    BLOCK_H = 16
+    MAX_KV_SPLITS = max_kv_splits
+    grid = (
+        batch,
+        triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
+        MAX_KV_SPLITS,
+    )
+
+    extra_kargs = {}
+    num_stages = 2
+    if _is_hip:
+        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        num_stages = 1
+
+    _fwd_grouped_kernel_stage1_quant_int8[grid](
+        q,
+        k_buffer,
+        v_buffer,
+        k_scales_zeros,
+        v_scales_zeros,
+        sm_scale,
+        kv_indptr,
+        kv_indices,
+        att_out,
+        att_lse,
+        num_kv_splits,
+        q.stride(0),
+        q.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        k_scales_zeros.stride(0),
+        k_scales_zeros.stride(1),
+        att_out.stride(0),
+        att_out.stride(1),
+        att_out.stride(2),
+        kv_group_num=kv_group_num,
+        q_head_num=head_num,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DPE=BLOCK_DPE,
+        BLOCK_DV=BLOCK_DV,
+        BLOCK_N=BLOCK,
+        BLOCK_H=BLOCK_H,
+        MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
+        num_warps=4,
+        num_stages=num_stages,
+        Lk=Lk,
+        Lv=Lv,
+        **extra_kargs,
+    )
+
+
+def _decode_grouped_att_m_fwd_quant_int4(
+    q,
+    k_buffer,  # Quantized INT4 (packed)
+    v_buffer,  # Quantized INT4 (packed)
+    k_scales_zeros,  # Scales and zeros for K
+    v_scales_zeros,  # Scales and zeros for V
+    att_out,
+    att_lse,
+    kv_indptr,
+    kv_indices,
+    num_kv_splits,
+    max_kv_splits,
+    sm_scale,
+    logit_cap,
+    xai_temperature_len=-1,
+):
+    BLOCK = 32
+    # For INT4, k_buffer is packed, so actual Lk is 2x the last dimension
+    Lk = k_buffer.shape[-1] * 2
+    Lv = v_buffer.shape[-1] * 2
+
+    # [TODO] work around shmem limit on MI3xx
+    if _is_hip and Lk >= 576:
+        BLOCK = 16
+
+    if Lk == 576:
+        BLOCK_DMODEL = 512
+        BLOCK_DPE = 64
+    elif Lk == 288:
+        BLOCK_DMODEL = 256
+        BLOCK_DPE = 32
+    else:
+        BLOCK_DMODEL = triton.next_power_of_2(Lk)
+        BLOCK_DPE = 0
+    BLOCK_DV = triton.next_power_of_2(Lv)
+
+    batch, head_num = q.shape[0], q.shape[1]
+    kv_group_num = q.shape[1] // k_buffer.shape[1]
+
+    BLOCK_H = 16
+    MAX_KV_SPLITS = max_kv_splits
+    grid = (
+        batch,
+        triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
+        MAX_KV_SPLITS,
+    )
+
+    extra_kargs = {}
+    num_stages = 2
+    if _is_hip:
+        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        num_stages = 1
+
+    _fwd_grouped_kernel_stage1_quant_int4[grid](
+        q,
+        k_buffer,
+        v_buffer,
+        k_scales_zeros,
+        v_scales_zeros,
+        sm_scale,
+        kv_indptr,
+        kv_indices,
+        att_out,
+        att_lse,
+        num_kv_splits,
+        q.stride(0),
+        q.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        k_scales_zeros.stride(0),
+        k_scales_zeros.stride(1),
+        att_out.stride(0),
+        att_out.stride(1),
+        att_out.stride(2),
+        kv_group_num=kv_group_num,
+        q_head_num=head_num,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DPE=BLOCK_DPE,
+        BLOCK_DV=BLOCK_DV,
+        BLOCK_N=BLOCK,
+        BLOCK_H=BLOCK_H,
+        MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
+        num_warps=4,
+        num_stages=num_stages,
+        Lk=Lk,
+        Lv=Lv,
+        **extra_kargs,
+    )
+
+
 @triton.jit
 def _fwd_kernel_stage2(
     Mid_O,
@@ -714,6 +1999,248 @@ def decode_attention_fwd_grouped(
         max_kv_splits,
         sinks,
     )
+
+
+def decode_attention_fwd_normal_quant(
+    q,
+    k_buffer,  # Quantized INT4/INT8
+    v_buffer,  # Quantized INT4/INT8
+    k_scales_zeros,  # Scales and zeros for K
+    v_scales_zeros,  # Scales and zeros for V
+    o,
+    kv_indptr,
+    kv_indices,
+    attn_logits,
+    attn_lse,
+    num_kv_splits,
+    max_kv_splits,
+    sm_scale,
+    kv_dtype,  # "int4" or "int8"
+    logit_cap=0.0,
+    sinks=None,
+    xai_temperature_len=-1,
+):
+    """
+    Normal (MHA) attention forward with quantized (INT4/INT8) KV cache.
+    Dequantizes on-the-fly inside the kernel, avoiding global memory writes.
+
+    Args:
+        kv_dtype: Type of quantization - "int4" or "int8"
+    """
+    # Stage 1: Compute attention scores and accumulate values
+    if kv_dtype == "int8":
+        _decode_att_m_fwd_quant_int8(
+            q,
+            k_buffer,
+            v_buffer,
+            k_scales_zeros,
+            v_scales_zeros,
+            attn_logits,
+            attn_lse,
+            kv_indptr,
+            kv_indices,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            logit_cap,
+            xai_temperature_len,
+        )
+        # For INT8, v_buffer has correct dimension
+        v_buf_for_stage2 = v_buffer
+    elif kv_dtype == "int4":
+        _decode_att_m_fwd_quant_int4(
+            q,
+            k_buffer,
+            v_buffer,
+            k_scales_zeros,
+            v_scales_zeros,
+            attn_logits,
+            attn_lse,
+            kv_indptr,
+            kv_indices,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            logit_cap,
+            xai_temperature_len,
+        )
+        # For INT4, v_buffer is packed (half size), but stage2 needs full dimension
+        # Create a dummy tensor with correct shape for stage2 to extract Lv
+        v_buf_for_stage2 = o  # o has the correct output dimension
+    else:
+        raise ValueError(f"Unsupported kv_dtype: {kv_dtype}. Must be 'int4' or 'int8'.")
+
+    # Stage 2: Reduce across KV splits and compute final output
+    _decode_softmax_reducev_fwd(
+        attn_logits,
+        attn_lse,
+        q,
+        o,
+        v_buf_for_stage2,  # Use the correct dimension buffer
+        kv_indptr,
+        num_kv_splits,
+        max_kv_splits,
+        sinks,
+    )
+
+
+def decode_attention_fwd_grouped_quant(
+    q,
+    k_buffer,  # Quantized INT4/INT8
+    v_buffer,  # Quantized INT4/INT8
+    k_scales_zeros,  # Scales and zeros for K
+    v_scales_zeros,  # Scales and zeros for V
+    o,
+    kv_indptr,
+    kv_indices,
+    attn_logits,
+    attn_lse,
+    num_kv_splits,
+    max_kv_splits,
+    sm_scale,
+    kv_dtype,  # "int4" or "int8"
+    logit_cap=0.0,
+    sinks=None,
+    xai_temperature_len=-1,
+):
+    """
+    Grouped (GQA/MQA) attention forward with quantized (INT4/INT8) KV cache.
+    Dequantizes on-the-fly inside the kernel, avoiding global memory writes.
+
+    Args:
+        kv_dtype: Type of quantization - "int4" or "int8"
+    """
+    # Stage 1: Compute attention scores and accumulate values
+    if kv_dtype == "int8":
+        _decode_grouped_att_m_fwd_quant_int8(
+            q,
+            k_buffer,
+            v_buffer,
+            k_scales_zeros,
+            v_scales_zeros,
+            attn_logits,
+            attn_lse,
+            kv_indptr,
+            kv_indices,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            logit_cap,
+            xai_temperature_len,
+        )
+        # For INT8, v_buffer has correct dimension
+        v_buf_for_stage2 = v_buffer
+    elif kv_dtype == "int4":
+        _decode_grouped_att_m_fwd_quant_int4(
+            q,
+            k_buffer,
+            v_buffer,
+            k_scales_zeros,
+            v_scales_zeros,
+            attn_logits,
+            attn_lse,
+            kv_indptr,
+            kv_indices,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            logit_cap,
+            xai_temperature_len,
+        )
+        # For INT4, v_buffer is packed (half size), but stage2 needs full dimension
+        # Create a dummy tensor with correct shape for stage2 to extract Lv
+        v_buf_for_stage2 = o  # o has the correct output dimension
+    else:
+        raise ValueError(f"Unsupported kv_dtype: {kv_dtype}. Must be 'int4' or 'int8'.")
+
+    # Stage 2: Reduce across KV splits and compute final output
+    _decode_softmax_reducev_fwd(
+        attn_logits,
+        attn_lse,
+        q,
+        o,
+        v_buf_for_stage2,  # Use the correct dimension buffer
+        kv_indptr,
+        num_kv_splits,
+        max_kv_splits,
+        sinks,
+    )
+
+
+def decode_attention_fwd_quantized(
+    q,
+    k_buffer,  # Quantized INT4/INT8
+    v_buffer,  # Quantized INT4/INT8
+    k_scales_zeros,  # Scales and zeros for K
+    v_scales_zeros,  # Scales and zeros for V
+    o,
+    kv_indptr,
+    kv_indices,
+    attn_logits,
+    attn_lse,
+    num_kv_splits,
+    max_kv_splits,
+    sm_scale,
+    kv_dtype,  # "int4" or "int8"
+    logit_cap=0.0,
+    sinks=None,
+    xai_temperature_len=-1,
+):
+    """
+    Attention forward with quantized (INT4/INT8) KV cache.
+    Dispatches to the appropriate kernel based on attention type (MHA vs GQA/MQA).
+
+    Args:
+        kv_dtype: Type of quantization - "int4" or "int8"
+    """
+    assert max_kv_splits == attn_logits.shape[2]
+    assert q.shape[0] <= kv_indptr.shape[0] - 1
+    assert q.shape[0] <= attn_logits.shape[0]
+
+    kv_group_num = q.shape[1] // v_buffer.shape[1]
+
+    if kv_group_num == 1:
+        # MHA
+        decode_attention_fwd_normal_quant(
+            q,
+            k_buffer,
+            v_buffer,
+            k_scales_zeros,
+            v_scales_zeros,
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            kv_dtype,
+            logit_cap=logit_cap,
+            sinks=sinks,
+            xai_temperature_len=xai_temperature_len,
+        )
+    else:
+        # GQA/MQA/MLA
+        decode_attention_fwd_grouped_quant(
+            q,
+            k_buffer,
+            v_buffer,
+            k_scales_zeros,
+            v_scales_zeros,
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            kv_dtype,
+            logit_cap=logit_cap,
+            sinks=sinks,
+            xai_temperature_len=xai_temperature_len,
+        )
 
 
 def decode_attention_fwd(
