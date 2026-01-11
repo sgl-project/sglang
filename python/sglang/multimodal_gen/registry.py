@@ -38,7 +38,10 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2PipelineConfig,
+    FluxKontextPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlus_2511_PipelineConfig,
@@ -489,7 +492,14 @@ def _register_configs():
         hf_model_paths=[
             "black-forest-labs/FLUX.1-dev",
         ],
-        model_detectors=[lambda hf_id: "flux.1" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=FluxSamplingParams,
+        pipeline_config_cls=FluxKontextPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.1-Kontext-dev",
+        ],
+        model_detectors=[lambda hf_id: "kontext" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=FluxSamplingParams,

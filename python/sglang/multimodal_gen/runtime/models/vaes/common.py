@@ -63,6 +63,18 @@ class ParallelTiledVAE(ABC, nn.Module):
     def scaling_factor(self) -> float | torch.Tensor:
         return cast(float | torch.Tensor, self.config.scaling_factor)
 
+    @property
+    def shift_factor(self) -> float | torch.Tensor | None:
+        # Check for instance-level override first (set by subclasses like WanVAE, QwenImageVAE)
+        if "_shift_factor" in self.__dict__:
+            return self._shift_factor
+        return getattr(self.config, "shift_factor", None)
+
+    @shift_factor.setter
+    def shift_factor(self, value: float | torch.Tensor | None) -> None:
+        # Allow subclasses to override the shift_factor via instance attribute
+        self._shift_factor = value
+
     @abstractmethod
     def _encode(self, *args, **kwargs) -> torch.Tensor:
         pass
