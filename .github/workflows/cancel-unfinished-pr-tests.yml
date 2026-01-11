@@ -1,4 +1,4 @@
-name: Cancel Unfinished PR Tests
+name: Cancel Unfinished PR Runs
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ permissions:
   pull-requests: read  # needed for gh pr view (labels)
 
 jobs:
-  cancel-pending-pr-test:
+  cancel-unfinished-pr-runs:
     runs-on: ubuntu-latest
     steps:
       - name: Install GitHub CLI
