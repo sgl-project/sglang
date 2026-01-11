@@ -6,35 +6,12 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use smg::{
-    core::{BasicWorkerBuilder, Worker, WorkerType},
-    policies::{LoadBalancingPolicy, ManualConfig, ManualPolicy, SelectWorkerInfo},
+use smg::policies::{LoadBalancingPolicy, ManualConfig, ManualPolicy, SelectWorkerInfo};
+
+use crate::common::{
+    manual_test_helpers::{create_workers, headers_with_routing_key, random_prefix},
+    redis_test_server::get_shared_server,
 };
-
-use crate::common::redis_test_server::get_shared_server;
-
-fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
-    urls.iter()
-        .map(|url| {
-            Arc::new(
-                BasicWorkerBuilder::new(*url)
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ) as Arc<dyn Worker>
-        })
-        .collect()
-}
-
-fn headers_with_routing_key(key: &str) -> http::HeaderMap {
-    let mut headers = http::HeaderMap::new();
-    headers.insert("x-smg-routing-key", key.parse().unwrap());
-    headers
-}
-
-fn random_prefix(test_name: &str) -> String {
-    let random_id: u64 = rand::random();
-    format!("{}:{}:", test_name, random_id)
-}
 
 fn create_redis_policy(test_name: &str) -> ManualPolicy {
     create_redis_policy_with_explicit_prefix(&random_prefix(test_name))
