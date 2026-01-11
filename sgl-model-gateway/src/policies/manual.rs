@@ -458,6 +458,10 @@ return {1, ''}
         match result {
             Ok((1, _)) => (true, None),
             Ok((0, current)) => (false, if current.is_empty() { None } else { Some(current) }),
+            Ok((_, current)) => {
+                warn!("Redis CAS Lua unexpected return value");
+                (false, if current.is_empty() { None } else { Some(current) })
+            }
             Err(e) => {
                 warn!("Redis CAS Lua error: {}", e);
                 (false, None)
