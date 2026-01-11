@@ -169,7 +169,13 @@ def run_a_suite(args):
     auto_partition_size = args.auto_partition_size
 
     # All tests (per-commit and nightly) are now in registered/
-    files = glob.glob("registered/**/*.py", recursive=True)
+    # If --path is specified, only scan that directory
+    if args.path:
+        path = args.path.rstrip("/")
+        files = glob.glob(f"{path}/**/*.py", recursive=True)
+        print(f"Filtering tests to path: {path}")
+    else:
+        files = glob.glob("registered/**/*.py", recursive=True)
     # Strict: all registered files must have proper registration
     sanity_check = True
 
@@ -208,6 +214,12 @@ def main():
         help="Hardware backend to run tests on.",
     )
     parser.add_argument("--suite", type=str, required=True, help="Test suite to run.")
+    parser.add_argument(
+        "--path",
+        type=str,
+        default=None,
+        help="Only run tests in this directory (e.g., 'registered/dllm/').",
+    )
     parser.add_argument(
         "--nightly",
         action="store_true",
