@@ -97,8 +97,10 @@ class StandardDispatcher(BaseDispatcher):
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
-
-        if should_use_flashinfer_cutlass_moe_fp4_allgather():
+        if (
+            should_use_flashinfer_cutlass_moe_fp4_allgather()
+            and self.quant_config is not None
+        ):
             # all-gather fp4 hidden states
             from flashinfer import nvfp4_block_scale_interleave
 
@@ -182,7 +184,10 @@ class StandardDispatcher(BaseDispatcher):
 
     def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:
         (hidden_states,) = combine_input
-        if should_use_flashinfer_cutlass_moe_fp4_allgather():
+        if (
+            should_use_flashinfer_cutlass_moe_fp4_allgather()
+            and self.quant_config is not None
+        ):
             hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
             get_tp_group().reduce_scatterv(
                 global_hidden_states,
