@@ -171,7 +171,15 @@ Printed after each run:
 - Time to First Token (TTFT, ms): mean/median/std/p99 for streaming mode
 - Inter-Token Latency (ITL, ms): mean/median/std/p95/p99/max between tokens
 - TPOT (ms): Token processing time after first token, i.e., `(latency - ttft)/(tokens-1)`
-- Accept length (sglang-only, if available): speculative decoding accept length
+
+When speculative decoding is enabled (sglang backend only), additional metrics are displayed:
+
+- Acceptance rate (%): percentage of draft tokens accepted by target model
+- Acceptance length (server): from `/get_server_info`, includes all requests since server start
+- Acceptance length (benchmark): `1 + accepted/drafts`, only benchmark requests. Mathematically: `completion_tokens / verify_ct = 1 + spec_accepted_tokens / verify_ct`
+- Draft tokens: total number of draft tokens generated
+- Accepted tokens: total number of draft tokens accepted
+- Drafts: total number of verification/draft steps
 
 The script also retokenizes generated text with the configured tokenizer and reports "retokenized" counts.
 
@@ -182,7 +190,15 @@ When `--output-file` is set, one JSON object is appended per run. Base fields:
 - Arguments summary: backend, dataset, request_rate, max_concurrency, etc.
 - Duration and totals: completed, total_input_tokens, total_output_tokens, retokenized totals
 - Throughputs and latency statistics as printed in the console
-- `accept_length` when available (sglang)
+
+When speculative decoding is enabled (sglang backend), we also provide:
+
+- `spec_decode_acceptance_rate`: percentage of draft tokens accepted
+- `spec_decode_acceptance_length`: benchmark-only, `1 + accepted/drafts`
+- `spec_decode_acceptance_length_server`: from server, all requests since start
+- `spec_decode_num_drafts`: total verification/draft steps
+- `spec_decode_draft_tokens`: total draft tokens generated
+- `spec_decode_accepted_tokens`: total draft tokens accepted
 
 With `--output-details`, an extended object also includes arrays:
 
