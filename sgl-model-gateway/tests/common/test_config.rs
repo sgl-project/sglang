@@ -96,22 +96,37 @@ impl TestRouterConfig {
 
     /// Create a manual routing config (for sticky routing tests)
     pub fn manual(port: u16) -> RouterConfig {
-        Self::manual_with_mode(port, ManualAssignmentMode::Random)
+        Self::manual_with_options(port, ManualAssignmentMode::Random, None)
+    }
+
+    /// Create a manual routing config with Redis backend
+    pub fn manual_with_redis(port: u16, redis_url: &str) -> RouterConfig {
+        Self::manual_with_options(port, ManualAssignmentMode::Random, Some(redis_url.to_string()))
     }
 
     /// Create a manual routing config with min_group assignment mode
     pub fn manual_min_group(port: u16) -> RouterConfig {
-        Self::manual_with_mode(port, ManualAssignmentMode::MinGroup)
+        Self::manual_with_options(port, ManualAssignmentMode::MinGroup, None)
     }
 
-    /// Create a manual routing config with specified assignment mode
-    pub fn manual_with_mode(port: u16, assignment_mode: ManualAssignmentMode) -> RouterConfig {
+    /// Create a manual routing config with min_group and Redis backend
+    pub fn manual_min_group_with_redis(port: u16, redis_url: &str) -> RouterConfig {
+        Self::manual_with_options(port, ManualAssignmentMode::MinGroup, Some(redis_url.to_string()))
+    }
+
+    /// Create a manual routing config with specified options
+    pub fn manual_with_options(
+        port: u16,
+        assignment_mode: ManualAssignmentMode,
+        redis_url: Option<String>,
+    ) -> RouterConfig {
         RouterConfig::builder()
             .regular_mode(vec![])
             .policy(PolicyConfig::Manual {
                 eviction_interval_secs: 60,
                 max_idle_secs: 3600,
                 assignment_mode,
+                redis_url,
             })
             .host(defaults::HOST)
             .port(port)

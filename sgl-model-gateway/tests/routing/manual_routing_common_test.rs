@@ -18,28 +18,12 @@ use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
 
 const ROUTING_KEY_HEADER: &str = "X-SMG-Routing-Key";
 
-struct TestEnv {
-    is_redis: bool,
-}
-
-impl TestEnv {
-    fn local() -> Self {
-        std::env::remove_var("SMG_MANUAL_REDIS_URL");
-        Self { is_redis: false }
-    }
-
-    fn redis() -> Self {
-        let server = get_shared_server();
-        std::env::set_var("SMG_MANUAL_REDIS_URL", server.url());
-        Self { is_redis: true }
-    }
-}
-
-impl Drop for TestEnv {
-    fn drop(&mut self) {
-        if self.is_redis {
-            std::env::remove_var("SMG_MANUAL_REDIS_URL");
-        }
+/// Get Redis URL for tests (None for local backend)
+fn get_redis_url_for_test(use_redis: bool) -> Option<String> {
+    if use_redis {
+        Some(get_shared_server().url())
+    } else {
+        None
     }
 }
 
@@ -48,14 +32,13 @@ macro_rules! all_backend_e2e_test {
         paste::paste! {
             #[tokio::test]
             async fn [<$name _local_backend>]() {
-                let _env = TestEnv::local();
-                [<$name _impl>]($base_port).await;
+                [<$name _impl>]($base_port, None).await;
             }
 
             #[tokio::test]
             async fn [<$name _redis_backend>]() {
-                let _env = TestEnv::redis();
-                [<$name _impl>]($base_port + 1000).await;
+                let redis_url = get_redis_url_for_test(true);
+                [<$name _impl>]($base_port + 1000, redis_url).await;
             }
         }
     };
