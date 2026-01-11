@@ -18,44 +18,39 @@ def test_model_loading():
     try:
         # Test model instantiation
         model = DeepseekV3ForCausalLM(config, quant_config=None)
-        print("  ✓ Model instantiated successfully")
+        print("Model instantiated successfully")
         
         # Verify utilities are accessible from model
         from sglang.srt.models.deepseek_common.utils import (
             FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
             yarn_get_mscale,
         )
-        print("  ✓ Utilities accessible from model context")
+        print("Utilities accessible from model context")
         
         return True
         
     except Exception as e:
-        print(f"  ❌ Model loading failed: {e}")
+        print(f"Model loading failed: {e}")
         import traceback
         traceback.print_exc()
         return False
 
 
 def main():
-    print("\n" + "="*60)
-    print("DeepSeek Model Loading Test")
-    print("="*60 + "\n")
+
     
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB\n")
     else:
-        print("⚠️  No GPU detected. Some tests may fail.\n")
+        print("No GPU detected. Some tests may fail.\n")
     
     success = test_model_loading()
     
-    print("\n" + "="*60)
     if success:
-        print("✅ MODEL LOADING TEST PASSED!")
+        print("MODEL LOADING TEST PASSED!")
     else:
-        print("❌ MODEL LOADING TEST FAILED!")
-    print("="*60 + "\n")
-    
+        print("MODEL LOADING TEST FAILED!") 
     return 0 if success else 1
 
 

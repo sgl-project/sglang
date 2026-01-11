@@ -31,7 +31,7 @@ def test_constants():
     # Test _is_cublas_ge_129
     assert isinstance(_is_cublas_ge_129, bool)
     
-    print("  ✓ All constants verified")
+    print("All constants verified")
 
 
 def test_yarn_get_mscale():
@@ -52,7 +52,7 @@ def test_yarn_get_mscale():
     result2 = yarn_get_mscale(2.0, 2.0)
     assert result2 > result1  # Higher mscale should give higher result
     
-    print(f"  ✓ yarn_get_mscale(2.0, 1.0) = {result1:.4f}")
+    print(f"yarn_get_mscale(2.0, 1.0) = {result1:.4f}")
 
 
 def test_get_llama_4_scaling():
@@ -72,7 +72,7 @@ def test_get_llama_4_scaling():
     # Check all values are >= 1.0 (no scaling down)
     assert (scaling >= 1.0).all()
     
-    print(f"  ✓ Scaling at pos 0: {scaling[0].item():.4f}, pos 10000: {scaling[3].item():.4f}")
+    print(f"Scaling at pos 0: {scaling[0].item():.4f}, pos 10000: {scaling[3].item():.4f}")
 
 
 def test_enable_nextn_moe_bf16_cast_to_fp8():
@@ -83,7 +83,7 @@ def test_enable_nextn_moe_bf16_cast_to_fp8():
     result = enable_nextn_moe_bf16_cast_to_fp8(None)
     assert result == False, "Should return False with None quant_config"
     
-    print("  ✓ Returns False with None quant_config")
+    print("Returns False with None quant_config")
 
 
 def test_add_forward_absorb_core_attention_backend():
@@ -108,15 +108,13 @@ def test_add_forward_absorb_core_attention_backend():
     # Clean up: remove test backend
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.remove(test_backend)
     
-    print("  ✓ Backend registration works correctly")
+    print("Backend registration works correctly")
 
 
 def main():
     """Run all unit tests."""
-    print("\n" + "="*60)
     print("DeepSeek Utils Refactoring - Unit Tests")
-    print("="*60 + "\n")
-    
+
     try:
         test_constants()
         test_yarn_get_mscale()
@@ -124,16 +122,14 @@ def main():
         test_enable_nextn_moe_bf16_cast_to_fp8()
         test_add_forward_absorb_core_attention_backend()
         
-        print("\n" + "="*60)
-        print("✅ ALL TESTS PASSED!")
-        print("="*60 + "\n")
+        print("ALL TESTS PASSED!")
         return 0
         
     except AssertionError as e:
-        print(f"\n❌ TEST FAILED: {e}\n")
+        print(f"\n TEST FAILED: {e}\n")
         return 1
     except Exception as e:
-        print(f"\n❌ UNEXPECTED ERROR: {e}\n")
+        print(f"\n UNEXPECTED ERROR: {e}\n")
         import traceback
         traceback.print_exc()
         return 1
