@@ -329,6 +329,11 @@ impl LocalBackend {
     fn has_eviction_task(&self) -> bool {
         self._eviction_task.is_some()
     }
+
+    #[cfg(test)]
+    fn iter_first_candidate_urls(&self) -> impl Iterator<Item = String> + '_ {
+        self.routing_map.iter().filter_map(|e| e.candidates.urls().first().cloned())
+    }
 }
 
 // ------------------------------------ redis backend ---------------------------------------
@@ -1038,7 +1043,6 @@ mod tests {
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
-        let mut distribution: HashMap<usize, usize> = HashMap::new();
         for i in 0..9 {
             let routing_key = format!("key-{}", i);
             let headers = headers_with_routing_key(&routing_key);
@@ -1052,11 +1056,19 @@ mod tests {
             assert_eq!(branch, ExecutionBranch::Vacant);
 
             let selected_idx = result.unwrap();
-            *distribution.entry(selected_idx).or_default() += 1;
             workers[selected_idx]
                 .worker_routing_key_load()
                 .increment(&routing_key);
         }
+
+        let distribution: HashMap<_, usize> = policy
+            .local_backend()
+            .unwrap()
+            .iter_first_candidate_urls()
+            .fold(HashMap::new(), |mut acc, url| {
+                *acc.entry(url).or_default() += 1;
+                acc
+            });
 
         assert_eq!(distribution.len(), 3, "Should use all 3 workers");
         for count in distribution.values() {
