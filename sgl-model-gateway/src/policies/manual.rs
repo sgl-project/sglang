@@ -1319,11 +1319,11 @@ mod tests {
     }
 
     macro_rules! all_backend_test {
-        ($name:ident, $test_fn:ident) => {
+        ($name:ident) => {
             paste::paste! {
                 #[tokio::test]
                 async fn [<$name _local_backend>]() {
-                    $test_fn(ManualPolicy::new()).await;
+                    [<$name _impl>](ManualPolicy::new()).await;
                 }
 
                 #[tokio::test]
@@ -1331,7 +1331,7 @@ mod tests {
                     let server = test_redis_server::get_shared_server();
                     let key_prefix = stringify!($name);
                     let policy = create_policy_with_redis(&server.url(), key_prefix);
-                    $test_fn(policy).await;
+                    [<$name _impl>](policy).await;
                 }
             }
         };
@@ -1353,7 +1353,7 @@ mod tests {
         }
     }
 
-    all_backend_test!(all_backend_consistent_routing, test_consistent_routing_impl);
+    all_backend_test!(test_consistent_routing);
 
     async fn test_failover_impl(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
