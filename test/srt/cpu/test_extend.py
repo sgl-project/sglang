@@ -183,6 +183,7 @@ class TestExtendAttention(CustomTestCase):
             self._test_extend_attention_once(1, 123, 1, 1, 128, 96, is_mla)
             self._test_extend_attention_once(1, 123, 16, 1, 128, 96, is_mla)
             self._test_extend_attention_once(4, 1230, 16, 4, 128, 96, is_mla)
+            self._test_extend_attention_once(1, 9000, 16, 1, 32, 32, is_mla)
 
 
 if __name__ == "__main__":
