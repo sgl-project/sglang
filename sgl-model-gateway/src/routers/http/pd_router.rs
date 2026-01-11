@@ -745,7 +745,7 @@ impl PDRouter {
             headers,
             hash_ring.clone(),
             "prefill",
-        )?;
+        ).await?;
 
         let decode = Self::pick_worker_by_policy_arc(
             &decode_workers,
@@ -754,7 +754,7 @@ impl PDRouter {
             headers,
             hash_ring,
             "decode",
-        )?;
+        ).await?;
 
         // Record worker selection metrics (Layer 3)
         let model = model_id.unwrap_or("default");
@@ -774,7 +774,7 @@ impl PDRouter {
         Ok((prefill, decode))
     }
 
-    fn pick_worker_by_policy_arc(
+    async fn pick_worker_by_policy_arc(
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
         request_text: Option<&str>,
@@ -812,6 +812,7 @@ impl PDRouter {
                     hash_ring,
                 },
             )
+            .await
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",
