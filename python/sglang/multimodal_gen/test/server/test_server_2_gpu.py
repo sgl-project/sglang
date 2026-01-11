@@ -1,5 +1,5 @@
 """
-Config-driven diffusion performance test with pytest parametrization.
+Config-driven diffusion performance test with pytest parametrization for 2-GPU cases.
 
 
 If the actual run is significantly better than the baseline, the improved cases with their updated baseline will be printed
@@ -9,23 +9,20 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     DiffusionServerBase,
     diffusion_server,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
-    ONE_GPU_CASES_B,
+    TWO_GPU_CASES,
     DiffusionTestCase,
 )
 
-logger = init_logger(__name__)
 
+class TestDiffusionServerTwoGpu(DiffusionServerBase):
+    """Performance tests for 2-GPU diffusion cases."""
 
-class TestDiffusionServerOneGpu(DiffusionServerBase):
-    """Performance tests for 1-GPU diffusion cases."""
-
-    @pytest.fixture(params=ONE_GPU_CASES_B, ids=lambda c: c.id)
+    @pytest.fixture(params=TWO_GPU_CASES, ids=lambda c: c.id)
     def case(self, request) -> DiffusionTestCase:
-        """Provide a DiffusionTestCase for each 1-GPU test."""
+        """Provide a DiffusionTestCase for each 2-GPU test."""
         return request.param
