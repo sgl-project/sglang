@@ -1,6 +1,24 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code)]
 
+use std::sync::Once;
+
+static TRACING_INIT: Once = Once::new();
+
+// TODO improve
+pub fn init_test_tracing() {
+    TRACING_INIT.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::INFO.into()),
+            )
+            .with_test_writer()
+            .try_init()
+            .ok();
+    });
+}
+
 pub mod manual_routing_test_helpers;
 pub mod mock_mcp_server;
 pub mod mock_openai_server;

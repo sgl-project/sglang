@@ -9,6 +9,9 @@ use tracing::{info, warn};
 static SHARED_SERVER: OnceLock<RedisTestServer> = OnceLock::new();
 
 pub fn get_shared_server() -> &'static RedisTestServer {
+    // TODO improve
+    super::init_test_tracing();
+
     SHARED_SERVER.get_or_init(|| {
         let server = RedisTestServer::start().expect("Failed to start shared Redis server");
         server.wait_ready();
