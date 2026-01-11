@@ -1040,9 +1040,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     bias,
                     activation,
                     conv_states,
-                    forward_batch.extend_prefix_lens,
-                    cache_indices,
-                    query_start_loc,
                     g,
                     beta,
                     ssm_states,
@@ -1062,9 +1059,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     bias,
                     activation,
                     conv_states,
-                    forward_batch.extend_prefix_lens,
-                    cache_indices,
-                    query_start_loc,
                     g,
                     beta,
                     ssm_states,
@@ -1086,9 +1080,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         bias: torch.Tensor,
         activation: str,
         conv_states: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
-        cache_indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
         ssm_states: torch.Tensor,
@@ -1103,6 +1094,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ):
 
         mixed_qkv = mixed_qkv.transpose(0, 1)
+        query_start_loc = forward_metadata.query_start_loc
+        cache_indices = forward_metadata.mamba_cache_indices
+        extend_prefix_lens = forward_batch.extend_prefix_lens
+
         if (
             forward_batch.mamba_track_mask is not None
             and forward_batch.mamba_track_mask.any()
@@ -1499,9 +1494,6 @@ def causal_conv1d_gdn_with_output(
     bias: torch.Tensor,
     activation: str,
     conv_states: torch.Tensor,
-    extend_prefix_lens: torch.Tensor,
-    cache_indices: torch.Tensor,
-    query_start_loc: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
     ssm_states: torch.Tensor,
@@ -1522,9 +1514,6 @@ def causal_conv1d_gdn_with_output(
             bias,
             activation,
             conv_states,
-            extend_prefix_lens,
-            cache_indices,
-            query_start_loc,
             g,
             beta,
             ssm_states,
