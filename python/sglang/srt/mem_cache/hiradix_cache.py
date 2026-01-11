@@ -401,7 +401,6 @@ class HiRadixCache(RadixCache):
             _priority, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
-            
             # node is protected from eviction as it has ongoing prefetch or backup to storage
             if x.host_ref_counter > 0:
                 continue
