@@ -36,38 +36,46 @@ class ConfigArgumentMerger:
             and "-h" not in a.option_strings
         }
 
-    def merge_config_with_args(self, cli_args: List[str]) -> List[str]:
-        """
-        Merge configuration file arguments with command-line arguments.
-
-        Configuration arguments are inserted after the subcommand to maintain
-        proper precedence: CLI > Config > Defaults
-
-        Args:
-            cli_args: List of command-line arguments
-
-        Returns:
-            Merged argument list with config values inserted
-
-        Raises:
-            ValueError: If multiple config files specified or no config file provided
-        """
+    def parse_config(self, cli_args):
         config_file_path = self._extract_config_file_path(cli_args)
         if not config_file_path:
-            return cli_args
+            return {}
 
         config_data = self._parse_yaml_config(config_file_path)
-        config_args = self._convert_config_to_args(config_data)
+        dest_map = {action.dest: action for action in self.parser._actions}
 
-        # Merge config args into CLI args
-        config_index = cli_args.index("--config")
+        parsed_config = {}
+        for key, value in config_data.items():
+            key_norm = key.replace("-", "_")
 
-        # Split arguments around config file
-        before_config = cli_args[:config_index]
-        after_config = cli_args[config_index + 2 :]  # Skip --config and file path
+            if key_norm in self.unsupported_actions:
+                action = self.unsupported_actions[key_norm]
+                msg = f"Unsupported config option '{key_norm}' with action '{action.__class__.__name__}'"
+                raise ValueError(msg)
 
-        # Simple merge: config args + CLI args
-        return config_args + before_config + after_config
+            if key_norm in dest_map:
+                action = dest_map[key_norm]
+                if action.choices and value not in action.choices:
+                    raise ValueError(
+                        f"Invalid value for '{key}': {value}. Allowed choices: {action.choices}"
+                    )
+
+                parsed_config[action.dest] = value
+
+        return parsed_config
+
+    def remove_config_from_argv(self, argv):
+        result = []
+        skip_next = False
+        for arg in argv:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == "--config":
+                skip_next = True
+                continue
+            result.append(arg)
+        return result
 
     def _extract_config_file_path(self, args: List[str]) -> str:
         """Extract the config file path from arguments."""
@@ -124,49 +132,3 @@ class ConfigArgumentMerger:
 
         if not path.exists():
             raise ValueError(f"Config file not found: {file_path}")
-
-    def _convert_config_to_args(self, config: Dict[str, Any]) -> List[str]:
-        """Convert configuration dictionary to argument list."""
-        args = []
-
-        for key, value in config.items():
-            key_norm = key.replace("-", "_")
-            if key_norm in self.unsupported_actions:
-                action = self.unsupported_actions[key_norm]
-                msg = f"Unsupported config option '{key_norm}' with action '{action.__class__.__name__}'"
-                raise ValueError(msg)
-            if isinstance(value, bool):
-                self._add_boolean_arg(args, key, value)
-            elif isinstance(value, list):
-                self._add_list_arg(args, key, value)
-            else:
-                self._add_scalar_arg(args, key, value)
-
-        return args
-
-    def _add_boolean_arg(self, args: List[str], key: str, value: bool) -> None:
-        """
-        Add boolean argument to the list.
-
-        Only store_true flags:
-            - value True -> add flag
-            - value False -> skip
-        Regular booleans:
-            - always add --key true/false
-        """
-        key_norm = key.replace("-", "_")
-        if key_norm in self.store_true_actions:
-            if value:
-                args.append(f"--{key}")
-        else:
-            args.extend([f"--{key}", str(value).lower()])
-
-    def _add_list_arg(self, args: List[str], key: str, value: List[Any]) -> None:
-        """Add list argument to the list."""
-        if value:  # Only add if list is not empty
-            args.append(f"--{key}")
-            args.extend(str(item) for item in value)
-
-    def _add_scalar_arg(self, args: List[str], key: str, value: Any) -> None:
-        """Add scalar argument to the list."""
-        args.extend([f"--{key}", str(value)])

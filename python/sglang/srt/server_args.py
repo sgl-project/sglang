@@ -2551,7 +2551,6 @@ class ServerArgs:
             "--model",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
-            required=True,
         )
         parser.add_argument(
             "--tokenizer-path",
@@ -5153,9 +5152,19 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
         # Extract boolean actions from the parser to handle them correctly
         config_merger = ConfigArgumentMerger(parser)
-        argv = config_merger.merge_config_with_args(argv)
+        config_values = config_merger.parse_config(argv)
+        if config_values:
+            parser.set_defaults(**config_values)
+
+        argv = config_merger.remove_config_from_argv(argv)
 
     raw_args = parser.parse_args(argv)
+
+    if not isinstance(raw_args.model_path, str):
+        raise ValueError(
+            "Missing required argument: --model-path (or 'model_path' in config file)"
+        )
+
     return ServerArgs.from_cli_args(raw_args)
 
 
