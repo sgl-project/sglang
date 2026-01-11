@@ -312,6 +312,8 @@ struct Router {
     balance_rel_threshold: f32,
     eviction_interval_secs: u64,
     max_tree_size: usize,
+    enable_reactive_eviction: bool,
+    reactive_eviction_threshold: f32,
     max_idle_secs: u64,
     max_payload_size: usize,
     dp_aware: bool,
@@ -409,6 +411,8 @@ impl Router {
                     balance_rel_threshold: self.balance_rel_threshold,
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_tree_size: self.max_tree_size,
+                    enable_reactive_eviction: self.enable_reactive_eviction,
+                    reactive_eviction_threshold: self.reactive_eviction_threshold,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,

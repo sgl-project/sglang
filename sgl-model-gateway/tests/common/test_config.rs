@@ -64,6 +64,8 @@ impl TestRouterConfig {
                 1.5,  // balance_rel_threshold
                 60,   // eviction_interval_secs
                 1000, // max_tree_size
+                true, // enable_reactive_eviction
+                1.2,  // reactive_eviction_threshold
             )
             .host(defaults::HOST)
             .port(port)

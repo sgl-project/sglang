@@ -322,6 +322,10 @@ pub enum PolicyConfig {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        #[serde(default = "default_true")]
+        enable_reactive_eviction: bool,
+        #[serde(default = "default_reactive_threshold")]
+        reactive_eviction_threshold: f32,
     },
 
     #[serde(rename = "power_of_two")]
@@ -374,6 +378,13 @@ pub enum PolicyConfig {
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },
+}
+fn default_true() -> bool {
+    true
+}
+
+fn default_reactive_threshold() -> f32 {
+    1.2
 }
 
 fn default_prefix_token_count() -> usize {
@@ -810,6 +821,8 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            enable_reactive_eviction: true,
+            reactive_eviction_threshold: 1.2,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -831,6 +844,8 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            enable_reactive_eviction: true,
+            reactive_eviction_threshold: 1.2,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -853,6 +868,8 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 600,
             max_tree_size: 5000,
+            enable_reactive_eviction: true,
+            reactive_eviction_threshold: 1.2,
         };
 
         match cache_aware {
@@ -862,6 +879,7 @@ mod tests {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                ..
             } => {
                 assert!((cache_threshold - 0.75).abs() < 0.0001);
                 assert_eq!(balance_abs_threshold, 20);
@@ -1163,7 +1181,7 @@ mod tests {
                 "http://worker2:8000".to_string(),
                 "http://worker3:8000".to_string(),
             ])
-            .cache_aware_policy(0.9, 5, 1.2, 600, 10000)
+            .cache_aware_policy(0.9, 5, 1.2, 600, 10000, true, 1.2)
             .host("0.0.0.0")
             .port(3001)
             .max_payload_size(536870912)
@@ -1251,6 +1269,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                enable_reactive_eviction: true,
+                reactive_eviction_threshold: 1.2,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1281,6 +1301,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                enable_reactive_eviction: true,
+                reactive_eviction_threshold: 1.2,
             }),
             decode_policy: None,
         };
@@ -1337,6 +1359,8 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 2000,
+            enable_reactive_eviction: true,
+            reactive_eviction_threshold: 1.2,
         };
 
         match pd.get_prefill_policy(&main_policy) {
