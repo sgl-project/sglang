@@ -385,7 +385,7 @@ impl RedisBackend {
                 if attempt > 0 {
                     Metrics::record_manual_policy_redis_error("retry");
                 }
-                self.try_select(&key, workers, healthy_indices, assignment_mode).await
+                self.select_one_attempt(&key, workers, healthy_indices, assignment_mode).await
             }
         }).await;
 
@@ -401,7 +401,7 @@ impl RedisBackend {
         }
     }
 
-    async fn try_select(
+    async fn select_one_attempt(
         &self,
         key: &str,
         workers: &[Arc<dyn Worker>],
