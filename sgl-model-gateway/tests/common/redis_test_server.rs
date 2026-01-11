@@ -73,7 +73,7 @@ impl RedisTestServer {
                 std::thread::sleep(Duration::from_millis(50));
                 return;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(1000));
         }
         panic!("Redis server failed to start on port {}", self.port);
     }
