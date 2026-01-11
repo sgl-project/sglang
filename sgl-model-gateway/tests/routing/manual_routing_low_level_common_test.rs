@@ -7,25 +7,8 @@ use smg::{
 };
 
 use crate::common::manual_routing_test_helpers::{
-    create_policy, create_workers, get_redis_config, headers_with_routing_key,
+    all_backend_test, create_policy, create_workers, headers_with_routing_key,
 };
-
-macro_rules! all_backend_test {
-    ($name:ident) => {
-        paste::paste! {
-            #[tokio::test]
-            async fn [<$name _local_backend>]() {
-                [<$name _impl>](None, None).await;
-            }
-
-            #[tokio::test]
-            async fn [<$name _redis_backend>]() {
-                let cfg = get_redis_config(stringify!($name));
-                [<$name _impl>](Some(cfg.url), Some(cfg.key_prefix)).await;
-            }
-        }
-    };
-}
 
 // ============================================================================
 // Consistent Routing Tests
