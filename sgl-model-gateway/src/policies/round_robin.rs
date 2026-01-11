@@ -86,11 +86,11 @@ mod tests {
         ];
 
         let info = SelectWorkerInfo::default();
-        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(1));
-        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(2));
-        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(1));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(2));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
     }
 
     #[tokio::test]
@@ -117,10 +117,10 @@ mod tests {
         workers[1].set_healthy(false);
 
         let info = SelectWorkerInfo::default();
-        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(2));
-        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(2));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(2));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(2));
     }
 
     #[tokio::test]
@@ -140,10 +140,10 @@ mod tests {
         ];
 
         let info = SelectWorkerInfo::default();
-        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(0));
-        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(1));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
 
         policy.reset();
-        assert_eq!(policy.select_worker(&workers, &info).await.await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
     }
 }

@@ -219,7 +219,7 @@ mod tests {
 
         // With single worker, should always select it
         assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default().await),
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(0)
         );
     }
@@ -258,7 +258,7 @@ mod tests {
 
         // 5. Run selection
         let selected_idx = policy
-            .select_worker(&workers, &SelectWorkerInfo::default().await)
+            .select_worker(&workers, &SelectWorkerInfo::default())
             .expect("Should select a worker");
 
         // 6. Verify the Fix
@@ -315,7 +315,7 @@ mod tests {
         policy.update_loads(&loads_1);
 
         let idx_1 = policy
-            .select_worker(&workers_1, &SelectWorkerInfo::default().await)
+            .select_worker(&workers_1, &SelectWorkerInfo::default())
             .unwrap();
         assert_eq!(
             idx_1, 0,
@@ -336,7 +336,7 @@ mod tests {
         policy.update_loads(&loads_2);
 
         let idx_2 = policy
-            .select_worker(&workers_2, &SelectWorkerInfo::default().await)
+            .select_worker(&workers_2, &SelectWorkerInfo::default())
             .unwrap();
         assert_eq!(idx_2, 1, "Partial Fail 1 Failed: Should fallback to requests and select Worker B (fewer requests)");
 
@@ -354,7 +354,7 @@ mod tests {
         policy.update_loads(&loads_3);
 
         let idx_3 = policy
-            .select_worker(&workers_3, &SelectWorkerInfo::default().await)
+            .select_worker(&workers_3, &SelectWorkerInfo::default())
             .unwrap();
         assert_eq!(idx_3, 0, "Partial Fail 2 Failed: Should fallback to requests and select Worker A (fewer requests)");
 
@@ -370,7 +370,7 @@ mod tests {
         policy.update_loads(&loads_4);
 
         let idx_4 = policy
-            .select_worker(&workers_4, &SelectWorkerInfo::default().await)
+            .select_worker(&workers_4, &SelectWorkerInfo::default())
             .unwrap();
         assert_eq!(
             idx_4, 1,

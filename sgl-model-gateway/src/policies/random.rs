@@ -78,7 +78,7 @@ mod tests {
 
         let mut counts = HashMap::new();
         for _ in 0..100 {
-            if let Some(idx) = policy.select_worker(&workers, &SelectWorkerInfo::default().await).await {
+            if let Some(idx) = policy.select_worker(&workers, &SelectWorkerInfo::default()).await {
                 *counts.entry(idx).or_insert(0) += 1;
             }
         }
@@ -107,7 +107,7 @@ mod tests {
 
         for _ in 0..10 {
             assert_eq!(
-                policy.select_worker(&workers, &SelectWorkerInfo::default().await).await,
+                policy.select_worker(&workers, &SelectWorkerInfo::default()).await,
                 Some(1)
             );
         }
@@ -124,7 +124,7 @@ mod tests {
 
         workers[0].set_healthy(false);
         assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default().await).await,
+            policy.select_worker(&workers, &SelectWorkerInfo::default()).await,
             None
         );
     }

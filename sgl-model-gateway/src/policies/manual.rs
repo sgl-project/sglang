@@ -35,6 +35,8 @@ use crate::{
 const MAX_CANDIDATE_WORKERS: usize = 2;
 const REDIS_KEY_PREFIX: &str = "smg:manual:";
 
+// ------------------------------------ API layer ---------------------------------------
+
 #[derive(Debug)]
 pub struct ManualPolicy {
     backend: Backend,
@@ -142,6 +144,8 @@ impl LoadBalancingPolicy for ManualPolicy {
         self
     }
 }
+
+// ------------------------------------ util functions ---------------------------------------
 
 fn find_healthy_worker(
     urls: &[String],
