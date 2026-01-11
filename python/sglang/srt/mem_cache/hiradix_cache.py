@@ -345,8 +345,12 @@ class HiRadixCache(RadixCache):
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
-                    num_evicted += self.write_backup(x, write_back=True)
-                    write_back_nodes.append(x)
+                    backed_up_len = self.write_backup(x, write_back=True)
+                    if backed_up_len > 0:
+                        num_evicted += backed_up_len
+                        write_back_nodes.append(x)
+                    else:
+                        num_evicted += self._evict_regular(x)
                 else:
                     num_evicted += self._evict_regular(x)
             else:
@@ -397,23 +401,25 @@ class HiRadixCache(RadixCache):
             _priority, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
-            # only evict the host value of evicted nodes
-            if not x.evicted:
-                continue
-
+            
             # node is protected from eviction as it has ongoing prefetch or backup to storage
             if x.host_ref_counter > 0:
                 continue
 
+            if x.host_value is None:
+                continue
+
             num_evicted += self.cache_controller.evict_host(x.host_value)
+            x.host_value = None
 
-            key = self.get_child_key_fn(x.key)
-            v = x.parent.children.pop(key, None)
-            assert v == x, f"parent does not have child key, {key}"
+            if x.evicted:
+                key = self.get_child_key_fn(x.key)
+                v = x.parent.children.pop(key, None)
+                assert v == x, f"parent does not have child key, {key}"
 
-            if len(x.parent.children) == 0 and x.parent.evicted:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+                if len(x.parent.children) == 0 and x.parent.evicted:
+                    new_priority = self.eviction_strategy.get_priority(x.parent)
+                    heapq.heappush(eviction_heap, (new_priority, x.parent))
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None

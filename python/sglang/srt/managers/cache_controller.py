@@ -302,9 +302,13 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            self.prefetch_capacity_limit = int(
-                0.8 * (self.mem_pool_host.size - self.mem_pool_device.size)
-            )
+            if self.mem_pool_host.size > self.mem_pool_device.size:
+                self.prefetch_capacity_limit = int(
+                    0.8 * (self.mem_pool_host.size - self.mem_pool_device.size)
+                )
+            else:
+                self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
+
             # granularity of batch storage IO operations, in number of pages
             self.storage_batch_size = 128
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
