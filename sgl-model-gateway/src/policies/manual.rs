@@ -618,6 +618,78 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
+    // ========================================================================
+    // All Backend Test Infrastructure
+    // ========================================================================
+
+    mod test_redis_server {
+        use std::process::{Child, Command, Stdio};
+        use std::sync::OnceLock;
+        use std::time::Duration;
+
+        static SHARED_SERVER: OnceLock<SharedRedisServer> = OnceLock::new();
+
+        pub struct SharedRedisServer {
+            _process: Child,
+            pub port: u16,
+        }
+
+        impl SharedRedisServer {
+            fn start() -> Self {
+                let port = portpicker::pick_unused_port().expect("No available port");
+                let process = Command::new("redis-server")
+                    .args(["--port", &port.to_string(), "--save", "", "--appendonly", "no", "--daemonize", "no"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("Failed to start redis-server. Is redis-server installed?");
+
+                std::thread::sleep(Duration::from_millis(500));
+                Self { _process: process, port }
+            }
+
+            pub fn url(&self) -> String {
+                format!("redis://127.0.0.1:{}", self.port)
+            }
+        }
+
+        pub fn get_shared_server() -> &'static SharedRedisServer {
+            SHARED_SERVER.get_or_init(SharedRedisServer::start)
+        }
+    }
+
+    fn create_policy_with_redis(redis_url: &str, key_prefix: &str) -> ManualPolicy {
+        std::env::set_var("SMG_MANUAL_REDIS_URL", redis_url);
+        std::env::set_var("SMG_MANUAL_REDIS_KEY_PREFIX", key_prefix);
+        let policy = ManualPolicy::new();
+        std::env::remove_var("SMG_MANUAL_REDIS_URL");
+        std::env::remove_var("SMG_MANUAL_REDIS_KEY_PREFIX");
+        policy
+    }
+
+    macro_rules! all_backend_test {
+        ($name:ident) => {
+            paste::paste! {
+                #[tokio::test]
+                async fn [<$name _local_backend>]() {
+                    [<$name _impl>](ManualPolicy::new()).await;
+                }
+
+                #[tokio::test]
+                async fn [<$name _redis_backend>]() {
+                    let server = test_redis_server::get_shared_server();
+                    let key_prefix = stringify!($name);
+                    let policy = create_policy_with_redis(&server.url(), key_prefix);
+                    [<$name _impl>](policy).await;
+                }
+            }
+        };
+    }
+
+    // ========================================================================
+    // Test Helpers
+    // ========================================================================
+
     fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
         urls.iter()
             .map(|url| {
@@ -1326,107 +1398,4 @@ mod tests {
         };
     }
 
-    async fn test_consistent_routing_impl(policy: ManualPolicy) {
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-        let headers = headers_with_routing_key("user-123");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-
-        let first_idx = policy.select_worker(&workers, &info).await.unwrap();
-
-        for _ in 0..5 {
-            let idx = policy.select_worker(&workers, &info).await.unwrap();
-            assert_eq!(idx, first_idx, "Same routing key should route to same worker");
-        }
-    }
-
-    all_backend_test!(test_consistent_routing);
-
-    async fn test_failover_impl(policy: ManualPolicy) {
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-        let headers = headers_with_routing_key("failover-key");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-
-        let first_idx = policy.select_worker(&workers, &info).await.unwrap();
-        workers[first_idx].set_healthy(false);
-
-        let second_idx = policy.select_worker(&workers, &info).await.unwrap();
-        assert_ne!(second_idx, first_idx, "Should failover to different worker");
-
-        for _ in 0..3 {
-            let idx = policy.select_worker(&workers, &info).await.unwrap();
-            assert_eq!(idx, second_idx, "Should stick to new worker");
-        }
-    }
-
-    all_backend_test!(test_failover);
-
-    async fn test_worker_recovery_impl(policy: ManualPolicy) {
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-        let headers = headers_with_routing_key("recovery-key");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-
-        let first_idx = policy.select_worker(&workers, &info).await.unwrap();
-        workers[first_idx].set_healthy(false);
-
-        let second_idx = policy.select_worker(&workers, &info).await.unwrap();
-        assert_ne!(second_idx, first_idx);
-
-        workers[first_idx].set_healthy(true);
-
-        let after_recovery = policy.select_worker(&workers, &info).await.unwrap();
-        assert_eq!(
-            after_recovery, first_idx,
-            "Should return to original worker (first in candidate list)"
-        );
-    }
-
-    all_backend_test!(test_worker_recovery);
-
-    async fn test_distribution_impl(policy: ManualPolicy) {
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-        let mut distribution: HashMap<usize, usize> = HashMap::new();
-
-        for i in 0..30 {
-            let headers = headers_with_routing_key(&format!("dist-user-{}", i));
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                ..Default::default()
-            };
-            let idx = policy.select_worker(&workers, &info).await.unwrap();
-            *distribution.entry(idx).or_insert(0) += 1;
-        }
-
-        assert!(
-            distribution.len() > 1,
-            "Should distribute across multiple workers, got {:?}",
-            distribution
-        );
-    }
-
-    all_backend_test!(test_distribution);
-
-    async fn test_no_healthy_workers_impl(policy: ManualPolicy) {
-        let workers = create_workers(&["http://w1:8000"]);
-        workers[0].set_healthy(false);
-
-        let headers = headers_with_routing_key("no-healthy-key");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-
-        let result = policy.select_worker(&workers, &info).await;
-        assert!(result.is_none(), "Should return None when no healthy workers");
-    }
-
-    all_backend_test!(test_no_healthy_workers);
 }
