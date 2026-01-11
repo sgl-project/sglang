@@ -172,7 +172,7 @@ class Envs:
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
-    SGLANG_SIMULATE_GRAMMAR_TIMEOUT = EnvFloat(-1)
+    SGLANG_GRAMMAR_SIMULATE_TIMEOUT = EnvFloat(-1)
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.03)
 
     # Test & Debug
