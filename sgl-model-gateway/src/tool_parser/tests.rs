@@ -1,5 +1,12 @@
 use super::*;
-use crate::tool_parser::{parsers::JsonParser, partial_json::PartialJson, traits::ToolParser};
+use crate::{
+    protocols::common::{Function, Tool},
+    tool_parser::{
+        parsers::{JsonParser, QwenCoderParser},
+        partial_json::PartialJson,
+        traits::ToolParser,
+    },
+};
 
 #[tokio::test]
 async fn test_tool_parser_factory() {
@@ -560,5 +567,174 @@ mod stress_tests {
         for handle in handles {
             handle.await.unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod qwen_coder_tests {
+    use super::*;
+
+    fn create_test_tools() -> Vec<Tool> {
+        vec![Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: Some("Get weather information".to_string()),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "units": {"type": "string"}
+                    }
+                }),
+                strict: None,
+            },
+        }]
+    }
+
+    #[tokio::test]
+    async fn test_qwen_coder_incremental_parameter_streaming() {
+        let mut parser = QwenCoderParser::new();
+        let tools = create_test_tools();
+
+        let chunks = [
+            "<tool_call>",
+            r#"<function=get_weather>"#,
+            r#"<parameter=city>Paris</parameter>"#,
+            r#"<parameter=units>metric</parameter>"#,
+            "</function></tool_call>",
+        ];
+
+        let mut all_calls = Vec::new();
+
+        // Process each chunk
+        for (i, chunk) in chunks.iter().enumerate() {
+            let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+            println!("Chunk {}: {:?}", i, chunk);
+            println!("  Calls: {:?}", result.calls);
+            println!("  Normal text: {:?}", result.normal_text);
+
+            for call in &result.calls {
+                all_calls.push(call.clone());
+            }
+        }
+
+        // Verify the final result
+        // We should have:
+        // 1. Tool name call (from chunk 2)
+        // 2. First parameter call: {"city": "Paris"}
+        // 3. Second parameter call: , "units": "metric"
+        // Final result should be: {"city": "Paris", "units": "metric"}
+
+        assert!(!all_calls.is_empty(), "Should have at least one call");
+
+        // Check that we have the tool name
+        let name_call = all_calls.iter().find(|c| c.name.is_some());
+        assert!(name_call.is_some(), "Should have tool name call");
+        assert_eq!(name_call.unwrap().name.as_ref().unwrap(), "get_weather");
+
+        // Check parameter calls
+        let param_calls: Vec<_> = all_calls.iter().filter(|c| c.name.is_none()).collect();
+        assert!(!param_calls.is_empty(), "Should have parameter calls");
+
+        // Verify final arguments format by concatenating all parameter fragments
+        let params_str: String = param_calls.iter().map(|c| c.parameters.as_str()).collect();
+        println!("Final streamed args: {}", params_str);
+
+        // Should contain both city and units parameters
+        assert!(params_str.contains("city"), "Should contain city parameter");
+        assert!(params_str.contains("Paris"), "Should contain Paris value");
+        assert!(
+            params_str.contains("units"),
+            "Should contain units parameter"
+        );
+        assert!(params_str.contains("metric"), "Should contain metric value");
+    }
+
+    #[tokio::test]
+    async fn test_qwen_coder_incremental_parameter_streaming_with_partial_values() {
+        let mut parser = QwenCoderParser::new();
+        let tools = create_test_tools();
+
+        // Test with parameter values that arrive in multiple chunks
+        // This tests the buffering logic for partial XML tags
+        let chunks = [
+            "<tool_call><function=get_weather>",
+            r#"<parameter=city>Paris</parameter>"#,
+            r#"<parameter=units>metric</parameter>"#,
+            "</function></tool_call>",
+        ];
+
+        let mut all_calls = Vec::new();
+
+        // Process each chunk
+        for (i, chunk) in chunks.iter().enumerate() {
+            let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+            println!("Chunk {}: {:?}", i, chunk);
+            println!("  Calls: {:?}", result.calls);
+
+            for call in &result.calls {
+                all_calls.push(call.clone());
+            }
+        }
+
+        // Verify we got the tool name
+        let name_call = all_calls.iter().find(|c| c.name.is_some());
+        assert!(name_call.is_some(), "Should have tool name call");
+        assert_eq!(name_call.unwrap().name.as_ref().unwrap(), "get_weather");
+
+        // Verify we got parameter calls
+        let param_calls: Vec<_> = all_calls.iter().filter(|c| c.name.is_none()).collect();
+        assert!(!param_calls.is_empty(), "Should have parameter calls");
+
+        // Verify final arguments by concatenating all parameter fragments
+        let params_str: String = param_calls.iter().map(|c| c.parameters.as_str()).collect();
+        assert!(params_str.contains("city"), "Should contain city parameter");
+        assert!(params_str.contains("Paris"), "Should contain Paris value");
+    }
+
+    #[tokio::test]
+    async fn test_qwen_coder_nested_json_parameter() {
+        let mut parser = QwenCoderParser::new();
+        let tools = vec![Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "test_function".to_string(),
+                description: None,
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "nested": {"type": "object"}
+                    }
+                }),
+                strict: None,
+            },
+        }];
+
+        let chunks = vec![
+            "<tool_call>",
+            r#"<function=test_function>"#,
+            r#"<parameter=nested>{"key": "value"}</parameter>"#,
+            "</function></tool_call>",
+        ];
+
+        let mut all_calls = Vec::new();
+        for chunk in chunks {
+            let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+            for call in result.calls {
+                all_calls.push(call);
+            }
+        }
+
+        // Verify nested JSON is parsed correctly via collected calls
+        let param_calls: Vec<_> = all_calls.iter().filter(|c| c.name.is_none()).collect();
+        assert!(!param_calls.is_empty(), "Should have parameter calls");
+
+        // The first parameter call should contain the nested JSON
+        let params_str: String = param_calls.iter().map(|c| c.parameters.as_str()).collect();
+        assert!(
+            params_str.contains("nested"),
+            "Should contain nested parameter"
+        );
     }
 }

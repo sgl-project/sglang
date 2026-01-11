@@ -14,4 +14,5 @@ pub mod tool_parser_mixed_edge_cases;
 pub mod tool_parser_partial_json;
 pub mod tool_parser_pythonic;
 pub mod tool_parser_qwen;
+pub mod tool_parser_qwen_coder;
 pub mod tool_parser_step3;
