@@ -35,7 +35,7 @@ class TestTP(CustomTestCase):
                 "--mooncake-ib-device",
                 ib_devices,
                 "--moe-a2a-backend",
-                "deepep",
+                "mooncake",
                 "--deepep-mode",
                 "low_latency",
                 "--chunked-prefill-size",
@@ -70,6 +70,7 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
+@unittest.skip("covered in TestMooncakeWithEPLB")
 class TestPureDP(TestTP):
     extra_args = [
         "--tp",
@@ -90,6 +91,7 @@ class TestHybridDPTP(TestTP):
     ]
 
 
+@unittest.skip("covered in TestMooncakeWithEPLB")
 class TestNoGatherdBuffer(TestTP):
     extra_args = [
         "--tp",
@@ -102,6 +104,7 @@ class TestNoGatherdBuffer(TestTP):
     ]
 
 
+@unittest.skip("covered in TestMooncakeWithEPLB")
 class TestTBO(TestTP):
     extra_args = [
         "--tp",
@@ -115,7 +118,7 @@ class TestTBO(TestTP):
     ]
 
 
-class TestMooncakeWitchEPLB(TestTP):
+class TestMooncakeWithEPLB(TestTP):
     extra_args = [
         "--tp",
         "4",
