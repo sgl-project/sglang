@@ -4,8 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-import math
-
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
@@ -163,8 +161,13 @@ class GetKAndS:
 
     @classmethod
     def triton(
-        cls, pool: "NSATokenToKVPool", buf: torch.Tensor, page_indices: torch.Tensor, seq_len_tensor: torch.Tensor,
-        seq_len_sum: int, max_seq_len: int,
+        cls,
+        pool: "NSATokenToKVPool",
+        buf: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_tensor: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
     ):
         """
         Triton implementation for gathering both K and S data from paged buffer in a single call.
@@ -185,6 +188,7 @@ class GetKAndS:
             page_size=pool.page_size,
             index_head_dim=pool.index_head_dim,
         )
+
 
 class SetK:
     @classmethod
@@ -611,7 +615,9 @@ def _get_k_and_s_triton(
              s_out: (seq_len, 4), uint8
     """
     # Allocate outputs
-    k_out = torch.empty((seq_len_sum, index_head_dim), dtype=torch.uint8, device=buf.device)
+    k_out = torch.empty(
+        (seq_len_sum, index_head_dim), dtype=torch.uint8, device=buf.device
+    )
     s_out = torch.empty((seq_len_sum, 4), dtype=torch.uint8, device=buf.device)
 
     _, buf_numel_per_page = buf.shape
@@ -675,7 +681,7 @@ def _get_k_and_s_triton_kernel(
 
     if token_id >= seq_len:
         return
-    
+
     pre_batch_idx = tl.arange(0, seq_len_num_pow)
     mask_pre_batch_idx = pre_batch_idx < batch_id
     prev_seq_lens = tl.load(seq_len_ptr + pre_batch_idx, mask=mask_pre_batch_idx)
@@ -684,7 +690,9 @@ def _get_k_and_s_triton_kernel(
     s_offset_batch = seq_len_offset * 4
 
     # Load the page index from page_indices
-    page_index = tl.load(page_indices_ptr + page_idx + batch_id * page_indice_batch_offset)
+    page_index = tl.load(
+        page_indices_ptr + page_idx + batch_id * page_indice_batch_offset
+    )
 
     # ===== Load K data (128 bytes) =====
     # Calculate source offset for K in buf
