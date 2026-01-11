@@ -488,7 +488,7 @@ impl RedisBackend {
         };
         let new_data = new_candidates.serialize();
 
-        match RedisCommandUtil::cas(
+        match redis_cas(
             &mut conn,
             &key,
             old_data.as_deref(),
@@ -507,21 +507,18 @@ impl RedisBackend {
     }
 }
 
-// ------------------------------------ redis utils ---------------------------------------
+// ------------------------------------ utils ---------------------------------------
 
-struct RedisCommandUtil;
-
-impl RedisCommandUtil {
-    async fn cas(
-        conn: &mut deadpool_redis::Connection,
-        key: &str,
-        expected: Option<&str>,
-        new_value: &str,
-        ttl_secs: u64,
-    ) -> Result<bool, redis::RedisError> {
-        static CAS_SCRIPT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
-            redis::Script::new(
-                r#"
+async fn redis_cas(
+    conn: &mut deadpool_redis::Connection,
+    key: &str,
+    expected: Option<&str>,
+    new_value: &str,
+    ttl_secs: u64,
+) -> Result<bool, redis::RedisError> {
+    static CAS_SCRIPT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+        redis::Script::new(
+            r#"
 local old = redis.call('GET', KEYS[1])
 local expected = ARGV[1]
 local match = (expected == '' and old == false) or (old == expected)
@@ -529,21 +526,18 @@ if not match then return 0 end
 redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
 return 1
 "#,
-            )
-        });
+        )
+    });
 
-        let result: i32 = CAS_SCRIPT
-            .key(key)
-            .arg(expected.unwrap_or(""))
-            .arg(new_value)
-            .arg(ttl_secs)
-            .invoke_async(conn)
-            .await?;
-        Ok(result == 1)
-    }
+    let result: i32 = CAS_SCRIPT
+        .key(key)
+        .arg(expected.unwrap_or(""))
+        .arg(new_value)
+        .arg(ttl_secs)
+        .invoke_async(conn)
+        .await?;
+    Ok(result == 1)
 }
-
-// ------------------------------------ misc utils ---------------------------------------
 
 fn find_healthy_worker(
     urls: &[String],
