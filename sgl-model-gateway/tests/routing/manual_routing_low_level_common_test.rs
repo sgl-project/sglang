@@ -7,7 +7,8 @@ use smg::{
 };
 
 use crate::common::manual_routing_test_helpers::{
-    manual_routing_all_backend_test, create_policy, create_workers, headers_with_routing_key,
+    create_policy, create_workers, headers_with_routing_key, manual_routing_all_backend_test,
+    RedisConfig,
 };
 
 // ============================================================================
@@ -15,8 +16,8 @@ use crate::common::manual_routing_test_helpers::{
 // ============================================================================
 
 manual_routing_all_backend_test!(test_consistent_routing);
-async fn test_consistent_routing_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
-    let policy = create_policy(redis_url, redis_key_prefix);
+async fn test_consistent_routing_impl(redis_cfg: Option<RedisConfig>) {
+    let policy = create_policy(redis_cfg);
     let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
     let headers = headers_with_routing_key("user-123");
@@ -39,11 +40,8 @@ async fn test_consistent_routing_impl(redis_url: Option<String>, redis_key_prefi
 }
 
 manual_routing_all_backend_test!(test_different_routing_ids);
-async fn test_different_routing_ids_impl(
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
-) {
-    let policy = create_policy(redis_url, redis_key_prefix);
+async fn test_different_routing_ids_impl(redis_cfg: Option<RedisConfig>) {
+    let policy = create_policy(redis_cfg);
     let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
     let mut distribution = HashMap::new();
@@ -68,8 +66,8 @@ async fn test_different_routing_ids_impl(
 // ============================================================================
 
 manual_routing_all_backend_test!(test_fallback_random);
-async fn test_fallback_random_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
-    let policy = create_policy(redis_url, redis_key_prefix);
+async fn test_fallback_random_impl(redis_cfg: Option<RedisConfig>) {
+    let policy = create_policy(redis_cfg);
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let mut counts = HashMap::new();
@@ -85,8 +83,8 @@ async fn test_fallback_random_impl(redis_url: Option<String>, redis_key_prefix: 
 }
 
 manual_routing_all_backend_test!(test_empty_routing_id);
-async fn test_empty_routing_id_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
-    let policy = create_policy(redis_url, redis_key_prefix);
+async fn test_empty_routing_id_impl(redis_cfg: Option<RedisConfig>) {
+    let policy = create_policy(redis_cfg);
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let mut counts = HashMap::new();
@@ -110,8 +108,8 @@ async fn test_empty_routing_id_impl(redis_url: Option<String>, redis_key_prefix:
 }
 
 manual_routing_all_backend_test!(test_empty_workers);
-async fn test_empty_workers_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
-    let policy = create_policy(redis_url, redis_key_prefix);
+async fn test_empty_workers_impl(redis_cfg: Option<RedisConfig>) {
+    let policy = create_policy(redis_cfg);
     let workers: Vec<Arc<dyn Worker>> = vec![];
     let headers = headers_with_routing_key("test");
     let info = SelectWorkerInfo {
@@ -123,8 +121,8 @@ async fn test_empty_workers_impl(redis_url: Option<String>, redis_key_prefix: Op
 }
 
 manual_routing_all_backend_test!(test_single_worker);
-async fn test_single_worker_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
-    let policy = create_policy(redis_url, redis_key_prefix);
+async fn test_single_worker_impl(redis_cfg: Option<RedisConfig>) {
+    let policy = create_policy(redis_cfg);
     let workers = create_workers(&["http://w1:8000"]);
 
     let headers = headers_with_routing_key("single-test");
@@ -147,11 +145,8 @@ async fn test_single_worker_impl(redis_url: Option<String>, redis_key_prefix: Op
 // ============================================================================
 
 manual_routing_all_backend_test!(test_with_unhealthy_workers);
-async fn test_with_unhealthy_workers_impl(
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
-) {
-    let policy = create_policy(redis_url, redis_key_prefix);
+async fn test_with_unhealthy_workers_impl(redis_cfg: Option<RedisConfig>) {
+    let policy = create_policy(redis_cfg);
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     workers[0].set_healthy(false);
@@ -172,8 +167,8 @@ async fn test_with_unhealthy_workers_impl(
 }
 
 manual_routing_all_backend_test!(test_no_healthy_workers);
-async fn test_no_healthy_workers_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
-    let policy = create_policy(redis_url, redis_key_prefix);
+async fn test_no_healthy_workers_impl(redis_cfg: Option<RedisConfig>) {
+    let policy = create_policy(redis_cfg);
     let workers = create_workers(&["http://w1:8000"]);
 
     workers[0].set_healthy(false);
@@ -187,11 +182,8 @@ async fn test_no_healthy_workers_impl(redis_url: Option<String>, redis_key_prefi
 }
 
 manual_routing_all_backend_test!(test_remaps_when_worker_becomes_unhealthy);
-async fn test_remaps_when_worker_becomes_unhealthy_impl(
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
-) {
-    let policy = create_policy(redis_url, redis_key_prefix);
+async fn test_remaps_when_worker_becomes_unhealthy_impl(redis_cfg: Option<RedisConfig>) {
+    let policy = create_policy(redis_cfg);
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("sticky-user");
@@ -224,8 +216,8 @@ async fn test_remaps_when_worker_becomes_unhealthy_impl(
 // ============================================================================
 
 manual_routing_all_backend_test!(test_worker_recovery);
-async fn test_worker_recovery_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
-    let policy = create_policy(redis_url, redis_key_prefix);
+async fn test_worker_recovery_impl(redis_cfg: Option<RedisConfig>) {
+    let policy = create_policy(redis_cfg);
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("recovery-test");
@@ -254,11 +246,8 @@ async fn test_worker_recovery_impl(redis_url: Option<String>, redis_key_prefix: 
 }
 
 manual_routing_all_backend_test!(test_max_candidate_workers_eviction);
-async fn test_max_candidate_workers_eviction_impl(
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
-) {
-    let policy = create_policy(redis_url, redis_key_prefix);
+async fn test_max_candidate_workers_eviction_impl(redis_cfg: Option<RedisConfig>) {
+    let policy = create_policy(redis_cfg);
     let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
     let headers = headers_with_routing_key("eviction-test");
@@ -301,14 +290,11 @@ async fn test_max_candidate_workers_eviction_impl(
 // ============================================================================
 
 manual_routing_all_backend_test!(test_min_group_distributes_evenly);
-async fn test_min_group_distributes_evenly_impl(
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
-) {
+async fn test_min_group_distributes_evenly_impl(redis_cfg: Option<RedisConfig>) {
     let policy = ManualPolicy::with_config(ManualConfig {
         assignment_mode: ManualAssignmentMode::MinGroup,
-        redis_url,
-        redis_key_prefix,
+        redis_url: redis_cfg.as_ref().map(|c| c.url.clone()),
+        redis_key_prefix: redis_cfg.as_ref().map(|c| c.key_prefix.clone()),
         ..Default::default()
     });
     let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
@@ -352,14 +338,11 @@ async fn test_min_group_distributes_evenly_impl(
 }
 
 manual_routing_all_backend_test!(test_min_group_prefers_fewer_keys);
-async fn test_min_group_prefers_fewer_keys_impl(
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
-) {
+async fn test_min_group_prefers_fewer_keys_impl(redis_cfg: Option<RedisConfig>) {
     let policy = ManualPolicy::with_config(ManualConfig {
         assignment_mode: ManualAssignmentMode::MinGroup,
-        redis_url,
-        redis_key_prefix,
+        redis_url: redis_cfg.as_ref().map(|c| c.url.clone()),
+        redis_key_prefix: redis_cfg.as_ref().map(|c| c.key_prefix.clone()),
         ..Default::default()
     });
     let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
@@ -384,14 +367,11 @@ async fn test_min_group_prefers_fewer_keys_impl(
 }
 
 manual_routing_all_backend_test!(test_min_load_prefers_fewer_requests);
-async fn test_min_load_prefers_fewer_requests_impl(
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
-) {
+async fn test_min_load_prefers_fewer_requests_impl(redis_cfg: Option<RedisConfig>) {
     let policy = ManualPolicy::with_config(ManualConfig {
         assignment_mode: ManualAssignmentMode::MinLoad,
-        redis_url,
-        redis_key_prefix,
+        redis_url: redis_cfg.as_ref().map(|c| c.url.clone()),
+        redis_key_prefix: redis_cfg.as_ref().map(|c| c.key_prefix.clone()),
         ..Default::default()
     });
     let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
@@ -416,14 +396,11 @@ async fn test_min_load_prefers_fewer_requests_impl(
 }
 
 manual_routing_all_backend_test!(test_min_group_sticky_after_assignment);
-async fn test_min_group_sticky_after_assignment_impl(
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
-) {
+async fn test_min_group_sticky_after_assignment_impl(redis_cfg: Option<RedisConfig>) {
     let policy = ManualPolicy::with_config(ManualConfig {
         assignment_mode: ManualAssignmentMode::MinGroup,
-        redis_url,
-        redis_key_prefix,
+        redis_url: redis_cfg.as_ref().map(|c| c.url.clone()),
+        redis_key_prefix: redis_cfg.as_ref().map(|c| c.key_prefix.clone()),
         ..Default::default()
     });
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
@@ -457,14 +434,11 @@ async fn test_min_group_sticky_after_assignment_impl(
 }
 
 manual_routing_all_backend_test!(test_random_mode_does_not_consider_load);
-async fn test_random_mode_does_not_consider_load_impl(
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
-) {
+async fn test_random_mode_does_not_consider_load_impl(redis_cfg: Option<RedisConfig>) {
     let policy = ManualPolicy::with_config(ManualConfig {
         assignment_mode: ManualAssignmentMode::Random,
-        redis_url,
-        redis_key_prefix,
+        redis_url: redis_cfg.as_ref().map(|c| c.url.clone()),
+        redis_key_prefix: redis_cfg.as_ref().map(|c| c.key_prefix.clone()),
         ..Default::default()
     });
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
