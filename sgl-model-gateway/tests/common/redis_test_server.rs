@@ -1,19 +1,18 @@
 use std::{
-    net::TcpStream as StdTcpStream,
+    net::TcpStream,
     process::{Child, Command},
     sync::OnceLock,
     time::Duration,
 };
 
-use tokio::net::TcpStream;
 use tracing::warn;
 
 static SHARED_SERVER: OnceLock<RedisTestServer> = OnceLock::new();
 
 pub fn get_shared_server() -> &'static RedisTestServer {
     SHARED_SERVER.get_or_init(|| {
-        let server = RedisTestServer::start_sync().expect("Failed to start shared Redis server");
-        server.wait_ready_sync();
+        let server = RedisTestServer::start().expect("Failed to start shared Redis server");
+        server.wait_ready();
         server
     })
 }
@@ -25,13 +24,7 @@ pub struct RedisTestServer {
 }
 
 impl RedisTestServer {
-    pub async fn start() -> Result<Self, String> {
-        let server = Self::start_sync()?;
-        server.wait_ready().await?;
-        Ok(server)
-    }
-
-    fn start_sync() -> Result<Self, String> {
+    pub fn start() -> Result<Self, String> {
         let port = portpicker::pick_unused_port()
             .ok_or_else(|| "Failed to find available port".to_string())?;
         let url = format!("redis://127.0.0.1:{}", port);
@@ -73,10 +66,10 @@ impl RedisTestServer {
         })
     }
 
-    fn wait_ready_sync(&self) {
+    pub fn wait_ready(&self) {
         let addr = format!("127.0.0.1:{}", self.port);
         for _ in 0..50 {
-            if StdTcpStream::connect(&addr).is_ok() {
+            if TcpStream::connect(&addr).is_ok() {
                 std::thread::sleep(Duration::from_millis(50));
                 return;
             }
@@ -85,27 +78,8 @@ impl RedisTestServer {
         panic!("Redis server failed to start on port {}", self.port);
     }
 
-    async fn wait_ready(&self) -> Result<(), String> {
-        let addr = format!("127.0.0.1:{}", self.port);
-        for _ in 0..50 {
-            if TcpStream::connect(&addr).await.is_ok() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        Err(format!(
-            "Redis server failed to start on port {}",
-            self.port
-        ))
-    }
-
     pub fn url(&self) -> &str {
         &self.url
-    }
-
-    pub async fn stop(&mut self) {
-        self.stop_inner();
     }
 
     fn stop_inner(&mut self) {
@@ -119,16 +93,14 @@ impl RedisTestServer {
         }
     }
 
-    pub async fn flush_all(&self) -> Result<(), String> {
+    pub fn flush_all(&self) -> Result<(), String> {
         let client = redis::Client::open(self.url.as_str())
             .map_err(|e| format!("Failed to connect to Redis: {}", e))?;
         let mut conn = client
-            .get_multiplexed_async_connection()
-            .await
+            .get_connection()
             .map_err(|e| format!("Failed to get connection: {}", e))?;
         redis::cmd("FLUSHALL")
-            .query_async::<()>(&mut conn)
-            .await
+            .query::<()>(&mut conn)
             .map_err(|e| format!("Failed to flush: {}", e))?;
         Ok(())
     }
@@ -144,25 +116,24 @@ impl Drop for RedisTestServer {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_redis_server_start_stop() {
-        let server = RedisTestServer::start().await.unwrap();
+    #[test]
+    fn test_redis_server_start_stop() {
+        let server = RedisTestServer::start().unwrap();
+        server.wait_ready();
         assert!(server.url().starts_with("redis://"));
 
         let client = redis::Client::open(server.url()).unwrap();
-        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let mut conn = client.get_connection().unwrap();
 
         let _: () = redis::cmd("SET")
             .arg("test_key")
             .arg("test_value")
-            .query_async(&mut conn)
-            .await
+            .query(&mut conn)
             .unwrap();
 
         let value: String = redis::cmd("GET")
             .arg("test_key")
-            .query_async(&mut conn)
-            .await
+            .query(&mut conn)
             .unwrap();
         assert_eq!(value, "test_value");
     }
