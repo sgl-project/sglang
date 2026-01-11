@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from concurrent import futures
 from typing import TYPE_CHECKING, List
 
@@ -40,6 +41,7 @@ class GrammarManager:
         self.grammar_sync_group = scheduler.dp_tp_cpu_group
         self.grammar_sync_size = scheduler.dp_tp_group.world_size
         self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
+        self.is_grammar_sync_entry = scheduler.dp_tp_group.is_first_rank
 
     def __len__(self):
         return len(self.grammar_queue)
@@ -104,11 +106,22 @@ class GrammarManager:
 
         num_ready_reqs = 0
         num_timeout_reqs = 0
+        sim_timeout_prob = envs.SGLANG_GRAMMAR_SIMULATE_TIMEOUT.get()
+        if self.is_grammar_sync_entry:
+            # Entry rank never simulates timeout
+            sim_timeout_prob = -1
+
         for req in self.grammar_queue:
             try:
                 if req.finished():  # It is aborted by AbortReq
                     num_ready_reqs += 1
                     continue
+
+                if sim_timeout_prob > 0 and time.time() % 1 < sim_timeout_prob:
+                    # Simulate timeout for non-entry ranks in TP sync group for testing
+                    warn_msg = f"Simulating grammar timeout for non-entry rank={self.grammar_sync_entry}"
+                    logger.warning(warn_msg)
+                    raise futures._base.TimeoutError()
 
                 req.grammar = req.grammar.result(timeout=GRAMMAR_POLL_INTERVAL)
                 self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
@@ -121,7 +134,10 @@ class GrammarManager:
                 req.grammar_wait_ct += 1
                 # NOTE(lianmin): this timeout is the waiting time of the above line. It is
                 # not the waiting time from it enters the grammar queue.
-                if req.grammar_wait_ct > GRAMMAR_TIMEOUT / GRAMMAR_POLL_INTERVAL:
+                if (
+                    sim_timeout_prob > 0
+                    or req.grammar_wait_ct > GRAMMAR_TIMEOUT / GRAMMAR_POLL_INTERVAL
+                ):
                     num_timeout_reqs = 1
                 break
 
