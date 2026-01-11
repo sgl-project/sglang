@@ -1040,6 +1040,8 @@ mod tests {
             eviction_interval_secs: 0,
             max_idle_secs: 3600,
             assignment_mode: ManualAssignmentMode::Random,
+            redis_url: None,
+            redis_key_prefix: None,
         };
         let policy = ManualPolicy::with_config(config);
         assert!(!policy.local_backend().unwrap().has_eviction_task());
@@ -1097,6 +1099,8 @@ mod tests {
             eviction_interval_secs: 1,
             max_idle_secs: 1,
             assignment_mode: ManualAssignmentMode::Random,
+            redis_url: None,
+            redis_key_prefix: None,
         };
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);

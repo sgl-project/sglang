@@ -131,6 +131,7 @@ mod tests {
             eviction_interval_secs: 60,
             max_idle_secs: 4 * 3600,
             assignment_mode: Default::default(),
+            redis_url: None,
         });
         assert_eq!(policy.name(), "manual");
 
