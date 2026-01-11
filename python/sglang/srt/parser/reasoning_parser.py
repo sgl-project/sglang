@@ -231,11 +231,6 @@ class GptOssDetector(BaseReasoningFormatDetector):
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         events = self.parser.parse(new_text)
 
-        # If <|end|> is in new text, flush buffer to emit any cached content
-        # This ensures that partial content received before <|end|> is properly emitted
-        if "<|end|>" in new_text:
-            events += self.parser.parse("")
-
         reasoning_text = "".join(
             [e.content for e in events if e.event_type == "reasoning"]
         )
