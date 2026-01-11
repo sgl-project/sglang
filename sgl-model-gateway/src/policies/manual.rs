@@ -715,7 +715,9 @@ mod tests {
         assert_eq!(counts.len(), 2, "Random fallback should use all workers");
     }
 
-    async fn test_with_unhealthy_workers_impl(policy: ManualPolicy) {
+    #[tokio::test]
+    async fn test_with_unhealthy_workers() {
+        let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         workers[0].set_healthy(false);
@@ -736,9 +738,10 @@ mod tests {
             assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
     }
-    all_backend_test!(test_with_unhealthy_workers);
 
-    async fn test_no_healthy_workers_with_branch_impl(policy: ManualPolicy) {
+    #[tokio::test]
+    async fn test_no_healthy_workers_with_branch() {
+        let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000"]);
 
         workers[0].set_healthy(false);
@@ -751,9 +754,10 @@ mod tests {
         assert_eq!(result, None);
         assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
     }
-    all_backend_test!(test_no_healthy_workers_with_branch);
 
-    async fn test_empty_routing_id_impl(policy: ManualPolicy) {
+    #[tokio::test]
+    async fn test_empty_routing_id() {
+        let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let mut counts = HashMap::new();
@@ -776,9 +780,10 @@ mod tests {
             "Empty routing_id should use random fallback"
         );
     }
-    all_backend_test!(test_empty_routing_id);
 
-    async fn test_remaps_when_worker_becomes_unhealthy_impl(policy: ManualPolicy) {
+    #[tokio::test]
+    async fn test_remaps_when_worker_becomes_unhealthy() {
+        let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_routing_key("sticky-user");
@@ -808,9 +813,10 @@ mod tests {
             assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
     }
-    all_backend_test!(test_remaps_when_worker_becomes_unhealthy);
 
-    async fn test_empty_workers_impl(policy: ManualPolicy) {
+    #[tokio::test]
+    async fn test_empty_workers() {
+        let policy = ManualPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![];
         let headers = headers_with_routing_key("test");
         let info = SelectWorkerInfo {
@@ -821,9 +827,10 @@ mod tests {
         assert_eq!(result, None);
         assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
     }
-    all_backend_test!(test_empty_workers);
 
-    async fn test_single_worker_impl(policy: ManualPolicy) {
+    #[tokio::test]
+    async fn test_single_worker() {
+        let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000"]);
 
         let headers = headers_with_routing_key("single-test");
@@ -842,9 +849,10 @@ mod tests {
             assert_eq!(branch, ExecutionBranch::OccupiedHit);
         }
     }
-    all_backend_test!(test_single_worker);
 
-    async fn test_worker_recovery_with_branch_impl(policy: ManualPolicy) {
+    #[tokio::test]
+    async fn test_worker_recovery_with_branch() {
+        let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_routing_key("recovery-test");
@@ -874,9 +882,10 @@ mod tests {
         );
         assert_eq!(branch, ExecutionBranch::OccupiedHit);
     }
-    all_backend_test!(test_worker_recovery_with_branch);
 
-    async fn test_max_candidate_workers_eviction_impl(policy: ManualPolicy) {
+    #[tokio::test]
+    async fn test_max_candidate_workers_eviction() {
+        let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let headers = headers_with_routing_key("eviction-test");
@@ -917,7 +926,6 @@ mod tests {
         );
         assert_eq!(branch, ExecutionBranch::OccupiedHit);
     }
-    all_backend_test!(test_max_candidate_workers_eviction);
 
     #[tokio::test]
     async fn test_unit_policy_name() {
