@@ -36,7 +36,7 @@ use crate::{
 use crate::core::retry::MaxRetriesExceeded;
 
 const MAX_CANDIDATE_WORKERS: usize = 2;
-const REDIS_KEY_PREFIX: &str = "smg:manual:";
+const REDIS_KEY_PREFIX: &str = "smg:manual_policy:";
 
 // ------------------------------------ API layer ---------------------------------------
 
