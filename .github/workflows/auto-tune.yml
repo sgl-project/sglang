@@ -58,7 +58,7 @@ jobs:
             sizes: "3072 4096"
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Check if group already completed
+      - name: Check and download existing artifact
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
@@ -70,19 +70,30 @@ jobs:
           response=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=${artifact_name}")
 
-          exists=$(echo "$response" | python3 -c "
+          artifact_id=$(echo "$response" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
-          artifacts = data.get('artifacts', [])
-          for a in artifacts:
-              if not a.get('expired', True):
-                  print(a['id'])
-                  break
+          # Sort by created_at descending to get the latest artifact
+          artifacts = sorted(
+              [a for a in data.get('artifacts', []) if not a.get('expired', True)],
+              key=lambda x: x.get('created_at', ''),
+              reverse=True
+          )
+          if artifacts:
+              print(artifacts[0]['id'])
           " 2>/dev/null)
 
-          if [ -n "$exists" ]; then
-            echo "Found existing artifact (id: $exists), skipping group ${{ matrix.batch_group.name }}"
+          if [ -n "$artifact_id" ]; then
+            echo "Found existing artifact (id: $artifact_id), downloading for re-upload"
             echo "skip=true" >> $GITHUB_OUTPUT
+
+            mkdir -p ./tuned_configs/
+            curl -L -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$artifact_id/zip" \
+              -o artifact.zip
+            unzip -o artifact.zip -d ./tuned_configs/
+            rm -f artifact.zip
+            echo "Downloaded existing artifact"
           else
             echo "No existing artifact found, will run tuning for group ${{ matrix.batch_group.name }}"
             echo "skip=false" >> $GITHUB_OUTPUT
@@ -109,7 +120,6 @@ jobs:
             --output-dir ./tuned_configs/
 
       - name: Upload tuned config for group
-        if: steps.check.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: config-${{ matrix.runner }}-group${{ matrix.batch_group.name }}
@@ -131,29 +141,6 @@ jobs:
         with:
           pattern: config-*
           path: ./downloaded_configs/
-
-      - name: Download existing artifacts from previous runs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p ./downloaded_configs/
-
-          # Get all non-expired config-* artifacts, sorted by created_at (oldest first so newest wins on overwrite)
-          gh api repos/${{ github.repository }}/actions/artifacts \
-            --jq '.artifacts | sort_by(.created_at) | .[] | select(.name | startswith("config-")) | select(.expired == false) | "\(.id) \(.name)"' \
-            2>/dev/null | while read -r id name; do
-            if [ -z "$id" ]; then
-              continue
-            fi
-
-            echo "Downloading artifact: $name (id: $id)"
-            gh api repos/${{ github.repository }}/actions/artifacts/$id/zip > artifact.zip 2>/dev/null || continue
-            unzip -o artifact.zip -d "./downloaded_configs/$name/" 2>/dev/null || true
-            rm -f artifact.zip
-          done
-
-          echo "Downloaded configs:"
-          find ./downloaded_configs -name "*.json" 2>/dev/null | head -20 || echo "No configs found"
 
       - name: Merge configs
         run: |
