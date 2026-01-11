@@ -478,6 +478,10 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
+
+            # Attach spectral metadata for spectral eviction
+            if self.eviction_policy == "spectral" and hasattr(req, 'attention_tokens'):
+                self._attach_spectral_from_request(req)
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : len(keys)]
@@ -703,6 +707,43 @@ class RadixCache(BasePrefixCache):
                 node.spectral_coherence = coherences[fp_idx]
 
             token_offset += node_len
+
+    def _attach_spectral_from_request(self, req):
+        """
+        Extract fingerprints from request's attention_tokens and attach to tree nodes.
+
+        This is called after cache_finished_req inserts the request into the tree.
+        The attention_tokens contain fingerprint data collected during generation.
+        """
+        attention_tokens = getattr(req, 'attention_tokens', [])
+        if not attention_tokens:
+            return
+
+        # Extract fingerprints and manifold zones from attention_tokens
+        fingerprints = []
+        manifold_zones = []
+
+        for token_info in attention_tokens:
+            if isinstance(token_info, dict):
+                # Fingerprint mode returns dict with fingerprint and manifold
+                fp = token_info.get('fingerprint')
+                zone = token_info.get('manifold')
+                if fp is not None:
+                    fingerprints.append(fp)
+                if zone is not None:
+                    manifold_zones.append(zone)
+
+        if not fingerprints:
+            return
+
+        # Attach to the request's last_node path
+        last_node = getattr(req, 'last_node', None)
+        if last_node is not None:
+            self.attach_spectral_metadata_to_path(
+                last_node,
+                fingerprints=fingerprints,
+                manifold_zones=manifold_zones if manifold_zones else None,
+            )
 
     def all_values_flatten(self):
         values = []
