@@ -2,14 +2,15 @@
 //!
 //! These tests verify the core policy behavior (select_worker_impl) across both backends.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use smg::{
     config::ManualAssignmentMode,
+    core::Worker,
     policies::{LoadBalancingPolicy, ManualConfig, ManualPolicy, SelectWorkerInfo},
 };
 
-use crate::common::manual_test_helpers::{
+use crate::common::manual_routing_test_helpers::{
     create_workers, get_redis_config, headers_with_routing_key,
 };
 
@@ -31,8 +32,8 @@ macro_rules! all_backend_test {
 
             #[tokio::test]
             async fn [<$name _redis_backend>]() {
-                let (redis_url, redis_key_prefix) = get_redis_config(stringify!($name));
-                [<$name _impl>](redis_url, redis_key_prefix).await;
+                let cfg = get_redis_config(stringify!($name));
+                [<$name _impl>](Some(cfg.url), Some(cfg.key_prefix)).await;
             }
         }
     };

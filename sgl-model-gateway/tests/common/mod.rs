@@ -1,7 +1,7 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code)]
 
-pub mod manual_test_helpers;
+pub mod manual_routing_test_helpers;
 pub mod mock_mcp_server;
 pub mod mock_openai_server;
 pub mod mock_worker;
