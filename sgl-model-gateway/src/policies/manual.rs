@@ -33,6 +33,7 @@ use crate::{
     observability::metrics::Metrics,
     routers::header_utils::extract_routing_key,
 };
+use crate::core::retry::MaxRetriesExceeded;
 
 const MAX_CANDIDATE_WORKERS: usize = 2;
 const REDIS_KEY_PREFIX: &str = "smg:manual:";
@@ -385,7 +386,7 @@ impl RedisBackend {
 
         match result {
             Ok((idx, branch)) => (idx, branch),
-            Err(crate::core::retry::MaxRetriesExceeded { last: (idx, branch) }) => (idx, branch),
+            Err(MaxRetriesExceeded { last: (idx, branch) }) => (idx, branch),
         }
     }
 
