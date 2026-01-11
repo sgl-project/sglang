@@ -51,7 +51,7 @@ impl RedisTestServer {
             }
         }
 
-        info!("starting redis server... cmd={cmd:?}");
+        info!("Starting redis server... cmd={cmd:?}");
         let process = cmd.spawn().map_err(|e| {
             format!(
                 "Failed to start redis-server: {}. Is redis-server installed?",
