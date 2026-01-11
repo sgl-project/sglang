@@ -51,11 +51,14 @@ impl PolicyFactory {
                 eviction_interval_secs,
                 max_idle_secs,
                 assignment_mode,
+                redis_url,
             } => {
                 let config = ManualConfig {
                     eviction_interval_secs: *eviction_interval_secs,
                     max_idle_secs: *max_idle_secs,
                     assignment_mode: *assignment_mode,
+                    redis_url: redis_url.clone(),
+                    redis_key_prefix: None,
                 };
                 Arc::new(ManualPolicy::with_config(config))
             }

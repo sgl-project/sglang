@@ -60,6 +60,9 @@ pub struct ManualConfig {
     pub eviction_interval_secs: u64,
     pub max_idle_secs: u64,
     pub assignment_mode: ManualAssignmentMode,
+    /// Redis URL for distributed routing table (uses local DashMap if None)
+    pub redis_url: Option<String>,
+    /// Optional prefix for Redis keys (for test isolation)
     pub redis_key_prefix: Option<String>,
 }
 
@@ -69,6 +72,7 @@ impl Default for ManualConfig {
             eviction_interval_secs: 60,
             max_idle_secs: 4 * 3600,
             assignment_mode: ManualAssignmentMode::Random,
+            redis_url: None,
             redis_key_prefix: None,
         }
     }
@@ -111,7 +115,7 @@ impl ManualPolicy {
     }
 
     pub fn with_config(config: ManualConfig) -> Self {
-        let backend = Backend::from_env(&config);
+        let backend = Backend::from_config(&config);
         Self {
             backend,
             assignment_mode: config.assignment_mode,
@@ -184,14 +188,14 @@ enum Backend {
 }
 
 impl Backend {
-    fn from_env(config: &ManualConfig) -> Self {
-        if let Ok(redis_url) = std::env::var("SMG_MANUAL_REDIS_URL") {
+    fn from_config(config: &ManualConfig) -> Self {
+        if let Some(redis_url) = &config.redis_url {
             let key_prefix = config.redis_key_prefix.as_ref().map_or_else(
                 || REDIS_KEY_PREFIX_DEFAULT.to_string(),
                 |p| format!("{}:{}", p, REDIS_KEY_PREFIX_DEFAULT),
             );
-            let backend = RedisBackend::new(&redis_url, config.max_idle_secs, key_prefix)
-                .expect("SMG_MANUAL_REDIS_URL is set but failed to connect to Redis");
+            let backend = RedisBackend::new(redis_url, config.max_idle_secs, key_prefix)
+                .expect("redis_url is set but failed to connect to Redis");
             info!("ManualPolicy using Redis backend: {}", redis_url);
             return Backend::Redis(backend);
         }
