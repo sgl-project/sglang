@@ -670,17 +670,8 @@ class HarmonyParser:
         # Check if we should start filtering commentary (after <|call|> token or tool_call event)
         buffer_has_call_token = self._buffer.get_buffer().rstrip().endswith("<|call|>")
 
-        # Update buffer state based on what was consumed
-        parsed_length = len(unparsed) - len(remaining)
-        if parsed_length > 0:
-            self._buffer.mark_parsed(parsed_length)
-
-        # If remaining is empty, it means we consumed everything
-        if not remaining:
-            self._buffer.set_buffer("")
-        else:
-            # Preserve remaining content for next parse
-            self._buffer.set_buffer(remaining)
+        # Update buffer with the remaining unparsed content for the next chunk.
+        self._buffer.set_buffer(remaining)
 
         # Filter events for streaming case
         filtered_events = []
