@@ -39,14 +39,7 @@ use crate::{
 };
 
 const MAX_CANDIDATE_WORKERS: usize = 2;
-const REDIS_KEY_PREFIX_BASE: &str = "smg:manual_policy:";
-
-fn redis_key_prefix() -> String {
-    match std::env::var("SMG_MANUAL_REDIS_KEY_PREFIX") {
-        Ok(prefix) => format!("{prefix}:{REDIS_KEY_PREFIX_BASE}"),
-        Err(_) => REDIS_KEY_PREFIX_BASE.to_string(),
-    }
-}
+const REDIS_KEY_PREFIX_DEFAULT: &str = "smg:manual_policy:";
 
 // ------------------------------------ API layer ---------------------------------------
 
@@ -67,6 +60,9 @@ pub struct ManualConfig {
     pub eviction_interval_secs: u64,
     pub max_idle_secs: u64,
     pub assignment_mode: ManualAssignmentMode,
+    /// Optional prefix for Redis keys. When set, keys will be formatted as "{prefix}:{base_prefix}:{routing_id}".
+    /// This allows multiple test instances to share a Redis server without key conflicts.
+    pub redis_key_prefix: Option<String>,
 }
 
 impl Default for ManualConfig {
@@ -75,6 +71,7 @@ impl Default for ManualConfig {
             eviction_interval_secs: 60,
             max_idle_secs: 4 * 3600,
             assignment_mode: ManualAssignmentMode::Random,
+            redis_key_prefix: None,
         }
     }
 }
@@ -1325,77 +1322,6 @@ mod tests {
             selected_worker_0,
             "Random mode should sometimes select worker 0 despite higher load"
         );
-    }
-
-    // ========================================================================
-    // All Backend Tests (Local + Redis)
-    // ========================================================================
-    //
-    // These tests run on both LocalBackend and RedisBackend.
-    // A shared Redis server is started once for all redis tests.
-
-    mod test_redis_server {
-        use std::process::{Child, Command, Stdio};
-        use std::sync::OnceLock;
-        use std::time::Duration;
-
-        static SHARED_SERVER: OnceLock<SharedRedisServer> = OnceLock::new();
-
-        pub struct SharedRedisServer {
-            _process: Child,
-            pub port: u16,
-        }
-
-        impl SharedRedisServer {
-            fn start() -> Self {
-                let port = portpicker::pick_unused_port().expect("No available port");
-                let process = Command::new("redis-server")
-                    .args(["--port", &port.to_string(), "--save", "", "--appendonly", "no", "--daemonize", "no"])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .expect("Failed to start redis-server. Is redis-server installed?");
-
-                std::thread::sleep(Duration::from_millis(500));
-                Self { _process: process, port }
-            }
-
-            pub fn url(&self) -> String {
-                format!("redis://127.0.0.1:{}", self.port)
-            }
-        }
-
-        pub fn get_shared_server() -> &'static SharedRedisServer {
-            SHARED_SERVER.get_or_init(SharedRedisServer::start)
-        }
-    }
-
-    fn create_policy_with_redis(redis_url: &str, key_prefix: &str) -> ManualPolicy {
-        std::env::set_var("SMG_MANUAL_REDIS_URL", redis_url);
-        std::env::set_var("SMG_MANUAL_REDIS_KEY_PREFIX", key_prefix);
-        let policy = ManualPolicy::new();
-        std::env::remove_var("SMG_MANUAL_REDIS_URL");
-        std::env::remove_var("SMG_MANUAL_REDIS_KEY_PREFIX");
-        policy
-    }
-
-    macro_rules! all_backend_test {
-        ($name:ident) => {
-            paste::paste! {
-                #[tokio::test]
-                async fn [<$name _local_backend>]() {
-                    [<$name _impl>](ManualPolicy::new()).await;
-                }
-
-                #[tokio::test]
-                async fn [<$name _redis_backend>]() {
-                    let server = test_redis_server::get_shared_server();
-                    let key_prefix = stringify!($name);
-                    let policy = create_policy_with_redis(&server.url(), key_prefix);
-                    [<$name _impl>](policy).await;
-                }
-            }
-        };
     }
 
 }
