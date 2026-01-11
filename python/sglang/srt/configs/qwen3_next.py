@@ -284,6 +284,7 @@ class Qwen3NextConfig(PretrainedConfig):
             head_dim=self.linear_value_head_dim,
             state_size=self.linear_key_head_dim,
             conv_kernel=self.linear_conv_kernel_dim,
+            k_last=True,  # Use K-last layout for efficient MTP verify kernel
         )
 
         return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)

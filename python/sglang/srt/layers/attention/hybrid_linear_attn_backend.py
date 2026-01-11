@@ -12,6 +12,27 @@ from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_update,
 )
+
+# Lazy import for K-last GDN verify kernel (CuTe DSL)
+_cutedsl_gdn_verify_available = None
+_cutedsl_gdn_verify_k_last = None
+
+
+def _get_cutedsl_gdn_verify():
+    """Lazy import for CuTe DSL GDN verify kernel."""
+    global _cutedsl_gdn_verify_available, _cutedsl_gdn_verify_k_last
+    if _cutedsl_gdn_verify_available is None:
+        try:
+            from sglang.jit_kernel.cutedsl_gdn_verify import (
+                cutedsl_gdn_verify_k_last,
+                is_cutedsl_gdn_verify_available,
+            )
+            _cutedsl_gdn_verify_available = is_cutedsl_gdn_verify_available()
+            if _cutedsl_gdn_verify_available:
+                _cutedsl_gdn_verify_k_last = cutedsl_gdn_verify_k_last
+        except ImportError:
+            _cutedsl_gdn_verify_available = False
+    return _cutedsl_gdn_verify_available, _cutedsl_gdn_verify_k_last
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -608,11 +629,17 @@ class MambaAttnBackendBase(AttentionBackend):
             and forward_batch.mamba_track_mask.any()
         ):
             h = h.squeeze(0)
+            # Check if K-last layout is used (for GDNAttnBackend with MTP optimization)
+            ssm_k_last = getattr(self, 'ssm_k_last', False)
 
             if forward_metadata.track_ssm_h_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_h_dst] = h[
-                    forward_metadata.track_ssm_h_src
-                ].to(ssm_states.dtype, copy=False)
+                h_to_store = h[forward_metadata.track_ssm_h_src]
+                if ssm_k_last:
+                    # h is V-last from kernel, transpose to K-last for pool
+                    h_to_store = h_to_store.transpose(-1, -2)
+                ssm_states[forward_metadata.track_ssm_h_dst] = h_to_store.to(
+                    ssm_states.dtype, copy=False
+                )
             if forward_metadata.track_ssm_final_src.numel() > 0:
                 ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
                     forward_metadata.track_ssm_final_src
@@ -842,6 +869,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         assert (
             self.conv_states_shape[-1] < FLA_CHUNK_SIZE
         ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+        # Check if SSM states use K-last layout (HV, V, K) for MTP kernel optimization
+        mamba_cache_params = getattr(model_runner.model_config.hf_config, 'mamba2_cache_params', None)
+        self.ssm_k_last = mamba_cache_params.shape.k_last if mamba_cache_params else False
 
     def forward_decode(
         self,
@@ -899,21 +929,45 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, seq_len, num_heads, head_k_dim)
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
-        core_attn_out = fused_sigmoid_gating_delta_rule_update(
-            A_log=A_log,
-            dt_bias=dt_bias,
-            q=query,
-            k=key,
-            v=value,
-            a=a,
-            b=b,
-            initial_state_source=ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            use_qk_l2norm_in_kernel=True,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-        )
+        # Decode kernel expects V-last layout
+        if self.ssm_k_last:
+            # K-last -> V-last: transpose for kernel
+            # Note: fused_sigmoid_gating_delta_rule_update updates ssm_states in-place,
+            # so we need to use a temporary buffer and copy back
+            ssm_states_v_last = ssm_states[:, cache_indices].transpose(-1, -2).contiguous()
+            core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                A_log=A_log,
+                dt_bias=dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                initial_state_source=ssm_states_v_last,
+                initial_state_indices=torch.arange(len(cache_indices), dtype=torch.int32, device=cache_indices.device),
+                cu_seqlens=query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+            )
+            # V-last -> K-last: transpose back and write to pool
+            ssm_states[:, cache_indices] = ssm_states_v_last.transpose(-1, -2)
+        else:
+            core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                A_log=A_log,
+                dt_bias=dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+            )
 
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices
@@ -1041,32 +1095,78 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, actual_seq_len, num_heads, head_k_dim)
         value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
-        g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
-
         if is_target_verify:
-            core_attn_out = fused_recurrent_gated_delta_rule_update(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
-                cu_seqlens=query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                disable_state_update=True,
-                intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
-                retrieve_parent_token=retrieve_parent_token,
-            )
+            # Check if K-last GDN verify kernel should be used
+            use_k_last_gdn = self.ssm_k_last and retrieve_parent_token is None
+            if use_k_last_gdn:
+                available, cutedsl_gdn_verify_k_last = _get_cutedsl_gdn_verify()
+                use_k_last_gdn = available
+
+            if use_k_last_gdn:
+                # Use K-last CuTe DSL GDN verify kernel (no transpose needed)
+                # Reshape for kernel: [1, seq_len, H, K] -> [B, T, H, K]
+                batch_size = seq_len // forward_batch.spec_info.draft_token_num
+                draft_token_num = forward_batch.spec_info.draft_token_num
+                query_mtp = query.view(batch_size, draft_token_num, num_heads, head_k_dim)
+                key_mtp = key.view(batch_size, draft_token_num, num_heads, head_k_dim)
+                value_mtp = value.view(batch_size, draft_token_num, num_value_heads, head_v_dim)
+                a_mtp = a.view(batch_size, draft_token_num, num_value_heads)
+                b_mtp = b.view(batch_size, draft_token_num, num_value_heads)
+
+                core_attn_out = cutedsl_gdn_verify_k_last(
+                    A_log=A_log,
+                    a=a_mtp,
+                    dt_bias=dt_bias,
+                    q=query_mtp,
+                    k=key_mtp,
+                    v=value_mtp,
+                    b=b_mtp,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices[:batch_size],
+                    intermediate_states_buffer=intermediate_state_cache,
+                    use_qk_l2norm_in_kernel=True,
+                    disable_state_update=True,
+                    cu_seqlens=query_start_loc,
+                    cache_steps=draft_token_num,
+                )
+                # Reshape output: [B, T, HV, V] -> [1, seq_len, HV, V]
+                core_attn_out = core_attn_out.view(1, seq_len, num_value_heads, head_v_dim)
+            else:
+                # Use original V-last kernel with pre-computed gates
+                g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
+                core_attn_out = fused_recurrent_gated_delta_rule_update(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices,
+                    cu_seqlens=query_start_loc,
+                    use_qk_l2norm_in_kernel=True,
+                    disable_state_update=True,
+                    intermediate_states_buffer=intermediate_state_cache,
+                    intermediate_state_indices=intermediate_state_indices,
+                    cache_steps=forward_batch.spec_info.draft_token_num,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
         else:
+            # Prefill/Extend path
+            g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
             # Only cuda env uses fuse ssm_states update
-            recurrent_state = ssm_states
-            recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-            if is_npu():
-                recurrent_state = ssm_states[cache_indices]
-                recurrent_state_indices_args = {}
+            # For K-last layout, we need to transpose before/after kernel call
+            # because chunk_gated_delta_rule expects V-last layout (HV, K, V)
+            if self.ssm_k_last:
+                # K-last -> V-last: transpose for kernel input
+                recurrent_state = ssm_states[:, cache_indices].transpose(-1, -2).contiguous()
+                recurrent_state_indices_args = {}  # Don't use in-place update for K-last
+            else:
+                recurrent_state = ssm_states
+                recurrent_state_indices_args = {"initial_state_indices": cache_indices}
+                if is_npu():
+                    recurrent_state = ssm_states[cache_indices]
+                    recurrent_state_indices_args = {}
+
             core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -1079,7 +1179,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 use_qk_l2norm_in_kernel=True,
                 **recurrent_state_indices_args,
             )
-            if is_npu():
+
+            if self.ssm_k_last:
+                # V-last -> K-last: transpose kernel output back to pool layout
+                last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+                ssm_states[:, cache_indices] = last_recurrent_state.transpose(-1, -2)
+            elif is_npu():
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )

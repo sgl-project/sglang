@@ -83,6 +83,7 @@ class Mamba2StateShape:
     head_dim: int
     state_size: int
     conv_kernel: int
+    k_last: bool = False  # If True, temporal shape is (HV, V, K) instead of (HV, K, V)
 
     @staticmethod
     def create(
@@ -94,6 +95,7 @@ class Mamba2StateShape:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
+        k_last: bool = False,  # If True, use K-last layout (HV, V, K) for MTP kernel
     ) -> "Mamba2StateShape":
         # if n_groups is not divisible by world_size, need to extend the shards
         # to ensure all groups needed by a head is sharded along with it
@@ -109,7 +111,12 @@ class Mamba2StateShape:
         # These are not TP-ed as they depend on A, dt_bias, D
         # - they are typically small
         #   e.g., QWen3-Next: (32, 128, 128)
-        temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
+        # K-last layout: (HV, V, K) for efficient MTP kernel access
+        # V-last layout: (HV, K, V) for prefill kernel (default)
+        if k_last:
+            temporal_state_shape = (divide(num_heads, tp_world_size), state_size, head_dim)
+        else:
+            temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
         return Mamba2StateShape(
             conv=[conv_state_shape],
             temporal=temporal_state_shape,
@@ -120,6 +127,7 @@ class Mamba2StateShape:
             head_dim=head_dim,
             state_size=state_size,
             conv_kernel=conv_kernel,
+            k_last=k_last,
         )
 
 
