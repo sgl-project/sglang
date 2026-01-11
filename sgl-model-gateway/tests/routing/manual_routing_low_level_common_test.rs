@@ -11,16 +11,8 @@ use smg::{
 };
 
 use crate::common::manual_routing_test_helpers::{
-    create_workers, get_redis_config, headers_with_routing_key,
+    create_policy, create_workers, get_redis_config, headers_with_routing_key,
 };
-
-fn create_policy(redis_url: Option<String>, redis_key_prefix: Option<String>) -> ManualPolicy {
-    ManualPolicy::with_config(ManualConfig {
-        redis_url,
-        redis_key_prefix,
-        ..Default::default()
-    })
-}
 
 macro_rules! all_backend_test {
     ($name:ident) => {
