@@ -35,6 +35,30 @@ use crate::{
 const MAX_CANDIDATE_WORKERS: usize = 2;
 const REDIS_KEY_PREFIX: &str = "smg:manual:";
 
+#[derive(Debug, Clone, Default)]
+struct CandidateWorkerUrls(Vec<String>);
+
+impl CandidateWorkerUrls {
+    fn push_bounded(&mut self, url: String) {
+        while self.0.len() >= MAX_CANDIDATE_WORKERS {
+            self.0.remove(0);
+        }
+        self.0.push(url);
+    }
+
+    fn serialize(&self) -> String {
+        self.0.join(",")
+    }
+
+    fn deserialize(data: &str) -> Self {
+        Self(data.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+    }
+
+    fn urls(&self) -> &[String] {
+        &self.0
+    }
+}
+
 // ------------------------------------ API layer ---------------------------------------
 
 #[derive(Debug)]
@@ -69,20 +93,24 @@ impl Default for ManualConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionBranch {
     NoHealthyWorkers,
+    NoRoutingId,
     OccupiedHit,
     OccupiedMiss,
     Vacant,
-    NoRoutingId,
+    RedisConnFailed,
+    RedisCasMaxRetries,
 }
 
 impl ExecutionBranch {
     fn as_str(&self) -> &'static str {
         match self {
             Self::NoHealthyWorkers => "no_healthy_workers",
+            Self::NoRoutingId => "no_routing_id",
             Self::OccupiedHit => "occupied_hit",
             Self::OccupiedMiss => "occupied_miss",
             Self::Vacant => "vacant",
-            Self::NoRoutingId => "no_routing_id",
+            Self::RedisConnFailed => "redis_conn_failed",
+            Self::RedisCasMaxRetries => "redis_cas_max_retries",
         }
     }
 }
@@ -198,17 +226,8 @@ struct LocalBackend {
 
 #[derive(Debug, Clone)]
 struct LocalNode {
-    candi_worker_urls: Vec<String>,
+    candidates: CandidateWorkerUrls,
     last_access: Instant,
-}
-
-impl LocalNode {
-    fn push_bounded(&mut self, url: String) {
-        while self.candi_worker_urls.len() >= MAX_CANDIDATE_WORKERS {
-            self.candi_worker_urls.remove(0);
-        }
-        self.candi_worker_urls.push(url);
-    }
 }
 
 impl LocalBackend {
@@ -263,18 +282,20 @@ impl LocalBackend {
             Entry::Occupied(mut entry) => {
                 let node = entry.get_mut();
                 node.last_access = Instant::now();
-                if let Some(idx) = find_healthy_worker(&node.candi_worker_urls, workers, healthy_indices) {
+                if let Some(idx) = find_healthy_worker(node.candidates.urls(), workers, healthy_indices) {
                     (idx, ExecutionBranch::OccupiedHit)
                 } else {
                     let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
-                    node.push_bounded(workers[selected_idx].url().to_string());
+                    node.candidates.push_bounded(workers[selected_idx].url().to_string());
                     (selected_idx, ExecutionBranch::OccupiedMiss)
                 }
             }
             Entry::Vacant(entry) => {
                 let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
+                let mut candidates = CandidateWorkerUrls::default();
+                candidates.push_bounded(workers[selected_idx].url().to_string());
                 entry.insert(LocalNode {
-                    candi_worker_urls: vec![workers[selected_idx].url().to_string()],
+                    candidates,
                     last_access: Instant::now(),
                 });
                 (selected_idx, ExecutionBranch::Vacant)
@@ -304,14 +325,6 @@ impl RedisBackend {
 
     fn key(&self, routing_id: &str) -> String {
         format!("{}{}", REDIS_KEY_PREFIX, routing_id)
-    }
-
-    fn parse_candidates(data: &str) -> Vec<String> {
-        data.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
-    }
-
-    fn serialize_candidates(urls: &[String]) -> String {
-        urls.join(",")
     }
 
     async fn get_conn_with_retry(&self) -> Option<deadpool_redis::Connection> {
@@ -346,19 +359,24 @@ impl RedisBackend {
         let mut conn = match self.get_conn_with_retry().await {
             Some(c) => c,
             None => {
-                return (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::Vacant);
+                return (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisConnFailed);
             }
         };
 
         const MAX_CAS_RETRIES: u32 = 5;
 
         for _ in 0..MAX_CAS_RETRIES {
-            // GETEX: GET + refresh TTL in one call
-            let old_data = RedisCommandUtil::getex(&mut conn, &key, self.ttl_secs).await;
+            let old_data = match RedisCommandUtil::getex(&mut conn, &key, self.ttl_secs).await {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!("Redis GETEX failed: {}", e);
+                    return (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisConnFailed);
+                }
+            };
 
             if let Some(ref data) = old_data {
-                let candidates = Self::parse_candidates(data);
-                if let Some(idx) = find_healthy_worker(&candidates, workers, healthy_indices) {
+                let candidates = CandidateWorkerUrls::deserialize(data);
+                if let Some(idx) = find_healthy_worker(candidates.urls(), workers, healthy_indices) {
                     return (idx, ExecutionBranch::OccupiedHit);
                 }
             }
@@ -367,99 +385,68 @@ impl RedisBackend {
             let new_url = workers[selected_idx].url();
 
             let (new_data, branch) = if let Some(ref data) = old_data {
-                let mut candidates = Self::parse_candidates(data);
-                while candidates.len() >= MAX_CANDIDATE_WORKERS {
-                    candidates.remove(0);
-                }
-                candidates.push(new_url.to_string());
-                (Self::serialize_candidates(&candidates), ExecutionBranch::OccupiedMiss)
+                let mut candidates = CandidateWorkerUrls::deserialize(data);
+                candidates.push_bounded(new_url.to_string());
+                (candidates.serialize(), ExecutionBranch::OccupiedMiss)
             } else {
                 (new_url.to_string(), ExecutionBranch::Vacant)
             };
 
-            // CAS using Lua script
-            let (success, _current) = RedisCommandUtil::cas(
-                &mut conn,
-                &key,
-                old_data.as_deref(),
-                &new_data,
-                self.ttl_secs,
-            ).await;
-
-            if success {
-                return (selected_idx, branch);
+            match RedisCommandUtil::cas(&mut conn, &key, old_data.as_deref(), &new_data, self.ttl_secs).await {
+                Ok(true) => return (selected_idx, branch),
+                Ok(false) => continue,
+                Err(e) => {
+                    warn!("Redis CAS failed: {}", e);
+                    return (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisConnFailed);
+                }
             }
-            // CAS failed, retry with fresh data
         }
 
-        // Max retries exceeded, fallback
         warn!("Redis CAS max retries exceeded for key {}", key);
-        (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::Vacant)
+        (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisCasMaxRetries)
     }
 }
 
 // ------------------------------------ redis utils ---------------------------------------
 
-/// Utility for Redis commands (GETEX, CAS via Lua)
 struct RedisCommandUtil;
 
 impl RedisCommandUtil {
-    /// GET + refresh TTL in one call (Redis 6.2+)
-    async fn getex(conn: &mut deadpool_redis::Connection, key: &str, ttl_secs: u64) -> Option<String> {
+    async fn getex(conn: &mut deadpool_redis::Connection, key: &str, ttl_secs: u64) -> Result<Option<String>, redis::RedisError> {
         redis::cmd("GETEX")
             .arg(key)
             .arg("EX")
             .arg(ttl_secs)
             .query_async(conn)
             .await
-            .ok()
-            .flatten()
     }
 
-    /// Compare-And-Swap using Lua script (auto EVALSHA with fallback to EVAL)
-    /// Returns (success, current_value_if_failed)
     async fn cas(
         conn: &mut deadpool_redis::Connection,
         key: &str,
         expected: Option<&str>,
         new_value: &str,
         ttl_secs: u64,
-    ) -> (bool, Option<String>) {
-        // Lua CAS script:
-        // - ARGV[1] = expected (empty string means expecting key to not exist)
-        // - ARGV[2] = new_value
-        // - ARGV[3] = ttl_secs
-        // - Returns: {1, ""} on success, {0, current_value} on mismatch
+    ) -> Result<bool, redis::RedisError> {
         static CAS_SCRIPT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
             redis::Script::new(r#"
 local old = redis.call('GET', KEYS[1])
 local expected = ARGV[1]
 local match = (expected == '' and old == false) or (old == expected)
-if not match then
-    return {0, old or ''}
-end
+if not match then return 0 end
 redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
-return {1, ''}
+return 1
 "#)
         });
 
-        let expected_arg = expected.unwrap_or("");
-        let result: Result<(i32, String), _> = CAS_SCRIPT
+        let result: i32 = CAS_SCRIPT
             .key(key)
-            .arg(expected_arg)
+            .arg(expected.unwrap_or(""))
             .arg(new_value)
             .arg(ttl_secs)
             .invoke_async(conn)
-            .await;
-
-        match result {
-            Ok((1, _)) => (true, None),
-            Ok((_, current)) => (false, if current.is_empty() { None } else { Some(current) }),
-            Err(e) => {
-                warn!("Redis CAS Lua error: {}", e);
-                (false, None)
-            }
-        }
+            .await?;
+        Ok(result == 1)
     }
 }
 
