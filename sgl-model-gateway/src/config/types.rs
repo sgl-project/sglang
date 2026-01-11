@@ -369,6 +369,9 @@ pub enum PolicyConfig {
         /// Redis URL for distributed routing table (optional, uses local DashMap if not set)
         #[serde(default)]
         redis_url: Option<String>,
+        /// Redis key prefix for namespacing (optional, mainly for testing)
+        #[serde(default)]
+        redis_key_prefix: Option<String>,
     },
 
     /// Consistent hashing policy using hash ring for session affinity:

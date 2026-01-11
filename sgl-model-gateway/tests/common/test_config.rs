@@ -128,6 +128,16 @@ impl TestRouterConfig {
         assignment_mode: ManualAssignmentMode,
         redis_url: Option<String>,
     ) -> RouterConfig {
+        Self::manual_with_full_options(port, assignment_mode, redis_url, None)
+    }
+
+    /// Create a manual routing config with full options including redis key prefix
+    pub fn manual_with_full_options(
+        port: u16,
+        assignment_mode: ManualAssignmentMode,
+        redis_url: Option<String>,
+        redis_key_prefix: Option<String>,
+    ) -> RouterConfig {
         RouterConfig::builder()
             .regular_mode(vec![])
             .policy(PolicyConfig::Manual {
@@ -135,6 +145,7 @@ impl TestRouterConfig {
                 max_idle_secs: 3600,
                 assignment_mode,
                 redis_url,
+                redis_key_prefix,
             })
             .host(defaults::HOST)
             .port(port)

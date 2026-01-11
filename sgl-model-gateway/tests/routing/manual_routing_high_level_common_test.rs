@@ -14,17 +14,18 @@ use serde_json::json;
 use tower::ServiceExt;
 
 use crate::common::{
-    redis_test_server::get_shared_server, AppTestContext, TestRouterConfig, TestWorkerConfig,
+    manual_routing_test_helpers::{random_prefix, RedisConfig},
+    redis_test_server::get_shared_server,
+    AppTestContext, TestRouterConfig, TestWorkerConfig,
 };
 
 const ROUTING_KEY_HEADER: &str = "X-SMG-Routing-Key";
 
-/// Get Redis URL for tests (None for local backend)
-fn get_redis_url_for_test(use_redis: bool) -> Option<String> {
-    if use_redis {
-        Some(get_shared_server().url().to_string())
-    } else {
-        None
+fn get_redis_config(test_name: &str) -> RedisConfig {
+    let server = get_shared_server();
+    RedisConfig {
+        url: server.url().to_string(),
+        key_prefix: random_prefix(test_name),
     }
 }
 
@@ -33,13 +34,13 @@ macro_rules! all_backend_e2e_test {
         paste::paste! {
             #[tokio::test]
             async fn [<$name _local_backend>]() {
-                [<$name _impl>]($base_port, None).await;
+                [<$name _impl>]($base_port, None, None).await;
             }
 
             #[tokio::test]
             async fn [<$name _redis_backend>]() {
-                let redis_url = get_redis_url_for_test(true);
-                [<$name _impl>]($base_port + 1000, redis_url).await;
+                let cfg = get_redis_config(stringify!($name));
+                [<$name _impl>]($base_port + 1000, Some(cfg.url), Some(cfg.key_prefix)).await;
             }
         }
     };
