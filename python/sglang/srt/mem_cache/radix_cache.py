@@ -300,9 +300,9 @@ class RadixCache(BasePrefixCache):
         elif self.eviction_policy == "spectral":
             from sglang.srt.mem_cache.evict_policy import get_spectral_strategy_class
             SpectralEvictionStrategy = get_spectral_strategy_class()
-            # Get spectral eviction parameters from cache_init_params
-            retention_ratio = getattr(cache_init_params, 'spectral_retention_ratio', 0.3)
-            spectral_weight = getattr(cache_init_params, 'spectral_weight', 0.7)
+            # Get spectral eviction parameters from params
+            retention_ratio = getattr(params, 'spectral_retention_ratio', 0.3)
+            spectral_weight = getattr(params, 'spectral_weight', 0.7)
             self.eviction_strategy: EvictionStrategy = SpectralEvictionStrategy(
                 retention_ratio=retention_ratio,
                 spectral_weight=spectral_weight,
