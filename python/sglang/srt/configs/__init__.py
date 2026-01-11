@@ -11,6 +11,7 @@ from sglang.srt.configs.jet_vlm import JetVLMConfig
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
+from sglang.srt.configs.lfm2 import Lfm2Config
 from sglang.srt.configs.longcat_flash import LongcatFlashConfig
 from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_VL_V2_Config
 from sglang.srt.configs.nemotron_h import NemotronHConfig
@@ -40,6 +41,7 @@ __all__ = [
     "DotsVLMConfig",
     "DotsOCRConfig",
     "FalconH1Config",
+    "Lfm2Config",
     "NemotronHConfig",
     "NemotronH_Nano_VL_V2_Config",
     "JetNemotronConfig",

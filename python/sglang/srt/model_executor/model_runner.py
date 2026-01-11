@@ -35,6 +35,7 @@ from sglang.srt.configs import (
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
+    Lfm2Config,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3NextConfig,
@@ -546,7 +547,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
         # Init memory pool and attention backends
-        self.init_memory_pool(min_per_gpu_memory)
+        # Set default dtype so mamba2_cache_params picks up the correct dtype for conv state
+        with set_default_torch_dtype(self.model_config.dtype):
+            self.init_memory_pool(min_per_gpu_memory)
 
         # Init max running requests
         self.max_running_requests = min(
@@ -1479,7 +1482,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def mamba2_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, FalconH1Config | NemotronHConfig):
+        if isinstance(config, FalconH1Config | NemotronHConfig | Lfm2Config):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
             return config.llm_config
