@@ -5,13 +5,18 @@ from typing import Literal, get_args
 from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+)
 
 QuantizationMethods = Literal[None]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
 # The customized quantization methods which will be added to this dict.
-_CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {}
+_CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
+    "modelopt_fp4": ModelOptFp4Config,
+}
 
 
 def register_quantization_config(quantization: str):
