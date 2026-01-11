@@ -350,48 +350,75 @@ impl RedisBackend {
             }
         };
 
-        // Fast path: read-only GET, check if we have a healthy cached worker
-        if let Ok(Some(data)) = redis::cmd("GET").arg(&key).query_async::<Option<String>>(&mut conn).await {
-            let candidates = Self::parse_candidates(&data);
-            if let Some(idx) = find_healthy_worker(&candidates, workers, healthy_indices) {
-                let _ = redis::cmd("EXPIRE").arg(&key).arg(self.ttl_secs).query_async::<()>(&mut conn).await;
-                return (idx, ExecutionBranch::OccupiedHit);
-            }
-            // Fall through to slow path - key exists but no healthy worker
-        }
+        const MAX_CAS_RETRIES: u32 = 5;
 
-        // Slow path: need to write
-        // Re-GET to handle race condition (similar to DashMap entry pattern)
-        let existing: Option<String> = redis::cmd("GET").arg(&key).query_async(&mut conn).await.ok().flatten();
+        for _ in 0..MAX_CAS_RETRIES {
+            let old_data: Option<String> = redis::cmd("GET").arg(&key).query_async(&mut conn).await.ok().flatten();
 
-        match existing {
-            Some(data) => {
-                // Occupied: re-check health (may have changed between fast and slow path)
-                let candidates = Self::parse_candidates(&data);
+            if let Some(ref data) = old_data {
+                let candidates = Self::parse_candidates(data);
                 if let Some(idx) = find_healthy_worker(&candidates, workers, healthy_indices) {
                     let _ = redis::cmd("EXPIRE").arg(&key).arg(self.ttl_secs).query_async::<()>(&mut conn).await;
                     return (idx, ExecutionBranch::OccupiedHit);
                 }
-                // No healthy worker, select new one and append to candidates
-                let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
-                let new_url = workers[selected_idx].url();
-                let mut new_candidates = candidates;
-                while new_candidates.len() >= MAX_CANDIDATE_WORKERS {
-                    new_candidates.remove(0);
+            }
+
+            let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
+            let new_url = workers[selected_idx].url();
+
+            let (new_data, branch) = if let Some(ref data) = old_data {
+                let mut candidates = Self::parse_candidates(data);
+                while candidates.len() >= MAX_CANDIDATE_WORKERS {
+                    candidates.remove(0);
                 }
-                new_candidates.push(new_url.to_string());
-                let new_data = Self::serialize_candidates(&new_candidates);
-                let _ = redis::cmd("SET").arg(&key).arg(&new_data).arg("EX").arg(self.ttl_secs).query_async::<()>(&mut conn).await;
-                (selected_idx, ExecutionBranch::OccupiedMiss)
+                candidates.push(new_url.to_string());
+                (Self::serialize_candidates(&candidates), ExecutionBranch::OccupiedMiss)
+            } else {
+                (new_url.to_string(), ExecutionBranch::Vacant)
+            };
+
+            // CAS using WATCH + MULTI/EXEC
+            let cas_result = self.cas_set(&mut conn, &key, old_data.as_deref(), &new_data).await;
+
+            if cas_result {
+                return (selected_idx, branch);
             }
-            None => {
-                // Vacant: create new entry
-                let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
-                let new_url = workers[selected_idx].url();
-                let _ = redis::cmd("SET").arg(&key).arg(new_url).arg("EX").arg(self.ttl_secs).query_async::<()>(&mut conn).await;
-                (selected_idx, ExecutionBranch::Vacant)
-            }
+            // CAS failed, retry
         }
+
+        // Max retries exceeded, fallback
+        warn!("Redis CAS max retries exceeded for key {}", key);
+        (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::Vacant)
+    }
+
+    async fn cas_set(
+        &self,
+        conn: &mut deadpool_redis::Connection,
+        key: &str,
+        expected: Option<&str>,
+        new_value: &str,
+    ) -> bool {
+        // WATCH key
+        if redis::cmd("WATCH").arg(key).query_async::<()>(conn).await.is_err() {
+            return false;
+        }
+
+        // Verify current value matches expected
+        let current: Option<String> = redis::cmd("GET").arg(key).query_async(conn).await.ok().flatten();
+        if current.as_deref() != expected {
+            let _ = redis::cmd("UNWATCH").query_async::<()>(conn).await;
+            return false;
+        }
+
+        // MULTI/EXEC
+        let result: Option<()> = redis::pipe()
+            .atomic()
+            .cmd("SET").arg(key).arg(new_value).arg("EX").arg(self.ttl_secs).ignore()
+            .query_async(conn)
+            .await
+            .ok();
+
+        result.is_some()
     }
 }
 
