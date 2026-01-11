@@ -17,6 +17,7 @@ repos:
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key
+        exclude: ^sgl-model-gateway/tests/.*_test\.rs$
       - id: debug-statements
       - id: no-commit-to-branch
   - repo: https://github.com/PyCQA/isort

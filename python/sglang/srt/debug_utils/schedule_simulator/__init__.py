@@ -1,11 +1,13 @@
 from sglang.srt.debug_utils.schedule_simulator.data_source import (
+    generate_gsp_requests,
     generate_random_requests,
     load_from_request_logger,
 )
 from sglang.srt.debug_utils.schedule_simulator.entrypoint import create_arg_parser, main
 from sglang.srt.debug_utils.schedule_simulator.gpu_state import GPUState, StepRecord
 from sglang.srt.debug_utils.schedule_simulator.metrics import (
-    AttentionBalancednessRecorder,
+    AttentionComputeBalancednessRecorder,
+    AvgBatchSizeRecorder,
     BatchSizeBalancednessRecorder,
     MetricRecorder,
 )
@@ -14,6 +16,7 @@ from sglang.srt.debug_utils.schedule_simulator.routers import (
     RandomRouter,
     RoundRobinRouter,
     RouterPolicy,
+    StickyRouter,
 )
 from sglang.srt.debug_utils.schedule_simulator.schedulers import (
     FIFOScheduler,
@@ -33,13 +36,16 @@ __all__ = [
     "RouterPolicy",
     "RandomRouter",
     "RoundRobinRouter",
+    "StickyRouter",
     "SchedulerPolicy",
     "FIFOScheduler",
     "MetricRecorder",
     "BatchSizeBalancednessRecorder",
-    "AttentionBalancednessRecorder",
+    "AttentionComputeBalancednessRecorder",
+    "AvgBatchSizeRecorder",
     "load_from_request_logger",
     "generate_random_requests",
+    "generate_gsp_requests",
     "create_arg_parser",
     "main",
 ]

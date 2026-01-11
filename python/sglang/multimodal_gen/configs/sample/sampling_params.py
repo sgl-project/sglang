@@ -124,6 +124,7 @@ class SamplingParams:
     num_inference_steps: int = None
     guidance_scale: float = None
     guidance_scale_2: float = None
+    true_cfg_scale: float = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
     boundary_ratio: float | None = None
 
@@ -579,6 +580,13 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.return_trajectory_decoded,
             help="Whether to return the decoded trajectory",
+        )
+        parser.add_argument(
+            "--diffusers-kwargs",
+            type=str,
+            default=None,
+            help="JSON string of extra kwargs to pass to diffusers pipeline. "
+            'Example: \'{"output_type": "latent", "clip_skip": 2}\'',
         )
         parser.add_argument(
             "--no-override-protected-fields",
