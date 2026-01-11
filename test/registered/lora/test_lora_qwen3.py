@@ -22,7 +22,7 @@ from sglang.test.lora_utils import (
 )
 
 register_cuda_ci(est_time=97, suite="nightly-1-gpu", nightly=True)
-register_amd_ci(est_time=97, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=97, suite="stage-b-test-small-1-gpu-amd")
 
 from sglang.test.test_utils import CustomTestCase
 
