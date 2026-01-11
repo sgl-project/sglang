@@ -22,6 +22,7 @@ use std::{sync::Arc, time::Instant};
 use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use rand::Rng;
+use redis::{AsyncCommands, Expiry};
 use tracing::{info, warn};
 
 use super::{
@@ -496,12 +497,7 @@ impl RedisCommandUtil {
         key: &str,
         ttl_secs: u64,
     ) -> Result<Option<String>, redis::RedisError> {
-        redis::cmd("GETEX")
-            .arg(key)
-            .arg("EX")
-            .arg(ttl_secs)
-            .query_async(conn)
-            .await
+        conn.get_ex(key, Expiry::EX(ttl_secs as i64)).await
     }
 
     async fn cas(
