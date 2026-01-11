@@ -412,7 +412,7 @@ impl RedisBackend {
             Ok(x) => x,
             Err(e) => {
                 warn!("Redis pool.get failed: {}", e);
-                return Ok((None, ExecutionBranch::RedisPoolGetFailed));
+                return (None, ExecutionBranch::RedisPoolGetFailed);
             }
         };
 
