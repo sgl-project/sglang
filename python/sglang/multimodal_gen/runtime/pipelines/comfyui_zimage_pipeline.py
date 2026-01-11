@@ -2,14 +2,30 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import re
+from collections.abc import Generator
+from itertools import chain
 from typing import Any
 
 import torch
+from torch.distributed import init_device_mesh
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
+from sglang.multimodal_gen.runtime.loader.fsdp_load import (
+    load_model_from_full_model_state_dict,
+    set_default_dtype,
+    shard_model,
+)
+from sglang.multimodal_gen.runtime.loader.utils import (
+    get_param_names_mapping,
+)
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    safetensors_weights_iterator,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+from sglang.multimodal_gen.utils import set_mixed_precision_policy
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_comfyui_passthrough import (
     ComfyUIPassThroughScheduler,
 )
@@ -102,6 +118,76 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
             )
             return super().load_modules(server_args, loaded_modules)
 
+    def _convert_comfyui_qkv_weights(
+        self,
+        weight_iterator: Generator[tuple[str, torch.Tensor], None, None],
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """
+        Convert ComfyUI zimage qkv weights to SGLang format.
+        Splits merged qkv.weight into separate to_q, to_k, to_v weights.
+        
+        Args:
+            weight_iterator: Iterator yielding (name, tensor) pairs from safetensors
+            dim: Model dimension
+            num_heads: Number of attention heads
+            num_kv_heads: Number of key-value heads
+            
+        Yields:
+            (name, tensor) pairs with qkv weights split into to_q, to_k, to_v
+        """
+        head_dim = dim // num_heads
+        q_size = dim
+        k_size = head_dim * num_kv_heads
+        v_size = head_dim * num_kv_heads
+        
+        for name, tensor in weight_iterator:
+            # Match qkv weights in layers, noise_refiner, or context_refiner
+            # Pattern: (layers|noise_refiner|context_refiner).{i}.attention.qkv.(weight|bias)
+            match = re.match(
+                r"(layers|noise_refiner|context_refiner)\.(\d+)\.attention\.qkv\.(weight|bias)$",
+                name,
+            )
+            if match:
+                module_name, layer_idx, param_type = match.groups()
+                base_name = f"{module_name}.{layer_idx}.attention"
+                
+                if param_type == "weight":
+                    # Weight shape: (q_size + k_size + v_size, dim)
+                    # Split into q, k, v
+                    q_weight = tensor[:q_size, :]
+                    k_weight = tensor[q_size : q_size + k_size, :]
+                    v_weight = tensor[q_size + k_size :, :]
+                    
+                    logger.debug(
+                        f"Splitting {name} (shape {tensor.shape}) into "
+                        f"to_q ({q_weight.shape}), to_k ({k_weight.shape}), to_v ({v_weight.shape})"
+                    )
+                    
+                    yield f"{base_name}.to_q.weight", q_weight
+                    yield f"{base_name}.to_k.weight", k_weight
+                    yield f"{base_name}.to_v.weight", v_weight
+                else:  # bias
+                    # Bias shape: (q_size + k_size + v_size,)
+                    # Split into q, k, v
+                    q_bias = tensor[:q_size]
+                    k_bias = tensor[q_size : q_size + k_size]
+                    v_bias = tensor[q_size + k_size :]
+                    
+                    logger.debug(
+                        f"Splitting {name} (shape {tensor.shape}) into "
+                        f"to_q ({q_bias.shape}), to_k ({k_bias.shape}), to_v ({v_bias.shape})"
+                    )
+                    
+                    yield f"{base_name}.to_q.bias", q_bias
+                    yield f"{base_name}.to_k.bias", k_bias
+                    yield f"{base_name}.to_v.bias", v_bias
+            else:
+                # Pass through other weights unchanged
+                yield name, tensor
+
     def _load_transformer_from_safetensors(
         self,
         server_args: ServerArgs,
@@ -142,6 +228,7 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
 
         # Add mappings for norm layers: map from ComfyUI format (k_norm/q_norm) to SGLang format (norm_k/norm_q)
         # The regex matches the source name from safetensors, and the tuple specifies the target name in the model
+        # Note: qkv weights are handled separately by _convert_comfyui_qkv_weights function
         comfyui_norm_mappings = {
             r"(.*)\.attention\.k_norm\.weight$": (
                 r"\1.attention.norm_k.weight",
@@ -150,11 +237,6 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
             ),
             r"(.*)\.attention\.q_norm\.weight$": (
                 r"\1.attention.norm_q.weight",
-                None,
-                None,
-            ),
-            r"(.*)\.attention\.qkv\.weight$": (
-                r"\1.attention.to_qkv.weight",
                 None,
                 None,
             ),
@@ -203,21 +285,76 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         try:
-            model = maybe_load_fsdp_model(
-                model_cls=model_cls,
-                init_params={"config": dit_config, "hf_config": hf_config},
-                weight_dir_list=safetensors_list,
-                device=get_local_torch_device(),
-                hsdp_replicate_dim=server_args.hsdp_replicate_dim,
-                hsdp_shard_dim=server_args.hsdp_shard_dim,
-                cpu_offload=server_args.dit_cpu_offload,
-                pin_cpu_memory=server_args.pin_cpu_memory,
-                fsdp_inference=server_args.use_fsdp_inference,
-                default_dtype=default_dtype,
+            # Create model first (same as maybe_load_fsdp_model)
+            from sglang.multimodal_gen.runtime.platforms import current_platform
+
+            mp_policy = MixedPrecisionPolicy(
+                torch.bfloat16, torch.float32, None, cast_forward_inputs=False
+            )
+
+            set_mixed_precision_policy(
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,
                 output_dtype=None,
+                mp_policy=mp_policy,
             )
+
+            with set_default_dtype(default_dtype), torch.device("meta"):
+                model = model_cls(**{"config": dit_config, "hf_config": hf_config})
+
+            # Check if we should use FSDP
+            use_fsdp = server_args.use_fsdp_inference
+            if current_platform.is_mps():
+                use_fsdp = False
+                logger.info("Disabling FSDP for MPS platform as it's not compatible")
+
+            if use_fsdp:
+                world_size = server_args.hsdp_replicate_dim * server_args.hsdp_shard_dim
+                device_mesh = init_device_mesh(
+                    current_platform.device_type,
+                    mesh_shape=(server_args.hsdp_replicate_dim, server_args.hsdp_shard_dim),
+                    mesh_dim_names=("replicate", "shard"),
+                )
+                shard_model(
+                    model,
+                    cpu_offload=server_args.dit_cpu_offload,
+                    reshard_after_forward=True,
+                    mp_policy=mp_policy,
+                    mesh=device_mesh,
+                    fsdp_shard_conditions=model._fsdp_shard_conditions,
+                    pin_cpu_memory=server_args.pin_cpu_memory,
+                )
+
+            # Get model dimensions for qkv splitting
+            arch_config = dit_config.arch_config
+            dim = arch_config.dim
+            num_heads = arch_config.num_attention_heads
+            num_kv_heads = arch_config.n_kv_heads
+
+            # Create weight iterator with qkv conversion
+            base_weight_iterator = safetensors_weights_iterator(safetensors_list)
+            converted_weight_iterator = self._convert_comfyui_qkv_weights(
+                base_weight_iterator, dim, num_heads, num_kv_heads
+            )
+
+            # Load weights
+            param_names_mapping_fn = get_param_names_mapping(updated_mapping)
+            load_model_from_full_model_state_dict(
+                model,
+                converted_weight_iterator,
+                get_local_torch_device(),
+                default_dtype,
+                strict=True,
+                cpu_offload=server_args.dit_cpu_offload,
+                param_names_mapping=param_names_mapping_fn,
+            )
+
+            # Check for meta parameters
+            for n, p in chain(model.named_parameters(), model.named_buffers()):
+                if p.is_meta:
+                    raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")
+                if isinstance(p, torch.nn.Parameter):
+                    p.requires_grad = False
         finally:
             model_cls.param_names_mapping = original_mapping
 
