@@ -42,18 +42,18 @@ impl Drop for TestEnv {
 }
 
 macro_rules! all_backend_e2e_test {
-    ($name:ident, $test_fn:ident, $base_port:expr) => {
+    ($name:ident, $base_port:expr) => {
         paste::paste! {
             #[tokio::test]
-            async fn [<$name _local>]() {
+            async fn [<$name _local_backend>]() {
                 let _env = TestEnv::local().await;
-                $test_fn($base_port).await;
+                [<$name _impl>]($base_port).await;
             }
 
             #[tokio::test]
-            async fn [<$name _redis>]() {
+            async fn [<$name _redis_backend>]() {
                 let _env = TestEnv::redis().await;
-                $test_fn($base_port + 1000).await;
+                [<$name _impl>]($base_port + 1000).await;
             }
         }
     };
@@ -117,7 +117,7 @@ async fn test_routing_with_header_impl(base_port: u16) {
     ctx.shutdown().await;
 }
 
-all_backend_e2e_test!(test_routing_with_header, test_routing_with_header_impl, 3700);
+all_backend_e2e_test!(test_routing_with_header, 3700);
 
 async fn test_routing_without_header_impl(base_port: u16) {
     let config = TestRouterConfig::manual(base_port);
@@ -157,7 +157,7 @@ async fn test_routing_without_header_impl(base_port: u16) {
     ctx.shutdown().await;
 }
 
-all_backend_e2e_test!(test_routing_without_header, test_routing_without_header_impl, 3710);
+all_backend_e2e_test!(test_routing_without_header, 3710);
 
 async fn test_routing_consistency_impl(base_port: u16) {
     let config = TestRouterConfig::manual(base_port);
@@ -206,7 +206,7 @@ async fn test_routing_consistency_impl(base_port: u16) {
     ctx.shutdown().await;
 }
 
-all_backend_e2e_test!(test_routing_consistency, test_routing_consistency_impl, 3720);
+all_backend_e2e_test!(test_routing_consistency, 3720);
 
 // ============================================================================
 // Min Group Mode Tests
