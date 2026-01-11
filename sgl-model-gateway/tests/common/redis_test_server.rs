@@ -1,5 +1,4 @@
 use std::{
-    net::TcpStream,
     process::{Child, Command},
     sync::OnceLock,
     time::Duration,
@@ -67,13 +66,17 @@ impl RedisTestServer {
     }
 
     pub fn wait_ready(&self) {
-        let addr = format!("127.0.0.1:{}", self.port);
+        let client = redis::Client::open(self.url.as_str())
+            .expect("Failed to create Redis client for health check");
+
         for _ in 0..50 {
-            if TcpStream::connect(&addr).is_ok() {
-                std::thread::sleep(Duration::from_millis(50));
-                return;
+            if let Ok(mut conn) = client.get_connection() {
+                let result: Result<String, _> = redis::cmd("PING").query(&mut conn);
+                if result.is_ok() {
+                    return;
+                }
             }
-            std::thread::sleep(Duration::from_millis(1000));
+            std::thread::sleep(Duration::from_millis(100));
         }
         panic!("Timeout waiting Redis server ready on port {}", self.port);
     }
