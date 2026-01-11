@@ -897,6 +897,15 @@ impl Metrics {
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
     }
 
+    /// Record manual policy Redis operation failure
+    pub fn record_manual_policy_redis_error(operation: &'static str) {
+        counter!(
+            "smg_manual_policy_redis_error_total",
+            "operation" => operation
+        )
+        .increment(1);
+    }
+
     /// Record consistent hashing policy execution branch for routing decisions
     pub fn record_worker_consistent_hashing_policy_branch(branch: &'static str) {
         counter!(

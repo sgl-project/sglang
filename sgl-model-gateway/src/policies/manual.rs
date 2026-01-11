@@ -28,7 +28,9 @@ use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::{
-    config::ManualAssignmentMode, core::Worker, observability::metrics::Metrics,
+    config::{ManualAssignmentMode, RetryConfig},
+    core::Worker,
+    observability::metrics::Metrics,
     routers::header_utils::extract_routing_key,
 };
 
@@ -355,24 +357,14 @@ impl RedisBackend {
         format!("{}{}", REDIS_KEY_PREFIX, routing_id)
     }
 
-    async fn get_conn_with_retry(&self) -> Option<deadpool_redis::Connection> {
-        const MAX_RETRIES: u32 = 3;
-        const RETRY_DELAY_MS: u64 = 10;
-
-        for attempt in 0..MAX_RETRIES {
-            match self.pool.get().await {
-                Ok(c) => return Some(c),
-                Err(e) => {
-                    if attempt < MAX_RETRIES - 1 {
-                        warn!("Redis connection attempt {} failed: {}, retrying...", attempt + 1, e);
-                        tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS * (attempt as u64 + 1))).await;
-                    } else {
-                        error!("Redis connection failed after {} attempts: {}", MAX_RETRIES, e);
-                    }
-                }
-            }
+    fn retry_config() -> RetryConfig {
+        RetryConfig {
+            max_retries: 5,
+            initial_backoff_ms: 5,
+            max_backoff_ms: 50,
+            backoff_multiplier: 2.0,
+            jitter_factor: 0.2,
         }
-        None
     }
 
     async fn select_by_routing_id(
@@ -382,56 +374,80 @@ impl RedisBackend {
         healthy_indices: &[usize],
         assignment_mode: ManualAssignmentMode,
     ) -> (usize, ExecutionBranch) {
+        use crate::core::retry::{BackoffCalculator, RetryError};
+
         let key = self.key(routing_id);
+        let config = Self::retry_config();
 
-        let mut conn = match self.get_conn_with_retry().await {
-            Some(c) => c,
-            None => {
-                return (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisConnFailed);
+        let result = crate::core::retry::RetryExecutor::execute_with_retry(&config, |attempt| {
+            let key = key.clone();
+            async move {
+                if attempt > 0 {
+                    Metrics::record_manual_policy_redis_error("retry");
+                }
+                self.try_select(&key, workers, healthy_indices, assignment_mode).await
             }
-        };
+        }).await;
 
-        const MAX_CAS_RETRIES: u32 = 5;
-
-        for _ in 0..MAX_CAS_RETRIES {
-            let old_data = match RedisCommandUtil::getex(&mut conn, &key, self.ttl_secs).await {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!("Redis GETEX failed: {}", e);
-                    return (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisConnFailed);
-                }
-            };
-
-            if let Some(ref data) = old_data {
-                let candidates = CandidateWorkerUrls::deserialize(data);
-                if let Some(idx) = find_healthy_worker(candidates.urls(), workers, healthy_indices) {
-                    return (idx, ExecutionBranch::OccupiedHit);
-                }
+        match result {
+            Ok((idx, branch)) => (idx, branch),
+            Err(RetryError::MaxRetriesExceeded) => {
+                warn!("Redis max retries exceeded for key {}", key);
+                (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisCasMaxRetries)
             }
+            Err(RetryError::NoAvailableWorkers) => {
+                (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisConnFailed)
+            }
+        }
+    }
 
-            let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
-            let new_url = workers[selected_idx].url();
+    async fn try_select(
+        &self,
+        key: &str,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        assignment_mode: ManualAssignmentMode,
+    ) -> Result<(usize, ExecutionBranch), ()> {
+        let mut conn = self.pool.get().await.map_err(|e| {
+            error!("Redis pool.get failed: {}", e);
+            Metrics::record_manual_policy_redis_error("conn");
+        })?;
 
-            let (new_data, branch) = if let Some(ref data) = old_data {
-                let mut candidates = CandidateWorkerUrls::deserialize(data);
-                candidates.push_bounded(new_url.to_string());
-                (candidates.serialize(), ExecutionBranch::OccupiedMiss)
-            } else {
-                (new_url.to_string(), ExecutionBranch::Vacant)
-            };
+        let old_data = RedisCommandUtil::getex(&mut conn, key, self.ttl_secs).await.map_err(|e| {
+            error!("Redis GETEX failed: {}", e);
+            Metrics::record_manual_policy_redis_error("getex");
+        })?;
 
-            match RedisCommandUtil::cas(&mut conn, &key, old_data.as_deref(), &new_data, self.ttl_secs).await {
-                Ok(true) => return (selected_idx, branch),
-                Ok(false) => continue,
-                Err(e) => {
-                    warn!("Redis CAS failed: {}", e);
-                    return (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisConnFailed);
-                }
+        if let Some(ref data) = old_data {
+            let candidates = CandidateWorkerUrls::deserialize(data);
+            if let Some(idx) = find_healthy_worker(candidates.urls(), workers, healthy_indices) {
+                return Ok((idx, ExecutionBranch::OccupiedHit));
             }
         }
 
-        warn!("Redis CAS max retries exceeded for key {}", key);
-        (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisCasMaxRetries)
+        let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
+        let new_url = workers[selected_idx].url();
+
+        let (new_data, branch) = if let Some(ref data) = old_data {
+            let mut candidates = CandidateWorkerUrls::deserialize(data);
+            candidates.push_bounded(new_url.to_string());
+            (candidates.serialize(), ExecutionBranch::OccupiedMiss)
+        } else {
+            (new_url.to_string(), ExecutionBranch::Vacant)
+        };
+
+        let success = RedisCommandUtil::cas(&mut conn, key, old_data.as_deref(), &new_data, self.ttl_secs)
+            .await
+            .map_err(|e| {
+                error!("Redis CAS failed: {}", e);
+                Metrics::record_manual_policy_redis_error("cas");
+            })?;
+
+        if success {
+            Ok((selected_idx, branch))
+        } else {
+            Err(())
+        }
     }
 }
 
