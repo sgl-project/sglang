@@ -428,6 +428,8 @@ impl Router {
                         "min_group" => config::ManualAssignmentMode::MinGroup,
                         other => panic!("Unknown assignment mode: {}", other),
                     },
+                    redis_url: None,
+                    redis_key_prefix: None,
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
