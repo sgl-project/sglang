@@ -178,9 +178,21 @@ async fn test_redis_ttl_expiry() {
         ..Default::default()
     };
 
-    let _first_idx = policy.select_worker(&workers, &info).await.unwrap();
+    policy.select_worker(&workers, &info).await.unwrap();
+    assert_eq!(policy.iter_urls().await.unwrap().len(), 1);
 
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
-    let _after_expiry = policy.select_worker(&workers, &info).await.unwrap();
+    assert_eq!(
+        policy.iter_urls().await.unwrap().len(),
+        0,
+        "Key should be expired and removed from Redis"
+    );
+
+    policy.select_worker(&workers, &info).await.unwrap();
+    assert_eq!(
+        policy.iter_urls().await.unwrap().len(),
+        1,
+        "New key should be created after expiry"
+    );
 }
