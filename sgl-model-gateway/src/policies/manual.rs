@@ -36,6 +36,7 @@ use crate::{
     observability::metrics::Metrics,
     routers::header_utils::extract_routing_key,
 };
+use crate::core::retry::RetryExecutor;
 
 const MAX_CANDIDATE_WORKERS: usize = 2;
 const REDIS_KEY_PREFIX: &str = "smg:manual:";
@@ -365,8 +366,6 @@ impl RedisBackend {
     ) -> (Option<usize>, ExecutionBranch) {
         use crate::core::retry::RetryError;
 
-        let key = format!("{}{}", REDIS_KEY_PREFIX, routing_id);
-
         let retry_config = RetryConfig {
             max_retries: 5,
             initial_backoff_ms: 5,
@@ -375,14 +374,12 @@ impl RedisBackend {
             jitter_factor: 0.2,
         };
 
-        let result = crate::core::retry::RetryExecutor::execute_with_retry(&retry_config, |attempt| {
-            let key = key.clone();
-            async move {
-                if attempt > 0 {
-                    Metrics::record_manual_policy_redis_error("retry");
-                }
-                self.select_one_attempt(&key, workers, healthy_indices, assignment_mode).await
+        let result = RetryExecutor::execute_with_retry(&retry_config, |attempt| async {
+            if attempt > 0 {
+                Metrics::record_manual_policy_redis_error("retry");
             }
+            let key = format!("{}{}", REDIS_KEY_PREFIX, routing_id).clone();
+            self.select_one_attempt(&key, workers, healthy_indices, assignment_mode).await
         }).await;
 
         match result {
