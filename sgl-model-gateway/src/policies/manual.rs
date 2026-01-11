@@ -22,7 +22,7 @@ use std::{sync::Arc, time::Instant};
 use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use rand::Rng;
-use tracing::info;
+use tracing::{error, info, warn};
 
 use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
@@ -53,16 +53,8 @@ impl ExecutionBranch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct RoutingId(String);
-
-impl RoutingId {
-    fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-}
-
 const MAX_CANDIDATE_WORKERS: usize = 2;
+const REDIS_KEY_PREFIX: &str = "smg:manual:";
 
 #[derive(Debug, Clone)]
 pub struct ManualConfig {
@@ -81,13 +73,63 @@ impl Default for ManualConfig {
     }
 }
 
+#[derive(Debug)]
+enum Backend {
+    Local(LocalBackend),
+    Redis(RedisBackend),
+}
+
+impl Backend {
+    fn from_env(config: &ManualConfig) -> Self {
+        if let Ok(redis_url) = std::env::var("SMG_MANUAL_REDIS_URL") {
+            match RedisBackend::new(&redis_url, config.max_idle_secs) {
+                Ok(backend) => {
+                    info!("ManualPolicy using Redis backend: {}", redis_url);
+                    return Backend::Redis(backend);
+                }
+                Err(e) => {
+                    error!("Failed to connect to Redis ({}), falling back to local: {}", redis_url, e);
+                }
+            }
+        }
+        info!("ManualPolicy using local DashMap backend");
+        Backend::Local(LocalBackend::new(config))
+    }
+
+    async fn select_by_routing_id(
+        &self,
+        routing_id: &str,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        assignment_mode: ManualAssignmentMode,
+    ) -> (usize, ExecutionBranch) {
+        match self {
+            Backend::Local(b) => b.select_by_routing_id(routing_id, workers, healthy_indices, assignment_mode),
+            Backend::Redis(b) => b.select_by_routing_id(routing_id, workers, healthy_indices, assignment_mode).await,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Backend::Local(b) => b.len(),
+            Backend::Redis(_) => 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LocalBackend {
+    routing_map: Arc<DashMap<String, LocalNode>>,
+    _eviction_task: Option<PeriodicTask>,
+}
+
 #[derive(Debug, Clone)]
-struct Node {
+struct LocalNode {
     candi_worker_urls: Vec<String>,
     last_access: Instant,
 }
 
-impl Node {
+impl LocalNode {
     fn push_bounded(&mut self, url: String) {
         while self.candi_worker_urls.len() >= MAX_CANDIDATE_WORKERS {
             self.candi_worker_urls.remove(0);
@@ -96,28 +138,11 @@ impl Node {
     }
 }
 
-#[derive(Debug)]
-pub struct ManualPolicy {
-    routing_map: Arc<DashMap<RoutingId, Node>>,
-    assignment_mode: ManualAssignmentMode,
-    _eviction_task: Option<PeriodicTask>,
-}
-
-impl Default for ManualPolicy {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ManualPolicy {
-    pub fn new() -> Self {
-        Self::with_config(ManualConfig::default())
-    }
-
-    pub fn with_config(config: ManualConfig) -> Self {
+impl LocalBackend {
+    fn new(config: &ManualConfig) -> Self {
         use std::time::Duration;
 
-        let routing_map = Arc::new(DashMap::<RoutingId, Node>::new());
+        let routing_map = Arc::new(DashMap::<String, LocalNode>::new());
 
         let eviction_task = if config.eviction_interval_secs > 0 && config.max_idle_secs > 0 {
             let routing_map_clone = Arc::clone(&routing_map);
@@ -150,49 +175,166 @@ impl ManualPolicy {
 
         Self {
             routing_map,
-            assignment_mode: config.assignment_mode,
             _eviction_task: eviction_task,
-        }
-    }
-
-    fn select_new_worker(&self, workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
-        match self.assignment_mode {
-            ManualAssignmentMode::Random => random_select(healthy_indices),
-            ManualAssignmentMode::MinLoad => min_load_select(workers, healthy_indices),
-            ManualAssignmentMode::MinGroup => min_group_select(workers, healthy_indices),
         }
     }
 
     fn select_by_routing_id(
         &self,
-        workers: &[Arc<dyn Worker>],
         routing_id: &str,
+        workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
+        assignment_mode: ManualAssignmentMode,
     ) -> (usize, ExecutionBranch) {
-        let routing_id = RoutingId::new(routing_id);
-
-        match self.routing_map.entry(routing_id) {
+        match self.routing_map.entry(routing_id.to_string()) {
             Entry::Occupied(mut entry) => {
                 let node = entry.get_mut();
                 node.last_access = Instant::now();
-                if let Some(idx) =
-                    find_healthy_worker(&node.candi_worker_urls, workers, healthy_indices)
-                {
+                if let Some(idx) = find_healthy_worker(&node.candi_worker_urls, workers, healthy_indices) {
                     (idx, ExecutionBranch::OccupiedHit)
                 } else {
-                    let selected_idx = self.select_new_worker(workers, healthy_indices);
+                    let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
                     node.push_bounded(workers[selected_idx].url().to_string());
                     (selected_idx, ExecutionBranch::OccupiedMiss)
                 }
             }
             Entry::Vacant(entry) => {
-                let selected_idx = self.select_new_worker(workers, healthy_indices);
-                entry.insert(Node {
+                let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
+                entry.insert(LocalNode {
                     candi_worker_urls: vec![workers[selected_idx].url().to_string()],
                     last_access: Instant::now(),
                 });
                 (selected_idx, ExecutionBranch::Vacant)
             }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.routing_map.len()
+    }
+}
+
+#[derive(Debug)]
+struct RedisBackend {
+    pool: deadpool_redis::Pool,
+    ttl_secs: u64,
+}
+
+impl RedisBackend {
+    fn new(url: &str, ttl_secs: u64) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let cfg = deadpool_redis::Config::from_url(url);
+        let pool = cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))?;
+        Ok(Self { pool, ttl_secs })
+    }
+
+    fn key(&self, routing_id: &str) -> String {
+        format!("{}{}", REDIS_KEY_PREFIX, routing_id)
+    }
+
+    fn parse_candidates(data: &str) -> Vec<String> {
+        data.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+    }
+
+    fn serialize_candidates(urls: &[String]) -> String {
+        urls.join(",")
+    }
+
+    async fn select_by_routing_id(
+        &self,
+        routing_id: &str,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        assignment_mode: ManualAssignmentMode,
+    ) -> (usize, ExecutionBranch) {
+        let key = self.key(routing_id);
+
+        let mut conn = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Redis connection failed, using random: {}", e);
+                return (random_select(healthy_indices), ExecutionBranch::Vacant);
+            }
+        };
+
+        let existing: Option<String> = match redis::cmd("GET").arg(&key).query_async(&mut conn).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Redis GET failed: {}", e);
+                return (random_select(healthy_indices), ExecutionBranch::Vacant);
+            }
+        };
+
+        if let Some(data) = existing {
+            let candidates = Self::parse_candidates(&data);
+            if let Some(idx) = find_healthy_worker(&candidates, workers, healthy_indices) {
+                let _ = redis::cmd("EXPIRE").arg(&key).arg(self.ttl_secs).query_async::<()>(&mut conn).await;
+                return (idx, ExecutionBranch::OccupiedHit);
+            }
+            let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
+            let new_url = workers[selected_idx].url();
+            let mut new_candidates = candidates;
+            while new_candidates.len() >= MAX_CANDIDATE_WORKERS {
+                new_candidates.remove(0);
+            }
+            new_candidates.push(new_url.to_string());
+            let new_data = Self::serialize_candidates(&new_candidates);
+            let _ = redis::cmd("SET").arg(&key).arg(&new_data).arg("EX").arg(self.ttl_secs).query_async::<()>(&mut conn).await;
+            return (selected_idx, ExecutionBranch::OccupiedMiss);
+        }
+
+        let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
+        let new_url = workers[selected_idx].url();
+
+        let set_result: Result<Option<String>, _> = redis::cmd("SET")
+            .arg(&key)
+            .arg(new_url)
+            .arg("NX")
+            .arg("EX")
+            .arg(self.ttl_secs)
+            .arg("GET")
+            .query_async(&mut conn)
+            .await;
+
+        match set_result {
+            Ok(None) => (selected_idx, ExecutionBranch::Vacant),
+            Ok(Some(existing_data)) => {
+                let candidates = Self::parse_candidates(&existing_data);
+                if let Some(idx) = find_healthy_worker(&candidates, workers, healthy_indices) {
+                    (idx, ExecutionBranch::OccupiedHit)
+                } else {
+                    (selected_idx, ExecutionBranch::OccupiedMiss)
+                }
+            }
+            Err(e) => {
+                warn!("Redis SET NX failed: {}", e);
+                (selected_idx, ExecutionBranch::Vacant)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ManualPolicy {
+    backend: Backend,
+    assignment_mode: ManualAssignmentMode,
+}
+
+impl Default for ManualPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManualPolicy {
+    pub fn new() -> Self {
+        Self::with_config(ManualConfig::default())
+    }
+
+    pub fn with_config(config: ManualConfig) -> Self {
+        let backend = Backend::from_env(&config);
+        Self {
+            backend,
+            assignment_mode: config.assignment_mode,
         }
     }
 
@@ -207,7 +349,12 @@ impl ManualPolicy {
         }
 
         if let Some(routing_id) = extract_routing_key(info.headers) {
-            let (idx, branch) = self.select_by_routing_id(workers, routing_id, &healthy_indices);
+            let (idx, branch) = self.backend.select_by_routing_id(
+                routing_id,
+                workers,
+                &healthy_indices,
+                self.assignment_mode,
+            ).await;
             return (Some(idx), branch);
         }
 
@@ -223,7 +370,7 @@ impl LoadBalancingPolicy for ManualPolicy {
     async fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo<'_>) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info).await;
         Metrics::record_worker_manual_policy_branch(branch.as_str());
-        Metrics::set_manual_policy_cache_entries(self.routing_map.len());
+        Metrics::set_manual_policy_cache_entries(self.backend.len());
         result
     }
 
@@ -259,6 +406,18 @@ fn random_select(healthy_indices: &[usize]) -> usize {
     let mut rng = rand::rng();
     let random_idx = rng.random_range(0..healthy_indices.len());
     healthy_indices[random_idx]
+}
+
+fn select_new_worker(
+    workers: &[Arc<dyn Worker>],
+    healthy_indices: &[usize],
+    assignment_mode: ManualAssignmentMode,
+) -> usize {
+    match assignment_mode {
+        ManualAssignmentMode::Random => random_select(healthy_indices),
+        ManualAssignmentMode::MinLoad => min_load_select(workers, healthy_indices),
+        ManualAssignmentMode::MinGroup => min_group_select(workers, healthy_indices),
+    }
 }
 
 fn select_min_by<K, V, F>(indices: &[K], get_value: F) -> K
