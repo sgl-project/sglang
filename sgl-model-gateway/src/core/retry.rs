@@ -198,58 +198,85 @@ mod tests {
         let cfg = base_retry_config();
         let remaining = Arc::new(AtomicU32::new(2));
         let calls = Arc::new(AtomicU32::new(0));
+        let backoffs = Arc::new(AtomicU32::new(0));
 
-        let res: Result<u32, RetryError> = RetryExecutor::execute_with_retry(&cfg, {
-            let remaining = remaining.clone();
-            let calls = calls.clone();
-            move |_attempt| {
-                calls.fetch_add(1, Ordering::Relaxed);
+        let res = RetryExecutor::execute_with_retry(
+            &cfg,
+            {
                 let remaining = remaining.clone();
-                async move {
-                    if remaining
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
-                        .is_ok()
-                    {
-                        Err(())
-                    } else {
-                        Ok(42u32)
+                let calls = calls.clone();
+                move |_attempt| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    let remaining = remaining.clone();
+                    async move {
+                        if remaining
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+                            .is_ok()
+                        {
+                            None
+                        } else {
+                            Some(42u32)
+                        }
                     }
                 }
-            }
-        })
+            },
+            |output, _attempt| output.is_none(),
+            {
+                let backoffs = backoffs.clone();
+                move |_delay, _next_attempt| {
+                    backoffs.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            || {},
+        )
         .await;
 
         assert!(res.is_ok());
-        assert_eq!(res.unwrap(), 42);
+        assert_eq!(res.unwrap(), Some(42));
         assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(backoffs.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
     async fn test_execute_with_retry_exhausted() {
         let cfg = base_retry_config();
         let calls = Arc::new(AtomicU32::new(0));
-        let res: Result<u32, RetryError> = RetryExecutor::execute_with_retry(&cfg, {
-            let calls = calls.clone();
-            move |_attempt| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                async move { Err(()) }
-            }
-        })
+        let exhausted = Arc::new(AtomicU32::new(0));
+
+        let res = RetryExecutor::execute_with_retry(
+            &cfg,
+            {
+                let calls = calls.clone();
+                move |_attempt| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    async move { None::<u32> }
+                }
+            },
+            |output, _attempt| output.is_none(),
+            |_delay, _next_attempt| {},
+            {
+                let exhausted = exhausted.clone();
+                move || {
+                    exhausted.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        )
         .await;
 
-        assert!(matches!(res, Err(RetryError::MaxRetriesExceeded)));
+        assert!(matches!(res, Err(MaxRetriesExceeded { last: None })));
         assert_eq!(calls.load(Ordering::Relaxed), cfg.max_retries);
+        assert_eq!(exhausted.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
-    async fn test_execute_response_with_retry_success_path_and_hooks() {
+    async fn test_execute_with_retry_or_last_success_path_and_hooks() {
         let cfg = base_retry_config();
         let remaining = Arc::new(AtomicU32::new(2));
         let calls = Arc::new(AtomicU32::new(0));
         let backoffs = Arc::new(AtomicU32::new(0));
         let exhausted = Arc::new(AtomicU32::new(0));
 
-        let response = RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_with_retry_or_last(
             &cfg,
             {
                 let remaining = remaining.clone();
@@ -292,13 +319,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_response_with_retry_non_retryable_short_circuit() {
+    async fn test_execute_with_retry_or_last_non_retryable_short_circuit() {
         let cfg = base_retry_config();
         let calls = Arc::new(AtomicU32::new(0));
         let backoffs = Arc::new(AtomicU32::new(0));
         let exhausted = Arc::new(AtomicU32::new(0));
 
-        let response = RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_with_retry_or_last(
             &cfg,
             {
                 let calls = calls.clone();
@@ -330,13 +357,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_response_with_retry_exhausted_hooks() {
+    async fn test_execute_with_retry_or_last_exhausted_hooks() {
         let cfg = base_retry_config();
         let calls = Arc::new(AtomicU32::new(0));
         let backoffs = Arc::new(AtomicU32::new(0));
         let exhausted = Arc::new(AtomicU32::new(0));
 
-        let response = RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_with_retry_or_last(
             &cfg,
             {
                 let calls = calls.clone();

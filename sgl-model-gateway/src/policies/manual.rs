@@ -424,13 +424,14 @@ impl RedisBackend {
         let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
         let new_url = workers[selected_idx].url();
 
-        let (new_data, branch) = if let Some(ref data) = old_data {
+        let (new_candidates, branch) = if let Some(ref data) = old_data {
             let mut candidates = CandidateWorkerUrls::deserialize(data);
             candidates.push_bounded(new_url.to_string());
-            (candidates.serialize(), ExecutionBranch::OccupiedMiss)
+            (candidates, ExecutionBranch::OccupiedMiss)
         } else {
-            (new_url.to_string(), ExecutionBranch::Vacant)
+            (CandidateWorkerUrls(vec![new_url.to_string()]), ExecutionBranch::Vacant)
         };
+        let new_data = new_candidates.serialize();
 
         match RedisCommandUtil::cas(&mut conn, &key, old_data.as_deref(), &new_data, self.ttl_secs).await {
             Ok(true) => (Some(selected_idx), branch),
