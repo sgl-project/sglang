@@ -154,12 +154,12 @@ void timestep_embedding(
 
   const DLDataType in_dtype = input.dtype();
 
-  const bool in_ok =
+  const bool input_dtype_supported =
       (in_dtype.code == kDLFloat && in_dtype.bits == 16) ||
       (in_dtype.code == kDLBfloat && in_dtype.bits == 16) ||
       (in_dtype.code == kDLFloat && in_dtype.bits == 32);
   RuntimeCheck(
-      in_ok,
+      input_dtype_supported,
       "input dtype must be fp16/bf16/fp32, but got ",
       in_dtype);
 
