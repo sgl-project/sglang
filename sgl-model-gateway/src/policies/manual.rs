@@ -78,7 +78,9 @@ enum ExecutionBranch {
     OccupiedHit,
     OccupiedMiss,
     Vacant,
-    RedisConnFailed,
+    RedisPoolGetFailed,
+    RedisGetexFailed,
+    RedisCasFailed,
     RedisCasMaxRetries,
 }
 
@@ -90,7 +92,9 @@ impl ExecutionBranch {
             Self::OccupiedHit => "occupied_hit",
             Self::OccupiedMiss => "occupied_miss",
             Self::Vacant => "vacant",
-            Self::RedisConnFailed => "redis_conn_failed",
+            Self::RedisPoolGetFailed => "redis_pool_get_failed",
+            Self::RedisGetexFailed => "redis_getex_failed",
+            Self::RedisCasFailed => "redis_cas_failed",
             Self::RedisCasMaxRetries => "redis_cas_max_retries",
         }
     }
@@ -126,7 +130,7 @@ impl ManualPolicy {
                 &healthy_indices,
                 self.assignment_mode,
             ).await;
-            return (Some(idx), branch);
+            return (idx.or_else(|| Some(random_select(&healthy_indices))), branch);
         }
 
         (
@@ -187,9 +191,12 @@ impl Backend {
         workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
         assignment_mode: ManualAssignmentMode,
-    ) -> (usize, ExecutionBranch) {
+    ) -> (Option<usize>, ExecutionBranch) {
         match self {
-            Backend::Local(b) => b.select_by_routing_id(routing_id, workers, healthy_indices, assignment_mode),
+            Backend::Local(b) => {
+                let (idx, branch) = b.select_by_routing_id(routing_id, workers, healthy_indices, assignment_mode);
+                (Some(idx), branch)
+            }
             Backend::Redis(b) => b.select_by_routing_id(routing_id, workers, healthy_indices, assignment_mode).await,
         }
     }
