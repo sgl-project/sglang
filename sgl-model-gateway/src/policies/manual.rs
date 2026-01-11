@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use rand::Rng;
 use redis::{AsyncCommands, Expiry};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
@@ -197,9 +197,9 @@ impl Backend {
     fn from_config(config: &ManualConfig) -> Self {
         if let Some(redis_url) = &config.redis_url {
             let key_prefix = format!("{}:{REDIS_KEY_MIDFIX_DEFAULT}", config.redis_key_prefix.as_deref().unwrap_or(""));
+            info!("ManualPolicy creating Redis backend: url={}, key_prefix={}", redis_url, key_prefix);
             let backend = RedisBackend::new(redis_url, config.max_idle_secs, key_prefix)
                 .expect("redis_url is set but failed to connect to Redis");
-            info!("ManualPolicy using Redis backend: {}", redis_url);
             Backend::Redis(backend)
         } else {
             info!("ManualPolicy using local DashMap backend");
@@ -471,15 +471,17 @@ impl RedisBackend {
         let old_data: Option<String> = match conn.get_ex(&key, Expiry::EX(self.ttl_secs)).await {
             Ok(x) => x,
             Err(e) => {
-                warn!("Redis getex exception: {}", e);
+                warn!("Redis getex exception: key={}, error={}", key, e);
                 return (None, ExecutionBranch::RedisGetexException);
             }
         };
+        debug!("Redis getex: key={}, old_data={:?}", key, old_data);
         let old_candidates = old_data.as_deref().map(CandidateWorkerUrls::deserialize);
 
         if let Some(ref old_candidates) = old_candidates {
             if let Some(idx) = find_healthy_worker(old_candidates.urls(), workers, healthy_indices)
             {
+                debug!("OccupiedHit: key={}, idx={}", key, idx);
                 return (Some(idx), ExecutionBranch::OccupiedHit);
             }
         }
@@ -507,10 +509,16 @@ impl RedisBackend {
         )
         .await
         {
-            Ok(true) => (Some(selected_idx), branch),
-            Ok(false) => (None, ExecutionBranch::RedisCasRace),
+            Ok(true) => {
+                debug!("CAS success: key={}, new_data={}", key, new_data);
+                (Some(selected_idx), branch)
+            }
+            Ok(false) => {
+                debug!("CAS race: key={}, old_data={:?}, new_data={}", key, old_data, new_data);
+                (None, ExecutionBranch::RedisCasRace)
+            }
             Err(e) => {
-                warn!("Redis cas exception: {}", e);
+                warn!("Redis cas exception: key={}, error={}", key, e);
                 (None, ExecutionBranch::RedisCasException)
             }
         }
