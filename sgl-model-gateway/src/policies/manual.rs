@@ -32,6 +32,21 @@ use crate::{
     routers::header_utils::extract_routing_key,
 };
 
+const MAX_CANDIDATE_WORKERS: usize = 2;
+const REDIS_KEY_PREFIX: &str = "smg:manual:";
+
+#[derive(Debug)]
+pub struct ManualPolicy {
+    backend: Backend,
+    assignment_mode: ManualAssignmentMode,
+}
+
+impl Default for ManualPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionBranch {
     NoHealthyWorkers,
@@ -53,9 +68,6 @@ impl ExecutionBranch {
     }
 }
 
-const MAX_CANDIDATE_WORKERS: usize = 2;
-const REDIS_KEY_PREFIX: &str = "smg:manual:";
-
 #[derive(Debug, Clone)]
 pub struct ManualConfig {
     pub eviction_interval_secs: u64,
@@ -72,6 +84,143 @@ impl Default for ManualConfig {
         }
     }
 }
+impl ManualPolicy {
+    pub fn new() -> Self {
+        Self::with_config(ManualConfig::default())
+    }
+
+    pub fn with_config(config: ManualConfig) -> Self {
+        let backend = Backend::from_env(&config);
+        Self {
+            backend,
+            assignment_mode: config.assignment_mode,
+        }
+    }
+
+    async fn select_worker_impl(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> (Option<usize>, ExecutionBranch) {
+        let healthy_indices = get_healthy_worker_indices(workers);
+        if healthy_indices.is_empty() {
+            return (None, ExecutionBranch::NoHealthyWorkers);
+        }
+
+        if let Some(routing_id) = extract_routing_key(info.headers) {
+            let (idx, branch) = self.backend.select_by_routing_id(
+                routing_id,
+                workers,
+                &healthy_indices,
+                self.assignment_mode,
+            ).await;
+            return (Some(idx), branch);
+        }
+
+        (
+            Some(random_select(&healthy_indices)),
+            ExecutionBranch::NoRoutingId,
+        )
+    }
+}
+
+#[async_trait]
+impl LoadBalancingPolicy for ManualPolicy {
+    async fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo<'_>) -> Option<usize> {
+        let (result, branch) = self.select_worker_impl(workers, info).await;
+        Metrics::record_worker_manual_policy_branch(branch.as_str());
+        Metrics::set_manual_policy_cache_entries(self.backend.len());
+        result
+    }
+
+    fn name(&self) -> &'static str {
+        "manual"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn find_healthy_worker(
+    urls: &[String],
+    workers: &[Arc<dyn Worker>],
+    healthy_indices: &[usize],
+) -> Option<usize> {
+    for url in urls {
+        if let Some(idx) = find_worker_index_by_url(workers, url) {
+            if healthy_indices.contains(&idx) {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn find_worker_index_by_url(workers: &[Arc<dyn Worker>], url: &str) -> Option<usize> {
+    workers.iter().position(|w| w.url() == url)
+}
+
+fn random_select(healthy_indices: &[usize]) -> usize {
+    let mut rng = rand::rng();
+    let random_idx = rng.random_range(0..healthy_indices.len());
+    healthy_indices[random_idx]
+}
+
+fn select_new_worker(
+    workers: &[Arc<dyn Worker>],
+    healthy_indices: &[usize],
+    assignment_mode: ManualAssignmentMode,
+) -> usize {
+    match assignment_mode {
+        ManualAssignmentMode::Random => random_select(healthy_indices),
+        ManualAssignmentMode::MinLoad => min_load_select(workers, healthy_indices),
+        ManualAssignmentMode::MinGroup => min_group_select(workers, healthy_indices),
+    }
+}
+
+fn select_min_by<K, V, F>(indices: &[K], get_value: F) -> K
+where
+    K: Copy,
+    V: Ord,
+    F: Fn(K) -> V,
+{
+    let mut min_val: Option<V> = None;
+    let mut candidates = Vec::new();
+
+    for &idx in indices {
+        let val = get_value(idx);
+        match min_val.as_ref().map(|m| val.cmp(m)) {
+            None | Some(std::cmp::Ordering::Less) => {
+                min_val = Some(val);
+                candidates.clear();
+                candidates.push(idx);
+            }
+            Some(std::cmp::Ordering::Equal) => {
+                candidates.push(idx);
+            }
+            Some(std::cmp::Ordering::Greater) => {}
+        }
+    }
+
+    if candidates.len() == 1 {
+        candidates[0]
+    } else {
+        let mut rng = rand::rng();
+        candidates[rng.random_range(0..candidates.len())]
+    }
+}
+
+fn min_load_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
+    select_min_by(healthy_indices, |idx| workers[idx].load())
+}
+
+fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
+    select_min_by(healthy_indices, |idx| {
+        workers[idx].worker_routing_key_load().value()
+    })
+}
+
 
 #[derive(Debug)]
 enum Backend {
@@ -313,154 +462,6 @@ impl RedisBackend {
     }
 }
 
-#[derive(Debug)]
-pub struct ManualPolicy {
-    backend: Backend,
-    assignment_mode: ManualAssignmentMode,
-}
-
-impl Default for ManualPolicy {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ManualPolicy {
-    pub fn new() -> Self {
-        Self::with_config(ManualConfig::default())
-    }
-
-    pub fn with_config(config: ManualConfig) -> Self {
-        let backend = Backend::from_env(&config);
-        Self {
-            backend,
-            assignment_mode: config.assignment_mode,
-        }
-    }
-
-    async fn select_worker_impl(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        info: &SelectWorkerInfo<'_>,
-    ) -> (Option<usize>, ExecutionBranch) {
-        let healthy_indices = get_healthy_worker_indices(workers);
-        if healthy_indices.is_empty() {
-            return (None, ExecutionBranch::NoHealthyWorkers);
-        }
-
-        if let Some(routing_id) = extract_routing_key(info.headers) {
-            let (idx, branch) = self.backend.select_by_routing_id(
-                routing_id,
-                workers,
-                &healthy_indices,
-                self.assignment_mode,
-            ).await;
-            return (Some(idx), branch);
-        }
-
-        (
-            Some(random_select(&healthy_indices)),
-            ExecutionBranch::NoRoutingId,
-        )
-    }
-}
-
-#[async_trait]
-impl LoadBalancingPolicy for ManualPolicy {
-    async fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo<'_>) -> Option<usize> {
-        let (result, branch) = self.select_worker_impl(workers, info).await;
-        Metrics::record_worker_manual_policy_branch(branch.as_str());
-        Metrics::set_manual_policy_cache_entries(self.backend.len());
-        result
-    }
-
-    fn name(&self) -> &'static str {
-        "manual"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-fn find_healthy_worker(
-    urls: &[String],
-    workers: &[Arc<dyn Worker>],
-    healthy_indices: &[usize],
-) -> Option<usize> {
-    for url in urls {
-        if let Some(idx) = find_worker_index_by_url(workers, url) {
-            if healthy_indices.contains(&idx) {
-                return Some(idx);
-            }
-        }
-    }
-    None
-}
-
-fn find_worker_index_by_url(workers: &[Arc<dyn Worker>], url: &str) -> Option<usize> {
-    workers.iter().position(|w| w.url() == url)
-}
-
-fn random_select(healthy_indices: &[usize]) -> usize {
-    let mut rng = rand::rng();
-    let random_idx = rng.random_range(0..healthy_indices.len());
-    healthy_indices[random_idx]
-}
-
-fn select_new_worker(
-    workers: &[Arc<dyn Worker>],
-    healthy_indices: &[usize],
-    assignment_mode: ManualAssignmentMode,
-) -> usize {
-    match assignment_mode {
-        ManualAssignmentMode::Random => random_select(healthy_indices),
-        ManualAssignmentMode::MinLoad => min_load_select(workers, healthy_indices),
-        ManualAssignmentMode::MinGroup => min_group_select(workers, healthy_indices),
-    }
-}
-
-fn select_min_by<K, V, F>(indices: &[K], get_value: F) -> K
-where
-    K: Copy,
-    V: Ord,
-    F: Fn(K) -> V,
-{
-    let mut min_val: Option<V> = None;
-    let mut candidates = Vec::new();
-
-    for &idx in indices {
-        let val = get_value(idx);
-        match min_val.as_ref().map(|m| val.cmp(m)) {
-            None | Some(std::cmp::Ordering::Less) => {
-                min_val = Some(val);
-                candidates.clear();
-                candidates.push(idx);
-            }
-            Some(std::cmp::Ordering::Equal) => {
-                candidates.push(idx);
-            }
-            Some(std::cmp::Ordering::Greater) => {}
-        }
-    }
-
-    if candidates.len() == 1 {
-        candidates[0]
-    } else {
-        let mut rng = rand::rng();
-        candidates[rng.random_range(0..candidates.len())]
-    }
-}
-
-fn min_load_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
-    select_min_by(healthy_indices, |idx| workers[idx].load())
-}
-
-fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
-    select_min_by(healthy_indices, |idx| {
-        workers[idx].worker_routing_key_load().value()
-    })
-}
 
 #[cfg(test)]
 mod tests {
