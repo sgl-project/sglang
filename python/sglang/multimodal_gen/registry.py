@@ -147,6 +147,7 @@ def _discover_and_register_pipelines():
         f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
     )
 
+
 def get_pipeline_config_classes(
     pipeline_class_name: str,
 ) -> Tuple[Type[PipelineConfig], Type[Any]] | None:

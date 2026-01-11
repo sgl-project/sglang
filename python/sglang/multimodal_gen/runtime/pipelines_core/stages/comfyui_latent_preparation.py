@@ -38,9 +38,15 @@ class ComfyUILatentPreparationStage(LatentPreparationStage):
                 return value.detach().clone().to(target_device)
             return value
         elif isinstance(value, list):
-            return [ComfyUILatentPreparationStage._fix_tensor_device(v, target_device) for v in value]
+            return [
+                ComfyUILatentPreparationStage._fix_tensor_device(v, target_device)
+                for v in value
+            ]
         elif isinstance(value, tuple):
-            return tuple(ComfyUILatentPreparationStage._fix_tensor_device(v, target_device) for v in value)
+            return tuple(
+                ComfyUILatentPreparationStage._fix_tensor_device(v, target_device)
+                for v in value
+            )
         return value
 
     @staticmethod
