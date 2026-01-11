@@ -957,7 +957,6 @@ def _launch_subprocesses(
         scheduler_infos = _wait_for_scheduler_ready(
             scheduler_pipe_readers, scheduler_procs
         )
-        # TODO(xinji1): refine the following codes with a bonus function
         # Start ZMQ server on non-head nodes to serve transfer engine info
         if (
             server_args.nnodes > 1

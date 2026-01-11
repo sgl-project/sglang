@@ -47,3 +47,23 @@ python -m sglang.launch_server [args] \
   --remote-instance-weight-loader-seed-instance-service-port [seed_instance_service_port] \
   --remote-instance-weight-loader-backend transfer_engine
 ```
+
+### Multi-node scenarios
+
+when users are trying to launch servers with multi-node settings,  `weight` R-fork will use zmq to build the communication between different nodes,
+so that the api call `get_remote_instance_transfer_engine_info` could also work for the gpus of nodes with the `node_rank > 1`.
+
+Users need to add `--node-hosts` and `--inter-node-transfer-engine-info-port`.
+
+`--node-hosts`: a dict of {`node_rank`: `address_of_node`} ;
+`--inter-node-transfer-engine-info-port`: port for zmq communication .
+
+For example:
+
+```
+# Node 0:
+python3 -m sglang.launch_server --model-path /data/models/Moonlight-16B-A3B-Instruct --tp 16 --trust-remote-code  --mem-frac 0.85 --host 0.0.0.0 --port 30000 --dist-init-addr node-0-addr:5000 --nnodes 2 --node-rank 0 --remote-instance-weight-loader-start-seed-via-transfer-engine --node-hosts '{"0":"node-0-addr","1":"node-1-addr"}' --inter-node-transfer-engine-info-port 15036
+
+# Node 1:
+python3 -m sglang.launch_server --model-path /data/models/Moonlight-16B-A3B-Instruct --tp 16 --trust-remote-code  --mem-frac 0.85 --host 0.0.0.0 --port 30000 --dist-init-addr node-0-addr:5000 --nnodes 2 --node-rank 1 --remote-instance-weight-loader-start-seed-via-transfer-engine --node-hosts '{"0":"node-0-addr","1":"node-1-addr"}' --inter-node-transfer-engine-info-port 15036
+```
