@@ -287,6 +287,74 @@ impl LocalBackend {
     }
 }
 
+// ------------------------------------ redis utils ---------------------------------------
+
+/// Utility for Redis commands (GETEX, CAS via Lua)
+struct RedisCommandUtil;
+
+impl RedisCommandUtil {
+    /// Lua script for CAS (Compare-And-Swap)
+    /// KEYS[1] = key
+    /// ARGV[1] = expected_old (empty string = nil)
+    /// ARGV[2] = new_value
+    /// ARGV[3] = ttl_secs
+    /// Returns: [1, ""] on success, [0, current_value] on CAS failure
+    const CAS_LUA: &'static str = r#"
+local old = redis.call('GET', KEYS[1])
+local expected = ARGV[1]
+if expected == '' then expected = false end
+
+if old ~= expected then
+    return {0, old or ''}
+end
+
+redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+return {1, ''}
+"#;
+
+    /// GET + refresh TTL in one call (Redis 6.2+)
+    async fn getex(conn: &mut deadpool_redis::Connection, key: &str, ttl_secs: u64) -> Option<String> {
+        redis::cmd("GETEX")
+            .arg(key)
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(conn)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Compare-And-Swap using Lua script
+    /// Returns (success, current_value_if_failed)
+    async fn cas(
+        conn: &mut deadpool_redis::Connection,
+        key: &str,
+        expected: Option<&str>,
+        new_value: &str,
+        ttl_secs: u64,
+    ) -> (bool, Option<String>) {
+        let expected_arg = expected.unwrap_or("");
+        let result: Result<(i32, String), _> = redis::cmd("EVAL")
+            .arg(Self::CAS_LUA)
+            .arg(1) // number of keys
+            .arg(key)
+            .arg(expected_arg)
+            .arg(new_value)
+            .arg(ttl_secs)
+            .query_async(conn)
+            .await;
+
+        match result {
+            Ok((1, _)) => (true, None),
+            Ok((0, current)) => (false, if current.is_empty() { None } else { Some(current) }),
+            Err(e) => {
+                warn!("Redis CAS Lua error: {}", e);
+                (false, None)
+            }
+        }
+    }
+}
+
 // ------------------------------------ redis backend ---------------------------------------
 
 #[derive(Debug)]
@@ -353,12 +421,12 @@ impl RedisBackend {
         const MAX_CAS_RETRIES: u32 = 5;
 
         for _ in 0..MAX_CAS_RETRIES {
-            let old_data: Option<String> = redis::cmd("GET").arg(&key).query_async(&mut conn).await.ok().flatten();
+            // GETEX: GET + refresh TTL in one call
+            let old_data = RedisCommandUtil::getex(&mut conn, &key, self.ttl_secs).await;
 
             if let Some(ref data) = old_data {
                 let candidates = Self::parse_candidates(data);
                 if let Some(idx) = find_healthy_worker(&candidates, workers, healthy_indices) {
-                    let _ = redis::cmd("EXPIRE").arg(&key).arg(self.ttl_secs).query_async::<()>(&mut conn).await;
                     return (idx, ExecutionBranch::OccupiedHit);
                 }
             }
@@ -377,48 +445,24 @@ impl RedisBackend {
                 (new_url.to_string(), ExecutionBranch::Vacant)
             };
 
-            // CAS using WATCH + MULTI/EXEC
-            let cas_result = self.cas_set(&mut conn, &key, old_data.as_deref(), &new_data).await;
+            // CAS using Lua script
+            let (success, _current) = RedisCommandUtil::cas(
+                &mut conn,
+                &key,
+                old_data.as_deref(),
+                &new_data,
+                self.ttl_secs,
+            ).await;
 
-            if cas_result {
+            if success {
                 return (selected_idx, branch);
             }
-            // CAS failed, retry
+            // CAS failed, retry with fresh data
         }
 
         // Max retries exceeded, fallback
         warn!("Redis CAS max retries exceeded for key {}", key);
         (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::Vacant)
-    }
-
-    async fn cas_set(
-        &self,
-        conn: &mut deadpool_redis::Connection,
-        key: &str,
-        expected: Option<&str>,
-        new_value: &str,
-    ) -> bool {
-        // WATCH key
-        if redis::cmd("WATCH").arg(key).query_async::<()>(conn).await.is_err() {
-            return false;
-        }
-
-        // Verify current value matches expected
-        let current: Option<String> = redis::cmd("GET").arg(key).query_async(conn).await.ok().flatten();
-        if current.as_deref() != expected {
-            let _ = redis::cmd("UNWATCH").query_async::<()>(conn).await;
-            return false;
-        }
-
-        // MULTI/EXEC
-        let result: Option<()> = redis::pipe()
-            .atomic()
-            .cmd("SET").arg(key).arg(new_value).arg("EX").arg(self.ttl_secs).ignore()
-            .query_async(conn)
-            .await
-            .ok();
-
-        result.is_some()
     }
 }
 
