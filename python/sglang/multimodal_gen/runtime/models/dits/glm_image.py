@@ -26,6 +26,7 @@ from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 from sglang.multimodal_gen.runtime.layers.attention import UlyssesAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -338,20 +339,9 @@ class GlmImageAttention(torch.nn.Module):
 
         # 3. Rotational positional embeddings applied to image latent stream only
         if image_rotary_emb is not None:
-            from diffusers.models.embeddings import apply_rotary_emb
-
-            img_query = apply_rotary_emb(
-                img_query,
-                image_rotary_emb,
-                sequence_dim=1,
-                use_real_unbind_dim=-2,
-            )
-            img_key = apply_rotary_emb(
-                img_key,
-                image_rotary_emb,
-                sequence_dim=1,
-                use_real_unbind_dim=-2,
-            )
+            cos, sin = image_rotary_emb
+            img_query = _apply_rotary_emb(img_query, cos, sin, is_neox_style=False)
+            img_key = _apply_rotary_emb(img_key, cos, sin, is_neox_style=False)
 
         # Handle KV caching - when cache is used, fall back to SDPA
         use_kv_cache = kv_cache is not None and kv_cache.mode in ["write", "read"]
@@ -561,8 +551,7 @@ class GlmImageRotaryPosEmbed(nn.Module):
 
         # Concatenate along last dimension to get [height, width, dim//2]
         freqs = torch.cat([freqs_h, freqs_w], dim=-1)
-        freqs = torch.cat([freqs, freqs], dim=-1)  # [height, width, dim]
-        freqs = freqs.reshape(height * width, -1)
+        freqs = freqs.reshape(height * width, -1)  # [height * width, dim//2]
         return (freqs.cos(), freqs.sin())
 
 
