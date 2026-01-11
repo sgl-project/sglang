@@ -1,0 +1,495 @@
+//! Low-level ManualPolicy tests that run on both LocalBackend and RedisBackend.
+//!
+//! These tests verify the core policy behavior (select_worker_impl) across both backends.
+
+use std::{collections::HashMap, sync::Arc};
+
+use smg::{
+    config::ManualAssignmentMode,
+    core::{BasicWorkerBuilder, Worker, WorkerType},
+    policies::{LoadBalancingPolicy, ManualConfig, ManualPolicy, SelectWorkerInfo},
+};
+
+use crate::common::redis_test_server::get_shared_server;
+
+fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
+    urls.iter()
+        .map(|url| {
+            Arc::new(
+                BasicWorkerBuilder::new(*url)
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ) as Arc<dyn Worker>
+        })
+        .collect()
+}
+
+fn headers_with_routing_key(key: &str) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-smg-routing-key", key.parse().unwrap());
+    headers
+}
+
+fn create_policy(redis_url: Option<String>, redis_key_prefix: Option<String>) -> ManualPolicy {
+    ManualPolicy::with_config(ManualConfig {
+        redis_url,
+        redis_key_prefix,
+        ..Default::default()
+    })
+}
+
+fn get_redis_config(test_name: &str) -> (Option<String>, Option<String>) {
+    let server = get_shared_server();
+    (
+        Some(server.url()),
+        Some(format!("test:{}:", test_name)),
+    )
+}
+
+macro_rules! all_backend_test {
+    ($name:ident) => {
+        paste::paste! {
+            #[tokio::test]
+            async fn [<$name _local_backend>]() {
+                [<$name _impl>](None, None).await;
+            }
+
+            #[tokio::test]
+            async fn [<$name _redis_backend>]() {
+                let (redis_url, redis_key_prefix) = get_redis_config(stringify!($name));
+                [<$name _impl>](redis_url, redis_key_prefix).await;
+            }
+        }
+    };
+}
+
+// ============================================================================
+// Consistent Routing Tests
+// ============================================================================
+
+all_backend_test!(test_consistent_routing);
+async fn test_consistent_routing_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
+    let policy = create_policy(redis_url, redis_key_prefix);
+    let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    let headers = headers_with_routing_key("user-123");
+    let info = SelectWorkerInfo {
+        headers: Some(&headers),
+        ..Default::default()
+    };
+
+    let first_result = policy.select_worker(&workers, &info).await;
+    let first_idx = first_result.unwrap();
+
+    for _ in 0..10 {
+        let result = policy.select_worker(&workers, &info).await;
+        assert_eq!(
+            result,
+            Some(first_idx),
+            "Same routing_id should route to same worker"
+        );
+    }
+}
+
+all_backend_test!(test_different_routing_ids);
+async fn test_different_routing_ids_impl(
+    redis_url: Option<String>,
+    redis_key_prefix: Option<String>,
+) {
+    let policy = create_policy(redis_url, redis_key_prefix);
+    let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    let mut distribution = HashMap::new();
+    for i in 0..100 {
+        let headers = headers_with_routing_key(&format!("user-{}", i));
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let result = policy.select_worker(&workers, &info).await;
+        *distribution.entry(result.unwrap()).or_insert(0) += 1;
+    }
+
+    assert!(
+        distribution.len() > 1,
+        "Should distribute across multiple workers"
+    );
+}
+
+// ============================================================================
+// Fallback and Edge Case Tests
+// ============================================================================
+
+all_backend_test!(test_fallback_random);
+async fn test_fallback_random_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
+    let policy = create_policy(redis_url, redis_key_prefix);
+    let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    let mut counts = HashMap::new();
+    for _ in 0..100 {
+        let info = SelectWorkerInfo::default();
+        let result = policy.select_worker(&workers, &info).await;
+        if let Some(idx) = result {
+            *counts.entry(idx).or_insert(0) += 1;
+        }
+    }
+
+    assert_eq!(counts.len(), 2, "Random fallback should use all workers");
+}
+
+all_backend_test!(test_empty_routing_id);
+async fn test_empty_routing_id_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
+    let policy = create_policy(redis_url, redis_key_prefix);
+    let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    let mut counts = HashMap::new();
+    for _ in 0..100 {
+        let headers = headers_with_routing_key("");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let result = policy.select_worker(&workers, &info).await;
+        if let Some(idx) = result {
+            *counts.entry(idx).or_insert(0) += 1;
+        }
+    }
+
+    assert_eq!(
+        counts.len(),
+        2,
+        "Empty routing_id should use random fallback"
+    );
+}
+
+all_backend_test!(test_empty_workers);
+async fn test_empty_workers_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
+    let policy = create_policy(redis_url, redis_key_prefix);
+    let workers: Vec<Arc<dyn Worker>> = vec![];
+    let headers = headers_with_routing_key("test");
+    let info = SelectWorkerInfo {
+        headers: Some(&headers),
+        ..Default::default()
+    };
+    let result = policy.select_worker(&workers, &info).await;
+    assert_eq!(result, None);
+}
+
+all_backend_test!(test_single_worker);
+async fn test_single_worker_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
+    let policy = create_policy(redis_url, redis_key_prefix);
+    let workers = create_workers(&["http://w1:8000"]);
+
+    let headers = headers_with_routing_key("single-test");
+    let info = SelectWorkerInfo {
+        headers: Some(&headers),
+        ..Default::default()
+    };
+
+    let result = policy.select_worker(&workers, &info).await;
+    assert_eq!(result, Some(0));
+
+    for _ in 0..10 {
+        let result = policy.select_worker(&workers, &info).await;
+        assert_eq!(result, Some(0));
+    }
+}
+
+// ============================================================================
+// Unhealthy Worker Tests
+// ============================================================================
+
+all_backend_test!(test_with_unhealthy_workers);
+async fn test_with_unhealthy_workers_impl(
+    redis_url: Option<String>,
+    redis_key_prefix: Option<String>,
+) {
+    let policy = create_policy(redis_url, redis_key_prefix);
+    let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    workers[0].set_healthy(false);
+
+    let headers = headers_with_routing_key("test-routing-id");
+    let info = SelectWorkerInfo {
+        headers: Some(&headers),
+        ..Default::default()
+    };
+
+    let result = policy.select_worker(&workers, &info).await;
+    assert_eq!(result, Some(1), "Should only select healthy worker");
+
+    for _ in 0..10 {
+        let result = policy.select_worker(&workers, &info).await;
+        assert_eq!(result, Some(1), "Should only select healthy worker");
+    }
+}
+
+all_backend_test!(test_no_healthy_workers);
+async fn test_no_healthy_workers_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
+    let policy = create_policy(redis_url, redis_key_prefix);
+    let workers = create_workers(&["http://w1:8000"]);
+
+    workers[0].set_healthy(false);
+    let headers = headers_with_routing_key("test");
+    let info = SelectWorkerInfo {
+        headers: Some(&headers),
+        ..Default::default()
+    };
+    let result = policy.select_worker(&workers, &info).await;
+    assert_eq!(result, None);
+}
+
+all_backend_test!(test_remaps_when_worker_becomes_unhealthy);
+async fn test_remaps_when_worker_becomes_unhealthy_impl(
+    redis_url: Option<String>,
+    redis_key_prefix: Option<String>,
+) {
+    let policy = create_policy(redis_url, redis_key_prefix);
+    let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    let headers = headers_with_routing_key("sticky-user");
+    let info = SelectWorkerInfo {
+        headers: Some(&headers),
+        ..Default::default()
+    };
+
+    let first_result = policy.select_worker(&workers, &info).await;
+    let first_idx = first_result.unwrap();
+
+    workers[first_idx].set_healthy(false);
+
+    let new_result = policy.select_worker(&workers, &info).await;
+    let new_idx = new_result.unwrap();
+    assert_ne!(new_idx, first_idx, "Should remap to healthy worker");
+
+    for _ in 0..10 {
+        let result = policy.select_worker(&workers, &info).await;
+        assert_eq!(
+            result,
+            Some(new_idx),
+            "Should consistently route to new worker"
+        );
+    }
+}
+
+// ============================================================================
+// Worker Recovery and Candidate Eviction Tests
+// ============================================================================
+
+all_backend_test!(test_worker_recovery);
+async fn test_worker_recovery_impl(redis_url: Option<String>, redis_key_prefix: Option<String>) {
+    let policy = create_policy(redis_url, redis_key_prefix);
+    let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    let headers = headers_with_routing_key("recovery-test");
+    let info = SelectWorkerInfo {
+        headers: Some(&headers),
+        ..Default::default()
+    };
+
+    let first_result = policy.select_worker(&workers, &info).await;
+    let first_idx = first_result.unwrap();
+
+    workers[first_idx].set_healthy(false);
+
+    let second_result = policy.select_worker(&workers, &info).await;
+    let second_idx = second_result.unwrap();
+    assert_ne!(second_idx, first_idx);
+
+    workers[first_idx].set_healthy(true);
+
+    let after_recovery = policy.select_worker(&workers, &info).await;
+    assert_eq!(
+        after_recovery,
+        Some(first_idx),
+        "Should return to original worker after recovery since it's first in candidate list"
+    );
+}
+
+all_backend_test!(test_max_candidate_workers_eviction);
+async fn test_max_candidate_workers_eviction_impl(
+    redis_url: Option<String>,
+    redis_key_prefix: Option<String>,
+) {
+    let policy = create_policy(redis_url, redis_key_prefix);
+    let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    let headers = headers_with_routing_key("eviction-test");
+    let info = SelectWorkerInfo {
+        headers: Some(&headers),
+        ..Default::default()
+    };
+
+    let first_result = policy.select_worker(&workers, &info).await;
+    let first_idx = first_result.unwrap();
+
+    workers[first_idx].set_healthy(false);
+
+    let second_result = policy.select_worker(&workers, &info).await;
+    let second_idx = second_result.unwrap();
+    assert_ne!(second_idx, first_idx);
+
+    workers[second_idx].set_healthy(false);
+
+    let remaining_idx = (0..3).find(|&i| i != first_idx && i != second_idx).unwrap();
+    let third_result = policy.select_worker(&workers, &info).await;
+    assert_eq!(
+        third_result,
+        Some(remaining_idx),
+        "Should select the only remaining healthy worker"
+    );
+
+    workers[first_idx].set_healthy(true);
+
+    let idx_after_restore = policy.select_worker(&workers, &info).await;
+    assert_ne!(
+        idx_after_restore,
+        Some(first_idx),
+        "First worker should be evicted from candidates due to MAX_CANDIDATE_WORKERS=2"
+    );
+}
+
+// ============================================================================
+// Assignment Mode Tests
+// ============================================================================
+
+all_backend_test!(test_min_group_distributes_evenly);
+async fn test_min_group_distributes_evenly_impl(
+    redis_url: Option<String>,
+    redis_key_prefix: Option<String>,
+) {
+    let policy = ManualPolicy::with_config(ManualConfig {
+        assignment_mode: ManualAssignmentMode::MinGroup,
+        redis_url,
+        redis_key_prefix,
+        ..Default::default()
+    });
+    let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    for i in 0..9 {
+        let routing_key = format!("key-{}", i);
+        let headers = headers_with_routing_key(&routing_key);
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let result = policy.select_worker(&workers, &info).await;
+        assert!(result.is_some());
+
+        let selected_idx = result.unwrap();
+        workers[selected_idx]
+            .worker_routing_key_load()
+            .increment(&routing_key);
+    }
+
+    for worker in &workers {
+        let load = worker.worker_routing_key_load().value();
+        assert_eq!(load, 3, "Each worker should have exactly 3 routing keys");
+    }
+}
+
+all_backend_test!(test_min_group_prefers_fewer_keys);
+async fn test_min_group_prefers_fewer_keys_impl(
+    redis_url: Option<String>,
+    redis_key_prefix: Option<String>,
+) {
+    let policy = ManualPolicy::with_config(ManualConfig {
+        assignment_mode: ManualAssignmentMode::MinGroup,
+        redis_url,
+        redis_key_prefix,
+        ..Default::default()
+    });
+    let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    workers[0].worker_routing_key_load().increment("existing-1");
+    workers[0].worker_routing_key_load().increment("existing-2");
+    workers[1].worker_routing_key_load().increment("existing-3");
+
+    assert_eq!(workers[0].worker_routing_key_load().value(), 2);
+    assert_eq!(workers[1].worker_routing_key_load().value(), 1);
+    assert_eq!(workers[2].worker_routing_key_load().value(), 0);
+
+    let headers = headers_with_routing_key("new-key");
+    let info = SelectWorkerInfo {
+        headers: Some(&headers),
+        ..Default::default()
+    };
+    let result = policy.select_worker(&workers, &info).await;
+    let selected_idx = result.unwrap();
+
+    assert_eq!(selected_idx, 2, "Should select worker with 0 routing keys");
+}
+
+all_backend_test!(test_min_load_prefers_fewer_requests);
+async fn test_min_load_prefers_fewer_requests_impl(
+    redis_url: Option<String>,
+    redis_key_prefix: Option<String>,
+) {
+    let policy = ManualPolicy::with_config(ManualConfig {
+        assignment_mode: ManualAssignmentMode::MinLoad,
+        redis_url,
+        redis_key_prefix,
+        ..Default::default()
+    });
+    let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    workers[0].increment_load();
+    workers[0].increment_load();
+    workers[1].increment_load();
+
+    assert_eq!(workers[0].load(), 2);
+    assert_eq!(workers[1].load(), 1);
+    assert_eq!(workers[2].load(), 0);
+
+    let headers = headers_with_routing_key("new-key");
+    let info = SelectWorkerInfo {
+        headers: Some(&headers),
+        ..Default::default()
+    };
+    let result = policy.select_worker(&workers, &info).await;
+    let selected_idx = result.unwrap();
+
+    assert_eq!(selected_idx, 2, "Should select worker with 0 load");
+}
+
+all_backend_test!(test_min_group_sticky_after_assignment);
+async fn test_min_group_sticky_after_assignment_impl(
+    redis_url: Option<String>,
+    redis_key_prefix: Option<String>,
+) {
+    let policy = ManualPolicy::with_config(ManualConfig {
+        assignment_mode: ManualAssignmentMode::MinGroup,
+        redis_url,
+        redis_key_prefix,
+        ..Default::default()
+    });
+    let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    workers[0].worker_routing_key_load().increment("key-0");
+    workers[1].worker_routing_key_load().increment("key-1");
+    workers[1].worker_routing_key_load().increment("key-2");
+
+    let headers = headers_with_routing_key("new-sticky-key");
+    let info = SelectWorkerInfo {
+        headers: Some(&headers),
+        ..Default::default()
+    };
+
+    let first_result = policy.select_worker(&workers, &info).await;
+    let first_idx = first_result.unwrap();
+    assert_eq!(first_idx, 0, "Should initially select worker 0 (fewer keys)");
+
+    workers[0].worker_routing_key_load().increment("key-3");
+    workers[0].worker_routing_key_load().increment("key-4");
+    workers[0].worker_routing_key_load().increment("key-5");
+
+    for _ in 0..5 {
+        let result = policy.select_worker(&workers, &info).await;
+        assert_eq!(
+            result,
+            Some(0),
+            "Should stay sticky even when worker has more keys"
+        );
+    }
+}
