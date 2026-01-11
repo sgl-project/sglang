@@ -219,7 +219,7 @@ mod tests {
 
         // With single worker, should always select it
         assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            policy.select_worker(&workers, &SelectWorkerInfo::default()).await,
             Some(0)
         );
     }
@@ -259,6 +259,7 @@ mod tests {
         // 5. Run selection
         let selected_idx = policy
             .select_worker(&workers, &SelectWorkerInfo::default())
+            .await
             .expect("Should select a worker");
 
         // 6. Verify the Fix
@@ -316,6 +317,7 @@ mod tests {
 
         let idx_1 = policy
             .select_worker(&workers_1, &SelectWorkerInfo::default())
+            .await
             .unwrap();
         assert_eq!(
             idx_1, 0,
@@ -337,6 +339,7 @@ mod tests {
 
         let idx_2 = policy
             .select_worker(&workers_2, &SelectWorkerInfo::default())
+            .await
             .unwrap();
         assert_eq!(idx_2, 1, "Partial Fail 1 Failed: Should fallback to requests and select Worker B (fewer requests)");
 
