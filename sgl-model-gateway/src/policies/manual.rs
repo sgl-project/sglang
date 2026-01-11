@@ -374,7 +374,7 @@ impl RedisBackend {
         healthy_indices: &[usize],
         assignment_mode: ManualAssignmentMode,
     ) -> (usize, ExecutionBranch) {
-        use crate::core::retry::{BackoffCalculator, RetryError};
+        use crate::core::retry::RetryError;
 
         let key = self.key(routing_id);
         let config = Self::retry_config();
