@@ -566,19 +566,30 @@ class Qwen3LLMModel(Qwen3Model):
         self.deepstack_embed_to_decoder_layer = range(
             len(config.vision_config.deepstack_visual_indexes)
         )
+        self._deepstack_zero_ws = {}
 
     def get_deepstack_embeds(
-        self, layer_idx: int, input_deepstack_embeds: Optional[torch.Tensor]
+        self,
+        layer_idx: int,
+        input_deepstack_embeds: Optional[torch.Tensor],
+        seq_len: int,
     ) -> Optional[torch.Tensor]:
-        """Get deepstack embeddings for a given layer index, or None if not applicable."""
-        if (
-            input_deepstack_embeds is None
-            or layer_idx not in self.deepstack_embed_to_decoder_layer
-        ):
+        if layer_idx not in self.deepstack_embed_to_decoder_layer:
             return None
+        if input_deepstack_embeds is None:
+            device = next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
+            if seq_len not in self._deepstack_zero_ws:
+                total = self.hidden_size * len(self.deepstack_embed_to_decoder_layer)
+                self._deepstack_zero_ws[seq_len] = torch.zeros(
+                    seq_len, total, dtype=dtype, device=device
+                ).contiguous()
+            sep = self.hidden_size * layer_idx
+            return self._deepstack_zero_ws[seq_len][:, sep : sep + self.hidden_size]
         sep = self.hidden_size * layer_idx
         return input_deepstack_embeds[:, sep : sep + self.hidden_size]
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -616,7 +627,7 @@ class Qwen3LLMModel(Qwen3Model):
             # The order matters because addition with different tensors is not associative in practice.
             # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
             deepstack_embeds = self.get_deepstack_embeds(
-                layer_idx - 1, input_deepstack_embeds
+                layer_idx - 1, input_deepstack_embeds, hidden_states.shape[0]
             )
             hidden_states, residual = layer(
                 positions,
@@ -628,7 +639,7 @@ class Qwen3LLMModel(Qwen3Model):
 
         # Handle deepstack for the last processed layer if it exists.
         last_deepstack = self.get_deepstack_embeds(
-            self.end_layer - 1, input_deepstack_embeds
+            self.end_layer - 1, input_deepstack_embeds, hidden_states.shape[0]
         )
 
         if not self.pp_group.is_last_rank:
@@ -884,6 +895,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        **kwargs,
     ):
         """Run forward pass for Qwen3-VL.
 
@@ -918,6 +930,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             positions=positions,
             use_deepstack=self.use_deepstack,
             pp_proxy_tensors=pp_proxy_tensors,
+            **kwargs,
         )
 
         if self.pp_group.is_last_rank:

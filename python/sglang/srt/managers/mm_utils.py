@@ -916,6 +916,7 @@ def embed_mm_inputs(
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    prealloc_deepstack: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -1016,12 +1017,16 @@ def embed_mm_inputs(
         deepstack_embedding_shape = input_embeds.shape[:-1] + (
             input_embeds.shape[-1] * num_deepstack_embeddings,
         )
-        # a zero-filled embedding, with the same length of input_embeds, but different hidden_size
-        input_deepstack_embeds = torch.zeros(
-            deepstack_embedding_shape,
-            device=input_embeds.device,
-            dtype=input_embeds.dtype,
-        )
+        if prealloc_deepstack is not None:
+            assert prealloc_deepstack.shape == deepstack_embedding_shape
+            input_deepstack_embeds = prealloc_deepstack
+            input_deepstack_embeds.zero_()
+        else:
+            input_deepstack_embeds = torch.zeros(
+                deepstack_embedding_shape,
+                device=input_embeds.device,
+                dtype=input_embeds.dtype,
+            )
 
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
@@ -1088,6 +1093,7 @@ def general_mm_embed_routine(
                 for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.mm_inputs[i] is not None
             ]
+            prealloc_deepstack = kwargs.get("input_deepstack_embeds", None)
             input_embeds, other_info = embed_mm_inputs(
                 mm_inputs_list=mm_inputs_list,
                 extend_prefix_lens=extend_prefix_lens,
@@ -1098,6 +1104,7 @@ def general_mm_embed_routine(
                 data_embedding_func_mapping=data_embedding_funcs,
                 placeholder_tokens=placeholder_tokens,
                 use_deepstack=use_deepstack,
+                prealloc_deepstack=prealloc_deepstack,
             )
             # add for qwen3_vl deepstack
             if use_deepstack:
