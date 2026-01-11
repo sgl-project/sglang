@@ -358,6 +358,7 @@ mod tests {
 
         let idx_3 = policy
             .select_worker(&workers_3, &SelectWorkerInfo::default())
+            .await
             .unwrap();
         assert_eq!(idx_3, 0, "Partial Fail 2 Failed: Should fallback to requests and select Worker A (fewer requests)");
 
@@ -374,6 +375,7 @@ mod tests {
 
         let idx_4 = policy
             .select_worker(&workers_4, &SelectWorkerInfo::default())
+            .await
             .unwrap();
         assert_eq!(
             idx_4, 1,
