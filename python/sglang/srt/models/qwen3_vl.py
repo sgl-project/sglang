@@ -497,8 +497,22 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         # rotary embedding -> (cos, sin)
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
-        # compute cu_seqlens
-        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
+        # compute cu_seqlens (this utility is expected to return CPU data; no GPU sync)
+        cu_seqlens_cpu = compute_cu_seqlens_from_grid_numpy(grid_thw)
+
+        if isinstance(cu_seqlens_cpu, torch.Tensor):
+            assert (
+                cu_seqlens_cpu.device.type == "cpu"
+            ), "compute_cu_seqlens_from_grid_numpy must return CPU tensor to avoid GPU sync."
+            cu_seqlens_list = cu_seqlens_cpu.to(torch.int32).contiguous().tolist()
+        else:
+            # numpy array / python list
+            cu_seqlens_list = [int(v) for v in cu_seqlens_cpu]
+
+        graph_key_hint = ViTCudaGraphRunner._hash_i32_list(cu_seqlens_list)
+
+        # move cu_seqlens to device for attention
+        cu_seqlens = cu_seqlens_cpu
         if not isinstance(cu_seqlens, torch.Tensor):
             cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
         else:
@@ -514,6 +528,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             cu_seqlens=cu_seqlens,
             cu_window_seqlens=None,
             output_indices=None,
+            graph_key_hint=graph_key_hint,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

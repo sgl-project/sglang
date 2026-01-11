@@ -488,9 +488,17 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         # compute position embedding
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        # NOTE: get_window_index returns:
+        #   - window_index: torch.Tensor (CPU)
+        #   - cu_window_seqlens: python list[int] (CPU)
+        window_index, cu_window_seqlens_list = self.get_window_index(grid_thw)
+
+        # Match runtime tensor values: unique_consecutive on CPU list (no GPU sync)
+        cu_window_seqlens_list = ViTCudaGraphRunner._unique_consecutive_list(
+            cu_window_seqlens_list
+        )
         cu_window_seqlens = torch.tensor(
-            cu_window_seqlens,
+            cu_window_seqlens_list,
             device=x.device,
             dtype=torch.int32,
         )
@@ -523,6 +531,29 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             position_embeddings[1].to(x.device, x.dtype),
         )
 
+        # CPU-side graph_key_hint (0 GPU sync)
+        # grid_thw is expected to be CPU tensor in normal pipeline.
+        # If it is CUDA, tolist() would sync; we intentionally avoid that case.
+        if isinstance(grid_thw, torch.Tensor):
+            assert (
+                grid_thw.device.type == "cpu"
+            ), "grid_thw must be on CPU to avoid GPU sync for graph_key_hint."
+            grid_list = grid_thw.tolist()
+        else:
+            grid_list = grid_thw
+
+        # cu_seqlens in this model is built as: [0] + [0] + cumsum(prod(t,h,w))
+        cum = 0
+        tmp = [0]
+        for t, h, w in grid_list:
+            cum += int(t) * int(h) * int(w)
+            tmp.append(cum)
+        cu_seqlens_list = [0] + tmp  # double-leading-0 to match existing code
+
+        full_sig = ViTCudaGraphRunner._hash_i32_list(cu_seqlens_list)
+        window_sig = ViTCudaGraphRunner._hash_i32_list(cu_window_seqlens_list)
+        graph_key_hint = (full_sig, window_sig)
+
         # compute cu_seqlens - move cu_seqlens to GPU and make it int32
         cu_seqlens = torch.cat(
             [
@@ -540,6 +571,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             cu_seqlens=cu_seqlens,
             cu_window_seqlens=cu_window_seqlens,
             output_indices=reverse_indices,
+            graph_key_hint=graph_key_hint,
         )
 
 
