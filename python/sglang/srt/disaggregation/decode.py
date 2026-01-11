@@ -503,7 +503,8 @@ class DecodePreallocQueue:
                     required_tokens_for_request,
                     origin_input_len
                     + min(
-                        decode_req.req.sampling_params.max_new_tokens,
+                        decode_req.req.sampling_params.max_new_tokens
+                        - len(decode_req.req.output_ids),
                         CLIP_MAX_NEW_TOKEN,
                     )
                     - retractable_tokens,
@@ -601,7 +602,10 @@ class DecodePreallocQueue:
         need_space_for_single_req = (
             max(
                 [
-                    min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                    min(
+                        x.sampling_params.max_new_tokens - len(x.output_ids),
+                        CLIP_MAX_NEW_TOKEN,
+                    )
                     + len(x.origin_input_ids)
                     - retractable_tokens
                     for x in self.scheduler.running_batch.reqs
