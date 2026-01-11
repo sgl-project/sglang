@@ -18,16 +18,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
-from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
 
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 
-# from diffusers.models.normalization import LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.attention import UlyssesAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import (
-    LayerNorm,
-    ScaleResidualLayerNormScaleShift,
-)
+from sglang.multimodal_gen.runtime.layers.layernorm import ScaleResidualLayerNormScaleShift
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
@@ -87,6 +82,70 @@ class GlmImageKVCache:
             cache.clear()
 
 
+class GlmImageTimestepEmbedding(nn.Module):
+    """
+    Replacement for diffusers TimestepEmbedding using ReplicatedLinear.
+    Structure: linear_1 -> act(silu) -> linear_2
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        time_embed_dim: int,
+        act_fn: str = "silu",
+        out_dim: int = None,
+    ):
+        super().__init__()
+        if out_dim is None:
+            out_dim = time_embed_dim
+        self.linear_1 = ReplicatedLinear(in_channels, time_embed_dim, bias=True)
+        if act_fn == "silu":
+            self.act = nn.SiLU()
+        elif act_fn == "gelu":
+            self.act = nn.GELU(approximate="tanh")
+        else:
+            self.act = nn.SiLU()
+        self.linear_2 = ReplicatedLinear(time_embed_dim, out_dim, bias=True)
+
+    def forward(self, sample: torch.Tensor) -> torch.Tensor:
+        sample, _ = self.linear_1(sample)
+        sample = self.act(sample)
+        sample, _ = self.linear_2(sample)
+        return sample
+
+
+class GlmImageTextProjection(nn.Module):
+    """
+    Replacement for diffusers PixArtAlphaTextProjection using ReplicatedLinear.
+    Structure: linear_1 -> act_1 -> linear_2
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_size: int,
+        out_features: int = None,
+        act_fn: str = "silu",
+    ):
+        super().__init__()
+        if out_features is None:
+            out_features = hidden_size
+        self.linear_1 = ReplicatedLinear(in_features, hidden_size, bias=True)
+        if act_fn == "silu":
+            self.act_1 = nn.SiLU()
+        elif act_fn == "gelu_tanh":
+            self.act_1 = nn.GELU(approximate="tanh")
+        else:
+            self.act_1 = nn.SiLU()
+        self.linear_2 = ReplicatedLinear(hidden_size, out_features, bias=True)
+
+    def forward(self, caption: torch.Tensor) -> torch.Tensor:
+        hidden_states, _ = self.linear_1(caption)
+        hidden_states = self.act_1(hidden_states)
+        hidden_states, _ = self.linear_2(hidden_states)
+        return hidden_states
+
+
 class GlmImageCombinedTimestepSizeEmbeddings(nn.Module):
     def __init__(
         self,
@@ -103,10 +162,10 @@ class GlmImageCombinedTimestepSizeEmbeddings(nn.Module):
         self.condition_proj = Timesteps(
             num_channels=condition_dim, flip_sin_to_cos=True, downscale_freq_shift=0
         )
-        self.timestep_embedder = TimestepEmbedding(
+        self.timestep_embedder = GlmImageTimestepEmbedding(
             in_channels=timesteps_dim, time_embed_dim=embedding_dim
         )
-        self.condition_embedder = PixArtAlphaTextProjection(
+        self.condition_embedder = GlmImageTextProjection(
             pooled_projection_dim, embedding_dim, act_fn="silu"
         )
 
