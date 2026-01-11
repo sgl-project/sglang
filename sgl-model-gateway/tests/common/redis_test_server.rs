@@ -82,17 +82,6 @@ impl RedisTestServer {
         &self.url
     }
 
-    fn stop_inner(&mut self) {
-        if let Some(mut process) = self.process.take() {
-            if let Err(e) = process.kill() {
-                warn!("Failed to kill redis-server process: {}", e);
-            }
-            if let Err(e) = process.wait() {
-                warn!("Failed to wait for redis-server process: {}", e);
-            }
-        }
-    }
-
     pub fn flush_all(&self) -> Result<(), String> {
         let client = redis::Client::open(self.url.as_str())
             .map_err(|e| format!("Failed to connect to Redis: {}", e))?;
@@ -108,7 +97,14 @@ impl RedisTestServer {
 
 impl Drop for RedisTestServer {
     fn drop(&mut self) {
-        self.stop_inner();
+        if let Some(mut process) = self.process.take() {
+            if let Err(e) = process.kill() {
+                warn!("Failed to kill redis-server process: {}", e);
+            }
+            if let Err(e) = process.wait() {
+                warn!("Failed to wait for redis-server process: {}", e);
+            }
+        }
     }
 }
 
