@@ -24,7 +24,10 @@ from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 
 # from diffusers.models.normalization import LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.attention import UlyssesAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNorm,
+    ScaleResidualLayerNormScaleShift,
+)
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
@@ -441,8 +444,12 @@ class GlmImageTransformerBlock(nn.Module):
         )
 
         # 2. Feedforward
-        self.norm2 = LayerNorm(dim, elementwise_affine=False, eps=1e-5)
-        self.norm2_context = LayerNorm(dim, elementwise_affine=False, eps=1e-5)
+        self.norm2 = ScaleResidualLayerNormScaleShift(
+            dim, norm_type="layer", eps=1e-5, elementwise_affine=False
+        )
+        self.norm2_context = ScaleResidualLayerNormScaleShift(
+            dim, norm_type="layer", eps=1e-5, elementwise_affine=False
+        )
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
     def forward(
@@ -486,18 +493,22 @@ class GlmImageTransformerBlock(nn.Module):
             kv_cache=kv_cache,
             **attention_kwargs,
         )
-        hidden_states = hidden_states + attn_hidden_states * gate_msa.unsqueeze(1)
-        encoder_hidden_states = (
-            encoder_hidden_states + attn_encoder_hidden_states * c_gate_msa.unsqueeze(1)
-        )
 
-        # 3. Feedforward
-        norm_hidden_states = self.norm2(hidden_states) * (
-            1 + scale_mlp.unsqueeze(1)
-        ) + shift_mlp.unsqueeze(1)
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states) * (
-            1 + c_scale_mlp.unsqueeze(1)
-        ) + c_shift_mlp.unsqueeze(1)
+        # 3. Feedforward (fused residual + norm + scale/shift)
+        norm_hidden_states, hidden_states = self.norm2(
+            hidden_states,
+            attn_hidden_states,
+            gate_msa.unsqueeze(1),
+            shift_mlp.unsqueeze(1),
+            scale_mlp.unsqueeze(1),
+        )
+        norm_encoder_hidden_states, encoder_hidden_states = self.norm2_context(
+            encoder_hidden_states,
+            attn_encoder_hidden_states,
+            c_gate_msa.unsqueeze(1),
+            c_shift_mlp.unsqueeze(1),
+            c_scale_mlp.unsqueeze(1),
+        )
 
         ff_output = self.ff(norm_hidden_states)
         ff_output_context = self.ff(norm_encoder_hidden_states)
