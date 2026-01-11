@@ -132,7 +132,9 @@ impl LoadBalancingPolicy for ManualPolicy {
     async fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo<'_>) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info).await;
         Metrics::record_worker_manual_policy_branch(branch.as_str());
-        Metrics::set_manual_policy_cache_entries(self.backend.len());
+        if let Some(len) = self.backend.len() {
+            Metrics::set_manual_policy_cache_entries(len);
+        }
         result
     }
 
@@ -155,17 +157,11 @@ enum Backend {
 
 impl Backend {
     fn from_env(config: &ManualConfig) -> Self {
-        // TODO: use flag later
         if let Ok(redis_url) = std::env::var("SMG_MANUAL_REDIS_URL") {
-            match RedisBackend::new(&redis_url, config.max_idle_secs) {
-                Ok(backend) => {
-                    info!("ManualPolicy using Redis backend: {}", redis_url);
-                    return Backend::Redis(backend);
-                }
-                Err(e) => {
-                    error!("Failed to connect to Redis ({}), falling back to local: {}", redis_url, e);
-                }
-            }
+            let backend = RedisBackend::new(&redis_url, config.max_idle_secs)
+                .expect("SMG_MANUAL_REDIS_URL is set but failed to connect to Redis");
+            info!("ManualPolicy using Redis backend: {}", redis_url);
+            return Backend::Redis(backend);
         }
         info!("ManualPolicy using local DashMap backend");
         Backend::Local(LocalBackend::new(config))
@@ -184,10 +180,10 @@ impl Backend {
         }
     }
 
-    fn len(&self) -> usize {
+    fn len(&self) -> Option<usize> {
         match self {
-            Backend::Local(b) => b.len(),
-            Backend::Redis(_) => 0,
+            Backend::Local(b) => Some(b.len()),
+            Backend::Redis(_) => None,
         }
     }
 }
