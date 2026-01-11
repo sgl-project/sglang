@@ -19,10 +19,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from diffusers.models.attention import AttentionModuleMixin, FeedForward
-from diffusers.models.embeddings import (
-    CombinedTimestepGuidanceTextProjEmbeddings,
-    CombinedTimestepTextProjEmbeddings,
-)
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import (
     AdaLayerNormContinuous,
@@ -41,6 +37,10 @@ from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     apply_flashinfer_rope_qk_inplace,
+)
+from sglang.multimodal_gen.runtime.layers.visual_embedding import (
+    CombinedTimestepGuidanceTextProjEmbeddings,
+    CombinedTimestepTextProjEmbeddings,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
