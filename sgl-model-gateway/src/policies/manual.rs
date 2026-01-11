@@ -40,7 +40,7 @@ use crate::{
 };
 
 const MAX_CANDIDATE_WORKERS: usize = 2;
-const REDIS_KEY_PREFIX_DEFAULT: &str = "smg:manual_policy:";
+const REDIS_KEY_MIDFIX_DEFAULT: &str = "smg:manual_policy:";
 
 // ------------------------------------ API layer ---------------------------------------
 
@@ -196,10 +196,7 @@ enum Backend {
 impl Backend {
     fn from_config(config: &ManualConfig) -> Self {
         if let Some(redis_url) = &config.redis_url {
-            let key_prefix = config.redis_key_prefix.as_ref().map_or_else(
-                || REDIS_KEY_PREFIX_DEFAULT.to_string(),
-                |p| format!("{}:{}", p, REDIS_KEY_PREFIX_DEFAULT),
-            );
+            let key_prefix = format!("{}:{REDIS_KEY_MIDFIX_DEFAULT}", config.redis_key_prefix.as_ref().unwrap_or_default());
             let backend = RedisBackend::new(redis_url, config.max_idle_secs, key_prefix)
                 .expect("redis_url is set but failed to connect to Redis");
             info!("ManualPolicy using Redis backend: {}", redis_url);
