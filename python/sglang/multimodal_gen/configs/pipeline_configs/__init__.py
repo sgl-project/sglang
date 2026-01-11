@@ -23,6 +23,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanT2V720PConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 
 __all__ = [
     "DiffusersGenericPipelineConfig",
@@ -38,4 +39,5 @@ __all__ = [
     "WanI2V720PConfig",
     "SelfForcingWanT2V480PConfig",
     "ZImagePipelineConfig",
+    "LTX2PipelineConfig",
 ]
