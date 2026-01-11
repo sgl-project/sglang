@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.metrics.collector import DPCooperationInfo
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
@@ -65,6 +67,15 @@ class MLPSyncBatchInfo:
             global_info_tensor.flatten(),
             local_info_tensor,
             group=group,
+        )
+        if device == "cpu":
+            tp_active_ranks = get_tp_group().active_ranks_cpu
+        else:
+            tp_active_ranks = get_tp_group().active_ranks
+        global_info_tensor.view(-1, 6)[tp_active_ranks == 0, :] = torch.tensor(
+            [0, 1, 0, 0, 1, ForwardMode.IDLE.value],
+            device=global_info_tensor.device,
+            dtype=global_info_tensor.dtype,
         )
 
         tp0_info = global_info_tensor[:, 0, :]
@@ -149,6 +160,7 @@ def prepare_mlp_sync_batch_raw(
     if len(offload_tags) == 0 and disable_overlap_schedule:
         group = tp_group.device_group
         device = tp_group.device
+        torch.distributed.barrier(group=tp_group.cpu_group)
     else:
         group = tp_group.cpu_group
         device = "cpu"
