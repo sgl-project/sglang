@@ -145,87 +145,6 @@ impl LoadBalancingPolicy for ManualPolicy {
     }
 }
 
-// ------------------------------------ util functions ---------------------------------------
-
-fn find_healthy_worker(
-    urls: &[String],
-    workers: &[Arc<dyn Worker>],
-    healthy_indices: &[usize],
-) -> Option<usize> {
-    for url in urls {
-        if let Some(idx) = find_worker_index_by_url(workers, url) {
-            if healthy_indices.contains(&idx) {
-                return Some(idx);
-            }
-        }
-    }
-    None
-}
-
-fn find_worker_index_by_url(workers: &[Arc<dyn Worker>], url: &str) -> Option<usize> {
-    workers.iter().position(|w| w.url() == url)
-}
-
-fn random_select(healthy_indices: &[usize]) -> usize {
-    let mut rng = rand::rng();
-    let random_idx = rng.random_range(0..healthy_indices.len());
-    healthy_indices[random_idx]
-}
-
-fn select_new_worker(
-    workers: &[Arc<dyn Worker>],
-    healthy_indices: &[usize],
-    assignment_mode: ManualAssignmentMode,
-) -> usize {
-    match assignment_mode {
-        ManualAssignmentMode::Random => random_select(healthy_indices),
-        ManualAssignmentMode::MinLoad => min_load_select(workers, healthy_indices),
-        ManualAssignmentMode::MinGroup => min_group_select(workers, healthy_indices),
-    }
-}
-
-fn select_min_by<K, V, F>(indices: &[K], get_value: F) -> K
-where
-    K: Copy,
-    V: Ord,
-    F: Fn(K) -> V,
-{
-    let mut min_val: Option<V> = None;
-    let mut candidates = Vec::new();
-
-    for &idx in indices {
-        let val = get_value(idx);
-        match min_val.as_ref().map(|m| val.cmp(m)) {
-            None | Some(std::cmp::Ordering::Less) => {
-                min_val = Some(val);
-                candidates.clear();
-                candidates.push(idx);
-            }
-            Some(std::cmp::Ordering::Equal) => {
-                candidates.push(idx);
-            }
-            Some(std::cmp::Ordering::Greater) => {}
-        }
-    }
-
-    if candidates.len() == 1 {
-        candidates[0]
-    } else {
-        let mut rng = rand::rng();
-        candidates[rng.random_range(0..candidates.len())]
-    }
-}
-
-fn min_load_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
-    select_min_by(healthy_indices, |idx| workers[idx].load())
-}
-
-fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
-    select_min_by(healthy_indices, |idx| {
-        workers[idx].worker_routing_key_load().value()
-    })
-}
-
 // ------------------------------------ base backend ---------------------------------------
 
 #[derive(Debug)]
@@ -470,6 +389,87 @@ impl RedisBackend {
             }
         }
     }
+}
+
+// ------------------------------------ util functions ---------------------------------------
+
+fn find_healthy_worker(
+    urls: &[String],
+    workers: &[Arc<dyn Worker>],
+    healthy_indices: &[usize],
+) -> Option<usize> {
+    for url in urls {
+        if let Some(idx) = find_worker_index_by_url(workers, url) {
+            if healthy_indices.contains(&idx) {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn find_worker_index_by_url(workers: &[Arc<dyn Worker>], url: &str) -> Option<usize> {
+    workers.iter().position(|w| w.url() == url)
+}
+
+fn random_select(healthy_indices: &[usize]) -> usize {
+    let mut rng = rand::rng();
+    let random_idx = rng.random_range(0..healthy_indices.len());
+    healthy_indices[random_idx]
+}
+
+fn select_new_worker(
+    workers: &[Arc<dyn Worker>],
+    healthy_indices: &[usize],
+    assignment_mode: ManualAssignmentMode,
+) -> usize {
+    match assignment_mode {
+        ManualAssignmentMode::Random => random_select(healthy_indices),
+        ManualAssignmentMode::MinLoad => min_load_select(workers, healthy_indices),
+        ManualAssignmentMode::MinGroup => min_group_select(workers, healthy_indices),
+    }
+}
+
+fn select_min_by<K, V, F>(indices: &[K], get_value: F) -> K
+where
+    K: Copy,
+    V: Ord,
+    F: Fn(K) -> V,
+{
+    let mut min_val: Option<V> = None;
+    let mut candidates = Vec::new();
+
+    for &idx in indices {
+        let val = get_value(idx);
+        match min_val.as_ref().map(|m| val.cmp(m)) {
+            None | Some(std::cmp::Ordering::Less) => {
+                min_val = Some(val);
+                candidates.clear();
+                candidates.push(idx);
+            }
+            Some(std::cmp::Ordering::Equal) => {
+                candidates.push(idx);
+            }
+            Some(std::cmp::Ordering::Greater) => {}
+        }
+    }
+
+    if candidates.len() == 1 {
+        candidates[0]
+    } else {
+        let mut rng = rand::rng();
+        candidates[rng.random_range(0..candidates.len())]
+    }
+}
+
+fn min_load_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
+    select_min_by(healthy_indices, |idx| workers[idx].load())
+}
+
+fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
+    select_min_by(healthy_indices, |idx| {
+        workers[idx].worker_routing_key_load().value()
+    })
 }
 
 
