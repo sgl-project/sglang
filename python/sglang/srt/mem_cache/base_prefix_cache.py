@@ -44,6 +44,8 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
+        hidden_indices  :   Indices for DFlash hidden states (same as KV cache locations
+                            with unified KV pool approach). None if not using DFlash.
     """
 
     device_indices: torch.Tensor
@@ -51,6 +53,7 @@ class MatchResult(NamedTuple):
     last_host_node: Any
     host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
+    hidden_indices: Optional[torch.Tensor] = None
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):

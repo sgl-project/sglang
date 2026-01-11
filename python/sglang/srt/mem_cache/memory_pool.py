@@ -666,6 +666,9 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        # DFlash hidden state storage (uses same indices as KV cache)
+        dflash_hidden_size: int = 0,
+        dflash_num_target_layers: int = 0,
     ):
         super().__init__(
             size,
@@ -684,6 +687,11 @@ class MHATokenToKVPool(KVCache):
             if swa_v_head_dim is not None
             else v_head_dim if v_head_dim is not None else head_dim
         )
+
+        # DFlash hidden state storage (shares same token indices as KV cache)
+        self.dflash_hidden_size = dflash_hidden_size
+        self.dflash_num_target_layers = dflash_num_target_layers
+        self.hidden_buffer: Optional[List[torch.Tensor]] = None
 
         self._create_buffers()
 
@@ -776,6 +784,18 @@ class MHATokenToKVPool(KVCache):
                     for _ in range(self.layer_num)
                 ]
 
+                # DFlash hidden state buffer (uses same token indices as KV cache)
+                # Stores hidden states from target model layers
+                if self.dflash_hidden_size > 0 and self.dflash_num_target_layers > 0:
+                    self.hidden_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.dflash_hidden_size),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.dflash_num_target_layers)
+                    ]
+
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
             dtype=torch.uint64,
@@ -798,6 +818,9 @@ class MHATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+        if self.hidden_buffer is not None:
+            del self.hidden_buffer
+            self.hidden_buffer = None
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -938,6 +961,127 @@ class MHATokenToKVPool(KVCache):
             alt_stream=self.alt_stream,
             same_kv_dim=self.same_kv_dim,
         )
+
+    # ===== DFlash Hidden State Methods =====
+    # These methods store/retrieve hidden states from target model
+    # using the SAME token indices as the KV cache, enabling unified memory management.
+
+    def enable_dflash_hidden_buffer(
+        self,
+        hidden_size: int,
+        num_target_layers: int,
+    ):
+        """
+        Enable hidden state buffer for DFlash after pool creation.
+
+        This allows the hidden buffer to be created after the draft model is loaded
+        and we know the actual hidden size and number of target layers.
+
+        Args:
+            hidden_size: Size of hidden states per target layer
+            num_target_layers: Number of target layers to store
+        """
+        if self.hidden_buffer is not None:
+            return  # Already enabled
+
+        self.dflash_hidden_size = hidden_size
+        self.dflash_num_target_layers = num_target_layers
+
+        # Create hidden buffer with same size as KV cache
+        self.hidden_buffer = [
+            torch.zeros(
+                (self.size + self.page_size, hidden_size),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            for _ in range(num_target_layers)
+        ]
+
+    def has_hidden_buffer(self) -> bool:
+        """Check if hidden state buffer is enabled."""
+        return self.hidden_buffer is not None
+
+    def set_hidden_states(
+        self,
+        loc: torch.Tensor,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+    ):
+        """
+        Store hidden states at specified cache locations.
+
+        Args:
+            loc: Token cache locations (same indices as used for KV cache)
+            layer_idx: Index into the hidden_buffer list (0 to dflash_num_target_layers-1)
+            hidden_states: Hidden states tensor [num_tokens, hidden_size]
+        """
+        if self.hidden_buffer is None:
+            return
+        if layer_idx >= len(self.hidden_buffer):
+            return
+        self.hidden_buffer[layer_idx][loc] = hidden_states
+
+    def get_hidden_states(
+        self,
+        loc: torch.Tensor,
+        layer_idx: int,
+    ) -> Optional[torch.Tensor]:
+        """
+        Retrieve hidden states from specified cache locations.
+
+        Args:
+            loc: Token cache locations (same indices as used for KV cache)
+            layer_idx: Index into the hidden_buffer list (0 to dflash_num_target_layers-1)
+
+        Returns:
+            Hidden states tensor [num_tokens, hidden_size] or None if not available
+        """
+        if self.hidden_buffer is None:
+            return None
+        if layer_idx >= len(self.hidden_buffer):
+            return None
+        return self.hidden_buffer[layer_idx][loc]
+
+    def set_all_hidden_states(
+        self,
+        loc: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ):
+        """
+        Store concatenated hidden states from all target layers.
+
+        Args:
+            loc: Token cache locations (same indices as used for KV cache)
+            hidden_states: Concatenated hidden states [num_tokens, hidden_size * num_layers]
+        """
+        if self.hidden_buffer is None:
+            return
+        num_layers = len(self.hidden_buffer)
+        hidden_size = self.dflash_hidden_size
+        for layer_idx in range(num_layers):
+            start = layer_idx * hidden_size
+            end = start + hidden_size
+            self.hidden_buffer[layer_idx][loc] = hidden_states[:, start:end]
+
+    def get_all_hidden_states(
+        self,
+        loc: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """
+        Retrieve concatenated hidden states from all target layers.
+
+        Args:
+            loc: Token cache locations (same indices as used for KV cache)
+
+        Returns:
+            Concatenated hidden states [num_tokens, hidden_size * num_layers] or None
+        """
+        if self.hidden_buffer is None:
+            return None
+        layer_hidden = [
+            self.hidden_buffer[i][loc] for i in range(len(self.hidden_buffer))
+        ]
+        return torch.cat(layer_hidden, dim=-1)
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():

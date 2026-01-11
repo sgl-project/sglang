@@ -287,6 +287,12 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
+        elif model_runner.spec_algorithm.is_dflash():
+            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+            self.num_tokens_per_bs = (
+                self.model_runner.server_args.speculative_dflash_block_size
+            )
+            self.capture_hidden_mode = CaptureHiddenMode.FULL
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -348,12 +354,16 @@ class CudaGraphRunner:
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-        # Speculative_inference
-        if (
+        # Speculative_inference - set up aux hidden state capture for EAGLE3 and DFlash
+        is_spec_algo = (
             model_runner.spec_algorithm.is_eagle3()
-            and model_runner.eagle_use_aux_hidden_state
-        ):
-            self.model_runner.model.set_eagle3_layers_to_capture()
+            or model_runner.spec_algorithm.is_dflash()
+        )
+        use_aux_hidden = model_runner.eagle_use_aux_hidden_state
+        layer_ids = getattr(model_runner, "eagle_aux_hidden_state_layer_ids", None)
+
+        if is_spec_algo and use_aux_hidden:
+            self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
 
         # Capture
         try:
@@ -918,6 +928,16 @@ class CudaGraphRunner:
                 draft_token_num=self.num_tokens_per_bs,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+
+        elif self.model_runner.spec_algorithm.is_dflash():
+            from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+            spec_info = DFlashVerifyInput(
+                draft_token=None,
+                positions=None,
+                block_size=self.model_runner.server_args.speculative_dflash_block_size,
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
 
         return spec_info
 
