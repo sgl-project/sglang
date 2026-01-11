@@ -296,6 +296,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
 
@@ -331,6 +332,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -367,6 +369,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -414,6 +417,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh diffusion
 
@@ -470,6 +474,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           bash scripts/ci/ci_install_dependency.sh
 
@@ -511,6 +516,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -556,6 +562,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
+        timeout-minutes: 20
         run: |
           pip install -e "python/[dev]"
 
@@ -589,7 +596,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        partition: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -605,6 +612,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -620,7 +628,7 @@ jobs:
           if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
-          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 11 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 $CONTINUE_ON_ERROR_FLAG
 
       - name: Merge metrics
         if: always()
@@ -666,6 +674,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -731,6 +740,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -790,6 +800,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -833,6 +844,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
@@ -874,6 +886,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
       - name: Run diffusion server tests
@@ -923,6 +936,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
 
@@ -968,6 +982,7 @@ jobs:
             pattern: wheel-python3.10-cuda12.9
 
         - name: Install dependencies
+          timeout-minutes: 10
           run: |
             CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -984,59 +999,6 @@ jobs:
               CONTINUE_ON_ERROR_FLAG="--continue-on-error"
             fi
             python3 run_suite.py --suite quantization_test $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
-
-  unit-test-backend-1-gpu:
-    needs: [check-changes, call-gate, stage-a-test-1]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'unit-test-backend-1-gpu') ||
-        (
-          !inputs.target_stage &&
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 1-gpu-runner
-    env:
-      RUNNER_LABELS: 1-gpu-runner
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel) }}
-      matrix:
-        part: [0, 1]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/srt
-          RETRY_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.enable_retry }}" == "true" ]]; then
-            RETRY_FLAG="--enable-retry"
-          fi
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
-          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
-
 
   stage-b-test-4-gpu-b200:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
@@ -1073,6 +1035,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
@@ -1104,7 +1067,7 @@ jobs:
 
 
   unit-test-backend-4-gpu:
-    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1137,6 +1100,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -1155,7 +1119,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-8-gpu-h200:
-    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1188,6 +1152,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -1212,7 +1177,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-8-gpu-h20:
-    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1246,6 +1211,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_deepep.sh
 
@@ -1293,6 +1259,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -1364,6 +1331,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -1427,6 +1395,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -1455,7 +1424,7 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_embeddings_api_batch_scaling
 
   performance-test-2-gpu:
-    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1484,6 +1453,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
@@ -1553,6 +1523,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
@@ -1595,6 +1566,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
@@ -1608,7 +1580,7 @@ jobs:
           python3 -m sglang.test.ci.run_with_retry test_moe_eval_accuracy_large.py
 
   unit-test-deepep-4-gpu:
-    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1637,6 +1609,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_deepep.sh
 
@@ -1655,7 +1628,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-deepep-8-gpu:
-    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1684,6 +1657,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_deepep.sh
 
@@ -1702,7 +1676,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-h200-deepep $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu-b200:
-    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200]
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200]
     if: |
       always() &&
       (
@@ -1736,6 +1710,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
@@ -1754,7 +1729,7 @@ jobs:
           IS_BLACKWELL=1 python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $RETRY_FLAG $CONTINUE_ON_ERROR_FLAG
 
   unit-test-backend-4-gpu-gb200:
-    needs: [check-changes, call-gate, unit-test-backend-1-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels-arm]
+    needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, stage-b-test-4-gpu-b200, sgl-kernel-build-wheels-arm]
     if: |
       always() &&
       (
@@ -1785,6 +1760,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9-aarch64
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/ci_install_deepep.sh
 
@@ -1826,7 +1802,6 @@ jobs:
         stage-b-test-large-2-gpu,
         stage-c-test-large-4-gpu,
         quantization-test,
-        unit-test-backend-1-gpu,
         stage-b-test-4-gpu-b200,
         unit-test-backend-4-gpu,
         unit-test-backend-8-gpu-h20,

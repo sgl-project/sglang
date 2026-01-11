@@ -9,6 +9,7 @@ from typing import Any, List
 import zmq
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
@@ -79,6 +80,7 @@ class Scheduler:
             UnmergeLoraWeightsReq: self._handle_unmerge_lora,
             Req: self._handle_generation,
             List[Req]: self._handle_generation,
+            ListLorasReq: self._handle_list_loras,
         }
 
         # FIFO, new reqs are appended
@@ -88,6 +90,10 @@ class Scheduler:
         self.warmed_up = False
 
         self.prepare_server_warmup_reqs()
+
+        # Maximum consecutive errors before terminating the event loop
+        self._max_consecutive_errors = 3
+        self._consecutive_error_count = 0
 
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status
@@ -104,6 +110,9 @@ class Scheduler:
     def _handle_unmerge_lora(self, reqs: List[Any]) -> OutputBatch:
         req = reqs[0]
         return self.worker.unmerge_lora_weights(req.target)
+
+    def _handle_list_loras(self, _reqs: List[Any]) -> OutputBatch:
+        return self.worker.list_loras()
 
     def _handle_generation(self, reqs: List[Req]):
         has_warmup = any(req.is_warmup for req in reqs)
@@ -247,11 +256,24 @@ class Scheduler:
                 new_reqs = self.recv_reqs()
                 new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
                 self.waiting_queue.extend(new_reqs)
+                # Reset error count on success
+                self._consecutive_error_count = 0
             except Exception as e:
+                self._consecutive_error_count += 1
                 logger.error(
-                    f"Error receiving requests in scheduler event loop: {e}",
+                    f"Error receiving requests in scheduler event loop "
+                    f"(attempt {self._consecutive_error_count}/{self._max_consecutive_errors}): {e}",
                     exc_info=True,
                 )
+                if self._consecutive_error_count >= self._max_consecutive_errors:
+                    logger.error(
+                        f"Maximum consecutive errors ({self._max_consecutive_errors}) reached. "
+                        "Terminating scheduler event loop."
+                    )
+                    raise RuntimeError(
+                        f"Scheduler terminated after {self._max_consecutive_errors} "
+                        f"consecutive errors. Last error: {e}"
+                    ) from e
                 continue
 
             # 2: execute, make sure a reply is always sent
