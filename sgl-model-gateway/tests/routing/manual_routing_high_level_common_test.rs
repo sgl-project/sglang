@@ -10,7 +10,7 @@ use tower::ServiceExt;
 
 use crate::common::{
     manual_routing_test_helpers::{
-        manual_routing_all_backend_e2e_test, get_redis_config, send_request, ROUTING_KEY_HEADER,
+        manual_routing_all_backend_e2e_test, send_request, RedisConfig, ROUTING_KEY_HEADER,
     },
     AppTestContext, TestRouterConfig, TestWorkerConfig,
 };
@@ -19,16 +19,11 @@ use crate::common::{
 // Basic Manual Routing Tests
 // ============================================================================
 
-async fn test_routing_with_header_impl(
-    base_port: u16,
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
-) {
+async fn test_routing_with_header_impl(base_port: u16, redis_cfg: Option<RedisConfig>) {
     let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::Random,
-        redis_url,
-        redis_key_prefix,
+        redis_cfg.as_ref(),
     );
     let ctx = AppTestContext::new_with_config(
         config,
@@ -84,16 +79,11 @@ async fn test_routing_with_header_impl(
 
 manual_routing_all_backend_e2e_test!(test_routing_with_header, 3700);
 
-async fn test_routing_without_header_impl(
-    base_port: u16,
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
-) {
+async fn test_routing_without_header_impl(base_port: u16, redis_cfg: Option<RedisConfig>) {
     let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::Random,
-        redis_url,
-        redis_key_prefix,
+        redis_cfg.as_ref(),
     );
     let ctx = AppTestContext::new_with_config(
         config,
@@ -133,16 +123,11 @@ async fn test_routing_without_header_impl(
 
 manual_routing_all_backend_e2e_test!(test_routing_without_header, 3710);
 
-async fn test_routing_consistency_impl(
-    base_port: u16,
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
-) {
+async fn test_routing_consistency_impl(base_port: u16, redis_cfg: Option<RedisConfig>) {
     let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::Random,
-        redis_url,
-        redis_key_prefix,
+        redis_cfg.as_ref(),
     );
     let ctx = AppTestContext::new_with_config(
         config,
@@ -197,14 +182,12 @@ manual_routing_all_backend_e2e_test!(test_routing_consistency, 3720);
 
 async fn test_min_group_concurrent_distribution_impl(
     base_port: u16,
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
+    redis_cfg: Option<RedisConfig>,
 ) {
     let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::MinGroup,
-        redis_url,
-        redis_key_prefix,
+        redis_cfg.as_ref(),
     );
     let ctx = AppTestContext::new_with_config(
         config,
@@ -255,16 +238,11 @@ async fn test_min_group_concurrent_distribution_impl(
 
 manual_routing_all_backend_e2e_test!(test_min_group_concurrent_distribution, 3910);
 
-async fn test_min_group_sticky_routing_impl(
-    base_port: u16,
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
-) {
+async fn test_min_group_sticky_routing_impl(base_port: u16, redis_cfg: Option<RedisConfig>) {
     let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::MinGroup,
-        redis_url,
-        redis_key_prefix,
+        redis_cfg.as_ref(),
     );
     let ctx = AppTestContext::new_with_config(
         config,
@@ -305,14 +283,12 @@ manual_routing_all_backend_e2e_test!(test_min_group_sticky_routing, 3920);
 
 async fn test_min_group_mixed_concurrent_routing_impl(
     base_port: u16,
-    redis_url: Option<String>,
-    redis_key_prefix: Option<String>,
+    redis_cfg: Option<RedisConfig>,
 ) {
     let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::MinGroup,
-        redis_url,
-        redis_key_prefix,
+        redis_cfg.as_ref(),
     );
     let ctx = AppTestContext::new_with_config(
         config,
