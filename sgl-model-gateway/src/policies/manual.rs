@@ -668,10 +668,12 @@ mod tests {
 
     fn create_policy_with_redis(redis_url: &str, key_prefix: &str) -> ManualPolicy {
         std::env::set_var("SMG_MANUAL_REDIS_URL", redis_url);
-        std::env::set_var("SMG_MANUAL_REDIS_KEY_PREFIX", key_prefix);
-        let policy = ManualPolicy::new();
+        let config = ManualConfig {
+            redis_key_prefix: Some(key_prefix.to_string()),
+            ..Default::default()
+        };
+        let policy = ManualPolicy::with_config(config);
         std::env::remove_var("SMG_MANUAL_REDIS_URL");
-        std::env::remove_var("SMG_MANUAL_REDIS_KEY_PREFIX");
         policy
     }
 

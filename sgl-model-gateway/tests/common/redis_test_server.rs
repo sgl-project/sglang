@@ -1,7 +1,60 @@
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::warn;
+
+// ============================================================================
+// Shared Redis Server (singleton for all tests)
+// ============================================================================
+
+static SHARED_SERVER: OnceLock<SharedRedisServer> = OnceLock::new();
+
+pub struct SharedRedisServer {
+    _process: Child,
+    pub port: u16,
+}
+
+impl SharedRedisServer {
+    fn start() -> Self {
+        let port = portpicker::pick_unused_port().expect("No available port");
+        let process = Command::new("redis-server")
+            .args([
+                "--port",
+                &port.to_string(),
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+                "--daemonize",
+                "no",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Failed to start redis-server. Is redis-server installed?");
+
+        std::thread::sleep(Duration::from_millis(500));
+        Self {
+            _process: process,
+            port,
+        }
+    }
+
+    pub fn url(&self) -> String {
+        format!("redis://127.0.0.1:{}", self.port)
+    }
+}
+
+/// Get or create a shared Redis server for tests.
+/// Multiple tests can use this server with different key prefixes.
+pub fn get_shared_server() -> &'static SharedRedisServer {
+    SHARED_SERVER.get_or_init(SharedRedisServer::start)
+}
+
+// ============================================================================
+// Per-test Redis Server (for tests that need isolated instances)
+// ============================================================================
 
 pub struct RedisTestServer {
     process: Option<Child>,
