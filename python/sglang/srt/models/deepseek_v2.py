@@ -90,6 +90,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    enable_nextn_moe_sparse_fully_dp,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -421,8 +422,12 @@ class DeepseekV2MoE(nn.Module):
         is_nextn: bool = False,
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
+        if enable_nextn_moe_sparse_fully_dp():
+            self.tp_size = 1
+            self.moe_ep_size = 1
+        else:
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
@@ -465,7 +470,11 @@ class DeepseekV2MoE(nn.Module):
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + (
+                0
+                if enable_nextn_moe_sparse_fully_dp()
+                else get_global_server_args().ep_num_redundant_experts
+            ),
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
@@ -520,6 +529,7 @@ class DeepseekV2MoE(nn.Module):
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
                     or get_moe_a2a_backend().is_ascend_fuseep()
+                    or enable_nextn_moe_sparse_fully_dp()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),

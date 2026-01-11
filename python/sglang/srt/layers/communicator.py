@@ -48,6 +48,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.moe import (
+    enable_nextn_moe_sparse_fully_dp,
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -271,6 +272,7 @@ class LayerScatterModes:
                     # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                     not get_moe_a2a_backend().is_none()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    or enable_nextn_moe_sparse_fully_dp()
                 )
                 else ScatterMode.FULL
             )
