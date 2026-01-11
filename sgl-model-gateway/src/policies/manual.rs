@@ -1375,7 +1375,7 @@ mod tests {
         }
     }
 
-    all_backend_test!(all_backend_failover, test_failover_impl);
+    all_backend_test!(test_failover);
 
     async fn test_worker_recovery_impl(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
@@ -1400,7 +1400,7 @@ mod tests {
         );
     }
 
-    all_backend_test!(all_backend_worker_recovery, test_worker_recovery_impl);
+    all_backend_test!(test_worker_recovery);
 
     async fn test_distribution_impl(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
@@ -1423,7 +1423,7 @@ mod tests {
         );
     }
 
-    all_backend_test!(all_backend_distribution, test_distribution_impl);
+    all_backend_test!(test_distribution);
 
     async fn test_no_healthy_workers_impl(policy: ManualPolicy) {
         let workers = create_workers(&["http://w1:8000"]);
@@ -1439,5 +1439,5 @@ mod tests {
         assert!(result.is_none(), "Should return None when no healthy workers");
     }
 
-    all_backend_test!(all_backend_no_healthy_workers, test_no_healthy_workers_impl);
+    all_backend_test!(test_no_healthy_workers);
 }
