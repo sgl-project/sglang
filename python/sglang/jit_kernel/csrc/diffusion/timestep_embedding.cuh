@@ -141,11 +141,9 @@ void timestep_embedding(
   auto B = SymbolicSize{"batch_size"};
   auto D = SymbolicSize{"dim"};
   auto device = SymbolicDevice{};
-  auto in_dtype = SymbolicDType{};
 
   TensorMatcher({B})
       .with_strides({1})
-      .with_dtype<int8_t, uint8_t, int16_t, int32_t, int64_t, float, double, half, nv_bfloat16>(in_dtype)
       .template with_device<kDLCUDA>(device)
       .verify(input);
 
@@ -153,48 +151,27 @@ void timestep_embedding(
 
   RuntimeCheck(D.unwrap() == dim, "Output dim mismatch: ", D.unwrap(), " vs ", dim);
   RuntimeCheck(dim % 8 == 0, "dim must align to 8, got ", dim);
+  
+  const bool in_ok =
+      (in_dtype.code == kDLFloat && in_dtype.bits == 16) ||
+      (in_dtype.code == kDLBfloat && in_dtype.bits == 16) ||
+      (in_dtype.code == kDLFloat && in_dtype.bits == 32);
+  RuntimeCheck(
+      in_ok,
+      "input dtype must be fp16/bf16/fp32, but got ",
+      in_dtype);
 
-  const auto dtype = input.dtype();
+  auto launch = [&]<typename TIn>() {
+    launch_timestep_embedding<TIn>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
+  };
 
-  if (host::is_type<int8_t>(dtype)) {
-    launch_timestep_embedding<int8_t>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
-    return;
+  if (in_dtype.code == kDLFloat && in_dtype.bits == 32) {
+    launch.template operator()<float>();
+  } else if (in_dtype.code == kDLBfloat && in_dtype.bits == 16) {
+    launch.template operator()<nv_bfloat16>();
+  } else if (in_dtype.code == kDLFloat && in_dtype.bits == 16) {
+    launch.template operator()<half>();
   }
-  if (host::is_type<uint8_t>(dtype)) {
-    launch_timestep_embedding<uint8_t>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
-    return;
-  }
-  if (host::is_type<int16_t>(dtype)) {
-    launch_timestep_embedding<int16_t>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
-    return;
-  }
-  if (host::is_type<int32_t>(dtype)) {
-    launch_timestep_embedding<int32_t>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
-    return;
-  }
-  if (host::is_type<int64_t>(dtype)) {
-    launch_timestep_embedding<int64_t>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
-    return;
-  }
-  if (host::is_type<float>(dtype)) {
-    launch_timestep_embedding<float>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
-    return;
-  }
-  if (host::is_type<double>(dtype)) {
-    launch_timestep_embedding<double>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
-    return;
-  }
-  if (host::is_type<half>(dtype)) {
-    launch_timestep_embedding<half>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
-    return;
-  }
-  if (host::is_type<nv_bfloat16>(dtype)) {
-    launch_timestep_embedding<nv_bfloat16>(
-        input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
-    return;
-  }
-
-  Panic("Unsupported input dtype for timestep_embedding");
 }
 
 }  // namespace
