@@ -31,8 +31,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{core::Worker, observability::metrics::Metrics};
 
@@ -223,13 +221,8 @@ impl PrefixHashPolicy {
     }
 }
 
-#[async_trait]
 impl LoadBalancingPolicy for PrefixHashPolicy {
-    async fn select_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info);
         Metrics::record_worker_prefix_hash_policy_branch(branch.as_str());
         result
@@ -261,8 +254,8 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test]
-    async fn test_prefix_hash_consistent_routing() {
+    #[test]
+    fn test_prefix_hash_consistent_routing() {
         let policy = PrefixHashPolicy::with_defaults();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(&workers));
@@ -285,8 +278,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_different_prefixes_distribute() {
+    #[test]
+    fn test_different_prefixes_distribute() {
         let policy = PrefixHashPolicy::with_defaults();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(&workers));
@@ -313,8 +306,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_shared_prefix_routes_same() {
+    #[test]
+    fn test_shared_prefix_routes_same() {
         let policy = PrefixHashPolicy::new(PrefixHashConfig {
             prefix_token_count: 5, // Only look at first 5 tokens
             ..Default::default()
@@ -343,8 +336,8 @@ mod tests {
         assert_eq!(result1, result2, "Same prefix should route to same worker");
     }
 
-    #[tokio::test]
-    async fn test_no_tokens_returns_none() {
+    #[test]
+    fn test_no_tokens_returns_none() {
         let policy = PrefixHashPolicy::with_defaults();
         let workers = create_workers(&["http://w1:8000"]);
         let ring = Arc::new(HashRing::new(&workers));
@@ -373,8 +366,8 @@ mod tests {
         assert_eq!(branch2, Branch::NoTokens);
     }
 
-    #[tokio::test]
-    async fn test_no_healthy_workers() {
+    #[test]
+    fn test_no_healthy_workers() {
         let policy = PrefixHashPolicy::with_defaults();
         let workers = create_workers(&["http://w1:8000"]);
         workers[0].set_healthy(false);
@@ -392,8 +385,8 @@ mod tests {
         assert_eq!(branch, Branch::NoHealthyWorkers);
     }
 
-    #[tokio::test]
-    async fn test_load_ok_calculation() {
+    #[test]
+    fn test_load_ok_calculation() {
         let policy = PrefixHashPolicy::new(PrefixHashConfig {
             load_factor: 1.25,
             ..Default::default()
@@ -408,8 +401,8 @@ mod tests {
         assert!(policy.load_ok(100, 0, 0)); // No workers = OK (shouldn't happen)
     }
 
-    #[tokio::test]
-    async fn test_policy_name() {
+    #[test]
+    fn test_policy_name() {
         let policy = PrefixHashPolicy::with_defaults();
         assert_eq!(policy.name(), "prefix_hash");
     }

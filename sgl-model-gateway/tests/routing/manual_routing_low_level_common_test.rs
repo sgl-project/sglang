@@ -493,3 +493,39 @@ async fn test_min_group_sticky_after_assignment_impl(
         );
     }
 }
+
+all_backend_test!(test_random_mode_does_not_consider_load);
+async fn test_random_mode_does_not_consider_load_impl(
+    redis_url: Option<String>,
+    redis_key_prefix: Option<String>,
+) {
+    let policy = ManualPolicy::with_config(ManualConfig {
+        assignment_mode: ManualAssignmentMode::Random,
+        redis_url,
+        redis_key_prefix,
+        ..Default::default()
+    });
+    let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    workers[0].worker_routing_key_load().increment("key-1");
+    workers[0].worker_routing_key_load().increment("key-2");
+    workers[0].worker_routing_key_load().increment("key-3");
+
+    let mut selected_worker_0 = false;
+    for i in 0..50 {
+        let headers = headers_with_routing_key(&format!("test-{}", i));
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let result = policy.select_worker(&workers, &info).await;
+        if result == Some(0) {
+            selected_worker_0 = true;
+            break;
+        }
+    }
+    assert!(
+        selected_worker_0,
+        "Random mode should sometimes select worker 0 despite higher load"
+    );
+}
