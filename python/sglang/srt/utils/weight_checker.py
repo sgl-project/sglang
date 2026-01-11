@@ -22,6 +22,8 @@ class WeightChecker:
             self._snapshot()
         elif action == "reset_tensors":
             self._reset_tensors()
+        elif action == "reset_tensors_without_buffers":
+            self._reset_tensors(skip_buffers=True)
         elif action == "compare":
             self._compare()
         else:
@@ -36,8 +38,8 @@ class WeightChecker:
             named_tensors
         ), f"should not have duplicated tensor name"
 
-    def _reset_tensors(self):
-        for name, param in self._model_state(skip_buffers=True):
+    def _reset_tensors(self, skip_buffers: bool = False):
+        for name, param in self._model_state(skip_buffers=skip_buffers):
             param.copy_(_random_like(param))
 
     def _compare(self):
