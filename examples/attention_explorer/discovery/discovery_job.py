@@ -76,7 +76,8 @@ from sklearn.preprocessing import StandardScaler
 # CONFIGURATION
 # =============================================================================
 
-FINGERPRINT_DIM = 20  # Schema v1 fingerprint dimension
+FINGERPRINT_DIM = 20  # Schema v1 fingerprint dimension (base)
+FINGERPRINT_DIM_V2 = 21  # Schema v2 with rotational_variance
 SCHEMA_VERSION = 1
 
 # Fingerprint layout (schema v1):
@@ -86,6 +87,7 @@ SCHEMA_VERSION = 1
 # [3]  entropy        - attention entropy (higher = more distributed)
 # [4-11] histogram    - 8-bin distance histogram
 # [12-19] layer_stats - per-layer entropy (up to 8 layers)
+# [20] rotational_variance (schema v2) - how much position affects attention (0=semantic, 1=positional)
 
 FP_LOCAL_MASS = 0
 FP_MID_MASS = 1
@@ -94,16 +96,27 @@ FP_ENTROPY = 3
 FP_HISTOGRAM_START = 4
 FP_HISTOGRAM_END = 12
 FP_LAYER_STATS_START = 12
+FP_LAYER_STATS_END = 20
+FP_ROTATIONAL_VARIANCE = 20  # Schema v2 extension
 
 # Zone thresholds (tuned for typical LLM attention patterns)
+# Updated to incorporate rotational_variance when available
 ZONE_THRESHOLDS = {
     'syntax_floor': {
         'local_mass_min': 0.5,
         'entropy_max': 2.5,
+        # Low rotational variance = position-driven (syntax)
+        'rotational_variance_max': 0.25,
     },
     'structure_ripple': {
         'long_mass_min': 0.25,
         'histogram_variance_min': 0.1,  # Periodic patterns have high variance
+        # High rotational variance = semantic reasoning
+        'rotational_variance_min': 0.35,
+    },
+    'semantic_bridge': {
+        # Medium rotational variance = balanced semantic/positional
+        'rotational_variance_range': (0.15, 0.5),
     },
     # semantic_bridge is the default when others don't match
 }
@@ -282,11 +295,15 @@ def assign_zone_labels(fingerprints: np.ndarray) -> Tuple[np.ndarray, np.ndarray
 
     The three zones represent different "attention programs":
     - syntax_floor: Local attention, low entropy (JSON repair, brackets, formatting)
+      + LOW rotational variance (position-driven, not semantic)
     - semantic_bridge: Mid-range retrieval, balanced (coreference, task routing)
+      + MEDIUM rotational variance (balanced semantic/positional)
     - structure_ripple: Long-range periodic patterns (counting, tables, indentation)
+      + HIGH rotational variance (semantic reasoning across structure)
 
     Args:
-        fingerprints: Array of shape (N, 20) with fingerprint vectors
+        fingerprints: Array of shape (N, 20) or (N, 21) with fingerprint vectors
+                     If 21 dimensions, position 20 contains rotational_variance
 
     Returns:
         Tuple of (zone_labels, zone_confidences) arrays
@@ -301,6 +318,14 @@ def assign_zone_labels(fingerprints: np.ndarray) -> Tuple[np.ndarray, np.ndarray
     long_mass = fingerprints[:, FP_LONG_MASS]
     entropy = fingerprints[:, FP_ENTROPY]
 
+    # Check for rotational variance (v2 fingerprints)
+    has_rotational_variance = fingerprints.shape[1] > FP_ROTATIONAL_VARIANCE
+    if has_rotational_variance:
+        rotational_variance = fingerprints[:, FP_ROTATIONAL_VARIANCE]
+        logger.info(f"Using rotational variance for zone assignment (mean={rotational_variance.mean():.3f})")
+    else:
+        rotational_variance = None
+
     # Histogram variance (indicates periodic patterns)
     histogram = fingerprints[:, FP_HISTOGRAM_START:FP_HISTOGRAM_END]
     hist_variance = np.var(histogram, axis=1)
@@ -309,27 +334,65 @@ def assign_zone_labels(fingerprints: np.ndarray) -> Tuple[np.ndarray, np.ndarray
     total_mass = local_mass + mid_mass + long_mass
     total_mass = np.maximum(total_mass, 1e-6)  # Avoid division by zero
 
+    # Get thresholds
+    sf_thresh = ZONE_THRESHOLDS['syntax_floor']
+    sr_thresh = ZONE_THRESHOLDS['structure_ripple']
+    sb_thresh = ZONE_THRESHOLDS.get('semantic_bridge', {})
+
     # Zone assignment logic
     for i in range(n):
-        # Check syntax_floor first (high local, low entropy)
-        if local_mass[i] > ZONE_THRESHOLDS['syntax_floor']['local_mass_min']:
-            if entropy[i] < ZONE_THRESHOLDS['syntax_floor']['entropy_max']:
-                zones[i] = 'syntax_floor'
-                # Confidence based on how clearly it matches
-                confidences[i] = min(1.0, local_mass[i] * (1.0 - entropy[i] / 4.0))
-                continue
+        rv = rotational_variance[i] if rotational_variance is not None else None
 
-        # Check structure_ripple (high long-range, periodic patterns)
-        if long_mass[i] > ZONE_THRESHOLDS['structure_ripple']['long_mass_min']:
-            if hist_variance[i] > ZONE_THRESHOLDS['structure_ripple']['histogram_variance_min']:
-                zones[i] = 'structure_ripple'
-                confidences[i] = min(1.0, long_mass[i] + hist_variance[i])
-                continue
+        # Check syntax_floor first (high local, low entropy, optionally low rotational variance)
+        if local_mass[i] > sf_thresh['local_mass_min']:
+            if entropy[i] < sf_thresh['entropy_max']:
+                # If rotational variance is available, check it's low (position-driven)
+                if rv is not None:
+                    rv_max = sf_thresh.get('rotational_variance_max', 1.0)
+                    if rv <= rv_max:
+                        zones[i] = 'syntax_floor'
+                        # High confidence when rotational variance confirms position-driven
+                        confidences[i] = min(1.0, local_mass[i] * (1.0 - entropy[i] / 4.0) * (1.0 - rv))
+                        continue
+                    # High rotational variance with local mass = likely semantic bridging, not syntax
+                    # Fall through to check other zones
+                else:
+                    zones[i] = 'syntax_floor'
+                    confidences[i] = min(1.0, local_mass[i] * (1.0 - entropy[i] / 4.0))
+                    continue
+
+        # Check structure_ripple (high long-range, periodic patterns, optionally high rotational variance)
+        if long_mass[i] > sr_thresh['long_mass_min']:
+            if hist_variance[i] > sr_thresh['histogram_variance_min']:
+                # If rotational variance is available, check it's high (semantic reasoning)
+                if rv is not None:
+                    rv_min = sr_thresh.get('rotational_variance_min', 0.0)
+                    if rv >= rv_min:
+                        zones[i] = 'structure_ripple'
+                        # High confidence when rotational variance confirms semantic reasoning
+                        confidences[i] = min(1.0, (long_mass[i] + rv) / 2)
+                        continue
+                    # Low rotational variance with long mass = structural, still structure_ripple
+                    zones[i] = 'structure_ripple'
+                    confidences[i] = min(1.0, long_mass[i] * 0.8)
+                    continue
+                else:
+                    zones[i] = 'structure_ripple'
+                    confidences[i] = min(1.0, long_mass[i] + hist_variance[i])
+                    continue
 
         # Default: semantic_bridge
         zones[i] = 'semantic_bridge'
-        # Confidence based on mid-mass dominance
-        confidences[i] = mid_mass[i] / total_mass[i]
+        # Confidence based on mid-mass dominance, boosted by rotational variance if available
+        if rv is not None:
+            rv_range = sb_thresh.get('rotational_variance_range', (0.0, 1.0))
+            if rv_range[0] <= rv <= rv_range[1]:
+                # Rotational variance in expected range for semantic bridging
+                confidences[i] = min(1.0, mid_mass[i] / total_mass[i] + 0.1)
+            else:
+                confidences[i] = mid_mass[i] / total_mass[i] * 0.9
+        else:
+            confidences[i] = mid_mass[i] / total_mass[i]
 
     logger.info(f"Zone distribution: "
                 f"syntax_floor={np.sum(zones == 'syntax_floor')}, "

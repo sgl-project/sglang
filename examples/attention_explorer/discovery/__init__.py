@@ -66,6 +66,11 @@ from .rope_derotation import (
     get_glossary,
     get_term_explanation,
     explain_attention_step,
+    # Fingerprint integration (schema v2)
+    compute_rotational_variance_for_fingerprint,
+    compute_rotational_variance_batch,
+    extend_fingerprint_with_rotational_variance,
+    extend_fingerprints_batch,
 )
 
 from .compass_router import (
