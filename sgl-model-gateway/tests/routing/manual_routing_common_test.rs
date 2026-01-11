@@ -289,7 +289,7 @@ async fn test_min_group_concurrent_distribution_impl(base_port: u16) {
     ctx.shutdown().await;
 }
 
-all_backend_e2e_test!(test_min_group_concurrent_distribution, test_min_group_concurrent_distribution_impl, 3910);
+all_backend_e2e_test!(test_min_group_concurrent_distribution, 3910);
 
 async fn test_min_group_sticky_routing_impl(base_port: u16) {
     let config = TestRouterConfig::manual_min_group(base_port);
@@ -328,7 +328,7 @@ async fn test_min_group_sticky_routing_impl(base_port: u16) {
     ctx.shutdown().await;
 }
 
-all_backend_e2e_test!(test_min_group_sticky_routing, test_min_group_sticky_routing_impl, 3920);
+all_backend_e2e_test!(test_min_group_sticky_routing, 3920);
 
 async fn test_min_group_mixed_concurrent_routing_impl(base_port: u16) {
     let config = TestRouterConfig::manual_min_group(base_port);
@@ -382,4 +382,4 @@ async fn test_min_group_mixed_concurrent_routing_impl(base_port: u16) {
     ctx.shutdown().await;
 }
 
-all_backend_e2e_test!(test_min_group_mixed_concurrent_routing, test_min_group_mixed_concurrent_routing_impl, 3930);
+all_backend_e2e_test!(test_min_group_mixed_concurrent_routing, 3930);
