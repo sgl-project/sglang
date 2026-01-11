@@ -608,8 +608,6 @@ fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> u
 mod tests {
     use std::collections::HashMap;
 
-    use paste::paste;
-
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 

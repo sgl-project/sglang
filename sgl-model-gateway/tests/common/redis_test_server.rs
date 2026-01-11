@@ -1,7 +1,7 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tracing::warn;
 
 pub struct RedisTestServer {
     process: Option<Child>,
@@ -11,7 +11,8 @@ pub struct RedisTestServer {
 
 impl RedisTestServer {
     pub async fn start() -> Result<Self, String> {
-        let port = find_available_port().await?;
+        let port = portpicker::pick_unused_port()
+            .ok_or_else(|| "Failed to find available port".to_string())?;
         let url = format!("redis://127.0.0.1:{}", port);
 
         let process = Command::new("redis-server")
@@ -30,7 +31,7 @@ impl RedisTestServer {
             .spawn()
             .map_err(|e| format!("Failed to start redis-server: {}. Is redis-server installed?", e))?;
 
-        let mut server = Self {
+        let server = Self {
             process: Some(process),
             port,
             url,
@@ -57,9 +58,17 @@ impl RedisTestServer {
     }
 
     pub async fn stop(&mut self) {
+        self.stop_inner();
+    }
+
+    fn stop_inner(&mut self) {
         if let Some(mut process) = self.process.take() {
-            let _ = process.kill();
-            let _ = process.wait();
+            if let Err(e) = process.kill() {
+                warn!("Failed to kill redis-server process: {}", e);
+            }
+            if let Err(e) = process.wait() {
+                warn!("Failed to wait for redis-server process: {}", e);
+            }
         }
     }
 
@@ -80,23 +89,8 @@ impl RedisTestServer {
 
 impl Drop for RedisTestServer {
     fn drop(&mut self) {
-        if let Some(mut process) = self.process.take() {
-            let _ = process.kill();
-            let _ = process.wait();
-        }
+        self.stop_inner();
     }
-}
-
-async fn find_available_port() -> Result<u16, String> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| format!("Failed to bind: {}", e))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("Failed to get local addr: {}", e))?
-        .port();
-    drop(listener);
-    Ok(port)
 }
 
 #[cfg(test)]

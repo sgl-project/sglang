@@ -1,6 +1,7 @@
 //! Manual routing policy integration tests
 //!
 //! Tests for the manual routing policy with sticky sessions using X-SMG-Routing-Key header.
+//! Tests run on both LocalBackend and RedisBackend.
 
 use std::collections::{HashMap, HashSet};
 
@@ -12,89 +13,73 @@ use axum::{
 use serde_json::json;
 use tower::ServiceExt;
 
+use crate::common::redis_test_server::RedisTestServer;
 use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
 
 const ROUTING_KEY_HEADER: &str = "X-SMG-Routing-Key";
 
-#[cfg(test)]
-mod manual_routing_tests {
-    use super::*;
+struct TestEnv {
+    _redis_server: Option<RedisTestServer>,
+}
 
-    /// Test sticky routing with X-SMG-Routing-Key header
-    #[tokio::test]
-    async fn test_manual_routing_with_header() {
-        let config = TestRouterConfig::manual(3700);
-
-        let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19700, 2))
-                .await;
-
-        let app = ctx.create_app().await;
-
-        // Send requests with different routing keys
-        let mut key_workers: HashMap<String, HashSet<String>> = HashMap::new();
-
-        for key_id in 0..5 {
-            let routing_key = format!("user-{}", key_id);
-
-            for _ in 0..4 {
-                let payload = json!({
-                    "text": format!("Request for {}", routing_key),
-                    "stream": false
-                });
-
-                let req = Request::builder()
-                    .method("POST")
-                    .uri("/generate")
-                    .header(CONTENT_TYPE, "application/json")
-                    .header(ROUTING_KEY_HEADER, &routing_key)
-                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
-                    .unwrap();
-
-                let resp = app.clone().oneshot(req).await.unwrap();
-                assert_eq!(resp.status(), StatusCode::OK);
-
-                // Extract worker ID from response header
-                if let Some(worker_id) = resp.headers().get("x-worker-id") {
-                    let worker = worker_id.to_str().unwrap().to_string();
-                    key_workers
-                        .entry(routing_key.clone())
-                        .or_default()
-                        .insert(worker);
-                }
-            }
-        }
-
-        // Verify sticky: each routing key should route to exactly one worker
-        for (key, workers) in &key_workers {
-            assert_eq!(
-                workers.len(),
-                1,
-                "Routing key {} should route to exactly one worker, got {:?}",
-                key,
-                workers
-            );
-        }
-
-        ctx.shutdown().await;
+impl TestEnv {
+    async fn local() -> Self {
+        std::env::remove_var("SMG_MANUAL_REDIS_URL");
+        Self { _redis_server: None }
     }
 
-    /// Test random fallback when no routing key header is provided
-    #[tokio::test]
-    async fn test_manual_routing_without_header() {
-        let config = TestRouterConfig::manual(3701);
+    async fn redis() -> Self {
+        let server = RedisTestServer::start().await.unwrap();
+        std::env::set_var("SMG_MANUAL_REDIS_URL", server.url());
+        Self { _redis_server: Some(server) }
+    }
+}
 
-        let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19702, 2))
-                .await;
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        std::env::remove_var("SMG_MANUAL_REDIS_URL");
+    }
+}
 
-        let app = ctx.create_app().await;
-        let mut success_count = 0;
+macro_rules! all_backend_e2e_test {
+    ($name:ident, $test_fn:ident, $base_port:expr) => {
+        paste::paste! {
+            #[tokio::test]
+            async fn [<$name _local>]() {
+                let _env = TestEnv::local().await;
+                $test_fn($base_port).await;
+            }
 
-        // Send requests without routing key - should fall back to random selection
-        for i in 0..20 {
+            #[tokio::test]
+            async fn [<$name _redis>]() {
+                let _env = TestEnv::redis().await;
+                $test_fn($base_port + 1000).await;
+            }
+        }
+    };
+}
+
+// ============================================================================
+// Basic Manual Routing Tests
+// ============================================================================
+
+async fn test_routing_with_header_impl(base_port: u16) {
+    let config = TestRouterConfig::manual(base_port);
+    let ctx = AppTestContext::new_with_config(
+        config,
+        TestWorkerConfig::healthy_workers(base_port + 16000, 2),
+    )
+    .await;
+
+    let app = ctx.create_app().await;
+    let mut key_workers: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for key_id in 0..5 {
+        let routing_key = format!("user-{}", key_id);
+
+        for _ in 0..4 {
             let payload = json!({
-                "text": format!("Request without key {}", i),
+                "text": format!("Request for {}", routing_key),
                 "stream": false
             });
 
@@ -102,51 +87,7 @@ mod manual_routing_tests {
                 .method("POST")
                 .uri("/generate")
                 .header(CONTENT_TYPE, "application/json")
-                // No ROUTING_KEY_HEADER
-                .body(Body::from(serde_json::to_string(&payload).unwrap()))
-                .unwrap();
-
-            let resp = app.clone().oneshot(req).await.unwrap();
-            if resp.status() == StatusCode::OK {
-                success_count += 1;
-            }
-        }
-
-        // All requests should succeed via random fallback
-        assert_eq!(
-            success_count, 20,
-            "All requests should succeed with random fallback when no routing key provided"
-        );
-
-        ctx.shutdown().await;
-    }
-
-    /// Test that same routing key consistently routes to same worker
-    #[tokio::test]
-    async fn test_manual_routing_consistency() {
-        let config = TestRouterConfig::manual(3702);
-
-        let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19704, 3))
-                .await;
-
-        let app = ctx.create_app().await;
-
-        let routing_key = "consistent-user-123";
-        let mut seen_workers: Vec<String> = Vec::new();
-
-        // Send multiple requests with same routing key
-        for i in 0..10 {
-            let payload = json!({
-                "text": format!("Consistent request {}", i),
-                "stream": false
-            });
-
-            let req = Request::builder()
-                .method("POST")
-                .uri("/generate")
-                .header(CONTENT_TYPE, "application/json")
-                .header(ROUTING_KEY_HEADER, routing_key)
+                .header(ROUTING_KEY_HEADER, &routing_key)
                 .body(Body::from(serde_json::to_string(&payload).unwrap()))
                 .unwrap();
 
@@ -154,32 +95,85 @@ mod manual_routing_tests {
             assert_eq!(resp.status(), StatusCode::OK);
 
             if let Some(worker_id) = resp.headers().get("x-worker-id") {
-                seen_workers.push(worker_id.to_str().unwrap().to_string());
+                let worker = worker_id.to_str().unwrap().to_string();
+                key_workers
+                    .entry(routing_key.clone())
+                    .or_default()
+                    .insert(worker);
             }
         }
-
-        // All requests should go to the same worker
-        if !seen_workers.is_empty() {
-            let first_worker = &seen_workers[0];
-            for worker in &seen_workers {
-                assert_eq!(
-                    worker, first_worker,
-                    "All requests with same routing key should go to same worker"
-                );
-            }
-        }
-
-        ctx.shutdown().await;
     }
+
+    for (key, workers) in &key_workers {
+        assert_eq!(
+            workers.len(),
+            1,
+            "Routing key {} should route to exactly one worker, got {:?}",
+            key,
+            workers
+        );
+    }
+
+    ctx.shutdown().await;
 }
 
-#[cfg(test)]
-mod manual_min_group_tests {
-    use super::*;
+all_backend_e2e_test!(test_routing_with_header, test_routing_with_header_impl, 3700);
 
-    async fn send_request(app: axum::Router, routing_key: &str) -> (String, String) {
+async fn test_routing_without_header_impl(base_port: u16) {
+    let config = TestRouterConfig::manual(base_port);
+    let ctx = AppTestContext::new_with_config(
+        config,
+        TestWorkerConfig::healthy_workers(base_port + 16000, 2),
+    )
+    .await;
+
+    let app = ctx.create_app().await;
+    let mut success_count = 0;
+
+    for i in 0..20 {
         let payload = json!({
-            "text": format!("Request for {}", routing_key),
+            "text": format!("Request without key {}", i),
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        if resp.status() == StatusCode::OK {
+            success_count += 1;
+        }
+    }
+
+    assert_eq!(
+        success_count, 20,
+        "All requests should succeed with random fallback when no routing key provided"
+    );
+
+    ctx.shutdown().await;
+}
+
+all_backend_e2e_test!(test_routing_without_header, test_routing_without_header_impl, 3710);
+
+async fn test_routing_consistency_impl(base_port: u16) {
+    let config = TestRouterConfig::manual(base_port);
+    let ctx = AppTestContext::new_with_config(
+        config,
+        TestWorkerConfig::healthy_workers(base_port + 16000, 3),
+    )
+    .await;
+
+    let app = ctx.create_app().await;
+    let routing_key = "consistent-user-123";
+    let mut seen_workers: Vec<String> = Vec::new();
+
+    for i in 0..10 {
+        let payload = json!({
+            "text": format!("Consistent request {}", i),
             "stream": false
         });
 
@@ -191,156 +185,201 @@ mod manual_min_group_tests {
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
 
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let worker_id = resp
-            .headers()
-            .get("x-worker-id")
-            .expect("Response should have x-worker-id header")
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        (routing_key.to_string(), worker_id)
+        if let Some(worker_id) = resp.headers().get("x-worker-id") {
+            seen_workers.push(worker_id.to_str().unwrap().to_string());
+        }
     }
 
-    #[tokio::test]
-    async fn test_min_group_concurrent_distribution() {
-        let config = TestRouterConfig::manual_min_group(3910);
-
-        let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(29910, 3, 500))
-                .await;
-
-        let app = ctx.create_app().await;
-
-        let mut handles = Vec::new();
-        for i in 0..9 {
-            let routing_key = format!("key-{}", i);
-            let app_clone = app.clone();
-            let handle = tokio::spawn(async move { send_request(app_clone, &routing_key).await });
-            handles.push(handle);
-        }
-
-        let results: Vec<(String, String)> = futures_util::future::join_all(handles)
-            .await
-            .into_iter()
-            .map(|r| r.unwrap())
-            .collect();
-
-        let key_to_worker: HashMap<String, String> = results.into_iter().collect();
-
-        let worker_counts: HashMap<String, usize> =
-            key_to_worker.values().fold(HashMap::new(), |mut acc, w| {
-                *acc.entry(w.clone()).or_default() += 1;
-                acc
-            });
-
-        assert_eq!(
-            worker_counts.len(),
-            3,
-            "min_group should distribute keys across all 3 workers, got {:?}",
-            worker_counts
-        );
-        for (worker, count) in &worker_counts {
+    if !seen_workers.is_empty() {
+        let first_worker = &seen_workers[0];
+        for worker in &seen_workers {
             assert_eq!(
-                *count, 3,
-                "Worker {} should have exactly 3 keys, got {}. Distribution: {:?}",
-                worker, count, key_to_worker
+                worker, first_worker,
+                "All requests with same routing key should go to same worker"
             );
         }
-
-        ctx.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn test_min_group_sticky_routing() {
-        let config = TestRouterConfig::manual_min_group(3911);
+    ctx.shutdown().await;
+}
 
-        let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(29920, 3, 200))
-                .await;
+all_backend_e2e_test!(test_routing_consistency, test_routing_consistency_impl, 3720);
 
-        let app = ctx.create_app().await;
+// ============================================================================
+// Min Group Mode Tests
+// ============================================================================
 
-        let routing_key = "sticky-key-123";
+async fn send_request(app: axum::Router, routing_key: &str) -> (String, String) {
+    let payload = json!({
+        "text": format!("Request for {}", routing_key),
+        "stream": false
+    });
 
-        let mut handles = Vec::new();
-        for _ in 0..5 {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/generate")
+        .header(CONTENT_TYPE, "application/json")
+        .header(ROUTING_KEY_HEADER, routing_key)
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let worker_id = resp
+        .headers()
+        .get("x-worker-id")
+        .expect("Response should have x-worker-id header")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    (routing_key.to_string(), worker_id)
+}
+
+async fn test_min_group_concurrent_distribution_impl(base_port: u16) {
+    let config = TestRouterConfig::manual_min_group(base_port);
+    let ctx = AppTestContext::new_with_config(
+        config,
+        TestWorkerConfig::slow_workers(base_port + 26000, 3, 500),
+    )
+    .await;
+
+    let app = ctx.create_app().await;
+
+    let mut handles = Vec::new();
+    for i in 0..9 {
+        let routing_key = format!("key-{}", i);
+        let app_clone = app.clone();
+        let handle = tokio::spawn(async move { send_request(app_clone, &routing_key).await });
+        handles.push(handle);
+    }
+
+    let results: Vec<(String, String)> = futures_util::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let key_to_worker: HashMap<String, String> = results.into_iter().collect();
+
+    let worker_counts: HashMap<String, usize> =
+        key_to_worker.values().fold(HashMap::new(), |mut acc, w| {
+            *acc.entry(w.clone()).or_default() += 1;
+            acc
+        });
+
+    assert_eq!(
+        worker_counts.len(),
+        3,
+        "min_group should distribute keys across all 3 workers, got {:?}",
+        worker_counts
+    );
+    for (worker, count) in &worker_counts {
+        assert_eq!(
+            *count, 3,
+            "Worker {} should have exactly 3 keys, got {}. Distribution: {:?}",
+            worker, count, key_to_worker
+        );
+    }
+
+    ctx.shutdown().await;
+}
+
+all_backend_e2e_test!(test_min_group_concurrent_distribution, test_min_group_concurrent_distribution_impl, 3910);
+
+async fn test_min_group_sticky_routing_impl(base_port: u16) {
+    let config = TestRouterConfig::manual_min_group(base_port);
+    let ctx = AppTestContext::new_with_config(
+        config,
+        TestWorkerConfig::slow_workers(base_port + 26000, 3, 200),
+    )
+    .await;
+
+    let app = ctx.create_app().await;
+    let routing_key = "sticky-key-123";
+
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let app_clone = app.clone();
+        let key = routing_key.to_string();
+        let handle = tokio::spawn(async move { send_request(app_clone, &key).await });
+        handles.push(handle);
+    }
+
+    let results: Vec<(String, String)> = futures_util::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let workers: Vec<String> = results.into_iter().map(|(_, w)| w).collect();
+    let unique_workers: HashSet<&String> = workers.iter().collect();
+    assert_eq!(
+        unique_workers.len(),
+        1,
+        "All requests with same routing key should route to same worker, got {:?}",
+        unique_workers
+    );
+
+    ctx.shutdown().await;
+}
+
+all_backend_e2e_test!(test_min_group_sticky_routing, test_min_group_sticky_routing_impl, 3920);
+
+async fn test_min_group_mixed_concurrent_routing_impl(base_port: u16) {
+    let config = TestRouterConfig::manual_min_group(base_port);
+    let ctx = AppTestContext::new_with_config(
+        config,
+        TestWorkerConfig::slow_workers(base_port + 26000, 2, 300),
+    )
+    .await;
+
+    let app = ctx.create_app().await;
+
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let routing_key = format!("key-{}", i);
+        for _ in 0..3 {
             let app_clone = app.clone();
-            let key = routing_key.to_string();
+            let key = routing_key.clone();
             let handle = tokio::spawn(async move { send_request(app_clone, &key).await });
             handles.push(handle);
         }
+    }
 
-        let results: Vec<(String, String)> = futures_util::future::join_all(handles)
-            .await
-            .into_iter()
-            .map(|r| r.unwrap())
-            .collect();
+    let results: Vec<(String, String)> = futures_util::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
 
-        let workers: Vec<String> = results.into_iter().map(|(_, w)| w).collect();
-        let unique_workers: HashSet<&String> = workers.iter().collect();
+    let mut key_to_workers: HashMap<String, HashSet<String>> = HashMap::new();
+    for (key, worker) in results {
+        key_to_workers.entry(key).or_default().insert(worker);
+    }
+
+    for (key, workers) in &key_to_workers {
         assert_eq!(
-            unique_workers.len(),
+            workers.len(),
             1,
-            "All requests with same routing key should route to same worker, got {:?}",
-            unique_workers
+            "Key {} should route to exactly one worker (sticky), but got {:?}",
+            key,
+            workers
         );
-
-        ctx.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn test_min_group_mixed_concurrent_routing() {
-        let config = TestRouterConfig::manual_min_group(3912);
+    let all_workers: HashSet<String> = key_to_workers.values().flatten().cloned().collect();
+    assert_eq!(
+        all_workers.len(),
+        2,
+        "Keys should be distributed across both workers"
+    );
 
-        let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(29930, 2, 300))
-                .await;
-
-        let app = ctx.create_app().await;
-
-        let mut handles = Vec::new();
-        for i in 0..4 {
-            let routing_key = format!("key-{}", i);
-            for _ in 0..3 {
-                let app_clone = app.clone();
-                let key = routing_key.clone();
-                let handle = tokio::spawn(async move { send_request(app_clone, &key).await });
-                handles.push(handle);
-            }
-        }
-
-        let results: Vec<(String, String)> = futures_util::future::join_all(handles)
-            .await
-            .into_iter()
-            .map(|r| r.unwrap())
-            .collect();
-
-        let mut key_to_workers: HashMap<String, HashSet<String>> = HashMap::new();
-        for (key, worker) in results {
-            key_to_workers.entry(key).or_default().insert(worker);
-        }
-
-        for (key, workers) in &key_to_workers {
-            assert_eq!(
-                workers.len(),
-                1,
-                "Key {} should route to exactly one worker (sticky), but got {:?}",
-                key,
-                workers
-            );
-        }
-
-        let all_workers: HashSet<String> = key_to_workers.values().flatten().cloned().collect();
-        assert_eq!(
-            all_workers.len(),
-            2,
-            "Keys should be distributed across both workers"
-        );
-
-        ctx.shutdown().await;
-    }
+    ctx.shutdown().await;
 }
+
+all_backend_e2e_test!(test_min_group_mixed_concurrent_routing, test_min_group_mixed_concurrent_routing_impl, 3930);

@@ -6,9 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use smg::{
-    config::ManualConfig,
     core::{BasicWorkerBuilder, Worker, WorkerType},
-    policies::{LoadBalancingPolicy, ManualPolicy, SelectWorkerInfo},
+    policies::{LoadBalancingPolicy, ManualConfig, ManualPolicy, SelectWorkerInfo},
 };
 
 use crate::common::redis_test_server::RedisTestServer;
