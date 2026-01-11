@@ -163,7 +163,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: merged-configs-all
-          path: ${{ env.CONFIG_DIR }}/**
+          path: ./downloaded_configs/**
           if-no-files-found: warn
 
       - name: Create PR with tuned configs
