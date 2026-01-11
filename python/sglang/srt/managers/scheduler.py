@@ -1838,7 +1838,7 @@ class Scheduler(
     ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
-            ready_grammar_requests = self.grammar_manager.move_ready_grammar_requests()
+            ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
@@ -2498,15 +2498,10 @@ class Scheduler(
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
-        for req in self.grammar_manager.grammar_queue:
-            # Abort method 2: call `set_finish_with_abort`
-            # The request will still run one prefill forward pass.
-            # In this case, we change the input_ids to be only one token to make this prefill cheap.
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                logger.debug(f"Abort grammar queue request. {req.rid=}")
-                if req.grammar:
-                    req.grammar.cancel()
-                req.set_finish_with_abort("Aborted by AbortReq.")
+        # Abort method 2: call `set_finish_with_abort`
+        # The request will still run one prefill forward pass.
+        # In this case, we change the input_ids to be only one token to make this prefill cheap.
+        self.grammar_manager.abort_requests(recv_req)
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from concurrent import futures
 from typing import TYPE_CHECKING, List
 
@@ -11,12 +12,13 @@ from sglang.srt.constrained.base_grammar_backend import (
 )
 from sglang.srt.environ import envs
 
-GRAMMAR_TIMEOUT = envs.SGLANG_GRAMMAR_TIMEOUT.get()
-
-
 if TYPE_CHECKING:
+    from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
+
+GRAMMAR_TIMEOUT = envs.SGLANG_GRAMMAR_TIMEOUT.get()
+logger = logging.getLogger(__name__)
 
 
 class GrammarManager:
@@ -40,6 +42,14 @@ class GrammarManager:
 
     def has_waiting_grammars(self) -> bool:
         return len(self.grammar_queue) > 0
+
+    def abort_requests(self, recv_req: AbortReq):
+        for req in self.grammar_queue:
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                logger.debug(f"Abort grammar queue request. {req.rid=}")
+                if req.grammar:
+                    req.grammar.cancel()
+                req.set_finish_with_abort("Aborted by AbortReq.")
 
     def process_req_with_grammar(self, req: Req) -> bool:
         # Init grammar cache for this request
@@ -81,7 +91,7 @@ class GrammarManager:
 
         return add_to_grammar_queue
 
-    def move_ready_grammar_requests(self) -> List[Req]:
+    def get_ready_grammar_requests(self) -> List[Req]:
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
 
         num_ready_reqs = 0
