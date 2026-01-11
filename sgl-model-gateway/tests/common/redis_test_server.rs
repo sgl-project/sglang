@@ -104,7 +104,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore]
     async fn test_redis_server_start_stop() {
         let server = RedisTestServer::start().await.unwrap();
         assert!(server.url().starts_with("redis://"));

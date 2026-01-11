@@ -111,7 +111,6 @@ async fn test_redis_failover_to_second_candidate() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_redis_worker_recovery() {
     let server = RedisTestServer::start().await.unwrap();
     let policy = create_redis_policy(server.url()).await;
@@ -139,7 +138,6 @@ async fn test_redis_worker_recovery() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_redis_both_candidates_unhealthy() {
     let server = RedisTestServer::start().await.unwrap();
     let policy = create_redis_policy(server.url()).await;
@@ -169,7 +167,6 @@ async fn test_redis_both_candidates_unhealthy() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
 async fn test_redis_multi_instance_consistency() {
     let server = RedisTestServer::start().await.unwrap();
     let policy1 = create_redis_policy(server.url()).await;
@@ -192,7 +189,6 @@ async fn test_redis_multi_instance_consistency() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_redis_cross_instance_failover() {
     let server = RedisTestServer::start().await.unwrap();
     let policy1 = create_redis_policy(server.url()).await;
@@ -223,7 +219,6 @@ async fn test_redis_cross_instance_failover() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
 async fn test_redis_concurrent_same_key() {
     let server = RedisTestServer::start().await.unwrap();
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
@@ -265,7 +260,6 @@ async fn test_redis_concurrent_same_key() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_redis_concurrent_different_keys() {
     let server = RedisTestServer::start().await.unwrap();
     let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
@@ -310,7 +304,6 @@ async fn test_redis_concurrent_different_keys() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
 async fn test_redis_ttl_expiry() {
     let server = RedisTestServer::start().await.unwrap();
 
@@ -342,7 +335,6 @@ async fn test_redis_ttl_expiry() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
 async fn test_redis_fallback_on_no_healthy_workers() {
     let server = RedisTestServer::start().await.unwrap();
     let policy = create_redis_policy(server.url()).await;
