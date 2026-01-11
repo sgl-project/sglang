@@ -22,7 +22,7 @@ use std::{sync::Arc, time::Instant};
 use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use rand::Rng;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
@@ -406,12 +406,12 @@ impl RedisBackend {
         assignment_mode: ManualAssignmentMode,
     ) -> Result<(Option<usize>, ExecutionBranch), ()> {
         let mut conn = self.pool.get().await.map_err(|e| {
-            error!("Redis pool.get failed: {}", e);
+            warn!("Redis pool.get failed: {}", e);
             Metrics::record_manual_policy_redis_error("conn");
         })?;
 
         let old_data = RedisCommandUtil::getex(&mut conn, key, self.ttl_secs).await.map_err(|e| {
-            error!("Redis GETEX failed: {}", e);
+            warn!("Redis GETEX failed: {}", e);
             Metrics::record_manual_policy_redis_error("getex");
         })?;
 
@@ -436,7 +436,7 @@ impl RedisBackend {
         let success = RedisCommandUtil::cas(&mut conn, key, old_data.as_deref(), &new_data, self.ttl_secs)
             .await
             .map_err(|e| {
-                error!("Redis CAS failed: {}", e);
+                warn!("Redis CAS failed: {}", e);
                 Metrics::record_manual_policy_redis_error("cas");
             })?;
 
