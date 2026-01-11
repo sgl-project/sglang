@@ -9,28 +9,11 @@ use serde_json::json;
 use tower::ServiceExt;
 
 use crate::common::{
-    manual_routing_test_helpers::get_redis_config, AppTestContext, TestRouterConfig,
-    TestWorkerConfig,
+    manual_routing_test_helpers::{
+        all_backend_e2e_test, get_redis_config, send_request, ROUTING_KEY_HEADER,
+    },
+    AppTestContext, TestRouterConfig, TestWorkerConfig,
 };
-
-const ROUTING_KEY_HEADER: &str = "X-SMG-Routing-Key";
-
-macro_rules! all_backend_e2e_test {
-    ($name:ident, $base_port:expr) => {
-        paste::paste! {
-            #[tokio::test]
-            async fn [<$name _local_backend>]() {
-                [<$name _impl>]($base_port, None, None).await;
-            }
-
-            #[tokio::test]
-            async fn [<$name _redis_backend>]() {
-                let cfg = get_redis_config(stringify!($name));
-                [<$name _impl>]($base_port + 1000, Some(cfg.url), Some(cfg.key_prefix)).await;
-            }
-        }
-    };
-}
 
 // ============================================================================
 // Basic Manual Routing Tests
@@ -211,34 +194,6 @@ all_backend_e2e_test!(test_routing_consistency, 3720);
 // ============================================================================
 // Min Group Mode Tests
 // ============================================================================
-
-async fn send_request(app: axum::Router, routing_key: &str) -> (String, String) {
-    let payload = json!({
-        "text": format!("Request for {}", routing_key),
-        "stream": false
-    });
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/generate")
-        .header(CONTENT_TYPE, "application/json")
-        .header(ROUTING_KEY_HEADER, routing_key)
-        .body(Body::from(serde_json::to_string(&payload).unwrap()))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let worker_id = resp
-        .headers()
-        .get("x-worker-id")
-        .expect("Response should have x-worker-id header")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    (routing_key.to_string(), worker_id)
-}
 
 async fn test_min_group_concurrent_distribution_impl(
     base_port: u16,
