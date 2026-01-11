@@ -135,16 +135,16 @@ impl TestRouterConfig {
     pub fn manual_with_full_options(
         port: u16,
         assignment_mode: ManualAssignmentMode,
-        redis_cfg: Option<&super::manual_routing_test_helpers::RedisConfig>,
+        cfg: &super::manual_routing_test_helpers::TestManualConfig,
     ) -> RouterConfig {
         RouterConfig::builder()
             .regular_mode(vec![])
             .policy(PolicyConfig::Manual {
                 eviction_interval_secs: 60,
-                max_idle_secs: 3600,
+                max_idle_secs: cfg.max_idle_secs,
                 assignment_mode,
-                redis_url: redis_cfg.map(|c| c.url.clone()),
-                redis_key_prefix: redis_cfg.map(|c| c.key_prefix.clone()),
+                redis_url: cfg.redis_url.clone(),
+                redis_key_prefix: cfg.redis_key_prefix.clone(),
             })
             .host(defaults::HOST)
             .port(port)

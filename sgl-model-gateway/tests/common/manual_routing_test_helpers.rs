@@ -18,9 +18,59 @@ use super::redis_test_server::get_shared_server;
 
 pub const ROUTING_KEY_HEADER: &str = "X-SMG-Routing-Key";
 
-pub struct RedisConfig {
-    pub url: String,
-    pub key_prefix: String,
+#[derive(Clone)]
+pub struct TestManualConfig {
+    pub redis_url: Option<String>,
+    pub redis_key_prefix: Option<String>,
+    pub max_idle_secs: u64,
+}
+
+impl Default for TestManualConfig {
+    fn default() -> Self {
+        Self {
+            redis_url: None,
+            redis_key_prefix: None,
+            max_idle_secs: 4 * 3600,
+        }
+    }
+}
+
+impl TestManualConfig {
+    pub fn local() -> Self {
+        Self::default()
+    }
+
+    pub fn redis(test_name: &str) -> Self {
+        let server = get_shared_server();
+        Self {
+            redis_url: Some(server.url().to_string()),
+            redis_key_prefix: Some(random_prefix(test_name)),
+            max_idle_secs: 4 * 3600,
+        }
+    }
+
+    pub fn redis_with_prefix(prefix: &str) -> Self {
+        let server = get_shared_server();
+        Self {
+            redis_url: Some(server.url().to_string()),
+            redis_key_prefix: Some(prefix.to_string()),
+            max_idle_secs: 4 * 3600,
+        }
+    }
+
+    pub fn with_ttl(mut self, secs: u64) -> Self {
+        self.max_idle_secs = secs;
+        self
+    }
+
+    pub fn build_policy(&self) -> ManualPolicy {
+        ManualPolicy::with_config(ManualConfig {
+            redis_url: self.redis_url.clone(),
+            redis_key_prefix: self.redis_key_prefix.clone(),
+            max_idle_secs: self.max_idle_secs,
+            ..Default::default()
+        })
+    }
 }
 
 pub fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
@@ -44,41 +94,6 @@ pub fn headers_with_routing_key(key: &str) -> http::HeaderMap {
 pub fn random_prefix(test_name: &str) -> String {
     let random_id: u64 = rand::random();
     format!("{}:{}:", test_name, random_id)
-}
-
-pub fn get_redis_config(test_name: &str) -> RedisConfig {
-    let server = get_shared_server();
-    RedisConfig {
-        url: server.url().to_string(),
-        key_prefix: random_prefix(test_name),
-    }
-}
-
-pub fn create_policy(redis_cfg: Option<RedisConfig>) -> ManualPolicy {
-    ManualPolicy::with_config(ManualConfig {
-        redis_url: redis_cfg.as_ref().map(|c| c.url.clone()),
-        redis_key_prefix: redis_cfg.as_ref().map(|c| c.key_prefix.clone()),
-        ..Default::default()
-    })
-}
-
-pub fn create_redis_policy(test_name: &str) -> ManualPolicy {
-    create_policy(Some(get_redis_config(test_name)))
-}
-
-pub fn create_redis_policy_with_explicit_prefix(prefix: &str) -> ManualPolicy {
-    let server = get_shared_server();
-    create_policy(Some(server.url().to_string()), Some(prefix.to_string()))
-}
-
-pub fn create_redis_policy_with_ttl(test_name: &str, max_idle_secs: u64) -> ManualPolicy {
-    let server = get_shared_server();
-    ManualPolicy::with_config(ManualConfig {
-        redis_url: Some(server.url().to_string()),
-        redis_key_prefix: Some(random_prefix(test_name)),
-        max_idle_secs,
-        ..Default::default()
-    })
 }
 
 pub async fn send_request(app: axum::Router, routing_key: &str) -> (String, String) {
@@ -111,39 +126,19 @@ pub async fn send_request(app: axum::Router, routing_key: &str) -> (String, Stri
 
 #[macro_export]
 macro_rules! manual_routing_all_backend_test {
-    ($name:ident) => {
+    ($name:ident $(, $extra:expr)*) => {
         paste::paste! {
             #[tokio::test]
             async fn [<$name _local_backend>]() {
-                [<$name _impl>](None).await;
+                [<$name _impl>]($crate::common::manual_routing_test_helpers::TestManualConfig::local() $(, $extra)*).await;
             }
 
             #[tokio::test]
             async fn [<$name _redis_backend>]() {
-                let cfg = $crate::common::manual_routing_test_helpers::get_redis_config(stringify!($name));
-                [<$name _impl>](Some(cfg)).await;
+                [<$name _impl>]($crate::common::manual_routing_test_helpers::TestManualConfig::redis(stringify!($name)) $(, $extra)*).await;
             }
         }
     };
 }
 
-#[macro_export]
-macro_rules! manual_routing_all_backend_e2e_test {
-    ($name:ident, $base_port:expr) => {
-        paste::paste! {
-            #[tokio::test]
-            async fn [<$name _local_backend>]() {
-                [<$name _impl>]($base_port, None).await;
-            }
-
-            #[tokio::test]
-            async fn [<$name _redis_backend>]() {
-                let cfg = $crate::common::manual_routing_test_helpers::get_redis_config(stringify!($name));
-                [<$name _impl>]($base_port + 1000, Some(cfg)).await;
-            }
-        }
-    };
-}
-
-pub use manual_routing_all_backend_e2e_test;
 pub use manual_routing_all_backend_test;
