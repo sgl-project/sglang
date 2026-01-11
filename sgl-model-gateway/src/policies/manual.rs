@@ -88,7 +88,16 @@ enum ExecutionBranch {
 impl ExecutionBranch {
     fn as_str(&self) -> &'static str {
         match self {
-            // TODO
+            Self::NoHealthyWorkers => "no_healthy_workers",
+            Self::NoRoutingId => "no_routing_id",
+            Self::OccupiedHit => "occupied_hit",
+            Self::OccupiedMiss => "occupied_miss",
+            Self::Vacant => "vacant",
+            Self::RedisPoolGetException => "redis_pool_get_exception",
+            Self::RedisGetexException => "redis_getex_exception",
+            Self::RedisCasRace => "redis_cas_race",
+            Self::RedisCasException => "redis_cas_exception",
+            Self::RedisBackendMaxRetries => "redis_backend_max_retries",
         }
     }
 }
@@ -402,7 +411,7 @@ impl RedisBackend {
             }
         };
 
-        let old_data = match RedisCommandUtil::getex(&mut conn, key, self.ttl_secs).await {
+        let old_data = match RedisCommandUtil::getex(&mut conn, &key, self.ttl_secs).await {
             Ok(x) => x,
             Err(e) => {
                 warn!("Redis getex exception: {}", e);
@@ -428,7 +437,7 @@ impl RedisBackend {
             (new_url.to_string(), ExecutionBranch::Vacant)
         };
 
-        match RedisCommandUtil::cas(&mut conn, key, old_data.as_deref(), &new_data, self.ttl_secs).await {
+        match RedisCommandUtil::cas(&mut conn, &key, old_data.as_deref(), &new_data, self.ttl_secs).await {
             Ok(true) => (Some(selected_idx), branch),
             Ok(false) => (None, ExecutionBranch::RedisCasRace),
             Err(e) => {
