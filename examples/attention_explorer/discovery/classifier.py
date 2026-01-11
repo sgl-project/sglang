@@ -48,22 +48,39 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # =============================================================================
 
-FINGERPRINT_DIM = 20
+# Fingerprint dimension (schema v1 = 20, schema v2 = 21 with rotational_variance)
+FINGERPRINT_DIM = 20  # Base dimension (backwards compatible)
+FINGERPRINT_DIM_V2 = 21  # Extended dimension with rotational_variance
 
 # Fingerprint layout (schema v1)
 FP_LOCAL_MASS = 0
 FP_MID_MASS = 1
 FP_LONG_MASS = 2
 FP_ENTROPY = 3
+FP_HISTOGRAM_START = 4
+FP_HISTOGRAM_END = 12
+FP_LAYER_STATS_START = 12
+FP_LAYER_STATS_END = 20
 
-# Zone thresholds
+# Schema v2 extension
+FP_ROTATIONAL_VARIANCE = 20  # Position 20 in v2 fingerprints
+
+# Zone thresholds (updated to use rotational_variance when available)
 ZONE_THRESHOLDS = {
     'syntax_floor': {
         'local_mass_min': 0.5,
         'entropy_max': 2.5,
+        # Low rotational variance suggests position-driven attention (syntax)
+        'rotational_variance_max': 0.25,
     },
     'structure_ripple': {
         'long_mass_min': 0.25,
+        # High rotational variance suggests semantic attention (reasoning)
+        'rotational_variance_min': 0.35,
+    },
+    'semantic_bridge': {
+        # Medium rotational variance - balanced semantic/positional
+        'rotational_variance_range': (0.15, 0.5),
     },
 }
 
@@ -345,27 +362,79 @@ class OnlineClassifier:
         return results
 
     def _assign_zone(self, fingerprint: np.ndarray) -> Tuple[str, float]:
-        """Assign zone label based on fingerprint features."""
+        """
+        Assign zone label based on fingerprint features.
+
+        Uses rotational_variance when available (v2 fingerprints) to improve
+        zone classification accuracy:
+
+        - syntax_floor: High local mass + low entropy + LOW rotational variance
+          (position-driven attention for grammar/syntax)
+
+        - structure_ripple: High long-range mass + HIGH rotational variance
+          (semantic reasoning across document structure)
+
+        - semantic_bridge: Balanced attention, medium rotational variance
+          (connecting meaning across moderate distances)
+        """
         local_mass = fingerprint[FP_LOCAL_MASS]
         mid_mass = fingerprint[FP_MID_MASS]
         long_mass = fingerprint[FP_LONG_MASS]
         entropy = fingerprint[FP_ENTROPY]
 
+        # Check for rotational_variance (v2 fingerprint)
+        has_rotational_variance = len(fingerprint) > FP_ROTATIONAL_VARIANCE
+        rotational_variance = fingerprint[FP_ROTATIONAL_VARIANCE] if has_rotational_variance else None
+
         total_mass = max(local_mass + mid_mass + long_mass, 1e-6)
 
-        # Check syntax_floor (high local, low entropy)
-        if local_mass > ZONE_THRESHOLDS['syntax_floor']['local_mass_min']:
-            if entropy < ZONE_THRESHOLDS['syntax_floor']['entropy_max']:
-                confidence = min(1.0, local_mass * (1.0 - entropy / 4.0))
-                return 'syntax_floor', confidence
+        # Check syntax_floor (high local, low entropy, optionally low rotational variance)
+        sf_thresh = ZONE_THRESHOLDS['syntax_floor']
+        if local_mass > sf_thresh['local_mass_min']:
+            if entropy < sf_thresh['entropy_max']:
+                # If we have rotational variance, verify it's low (position-driven)
+                if rotational_variance is not None:
+                    if rotational_variance <= sf_thresh.get('rotational_variance_max', 1.0):
+                        # Strong confidence when rotational variance confirms position-driven
+                        confidence = min(1.0, local_mass * (1.0 - entropy / 4.0) * (1.0 - rotational_variance))
+                        return 'syntax_floor', confidence
+                    # High rotational variance with local mass = semantic, not syntax
+                    # Fall through to check other zones
+                else:
+                    # No rotational variance, use original heuristic
+                    confidence = min(1.0, local_mass * (1.0 - entropy / 4.0))
+                    return 'syntax_floor', confidence
 
-        # Check structure_ripple (high long-range)
-        if long_mass > ZONE_THRESHOLDS['structure_ripple']['long_mass_min']:
-            confidence = min(1.0, long_mass * 1.5)
-            return 'structure_ripple', confidence
+        # Check structure_ripple (high long-range, optionally high rotational variance)
+        sr_thresh = ZONE_THRESHOLDS['structure_ripple']
+        if long_mass > sr_thresh['long_mass_min']:
+            # If we have rotational variance, verify it's high (semantic reasoning)
+            if rotational_variance is not None:
+                rv_min = sr_thresh.get('rotational_variance_min', 0.0)
+                if rotational_variance >= rv_min:
+                    # High confidence when rotational variance confirms semantic reasoning
+                    confidence = min(1.0, (long_mass + rotational_variance) / 2)
+                    return 'structure_ripple', confidence
+                # Low rotational variance with long mass = structural, not semantic
+                # Still return structure_ripple but with lower confidence
+                confidence = min(1.0, long_mass * 0.8)
+                return 'structure_ripple', confidence
+            else:
+                confidence = min(1.0, long_mass * 1.5)
+                return 'structure_ripple', confidence
 
         # Default: semantic_bridge
-        confidence = mid_mass / total_mass
+        # When rotational variance is available, use it to boost confidence
+        if rotational_variance is not None:
+            sb_range = ZONE_THRESHOLDS['semantic_bridge'].get('rotational_variance_range', (0.0, 1.0))
+            if sb_range[0] <= rotational_variance <= sb_range[1]:
+                # Rotational variance in expected range for semantic bridging
+                confidence = min(1.0, mid_mass / total_mass + 0.1)
+            else:
+                confidence = mid_mass / total_mass * 0.9
+        else:
+            confidence = mid_mass / total_mass
+
         return 'semantic_bridge', confidence
 
     def _classify_hdbscan(self, fingerprint: np.ndarray) -> Tuple[int, float]:

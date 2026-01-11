@@ -770,6 +770,139 @@ def explain_attention_step(
 # TESTING
 # =============================================================================
 
+# =============================================================================
+# FINGERPRINT INTEGRATION
+# =============================================================================
+
+def compute_rotational_variance_for_fingerprint(
+    query_pos: int,
+    key_positions: List[int],
+    attention_scores: List[float],
+    derotator: Optional[RoPEDerotator] = None,
+) -> float:
+    """
+    Compute rotational variance for use in fingerprint schema v2.
+
+    This is a convenience function that extracts just the rotational variance
+    from a full de-rotation analysis, suitable for extending a fingerprint
+    from 20 to 21 dimensions.
+
+    Args:
+        query_pos: Position of the query token
+        key_positions: Positions of attended tokens
+        attention_scores: Attention weights
+
+    Returns:
+        Rotational variance (0.0 = pure semantic, 1.0 = pure positional)
+
+    Example:
+        >>> # During fingerprint computation
+        >>> rv = compute_rotational_variance_for_fingerprint(
+        ...     query_pos=100,
+        ...     key_positions=[50, 90, 95, 98, 99],
+        ...     attention_scores=[0.1, 0.1, 0.2, 0.3, 0.3]
+        ... )
+        >>> # Extend 20-dim fingerprint to 21-dim
+        >>> fingerprint_v2 = np.append(fingerprint_v1, rv)
+    """
+    if derotator is None:
+        derotator = RoPEDerotator()
+
+    if not key_positions or not attention_scores:
+        return 0.5  # Neutral default
+
+    result = derotator.analyze(query_pos, key_positions, attention_scores)
+    return result.rotational_variance
+
+
+def compute_rotational_variance_batch(
+    query_positions: List[int],
+    key_positions_batch: List[List[int]],
+    attention_scores_batch: List[List[float]],
+    derotator: Optional[RoPEDerotator] = None,
+) -> np.ndarray:
+    """
+    Compute rotational variance for a batch of attention patterns.
+
+    Optimized for batch processing during fingerprint computation.
+
+    Args:
+        query_positions: List of query positions for each step
+        key_positions_batch: List of key position lists
+        attention_scores_batch: List of attention score lists
+
+    Returns:
+        Array of rotational variance values
+
+    Example:
+        >>> # For a batch of 100 decode steps
+        >>> rv_batch = compute_rotational_variance_batch(
+        ...     query_positions=list(range(100, 200)),
+        ...     key_positions_batch=[...],
+        ...     attention_scores_batch=[...]
+        ... )
+        >>> # Append to fingerprint matrix
+        >>> fingerprints_v2 = np.column_stack([fingerprints_v1, rv_batch])
+    """
+    if derotator is None:
+        derotator = RoPEDerotator()
+
+    n = len(query_positions)
+    variances = np.zeros(n, dtype=np.float32)
+
+    for i in range(n):
+        if key_positions_batch[i] and attention_scores_batch[i]:
+            result = derotator.analyze(
+                query_positions[i],
+                key_positions_batch[i],
+                attention_scores_batch[i]
+            )
+            variances[i] = result.rotational_variance
+        else:
+            variances[i] = 0.5  # Neutral default
+
+    return variances
+
+
+def extend_fingerprint_with_rotational_variance(
+    fingerprint: np.ndarray,
+    rotational_variance: float,
+) -> np.ndarray:
+    """
+    Extend a 20-dim fingerprint to 21-dim by adding rotational variance.
+
+    Args:
+        fingerprint: 20-dimensional fingerprint (schema v1)
+        rotational_variance: Rotational variance value (0-1)
+
+    Returns:
+        21-dimensional fingerprint (schema v2)
+    """
+    if len(fingerprint) >= 21:
+        # Already v2 or later
+        return fingerprint
+    return np.append(fingerprint, rotational_variance)
+
+
+def extend_fingerprints_batch(
+    fingerprints: np.ndarray,
+    rotational_variances: np.ndarray,
+) -> np.ndarray:
+    """
+    Extend a batch of 20-dim fingerprints to 21-dim.
+
+    Args:
+        fingerprints: Array of shape (N, 20)
+        rotational_variances: Array of shape (N,)
+
+    Returns:
+        Array of shape (N, 21)
+    """
+    if fingerprints.shape[1] >= 21:
+        return fingerprints
+    return np.column_stack([fingerprints, rotational_variances])
+
+
 def demo():
     """Demonstrate the RoPE de-rotation analysis."""
     print("=" * 60)
