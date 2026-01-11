@@ -22,7 +22,7 @@ use std::{sync::Arc, time::Instant};
 use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use rand::Rng;
-use tracing::{error, info};
+use tracing::info;
 
 use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
