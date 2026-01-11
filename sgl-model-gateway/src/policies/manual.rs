@@ -314,6 +314,26 @@ impl RedisBackend {
         urls.join(",")
     }
 
+    async fn get_conn_with_retry(&self) -> Option<deadpool_redis::Connection> {
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAY_MS: u64 = 10;
+
+        for attempt in 0..MAX_RETRIES {
+            match self.pool.get().await {
+                Ok(c) => return Some(c),
+                Err(e) => {
+                    if attempt < MAX_RETRIES - 1 {
+                        warn!("Redis connection attempt {} failed: {}, retrying...", attempt + 1, e);
+                        tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS * (attempt as u64 + 1))).await;
+                    } else {
+                        error!("Redis connection failed after {} attempts: {}", MAX_RETRIES, e);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     async fn select_by_routing_id(
         &self,
         routing_id: &str,
@@ -323,10 +343,9 @@ impl RedisBackend {
     ) -> (usize, ExecutionBranch) {
         let key = self.key(routing_id);
 
-        let mut conn = match self.pool.get().await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Redis connection failed, using random: {}", e);
+        let mut conn = match self.get_conn_with_retry().await {
+            Some(c) => c,
+            None => {
                 return (random_select(healthy_indices), ExecutionBranch::Vacant);
             }
         };
