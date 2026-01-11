@@ -201,6 +201,7 @@ def _handle_output_by_index(output, i):
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
+            load=output.load if i == 0 else None,
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
@@ -290,6 +291,7 @@ def _handle_output_by_index(output, i):
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
+            load=output.load if i == 0 else None,
         )
     elif isinstance(output, BatchMultimodalOutput):
         new_output = BatchMultimodalOutput(
