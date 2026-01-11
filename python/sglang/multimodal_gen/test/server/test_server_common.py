@@ -528,6 +528,104 @@ Consider updating perf_baselines.json with the snippets below:
             "[LoRA Switch E2E] All dynamic switch E2E tests passed for %s", case.id
         )
 
+    def _test_dynamic_lora_loading(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+    ) -> None:
+        """
+        Test dynamic LoRA loading after server startup.
+
+        This test reproduces the LayerwiseOffload + set_lora issue:
+        - Server starts WITHOUT lora_path (LayerwiseOffloadManager initializes first)
+        - Then set_lora is called via API to load LoRA dynamically
+        - This tests the interaction between layerwise offload and dynamic LoRA loading
+        """
+        base_url = f"http://localhost:{ctx.port}/v1"
+        dynamic_lora_path = case.server_args.dynamic_lora_path
+
+        # Call set_lora to load LoRA dynamically after server startup
+        logger.info(
+            "[Dynamic LoRA] Loading LoRA dynamically via set_lora API for %s", case.id
+        )
+        logger.info("[Dynamic LoRA] LoRA path: %s", dynamic_lora_path)
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={"lora_nickname": "default", "lora_path": dynamic_lora_path},
+        )
+        assert resp.status_code == 200, f"Dynamic set_lora failed: {resp.text}"
+        logger.info("[Dynamic LoRA] set_lora succeeded for %s", case.id)
+
+    def _test_multi_lora_e2e(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+        generate_fn: Callable[[str, openai.Client], str],
+        first_lora_path: str,
+        second_lora_path: str,
+    ) -> None:
+        """
+        Test multiple LoRA adapters with different set_lora input scenarios.
+        Tests: basic multi-LoRA, different strengths, cached adapters, switch back to single.
+        """
+        base_url = f"http://localhost:{ctx.port}/v1"
+        client = OpenAI(base_url=base_url, api_key="dummy")
+
+        # Test 1: Basic multi-LoRA with list format
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={
+                "lora_nickname": ["default", "lora2"],
+                "lora_path": [first_lora_path, second_lora_path],
+                "target": "all",
+                "strength": [1.0, 1.0],
+            },
+        )
+        assert (
+            resp.status_code == 200
+        ), f"set_lora with multiple adapters failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        # Test 2: Different strengths
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={
+                "lora_nickname": ["default", "lora2"],
+                "lora_path": [first_lora_path, second_lora_path],
+                "target": "all",
+                "strength": [0.8, 0.5],
+            },
+        )
+        assert (
+            resp.status_code == 200
+        ), f"set_lora with different strengths failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        # Test 3: Different targets
+        requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={
+                "lora_nickname": ["default", "lora2"],
+                "lora_path": [first_lora_path, second_lora_path],
+                "target": ["transformer", "transformer_2"],
+                "strength": [0.8, 0.5],
+            },
+        )
+        assert (
+            resp.status_code == 200
+        ), f"set_lora with cached adapters failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        # Test 4: Switch back to single LoRA
+        resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        assert (
+            resp.status_code == 200
+        ), f"set_lora back to single adapter failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        logger.info("[Multi-LoRA] All multi-LoRA tests passed for %s", case.id)
+
     def _test_v1_models_endpoint(
         self, ctx: ServerContext, case: DiffusionTestCase
     ) -> None:
@@ -629,6 +727,11 @@ Consider updating perf_baselines.json with the snippets below:
         - test_diffusion_perf[qwen_image_edit]
         - etc.
         """
+        # Dynamic LoRA loading test - tests LayerwiseOffload + set_lora interaction
+        # Server starts WITHOUT lora_path, then set_lora is called after startup
+        if case.server_args.dynamic_lora_path:
+            self._test_dynamic_lora_loading(diffusion_server, case)
+
         generate_fn = get_generate_fn(
             model_path=case.server_args.model_path,
             modality=case.server_args.modality,
@@ -646,5 +749,23 @@ Consider updating perf_baselines.json with the snippets below:
         self._test_v1_models_endpoint(diffusion_server, case)
 
         # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
-        if case.server_args.lora_path:
+        if case.server_args.lora_path or case.server_args.dynamic_lora_path:
             self._test_lora_api_functionality(diffusion_server, case, generate_fn)
+
+            # Test dynamic LoRA switching (requires a second LoRA adapter)
+            if case.server_args.second_lora_path:
+                self._test_lora_dynamic_switch_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.second_lora_path,
+                )
+
+                # Test multi-LoRA functionality
+                self._test_multi_lora_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.lora_path,
+                    case.server_args.second_lora_path,
+                )
