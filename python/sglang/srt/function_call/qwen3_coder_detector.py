@@ -273,7 +273,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             if current_slice.startswith(self.tool_call_start_token):
                 self.parsed_pos += len(self.tool_call_start_token)
-                self.is_inside_tool_call = True  # [FIX] Enter tool call region
+                self.is_inside_tool_call = True
                 continue
 
             # -------------------------------------------------------
@@ -288,7 +288,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     self.current_tool_name_sent = True
                     self.current_tool_param_count = 0
                     self.json_started = False
-                    self.current_func_name = func_name  # Store for param parsing
+                    self.current_func_name = func_name
 
                     calls.append(
                         ToolCallItem(
