@@ -15,19 +15,6 @@ limitations under the License.
 
 from __future__ import annotations
 
-import dataclasses
-from dataclasses import dataclass
-from typing import List
-
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa import index_buf_accessor
-from sglang.srt.layers.attention.nsa.quant_k_cache import (
-    quantize_k_cache,
-    quantize_k_cache_separate,
-)
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-
 """
 Memory pool.
 
@@ -38,16 +25,26 @@ KVCache actually holds the physical kv cache.
 """
 
 import abc
+import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
+from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa import index_buf_accessor
+from sglang.srt.layers.attention.nsa.quant_k_cache import (
+    quantize_k_cache,
+    quantize_k_cache_separate,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -56,6 +53,10 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+store_cache = register_custom_op(store_cache, mutates_args=["k_cache", "v_cache"])
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -73,6 +74,43 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
+
+
+def _set_kv_buffer_impl(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+    row_dim: int,  # head_num * head_dim
+    store_dtype: torch.dtype,
+    device_module: Any,
+    alt_stream: Optional[torch.cuda.Stream] = None,
+    same_kv_dim: bool = True,
+) -> None:
+    row_bytes = row_dim * store_dtype.itemsize
+    if _is_cuda and same_kv_dim and can_use_store_cache(row_bytes):
+        return store_cache(
+            k.view(-1, row_dim),
+            v.view(-1, row_dim),
+            k_cache.view(-1, row_dim),
+            v_cache.view(-1, row_dim),
+            indices,
+            row_bytes=row_bytes,
+        )
+
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+    if get_is_capture_mode() and alt_stream is not None:
+        current_stream = device_module.current_stream()
+        alt_stream.wait_stream(current_stream)
+        k_cache[indices] = k
+        with device_module.stream(alt_stream):
+            v_cache[indices] = v
+        current_stream.wait_stream(alt_stream)
+    else:  # fallback to naive implementation
+        k_cache[indices] = k
+        v_cache[indices] = v
 
 
 class ReqToTokenPool:
@@ -661,6 +699,10 @@ class MHATokenToKVPool(KVCache):
 
         self._finalize_allocation_log(size)
 
+        # for store_cache JIT kernel
+        self.row_dim = self.head_num * self.head_dim
+        self.same_kv_dim = self.head_dim == self.v_head_dim
+
     def _init_kv_copy_and_warmup(self):
         # Heuristics for KV copy tiling
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
@@ -868,8 +910,6 @@ class MHATokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
@@ -886,17 +926,18 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if get_is_capture_mode() and self.alt_stream is not None:
-            # Overlap the copy of K and V cache for small batch size
-            current_stream = self.device_module.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            with self.device_module.stream(self.alt_stream):
-                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+        _set_kv_buffer_impl(
+            cache_k,
+            cache_v,
+            self.k_buffer[layer_id - self.start_layer],
+            self.v_buffer[layer_id - self.start_layer],
+            loc,
+            row_dim=self.row_dim,
+            store_dtype=self.store_dtype,
+            device_module=self.device_module,
+            alt_stream=self.alt_stream,
+            same_kv_dim=self.same_kv_dim,
+        )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
