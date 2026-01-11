@@ -162,7 +162,7 @@ NSA_CHOICES = [
     "aiter",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "spectral"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -316,6 +316,8 @@ class ServerArgs:
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
     prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
     prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
+    spectral_retention_ratio: float = 0.3  # For spectral eviction: fraction to keep
+    spectral_weight: float = 0.7  # For spectral eviction: weight vs LRU
 
     # Runtime options
     device: Optional[str] = None
@@ -2956,7 +2958,19 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'spectral' uses attention fingerprints for geometric eviction.",
+        )
+        parser.add_argument(
+            "--spectral-retention-ratio",
+            type=float,
+            default=ServerArgs.spectral_retention_ratio,
+            help="Fraction of tokens to retain with spectral eviction (0.3 = 30%%). Only used when --radix-eviction-policy=spectral.",
+        )
+        parser.add_argument(
+            "--spectral-weight",
+            type=float,
+            default=ServerArgs.spectral_weight,
+            help="Weight of spectral score vs LRU in eviction decisions (0.7 = 70%% spectral). Only used when --radix-eviction-policy=spectral.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",

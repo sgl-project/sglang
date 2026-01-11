@@ -109,6 +109,14 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
+        # Spectral eviction metadata (for --radix-eviction-policy spectral)
+        # Attention fingerprint: 20D feature vector from attention patterns
+        self.spectral_fingerprint: Optional[Any] = None  # np.ndarray
+        # Manifold zone classification: syntax_floor, semantic_bridge, etc.
+        self.manifold_zone: Optional[str] = None
+        # Spectral coherence: 0-1 measure of how well token fits learned manifold
+        self.spectral_coherence: Optional[float] = None
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -289,9 +297,19 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
         elif self.eviction_policy == "priority":
             self.eviction_strategy: EvictionStrategy = PriorityStrategy()
+        elif self.eviction_policy == "spectral":
+            from sglang.srt.mem_cache.evict_policy import get_spectral_strategy_class
+            SpectralEvictionStrategy = get_spectral_strategy_class()
+            # Get spectral eviction parameters from cache_init_params
+            retention_ratio = getattr(cache_init_params, 'spectral_retention_ratio', 0.3)
+            spectral_weight = getattr(cache_init_params, 'spectral_weight', 0.7)
+            self.eviction_strategy: EvictionStrategy = SpectralEvictionStrategy(
+                retention_ratio=retention_ratio,
+                spectral_weight=spectral_weight,
+            )
         else:
             raise ValueError(
-                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority'."
+                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'spectral'."
             )
         self.reset()
 
@@ -606,6 +624,85 @@ class RadixCache(BasePrefixCache):
     def protected_size(self):
         # protected size refers to the size of the cache that is locked
         return self.protected_size_
+
+    def attach_spectral_metadata(
+        self,
+        node: TreeNode,
+        fingerprint: Optional[Any] = None,
+        manifold_zone: Optional[str] = None,
+        spectral_coherence: Optional[float] = None,
+    ):
+        """
+        Attach spectral eviction metadata to a tree node.
+
+        This is called when fingerprints are computed during generation
+        and enables the spectral eviction strategy to make informed decisions.
+
+        Args:
+            node: TreeNode to attach metadata to
+            fingerprint: 20D attention fingerprint array
+            manifold_zone: Zone classification (syntax_floor, semantic_bridge, etc.)
+            spectral_coherence: 0-1 score of manifold fit
+        """
+        if node is None or node is self.root_node:
+            return
+
+        if fingerprint is not None:
+            node.spectral_fingerprint = fingerprint
+        if manifold_zone is not None:
+            node.manifold_zone = manifold_zone
+        if spectral_coherence is not None:
+            node.spectral_coherence = spectral_coherence
+
+    def attach_spectral_metadata_to_path(
+        self,
+        last_node: TreeNode,
+        fingerprints: Optional[List[Any]] = None,
+        manifold_zones: Optional[List[str]] = None,
+        coherences: Optional[List[float]] = None,
+    ):
+        """
+        Attach spectral metadata to all nodes along the path from last_node to root.
+
+        This is useful when attaching fingerprints collected during a full generation.
+        Each fingerprint corresponds to a token position.
+
+        Args:
+            last_node: The leaf node of the request path
+            fingerprints: List of fingerprints (one per token)
+            manifold_zones: List of zone classifications
+            coherences: List of coherence scores
+        """
+        if last_node is None or self.eviction_policy != "spectral":
+            return
+
+        # Collect path from root to last_node
+        path = []
+        node = last_node
+        while node is not None and node is not self.root_node:
+            path.append(node)
+            node = node.parent
+        path.reverse()  # Root to leaf order
+
+        # Attach metadata - use last fingerprint for each node (most recent)
+        # Note: nodes represent prefixes, so we aggregate fingerprints
+        token_offset = 0
+        for node in path:
+            node_len = len(node.key) if node.key else 0
+            if node_len == 0:
+                continue
+
+            # Use the last token's fingerprint for this node
+            fp_idx = min(token_offset + node_len - 1, len(fingerprints) - 1) if fingerprints else -1
+
+            if fingerprints and fp_idx >= 0 and fp_idx < len(fingerprints):
+                node.spectral_fingerprint = fingerprints[fp_idx]
+            if manifold_zones and fp_idx >= 0 and fp_idx < len(manifold_zones):
+                node.manifold_zone = manifold_zones[fp_idx]
+            if coherences and fp_idx >= 0 and fp_idx < len(coherences):
+                node.spectral_coherence = coherences[fp_idx]
+
+            token_offset += node_len
 
     def all_values_flatten(self):
         values = []
