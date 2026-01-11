@@ -91,30 +91,6 @@ impl ExecutionBranch {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct CandidateWorkerUrls(Vec<String>);
-
-impl CandidateWorkerUrls {
-    fn push_bounded(&mut self, url: String) {
-        while self.0.len() >= MAX_CANDIDATE_WORKERS {
-            self.0.remove(0);
-        }
-        self.0.push(url);
-    }
-
-    fn serialize(&self) -> String {
-        self.0.join(",")
-    }
-
-    fn deserialize(data: &str) -> Self {
-        Self(data.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
-    }
-
-    fn urls(&self) -> &[String] {
-        &self.0
-    }
-}
-
 impl ManualPolicy {
     pub fn new() -> Self {
         Self::with_config(ManualConfig::default())
@@ -216,6 +192,30 @@ impl Backend {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct CandidateWorkerUrls(Vec<String>);
+
+impl CandidateWorkerUrls {
+    fn push_bounded(&mut self, url: String) {
+        while self.0.len() >= MAX_CANDIDATE_WORKERS {
+            self.0.remove(0);
+        }
+        self.0.push(url);
+    }
+
+    fn serialize(&self) -> String {
+        self.0.join(",")
+    }
+
+    fn deserialize(data: &str) -> Self {
+        Self(data.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+    }
+
+    fn urls(&self) -> &[String] {
+        &self.0
+    }
+}
+
 // ------------------------------------ local backend ---------------------------------------
 
 #[derive(Debug)]
@@ -305,6 +305,16 @@ impl LocalBackend {
 
     fn len(&self) -> usize {
         self.routing_map.len()
+    }
+
+    #[cfg(test)]
+    fn get_last_access(&self, routing_id: &str) -> Option<Instant> {
+        self.routing_map.get(routing_id).map(|e| e.last_access)
+    }
+
+    #[cfg(test)]
+    fn has_eviction_task(&self) -> bool {
+        self._eviction_task.is_some()
     }
 }
 
