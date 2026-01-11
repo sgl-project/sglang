@@ -438,7 +438,7 @@ impl RedisBackend {
             }
         };
 
-        let old_data = match conn.get_ex(&key, Expiry::EX(self.ttl_secs)).await {
+        let old_data: Option<String> = match conn.get_ex(&key, Expiry::EX(self.ttl_secs)).await {
             Ok(x) => x,
             Err(e) => {
                 warn!("Redis getex exception: {}", e);
