@@ -356,16 +356,6 @@ impl RedisBackend {
         Ok(Self { pool, ttl_secs })
     }
 
-    fn retry_config() -> RetryConfig {
-        RetryConfig {
-            max_retries: 5,
-            initial_backoff_ms: 5,
-            max_backoff_ms: 50,
-            backoff_multiplier: 2.0,
-            jitter_factor: 0.2,
-        }
-    }
-
     async fn select_by_routing_id(
         &self,
         routing_id: &str,
@@ -376,9 +366,16 @@ impl RedisBackend {
         use crate::core::retry::RetryError;
 
         let key = format!("{}{}", REDIS_KEY_PREFIX, routing_id);
-        let config = Self::retry_config();
 
-        let result = crate::core::retry::RetryExecutor::execute_with_retry(&config, |attempt| {
+        let retry_config = RetryConfig {
+            max_retries: 5,
+            initial_backoff_ms: 5,
+            max_backoff_ms: 50,
+            backoff_multiplier: 2.0,
+            jitter_factor: 0.2,
+        };
+
+        let result = crate::core::retry::RetryExecutor::execute_with_retry(&retry_config, |attempt| {
             let key = key.clone();
             async move {
                 if attempt > 0 {
