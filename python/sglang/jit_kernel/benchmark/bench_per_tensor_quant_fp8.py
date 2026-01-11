@@ -65,17 +65,11 @@ def calculate_diff(batch_size: int, seq_len: int):
     vllm_out, vllm_scale = vllm_scaled_fp8_quant(x)
     sglang_out, sglang_scale = sglang_scaled_fp8_quant(x)
 
-    scale_diff = torch.abs(vllm_scale - sglang_scale).item()
-    output_diff = torch.abs(vllm_out.float() - sglang_out.float()).mean().item()
     vllm_out = vllm_out.to(torch.float32)
     sglang_out = sglang_out.to(torch.float32)
 
-    if torch.allclose(vllm_out, sglang_out, rtol=1e-3, atol=1e-3) and torch.allclose(
-        vllm_scale, sglang_scale, rtol=1e-3, atol=1e-3
-    ):
-        print("All implementations match")
-    else:
-        print("Implementations differ")
+    triton.testing.assert_close(vllm_out, sglang_out, rtol=1e-3, atol=1e-3)
+    triton.testing.assert_close(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-3)
 
 
 if IS_CI:

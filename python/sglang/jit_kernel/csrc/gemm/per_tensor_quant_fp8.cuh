@@ -48,7 +48,8 @@ per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output
   __shared__ float smem[kWarpThreads];
   cta::reduce_max(max_value, smem);
   if (threadIdx.x == 0) {
-    atomic::max(output_s, smem[0]);
+    const auto max_value = smem[0];
+    atomic::max(output_s, max_value / math::FP8_E4M3_MAX);
   }
 }
 
