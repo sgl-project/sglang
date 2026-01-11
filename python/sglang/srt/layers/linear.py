@@ -163,6 +163,7 @@ class LinearBase(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
         self.quant_config = quant_config
+        self.prefix = prefix
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         else:
@@ -253,9 +254,14 @@ class ReplicatedLinear(LinearBase):
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(
+        self, x: torch.Tensor, **kwargs
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
+        dynamic_scale = kwargs.get("dynamic_scale", None)
+        if dynamic_scale is not None:
+            x = x, dynamic_scale
         output = self.quant_method.apply(self, x, bias)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
