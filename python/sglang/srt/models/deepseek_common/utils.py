@@ -2,6 +2,7 @@ import logging
 from typing import Optional
 
 import torch
+import math
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_runner_backend
@@ -63,7 +64,6 @@ def add_forward_absorb_core_attention_backend(backend_name: str) -> None:
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    import math
 
     if scale <= 1:
         return 1.0
