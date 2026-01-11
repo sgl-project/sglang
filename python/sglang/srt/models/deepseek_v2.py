@@ -2542,7 +2542,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         ):
             k = k_nope.new_empty(*k_shape)
             concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
-        elif _is_cuda:
+        elif _is_cuda and all(
+            # (i.bit_count() == 1) == (is_power_of_two(i))
+            i.bit_count() == 1
+            for i in (k_shape[1], k_nope.shape[-1], k_pe.shape[-1])
+        ):
             # fa3 mha support fp8 inputs
             if (
                 self.current_attention_backend == "fa3"
