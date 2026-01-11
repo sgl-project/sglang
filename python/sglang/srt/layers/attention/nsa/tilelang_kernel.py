@@ -147,6 +147,8 @@ def fp8_index_kernel(h: int, d: int, clear_accum=True):
                 T.copy(k_s[i_b, i1_n * blk_n1 + i2_n * blk_n2], k_s_frag)
 
                 logits = T.alloc_fragment((blk_n2, h), FP32)
+                if not clear_accum:
+                    T.fill(logits, 0)
                 T.gemm(
                     k_smem,
                     q_smem,
