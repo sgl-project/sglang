@@ -36,6 +36,9 @@ class GrammarManager:
         else:
             self.grammar_backend = None
 
+    def __len__(self):
+        return len(self.grammar_queue)
+
     def clear(self):
         if self.grammar_backend:
             self.grammar_backend.reset()
