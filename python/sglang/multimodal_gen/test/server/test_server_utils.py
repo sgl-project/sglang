@@ -1078,7 +1078,11 @@ def get_generate_fn(
             prompt=sampling_params.prompt,
             size=sampling_params.output_size,
             seconds=video_seconds,
-            extra_body={"reference_url": sampling_params.image_path},
+            extra_body={
+                "reference_url": sampling_params.image_path,
+                "fps": sampling_params.fps,
+                "num_frames": sampling_params.num_frames,
+            },
         )
 
     def generate_text_image_to_video(case_id, client) -> str:
@@ -1102,6 +1106,10 @@ def get_generate_fn(
                 size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
+                extra_body={
+                    "fps": sampling_params.fps,
+                    "num_frames": sampling_params.num_frames,
+                },
             )
 
     if modality == "video":
