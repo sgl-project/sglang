@@ -34,6 +34,13 @@ class GrammarManager:
         else:
             self.grammar_backend = None
 
+    def clear(self):
+        if self.grammar_backend:
+            self.grammar_backend.reset()
+
+    def has_waiting_grammars(self) -> bool:
+        return len(self.grammar_queue) > 0
+
     def process_req_with_grammar(self, req: Req) -> bool:
         # Init grammar cache for this request
         add_to_grammar_queue = False

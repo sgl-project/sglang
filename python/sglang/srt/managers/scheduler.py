@@ -1837,7 +1837,7 @@ class Scheduler(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
-        if self.grammar_manager.grammar_queue:
+        if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.move_ready_grammar_requests()
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
@@ -2361,8 +2361,7 @@ class Scheduler(
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
-            if self.grammar_manager.grammar_backend:
-                self.grammar_manager.grammar_backend.clear()
+            self.grammar_manager.clear()
             self.reset_metrics()
 
             if self.draft_worker:
