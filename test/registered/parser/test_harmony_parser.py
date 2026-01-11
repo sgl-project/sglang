@@ -290,9 +290,8 @@ class TestCanonicalStrategy(CustomTestCase):
         text = "<|channel|>analysis<|message|><|end|>"
         events, remaining = self.strategy.parse(text)
 
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].event_type, "reasoning")
-        self.assertEqual(events[0].content, "")
+        # Empty analysis blocks should not emit events (filtered out)
+        self.assertEqual(len(events), 0)
         self.assertEqual(remaining, "")
 
     def test_parse_commentary_filler_between_blocks(self):
@@ -437,7 +436,11 @@ class TestHarmonyParser(CustomTestCase):
     def test_init(self):
         """Test HarmonyParser initialization."""
         self.assertIsNone(self.parser.strategy)
-        self.assertEqual(self.parser._buffer, "")
+        # _buffer is now a SemanticBuffer object
+        from sglang.srt.parser.harmony_parser import SemanticBuffer
+
+        self.assertIsInstance(self.parser._buffer, SemanticBuffer)
+        self.assertEqual(self.parser._buffer.get_buffer(), "")
 
     def test_strategy_selection_canonical(self):
         """Test automatic strategy selection for canonical format."""
@@ -483,15 +486,17 @@ class TestHarmonyParser(CustomTestCase):
             events = self.parser.parse(chunk)
             all_events.extend(events)
 
-        self.assertEqual(len(all_events), 5)
+        # After fix, empty events are filtered out
+        # We get: 1 reasoning event + 1 normal event = 2 events total
+        self.assertEqual(len(all_events), 2)
 
         # Verify we get reasoning events
         reasoning_events = [e for e in all_events if e.event_type == "reasoning"]
-        self.assertTrue(len(reasoning_events) > 0)
+        self.assertEqual(len(reasoning_events), 1)
 
         # Verify we get normal events
         normal_events = [e for e in all_events if e.event_type == "normal"]
-        self.assertTrue(len(normal_events) > 0)
+        self.assertEqual(len(normal_events), 1)
 
         # Verify content is eventually parsed correctly
         combined_reasoning = "".join(e.content for e in reasoning_events)
@@ -873,6 +878,265 @@ class TestEdgeCases(CustomTestCase):
         self.assertEqual(events[1].event_type, "reasoning")
         self.assertEqual(events[0].content, "first reasoning")
         self.assertEqual(events[1].content, "second reasoning")
+
+
+class TestStreamingBufferManagement(CustomTestCase):
+    """Test cases to reproduce streaming buffer management issues from RFC."""
+
+    def test_multiple_end_markers_data_loss(self):
+        """Test Issue 1: Multiple <|end|> markers cause data loss in streaming.
+
+        This reproduces Example 1 from RFC where content after <|end|> marker
+        in the same parsing cycle gets lost because buffer is reset incorrectly.
+
+        The issue: When CanonicalStrategy sees <|end|>, it returns empty remaining buffer,
+        causing HarmonyParser to reset. Any content already in buffer before that point
+        but not yet emitted gets lost.
+        """
+        parser = HarmonyParser()
+
+        # Simulate a chunk that contains two analysis blocks with their own <|end|> markers
+        # The parser should extract both, but current implementation loses the second one
+        chunks = [
+            "<|channel|>analysis<|message|>First reasoning<|end|><|channel|>analysis<|message|>Second reasoning<|end|>",
+            "<|start|>assistant<|channel|>final<|message|>Final answer<|return|>",
+        ]
+
+        all_events = []
+        for chunk in chunks:
+            events = parser.parse(chunk)
+            all_events.extend(events)
+
+        # Expected: should have reasoning events for both parts
+        reasoning_events = [e for e in all_events if e.event_type == "reasoning"]
+        normal_events = [e for e in all_events if e.event_type == "normal"]
+
+        combined_reasoning = "".join(e.content for e in reasoning_events)
+        combined_normal = "".join(
+            e.content
+            for e in normal_events
+            if e.content and "<|return|>" not in e.content
+        )
+
+        self.assertIn(
+            "First reasoning",
+            combined_reasoning,
+            "First reasoning part should be present",
+        )
+        self.assertIn(
+            "Second reasoning",
+            combined_reasoning,
+            "Second reasoning part should be present - THIS FAILS BEFORE FIX",
+        )
+        self.assertIn("Final answer", combined_normal, "Final answer should be present")
+        self.assertEqual(
+            len(reasoning_events),
+            2,
+            "Should have 2 reasoning events",
+        )
+
+    def test_partial_reasoning_before_end_marker(self):
+        """Test Issue 2: Partial reasoning content before <|end|> is lost.
+
+        This reproduces Example 2 from RFC where partial reasoning emitted
+        before <|end|> marker is not tracked properly.
+
+        The issue: When partial reasoning is emitted before seeing the complete
+        structure with <|end|>, and then later we get more partial chunks, the
+        parser can lose track of what was already emitted vs what's pending.
+        """
+        parser = HarmonyParser()
+
+        # Simulate streaming chunks where reasoning comes in multiple parts
+        # Each chunk appears to restart the analysis block
+        chunks = [
+            "<|channel|>analysis<|message|>Let me think",
+            "<|end|>",
+            "<|channel|>analysis<|message|> carefully",
+            "<|end|>",
+            "<|start|>assistant<|channel|>final<|message|>Answer: 42<|return|>",
+        ]
+
+        all_events = []
+        for chunk in chunks:
+            events = parser.parse(chunk)
+            all_events.extend(events)
+
+        reasoning_events = [e for e in all_events if e.event_type == "reasoning"]
+        normal_events = [e for e in all_events if e.event_type == "normal"]
+
+        combined_reasoning = "".join(e.content for e in reasoning_events)
+
+        # Should have both parts of the reasoning
+        self.assertIn(
+            "Let me think", combined_reasoning, "First reasoning part should be present"
+        )
+        self.assertIn(
+            "carefully",
+            combined_reasoning,
+            "Second reasoning part should be present - THIS FAILS BEFORE FIX",
+        )
+
+        # Should have 2 reasoning events (one for each <|end|> block)
+        # The content should be properly accumulated
+        self.assertEqual(
+            len(reasoning_events),
+            2,
+            "Should have 2 reasoning events (one per block)",
+        )
+
+    def test_strategy_switching_content_loss(self):
+        """Test Issue 4: Strategy switching mid-stream causes content loss.
+
+        This reproduces Example 3 from RFC where strategy switching causes
+        previous content to be lost.
+
+        The issue: When TextStrategy is selected first and returns some events,
+        then a subsequent chunk triggers CanonicalStrategy selection, the
+        content already returned by TextStrategy is lost because the parser
+        doesn't track what was already emitted across strategy changes.
+        """
+        parser = HarmonyParser()
+
+        # First chunk triggers TextStrategy
+        chunk1 = "analysis partial"
+        events1 = parser.parse(chunk1)
+
+        # Second chunk has full Harmony format, triggering CanonicalStrategy
+        # At this point, the previous content from TextStrategy should still be
+        # available in the full output
+        chunk2 = "<|channel|>analysis<|message|>content<|end|><|start|>assistant<|channel|>final<|message|>Answer<|return|>"
+        events2 = parser.parse(chunk2)
+
+        # Accumulate all events from both parse calls
+        all_events = events1 + events2
+
+        # We should have events, but currently we lose the "analysis partial"
+        self.assertTrue(len(all_events) > 0, "Should have events")
+
+        # The key issue: we should have both reasoning events
+        # - One for the TextStrategy analysis (partial)
+        # - One for the CanonicalStrategy analysis (content)
+        reasoning_events = [e for e in all_events if e.event_type == "reasoning"]
+        normal_events = [e for e in all_events if e.event_type == "normal"]
+
+        # This fails before fix - we lose the first reasoning content
+        self.assertEqual(
+            len(reasoning_events),
+            2,
+            "Should have 2 reasoning events from both strategies - THIS FAILS BEFORE FIX",
+        )
+
+        # Both reasoning parts should be present
+        combined_reasoning = "".join(e.content for e in reasoning_events)
+        self.assertIn(
+            "partial",
+            combined_reasoning,
+            "First reasoning from TextStrategy should be preserved - THIS FAILS BEFORE FIX",
+        )
+        self.assertIn(
+            "content",
+            combined_reasoning,
+            "Second reasoning from CanonicalStrategy should be present",
+        )
+
+    def test_tool_call_chunk_boundary_issue(self):
+        """Test Issue: Tool call content at chunk boundaries can be lost.
+
+        This tests that tool call content spanning multiple chunks is preserved
+        when the chunk boundary falls in the middle of the content.
+        """
+        parser = HarmonyParser()
+
+        # First chunk starts a tool call but doesn't have <|call|>
+        parser.parse(
+            '<|channel|>commentary to=functions.get_weather<|message|>{"location":"SF'
+        )
+
+        # Second chunk continues the content and has <|call|>
+        # At this point, the parser should accumulate both chunks and emit the tool call
+        all_events = parser.parse(
+            '","unit":"celsius"}<|call|><|start|>assistant<|channel|>final<|message|>Done<|return|>'
+        )
+
+        tool_events = [e for e in all_events if e.event_type == "tool_call"]
+
+        self.assertEqual(len(tool_events), 1, "Should have 1 tool call event")
+        # The tool call content should span both chunks
+        self.assertIn(
+            '"location":"SF"',
+            tool_events[0].content,
+            "Tool call content should include first chunk - THIS FAILS BEFORE FIX",
+        )
+        self.assertIn(
+            '"unit":"celsius"',
+            tool_events[0].content,
+            "Tool call content should include second chunk - THIS FAILS BEFORE FIX",
+        )
+
+    def test_buffer_state_loss_after_reset(self):
+        """Test Issue: Buffer state is preserved across multiple blocks in same chunk.
+
+        This tests that when a strategy completes a block (e.g., sees <|end|>),
+        it correctly continues parsing the next block in the same chunk.
+        With the fix, partial content from the second block should also be emitted.
+        """
+        parser = HarmonyParser()
+
+        # Single chunk that contains:
+        # 1. Complete analysis block with <|end|>
+        # 2. Start of another analysis block without <|end|>
+        chunk = (
+            "<|channel|>analysis<|message|>First<|end|>"
+            "<|channel|>analysis<|message|>Second partial"
+        )
+
+        # Parse the chunk
+        events = parser.parse(chunk)
+
+        # With the fix, we should get both reasoning events:
+        # 1. Complete reasoning from first block
+        # 2. Partial reasoning from second block (for streaming)
+        reasoning_events = [e for e in events if e.event_type == "reasoning"]
+        self.assertEqual(
+            len(reasoning_events),
+            2,
+            "Should have 2 reasoning events (1 complete, 1 partial)",
+        )
+        self.assertEqual(
+            reasoning_events[0].content, "First", "First reasoning should be emitted"
+        )
+        self.assertEqual(
+            reasoning_events[1].content,
+            "Second partial",
+            "Second partial reasoning should be emitted for streaming",
+        )
+
+        # Now parse another chunk with <|end|> to complete the second block
+        # Note: The first parse already consumed "Second partial" and returned empty remaining
+        # So this new chunk starts fresh with <|end|> which doesn't have a matching analysis block
+        chunk2 = "<|end|><|start|>assistant<|channel|>final<|message|>Done<|return|>"
+        events2 = parser.parse(chunk2)
+
+        reasoning_events2 = [e for e in events2 if e.event_type == "reasoning"]
+        normal_events2 = [e for e in events2 if e.event_type == "normal"]
+
+        # The second chunk only has the final answer, no more reasoning
+        self.assertEqual(len(reasoning_events2), 0, "Should have no reasoning events")
+        self.assertEqual(len(normal_events2), 1, "Should have 1 normal event")
+        self.assertEqual(
+            normal_events2[0].content, "Done", "Final answer should be emitted"
+        )
+
+        # Overall, we should have all reasoning content across both parse calls
+        all_reasoning_events = reasoning_events + reasoning_events2
+        combined_reasoning = "".join(e.content for e in all_reasoning_events)
+        self.assertIn("First", combined_reasoning, "First reasoning should be present")
+        self.assertIn(
+            "Second partial",
+            combined_reasoning,
+            "Second partial reasoning should be present",
+        )
 
 
 if __name__ == "__main__":

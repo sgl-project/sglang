@@ -21,6 +21,53 @@ class Token:
     end: int
 
 
+class SemanticBuffer:
+    """
+    Buffer that understands Harmony format semantics.
+    Maintains events and tracks parsed positions to avoid content loss in streaming.
+    """
+
+    def __init__(self):
+        self._buffer: str = ""
+        self._parsed_position: int = 0
+        self._emitted_events: List[Event] = []
+
+    def append(self, text: str):
+        """Add text to buffer."""
+        self._buffer += text
+
+    def get_unparsed(self) -> str:
+        """Get unparsed portion from current position."""
+        return self._buffer[self._parsed_position :]
+
+    def mark_parsed(self, length: int):
+        """Mark portion as parsed."""
+        self._parsed_position = min(self._parsed_position + length, len(self._buffer))
+
+    def add_emitted_event(self, event: Event):
+        """Track an event that has been emitted."""
+        self._emitted_events.append(event)
+
+    def reset(self):
+        """Reset the buffer state."""
+        self._buffer = ""
+        self._parsed_position = 0
+        self._emitted_events = []
+
+    def get_emitted_events(self) -> List[Event]:
+        """Get all events that have been emitted."""
+        return self._emitted_events.copy()
+
+    def get_buffer(self) -> str:
+        """Get the full buffer content."""
+        return self._buffer
+
+    def set_buffer(self, buffer: str):
+        """Set the buffer content (used after strategy returns remaining)."""
+        self._buffer = buffer
+        self._parsed_position = 0
+
+
 def prefix_hold(text: str, tokens: List[str]) -> Tuple[str, str]:
     """
     Holds back the longest suffix of `text` that could be a prefix of any token.
@@ -239,6 +286,10 @@ class CanonicalStrategy:
         content_start = tokens[message_pos].end
         content = text[content_start:]
 
+        # Only emit event if there's actual content
+        if not content:
+            return None, text[tokens[start_pos].start : content_start]
+
         # Return partial reasoning content and preserve the channel structure for next parse
         remaining_text = text[tokens[start_pos].start : content_start]
         return Event("reasoning", content), remaining_text
@@ -329,7 +380,11 @@ class CanonicalStrategy:
             if channel_type == "final":
                 # Final blocks can end at end of input without requiring <|return|>
                 content = text[content_start:]
-                return Event("normal", content), end_pos
+                # Only emit event if there's actual content
+                if content.strip():
+                    return Event("normal", content), end_pos
+                else:
+                    return None, content_start
             return None  # Analysis and commentary need proper end tokens
 
         end_token = tokens[end_pos]
@@ -342,7 +397,12 @@ class CanonicalStrategy:
                 raw_text = text[tokens[start_pos].start : end_token.end]
                 return Event("tool_call", content.strip(), raw_text), end_pos + 1
             else:
-                return Event("reasoning", content), end_pos + 1
+                # Only emit reasoning event if there's actual content
+                if content.strip():
+                    return Event("reasoning", content), end_pos + 1
+                else:
+                    # Empty analysis block - skip event, just advance position
+                    return None, end_pos + 1
         elif channel_type == "commentary":
             if end_token.type == "CALL":
                 raw_text = text[tokens[start_pos].start : end_token.end]
@@ -568,7 +628,7 @@ class HarmonyParser:
 
     def __init__(self):
         self.strategy = None
-        self._buffer = ""
+        self._buffer = SemanticBuffer()
         self._should_filter_commentary = (
             False  # Track if we should filter commentary in next chunks
         )
@@ -577,18 +637,22 @@ class HarmonyParser:
         )
 
     def parse(self, chunk: str) -> List[Event]:
-        self._buffer += chunk
+        # Append new chunk to semantic buffer
+        self._buffer.append(chunk)
 
         if self.strategy is None:
-            if "<|channel|>" in self._buffer or "<|start|>" in self._buffer:
+            if (
+                "<|channel|>" in self._buffer.get_buffer()
+                or "<|start|>" in self._buffer.get_buffer()
+            ):
                 self.strategy = CanonicalStrategy()
             elif re.search(
                 r"(?:^|\s)(?:assistant)?\s*(analysis|commentary|assistantfinal)",
-                self._buffer,
+                self._buffer.get_buffer(),
                 re.IGNORECASE,
             ):
                 self.strategy = TextStrategy()
-            elif "<|end|>" in self._buffer:
+            elif "<|end|>" in self._buffer.get_buffer():
                 # Fallback: EndMarkerOnlyStrategy for content with only <|end|> marker
                 self.strategy = EndMarkerOnlyStrategy()
             else:
@@ -597,18 +661,33 @@ class HarmonyParser:
 
         if hasattr(self.strategy, "set_buffer_context"):
             # Provide full buffer context to strategy for smarter whitespace handling
-            self.strategy.set_buffer_context(self._buffer)
+            self.strategy.set_buffer_context(self._buffer.get_buffer())
 
-        events, remaining = self.strategy.parse(self._buffer)
+        # Parse the unparsed portion
+        unparsed = self._buffer.get_unparsed()
+        events, remaining = self.strategy.parse(unparsed)
 
         # Check if we should start filtering commentary (after <|call|> token or tool_call event)
-        buffer_has_call_token = self._buffer.rstrip().endswith("<|call|>")
+        buffer_has_call_token = self._buffer.get_buffer().rstrip().endswith("<|call|>")
 
-        self._buffer = remaining
+        # Update buffer state based on what was consumed
+        parsed_length = len(unparsed) - len(remaining)
+        if parsed_length > 0:
+            self._buffer.mark_parsed(parsed_length)
+
+        # If remaining is empty, it means we consumed everything
+        if not remaining:
+            self._buffer.set_buffer("")
+        else:
+            # Preserve remaining content for next parse
+            self._buffer.set_buffer(remaining)
 
         # Filter events for streaming case
         filtered_events = []
         for event in events:
+            # Skip None events
+            if event is None:
+                continue
             should_filter = False
 
             if event.event_type == "normal":
@@ -654,3 +733,10 @@ class HarmonyParser:
             filtered_events.append(event)
 
         return filtered_events
+
+    def reset(self):
+        """Reset the parser state for a new parsing session."""
+        self.strategy = None
+        self._buffer = SemanticBuffer()
+        self._should_filter_commentary = False
+        self._partial_commentary = ""
