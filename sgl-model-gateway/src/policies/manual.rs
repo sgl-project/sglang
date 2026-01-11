@@ -60,8 +60,6 @@ pub struct ManualConfig {
     pub eviction_interval_secs: u64,
     pub max_idle_secs: u64,
     pub assignment_mode: ManualAssignmentMode,
-    /// Optional prefix for Redis keys. When set, keys will be formatted as "{prefix}:{base_prefix}:{routing_id}".
-    /// This allows multiple test instances to share a Redis server without key conflicts.
     pub redis_key_prefix: Option<String>,
 }
 
@@ -188,7 +186,11 @@ enum Backend {
 impl Backend {
     fn from_env(config: &ManualConfig) -> Self {
         if let Ok(redis_url) = std::env::var("SMG_MANUAL_REDIS_URL") {
-            let backend = RedisBackend::new(&redis_url, config.max_idle_secs)
+            let key_prefix = config.redis_key_prefix.as_ref().map_or_else(
+                || REDIS_KEY_PREFIX_DEFAULT.to_string(),
+                |p| format!("{}:{}", p, REDIS_KEY_PREFIX_DEFAULT),
+            );
+            let backend = RedisBackend::new(&redis_url, config.max_idle_secs, key_prefix)
                 .expect("SMG_MANUAL_REDIS_URL is set but failed to connect to Redis");
             info!("ManualPolicy using Redis backend: {}", redis_url);
             return Backend::Redis(backend);
@@ -380,13 +382,22 @@ impl LocalBackend {
 struct RedisBackend {
     pool: deadpool_redis::Pool,
     ttl_secs: u64,
+    key_prefix: String,
 }
 
 impl RedisBackend {
-    fn new(url: &str, ttl_secs: u64) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    fn new(
+        url: &str,
+        ttl_secs: u64,
+        key_prefix: String,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cfg = deadpool_redis::Config::from_url(url);
         let pool = cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))?;
-        Ok(Self { pool, ttl_secs })
+        Ok(Self {
+            pool,
+            ttl_secs,
+            key_prefix,
+        })
     }
 
     async fn select_by_routing_id(
@@ -432,7 +443,7 @@ impl RedisBackend {
         healthy_indices: &[usize],
         assignment_mode: ManualAssignmentMode,
     ) -> (Option<usize>, ExecutionBranch) {
-        let key = format!("{}{}", redis_key_prefix(), routing_id);
+        let key = format!("{}{}", self.key_prefix, routing_id);
 
         let mut conn = match self.pool.get().await {
             Ok(x) => x,
