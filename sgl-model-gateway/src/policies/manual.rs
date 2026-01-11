@@ -905,13 +905,13 @@ mod tests {
     all_backend_test!(test_max_candidate_workers_eviction);
 
     #[tokio::test]
-    async fn test_manual_policy_name() {
+    async fn test_unit_policy_name() {
         let policy = ManualPolicy::new();
         assert_eq!(policy.name(), "manual");
     }
 
     #[tokio::test]
-    async fn test_candidate_worker_urls_push_bounded() {
+    async fn test_unit_candidate_worker_urls_push_bounded() {
         let mut candidates = CandidateWorkerUrls::default();
         candidates.push_bounded("http://w1:8000".to_string());
 
@@ -931,7 +931,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_candidate_worker_urls_serialize_deserialize() {
+    async fn test_unit_candidate_worker_urls_serialize_deserialize() {
         let mut candidates = CandidateWorkerUrls::default();
         candidates.push_bounded("http://w1:8000".to_string());
         candidates.push_bounded("http://w2:8000".to_string());
@@ -947,7 +947,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_manual_find_healthy_worker_priority() {
+    async fn test_unit_find_healthy_worker_priority() {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let urls = vec![
@@ -981,7 +981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_manual_find_worker_index_by_url() {
+    async fn test_unit_find_worker_index_by_url() {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         assert_eq!(
@@ -1000,14 +1000,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_manual_config_default() {
+    async fn test_unit_config_default() {
         let config = ManualConfig::default();
         assert_eq!(config.eviction_interval_secs, 60);
         assert_eq!(config.max_idle_secs, 4 * 3600);
     }
 
     #[tokio::test]
-    async fn test_manual_with_disabled_eviction() {
+    async fn test_local_backend_disabled_eviction() {
         let config = ManualConfig {
             eviction_interval_secs: 0,
             max_idle_secs: 3600,
@@ -1018,7 +1018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_manual_last_access_updates() {
+    async fn test_local_backend_last_access_updates() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
         let headers = headers_with_routing_key("test-key");
@@ -1062,7 +1062,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_manual_ttl_eviction_logic() {
+    async fn test_local_backend_ttl_eviction() {
         use std::time::Duration;
 
         let config = ManualConfig {
@@ -1088,7 +1088,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_min_group_select_distributes_evenly() {
+    async fn test_local_backend_min_group_distributes_evenly() {
         let config = ManualConfig {
             assignment_mode: ManualAssignmentMode::MinGroup,
             ..Default::default()
