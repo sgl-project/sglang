@@ -52,6 +52,10 @@ pub fn method_not_allowed(code: impl Into<String>, message: impl Into<String>) -
     create_error(StatusCode::METHOD_NOT_ALLOWED, code, message)
 }
 
+pub fn too_many_requests(code: impl Into<String>, message: impl Into<String>) -> Response {
+    create_error(StatusCode::TOO_MANY_REQUESTS, code, message)
+}
+
 pub fn create_error(
     status: StatusCode,
     code: impl Into<String>,

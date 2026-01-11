@@ -12,6 +12,7 @@ pub enum PolicyType {
     CacheAware,
     PowerOfTwo,
     Bucket,
+    WorkloadAware,
     Manual,
     ConsistentHashing,
     PrefixHash,
@@ -418,6 +419,7 @@ struct Router {
     enable_trace: bool,
     otlp_traces_endpoint: String,
     control_plane_auth: Option<PyControlPlaneAuthConfig>,
+    max_waiting_per_worker: usize,
 }
 
 impl Router {
@@ -462,6 +464,10 @@ impl Router {
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
                     prefix_token_count: 256,
                     load_factor: 1.25,
+                },
+                PolicyType::WorkloadAware => ConfigPolicyConfig::WorkloadAware {
+                    num_waiting_reqs: self.max_waiting_per_worker,
+                    api_key: self.api_key.clone(),
                 },
             }
         };
@@ -709,6 +715,7 @@ impl Router {
         enable_trace = false,
         otlp_traces_endpoint = String::from("localhost:4317"),
         control_plane_auth = None,
+        max_waiting_per_worker = 10,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -793,6 +800,7 @@ impl Router {
         enable_trace: bool,
         otlp_traces_endpoint: String,
         control_plane_auth: Option<PyControlPlaneAuthConfig>,
+        max_waiting_per_worker: usize,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -891,6 +899,7 @@ impl Router {
             enable_trace,
             otlp_traces_endpoint,
             control_plane_auth,
+            max_waiting_per_worker,
         })
     }
 

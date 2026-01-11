@@ -151,6 +151,23 @@ impl ConfigValidator {
             | PolicyConfig::RoundRobin
             | PolicyConfig::Manual { .. }
             | PolicyConfig::ConsistentHashing => {}
+            PolicyConfig::WorkloadAware {
+                num_waiting_reqs,
+                api_key,
+            } => {
+                if *num_waiting_reqs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "num_waiting_reqs".to_string(),
+                        value: num_waiting_reqs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+                if api_key.is_none() {
+                    return Err(ConfigError::MissingRequired {
+                        field: "api_key".to_string(),
+                    });
+                }
+            },
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold: _,
