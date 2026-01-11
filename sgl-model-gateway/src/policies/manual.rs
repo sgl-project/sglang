@@ -82,7 +82,7 @@ enum ExecutionBranch {
     RedisGetexException,
     RedisCasRace,
     RedisCasException,
-    RedisCasMaxRetries,
+    RedisBackendMaxRetries,
 }
 
 impl ExecutionBranch {
@@ -395,8 +395,8 @@ impl RedisBackend {
         match result {
             Ok((idx, branch)) => (idx, branch),
             Err(RetryError::MaxRetriesExceeded) => {
-                warn!("Redis max retries exceeded for key {}", key);
-                (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisCasMaxRetries)
+                warn!("Max retries exceeded for routing_id={}", routing_id);
+                (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisBackendMaxRetries)
             }
         }
     }
