@@ -44,7 +44,10 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
-from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils import flatten_nested_list, get_bool_env_var, is_hip
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 def has_valid_data(data) -> bool:
@@ -503,7 +506,7 @@ def run_dp_sharded_mrope_vision_model(
 
     # patches_per_image = [1000, 100, 200, 50]
     patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
-    # print(f"{patches_per_image = }")
+
     # patches_per_image = [0, 1000, 1100, 1300, 1350]
     cum_patches_per_image = [0, *itertools.accumulate(patches_per_image)]
 
@@ -573,7 +576,10 @@ def run_dp_sharded_mrope_vision_model(
             )
     else:
         if pixel_values_local.shape[0] > 0:
-            # print(f"{local_grid_thw_list = }", flush=True)
+            if _use_aiter:
+                init_all_vision_forward_metadata(
+                    vision_model, torch.tensor(local_grid_thw_list), pixel_values_local
+                )
             image_embeds_local = vision_model(
                 pixel_values_local, torch.tensor(local_grid_thw_list)
             )
@@ -649,3 +655,16 @@ def run_dp_sharded_mrope_vision_model(
             current_idx += count
     out_embeddings = torch.cat(original_order_embeddings, dim=0)
     return out_embeddings
+
+
+def init_all_vision_forward_metadata(vision_model, image_grid_thw, pixel_values):
+    vision_attn_modules_found = False
+    for name, module in vision_model.named_modules():
+        if hasattr(module, "init_vision_forward_metadata"):
+            if not vision_attn_modules_found:
+                vision_attn_modules_found = True
+                vision_forward_metadata = module.init_vision_forward_metadata(
+                    image_grid_thw, pixel_values
+                )
+            else:
+                module.set_vision_forward_metadata(vision_forward_metadata)
