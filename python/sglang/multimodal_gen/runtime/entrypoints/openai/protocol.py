@@ -9,6 +9,7 @@ class ImageResponseData(BaseModel):
     b64_json: Optional[str] = None
     url: Optional[str] = None
     revised_prompt: Optional[str] = None
+    file_path: Optional[str] = None
 
 
 class ImageResponse(BaseModel):
@@ -57,6 +58,7 @@ class VideoResponse(BaseModel):
     completed_at: Optional[int] = None
     expires_at: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
+    file_path: Optional[str] = None
     peak_memory_mb: Optional[float] = None
 
 
@@ -79,6 +81,7 @@ class VideoGenerationsRequest(BaseModel):
     )
     negative_prompt: Optional[str] = None
     enable_teacache: Optional[bool] = False
+    output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
