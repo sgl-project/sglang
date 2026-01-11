@@ -14,13 +14,6 @@ from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-try:
-    from vllm import _custom_ops as ops
-
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
-
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
@@ -75,7 +68,6 @@ if _is_cuda:
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
 
-use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 
 # Input scaling factors are no longer optional in _scaled_mm starting
@@ -958,35 +950,22 @@ def apply_fp8_linear(
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
         # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
         # for sgl-kernel fp8_scaled_mm, it support per channel W now
-        if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
-            # Fall back to vllm cutlass w8a8 fp8 kernel
-            output = ops.cutlass_scaled_mm(
-                qinput,
-                weight,
-                out_dtype=input.dtype,
-                scale_a=x_scale,
-                scale_b=weight_scale,
-                bias=bias,
+        cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
+        if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
+            # Massage the input to be 2D
+            qinput = qinput.view(-1, qinput.shape[-1])
+            output = triton_scaled_mm(
+                qinput, weight, x_scale, weight_scale, input.dtype, bias
             )
         else:
-            cutlass_compatible_b = (
-                weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
+            output = fp8_scaled_mm(
+                qinput,
+                weight,
+                x_scale,
+                weight_scale,
+                out_dtype=input.dtype,
+                bias=bias,
             )
-            if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
-                # Massage the input to be 2D
-                qinput = qinput.view(-1, qinput.shape[-1])
-                output = triton_scaled_mm(
-                    qinput, weight, x_scale, weight_scale, input.dtype, bias
-                )
-            else:
-                output = fp8_scaled_mm(
-                    qinput,
-                    weight,
-                    x_scale,
-                    weight_scale,
-                    out_dtype=input.dtype,
-                    bias=bias,
-                )
         return output.view(*output_shape)
 
     # torch.scaled_mm supports per tensor weights + activations only
