@@ -32,7 +32,7 @@ class NodeRegistry:
     """Registry for mapping tp_ranks to nodes in a distributed setup."""
 
     def __init__(self, server_args: ServerArgs):
-        # TODO: here we may need to assume that tp_size always equal to world_size?
+        # NOTE: Assuming that in sglang, tp_size * pp_size = world_size.
         self.server_args = server_args
         self.nodes: Dict[int, NodeInfo] = {}
         if hasattr(self.server_args, "node_hosts") and self.server_args.node_hosts:
