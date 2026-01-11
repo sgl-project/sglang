@@ -22,7 +22,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_npu, make_layers
+
+_is_npu = is_npu()
 
 
 class PhiAttention(nn.Module):
@@ -179,7 +181,7 @@ class PhiModel(nn.Module):
 
         pp_group = get_pp_group()
         pp_size = pp_group.world_size
-        pp_rank = pp_group.rank
+        pp_rank = pp_group.rank_in_group
 
         self.start_layer = pp_rank * config.num_hidden_layers // pp_size
         self.end_layer = (pp_rank + 1) * config.num_hidden_layers // pp_size
@@ -287,7 +289,14 @@ class PhiForCausalLM(nn.Module):
 
             # Handle packed weights
             is_packed = False
-            for packed_name, src_names in self.packed_modules_mapping.items():
+
+            packed_modules_mapping = self.packed_modules_mapping
+            # In npu mode, the packed mapping is updated in loader.py for w8a8
+            if _is_npu:
+                packed_modules_mapping = self.packed_modules_mapping.get(
+                    "model", self.packed_modules_mapping
+                )
+            for packed_name, src_names in packed_modules_mapping.items():
                 if packed_name not in name:
                     continue
 
