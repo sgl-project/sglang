@@ -106,6 +106,11 @@ class MarlinLinearLayerConfig:
     has_g_idx: bool
 
 
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
+
 class GPTQConfig(QuantizationConfig):
     """Config class for GPTQ.
 
@@ -205,7 +210,15 @@ class GPTQConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[LinearMethodBase]:
         # Delay the import to avoid circular dependency
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if _is_npu:
+            if isinstance(layer, LinearBase):
+                return None
+            elif isinstance(layer, FusedMoE):
+                return GPTQMoEAscendMethod(self)
+            return None
 
         if isinstance(layer, FusedMoE):
             raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
@@ -1099,3 +1112,166 @@ if _is_cuda:
     @register_fake_if_exists("sgl_kernel::gptq_shuffle")
     def _(q_weight, q_perm, bit):
         return
+
+
+class GPTQMoEAscendMethod(FusedMoEMethodBase):
+
+    def __init__(self, quant_config: GPTQConfig):
+        self.quant_config = quant_config
+        if self.quant_config.weight_bits != 4:
+            raise ValueError("AWQMoEMethod only supports 4bit now.")
+        self.quant_type = scalar_types.uint4
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        # Delay the import to avoid circular dependency
+        from sglang.srt.layers.linear import set_weight_attrs
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        extra_weight_attrs.update(
+            {
+                "is_transposed": True,
+                "quant_method": FusedMoeWeightScaleSupported.GROUP.value,
+            }
+        )
+
+        w13_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                2 * intermediate_size_per_partition // self.quant_config.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_qweight", w13_qweight)
+        set_weight_attrs(w13_qweight, extra_weight_attrs)
+
+        w2_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition,
+                hidden_size // self.quant_config.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_qweight", w2_qweight)
+        set_weight_attrs(w2_qweight, extra_weight_attrs)
+
+        num_groups_w13 = hidden_size // self.quant_config.group_size
+        num_groups_w2 = intermediate_size_per_partition // self.quant_config.group_size
+
+        # WEIGHT_SCALES
+        # Allocate 2 scales for w1 and w3 respectively.
+        w13_scales = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w13,
+                intermediate_size_per_partition * 2,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_scales", w13_scales)
+        set_weight_attrs(w13_scales, extra_weight_attrs)
+
+        w2_scales = torch.nn.Parameter(
+            torch.empty(num_experts, num_groups_w2, hidden_size, dtype=params_dtype),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_scales", w2_scales)
+        set_weight_attrs(w2_scales, extra_weight_attrs)
+
+        # WEIGHT_ZERO_POINT
+        # Allocate 2 zero points for w1 and w3 respectively.
+        w13_qzeros = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w13,
+                2 * intermediate_size_per_partition // self.quant_config.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_qzeros", w13_qzeros)
+        set_weight_attrs(w13_qzeros, extra_weight_attrs)
+
+        w2_qzeros = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w2,
+                hidden_size // self.quant_config.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_qzeros", w2_qzeros)
+        set_weight_attrs(w2_qzeros, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        num_experts = layer.w13_qweight.shape[0]
+        device = layer.w13_qweight.device
+
+        layer.w13_g_idx_sort_indices = torch.nn.Parameter(
+            torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+            requires_grad=False,
+        )
+        layer.w2_g_idx_sort_indices = torch.nn.Parameter(
+            torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+            requires_grad=False,
+        )
+
+        # hidden_size->intermediate_size
+        marlin_w13_scales = marlin_moe_permute_scales(
+            s=layer.w13_scales,
+            size_k=layer.intermediate_size_per_partition,
+            size_n=layer.w13_scales.shape[2],
+            group_size=self.quant_config.group_size,
+        )
+
+        replace_parameter(layer, "w13_scales", marlin_w13_scales)
+
+        marlin_w2_scales = marlin_moe_permute_scales(
+            s=layer.w2_scales,
+            size_k=layer.intermediate_size_per_partition,
+            size_n=layer.w2_scales.shape[2],
+            group_size=self.quant_config.group_size,
+        )
+        replace_parameter(layer, "w2_scales", marlin_w2_scales)
+
+        # replace_parameter(layer, "w2_qzeros", marlin_w2_zp)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        assert get_moe_runner_backend().is_auto()
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        quant_info = MarlinMoeQuantInfo(
+            w13_qweight=layer.w13_qweight,
+            w2_qweight=layer.w2_qweight,
+            w13_scales=layer.w13_scales,
+            w2_scales=layer.w2_scales,
+            w13_g_idx_sort_indices=layer.w13_g_idx_sort_indices,
+            w2_g_idx_sort_indices=layer.w2_g_idx_sort_indices,
+            w13_qzeros=layer.w13_qzeros,
+            w2_qzeros=layer.w2_qzeros,
+            weight_bits=self.quant_config.weight_bits,
+        )
+
+        return self.runner.run(dispatch_output, quant_info)
