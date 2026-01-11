@@ -43,7 +43,7 @@ const REDIS_KEY_PREFIX_BASE: &str = "smg:manual_policy:";
 
 fn redis_key_prefix() -> String {
     match std::env::var("SMG_MANUAL_REDIS_KEY_PREFIX") {
-        Ok(prefix) => format!("{}{}:", REDIS_KEY_PREFIX_BASE, prefix),
+        Ok(prefix) => format!("{prefix}:{REDIS_KEY_PREFIX_BASE}"),
         Err(_) => REDIS_KEY_PREFIX_BASE.to_string(),
     }
 }
