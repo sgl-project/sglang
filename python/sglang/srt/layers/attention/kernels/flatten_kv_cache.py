@@ -50,17 +50,16 @@ def _flatten_kv_cache_quant_sglang(
     stride_vszh: tl.constexpr,
     stride_vszd: tl.constexpr,
     # Strides for output
-    stride_koh,  # Output K head stride
     stride_kos: tl.constexpr,  # Output K seq/token stride
+    stride_koh: tl.constexpr,  # Output K head stride
     stride_kod: tl.constexpr,  # Output K dim stride
-    stride_voh,
     stride_vos: tl.constexpr,
+    stride_voh: tl.constexpr,
     stride_vod: tl.constexpr,
     # Page table stride
     stride_page_table,  # Stride for page table indexing
     # Config
     quant_policy: tl.constexpr,  # 4=int4, 8=int8
-    OUT_SIZE,  # Total output size (for last batch padding)
     TOTAL_SLOTS,  # Total number of slots in cache (for bounds checking)
     PAGE_SIZE: tl.constexpr,  # Page size (tokens per page)
     HEAD_DIM_K: tl.constexpr,
@@ -379,10 +378,10 @@ def flatten_kv_cache_sglang(
     # Allocate flattened output
     # Use layout: [num_heads, total_tokens, head_dim] for better memory access
     k_flattened = torch.empty(
-        (num_heads, out_size, head_dim_k), dtype=output_dtype, device=k_cache.device
+        (out_size, num_heads, head_dim_k), dtype=output_dtype, device=k_cache.device
     )
     v_flattened = torch.empty(
-        (num_heads, out_size, head_dim_v), dtype=output_dtype, device=v_cache.device
+        (out_size, num_heads, head_dim_v), dtype=output_dtype, device=v_cache.device
     )
 
     # Calculate grid size using pre-computed max_seq_len_k (avoids D2H copy)
@@ -420,17 +419,16 @@ def flatten_kv_cache_sglang(
         stride_vszh=v_scales_zeros.stride(1),
         stride_vszd=v_scales_zeros.stride(2),
         # Output strides
-        stride_koh=k_flattened.stride(0),
-        stride_kos=k_flattened.stride(1),
+        stride_kos=k_flattened.stride(0),
+        stride_koh=k_flattened.stride(1),
         stride_kod=k_flattened.stride(2),
-        stride_voh=v_flattened.stride(0),
-        stride_vos=v_flattened.stride(1),
+        stride_vos=v_flattened.stride(0),
+        stride_voh=v_flattened.stride(1),
         stride_vod=v_flattened.stride(2),
         # Page table stride
         stride_page_table=page_table.stride(0),
         # Config
         quant_policy=quant_policy,
-        OUT_SIZE=out_size,
         TOTAL_SLOTS=total_slots,
         PAGE_SIZE=page_size,
         HEAD_DIM_K=head_dim_k,
@@ -439,9 +437,5 @@ def flatten_kv_cache_sglang(
         BLOCK_DK=BLOCK_DK,
         BLOCK_DV=BLOCK_DV,
     )
-
-    # Reshape to [total_tokens, num_heads, head_dim] for flash attention
-    k_flattened = k_flattened.transpose(0, 1).contiguous()
-    v_flattened = v_flattened.transpose(0, 1).contiguous()
 
     return k_flattened, v_flattened
