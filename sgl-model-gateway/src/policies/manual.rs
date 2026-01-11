@@ -438,7 +438,7 @@ impl RedisBackend {
             }
         };
 
-        let old_data = match RedisCommandUtil::getex(&mut conn, &key, self.ttl_secs).await {
+        let old_data = match conn.get_ex(&key, Expiry::EX(self.ttl_secs)).await {
             Ok(x) => x,
             Err(e) => {
                 warn!("Redis getex exception: {}", e);
@@ -492,14 +492,6 @@ impl RedisBackend {
 struct RedisCommandUtil;
 
 impl RedisCommandUtil {
-    async fn getex(
-        conn: &mut deadpool_redis::Connection,
-        key: &str,
-        ttl_secs: u64,
-    ) -> Result<Option<String>, redis::RedisError> {
-        conn.get_ex(key, Expiry::EX(ttl_secs as i64)).await
-    }
-
     async fn cas(
         conn: &mut deadpool_redis::Connection,
         key: &str,
