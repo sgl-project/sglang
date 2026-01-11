@@ -15,6 +15,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 class GlmImagePipelineConfig(ImagePipelineConfig):
     """Configuration for the GlmImage pipeline."""
 
+    vae_precision: str = "bf16"
+
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
 
@@ -60,20 +62,20 @@ class GlmImagePipelineConfig(ImagePipelineConfig):
             "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
 
-    def post_denoising_loop(self, latents, batch):
-        # latents = latents.to(self.vae_config.dtype)
+    def get_decode_scale_and_shift(self, device, dtype, vae):
         latents_mean = (
             torch.tensor(self.vae_config.latents_mean)
             .view(1, self.vae_config.latent_channels, 1, 1)
-            .to(latents.device, latents.dtype)
+            .to(device, dtype)
         )
         latents_std = (
             torch.tensor(self.vae_config.latents_std)
             .view(1, self.vae_config.latent_channels, 1, 1)
-            .to(latents.device, latents.dtype)
+            .to(device, dtype)
         )
-        latents = latents * latents_std + latents_mean
+        return 1.0 / latents_std, latents_mean
 
+    def post_denoising_loop(self, latents, batch):
         if getattr(batch, "kv_caches", None) is not None:
             batch.kv_caches.clear()
-        return latents
+        return latents.bfloat16()

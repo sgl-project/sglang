@@ -838,10 +838,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                     device=device, dtype=prompt_embeds.dtype
                 )
 
-                # move to another place
-                self.vae = self.vae.to(device=device, dtype=prompt_embeds.dtype)
-                #
-
                 condition_latent = retrieve_latents(
                     self.vae.encode(condition_image),
                     generator=generator,

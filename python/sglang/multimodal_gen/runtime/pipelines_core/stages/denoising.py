@@ -1342,6 +1342,7 @@ class DenoisingStage(PipelineStage):
             noise_pred = noise_pred_uncond + current_guidance_scale * (
                 noise_pred_cond - noise_pred_uncond
             )
+
             if batch.guidance_rescale > 0.0:
                 noise_pred = self.rescale_noise_cfg(
                     noise_pred,
