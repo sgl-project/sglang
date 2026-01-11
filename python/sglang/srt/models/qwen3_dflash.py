@@ -191,9 +191,9 @@ class Qwen3DFlashAttention(nn.Module):
         dummy_q = torch.zeros_like(k)
         _, k = self.rotary_emb(positions, dummy_q, k)
 
-        # Reshape for KV cache
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        # Reshape for KV cache and make contiguous for JIT kernel compatibility
+        k = k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
+        v = v.view(-1, self.num_kv_heads, self.head_dim).contiguous()
 
         return k, v
 

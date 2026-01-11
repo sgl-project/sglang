@@ -259,7 +259,11 @@ class DFlashWorker(TpModelWorker):
             k, v = attn.project_hidden_to_kv(hidden_states, positions)
 
             # Store in KV cache at the specified locations
-            token_to_kv_pool.set_kv_buffer(attn, cache_locs, k, v, None, None)
+            # Use direct indexing to bypass JIT kernel which has compatibility issues
+            # with the K/V tensor layout from project_hidden_to_kv
+            k_buffer, v_buffer = token_to_kv_pool.get_kv_buffer(attn.layer_id)
+            k_buffer[cache_locs] = k
+            v_buffer[cache_locs] = v
 
     def _cache_hidden_to_kv_per_request(
         self,
