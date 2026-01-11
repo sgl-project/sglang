@@ -28,6 +28,11 @@ For 1M context with chunk_size=4096, num_chunks=244, k=10:
   Intermediate: batch × 64 × 10 × 244 × 4 = ~6MB (vs 4GB for full matrix!)
   Final: batch × 10 × 8 = 80 bytes per sequence
 
+SENTINEL CONVENTION:
+  Position indices use -1 to indicate invalid/padding entries.
+  This distinguishes padding from token position 0 (the first token).
+  Consumers should filter out positions < 0 before processing.
+
 This is called AFTER the main attention forward, not integrated into it,
 to keep the performance-critical attention kernel simple.
 """
@@ -192,7 +197,7 @@ def compute_topk_attention_chunked(
     if batch_size == 0:
         return (
             torch.zeros((0, top_k), dtype=torch.float32, device=device),
-            torch.zeros((0, top_k), dtype=torch.int64, device=device),
+            torch.full((0, top_k), -1, dtype=torch.int64, device=device),  # -1 = invalid position
             torch.zeros((0, top_k), dtype=torch.float32, device=device),
             torch.zeros((0,), dtype=torch.float32, device=device),
         )
@@ -201,11 +206,11 @@ def compute_topk_attention_chunked(
     if kv_indptr.shape[0] != batch_size + 1:
         logger.warning(
             f"kv_indptr size mismatch: expected {batch_size + 1}, got {kv_indptr.shape[0]}. "
-            "Returning zeros."
+            "Returning invalid markers."
         )
         return (
             torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
-            torch.zeros((batch_size, top_k), dtype=torch.int64, device=device),
+            torch.full((batch_size, top_k), -1, dtype=torch.int64, device=device),  # -1 = invalid
             torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
             torch.zeros((batch_size,), dtype=torch.float32, device=device),
         )
@@ -220,7 +225,7 @@ def compute_topk_attention_chunked(
     if max_seq_len == 0:
         return (
             torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
-            torch.zeros((batch_size, top_k), dtype=torch.int64, device=device),
+            torch.full((batch_size, top_k), -1, dtype=torch.int64, device=device),  # -1 = invalid
             torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
             torch.zeros((batch_size,), dtype=torch.float32, device=device),
         )
@@ -231,11 +236,11 @@ def compute_topk_attention_chunked(
         if max_kv_idx > kv_indices.shape[0]:
             logger.warning(
                 f"kv_indptr max ({max_kv_idx}) > kv_indices size ({kv_indices.shape[0]}). "
-                "Returning zeros."
+                "Returning invalid markers."
             )
             return (
                 torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
-                torch.zeros((batch_size, top_k), dtype=torch.int64, device=device),
+                torch.full((batch_size, top_k), -1, dtype=torch.int64, device=device),  # -1 = invalid
                 torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
                 torch.zeros((batch_size,), dtype=torch.float32, device=device),
             )
@@ -246,11 +251,11 @@ def compute_topk_attention_chunked(
         if max_idx >= k_buffer.shape[0] or min_idx < 0:
             logger.warning(
                 f"kv_indices out of bounds: min={min_idx}, max={max_idx}, "
-                f"k_buffer size={k_buffer.shape[0]}. Returning zeros."
+                f"k_buffer size={k_buffer.shape[0]}. Returning invalid markers."
             )
             return (
                 torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
-                torch.zeros((batch_size, top_k), dtype=torch.int64, device=device),
+                torch.full((batch_size, top_k), -1, dtype=torch.int64, device=device),  # -1 = invalid
                 torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
                 torch.zeros((batch_size,), dtype=torch.float32, device=device),
             )
@@ -474,7 +479,7 @@ def _rescan_top_chunks(
 
         if seq_len == 0:
             topk_scores_list.append(torch.zeros(top_k, device=device))
-            topk_indices_list.append(torch.zeros(top_k, dtype=torch.int64, device=device))
+            topk_indices_list.append(torch.full((top_k,), -1, dtype=torch.int64, device=device))  # -1 = invalid
             topk_logits_list.append(torch.zeros(top_k, device=device))
             logsumexp_list.append(torch.tensor(0.0, device=device))
             continue
@@ -547,7 +552,7 @@ def _rescan_top_chunks(
 
         if len(all_scores) == 0:
             topk_scores_list.append(torch.zeros(top_k, device=device))
-            topk_indices_list.append(torch.zeros(top_k, dtype=torch.int64, device=device))
+            topk_indices_list.append(torch.full((top_k,), -1, dtype=torch.int64, device=device))  # -1 = invalid
             topk_logits_list.append(torch.zeros(top_k, device=device))
             logsumexp_list.append(torch.tensor(0.0, device=device))
             continue
@@ -571,11 +576,11 @@ def _rescan_top_chunks(
         # Softmax normalize (over top-k only, for display purposes)
         topk_probs = torch.softmax(topk_vals, dim=0)
 
-        # Pad if needed
+        # Pad if needed (use -1 for invalid positions to distinguish from token 0)
         if actual_k < top_k:
             padding = top_k - actual_k
             topk_probs = torch.cat([topk_probs, torch.zeros(padding, device=device)])
-            topk_positions = torch.cat([topk_positions, torch.zeros(padding, dtype=torch.int64, device=device)])
+            topk_positions = torch.cat([topk_positions, torch.full((padding,), -1, dtype=torch.int64, device=device)])
             topk_vals = torch.cat([topk_vals, torch.full((padding,), float('-inf'), device=device)])
 
         topk_scores_list.append(topk_probs)
@@ -632,7 +637,7 @@ def _compute_topk_pytorch(
 
         if seq_len == 0:
             topk_scores_list.append(torch.zeros(top_k, device=device))
-            topk_indices_list.append(torch.zeros(top_k, dtype=torch.int64, device=device))
+            topk_indices_list.append(torch.full((top_k,), -1, dtype=torch.int64, device=device))  # -1 = invalid
             topk_logits_list.append(torch.zeros(top_k, device=device))
             logsumexp_list.append(torch.tensor(0.0, device=device))
             continue
@@ -650,7 +655,7 @@ def _compute_topk_pytorch(
                     f"k_buffer_size={k_buffer_size}). Skipping."
                 )
                 topk_scores_list.append(torch.zeros(top_k, device=device))
-                topk_indices_list.append(torch.zeros(top_k, dtype=torch.int64, device=device))
+                topk_indices_list.append(torch.full((top_k,), -1, dtype=torch.int64, device=device))  # -1 = invalid
                 topk_logits_list.append(torch.zeros(top_k, device=device))
                 logsumexp_list.append(torch.tensor(0.0, device=device))
                 continue
@@ -692,19 +697,19 @@ def _compute_topk_pytorch(
         if actual_k > 0:
             topk_vals, topk_idx = torch.topk(scores_avg, actual_k)
         else:
-            # All positions are sink tokens
+            # All positions are sink tokens - use -1 as invalid position sentinel
             topk_vals = torch.full((top_k,), float('-inf'), device=device)
-            topk_idx = torch.zeros(top_k, dtype=torch.int64, device=device)
+            topk_idx = torch.full((top_k,), -1, dtype=torch.int64, device=device)
 
         # Softmax normalize (over top-k only, for display)
         topk_probs = torch.softmax(topk_vals, dim=0)
 
-        # Pad if needed (only when we have partial results from topk, not when all are sinks)
+        # Pad if needed (use -1 for invalid positions to distinguish from token 0)
         # When actual_k == 0, the else branch above already created correctly-sized tensors
         if actual_k > 0 and actual_k < top_k:
             padding = top_k - actual_k
             topk_probs = torch.cat([topk_probs, torch.zeros(padding, device=device)])
-            topk_idx = torch.cat([topk_idx, torch.zeros(padding, dtype=torch.int64, device=device)])
+            topk_idx = torch.cat([topk_idx, torch.full((padding,), -1, dtype=torch.int64, device=device)])
             topk_vals = torch.cat([topk_vals, torch.full((padding,), float('-inf'), device=device)])
 
         topk_scores_list.append(topk_probs)
