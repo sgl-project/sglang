@@ -4,8 +4,7 @@ use smg::policies::{LoadBalancingPolicy, ManualConfig, ManualPolicy, SelectWorke
 
 use crate::common::{
     manual_routing_test_helpers::{
-        create_redis_policy, create_redis_policy_with_explicit_prefix,
-        create_redis_policy_with_ttl, create_workers, headers_with_routing_key, random_prefix,
+        create_workers, headers_with_routing_key, random_prefix, TestManualConfig,
     },
     redis_test_server::get_shared_server,
 };
@@ -17,8 +16,9 @@ use crate::common::{
 #[tokio::test]
 async fn test_redis_multi_instance_consistency() {
     let prefix = random_prefix("test_multi_instance");
-    let policy1 = create_redis_policy_with_explicit_prefix(&prefix);
-    let policy2 = create_redis_policy_with_explicit_prefix(&prefix);
+    let cfg = TestManualConfig::redis_with_prefix(&prefix);
+    let policy1 = cfg.build_policy();
+    let policy2 = cfg.build_policy();
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("shared-key");
@@ -39,8 +39,9 @@ async fn test_redis_multi_instance_consistency() {
 #[tokio::test]
 async fn test_redis_cross_instance_failover() {
     let prefix = random_prefix("test_cross_failover");
-    let policy1 = create_redis_policy_with_explicit_prefix(&prefix);
-    let policy2 = create_redis_policy_with_explicit_prefix(&prefix);
+    let cfg = TestManualConfig::redis_with_prefix(&prefix);
+    let policy1 = cfg.build_policy();
+    let policy2 = cfg.build_policy();
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("cross-failover");
@@ -169,7 +170,7 @@ async fn test_redis_concurrent_different_keys() {
 
 #[tokio::test]
 async fn test_redis_ttl_expiry() {
-    let policy = create_redis_policy_with_ttl("test_ttl", 2);
+    let policy = TestManualConfig::redis("test_ttl").with_ttl(2).build_policy();
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("ttl-test");

@@ -10,7 +10,7 @@ use tower::ServiceExt;
 
 use crate::common::{
     manual_routing_test_helpers::{
-        manual_routing_all_backend_e2e_test, send_request, RedisConfig, ROUTING_KEY_HEADER,
+        manual_routing_all_backend_test, send_request, TestManualConfig, ROUTING_KEY_HEADER,
     },
     AppTestContext, TestRouterConfig, TestWorkerConfig,
 };
@@ -19,11 +19,11 @@ use crate::common::{
 // Basic Manual Routing Tests
 // ============================================================================
 
-async fn test_routing_with_header_impl(base_port: u16, redis_cfg: Option<RedisConfig>) {
+async fn test_routing_with_header_impl(cfg: TestManualConfig, base_port: u16) {
     let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::Random,
-        redis_cfg.as_ref(),
+        &cfg,
     );
     let ctx = AppTestContext::new_with_config(
         config,
@@ -77,13 +77,13 @@ async fn test_routing_with_header_impl(base_port: u16, redis_cfg: Option<RedisCo
     ctx.shutdown().await;
 }
 
-manual_routing_all_backend_e2e_test!(test_routing_with_header, 3700);
+manual_routing_all_backend_test!(test_routing_with_header, 3700);
 
-async fn test_routing_without_header_impl(base_port: u16, redis_cfg: Option<RedisConfig>) {
+async fn test_routing_without_header_impl(cfg: TestManualConfig, base_port: u16) {
     let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::Random,
-        redis_cfg.as_ref(),
+        &cfg,
     );
     let ctx = AppTestContext::new_with_config(
         config,
@@ -121,13 +121,13 @@ async fn test_routing_without_header_impl(base_port: u16, redis_cfg: Option<Redi
     ctx.shutdown().await;
 }
 
-manual_routing_all_backend_e2e_test!(test_routing_without_header, 3710);
+manual_routing_all_backend_test!(test_routing_without_header, 3710);
 
-async fn test_routing_consistency_impl(base_port: u16, redis_cfg: Option<RedisConfig>) {
+async fn test_routing_consistency_impl(cfg: TestManualConfig, base_port: u16) {
     let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::Random,
-        redis_cfg.as_ref(),
+        &cfg,
     );
     let ctx = AppTestContext::new_with_config(
         config,
@@ -174,20 +174,17 @@ async fn test_routing_consistency_impl(base_port: u16, redis_cfg: Option<RedisCo
     ctx.shutdown().await;
 }
 
-manual_routing_all_backend_e2e_test!(test_routing_consistency, 3720);
+manual_routing_all_backend_test!(test_routing_consistency, 3720);
 
 // ============================================================================
 // Min Group Mode Tests
 // ============================================================================
 
-async fn test_min_group_concurrent_distribution_impl(
-    base_port: u16,
-    redis_cfg: Option<RedisConfig>,
-) {
+async fn test_min_group_concurrent_distribution_impl(cfg: TestManualConfig, base_port: u16) {
     let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::MinGroup,
-        redis_cfg.as_ref(),
+        &cfg,
     );
     let ctx = AppTestContext::new_with_config(
         config,
@@ -236,13 +233,13 @@ async fn test_min_group_concurrent_distribution_impl(
     ctx.shutdown().await;
 }
 
-manual_routing_all_backend_e2e_test!(test_min_group_concurrent_distribution, 3910);
+manual_routing_all_backend_test!(test_min_group_concurrent_distribution, 3910);
 
-async fn test_min_group_sticky_routing_impl(base_port: u16, redis_cfg: Option<RedisConfig>) {
+async fn test_min_group_sticky_routing_impl(cfg: TestManualConfig, base_port: u16) {
     let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::MinGroup,
-        redis_cfg.as_ref(),
+        &cfg,
     );
     let ctx = AppTestContext::new_with_config(
         config,
@@ -279,16 +276,13 @@ async fn test_min_group_sticky_routing_impl(base_port: u16, redis_cfg: Option<Re
     ctx.shutdown().await;
 }
 
-manual_routing_all_backend_e2e_test!(test_min_group_sticky_routing, 3920);
+manual_routing_all_backend_test!(test_min_group_sticky_routing, 3920);
 
-async fn test_min_group_mixed_concurrent_routing_impl(
-    base_port: u16,
-    redis_cfg: Option<RedisConfig>,
-) {
+async fn test_min_group_mixed_concurrent_routing_impl(cfg: TestManualConfig, base_port: u16) {
     let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::MinGroup,
-        redis_cfg.as_ref(),
+        &cfg,
     );
     let ctx = AppTestContext::new_with_config(
         config,
@@ -340,4 +334,4 @@ async fn test_min_group_mixed_concurrent_routing_impl(
     ctx.shutdown().await;
 }
 
-manual_routing_all_backend_e2e_test!(test_min_group_mixed_concurrent_routing, 3930);
+manual_routing_all_backend_test!(test_min_group_mixed_concurrent_routing, 3930);
