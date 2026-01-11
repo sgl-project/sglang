@@ -29,6 +29,7 @@ def _jit_kvcache_module(row_bytes: int) -> Module:
 
 @cache_once
 def can_use_store_cache(size: int) -> bool:
+    return False
     logger = logging.getLogger(__name__)
     if size % 4 != 0:
         logger.warning(
