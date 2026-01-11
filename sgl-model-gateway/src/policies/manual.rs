@@ -78,10 +78,10 @@ enum ExecutionBranch {
     OccupiedHit,
     OccupiedMiss,
     Vacant,
-    RedisPoolGetFailed,
-    RedisGetexFailed,
+    RedisPoolGetException,
+    RedisGetexException,
     RedisCasRace,
-    RedisCasFailed,
+    RedisCasException,
     RedisCasMaxRetries,
 }
 
@@ -93,9 +93,9 @@ impl ExecutionBranch {
             Self::OccupiedHit => "occupied_hit",
             Self::OccupiedMiss => "occupied_miss",
             Self::Vacant => "vacant",
-            Self::RedisPoolGetFailed => "redis_pool_get_failed",
-            Self::RedisGetexFailed => "redis_getex_failed",
-            Self::RedisCasFailed => "redis_cas_failed",
+            Self::RedisPoolGetException => "redis_pool_get_failed",
+            Self::RedisGetexException => "redis_getex_failed",
+            Self::RedisCasException => "redis_cas_failed",
             Self::RedisCasMaxRetries => "redis_cas_max_retries",
         }
     }
@@ -420,7 +420,7 @@ impl RedisBackend {
             Ok(x) => x,
             Err(e) => {
                 warn!("Redis pool.get exception: {}", e);
-                return (None, ExecutionBranch::RedisPoolGetFailed);
+                return (None, ExecutionBranch::RedisPoolGetException);
             }
         };
 
@@ -428,7 +428,7 @@ impl RedisBackend {
             Ok(x) => x,
             Err(e) => {
                 warn!("Redis getex exception: {}", e);
-                return (None, ExecutionBranch::RedisGetexFailed);
+                return (None, ExecutionBranch::RedisGetexException);
             }
         };
 
@@ -455,7 +455,7 @@ impl RedisBackend {
             Ok(false) => (None, ExecutionBranch::RedisCasRace),
             Err(e) => {
                 warn!("Redis cas exception: {}", e);
-                (None, ExecutionBranch::RedisCasFailed)
+                (None, ExecutionBranch::RedisCasException)
             }
         }
     }
