@@ -380,22 +380,14 @@ class SparseLinearAttention(nn.Module):
         self.proj_l = nn.Linear(head_dim, head_dim, dtype=torch.float32)
 
         if feature_map == "elu":
-
-            def elu_feature_map(x):
-                return F.elu(x) + 1
-
-            self.feature_map_q = elu_feature_map
-            self.feature_map_k = elu_feature_map
+            self.feature_map_q = self._elu_feature_map
+            self.feature_map_k = self.elu_feature_map
         elif feature_map == "relu":
             self.feature_map_q = nn.ReLU()
             self.feature_map_k = nn.ReLU()
         elif feature_map == "softmax":
-
-            def softmax_feature_map(x):
-                return F.softmax(x, dim=-1)
-
-            self.feature_map_q = softmax_feature_map
-            self.feature_map_k = softmax_feature_map
+            self.feature_map_q = self._softmax_feature_map
+            self.feature_map_k = self._softmax_feature_map
         else:
             raise NotImplementedError(f"Not supported feature map {feature_map}.")
 
@@ -437,12 +429,7 @@ class SparseLinearAttention(nn.Module):
         q = self.feature_map_q(q).contiguous().to(self.dtype)  # c_q
         k = self.feature_map_k(k).contiguous().to(self.dtype)  # c_k
 
-        def calc_linear(q, k, v):
-            kvsum = k.transpose(-1, -2) @ v
-            ksum = torch.sum(k, dim=-2, keepdim=True)
-            return (q @ kvsum) / (1e-5 + (q * ksum).sum(dim=-1, keepdim=True))
-
-        o_l = calc_linear(q, k, v)
+        o_l = self._torch_calc_linear(q, k, v)
 
         with torch.amp.autocast("cuda", dtype=self.dtype):
             o_l = self.proj_l(o_l)
@@ -452,6 +439,22 @@ class SparseLinearAttention(nn.Module):
             return o, real_topk / sparse_map.shape[-1]
         else:
             return o
+
+    def _torch_calc_linear(self, q, k, v):
+        kv = torch.matmul(k.transpose(-1, -2), v)
+        k_sum = torch.sum(k, dim=-2, keepdim=True)
+        return torch.matmul(q, kv) / (1e-5 + torch.matmul(q, k_sum.transpose(-1, -2)))
+
+    def _calc_linear(self, q, k, v):
+        kvsum = k.transpose(-1, -2) @ v
+        ksum = torch.sum(k, dim=-2, keepdim=True)
+        return (q @ kvsum) / (1e-5 + (q * ksum).sum(dim=-1, keepdim=True))
+
+    def _softmax_feature_map(self, x):
+        return F.softmax(x, dim=-1)
+
+    def _elu_feature_map(self, x):
+        return F.elu(x) + 1
 
 
 class _attention(torch.autograd.Function):
