@@ -148,8 +148,8 @@ SGLang Diffusion x Cache-DiT supports almost all models originally supported in 
 
 ## Limitations
 
-- **Single GPU only**: Distributed support (TP/SP) is not yet validated; Cache-DiT will be automatically disabled when
-  `world_size > 1`
+- **SGLang-native pipelines**: Distributed support (TP/SP) is not yet validated; Cache-DiT will be automatically
+  disabled when `world_size > 1`.
 - **SCM minimum steps**: SCM requires >= 8 inference steps to be effective
 - **Model support**: Only models registered in Cache-DiT's BlockAdapterRegister are supported
 
