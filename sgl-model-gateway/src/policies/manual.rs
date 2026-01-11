@@ -287,74 +287,6 @@ impl LocalBackend {
     }
 }
 
-// ------------------------------------ redis utils ---------------------------------------
-
-/// Utility for Redis commands (GETEX, CAS via Lua)
-struct RedisCommandUtil;
-
-impl RedisCommandUtil {
-    /// Lua script for CAS (Compare-And-Swap)
-    /// KEYS[1] = key
-    /// ARGV[1] = expected_old (empty string = nil)
-    /// ARGV[2] = new_value
-    /// ARGV[3] = ttl_secs
-    /// Returns: [1, ""] on success, [0, current_value] on CAS failure
-    const CAS_LUA: &'static str = r#"
-local old = redis.call('GET', KEYS[1])
-local expected = ARGV[1]
-if expected == '' then expected = false end
-
-if old ~= expected then
-    return {0, old or ''}
-end
-
-redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
-return {1, ''}
-"#;
-
-    /// GET + refresh TTL in one call (Redis 6.2+)
-    async fn getex(conn: &mut deadpool_redis::Connection, key: &str, ttl_secs: u64) -> Option<String> {
-        redis::cmd("GETEX")
-            .arg(key)
-            .arg("EX")
-            .arg(ttl_secs)
-            .query_async(conn)
-            .await
-            .ok()
-            .flatten()
-    }
-
-    /// Compare-And-Swap using Lua script
-    /// Returns (success, current_value_if_failed)
-    async fn cas(
-        conn: &mut deadpool_redis::Connection,
-        key: &str,
-        expected: Option<&str>,
-        new_value: &str,
-        ttl_secs: u64,
-    ) -> (bool, Option<String>) {
-        let expected_arg = expected.unwrap_or("");
-        let result: Result<(i32, String), _> = redis::cmd("EVAL")
-            .arg(Self::CAS_LUA)
-            .arg(1) // number of keys
-            .arg(key)
-            .arg(expected_arg)
-            .arg(new_value)
-            .arg(ttl_secs)
-            .query_async(conn)
-            .await;
-
-        match result {
-            Ok((1, _)) => (true, None),
-            Ok((0, current)) => (false, if current.is_empty() { None } else { Some(current) }),
-            Err(e) => {
-                warn!("Redis CAS Lua error: {}", e);
-                (false, None)
-            }
-        }
-    }
-}
-
 // ------------------------------------ redis backend ---------------------------------------
 
 #[derive(Debug)]
@@ -466,7 +398,75 @@ impl RedisBackend {
     }
 }
 
-// ------------------------------------ util functions ---------------------------------------
+// ------------------------------------ redis utils ---------------------------------------
+
+/// Utility for Redis commands (GETEX, CAS via Lua)
+struct RedisCommandUtil;
+
+impl RedisCommandUtil {
+    /// Lua script for CAS (Compare-And-Swap)
+    /// KEYS[1] = key
+    /// ARGV[1] = expected_old (empty string = nil)
+    /// ARGV[2] = new_value
+    /// ARGV[3] = ttl_secs
+    /// Returns: [1, ""] on success, [0, current_value] on CAS failure
+    const CAS_LUA: &'static str = r#"
+local old = redis.call('GET', KEYS[1])
+local expected = ARGV[1]
+if expected == '' then expected = false end
+
+if old ~= expected then
+    return {0, old or ''}
+end
+
+redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+return {1, ''}
+"#;
+
+    /// GET + refresh TTL in one call (Redis 6.2+)
+    async fn getex(conn: &mut deadpool_redis::Connection, key: &str, ttl_secs: u64) -> Option<String> {
+        redis::cmd("GETEX")
+            .arg(key)
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(conn)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Compare-And-Swap using Lua script
+    /// Returns (success, current_value_if_failed)
+    async fn cas(
+        conn: &mut deadpool_redis::Connection,
+        key: &str,
+        expected: Option<&str>,
+        new_value: &str,
+        ttl_secs: u64,
+    ) -> (bool, Option<String>) {
+        let expected_arg = expected.unwrap_or("");
+        let result: Result<(i32, String), _> = redis::cmd("EVAL")
+            .arg(Self::CAS_LUA)
+            .arg(1) // number of keys
+            .arg(key)
+            .arg(expected_arg)
+            .arg(new_value)
+            .arg(ttl_secs)
+            .query_async(conn)
+            .await;
+
+        match result {
+            Ok((1, _)) => (true, None),
+            Ok((0, current)) => (false, if current.is_empty() { None } else { Some(current) }),
+            Err(e) => {
+                warn!("Redis CAS Lua error: {}", e);
+                (false, None)
+            }
+        }
+    }
+}
+
+// ------------------------------------ misc utils ---------------------------------------
 
 fn find_healthy_worker(
     urls: &[String],
