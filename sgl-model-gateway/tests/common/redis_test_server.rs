@@ -81,18 +81,6 @@ impl RedisTestServer {
     pub fn url(&self) -> &str {
         &self.url
     }
-
-    pub fn flush_all(&self) -> Result<(), String> {
-        let client = redis::Client::open(self.url.as_str())
-            .map_err(|e| format!("Failed to connect to Redis: {}", e))?;
-        let mut conn = client
-            .get_connection()
-            .map_err(|e| format!("Failed to get connection: {}", e))?;
-        redis::cmd("FLUSHALL")
-            .query::<()>(&mut conn)
-            .map_err(|e| format!("Failed to flush: {}", e))?;
-        Ok(())
-    }
 }
 
 impl Drop for RedisTestServer {
