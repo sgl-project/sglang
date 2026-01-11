@@ -196,7 +196,7 @@ enum Backend {
 impl Backend {
     fn from_config(config: &ManualConfig) -> Self {
         if let Some(redis_url) = &config.redis_url {
-            let key_prefix = format!("{}:{REDIS_KEY_MIDFIX_DEFAULT}", config.redis_key_prefix.as_ref().unwrap_or_default());
+            let key_prefix = format!("{}:{REDIS_KEY_MIDFIX_DEFAULT}", config.redis_key_prefix.as_deref().unwrap_or(""));
             let backend = RedisBackend::new(redis_url, config.max_idle_secs, key_prefix)
                 .expect("redis_url is set but failed to connect to Redis");
             info!("ManualPolicy using Redis backend: {}", redis_url);
