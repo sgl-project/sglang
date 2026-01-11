@@ -647,6 +647,10 @@ mod tests {
         headers
     }
 
+    // ========================================================================
+    // Unit Tests
+    // ========================================================================
+
     #[tokio::test]
     async fn test_unit_policy_name() {
         let policy = ManualPolicy::new();
@@ -748,6 +752,10 @@ mod tests {
         assert_eq!(config.eviction_interval_secs, 60);
         assert_eq!(config.max_idle_secs, 4 * 3600);
     }
+
+    // ========================================================================
+    // Local Tests
+    // ========================================================================
 
     #[tokio::test]
     async fn test_local_backend_disabled_eviction() {
