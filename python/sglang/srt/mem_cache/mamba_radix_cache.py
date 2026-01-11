@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_paged,
     get_child_key,
 )
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -955,11 +956,14 @@ class MambaRadixCache(BasePrefixCache):
         # Calculate the branching point. It is defined as the last aligned position that
         # does not have a mamba value.
         if len(value) > best_value_len:
-            fla_chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // FLA_CHUNK_SIZE
-            ) * FLA_CHUNK_SIZE
+            mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+            mamba_cache_chunk_aligned_seqlen = (
+                sum(len(v) for v in value) // mamba_cache_chunk_size
+            ) * mamba_cache_chunk_size
             mamba_branching_seqlen = (
-                fla_chunk_aligned_seqlen if fla_chunk_aligned_seqlen > 0 else None
+                mamba_cache_chunk_aligned_seqlen
+                if mamba_cache_chunk_aligned_seqlen > 0
+                else None
             )
         else:
             mamba_branching_seqlen = None

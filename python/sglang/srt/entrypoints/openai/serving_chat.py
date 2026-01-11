@@ -246,6 +246,7 @@ class OpenAIServingChat(OpenAIServingBase):
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
+            routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             image_max_dynamic_patch=img_max_dynamic_patch,
