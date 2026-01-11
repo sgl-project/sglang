@@ -378,8 +378,7 @@ impl RedisBackend {
             if attempt > 0 {
                 Metrics::record_manual_policy_redis_error("retry");
             }
-            let key = format!("{}{}", REDIS_KEY_PREFIX, routing_id).clone();
-            self.select_one_attempt(&key, workers, healthy_indices, assignment_mode).await
+            self.select_one_attempt(routing_id, workers, healthy_indices, assignment_mode).await
         }).await;
 
         match result {
@@ -393,11 +392,13 @@ impl RedisBackend {
 
     async fn select_one_attempt(
         &self,
-        key: &str,
+        routing_id: &str,
         workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
         assignment_mode: ManualAssignmentMode,
     ) -> (Option<usize>, ExecutionBranch) {
+        let key = format!("{}{}", REDIS_KEY_PREFIX, routing_id).clone();
+
         let mut conn = match self.pool.get().await {
             Ok(x) => x,
             Err(e) => {
