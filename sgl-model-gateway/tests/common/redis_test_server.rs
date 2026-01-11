@@ -75,7 +75,7 @@ impl RedisTestServer {
             }
             std::thread::sleep(Duration::from_millis(1000));
         }
-        panic!("Redis server failed to start on port {}", self.port);
+        panic!("Timeout waiting Redis server ready on port {}", self.port);
     }
 
     pub fn url(&self) -> &str {
