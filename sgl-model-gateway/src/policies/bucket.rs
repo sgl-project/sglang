@@ -588,7 +588,7 @@ mod tests {
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
     #[tokio::test]
-    async async fn test_load_balancing_conditions() {
+    async fn test_load_balancing_conditions() {
         // Test 1: Basic load balancing trigger
         let config = BucketConfig {
             balance_abs_threshold: 32,
@@ -807,7 +807,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async async fn test_adjust_boundary_1() {
+    async fn test_adjust_boundary_1() {
         // Test configuration: Set high threshold to prevent load balancing policy.
         let config = BucketConfig {
             balance_abs_threshold: 300,
@@ -1026,7 +1026,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async async fn test_adjust_boundary_2() {
+    async fn test_adjust_boundary_2() {
         let config = BucketConfig {
             balance_abs_threshold: 300,
             balance_rel_threshold: 1.0001,
@@ -1149,7 +1149,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async async fn test_not_adjust_boundary() {
+    async fn test_not_adjust_boundary() {
         let config = BucketConfig {
             balance_abs_threshold: 300,
             balance_rel_threshold: 1.0001,

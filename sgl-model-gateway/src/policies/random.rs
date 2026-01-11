@@ -56,7 +56,7 @@ mod tests {
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
     #[tokio::test]
-    async async fn test_random_selection() {
+    async fn test_random_selection() {
         let policy = RandomPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -88,7 +88,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async async fn test_random_with_unhealthy_workers() {
+    async fn test_random_with_unhealthy_workers() {
         let policy = RandomPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async async fn test_random_no_healthy_workers() {
+    async fn test_random_no_healthy_workers() {
         let policy = RandomPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
             BasicWorkerBuilder::new("http://w1:8000")

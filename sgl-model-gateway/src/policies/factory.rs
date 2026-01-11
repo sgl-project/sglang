@@ -96,7 +96,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async async fn test_create_from_config() {
+    async fn test_create_from_config() {
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Random);
         assert_eq!(policy.name(), "random");
 
@@ -136,7 +136,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async async fn test_create_by_name() {
+    async fn test_create_by_name() {
         assert!(PolicyFactory::create_by_name("random").is_some());
         assert!(PolicyFactory::create_by_name("RANDOM").is_some());
         assert!(PolicyFactory::create_by_name("round_robin").is_some());

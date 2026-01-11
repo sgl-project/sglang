@@ -65,7 +65,7 @@ mod tests {
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
     #[tokio::test]
-    async async fn test_round_robin_selection() {
+    async fn test_round_robin_selection() {
         let policy = RoundRobinPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -94,7 +94,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async async fn test_round_robin_with_unhealthy_workers() {
+    async fn test_round_robin_with_unhealthy_workers() {
         let policy = RoundRobinPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -124,7 +124,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async async fn test_round_robin_reset() {
+    async fn test_round_robin_reset() {
         let policy = RoundRobinPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
