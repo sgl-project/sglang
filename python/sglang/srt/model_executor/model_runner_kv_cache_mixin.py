@@ -129,6 +129,30 @@ class ModelRunnerKVCacheMixin:
                 f"({num_target_layers} layers × {hidden_size} hidden_size)"
             )
 
+            # Add draft model KV cache size per token
+            # Load draft model config to get layer count automatically
+            from transformers import AutoConfig
+
+            draft_config = AutoConfig.from_pretrained(
+                self.server_args.speculative_draft_model_path,
+                trust_remote_code=True,
+            )
+            num_draft_layers = draft_config.num_hidden_layers
+            num_kv_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
+            # Draft KV cache: num_kv_heads × (head_dim + v_head_dim) × num_draft_layers × kv_size
+            draft_kv_size = (
+                num_kv_heads
+                * (self.model_config.head_dim + self.model_config.v_head_dim)
+                * num_draft_layers
+                * kv_size
+            )
+            cell_size += draft_kv_size
+            logger.info(
+                f"[DFlash] Adding {draft_kv_size} bytes per token for draft KV cache "
+                f"({num_draft_layers} layers × {num_kv_heads} kv_heads × "
+                f"{self.model_config.head_dim + self.model_config.v_head_dim} dim)"
+            )
+
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):

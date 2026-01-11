@@ -34,6 +34,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -150,20 +151,145 @@ class Qwen3DFlashAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
+        # RadixAttention for backend-accelerated path with bidirectional attention
+        self.radix_attn = RadixAttention(
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            scaling=self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
+            attn_type=AttentionType.ENCODER_ONLY,
+        )
+
+    def project_hidden_to_kv(
+        self, hidden_states: torch.Tensor, positions: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Project hidden states to K/V tensors for caching.
+
+        Used by DFlashWorker to cache target hidden states as K/V in the draft
+        model's KV pool before draft forward.
+
+        Args:
+            hidden_states: Hidden states [num_tokens, hidden_size]
+            positions: Position IDs for RoPE [num_tokens]
+
+        Returns:
+            Tuple of (K, V) tensors, each shaped [num_tokens, num_kv_heads, head_dim]
+        """
+        # Project to QKV (we only need K and V)
+        qkv, _ = self.qkv_proj(hidden_states)
+        _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # Apply K normalization (norm expects 2D tensor with shape [-1, head_dim])
+        k_shape = k.shape
+        k_by_head = k.reshape(-1, self.head_dim)
+        k_by_head = self.k_norm(k_by_head)
+        k = k_by_head.view(k_shape)
+
+        # Apply RoPE to K (need dummy Q for the rotary_emb interface)
+        dummy_q = torch.zeros_like(k)
+        _, k = self.rotary_emb(positions, dummy_q, k)
+
+        # Reshape for KV cache
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+
+        return k, v
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
+        forward_batch: Optional[ForwardBatch],
         ctx_len: int,
     ) -> torch.Tensor:
         """
         Forward pass matching original DFlash attention pattern.
 
+        Supports two modes:
+        1. Torch fallback (ctx_len > 0): hidden_states = [context, noise], manual attention
+        2. RadixAttention (ctx_len == 0, forward_batch provided): hidden_states = noise only,
+           context K/V pre-cached in KV pool, uses ENCODER_ONLY for bidirectional attention
+
+        Args:
+            positions: Position IDs for rotary embeddings [total_tokens]
+            hidden_states: Concatenated [target_hidden, noise] or noise only [tokens, hidden]
+            forward_batch: ForwardBatch for RadixAttention mode, None for torch fallback
+            ctx_len: Length of target_hidden portion (0 for RadixAttention mode)
+
+        Returns:
+            Attention output for NOISE positions only [noise_tokens, hidden]
+        """
+        total_tokens = hidden_states.shape[0]
+        noise_len = total_tokens - ctx_len
+
+        # RadixAttention mode: ctx_len=0 means context is pre-cached, use backend
+        if ctx_len == 0 and forward_batch is not None:
+            return self._forward_radix(positions, hidden_states, forward_batch)
+
+        # Torch fallback mode: ctx_len > 0 means context is in hidden_states
+        return self._forward_torch(positions, hidden_states, ctx_len)
+
+    def _forward_radix(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """
+        RadixAttention forward path with bidirectional attention.
+
+        Context K/V is pre-cached in the KV pool. Noise K/V is saved to
+        temporary cache locations during attention, then freed by caller.
+
+        Args:
+            positions: Position IDs for rotary embeddings [noise_len]
+            hidden_states: Noise tokens only [noise_len, hidden]
+            forward_batch: ForwardBatch with attention metadata
+
+        Returns:
+            Attention output [noise_len, hidden]
+        """
+        # QKV projection on noise tokens
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # Apply Q/K normalization
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            head_dim=self.head_dim,
+        )
+
+        # Apply rotary embeddings
+        q, k = self.rotary_emb(positions, q, k)
+
+        # Use RadixAttention with ENCODER_ONLY (bidirectional) and save_kv_cache=True
+        # The noise K/V must be saved to cache so attention can read them.
+        # The cache locations will be freed by the caller after forward pass.
+        attn_output = self.radix_attn(q, k, v, forward_batch, save_kv_cache=True)
+
+        # Output projection
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _forward_torch(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx_len: int,
+    ) -> torch.Tensor:
+        """
+        Torch fallback forward path with manual attention.
+
+        Used when forward_batch is None or ctx_len > 0.
+
         Args:
             positions: Position IDs for rotary embeddings [total_tokens]
             hidden_states: Concatenated [target_hidden, noise] [total_tokens, hidden]
-            forward_batch: Unused, kept for interface compatibility
             ctx_len: Length of target_hidden portion
 
         Returns:
@@ -217,6 +343,7 @@ class Qwen3DFlashAttention(nn.Module):
 
         # Compute attention: Q [1, heads, noise_len, head_dim] @ K^T [1, heads, head_dim, total_len]
         # Result: [1, heads, noise_len, total_len]
+        # Non-causal (bidirectional) attention
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
         attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
             v.dtype

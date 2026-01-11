@@ -60,6 +60,9 @@ class DFlashDraftInput(SpecInput):
     # Capture mode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
+    # Number of tokens per batch for DRAFT_EXTEND_V2 CUDA graph replay
+    num_tokens_per_batch: int = 16
+
     # Class-level constant for allocation (set by worker)
     ALLOC_LEN_PER_DECODE: ClassVar[int] = 16
 

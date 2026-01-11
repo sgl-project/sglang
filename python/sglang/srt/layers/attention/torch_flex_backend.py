@@ -257,8 +257,11 @@ class TorchFlexAttnBackend(AttentionBackend):
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        causal = True
-        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+        # Determine causal mode from attention type
+        causal = not (
+            layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY
+        )
+        if not causal:
             raise NotImplementedError(
                 "TorchFlexAttnBackend does not support non-causal attention for now."
             )
