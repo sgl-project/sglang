@@ -2156,32 +2156,6 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
         return output
 
-    def _set_mla_kv_buffer(
-        self,
-        latent_cache: torch.Tensor,
-        kv_a: torch.Tensor,
-        k_pe: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        if _is_cuda or _use_aiter_gfx95:
-            # Save latent cache
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-            )
-        elif _is_npu:
-            # To reduce a time-costing split operation
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-            )
-        else:
-            latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-            latent_cache[:, :, self.kv_lora_rank :] = k_pe
-
-            # Save latent cache
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
-            )
-
     @staticmethod
     def _get_q_b_proj_quant_config(quant_config):
         if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():

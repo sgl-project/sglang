@@ -6,7 +6,12 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.deepseek_common.utils import _is_cuda, _is_hip, _use_aiter_gfx95
+from sglang.srt.models.deepseek_common.utils import (
+    _is_cuda,
+    _is_hip,
+    _is_npu,
+    _use_aiter_gfx95,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator
@@ -295,6 +300,32 @@ class DeepseekMHAForwardMixin:
             del kv, k, v, output, lse, tmp_output, tmp_lse
 
         return accum_output
+
+    def _set_mla_kv_buffer(
+        self,
+        latent_cache: torch.Tensor,
+        kv_a: torch.Tensor,
+        k_pe: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if _is_cuda or _use_aiter_gfx95:
+            # Save latent cache
+            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            )
+        elif _is_npu:
+            # To reduce a time-costing split operation
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            )
+        else:
+            latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
+            latent_cache[:, :, self.kv_lora_rank :] = k_pe
+
+            # Save latent cache
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+            )
 
     def _get_mla_kv_buffer(
         self,
