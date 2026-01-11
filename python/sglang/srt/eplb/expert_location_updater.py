@@ -157,8 +157,22 @@ def _update_expert_weights_raw(
         )
 
 
+temp_buffers_global = None
+
+
 def create_temp_buffers(sample_tensors):
-    return [torch.empty_like(tensor) for tensor in sample_tensors]
+    global temp_buffers_global
+    if (
+        temp_buffers_global is None
+        or len(temp_buffers_global) != len(sample_tensors)
+        or any(len(tb) != len(st) for tb, st in zip(temp_buffers_global, sample_tensors))
+        or any(tb[0].shape != st[0].shape for tb, st in zip(temp_buffers_global, sample_tensors))
+    ):
+        temp_buffers_global = [
+            [torch.empty_like(x) for x in row] 
+            for row in sample_tensors
+        ]
+    return temp_buffers_global
 
 
 def update_expert_weights_single_layer(
@@ -174,7 +188,7 @@ def update_expert_weights_single_layer(
     log_metrics: bool = False,
 ):
     assert all(
-        tensor.shape[0] == num_local_physical_experts
+        len(tensor) == num_local_physical_experts
         for tensor in routed_experts_weights
     ), f"{num_local_physical_experts=} {[x.shape for x in routed_experts_weights]=}"
     assert isinstance(old_physical_to_logical_map, list)
