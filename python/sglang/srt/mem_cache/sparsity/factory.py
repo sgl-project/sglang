@@ -15,6 +15,9 @@ from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseConfig,
     SparseCoordinator,
 )
+from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import (
+    SparseKVCacheManager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +50,14 @@ def _create_backend_adaptor(
     device: torch.device,
     sparse_algorithm: BaseSparseAlgorithm,
     req_to_token_pool,
+    sparse_kv_cache_manager,
 ):
     """Create backend adaptor."""
     if isinstance(sparse_algorithm, DeepSeekNSAAlgorithm):
         return NSABackendAdaptor(device, req_to_token_pool)
 
     if backend in ["fa3", "flashattention"]:
-        return FlashAttentionAdaptor(device)
+        return FlashAttentionAdaptor(device, req_to_token_pool, sparse_kv_cache_manager)
 
     raise ValueError(f"Unknown attention backend: {backend}")
 
@@ -94,13 +98,22 @@ def create_sparse_coordinator(
     token_to_kv_pool,
     start_layer: int,
     end_layer: int,
+    token_to_kv_pool_allocator,
+    tp_group,
     server_args,
     **kwargs,
 ) -> SparseCoordinator:
     config = _parse_sparse_config(server_args)
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
+    sparse_kv_cache_manager = SparseKVCacheManager(
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        tp_group=tp_group,
+        server_args=server_args,
+    )
+
     backend_adaptor = _create_backend_adaptor(
-        config.backend, device, algorithm, req_to_token_pool
+        config.backend, device, algorithm, req_to_token_pool, sparse_kv_cache_manager
     )
 
     coordinator = SparseCoordinator(
@@ -109,6 +122,7 @@ def create_sparse_coordinator(
         backend_adaptor=backend_adaptor,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool=token_to_kv_pool,
+        sparse_kv_cache_manager=sparse_kv_cache_manager,
         start_layer=start_layer,
         end_layer=end_layer,
         device=device,
@@ -124,3 +138,7 @@ def register_sparse_coordinator(coordinator: SparseCoordinator) -> None:
 
 def get_sparse_coordinator() -> Optional[SparseCoordinator]:
     return _global_sparse_coordinator
+
+
+def is_hierarchical_sparse_attention_enabled() -> bool:
+    return _global_sparse_coordinator is not None

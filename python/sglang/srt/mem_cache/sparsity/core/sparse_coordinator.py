@@ -7,6 +7,9 @@ import torch
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
+from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import (
+    SparseKVCacheManager,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -29,6 +32,7 @@ class RequestTrackers:
     ):
         self.device = device
         self.num_layers = num_layers
+        self.min_sparse_prompt_len = min_sparse_prompt_len
 
         self.repr_constructed = torch.zeros(
             max_pool_size, dtype=torch.bool, device=device
@@ -37,18 +41,74 @@ class RequestTrackers:
         self.last_constructed_page = torch.zeros(
             max_pool_size, dtype=torch.int64, device=device
         )
+        self.prompt_kv_offloaded_and_slots_truncated = torch.zeros(
+            max_pool_size, dtype=torch.bool, device=device
+        )
 
-        # TODO: Add more trackers for hierarchical KVCache management
+        # Trackers for diff kernel
+        self.full_host_indices = torch.full(
+            (max_pool_size, max_context_len),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.curr_device_indices = torch.full(
+            (max_pool_size, self.min_sparse_prompt_len),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.should_load_device_indices = torch.full(
+            (max_pool_size, self.min_sparse_prompt_len),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.should_load_host_indices = torch.full(
+            (max_pool_size, self.min_sparse_prompt_len),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.prev_top_k_result = torch.full(
+            (max_pool_size, num_layers, self.min_sparse_prompt_len),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.prev_device_indices = torch.full(
+            (max_pool_size, num_layers, self.min_sparse_prompt_len),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
 
     def register(self, idx: int, prompt_len: int) -> None:
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = prompt_len
         self.last_constructed_page[idx] = 0
+        self.prompt_kv_offloaded_and_slots_truncated[idx] = False
+        self.full_host_indices[idx].fill_(-1)
+        self.curr_device_indices[idx].fill_(-1)
+        self.should_load_device_indices[idx].fill_(-1)
+        self.should_load_host_indices[idx].fill_(-1)
+        self.prev_top_k_result[idx].fill_(-1)
+        self.prev_device_indices[idx].fill_(-1)
 
-    def clear(self, idx: int) -> None:
+    def clear(self, idx: int) -> torch.Tensor:
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = 0
         self.last_constructed_page[idx] = 0
+        self.prompt_kv_offloaded_and_slots_truncated[idx] = False
+        host_indices = self.full_host_indices[idx][self.full_host_indices[idx] != -1]
+        self.full_host_indices[idx].fill_(-1)
+        self.curr_device_indices[idx].fill_(-1)
+        self.should_load_device_indices[idx].fill_(-1)
+        self.should_load_host_indices[idx].fill_(-1)
+        self.prev_top_k_result[idx].fill_(-1)
+        self.prev_device_indices[idx].fill_(-1)
+
+        return host_indices
 
 
 @dataclass
@@ -97,6 +157,7 @@ class SparseCoordinator:
         backend_adaptor: Optional[BackendAdaptor],
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool: KVCache,
+        sparse_kv_cache_manager: SparseKVCacheManager,
         start_layer: int,
         end_layer: int,
         device: torch.device,
@@ -106,6 +167,7 @@ class SparseCoordinator:
         self.backend_adaptor = backend_adaptor
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool = token_to_kv_pool
+        self.sparse_kv_cache_manager = sparse_kv_cache_manager
         self.start_layer = start_layer
         self.end_layer = end_layer
         self.device = device
@@ -118,6 +180,7 @@ class SparseCoordinator:
             self.config.min_sparse_prompt_len,
             self.req_to_token_pool.max_context_len,
         )
+        self.sparse_kv_cache_manager.req_states = self.states
 
         # Initialize algorithm representation pool and context
         self.algorithm.initialize_representation_pool(
@@ -140,6 +203,46 @@ class SparseCoordinator:
         """
         if req.req_pool_idx is not None:
             self.states.register(req.req_pool_idx, len(req.origin_input_ids))
+        logger.info(f"Request {req.rid}, prompt length: {len(req.origin_input_ids)}")
+
+    def trigger_async_offload_prompt_cache(self, req: "Req") -> None:
+        """Trigger async offload of prompt cache."""
+        if (
+            req.req_pool_idx is None
+            or len(req.origin_input_ids) < self.config.min_sparse_prompt_len
+        ):
+            return
+
+        self.sparse_kv_cache_manager.offload_prompt_kvcache(req)
+        logger.info(f"Request {req.rid} async offload prompt cache begin")
+
+    def check_prompt_offload_completion(self, tree_cache):
+        """
+        Check if the prompt KV cache offload has completed.
+        If completed, update the request state and return the requests.
+        """
+        reqs = self.sparse_kv_cache_manager.poll_prompt_offload_completion()
+        for req in reqs:
+            assert (
+                self.states.prompt_kv_offloaded_and_slots_truncated[req.req_pool_idx]
+                == False
+            )
+
+            # Store previous device indices
+            indices_len = self.config.min_sparse_prompt_len
+            self.states.prev_device_indices[req.req_pool_idx] = (
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, :indices_len]
+            )
+            self._maybe_truncate_kv_cache_after_prompt_offloaded(
+                req, self.req_to_token_pool, tree_cache
+            )
+            logger.info(f"Request {req.rid} async offload prompt cache done.")
+        return reqs
+
+    def get_reqs_offloaded_and_truncated_mask(
+        self, req_pool_indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.states.prompt_kv_offloaded_and_slots_truncated[req_pool_indices]
 
     def on_request_end(self, req: "Req") -> None:
         """
@@ -149,10 +252,19 @@ class SparseCoordinator:
         if req.req_pool_idx is None:
             return
 
-        self.states.clear(req.req_pool_idx)
+        self.sparse_kv_cache_manager.poll_decode_offload_completion()
+        host_indices = self.states.clear(req.req_pool_idx)
 
-        # TODO: Implement request end handling
-        # - Release host indices if any were allocated for offloading
+        if host_indices.numel() > 0:
+            # Free host indices
+            self.sparse_kv_cache_manager.host_mem_pool.free(host_indices.cpu())
+            req_seqlen = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            assert (
+                len(host_indices) == req_seqlen
+            ), f"Host indices mismatch: {len(host_indices)} != {req_seqlen}"
+            logger.info(
+                f"Request {req.rid} ended, released {len(host_indices)} host indices"
+            )
 
     def forward_begin(self, forward_batch: "ForwardBatch") -> None:
         """
@@ -161,9 +273,8 @@ class SparseCoordinator:
         Wait for pending KVCache offloading operations to complete before forward pass.
         Ensures memory consistency for subsequent sparse attention operations.
         """
-        # TODO: Implement forward begin handling
-        # - Check if there are pending offloading operations
-        pass
+        if self._should_check_offload(forward_batch):
+            self.sparse_kv_cache_manager.poll_decode_offload_completion()
 
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
         """
@@ -171,10 +282,26 @@ class SparseCoordinator:
 
         Trigger async KVCache offloading operations.
         """
-        # TODO: Implement forward end handling
-        # - Identify tokens to offload
-        # - Trigger async offloading operations
-        pass
+        if not self._should_check_offload(forward_batch):
+            return
+
+        offload_mask = (
+            self.states.prompt_lens[forward_batch.req_pool_indices]
+            >= self.config.min_sparse_prompt_len
+        )
+        if offload_mask.any():
+            self.sparse_kv_cache_manager.offload_decode_token_kvcache(
+                forward_batch.req_pool_indices[offload_mask],
+                forward_batch.out_cache_loc[offload_mask],
+                forward_batch.seq_lens[offload_mask] - 1,
+            )
+
+    def _should_check_offload(self, forward_batch: "ForwardBatch") -> bool:
+        return (
+            forward_batch.req_pool_indices.numel() > 0
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and self.sparse_kv_cache_manager is not None
+        )
 
     def attention_begin(
         self,
@@ -264,9 +391,96 @@ class SparseCoordinator:
         )
 
     def _compute_sparse_mask(self, req_pool_indices):
-        mask = (
-            self.states.prompt_lens[req_pool_indices]
-            >= self.config.min_sparse_prompt_len
+        mask = self.states.prompt_kv_offloaded_and_slots_truncated[req_pool_indices]
+        mask = mask & self.states.repr_constructed[req_pool_indices]
+        return mask
+
+    def _maybe_truncate_kv_cache_after_prompt_offloaded(
+        self, req: "Req", req_to_token_pool, tree_cache
+    ):
+        """
+        Truncate device KV cache after prompt is offloaded to host.
+
+        Strategy: Keep prefix (for representations) + last page (for rolling decode),
+        free the middle part to save device memory.
+
+        Example: If allocated 40 pages and topk page cnt is 32, keep first 31 pages + last 1 page = 32 pages total.
+        """
+        if (
+            req.is_chunked > 0
+            or self.states.prompt_kv_offloaded_and_slots_truncated[req.req_pool_idx]
+        ):
+            return
+
+        allocated_len = req.kv_allocated_len
+        kv_keep_len = self.get_hierarchical_sparse_truncated_len()
+        page_size = tree_cache.page_size
+
+        # Align allocation to page boundary if needed
+        if page_size > 1 and allocated_len % page_size != 0:
+            slots_needed = page_size - (allocated_len % page_size)
+            last_slot = req_to_token_pool.req_to_token[
+                req.req_pool_idx, allocated_len - 1
+            ]
+
+            # The page containing last_slot is already allocated, just fill remaining slots
+            # These slots [last_slot+1, ..., last_slot+slots_needed] are in the same page
+            remaining_slots = torch.arange(
+                last_slot + 1,
+                last_slot + 1 + slots_needed,
+                dtype=torch.int32,
+            )
+
+            req_to_token_pool.req_to_token[
+                req.req_pool_idx, allocated_len : allocated_len + slots_needed
+            ] = remaining_slots
+            logger.info(
+                f"Aligned allocation for req {req.req_pool_idx}: {allocated_len} -> {allocated_len + slots_needed}"
+            )
+            allocated_len += slots_needed
+            req.kv_allocated_len = allocated_len
+
+        # Check if truncation needed
+        if allocated_len <= kv_keep_len:
+            if allocated_len == kv_keep_len:
+                self.states.prompt_kv_offloaded_and_slots_truncated[
+                    req.req_pool_idx
+                ] = True
+
+            logger.info(
+                f"No truncation for req {req.req_pool_idx}: allocated={allocated_len} <= keep={kv_keep_len}"
+            )
+            return
+
+        # Truncate: keep prefix + last page, free middle
+        keep_prefix_len = kv_keep_len - page_size
+        last_page_start = allocated_len - page_size
+
+        last_page_slots = req_to_token_pool.req_to_token[
+            req.req_pool_idx, last_page_start:allocated_len
+        ].clone()
+
+        free_indices = req_to_token_pool.req_to_token[
+            req.req_pool_idx, keep_prefix_len:last_page_start
+        ]
+
+        req_to_token_pool.req_to_token[
+            req.req_pool_idx, keep_prefix_len:kv_keep_len
+        ] = last_page_slots
+
+        if len(free_indices) > 0:
+            tree_cache.token_to_kv_pool_allocator.free(free_indices)
+
+        req.kv_committed_len = kv_keep_len
+        req.kv_allocated_len = kv_keep_len
+        req.prefix_indices = req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_keep_len
+        ].to(dtype=torch.int64, copy=True)
+        self.states.prompt_kv_offloaded_and_slots_truncated[req.req_pool_idx] = True
+
+        logger.info(
+            f"Truncated req {req.req_pool_idx}: allocated={allocated_len} -> {kv_keep_len}, freed [{keep_prefix_len}:{last_page_start}], last page slots:{last_page_slots.tolist()}"
         )
 
-        return mask
+    def get_hierarchical_sparse_truncated_len(self) -> Optional[int]:
+        return self.config.min_sparse_prompt_len + self.page_size

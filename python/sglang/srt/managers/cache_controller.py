@@ -261,6 +261,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
+        enable_hierarchical_sparse_attention: Optional[bool] = False,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -351,6 +352,11 @@ class HiCacheController:
         self.ack_load_queue: List[HiCacheAck] = []
         self.ack_write_queue: List[HiCacheAck] = []
 
+        # Additional ack queues for hierarchical sparse attention
+        if enable_hierarchical_sparse_attention:
+            self.ack_sparse_prompt_write_queue: List[HiCacheAck] = []
+            self.ack_sparse_decode_write_queue: List[HiCacheAck] = []
+
         self.stop_event = threading.Event()
         self.write_buffer = TransferBuffer(self.stop_event)
         self.load_buffer = TransferBuffer(
@@ -440,6 +446,7 @@ class HiCacheController:
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        sparse_ack_type: Optional[str] = None,
     ) -> Optional[torch.Tensor]:
         """
         Back up KV caches from device memory to host memory.
@@ -450,10 +457,10 @@ class HiCacheController:
         self.write_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
-        self.start_writing()
+        self.start_writing(sparse_ack_type=sparse_ack_type)
         return host_indices
 
-    def start_writing(self) -> None:
+    def start_writing(self, sparse_ack_type: Optional[str] = None) -> None:
         if len(self.write_queue) == 0:
             return
 
@@ -479,7 +486,15 @@ class HiCacheController:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
 
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        # Route ack to appropriate queue
+        if sparse_ack_type == "prompt":
+            ack_queue = self.ack_sparse_prompt_write_queue
+        elif sparse_ack_type == "decode":
+            ack_queue = self.ack_sparse_decode_write_queue
+        else:
+            ack_queue = self.ack_write_queue
+
+        ack_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
     def load(
         self,

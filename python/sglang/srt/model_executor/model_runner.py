@@ -562,6 +562,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.device == "cuda":
             self.init_cublas()
+            self.init_sparse_coordinator()
             self.init_attention_backend()
             self.kernel_warmup()
             self.init_device_graphs()
@@ -1582,6 +1583,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         c = a @ b
         return c
 
+    def init_sparse_coordinator(self):
+        """Initialize sparse attention coordinator if enabled."""
+        self.sparse_coordinator = None
+
+        if not self.server_args.enable_hierarchical_sparse_attention:
+            return
+
+        try:
+            from sglang.srt.mem_cache.sparsity import create_sparse_coordinator
+
+            if self.server_args.enable_dp_attention:
+                from sglang.srt.layers.dp_attention import get_attention_tp_group
+
+                tp_group_cpu = get_attention_tp_group().cpu_group
+            else:
+                tp_group_cpu = get_tp_group().cpu_group
+
+            self.sparse_coordinator = create_sparse_coordinator(
+                device=self.device,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool=self.token_to_kv_pool,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=tp_group_cpu,
+                server_args=self.server_args,
+            )
+
+        except Exception as e:
+            logger.error(f"[ModelRunner] Failed to initialize sparse coordinator: {e}")
+            self.sparse_coordinator = None
+
     def init_attention_backend(self):
         """Init attention kernel backend."""
         if self.server_args.enable_pdmux:
@@ -2214,6 +2247,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.forward_pass_id,
             forward_batch,
         ) as recorder_outputs:
+            if self.sparse_coordinator is not None:
+                self.sparse_coordinator.forward_begin(forward_batch)
+
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -2221,6 +2257,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
+
+            if self.sparse_coordinator is not None:
+                self.sparse_coordinator.forward_end(forward_batch)
+
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache

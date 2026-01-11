@@ -79,6 +79,13 @@ class NSABackendAdaptor(BackendAdaptor):
 class FlashAttentionAdaptor(BackendAdaptor):
     """Adaptor for FlashAttention backend."""
 
+    def __init__(
+        self, device: torch.device, req_to_token_pool, sparse_kv_cache_manager
+    ):
+        super().__init__(device)
+        self.req_to_token_pool = req_to_token_pool
+        self.sparse_kv_cache_manager = sparse_kv_cache_manager
+
     def save_original_metadata(self, metadata: Any) -> None:
         self._original_metadata = {
             "page_table": metadata.page_table.clone(),
@@ -113,10 +120,17 @@ class FlashAttentionAdaptor(BackendAdaptor):
         if not sparse_mask.any():
             return current_metadata
 
-        current_metadata.page_table.copy_(self._original_metadata["page_table"])
-        current_metadata.cache_seqlens_int32.copy_(
-            self._original_metadata["cache_seqlens_int32"]
-        )
+        # TODO: Add the io transfer loggic here when Page-Wise Diff Kernel is ready
+        # self.sparse_kv_cache_manager.swap_in_selected_pages(
+        #     req_pool_indices=forward_batch.req_pool_indices,
+        #     top_k_result=selected_indices,
+        #     out_cache_loc=forward_batch.out_cache_loc,
+        #     seq_lens=forward_batch.seq_lens,
+        #     sparse_mask=sparse_mask,
+        #     page_table=current_metadata.page_table,
+        #     layer_id=layer_id,
+        #     page_size=page_size,
+        # )
 
         physical_pages = self._logical_to_physical_pages_batch(
             selected_indices,
@@ -160,17 +174,13 @@ class FlashAttentionAdaptor(BackendAdaptor):
         req_to_token: torch.Tensor,
         page_size: int,
     ) -> torch.Tensor:
-        bs, max_pages = logical_pages.shape
-
-        page_starts = logical_pages * page_size
-        page_starts_clamped = page_starts.clamp(min=0)
-
-        req_indices_expanded = req_pool_indices.unsqueeze(1).expand(-1, max_pages)
-        first_tokens = req_to_token[req_indices_expanded, page_starts_clamped]
-
-        physical_pages = first_tokens // page_size
-        physical_pages = torch.where(
-            logical_pages >= 0, physical_pages, torch.zeros_like(physical_pages)
+        bs, max_selected = logical_pages.shape
+        page_offsets = (
+            torch.arange(max_selected, device=logical_pages.device, dtype=torch.int64)
+            * page_size
         )
-
+        page_offsets = page_offsets.unsqueeze(0).expand(bs, max_selected)
+        req_indices_expanded = req_pool_indices.unsqueeze(1).expand(-1, max_selected)
+        physical_pages = req_to_token[req_indices_expanded, page_offsets]
+        physical_pages = physical_pages // page_size
         return physical_pages.to(torch.int32)
