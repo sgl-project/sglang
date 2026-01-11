@@ -49,7 +49,7 @@ class ExpertDistributionMetrics:
     eplb_balancedness: torch.Tensor
 
     def copy_to_cpu(self):
-        self.eplb_balancedness = self.eplb_balancedness.to("cpu", non_blocking=True)
+        self.eplb_balancedness = self.eplb_balancedness.to("cpu")
 
 
 class ExpertDistributionRecorder(ABC):
