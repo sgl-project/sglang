@@ -14,6 +14,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 # Compatible with both 'O' and 'V'
 class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
     models = [MiniCPMV, MiniCPMO]
+    support_dynamic_frame_expansion = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
