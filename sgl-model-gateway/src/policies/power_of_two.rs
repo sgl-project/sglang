@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use async_trait::async_trait;
 use rand::Rng;
 use tracing::debug;
 
@@ -29,11 +30,12 @@ impl PowerOfTwoPolicy {
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for PowerOfTwoPolicy {
-    fn select_worker(
+    async fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        _info: &SelectWorkerInfo,
+        _info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 

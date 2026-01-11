@@ -83,7 +83,7 @@ impl PipelineStage for WorkerSelectionStage {
                     text,
                     tokens,
                     headers,
-                ) {
+                ).await {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
                         let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
@@ -101,7 +101,7 @@ impl PipelineStage for WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
-                match self.select_pd_pair(ctx.input.model_id.as_deref(), text, tokens, headers) {
+                match self.select_pd_pair(ctx.input.model_id.as_deref(), text, tokens, headers).await {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
                     None => {
                         let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
@@ -130,7 +130,7 @@ impl PipelineStage for WorkerSelectionStage {
 }
 
 impl WorkerSelectionStage {
-    fn select_single_worker(
+    async fn select_single_worker(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
@@ -174,7 +174,7 @@ impl WorkerSelectionStage {
                 headers,
                 hash_ring,
             },
-        )?;
+        ).await?;
         let selected = available[idx].clone();
 
         // Record worker selection metric
@@ -188,7 +188,7 @@ impl WorkerSelectionStage {
         Some(selected)
     }
 
-    fn select_pd_pair(
+    async fn select_pd_pair(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
@@ -244,8 +244,8 @@ impl WorkerSelectionStage {
             headers,
             hash_ring,
         };
-        let prefill_idx = policy.select_worker(&available_prefill, &info)?;
-        let decode_idx = policy.select_worker(&available_decode, &info)?;
+        let prefill_idx = policy.select_worker(&available_prefill, &info).await?;
+        let decode_idx = policy.select_worker(&available_decode, &info).await?;
 
         let model = model_id.unwrap_or("default");
         let policy_name = policy.name();

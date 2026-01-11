@@ -5,6 +5,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use async_trait::async_trait;
 use dashmap::DashMap;
 use rand::Rng;
 use tracing::{debug, error, info, warn};
@@ -203,8 +204,9 @@ impl BucketPolicy {
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for BucketPolicy {
-    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+    async fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo<'_>) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {

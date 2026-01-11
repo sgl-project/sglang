@@ -5,6 +5,8 @@
 
 use std::{fmt::Debug, sync::Arc};
 
+use async_trait::async_trait;
+
 use crate::core::{HashRing, Worker};
 
 mod bucket;
@@ -35,6 +37,7 @@ pub use tree::PrefixMatchResult;
 ///
 /// This trait provides a unified interface for implementing routing algorithms
 /// that can work with both regular single-worker selection and PD dual-worker selection.
+#[async_trait]
 pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Select a single worker from the available workers
     ///
@@ -44,7 +47,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// # Arguments
     /// * `workers` - Available workers to select from
     /// * `info` - Additional information for routing decisions
-    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize>;
+    async fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo<'_>) -> Option<usize>;
 
     /// Update policy state after request completion
     ///

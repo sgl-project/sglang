@@ -61,6 +61,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use dashmap::DashMap;
 use rand::Rng;
 use tracing::debug;
@@ -245,8 +246,9 @@ impl CacheAwarePolicy {
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for CacheAwarePolicy {
-    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+    async fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo<'_>) -> Option<usize> {
         let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 

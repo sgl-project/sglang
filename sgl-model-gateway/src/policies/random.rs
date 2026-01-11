@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use rand::Rng;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
@@ -19,11 +20,12 @@ impl RandomPolicy {
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for RandomPolicy {
-    fn select_worker(
+    async fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        _info: &SelectWorkerInfo,
+        _info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 

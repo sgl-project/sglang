@@ -12,12 +12,17 @@
 //!
 //! ## Header
 //! - `X-SMG-Routing-Key`: The routing key for sticky session routing
+//!
+//! ## Redis Backend
+//! When `SMG_MANUAL_REDIS_URL` environment variable is set, uses Redis for
+//! distributed routing state. Otherwise uses local DashMap.
 
 use std::{sync::Arc, time::Instant};
 
+use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use rand::Rng;
-use tracing::info;
+use tracing::{error, info};
 
 use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
@@ -191,10 +196,10 @@ impl ManualPolicy {
         }
     }
 
-    fn select_worker_impl(
+    async fn select_worker_impl(
         &self,
         workers: &[Arc<dyn Worker>],
-        info: &SelectWorkerInfo,
+        info: &SelectWorkerInfo<'_>,
     ) -> (Option<usize>, ExecutionBranch) {
         let healthy_indices = get_healthy_worker_indices(workers);
         if healthy_indices.is_empty() {
@@ -213,9 +218,10 @@ impl ManualPolicy {
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for ManualPolicy {
-    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
-        let (result, branch) = self.select_worker_impl(workers, info);
+    async fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo<'_>) -> Option<usize> {
+        let (result, branch) = self.select_worker_impl(workers, info).await;
         Metrics::record_worker_manual_policy_branch(branch.as_str());
         Metrics::set_manual_policy_cache_entries(self.routing_map.len());
         result
