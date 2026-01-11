@@ -7,89 +7,69 @@ use std::{
 use tokio::net::TcpStream;
 use tracing::warn;
 
-static SHARED_SERVER: OnceLock<SharedRedisServer> = OnceLock::new();
+static SHARED_SERVER: OnceLock<RedisTestServer> = OnceLock::new();
 
-pub struct SharedRedisServer {
-    _process: Child,
-    pub port: u16,
-}
-
-impl SharedRedisServer {
-    fn start() -> Self {
-        let port = portpicker::pick_unused_port().expect("No available port");
-        let process = Command::new("redis-server")
-            .args([
-                "--port",
-                &port.to_string(),
-                "--save",
-                "",
-                "--appendonly",
-                "no",
-                "--daemonize",
-                "no",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Failed to start redis-server. Is redis-server installed?");
-
-        std::thread::sleep(Duration::from_millis(500));
-        Self {
-            _process: process,
-            port,
-        }
-    }
-
-    pub fn url(&self) -> String {
-        format!("redis://127.0.0.1:{}", self.port)
-    }
-}
-
-pub fn get_shared_server() -> &'static SharedRedisServer {
-    SHARED_SERVER.get_or_init(SharedRedisServer::start)
+pub fn get_shared_server() -> &'static RedisTestServer {
+    SHARED_SERVER.get_or_init(|| RedisTestServer::start_sync().expect("Failed to start shared Redis server"))
 }
 
 pub struct RedisTestServer {
     process: Option<Child>,
     port: u16,
-    pub url: String,
+    url: String,
 }
 
 impl RedisTestServer {
     pub async fn start() -> Result<Self, String> {
+        let server = Self::start_sync()?;
+        server.wait_ready().await?;
+        Ok(server)
+    }
+
+    fn start_sync() -> Result<Self, String> {
         let port = portpicker::pick_unused_port()
             .ok_or_else(|| "Failed to find available port".to_string())?;
         let url = format!("redis://127.0.0.1:{}", port);
 
-        let process = Command::new("redis-server")
-            .args([
-                "--port",
-                &port.to_string(),
-                "--save",
-                "",
-                "--appendonly",
-                "no",
-                "--daemonize",
-                "no",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                format!(
-                    "Failed to start redis-server: {}. Is redis-server installed?",
-                    e
-                )
-            })?;
+        let mut cmd = Command::new("redis-server");
+        cmd.args([
+            "--port",
+            &port.to_string(),
+            "--save",
+            "",
+            "--appendonly",
+            "no",
+            "--daemonize",
+            "no",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
-        let server = Self {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    Ok(())
+                });
+            }
+        }
+
+        let process = cmd.spawn().map_err(|e| {
+            format!(
+                "Failed to start redis-server: {}. Is redis-server installed?",
+                e
+            )
+        })?;
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        Ok(Self {
             process: Some(process),
             port,
             url,
-        };
-
-        server.wait_ready().await?;
-        Ok(server)
+        })
     }
 
     async fn wait_ready(&self) -> Result<(), String> {
