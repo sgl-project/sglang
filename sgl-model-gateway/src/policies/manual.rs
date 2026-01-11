@@ -395,9 +395,6 @@ impl RedisBackend {
                 warn!("Redis max retries exceeded for key {}", key);
                 (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisCasMaxRetries)
             }
-            Err(RetryError::NoAvailableWorkers) => {
-                (select_new_worker(workers, healthy_indices, assignment_mode), ExecutionBranch::RedisConnFailed)
-            }
         }
     }
 
