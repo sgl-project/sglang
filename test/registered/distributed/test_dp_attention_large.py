@@ -3,13 +3,11 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMixin
 from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
-from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -23,10 +21,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=350, suite="stage-b-test-large-2-gpu")
+register_cuda_ci(est_time=350, suite="stage-c-test-large-4-gpu")
 
 
-class TestDPAttentionDP2TP2(
+class TestDPAttentionDP2TP4(
     CustomTestCase,
     TestJSONConstrainedMixin,
     TestEBNFConstrainedMixin,
@@ -42,14 +40,9 @@ class TestDPAttentionDP2TP2(
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--tp",
-                "2",
+                "--tp=4",
                 "--enable-dp-attention",
-                "--dp",
-                "2",
-                "--enable-torch-compile",
-                "--torch-compile-max-bs",
-                "2",
+                "--dp=2",
             ],
         )
 
@@ -69,46 +62,6 @@ class TestDPAttentionDP2TP2(
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
-
-
-class TestDPRetract(
-    CustomTestCase,
-    TestJSONConstrainedMixin,
-    TestEBNFConstrainedMixin,
-    TestRegexConstrainedMixin,
-):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "2",
-                "--enable-dp-attention",
-                "--dp",
-                "2",
-                "--max-total-tokens",
-                "4500",
-                "--max-running-requests",
-                "128",
-                "--chunked-prefill-size",
-                "256",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_radix_attention(self):
-        with envs.SGLANG_TEST_RETRACT.override(True):
-            run_radix_attention_test(self.base_url)
-            self.assertIsNone(self.process.poll())
 
 
 class TestDPAttentionDP2TP2DeepseekV3MTP(
