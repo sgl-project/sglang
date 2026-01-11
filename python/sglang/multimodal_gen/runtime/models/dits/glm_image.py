@@ -20,9 +20,10 @@ import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
-
 from sglang.multimodal_gen.runtime.layers.attention import UlyssesAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import ScaleResidualLayerNormScaleShift
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    ScaleResidualLayerNormScaleShift,
+)
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
@@ -750,7 +751,7 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         inner_dim = arch_config.num_attention_heads * arch_config.attention_head_dim
 
         # 1. RoPE
-        self.rope = GlmImageRotaryPosEmbed(
+        self.rotary_emb = GlmImageRotaryPosEmbed(
             arch_config.attention_head_dim, arch_config.patch_size, theta=10000.0
         )
 
@@ -842,8 +843,7 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         # 1. RoPE
         image_rotary_emb = freqs_cis
         if image_rotary_emb is None:
-            image_rotary_emb = self.rope(hidden_states)
-
+            image_rotary_emb = self.rotary_emb(hidden_states)
         # 2. Patch & Timestep embeddings
         p = self.config.patch_size
         post_patch_height = height // p

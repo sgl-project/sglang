@@ -28,6 +28,16 @@ class GlmImagePipelineConfig(ImagePipelineConfig):
 
     enable_autocast: bool = False
 
+    def get_freqs_cis(self, batch, device, rotary_emb, dtype):
+        self.vae_scale_factor = 2 ** (
+            len(self.vae_config.arch_config.block_out_channels) - 1
+        )
+        height = batch.height // self.vae_scale_factor
+        width = batch.width // self.vae_scale_factor
+        hidden_states = torch.empty(1, 1, height, width, device=device, dtype=dtype)
+        freqs_cis = rotary_emb(hidden_states)
+        return freqs_cis
+
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {
             "prior_token_id": batch.prior_token_id,
@@ -36,6 +46,7 @@ class GlmImagePipelineConfig(ImagePipelineConfig):
             "target_size": batch.target_size,
             "kv_caches": batch.kv_caches,
             "kv_caches_mode": "read",
+            "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -46,6 +57,7 @@ class GlmImagePipelineConfig(ImagePipelineConfig):
             "target_size": batch.target_size,
             "kv_caches": batch.kv_caches,
             "kv_caches_mode": "skip",
+            "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
 
     def post_denoising_loop(self, latents, batch):
