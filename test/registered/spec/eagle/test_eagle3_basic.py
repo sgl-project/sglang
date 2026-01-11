@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=50, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=64, suite="stage-b-test-small-1-gpu")
 
 
 class TestEagle3Basic(EagleServerBase):

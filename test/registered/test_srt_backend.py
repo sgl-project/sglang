@@ -19,7 +19,7 @@ from sglang.test.test_programs import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=80, suite="stage-a-test-1")
+register_cuda_ci(est_time=107, suite="stage-a-test-1")
 register_amd_ci(est_time=120, suite="stage-a-test-1")
 
 

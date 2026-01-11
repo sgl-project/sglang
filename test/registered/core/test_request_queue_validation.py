@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     send_generate_requests,
 )
 
-register_cuda_ci(est_time=47, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=39, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=70, suite="stage-b-test-small-1-gpu-amd")
 
 

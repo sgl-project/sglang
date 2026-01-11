@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 # RadixAttention server integration tests
-register_cuda_ci(est_time=100, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=156, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=100, suite="stage-b-test-small-1-gpu-amd")
 
 

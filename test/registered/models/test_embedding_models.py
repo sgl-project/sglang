@@ -1,7 +1,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Embedding model tests
-register_cuda_ci(est_time=73, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=173, suite="stage-b-test-small-1-gpu")
 register_amd_ci(
     est_time=73,
     suite="stage-b-test-small-1-gpu-amd",
