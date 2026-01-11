@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 import torch
+from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
@@ -30,10 +31,11 @@ class GlmImagePipelineConfig(ImagePipelineConfig):
 
     enable_autocast: bool = False
 
+    def __post_init__(self):
+        self.vae_scale_factor = self.vae_config.get_vae_scale_factor()
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+
     def get_freqs_cis(self, batch, device, rotary_emb, dtype):
-        self.vae_scale_factor = 2 ** (
-            len(self.vae_config.arch_config.block_out_channels) - 1
-        )
         height = batch.height // self.vae_scale_factor
         width = batch.width // self.vae_scale_factor
         hidden_states = torch.empty(1, 1, height, width, device=device, dtype=dtype)
@@ -79,3 +81,6 @@ class GlmImagePipelineConfig(ImagePipelineConfig):
         if getattr(batch, "kv_caches", None) is not None:
             batch.kv_caches.clear()
         return latents.bfloat16()
+
+    def post_decoding(self, frames, server_args):
+        return self.image_processor.postprocess(frames, output_type="latent")
