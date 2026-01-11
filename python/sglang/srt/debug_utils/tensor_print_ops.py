@@ -5,17 +5,17 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 
 @register_custom_op(mutates_args=[])
-def print_tensor_debug(t: torch.Tensor, name: str) -> None:
+def print_tensor_meta(t: torch.Tensor, name: str) -> None:
     """
-    Debug operator specifically for PCG.
-    Injects a synchronized logging point into the compiled graph to print tensor.
+    Debug operator for printing tensor meta info.
 
     Usage:
-        torch.ops.sglang.print_tensor_debug(hidden_states, "tensor_name")
+        torch.ops.sglang.print_tensor_stats(qkv, "qkv")
 
     Output Effect:
+
         ================================================================================
-        [TensorDebug] <name>
+        [TensorStats] <name>
         --------------------------------------------------------------------------------
           shape     : (<dimensions>)
           dtype     : <type>
@@ -25,7 +25,9 @@ def print_tensor_debug(t: torch.Tensor, name: str) -> None:
           has_nan   : <bool>
           has_inf   : <bool>
         ================================================================================
+
     """
+
     ctx = get_forward_context()
     if ctx is None:
         return
@@ -33,20 +35,17 @@ def print_tensor_debug(t: torch.Tensor, name: str) -> None:
     if not t.is_cuda or torch.cuda.current_device() != 0:
         return
 
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
 
     is_fp = torch.is_floating_point(t)
-
     min_v = t.min()
     max_v = t.max()
     mean_v = t.mean() if is_fp else None
-
     has_nan = torch.isnan(t).any().item() if is_fp else False
     has_inf = torch.isinf(t).any().item() if is_fp else False
 
     print("\n" + "=" * 80, flush=True)
-    print(f"[TensorDebug] {name}", flush=True)
+    print(f"[TensorMeta] {name}", flush=True)
     print("-" * 80, flush=True)
 
     print(f"  shape     : {tuple(t.shape)}", flush=True)
@@ -60,5 +59,43 @@ def print_tensor_debug(t: torch.Tensor, name: str) -> None:
     if is_fp:
         print(f"  has_nan   : {has_nan}", flush=True)
         print(f"  has_inf   : {has_inf}", flush=True)
+
+    print("=" * 80 + "\n", flush=True)
+
+
+@register_custom_op(mutates_args=[])
+def print_tensor_data(t: torch.Tensor, name: str) -> None:
+    """
+    Debug operator for printing tensor contents.
+
+    Usage:
+        torch.ops.sglang.print_tensor_data(qkv[:5,], "qkv[:5,]")
+        torch.ops.sglang.print_tensor_data(qkv[,:5], "qkv[,:5]")
+
+    Output Effect:
+
+        ================================================================================
+        [TensorData] <name>
+        --------------------------------------------------------------------------------
+          shape: (<dimensions>)
+          <tensor_data>
+        ================================================================================
+
+    """
+    ctx = get_forward_context()
+    if ctx is None:
+        return
+
+    if not t.is_cuda or torch.cuda.current_device() != 0:
+        return
+
+    torch.cuda.synchronize()
+
+    print("\n" + "=" * 80, flush=True)
+    print(f"[TensorData] {name}", flush=True)
+    print("-" * 80, flush=True)
+
+    print(f"  shape: {tuple(t.shape)}", flush=True)
+    print(f"{t}", flush=True)
 
     print("=" * 80 + "\n", flush=True)

@@ -18,8 +18,9 @@ class CompilationConfig:
         self.split_ops = [
             "sglang.unified_attention_with_output",
             "sglang.gdn_with_output",
-            "sglang.print_tensor_debug",
             "sglang.inplace_all_reduce",
+            "sglang.print_tensor_meta",
+            "sglang.print_tensor_data",
         ]
 
     def add_split_op(self, op: str):
