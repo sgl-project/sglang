@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import logging
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 import torch
-import torch.distributed as dist
 
+from sglang.srt.distributed import get_moe_tensor_parallel_world_size, get_tp_group
 from sglang.srt.environ import envs
-
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -15,15 +13,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import TopKOutput, StandardTopKOutput
-from sglang.srt.distributed import (
-    get_moe_tensor_parallel_world_size,
-    get_tp_group,
-)
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.utils import round_up
 
 try:
     import pplx_kernels as pplx
+
     use_pplx = True
 except ImportError:
     use_pplx = False
@@ -38,7 +33,7 @@ class PPLXDispatchOutput(NamedTuple):
     hidden_states_scale: Optional[torch.Tensor]
     expert_num_tokens: torch.Tensor
     topk_output: StandardTopKOutput
-    
+
     @property
     def format(self) -> DispatchOutputFormat:
         return DispatchOutputFormat.PPLX
@@ -63,6 +58,7 @@ class PPLXCombineInput(NamedTuple):
 
 assert isinstance(PPLXCombineInput, CombineInput)
 
+
 class PPLXDispatcher(BaseDispatcher):
     def __init__(
         self,
@@ -84,23 +80,22 @@ class PPLXDispatcher(BaseDispatcher):
         self.internode = envs.SGLANG_PPLX_INTERNODE.get()
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
-        self.experts_per_token = experts_per_token # topk
+        self.experts_per_token = experts_per_token  # topk
         self.rank = get_tp_group().rank
-        self.world_size = get_tp_group().world_size # vllm: dp_size is tp_size, bugs in pplx-kernels
+        self.world_size = (
+            get_tp_group().world_size
+        )  # vllm: dp_size is tp_size, bugs in pplx-kernels
         self.dp_size = get_moe_tensor_parallel_world_size()
         self.hidden_dim = hidden_dim
 
         print(f"self.dp_size = {self.dp_size}")
         print(f"self.world_size = {self.world_size}")
 
-        assert params_dtype.itemsize == 2, (
-            "!!!current only support bfloat16/fp16!!!"
-        )
+        assert params_dtype.itemsize == 2, "!!!current only support bfloat16/fp16!!!"
         # currently only for fp16
         self.hidden_dim_bytes = round_up(
-            hidden_dim * params_dtype.itemsize,
-            16
-        ) # vllm: All pplx byte sizes must be 16-bit aligned.
+            hidden_dim * params_dtype.itemsize, 16
+        )  # vllm: All pplx byte sizes must be 16-bit aligned.
 
         self.hidden_dim_scale_bytes = 0
 
@@ -114,7 +109,7 @@ class PPLXDispatcher(BaseDispatcher):
                 dp_size=self.dp_size,
                 hidden_dim=self.hidden_dim,
                 hidden_dim_bytes=self.hidden_dim_bytes,
-                hidden_dim_scale_bytes=self.hidden_dim_bytes
+                hidden_dim_scale_bytes=self.hidden_dim_bytes,
             )
         else:
             self.ata = pplx.AllToAll.intranode(
@@ -127,7 +122,7 @@ class PPLXDispatcher(BaseDispatcher):
                 hidden_dim=self.hidden_dim,
                 hidden_dim_bytes=self.hidden_dim_bytes,
                 hidden_dim_scale_bytes=self.hidden_dim_scale_bytes,
-                group_name=get_tp_group().cpu_group.group_name
+                group_name=get_tp_group().cpu_group.group_name,
             )
 
     def dispatch(
@@ -139,7 +134,7 @@ class PPLXDispatcher(BaseDispatcher):
         num_tokens = hidden_states.size(0)
         hidden_dim = hidden_states.size(-1)
         topk_ids = topk_output.topk_ids
-        
+
         assert topk_ids.size(0) == num_tokens
 
         device = hidden_states.device
@@ -172,7 +167,7 @@ class PPLXDispatcher(BaseDispatcher):
             out_expert_num_tokens=expert_num_tokens,
             out_expert_x=expert_x,
             out_expert_x_scale=expert_x_scale,
-            dp_x = hidden_states,
+            dp_x=hidden_states,
             dp_x_scale=hidden_states_scale,
             indices=topk_ids_u32,
             bound_m=bound_m,
@@ -186,7 +181,7 @@ class PPLXDispatcher(BaseDispatcher):
             expert_num_tokens=expert_num_tokens,
             topk_output=topk_output,
         )
-    
+
     def combine(
         self,
         combine_input: PPLXCombineInput,

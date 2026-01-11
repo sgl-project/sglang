@@ -119,7 +119,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         )
     elif a2a_backend.is_pplx():
         from sglang.srt.layers.moe.token_dispatcher.pplx import PPLXDispatcher
-        
+
         return PPLXDispatcher(
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,

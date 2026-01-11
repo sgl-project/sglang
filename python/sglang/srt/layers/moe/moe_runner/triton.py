@@ -22,13 +22,13 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher.standard import (
-        StandardCombineInput,
-        StandardDispatchOutput,
-    )
     from sglang.srt.layers.moe.token_dispatcher.pplx import (
         PPLXCombineInput,
         PPLXDispatchOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+        StandardDispatchOutput,
     )
 
 
@@ -364,6 +364,7 @@ def fused_experts_none_to_triton(
         hidden_states=output,
     )
 
+
 @register_fused_func("pplx", "triton")
 def fused_experts_pplx_to_triton(
     dispatch_output: PPLXDispatchOutput,
@@ -381,7 +382,7 @@ def fused_experts_pplx_to_triton(
 
     num_local_experts = dispatch_output.hidden_states.size(0)
     capacity = dispatch_output.hidden_states.size(1)
-    
+
     range_vector = torch.arange(capacity, device=dispatch_output.hidden_states.device)
     mask = range_vector < out_expert_num_tokens.unsqueeze(1)
 
@@ -389,16 +390,20 @@ def fused_experts_pplx_to_triton(
     fused_moe_input = dispatch_output.hidden_states[mask]
 
     fake_topk_ids = torch.repeat_interleave(
-        torch.arange(num_local_experts, device=dispatch_output.hidden_states.device, dtype=torch.int32),
+        torch.arange(
+            num_local_experts,
+            device=dispatch_output.hidden_states.device,
+            dtype=torch.int32,
+        ),
         out_expert_num_tokens.long(),
-        dim=0
-    ).unsqueeze(1) # (total_tokens, 1)
+        dim=0,
+    ).unsqueeze(
+        1
+    )  # (total_tokens, 1)
 
     fake_topk_weights = torch.ones_like(fake_topk_ids, dtype=torch.float32)
     fake_topk_output = StandardTopKOutput(
-        topk_weights=fake_topk_weights,
-        topk_ids=fake_topk_ids,
-        router_logits=None
+        topk_weights=fake_topk_weights, topk_ids=fake_topk_ids, router_logits=None
     )
 
     output = fused_experts(
