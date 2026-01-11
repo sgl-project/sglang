@@ -225,8 +225,8 @@ async fn send_request(app: axum::Router, routing_key: &str) -> (String, String) 
     (routing_key.to_string(), worker_id)
 }
 
-async fn test_min_group_concurrent_distribution_impl(base_port: u16) {
-    let config = TestRouterConfig::manual_min_group(base_port);
+async fn test_min_group_concurrent_distribution_impl(base_port: u16, redis_url: Option<String>) {
+    let config = TestRouterConfig::manual_with_options(base_port, smg::config::ManualAssignmentMode::MinGroup, redis_url);
     let ctx = AppTestContext::new_with_config(
         config,
         TestWorkerConfig::slow_workers(base_port + 26000, 3, 500),
@@ -276,8 +276,8 @@ async fn test_min_group_concurrent_distribution_impl(base_port: u16) {
 
 all_backend_e2e_test!(test_min_group_concurrent_distribution, 3910);
 
-async fn test_min_group_sticky_routing_impl(base_port: u16) {
-    let config = TestRouterConfig::manual_min_group(base_port);
+async fn test_min_group_sticky_routing_impl(base_port: u16, redis_url: Option<String>) {
+    let config = TestRouterConfig::manual_with_options(base_port, smg::config::ManualAssignmentMode::MinGroup, redis_url);
     let ctx = AppTestContext::new_with_config(
         config,
         TestWorkerConfig::slow_workers(base_port + 26000, 3, 200),
@@ -315,8 +315,8 @@ async fn test_min_group_sticky_routing_impl(base_port: u16) {
 
 all_backend_e2e_test!(test_min_group_sticky_routing, 3920);
 
-async fn test_min_group_mixed_concurrent_routing_impl(base_port: u16) {
-    let config = TestRouterConfig::manual_min_group(base_port);
+async fn test_min_group_mixed_concurrent_routing_impl(base_port: u16, redis_url: Option<String>) {
+    let config = TestRouterConfig::manual_with_options(base_port, smg::config::ManualAssignmentMode::MinGroup, redis_url);
     let ctx = AppTestContext::new_with_config(
         config,
         TestWorkerConfig::slow_workers(base_port + 26000, 2, 300),

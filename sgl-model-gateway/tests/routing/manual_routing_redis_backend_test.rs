@@ -30,11 +30,12 @@ fn headers_with_routing_key(key: &str) -> http::HeaderMap {
     headers
 }
 
-async fn create_redis_policy(redis_url: &str) -> ManualPolicy {
-    std::env::set_var("SMG_MANUAL_REDIS_URL", redis_url);
-    let policy = ManualPolicy::new();
-    std::env::remove_var("SMG_MANUAL_REDIS_URL");
-    policy
+fn create_redis_policy(redis_url: &str) -> ManualPolicy {
+    let config = ManualConfig {
+        redis_url: Some(redis_url.to_string()),
+        ..Default::default()
+    };
+    ManualPolicy::with_config(config)
 }
 
 // ============================================================================
@@ -44,7 +45,7 @@ async fn create_redis_policy(redis_url: &str) -> ManualPolicy {
 #[tokio::test]
 async fn test_redis_vacant_to_occupied_hit() {
     let server = RedisTestServer::start().await.unwrap();
-    let policy = create_redis_policy(server.url()).await;
+    let policy = create_redis_policy(server.url());
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("user-123");
@@ -64,7 +65,7 @@ async fn test_redis_vacant_to_occupied_hit() {
 #[tokio::test]
 async fn test_redis_different_routing_ids_distribute() {
     let server = RedisTestServer::start().await.unwrap();
-    let policy = create_redis_policy(server.url()).await;
+    let policy = create_redis_policy(server.url());
     let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
     let mut distribution: HashMap<usize, usize> = HashMap::new();
@@ -88,7 +89,7 @@ async fn test_redis_different_routing_ids_distribute() {
 #[tokio::test]
 async fn test_redis_failover_to_second_candidate() {
     let server = RedisTestServer::start().await.unwrap();
-    let policy = create_redis_policy(server.url()).await;
+    let policy = create_redis_policy(server.url());
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("failover-test");
@@ -112,7 +113,7 @@ async fn test_redis_failover_to_second_candidate() {
 #[tokio::test]
 async fn test_redis_worker_recovery() {
     let server = RedisTestServer::start().await.unwrap();
-    let policy = create_redis_policy(server.url()).await;
+    let policy = create_redis_policy(server.url());
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("recovery-test");
@@ -139,7 +140,7 @@ async fn test_redis_worker_recovery() {
 #[tokio::test]
 async fn test_redis_both_candidates_unhealthy() {
     let server = RedisTestServer::start().await.unwrap();
-    let policy = create_redis_policy(server.url()).await;
+    let policy = create_redis_policy(server.url());
     let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
     let headers = headers_with_routing_key("both-unhealthy");
@@ -168,8 +169,8 @@ async fn test_redis_both_candidates_unhealthy() {
 #[tokio::test]
 async fn test_redis_multi_instance_consistency() {
     let server = RedisTestServer::start().await.unwrap();
-    let policy1 = create_redis_policy(server.url()).await;
-    let policy2 = create_redis_policy(server.url()).await;
+    let policy1 = create_redis_policy(server.url());
+    let policy2 = create_redis_policy(server.url());
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("shared-key");
@@ -190,8 +191,8 @@ async fn test_redis_multi_instance_consistency() {
 #[tokio::test]
 async fn test_redis_cross_instance_failover() {
     let server = RedisTestServer::start().await.unwrap();
-    let policy1 = create_redis_policy(server.url()).await;
-    let policy2 = create_redis_policy(server.url()).await;
+    let policy1 = create_redis_policy(server.url());
+    let policy2 = create_redis_policy(server.url());
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
     let headers = headers_with_routing_key("cross-failover");
@@ -228,9 +229,7 @@ async fn test_redis_concurrent_same_key() {
         let redis_url = server.url().to_string();
         let workers_clone = Arc::clone(&workers);
         let handle = tokio::spawn(async move {
-            std::env::set_var("SMG_MANUAL_REDIS_URL", &redis_url);
-            let policy = ManualPolicy::new();
-            std::env::remove_var("SMG_MANUAL_REDIS_URL");
+            let policy = create_redis_policy(&redis_url);
 
             let headers = headers_with_routing_key("concurrent-key");
             let info = SelectWorkerInfo {
@@ -270,9 +269,7 @@ async fn test_redis_concurrent_different_keys() {
         let workers_clone = Arc::clone(&workers);
         let key = format!("key-{}", i);
         let handle = tokio::spawn(async move {
-            std::env::set_var("SMG_MANUAL_REDIS_URL", &redis_url);
-            let policy = ManualPolicy::new();
-            std::env::remove_var("SMG_MANUAL_REDIS_URL");
+            let policy = create_redis_policy(&redis_url);
 
             let headers = headers_with_routing_key(&key);
             let info = SelectWorkerInfo {
@@ -306,13 +303,12 @@ async fn test_redis_concurrent_different_keys() {
 async fn test_redis_ttl_expiry() {
     let server = RedisTestServer::start().await.unwrap();
 
-    std::env::set_var("SMG_MANUAL_REDIS_URL", server.url());
     let config = ManualConfig {
+        redis_url: Some(server.url().to_string()),
         max_idle_secs: 2,
         ..Default::default()
     };
     let policy = ManualPolicy::with_config(config);
-    std::env::remove_var("SMG_MANUAL_REDIS_URL");
 
     let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
@@ -336,7 +332,7 @@ async fn test_redis_ttl_expiry() {
 #[tokio::test]
 async fn test_redis_fallback_on_no_healthy_workers() {
     let server = RedisTestServer::start().await.unwrap();
-    let policy = create_redis_policy(server.url()).await;
+    let policy = create_redis_policy(server.url());
     let workers = create_workers(&["http://w1:8000"]);
     workers[0].set_healthy(false);
 

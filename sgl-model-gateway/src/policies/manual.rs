@@ -14,8 +14,9 @@
 //! - `X-SMG-Routing-Key`: The routing key for sticky session routing
 //!
 //! ## Redis Backend
-//! When `SMG_MANUAL_REDIS_URL` environment variable is set, uses Redis for
-//! distributed routing state. Otherwise uses local DashMap.
+//! When `--redis-url` is provided, uses Redis for distributed routing state.
+//! Otherwise uses local DashMap. This enables consistent routing across
+//! multiple router instances.
 
 use std::{sync::Arc, time::Instant};
 
