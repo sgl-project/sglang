@@ -435,7 +435,7 @@ class LTX2AudioDecoder(torch.nn.Module):
         self,
         *,
         ch: int = 128,
-        out_ch: int = 128,
+        out_ch: int = 2,
         ch_mult: Tuple[int, ...] = (1, 2, 4, 8),
         num_res_blocks: int = 2,
         attn_resolutions: Set[int] = set(),
@@ -448,7 +448,7 @@ class LTX2AudioDecoder(torch.nn.Module):
         sample_rate: int = 16000,
         mel_hop_length: int = 160,
         is_causal: bool = True,
-        mel_bins: int | None = None,
+        mel_bins: int | None = 64,
     ) -> None:
         super().__init__()
         
@@ -661,119 +661,23 @@ class LTX2Vocoder(torch.nn.Module):
         self.conv_post = nn.Conv1d(final_channels, out_channels, 7, 1, padding=3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [batch, channels, time, mel_bins]
-        x = x.transpose(2, 3)  # -> [batch, channels, mel_bins, time]
-
+        # Match ltx-core vocoder behavior.
+        # Input:
+        #   - Stereo mel spectrogram: [B, 2, T, mel_bins]
+        #   - Already-flattened:      [B, 2*mel_bins, T]
         if x.dim() == 4:
-            # stereo: [batch, 2, mel_bins, time] -> [batch, 2*mel_bins, time]
-            # Note: LTX-2 vocoder expects channels=128 for stereo (2*64)
-            # If input is [B, 2, T, F], then F should be 64?
-            # Let's check LTX-2 logic.
-            # Vocoder in_channels = 128 if stereo else 64.
-            # Input x is spectrogram.
-            # If stereo, x should be [B, 2, T, F].
-            # rearrange "b s c t -> b (s c) t" where s=2, c=mel_bins?
-            # Wait, x.transpose(2,3) makes it [B, C, F, T].
-            # If C=2 (stereo), F=64.
-            # Then rearrange "b s f t -> b (s f) t" -> [B, 128, T].
-            # Yes, this matches.
-            
-            # But wait, AudioDecoder output is [B, C, T, F].
-            # AudioDecoder out_ch=128.
-            # So x is [B, 128, T, F]? No.
-            # AudioDecoder output is spectrogram.
-            # If stereo, AudioDecoder output channels should be 2?
-            # LTX-2 AudioDecoder config: out_ch=128.
-            # This implies the decoder output IS the feature map for vocoder, NOT the spectrogram?
-            # Let's re-read AudioDecoder.forward docstring:
-            # "Reconstructed audio spectrogram of shape (batch, channels, time, frequency)"
-            # But out_ch=128.
-            # If it's a spectrogram, channels usually 1 or 2.
-            # Unless "channels" here means something else.
-            
-            # Let's look at Vocoder.forward again.
-            # x = x.transpose(2, 3)
-            # if x.dim() == 4: assert x.shape[1] == 2
-            
-            # This implies input x has shape [B, 2, T, F].
-            # But AudioDecoder output has shape [B, 128, T, F].
-            # This is a contradiction unless AudioDecoder out_ch=2.
-            
-            # Let's check LTX-2 config again.
-            # AudioDecoder out_ch=128.
-            # Vocoder in_channels=128.
-            
-            # If AudioDecoder outputs [B, 128, T, F], and Vocoder expects [B, 2, T, F]...
-            # Wait, maybe AudioDecoder output IS [B, 128, T, 1]? Or [B, 128, T, F] is wrong?
-            
-            # Let's check AudioDecoder._adjust_output_shape.
-            # target_shape.channels comes from self.out_ch (128).
-            # So output is [B, 128, T, F].
-            
-            # Now check Vocoder.forward in ltx-core.
-            # x = x.transpose(2, 3)
-            # if x.dim() == 4: assert x.shape[1] == 2
-            
-            # This assertion `x.shape[1] == 2` is very strong.
-            # It implies input MUST have 2 channels.
-            
-            # So AudioDecoder MUST output 2 channels?
-            # But config says out_ch=128.
-            
-            # Maybe I misread the config or the code.
-            # Let's check `audio_vae.py` again.
-            # `target_shape = AudioLatentShape(..., channels=self.out_ch, ...)`
-            
-            # Is it possible that `out_ch` in AudioDecoder config is actually 2?
-            # In `LTX_2_WEIGHTS.md` I wrote `out_ch: 128`.
-            # Let me check `ltx-core` code again.
-            
-            # Maybe `AudioDecoder` output is NOT fed directly to `Vocoder`?
-            # `decode_audio` function:
-            # decoded_audio = audio_decoder(latent)
-            # decoded_audio = vocoder(decoded_audio).squeeze(0).float()
-            
-            # If `audio_decoder` returns [B, 128, T, F], and `vocoder` expects [B, 2, T, F]...
-            # There must be a mismatch in my understanding.
-            
-            # Possibility 1: AudioDecoder out_ch IS 2.
-            # Possibility 2: Vocoder input logic handles 128 channels differently.
-            # Possibility 3: There is an intermediate step.
-            
-            # Let's look at `Vocoder` init.
-            # in_channels = 128 if stereo else 64.
-            # self.conv_pre = nn.Conv1d(in_channels, ...)
-            
-            # If input is [B, 2, T, F] (stereo spectrogram),
-            # rearrange "b s c t -> b (s c) t" makes it [B, 2*F, T].
-            # If F (mel_bins) = 64, then 2*64 = 128.
-            # This matches `in_channels=128`.
-            
-            # So, Vocoder expects a spectrogram with `mel_bins=64`.
-            # And AudioDecoder must output [B, 2, T, 64].
-            
-            # So `AudioDecoder.out_ch` MUST be 2.
-            # Why did I think it was 128?
-            # Maybe `ch` (base channels) is 128, but `out_ch` is 2.
-            
-            # I will assume `out_ch` should be 2 (for stereo) or 1 (mono).
-            # And `mel_bins` should be 64.
-            
-            # In `LTX_2_WEIGHTS.md`, I wrote `out_ch: 128`. This might be wrong.
-            # I should correct the default in `LTX2AudioDecoder.__init__` to `out_ch=2` (or read from config).
-            # But wait, `LTX2AudioDecoder` init args come from config.
-            # I'll keep the default as 128 in `__init__` signature to match `ltx-core` signature (if that was the default there),
-            # but in usage, it should be 2.
-            
-            # Actually, let's check `ltx-core` `audio_vae.py` `__init__` again.
-            # It doesn't have a default for `out_ch`. It's a required kwarg.
-            
-            # I will proceed with the code as is, but add a comment or handle the shape mismatch if it occurs.
-            # The `Vocoder.forward` logic I copied:
-            # if x.dim() == 4: assert x.shape[1] == 2
-            # This confirms input must be 2 channels.
-            
-            pass
+            x = x.transpose(2, 3)  # -> [B, 2, mel_bins, T]
+            if x.shape[1] != 2:
+                raise ValueError(
+                    "LTX2Vocoder expects stereo mel spectrogram [B, 2, T, mel_bins]. "
+                    f"Got {tuple(x.shape)} after transpose."
+                )
+            b, s, mel_bins, t = x.shape
+            x = x.reshape(b, s * mel_bins, t)
+        elif x.dim() != 3:
+            raise ValueError(
+                f"LTX2Vocoder expects a 3D/4D tensor, got dim={x.dim()} shape={tuple(x.shape)}"
+            )
 
         x = self.conv_pre(x)
 

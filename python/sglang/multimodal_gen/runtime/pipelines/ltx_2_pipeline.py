@@ -1,4 +1,6 @@
 import os
+import json
+import inspect
 import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file as load_safetensors
@@ -19,6 +21,34 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _filter_kwargs_for_cls(cls, cfg: dict) -> dict:
+    sig = inspect.signature(cls.__init__)
+    valid = set(sig.parameters.keys()) - {"self"}
+    return {k: v for k, v in cfg.items() if k in valid}
+
+
+def _load_component_config(model_path: str, subfolder: str) -> dict:
+    # Local path
+    if os.path.isdir(model_path):
+        cfg_path = os.path.join(model_path, subfolder, "config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {}
+
+    # HF Hub
+    local_dir = snapshot_download(
+        repo_id=model_path,
+        allow_patterns=[f"{subfolder}/*"],
+        local_files_only=False,
+    )
+    cfg_path = os.path.join(local_dir, subfolder, "config.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
 def load_model_weights(model, model_path, subfolder, filename="diffusion_pytorch_model.safetensors"):
     """Helper to load weights from local path or HF Hub."""
@@ -80,9 +110,21 @@ class LTX2Pipeline(ComposedPipelineBase):
         scheduler = self.get_module("scheduler")
         vae = self.get_module("vae")
         
-        # Initialize Audio Components
-        audio_vae = LTX2AudioDecoder()
-        vocoder = LTX2Vocoder()
+        # Initialize Audio Components (prefer config.json if present)
+        audio_cfg = _load_component_config(self.model_path, "audio_vae")
+        vocoder_cfg = _load_component_config(self.model_path, "vocoder")
+
+        # ltx-core style nesting support
+        audio_cfg = (
+            audio_cfg.get("ddconfig")
+            or audio_cfg.get("model", {}).get("params", {}).get("ddconfig")
+            or audio_cfg.get("audio_vae", {}).get("model", {}).get("params", {}).get("ddconfig")
+            or audio_cfg
+        )
+        vocoder_cfg = vocoder_cfg.get("vocoder") or vocoder_cfg
+
+        audio_vae = LTX2AudioDecoder(**_filter_kwargs_for_cls(LTX2AudioDecoder, audio_cfg))
+        vocoder = LTX2Vocoder(**_filter_kwargs_for_cls(LTX2Vocoder, vocoder_cfg))
         
         # Load weights
         load_model_weights(audio_vae, self.model_path, "audio_vae")

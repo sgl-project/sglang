@@ -12,6 +12,7 @@ from sglang.multimodal_gen.configs.models.encoders.clip import (
 )
 from sglang.multimodal_gen.configs.models.encoders.llama import LlamaConfig
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.configs.models.encoders.gemma import GemmaConfig
 
 __all__ = [
     "EncoderConfig",
@@ -22,4 +23,5 @@ __all__ = [
     "CLIPVisionConfig",
     "LlamaConfig",
     "T5Config",
+    "GemmaConfig",
 ]

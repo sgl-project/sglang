@@ -9,6 +9,7 @@ diffusion models.
 """
 
 import os
+from typing import Any, Optional
 
 import imageio
 import torch
@@ -53,7 +54,7 @@ def post_process_sample(
     data_type: DataType,
     fps: int,
     save_output: bool = True,
-    save_file_path: str = None,
+    save_file_path: Optional[str] = None,
 ):
     """
     Process sample output and save video if necessary
@@ -98,7 +99,14 @@ def post_process_sample(
                     # Audio is likely (C, L) or (L,). LTX audio is (C, L) latent -> decoded audio (1, L)
                     # We need to check shape.
                     if isinstance(audio, torch.Tensor):
-                        audio_np = audio.squeeze().cpu().numpy()
+                        audio_np = (
+                            audio.detach()
+                            .squeeze()
+                            .float()
+                            .clamp(-1.0, 1.0)
+                            .cpu()
+                            .numpy()
+                        )
                         # LTX default sample rate is 24000
                         scipy.io.wavfile.write(audio_path, 24000, audio_np)
                         logger.info(f"Audio saved to {CYAN}{audio_path}{RESET}")

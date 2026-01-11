@@ -1,3 +1,5 @@
+import math
+
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
@@ -24,18 +26,33 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
         # This sets batch.latents and batch.raw_latent_shape
         batch = super().forward(batch, server_args)
 
-        # 2. Prepare Audio Latents
+        # 2. Prepare Audio Latents (optional)
+        if not getattr(batch, "generate_audio", True):
+            batch.audio_latents = None
+            batch.raw_audio_latent_shape = None
+            return batch
+
         device = get_local_torch_device()
-        dtype = batch.prompt_embeds[0].dtype
+        if isinstance(batch.prompt_embeds, list) and batch.prompt_embeds:
+            dtype = batch.prompt_embeds[0].dtype
+        elif isinstance(batch.prompt_embeds, torch.Tensor):
+            dtype = batch.prompt_embeds.dtype
+        else:
+            dtype = torch.float16
         generator = batch.generator
         config = server_args.pipeline_config
 
-        # Calculate audio latent dimensions
-        # LTX-2 Audio VAE produces latents at ~25Hz (16kHz / 160 hop / 4 downsample = 25Hz)
-        # Assuming video is also 25fps, audio_frames ~= video_frames
-        # TODO: If frame_rate is variable, we need to access it here.
-        # For now, assume 1:1 mapping as per LTX-2 defaults.
-        audio_latent_frames = batch.num_frames
+        # Calculate audio latent dimensions.
+        # The Audio VAE latent time axis is ~25 Hz (16k / 160 hop / 4 downsample).
+        # We compute latent frames from video duration, accounting for causal decode cropping.
+        fps = getattr(batch, "fps", None) or 24
+        duration_s = float(batch.num_frames) / float(fps)
+        mel_hz = 100.0  # 16k / 160
+        mel_frames_target = int(math.ceil(duration_s * mel_hz))
+        down = int(getattr(config, "audio_latent_downsample_factor", 4))
+        is_causal = True
+        causal_crop = (down - 1) if is_causal else 0
+        audio_latent_frames = int(math.ceil((mel_frames_target + causal_crop) / down))
 
         # Shape: [B, C, T, F] where F is mel_bins
         shape = (
@@ -76,10 +93,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
         audio_latents = getattr(batch, "audio_latents", None)
         
         if audio_latents is None:
-            # Fallback or error? For now, assume audio is required for LTX-2
-            # But if user didn't request audio, maybe we should skip?
-            # LTX-2 is inherently AV.
-            raise ValueError("Audio latents not found in batch for LTX2AVDenoisingStage")
+            raise ValueError(
+                "Audio latents not found in batch. If you want video-only, set `generate_audio=False`."
+            )
 
         # Prepare extra kwargs for the model (guidance, etc.)
         # extra_step_kwargs = self.prepare_extra_step_kwargs(batch, server_args)
@@ -87,9 +103,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
         # Denoising loop
         # num_warmup_steps = len(self.scheduler.timesteps) - self.scheduler.num_inference_steps * self.scheduler.order
         
+        device = getattr(self.transformer, "device", None) or get_local_torch_device()
+        target_dtype = getattr(self.transformer, "dtype", latents.dtype)
+
         # Ensure latents are on correct device/dtype
-        latents = latents.to(self.device, dtype=self.transformer.dtype)
-        audio_latents = audio_latents.to(self.device, dtype=self.transformer.dtype)
+        latents = latents.to(device, dtype=target_dtype)
+        audio_latents = audio_latents.to(device, dtype=target_dtype)
+
+        extra_step_kwargs = getattr(batch, "extra_step_kwargs", None) or {}
         
         with self.progress_bar(total=self.scheduler.num_inference_steps) as progress_bar:
             for i, t in enumerate(self.scheduler.timesteps):
@@ -101,7 +122,8 @@ class LTX2AVDenoisingStage(DenoisingStage):
                 audio_latent_model_input = torch.cat([audio_latents] * 2) if do_cfg else audio_latents
                 
                 # Scale latents (FlowMatch usually doesn't, but check scheduler)
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                t_device = t.to(device) if isinstance(t, torch.Tensor) else torch.tensor(t, device=device)
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t_device)
                 # Audio latents scaling? Assuming same as video or none.
                 
                 # Prepare kwargs
@@ -124,12 +146,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
 
                 encoder_attention_mask = batch.prompt_attention_mask
                 if isinstance(encoder_attention_mask, list):
-                     if do_cfg:
-                        pos_mask = batch.prompt_attention_mask[0]
-                        neg_mask = batch.negative_attention_mask[0]
-                        encoder_attention_mask = torch.cat([neg_mask, pos_mask])
-                     else:
-                        encoder_attention_mask = batch.prompt_attention_mask[0]
+                    if do_cfg:
+                        pos_mask = encoder_attention_mask[0]
+                        neg_mask = (batch.negative_attention_mask or [None])[0]
+                        encoder_attention_mask = (
+                            torch.cat([neg_mask, pos_mask]) if neg_mask is not None else pos_mask
+                        )
+                    else:
+                        encoder_attention_mask = encoder_attention_mask[0]
 
                 kwargs = {
                     "encoder_hidden_states": encoder_hidden_states,
@@ -142,7 +166,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                 # LTX-2 DiT forward returns (video_pred, audio_pred)
                 noise_pred = self.transformer(
                     latent_model_input,
-                    timestep=t,
+                    timestep=t_device,
                     **kwargs
                 )
                 
@@ -162,15 +186,21 @@ class LTX2AVDenoisingStage(DenoisingStage):
                     video_pred = video_pred_uncond + guidance_scale * (video_pred_text - video_pred_uncond)
                     audio_pred = audio_pred_uncond + guidance_scale * (audio_pred_text - audio_pred_uncond)
                 
-                # Compute previous sample (Step)
-                # Manual FlowMatch Euler step
-                sigma = self.scheduler.sigmas[i]
-                sigma_next = self.scheduler.sigmas[i + 1]
-                dt = sigma_next - sigma
-                
-                # Update latents
-                latents = latents + dt * video_pred
-                audio_latents = audio_latents + dt * audio_pred
+                # Compute the previous noisy sample.
+                latents = self.scheduler.step(
+                    model_output=video_pred,
+                    timestep=t_device,
+                    sample=latents,
+                    **extra_step_kwargs,
+                    return_dict=False,
+                )[0]
+                audio_latents = self.scheduler.step(
+                    model_output=audio_pred,
+                    timestep=t_device,
+                    sample=audio_latents,
+                    **extra_step_kwargs,
+                    return_dict=False,
+                )[0]
                 
                 # Update progress bar
                 progress_bar.update()
@@ -267,30 +297,14 @@ class LTX2AVDecodingStage(DecodingStage):
         
         # 2. Decode Audio
         audio_latents = getattr(batch, "audio_latents", None)
-        if audio_latents is not None:
-            # Ensure models are on correct device
-            device = self.device
-            dtype = self.vae.dtype # Use video VAE dtype as reference?
-            
-            # audio_vae and vocoder might be on CPU if not moved explicitly?
-            # Assuming they are on device.
-            
+        if audio_latents is not None and getattr(batch, "generate_audio", True):
             with torch.no_grad():
-                # Decode spectrogram
-                # audio_latents: [B, C, T, F]
                 spectrogram = self.audio_vae(audio_latents)
-                
-                # Vocode to waveform
-                # spectrogram: [B, C, T, F] -> [B, C, F, T] for vocoder?
-                # LTX-2 Vocoder expects [B, C, F, T] (channels, mel_bins, time)?
-                # Let's check vocoder.py forward:
-                # x = x.transpose(2, 3) # (batch, channels, time, mel_bins) -> (batch, channels, mel_bins, time)
-                # So it expects [B, C, T, F] input!
-                
                 waveform = self.vocoder(spectrogram)
-                # waveform: [B, out_channels, time]
-            
-            # Dynamically attach to output_batch
-            output_batch.audio_output = waveform
-            
+
+            # Pack audio alongside per-sample video tensor so entrypoints can save both.
+            if isinstance(output_batch.output, torch.Tensor):
+                videos = output_batch.output
+                output_batch.output = [(videos[i], waveform[i]) for i in range(videos.shape[0])]
+        
         return output_batch

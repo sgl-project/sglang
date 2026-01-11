@@ -36,5 +36,7 @@ class LTX2ArchConfig(DiTArchConfig):
 
 @dataclass
 class LTX2Config(DiTConfig):
+    
     arch_config: DiTArchConfig = field(default_factory=LTX2ArchConfig)
+    
     prefix: str = "LTX2"

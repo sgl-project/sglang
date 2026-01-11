@@ -1,11 +1,24 @@
 import dataclasses
-from typing import Tuple
 from dataclasses import field
+from typing import Callable
 
 import torch
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput, EncoderConfig
+from sglang.multimodal_gen.configs.models.encoders.gemma import GemmaConfig
 from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2Config
+
+
+def _gemma_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+    # Prefer LTX-2 style outputs when available.
+    if hasattr(outputs, "video_context"):
+        return getattr(outputs, "video_context")
+    if hasattr(outputs, "last_hidden_state"):
+        return outputs.last_hidden_state
+    raise AttributeError(
+        "Unsupported text encoder output: expected `video_context` or `last_hidden_state`."
+    )
 
 
 @dataclasses.dataclass
@@ -35,8 +48,13 @@ class LTX2PipelineConfig(PipelineConfig):
     vae_scale_factor: int = 32  # Spatial compression
     vae_temporal_compression: int = 8
     
-    # Text Encoder
-    text_encoder_model_path: str = "google/gemma-3-12b-it"  # Default placeholder
+    # Text encoding stage (Gemma)
+    text_encoder_configs: tuple[EncoderConfig, ...] = field(
+        default_factory=lambda: (GemmaConfig(),)
+    )
+    postprocess_text_funcs: tuple[
+        Callable[[BaseEncoderOutput, dict], torch.Tensor], ...
+    ] = field(default_factory=lambda: (_gemma_postprocess_text,))
     
     def __post_init__(self):
         super().__post_init__()

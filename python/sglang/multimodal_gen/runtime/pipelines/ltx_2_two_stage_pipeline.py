@@ -1,4 +1,6 @@
 import os
+import json
+import inspect
 import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file as load_safetensors
@@ -22,6 +24,32 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _filter_kwargs_for_cls(cls, cfg: dict) -> dict:
+    sig = inspect.signature(cls.__init__)
+    valid = set(sig.parameters.keys()) - {"self"}
+    return {k: v for k, v in cfg.items() if k in valid}
+
+
+def _load_component_config(model_path: str, subfolder: str) -> dict:
+    if os.path.isdir(model_path):
+        cfg_path = os.path.join(model_path, subfolder, "config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {}
+
+    local_dir = snapshot_download(
+        repo_id=model_path,
+        allow_patterns=[f"{subfolder}/*"],
+        local_files_only=False,
+    )
+    cfg_path = os.path.join(local_dir, subfolder, "config.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
 # From ltx_pipelines/utils/constants.py
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
@@ -86,12 +114,25 @@ class LTX2TwoStagePipeline(ComposedPipelineBase):
         scheduler = self.get_module("scheduler")
         vae = self.get_module("vae")
         
-        # Initialize Audio Components
-        audio_vae = LTX2AudioDecoder()
-        vocoder = LTX2Vocoder()
+        # Initialize Audio Components (prefer config.json if present)
+        audio_cfg = _load_component_config(self.model_path, "audio_vae")
+        vocoder_cfg = _load_component_config(self.model_path, "vocoder")
+        upsampler_cfg = _load_component_config(self.model_path, "upsampler")
+
+        audio_cfg = (
+            audio_cfg.get("ddconfig")
+            or audio_cfg.get("model", {}).get("params", {}).get("ddconfig")
+            or audio_cfg.get("audio_vae", {}).get("model", {}).get("params", {}).get("ddconfig")
+            or audio_cfg
+        )
+        vocoder_cfg = vocoder_cfg.get("vocoder") or vocoder_cfg
+        upsampler_cfg = upsampler_cfg.get("upsampler") or upsampler_cfg
+
+        audio_vae = LTX2AudioDecoder(**_filter_kwargs_for_cls(LTX2AudioDecoder, audio_cfg))
+        vocoder = LTX2Vocoder(**_filter_kwargs_for_cls(LTX2Vocoder, vocoder_cfg))
         
         # Initialize Upsampler
-        upsampler = LatentUpsampler()
+        upsampler = LatentUpsampler(**_filter_kwargs_for_cls(LatentUpsampler, upsampler_cfg))
         
         # Load weights
         # We assume the model_path (local or HF ID) contains these subfolders

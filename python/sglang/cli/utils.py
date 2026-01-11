@@ -88,7 +88,7 @@ def _maybe_download_model(
 
 
 # Copied and adapted from hf_diffusers_utils.py
-def is_diffusers_model_path(model_path: str) -> True:
+def is_diffusers_model_path(model_path: str) -> bool:
     """
     Verify if the model directory contains a valid diffusers configuration.
 
@@ -118,10 +118,6 @@ def is_diffusers_model_path(model_path: str) -> True:
 def get_is_diffusion_model(model_path: str):
     model_path = _maybe_download_model(model_path)
     is_diffusion_model = is_diffusers_model_path(model_path)
-    
-    # Special check for LTX model which might not have model_index.json
-    if not is_diffusion_model and ("ltx" in model_path.lower() or "ltx-2" in model_path.lower()):
-        is_diffusion_model = True
         
     if is_diffusion_model:
         logger.info("Diffusion model detected")

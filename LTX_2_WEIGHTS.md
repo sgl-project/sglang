@@ -6,6 +6,7 @@ To run the LTX-2 Audio-Video pipeline in SGLang, you need to organize your model
 
 ```
 ltx-2-model/
+├── model_index.json
 ├── transformer/
 │   ├── config.json
 │   └── diffusion_pytorch_model.safetensors
@@ -21,48 +22,45 @@ ltx-2-model/
 │   └── merges.txt
 ├── scheduler/
 │   └── scheduler_config.json
-├── audio_vae/  # New: Audio Decoder
+├── audio_vae/  # Audio decoder
 │   ├── config.json
 │   └── diffusion_pytorch_model.safetensors
-└── vocoder/    # New: Audio Vocoder
-    ├── config.json
-    └── diffusion_pytorch_model.safetensors
-└── upsampler/  # New: Latent Upsampler
+├── vocoder/    # Audio vocoder
+│   ├── config.json
+│   └── diffusion_pytorch_model.safetensors
+└── upsampler/  # Latent upsampler (two-stage)
     ├── config.json
     └── diffusion_pytorch_model.safetensors
 ```
 
 ## Configuration Details
 
-### Audio VAE (audio_vae/config.json)
-Should contain parameters for `AudioDecoder`:
+### Audio VAE (`audio_vae/config.json`)
+Should contain parameters for `LTX2AudioDecoder` (or be nested under `audio_vae.model.params.ddconfig`):
+
 - `ch`: 128
-- `out_ch`: 128
+- `out_ch`: 2
 - `ch_mult`: [1, 2, 4, 8]
 - `num_res_blocks`: 2
 - `attn_resolutions`: []
 - `resolution`: 256
 - `z_channels`: 8
 - `sample_rate`: 16000
+- `mel_bins`: 64
 
-### Vocoder (vocoder/config.json)
-Should contain parameters for `Vocoder`:
+### Vocoder (`vocoder/config.json`)
+Should contain parameters for `LTX2Vocoder` (or be nested under `vocoder`):
+
 - `resblock_kernel_sizes`: [3, 7, 11]
 - `upsample_rates`: [6, 5, 2, 2, 2]
 - `upsample_initial_channel`: 1024
 - `output_sample_rate`: 24000
 
-### Upsampler (upsampler/config.json)
-Should contain parameters for `LatentUpsampler`:
-- `in_channels`: 128
-- `mid_channels`: 512
-- `num_blocks_per_stage`: 4
-- `dims`: 3
-- `spatial_upsample`: true
-- `temporal_upsample`: false
-- `spatial_scale`: 2.0
-- `rational_resampler`: false
+### Upsampler (`upsampler/config.json`)
+Should contain parameters for `LatentUpsampler` (or be nested under `upsampler`).
 
 ## Notes
-- The `transformer` config must support `audio_hidden_states` input.
+
+- The `transformer` implementation must support `audio_hidden_states` input.
 - Ensure `scheduler` is compatible with Flow Matching (e.g., `FlowMatchEulerDiscreteScheduler`).
+
