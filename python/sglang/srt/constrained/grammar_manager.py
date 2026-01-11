@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 GRAMMAR_TIMEOUT = envs.SGLANG_GRAMMAR_TIMEOUT.get()
+GRAMMAR_POLL_INTERVAL = envs.SGLANG_GRAMMAR_POLL_INTERVAL.get()
 logger = logging.getLogger(__name__)
 
 
@@ -109,7 +110,7 @@ class GrammarManager:
                     num_ready_reqs += 1
                     continue
 
-                req.grammar = req.grammar.result(timeout=0.03)
+                req.grammar = req.grammar.result(timeout=GRAMMAR_POLL_INTERVAL)
                 self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
                 if req.grammar is INVALID_GRAMMAR_OBJ:
                     error_msg = f"Invalid grammar request: {req.grammar_key=}"
@@ -120,7 +121,7 @@ class GrammarManager:
                 req.grammar_wait_ct += 1
                 # NOTE(lianmin): this timeout is the waiting time of the above line. It is
                 # not the waiting time from it enters the grammar queue.
-                if req.grammar_wait_ct > GRAMMAR_TIMEOUT / 0.03:
+                if req.grammar_wait_ct > GRAMMAR_TIMEOUT / GRAMMAR_POLL_INTERVAL:
                     num_timeout_reqs = 1
                 break
 
