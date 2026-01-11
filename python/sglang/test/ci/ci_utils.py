@@ -101,12 +101,82 @@ def run_with_timeout(
     return ret_value[0]
 
 
-def write_github_step_summary(content: str):
+def write_github_step_summary(content: str, append: bool = False):
     """Write content to GitHub Step Summary if available."""
     summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_file:
-        with open(summary_file, "a") as f:
+        mode = "a" if append else "w"
+        with open(summary_file, mode) as f:
             f.write(content)
+
+
+def generate_test_summary_md(
+    passed_tests, failed_tests, retried_tests, total_files, remaining_files=None
+):
+    """Generate markdown summary of test results."""
+    completed = len(passed_tests) + len(failed_tests)
+    total_elapsed = sum(e for _, e, _ in passed_tests) + sum(
+        e for _, _, e, _ in failed_tests
+    )
+    total_estimated = sum(est for _, _, est in passed_tests) + sum(
+        est for _, _, _, est in failed_tests
+    )
+
+    # Header with progress
+    if remaining_files:
+        summary_md = f"## Test Progress: {len(passed_tests)}/{completed} passed ({completed}/{total_files} completed)\n"
+        summary_md += (
+            f"**Time so far:** {total_elapsed:.0f}s (est: {total_estimated:.0f}s)\n\n"
+        )
+    else:
+        summary_md = f"## Test Summary: {len(passed_tests)}/{total_files} passed\n"
+        summary_md += (
+            f"**Total time:** {total_elapsed:.0f}s (est: {total_estimated:.0f}s)\n\n"
+        )
+
+    # Show remaining tests if job is still running
+    if remaining_files:
+        summary_md += "### ⏳ Remaining\n"
+        for test in remaining_files[:5]:  # Show first 5
+            summary_md += f"- `{test}`\n"
+        if len(remaining_files) > 5:
+            summary_md += f"- ... and {len(remaining_files) - 5} more\n"
+        summary_md += "\n"
+
+    # Failed tests (always show prominently)
+    if failed_tests:
+        summary_md += "### ✗ Failed\n"
+        summary_md += "| Test | Reason | Time | Est |\n"
+        summary_md += "|------|--------|------|-----|\n"
+        for test, reason, elapsed, est in failed_tests:
+            summary_md += f"| `{test}` | {reason} | {elapsed:.0f}s | {est:.0f}s |\n"
+        summary_md += "\n"
+
+    # Retried tests
+    if retried_tests:
+        passed_on_retry = [(t, a) for t, a, r in retried_tests if r == "passed"]
+        failed_after_retry = [(t, a, r) for t, a, r in retried_tests if r != "passed"]
+        summary_md += "### ↻ Retried\n"
+        if passed_on_retry:
+            for test, attempts in passed_on_retry:
+                summary_md += f"- ✓ `{test}` (passed on attempt {attempts})\n"
+        if failed_after_retry:
+            for test, attempts, result in failed_after_retry:
+                summary_md += f"- ✗ `{test}` ({attempts} attempts, {result})\n"
+        summary_md += "\n"
+
+    # Passed tests (collapsible)
+    if passed_tests:
+        summary_md += "<details>\n<summary>✓ Passed ({} tests)</summary>\n\n".format(
+            len(passed_tests)
+        )
+        summary_md += "| Test | Time | Est |\n"
+        summary_md += "|------|------|-----|\n"
+        for test, elapsed, est in passed_tests:
+            summary_md += f"| `{test}` | {elapsed:.0f}s | {est:.0f}s |\n"
+        summary_md += "\n</details>\n"
+
+    return summary_md
 
 
 def run_unittest_files(
@@ -132,9 +202,17 @@ def run_unittest_files(
     """
     tic = time.perf_counter()
     success = True
-    passed_tests = []
-    failed_tests = []
+    passed_tests = []  # List of (filename, elapsed, estimated)
+    failed_tests = []  # List of (filename, reason, elapsed, estimated)
     retried_tests = []  # Track which tests were retried
+
+    # Extract all filenames for tracking remaining tests
+    all_filenames = []
+    for file in files:
+        if isinstance(file, CIRegistry):
+            all_filenames.append(file.filename)
+        else:
+            all_filenames.append(file.name)
 
     for i, file in enumerate(files):
         if isinstance(file, CIRegistry):
@@ -145,6 +223,7 @@ def run_unittest_files(
 
         process = None
         output_lines = []
+        file_elapsed = [0.0]  # Use list to allow modification in nested function
 
         def run_one_file(filename, capture_output=False):
             nonlocal process, output_lines
@@ -177,6 +256,7 @@ def run_unittest_files(
                 process.wait()
 
             elapsed = time.perf_counter() - file_tic
+            file_elapsed[0] = elapsed
 
             logger.info(
                 f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n"
@@ -210,7 +290,7 @@ def run_unittest_files(
                             f"\n✓ PASSED on retry (attempt {attempt}): {filename}\n"
                         )
                         retried_tests.append((filename, attempt, "passed"))
-                    passed_tests.append(filename)
+                    passed_tests.append((filename, file_elapsed[0], estimated_time))
                     break
                 else:
                     # Check if we should retry
@@ -237,7 +317,14 @@ def run_unittest_files(
                     )
                     if was_retried:
                         retried_tests.append((filename, attempt, "failed"))
-                    failed_tests.append((filename, f"exit code {ret_code}"))
+                    failed_tests.append(
+                        (
+                            filename,
+                            f"exit code {ret_code}",
+                            file_elapsed[0],
+                            estimated_time,
+                        )
+                    )
                     break
 
             except TimeoutError:
@@ -248,8 +335,26 @@ def run_unittest_files(
                 )
                 if was_retried:
                     retried_tests.append((filename, attempt, "timeout"))
-                failed_tests.append((filename, f"timeout after {timeout_per_file}s"))
+                failed_tests.append(
+                    (
+                        filename,
+                        f"timeout after {timeout_per_file}s",
+                        timeout_per_file,
+                        estimated_time,
+                    )
+                )
                 break
+
+        # Update GitHub Step Summary after each test (overwrites previous)
+        # This ensures summary is available even if job is killed
+        completed_filenames = [t[0] for t in passed_tests] + [
+            t[0] for t in failed_tests
+        ]
+        remaining = [f for f in all_filenames if f not in completed_filenames]
+        summary_md = generate_test_summary_md(
+            passed_tests, failed_tests, retried_tests, len(files), remaining
+        )
+        write_github_step_summary(summary_md)
 
         if not file_passed:
             success = False
@@ -263,7 +368,7 @@ def run_unittest_files(
     else:
         logger.info(f"Fail. Time elapsed: {elapsed_total:.2f}s")
 
-    # Print summary
+    # Print summary to logs
     logger.info(f"\n{'='*60}")
     logger.info(f"Test Summary: {len(passed_tests)}/{len(files)} passed")
     if enable_retry and retried_tests:
@@ -271,27 +376,22 @@ def run_unittest_files(
     logger.info(f"{'='*60}")
     if passed_tests:
         logger.info("✓ PASSED:")
-        for test in passed_tests:
-            logger.info(f"  {test}")
+        for test, elapsed, est in passed_tests:
+            logger.info(f"  {test} ({elapsed:.0f}s / {est:.0f}s est)")
     if failed_tests:
         logger.info("\n✗ FAILED:")
-        for test, reason in failed_tests:
-            logger.info(f"  {test} ({reason})")
+        for test, reason, elapsed, est in failed_tests:
+            logger.info(f"  {test} ({reason}, {elapsed:.0f}s / {est:.0f}s est)")
     if retried_tests:
         logger.info("\n↻ RETRIED:")
         for test, attempts, result in retried_tests:
             logger.info(f"  {test} ({attempts} attempts, {result})")
     logger.info(f"{'='*60}\n")
 
-    # Write GitHub Step Summary only if retries occurred
-    if retried_tests:
-        passed_on_retry = [t for t, _, r in retried_tests if r == "passed"]
-        failed_after_retry = [t for t, _, r in retried_tests if r != "passed"]
-        summary = f"**↻ Retried {len(retried_tests)} test(s):**\n"
-        if passed_on_retry:
-            summary += f"- ✓ Passed on retry: {', '.join(passed_on_retry)}\n"
-        if failed_after_retry:
-            summary += f"- ✗ Still failed: {', '.join(failed_after_retry)}\n"
-        write_github_step_summary(summary)
+    # Write final GitHub Step Summary (no remaining tests)
+    summary_md = generate_test_summary_md(
+        passed_tests, failed_tests, retried_tests, len(files), remaining_files=None
+    )
+    write_github_step_summary(summary_md)
 
     return 0 if success else -1
