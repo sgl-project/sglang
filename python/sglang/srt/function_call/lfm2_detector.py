@@ -288,50 +288,6 @@ class Lfm2Detector(BaseFormatDetector):
         """Remove special tokens from text."""
         return text.replace(self.bot_token, "").replace(self.eot_token, "")
 
-    def _find_matching_bracket(self, buffer: str, start: int) -> int:
-        """
-        Find the matching closing bracket for the opening bracket at start position.
-        Properly handles nested brackets and strings.
-
-        Args:
-            buffer: The text buffer to search in
-            start: Position of the opening bracket '['
-
-        Returns:
-            Position of the matching closing bracket ']', or -1 if not found
-        """
-        bracket_count = 0
-        in_string = False
-        string_char = None
-        escape_next = False
-
-        for i in range(start, len(buffer)):
-            char = buffer[i]
-
-            if escape_next:
-                escape_next = False
-                continue
-
-            if char == "\\":
-                escape_next = True
-                continue
-
-            if char in ('"', "'") and not in_string:
-                in_string = True
-                string_char = char
-            elif char == string_char and in_string:
-                in_string = False
-                string_char = None
-            elif not in_string:
-                if char == "[":
-                    bracket_count += 1
-                elif char == "]":
-                    bracket_count -= 1
-                    if bracket_count == 0:
-                        return i
-
-        return -1  # No matching bracket found
-
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
