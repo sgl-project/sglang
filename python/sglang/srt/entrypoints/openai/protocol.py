@@ -36,7 +36,7 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
-from typing_extensions import Literal
+from typing_extensions import Annotated, Literal
 
 try:
     from xgrammar import StructuralTag
@@ -941,12 +941,31 @@ class ResponseReasoningParam(BaseModel):
     )
 
 
-class ResponseTool(BaseModel):
-    """Tool definition for responses."""
+class ResponseBuiltinTool(BaseModel):
+    """Built-in tool for responses (simplified format)."""
 
     type: Literal["web_search_preview", "code_interpreter"] = Field(
-        description="Type of tool to enable"
+        description="Built-in tool type"
     )
+
+
+class ResponseFunctionTool(BaseModel):
+    """Function tool for responses (full format)."""
+
+    type: Literal["function"] = Field(description="Tool type identifier")
+    name: str = Field(description="Function name")
+    description: Optional[str] = Field(default=None, description="Function description")
+    parameters: Optional[object] = Field(
+        default=None, description="Function parameters schema"
+    )
+    strict: bool = Field(default=False, description="Whether to enable strict mode")
+
+
+# Union type for ResponseTool (Option B implementation)
+ResponseTool: TypeAlias = Annotated[
+    Union[ResponseBuiltinTool, ResponseFunctionTool],
+    Field(discriminator="type"),
+]
 
 
 ResponseInputOutputItem: TypeAlias = Union[
