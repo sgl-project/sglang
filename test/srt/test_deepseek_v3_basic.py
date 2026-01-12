@@ -1,8 +1,6 @@
 import unittest
 from types import SimpleNamespace
 
-import requests
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
@@ -24,7 +22,13 @@ class TestDeepseekV3Basic(CustomTestCase):
     def setUpClass(cls):
         cls.model = FULL_DEEPSEEK_V3_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = ["--trust-remote-code", "--tp", "8"]
+        other_args = [
+            "--trust-remote-code",
+            "--tp",
+            "8",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
+        ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

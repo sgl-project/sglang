@@ -54,6 +54,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -113,6 +114,7 @@ class GptOssSparseMoeBlock(nn.Module):
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=True,
+            layer_id=layer_id,
         )
 
         self.top_k = config.num_experts_per_tok
@@ -168,6 +170,9 @@ class GptOssSparseMoeBlock(nn.Module):
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
         ]
 
     def forward_normal(
@@ -395,12 +400,14 @@ class GptOssDecoderLayer(nn.Module):
         self.is_layer_sparse = True
         self.is_nextn = False
         is_previous_layer_sparse = True
+        is_next_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:

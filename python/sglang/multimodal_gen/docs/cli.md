@@ -1,11 +1,11 @@
-# sgl-diffusion CLI Inference
+# SGLang diffusion CLI Inference
 
-The sgl-diffusion CLI provides a quick way to access the sgl-diffusion inference pipeline for image and video generation.
+The SGLang-diffusion CLI provides a quick way to access the inference pipeline for image and video generation.
 
 ## Prerequisites
 
-- A working sgl-diffusion installation and the `sgl-diffusion` CLI available in `$PATH`.
-- Python 3.10+ if you plan to use the OpenAI Python SDK.
+- A working SGLang diffusion installation and the `sglang` CLI available in `$PATH`.
+- Python 3.11+ if you plan to use the OpenAI Python SDK.
 
 
 ## Supported Arguments
@@ -13,9 +13,12 @@ The sgl-diffusion CLI provides a quick way to access the sgl-diffusion inference
 ### Server Arguments
 
 - `--model-path {MODEL_PATH}`: Path to the model or model ID
+- `--vae-path {VAE_PATH}`: Path to a custom VAE model or HuggingFace model ID (e.g., `fal/FLUX.2-Tiny-AutoEncoder`). If not specified, the VAE will be loaded from the main model path.
+- `--lora-path {LORA_PATH}`: Path to a LoRA adapter (local path or HuggingFace model ID). If not specified, LoRA will not be applied.
+- `--lora-nickname {NAME}`: Nickname for the LoRA adapter. (default: `default`).
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use
 - `--tp-size {TP_SIZE}`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
-- `--sp-size {SP_SIZE}`: Sequence parallelism size (typically should match the number of GPUs)
+- `--sp-degree {SP_SIZE}`: Sequence parallelism size (typically should match the number of GPUs)
 - `--ulysses-degree {ULYSSES_DEGREE}`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree {RING_DEGREE}`: The degree of ring attention-style SP in USP
 
@@ -127,7 +130,7 @@ sglang generate --help
 
 ## Serve
 
-Launch the sgl-diffusion HTTP server and interact with it using the OpenAI SDK and curl. The server implements an OpenAI-compatible subset for Videos under the `/v1/videos` namespace.
+Launch the SGLang diffusion HTTP server and interact with it using the OpenAI SDK and curl.
 
 ### Start the server
 
@@ -149,98 +152,8 @@ sglang serve "${SERVER_ARGS[@]}"
 - **--model-path**: Which model to load. The example uses `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`.
 - **--port**: HTTP port to listen on (the default here is `30010`).
 
-Wait until the port is listening. In CI, the tests probe `127.0.0.1:30010` before sending requests.
+For detailed API usage, including Image, Video Generation and LoRA management, please refer to the [OpenAI API Documentation](openai_api.md).
 
-### OpenAI Python SDK usage
-
-Initialize the client with a dummy API key and point `base_url` to your local server:
-
-```python
-from openai import OpenAI
-
-client = OpenAI(api_key="sk-proj-1234567890", base_url="http://localhost:30010/v1")
-```
-
-- **Create a video**
-
-```python
-video = client.videos.create(prompt="A calico cat playing a piano on stage", size="1280x720")
-print(video.id, video.status)
-```
-
-Response example fields include `id`, `status` (e.g., `queued` → `completed`), `size`, and `seconds`.
-
-- **List videos**
-
-```python
-videos = client.videos.list()
-for item in videos.data:
-    print(item.id, item.status)
-```
-
-- **Poll for completion and download content**
-
-```python
-import time
-
-video = client.videos.create(prompt="A calico cat playing a piano on stage", size="1280x720")
-video_id = video.id
-
-# Simple polling loop
-while True:
-    page = client.videos.list()
-    item = next((v for v in page.data if v.id == video_id), None)
-    if item and item.status == "completed":
-        break
-    time.sleep(5)
-
-# Download binary content (MP4)
-resp = client.videos.download_content(video_id=video_id)
-content = resp.read()  # bytes
-with open("output.mp4", "wb") as f:
-    f.write(content)
-```
-
-### curl examples
-
-- **Create a video**
-
-```bash
-curl -sS -X POST "http://localhost:30010/v1/videos" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-proj-1234567890" \
-  -d '{
-        "prompt": "A calico cat playing a piano on stage",
-        "size": "1280x720"
-      }'
-```
-
-- **List videos**
-
-```bash
-curl -sS -X GET "http://localhost:30010/v1/videos" \
-  -H "Authorization: Bearer sk-proj-1234567890"
-```
-
-- **Download video content**
-
-```bash
-curl -sS -L "http://localhost:30010/v1/videos/<VIDEO_ID>/content" \
-  -H "Authorization: Bearer sk-proj-1234567890" \
-  -o output.mp4
-```
-
-### API surface implemented here
-
-The server exposes these endpoints (OpenAPI tag `videos`):
-
-- `POST /v1/videos` — Create a generation job and return a queued `video` object.
-- `GET /v1/videos` — List jobs.
-- `GET /v1/videos/{video_id}/content` — Download binary content when ready (e.g., MP4).
-
-### Reference
-
-- OpenAI Videos API reference: `https://platform.openai.com/docs/api-reference/videos`
 
 ## Generate
 
@@ -266,9 +179,66 @@ SAMPLING_ARGS=(
 )
 
 sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
+
+# Or, users can set `SGLANG_CACHE_DIT_ENABLED` env as `true` to enable cache acceleration
+SGLANG_CACHE_DIT_ENABLED=true sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
 ```
 
 Once the generation task has finished, the server will shut down automatically.
 
 > [!NOTE]
 > The HTTP server-related arguments are ignored in this subcommand.
+
+## Diffusers Backend
+
+SGLang diffusion supports a **diffusers backend** that allows you to run any diffusers-compatible model through SGLang's infrastructure using vanilla diffusers pipelines. This is useful for running models without native SGLang implementations or models with custom pipeline classes.
+
+### Arguments
+
+| Argument | Values | Description |
+|----------|--------|-------------|
+| `--backend` | `auto` (default), `sglang`, `diffusers` | `auto`: prefer native SGLang, fallback to diffusers. `sglang`: force native (fails if unavailable). `diffusers`: force vanilla diffusers pipeline. |
+| `--diffusers-attention-backend` | `flash`, `_flash_3_hub`, `sage`, `xformers`, `native` | Attention backend for diffusers pipelines. See [diffusers attention backends](https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends). |
+| `--trust-remote-code` | flag | Required for models with custom pipeline classes (e.g., Ovis). |
+| `--vae-tiling` | flag | Enable VAE tiling for large image support (decodes tile-by-tile). |
+| `--vae-slicing` | flag | Enable VAE slicing for lower memory usage (decodes slice-by-slice). |
+| `--dit-precision` | `fp16`, `bf16`, `fp32` | Precision for the diffusion transformer. |
+| `--vae-precision` | `fp16`, `bf16`, `fp32` | Precision for the VAE. |
+
+### Example: Running Ovis-Image-7B
+
+[Ovis-Image-7B](https://huggingface.co/AIDC-AI/Ovis-Image-7B) is a 7B text-to-image model optimized for high-quality text rendering.
+
+```bash
+sglang generate \
+  --model-path AIDC-AI/Ovis-Image-7B \
+  --backend diffusers \
+  --trust-remote-code \
+  --diffusers-attention-backend flash \
+  --prompt "A serene Japanese garden with cherry blossoms" \
+  --height 1024 \
+  --width 1024 \
+  --num-inference-steps 30 \
+  --save-output \
+  --output-path outputs \
+  --output-file-name ovis_garden.png
+```
+
+### Extra Diffusers Arguments
+
+For pipeline-specific parameters not exposed via CLI, use `diffusers_kwargs` in a config file:
+
+```json
+{
+    "model_path": "AIDC-AI/Ovis-Image-7B",
+    "backend": "diffusers",
+    "prompt": "A beautiful landscape",
+    "diffusers_kwargs": {
+        "cross_attention_kwargs": {"scale": 0.5}
+    }
+}
+```
+
+```bash
+sglang generate --config config.json
+```

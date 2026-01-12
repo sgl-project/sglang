@@ -259,6 +259,8 @@ class HiCacheController:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
+        pp_rank: int = 0,
+        pp_size: int = 1,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -267,6 +269,8 @@ class HiCacheController:
         self.page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
 
         if storage_backend is not None:
             self.storage_backend_type = storage_backend
@@ -309,16 +313,23 @@ class HiCacheController:
             # create a new communication group for synchronizing storage operations across TP workers
             self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
             if self.tp_world_size > 1:
+                from sglang.srt.distributed.parallel_state import (
+                    create_custom_parallel_group,
+                )
+
                 group_ranks = torch.distributed.get_process_group_ranks(tp_group)
-                self.prefetch_tp_group = torch.distributed.new_group(
-                    group_ranks, backend="gloo"
+                self.prefetch_tp_group = create_custom_parallel_group(
+                    group_ranks=group_ranks, backend="gloo"
                 )
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if self.storage_backend_type in ["hf3fs", "mooncake", "eic"]:
+            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic"]) or (
+                self.storage_backend_type == "dynamic"
+                and bool(self.storage_config.extra_config.get("interface_v1", 0))
+            ):
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
@@ -381,12 +392,14 @@ class HiCacheController:
             self.tp_size = get_tensor_model_parallel_world_size()
             self.dp_rank = 0
 
-        # Currently, AscendMLAPagedTokenToKVPool is the subclass of MLATokenToKVPool.
+        # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
             is_mla_model=is_mla_backend,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
@@ -500,7 +513,7 @@ class HiCacheController:
             elif self.mem_pool_host.layout == "page_first_direct":
                 return host_indices, device_indices.cpu()
         elif self.io_backend == "kernel_ascend":
-            return host_indices, device_indices
+            return host_indices, device_indices.cpu()
         else:
             raise ValueError(f"Unsupported io backend")
 
@@ -643,11 +656,6 @@ class HiCacheController:
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
-
-        # release pre-allocated memory
-        self.append_host_mem_release(
-            operation.host_indices[operation.completed_tokens :]
-        )
 
     def prefetch_io_aux_func(self):
         """

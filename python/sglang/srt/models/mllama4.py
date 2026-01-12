@@ -173,9 +173,6 @@ class Llama4VisionEncoderLayer(nn.Module):
             use_qkv_parallel=True,
             # vision_model is explicitly ignored in Maverick-17B-128E-Instruct-FP8
             quant_config=None,
-            dropout=0.0,
-            qkv_backend="sdpa",
-            softmax_in_single_precision=False,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
             qkv_bias=True,

@@ -12,7 +12,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 | text                       | `Optional[Union[List[str], str]] = None`                                     | The input prompt. Can be a single prompt or a batch of prompts.                                                                                                 |
 | input_ids                  | `Optional[Union[List[List[int]], List[int]]] = None`                         | The token IDs for text; one can specify either text or input_ids.                                                                                               |
 | input_embeds               | `Optional[Union[List[List[List[float]]], List[List[float]]]] = None`         | The embeddings for input_ids; one can specify either text, input_ids, or input_embeds.                                                                          |
-| image_data                 | `Optional[Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]] = None` | The image input. Can be an image instance, file name, URL, or base64 encoded string. Can be a single image, list of images, or list of lists of images. |
+| image_data                 | `Optional[Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]] = None` | The image input. Supports three formats: (1) **Raw images**: PIL Image, file path, URL, or base64 string; (2) **Processor output**: Dict with `format: "processor_output"` containing HuggingFace processor outputs; (3) **Precomputed embeddings**: Dict with `format: "precomputed_embedding"` and `feature` containing pre-calculated visual embeddings. Can be a single image, list of images, or list of lists of images. See [Multimodal Input Formats](#multimodal-input-formats) for details. |
 | audio_data                 | `Optional[Union[List[AudioDataItem], AudioDataItem]] = None`                 | The audio input. Can be a file name, URL, or base64 encoded string.                                                                                             |
 | sampling_params            | `Optional[Union[List[Dict], Dict]] = None`                                   | The sampling parameters as described in the sections below.                                                                                                     |
 | rid                        | `Optional[Union[List[str], str]] = None`                                     | The request ID.                                                                                                                                                 |
@@ -61,6 +61,7 @@ python -m sglang.launch_server --model-path <MODEL> --sampling-defaults openai
 |--------------------|------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
 | frequency_penalty  | `float = 0.0`          | Penalizes tokens based on their frequency in generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of penalization grows linearly with each appearance of a token. |
 | presence_penalty   | `float = 0.0`          | Penalizes tokens if they appeared in the generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of the penalization is constant if a token occurred. |
+| repetition_penalty | `float = 1.0`          | Scales the logits of previously generated tokens to discourage (values > 1) or encourage (values < 1) repetition. Valid range is `[0, 2]`; `1.0` leaves probabilities unchanged. |
 | min_new_tokens     | `int = 0`              | Forces the model to generate at least `min_new_tokens` until a stop word or EOS token is sampled. Note that this might lead to unintended behavior, for example, if the distribution is highly skewed towards these tokens. |
 
 ### Constrained decoding
@@ -161,7 +162,7 @@ python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-o
 Download an image:
 
 ```bash
-curl -o example_image.png -L https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true
+curl -o example_image.png -L https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true
 ```
 
 Send a request:

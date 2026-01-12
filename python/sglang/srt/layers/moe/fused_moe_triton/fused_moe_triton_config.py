@@ -114,15 +114,24 @@ def get_moe_configs(
                 # If a configuration has been found, return it
                 return {int(key): val for key, val in json.load(f).items()}
 
-    # If no optimized configuration is available, we will use the default
-    # configuration
-    logger.warning(
-        (
-            "Using default MoE kernel config. Performance might be sub-optimal! "
-            "Config file not found at %s, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
-        ),
-        config_file_path,
-    )
+    # If no optimized configuration is available, we will use the default configuration when down_moe is False
+    # When down_moe is True, we will try to use the config for down_moe=False
+    if down_moe:
+        logger.warning(
+            (
+                "Using MoE kernel config with down_moe=False. Performance might be sub-optimal! "
+                "Config file not found at %s, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
+            ),
+            config_file_path,
+        )
+    else:
+        logger.warning(
+            (
+                "Using default MoE kernel config. Performance might be sub-optimal! "
+                "Config file not found at %s, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
+            ),
+            config_file_path,
+        )
     return None
 
 
@@ -199,6 +208,7 @@ def try_get_optimal_moe_config(
     M: int,
     is_marlin: bool = False,
     block_shape: Optional[List[int]] = None,
+    per_channel_quant: bool = False,
     return_down_config: bool = False,
 ):
     from sglang.srt.layers.moe.fused_moe_triton import get_config
@@ -213,7 +223,15 @@ def try_get_optimal_moe_config(
         E, _, N = w2_shape
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
-        configs = get_moe_configs(E, N, dtype, block_n, block_k, down_moe=False)
+        configs = get_moe_configs(
+            E,
+            N,
+            dtype,
+            block_n,
+            block_k,
+            per_channel_quant=per_channel_quant,
+            down_moe=False,
+        )
 
         if configs:
             # If an optimal configuration map has been found, look up the
@@ -225,7 +243,15 @@ def try_get_optimal_moe_config(
                 M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
             )
         if return_down_config:
-            down_configs = get_moe_configs(E, N, dtype, block_n, block_k, down_moe=True)
+            down_configs = get_moe_configs(
+                E,
+                N,
+                dtype,
+                block_n,
+                block_k,
+                per_channel_quant=per_channel_quant,
+                down_moe=True,
+            )
             if down_configs:
                 down_config = down_configs[
                     min(down_configs.keys(), key=lambda x: abs(x - M))
