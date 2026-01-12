@@ -72,6 +72,10 @@ class TestValkeyUnified(unittest.TestCase):
         # Test get without target location
         retrieved_direct = self.hicache.get(key)
         self.assertIsNotNone(retrieved_direct)
+        retrieved_value = torch.frombuffer(
+            retrieved_direct.numpy().tobytes(), dtype=value.dtype
+        ).reshape(value.shape)
+        self.verify_tensors_equal(value, retrieved_value)
 
     def test_batch_set_get(self):
         """Test batch tensor set/get operations."""
@@ -91,6 +95,13 @@ class TestValkeyUnified(unittest.TestCase):
         self.assertEqual(len(retrieved_direct), len(keys))
         self.assertTrue(all(r is not None for r in retrieved_direct))
 
+        # Verify data integrity for each retrieved tensor
+        for original, retrieved in zip(values, retrieved_direct):
+            retrieved_value = torch.frombuffer(
+                retrieved.numpy().tobytes(), dtype=original.dtype
+            ).reshape(original.shape)
+            self.verify_tensors_equal(original, retrieved_value)
+
     def test_mixed_operations(self):
         """Test mixing single and batch operations."""
         # Test interleaved set/get operations
@@ -102,12 +113,20 @@ class TestValkeyUnified(unittest.TestCase):
         self.assertTrue(self.hicache.set(key1, value1))
         retrieved1 = self.hicache.get(key1)
         self.assertIsNotNone(retrieved1)
+        retrieved_value1 = torch.frombuffer(
+            retrieved1.numpy().tobytes(), dtype=value1.dtype
+        ).reshape(value1.shape)
+        self.verify_tensors_equal(value1, retrieved_value1)
 
         # Batch set/get
         self.assertTrue(self.hicache.batch_set([key2], [value2]))
         retrieved2 = self.hicache.batch_get([key2])
         self.assertEqual(len(retrieved2), 1)
         self.assertIsNotNone(retrieved2[0])
+        retrieved_value2 = torch.frombuffer(
+            retrieved2[0].numpy().tobytes(), dtype=value2.dtype
+        ).reshape(value2.shape)
+        self.verify_tensors_equal(value2, retrieved_value2)
 
     def test_data_integrity(self):
         """Test data integrity across operations."""
@@ -128,10 +147,18 @@ class TestValkeyUnified(unittest.TestCase):
                 self.assertTrue(self.hicache.set(key, tensor))
                 retrieved1 = self.hicache.get(key)
                 self.assertIsNotNone(retrieved1)
+                retrieved_value1 = torch.frombuffer(
+                    retrieved1.numpy().tobytes(), dtype=tensor.dtype
+                ).reshape(tensor.shape)
+                self.verify_tensors_equal(tensor, retrieved_value1)
 
                 # Get again to verify persistence
                 retrieved2 = self.hicache.get(key)
                 self.assertIsNotNone(retrieved2)
+                retrieved_value2 = torch.frombuffer(
+                    retrieved2.numpy().tobytes(), dtype=tensor.dtype
+                ).reshape(tensor.shape)
+                self.verify_tensors_equal(tensor, retrieved_value2)
 
     def test_batch_exists(self):
         """Test batch exists functionality."""
@@ -222,6 +249,10 @@ class TestValkeyUnified(unittest.TestCase):
 
         # Test batch set with None values
         result = self.hicache.batch_set(["key1"], None)
+        self.assertFalse(result)
+
+        # Test batch set with None value in values list
+        result = self.hicache.batch_set(["key1", "key2"], [torch.randn(2, 2), None])
         self.assertFalse(result)
 
     def test_key_prefixing(self):

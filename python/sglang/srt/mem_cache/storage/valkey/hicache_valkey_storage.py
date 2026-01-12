@@ -194,7 +194,10 @@ class HiCacheValkeyStorage(HiCacheStorage):
             pipe = self.client.pipeline()
             for full_key, value in zip(full_keys, values):
                 if value is None:
-                    continue
+                    logger.error(
+                        "Encountered a None value in the values list during batch_set, which is not allowed."
+                    )
+                    return False
                 tensor_bytes = (
                     value.contiguous().view(dtype=torch.uint8).numpy().tobytes()
                 )
@@ -246,10 +249,28 @@ class HiCacheValkeyStorage(HiCacheStorage):
         """Clear all keys with the current prefix."""
         try:
             pattern = f"{self.key_prefix}:*"
-            keys = self.client.keys(pattern)
-            if keys:
-                self.client.delete(*keys)
-                logger.info(f"Cleared {len(keys)} keys with prefix {self.key_prefix}")
+            # Use scan_iter to avoid blocking the server with a `KEYS` command on a large database.
+            # Process keys in batches to avoid memory issues with large keysets
+            batch_size = 1000
+            total_deleted = 0
+            batch = []
+
+            for key in self.client.scan_iter(match=pattern):
+                batch.append(key)
+                if len(batch) >= batch_size:
+                    self.client.delete(*batch)
+                    total_deleted += len(batch)
+                    batch = []
+
+            # Delete remaining keys in the last batch
+            if batch:
+                self.client.delete(*batch)
+                total_deleted += len(batch)
+
+            if total_deleted > 0:
+                logger.info(
+                    f"Cleared {total_deleted} keys with prefix {self.key_prefix}"
+                )
         except Exception as e:
             logger.error(f"Failed to clear storage: {e}")
 
@@ -258,7 +279,8 @@ class HiCacheValkeyStorage(HiCacheStorage):
         try:
             info = self.client.info()
             pattern = f"{self.key_prefix}:*"
-            key_count = len(self.client.keys(pattern))
+            # Use scan_iter to avoid blocking the server with a `KEYS` command on a large database.
+            key_count = sum(1 for _ in self.client.scan_iter(match=pattern))
 
             return {
                 "backend": "valkey",
