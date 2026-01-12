@@ -477,6 +477,7 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
+    mamba_ssm_k_last: bool = False  # Use K-last layout (HV, V, K) for MTP kernel optimization
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -3826,6 +3827,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
+        )
+        parser.add_argument(
+            "--mamba-ssm-k-last",
+            action="store_true",
+            default=ServerArgs.mamba_ssm_k_last,
+            help="Use K-last layout (HV, V, K) for SSM states to optimize MTP kernel.",
         )
 
         # Hierarchical cache

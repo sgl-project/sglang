@@ -275,6 +275,10 @@ class Qwen3NextConfig(PretrainedConfig):
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
         from sglang.srt.layers.dp_attention import get_attention_tp_size
+        from sglang.srt.server_args import get_global_server_args
+
+        # Get k_last setting from server args
+        k_last = get_global_server_args().mamba_ssm_k_last
 
         shape = Mamba2StateShape.create(
             tp_world_size=get_attention_tp_size(),
@@ -284,7 +288,7 @@ class Qwen3NextConfig(PretrainedConfig):
             head_dim=self.linear_value_head_dim,
             state_size=self.linear_key_head_dim,
             conv_kernel=self.linear_conv_kernel_dim,
-            k_last=True,  # Use K-last layout for efficient MTP verify kernel
+            k_last=k_last,  # Use K-last layout for efficient MTP verify kernel
         )
 
         return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)

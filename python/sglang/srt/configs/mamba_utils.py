@@ -113,10 +113,13 @@ class Mamba2StateShape:
         #   e.g., QWen3-Next: (32, 128, 128)
         # K-last layout: (HV, V, K) for efficient MTP kernel access
         # V-last layout: (HV, K, V) for prefill kernel (default)
+        # Note: state_size=K dimension, head_dim=V dimension
         if k_last:
-            temporal_state_shape = (divide(num_heads, tp_world_size), state_size, head_dim)
-        else:
+            # K-last: (HV, V, K) = (HV, head_dim, state_size)
             temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
+        else:
+            # V-last: (HV, K, V) = (HV, state_size, head_dim)
+            temporal_state_shape = (divide(num_heads, tp_world_size), state_size, head_dim)
         return Mamba2StateShape(
             conv=[conv_state_shape],
             temporal=temporal_state_shape,
