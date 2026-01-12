@@ -320,6 +320,9 @@ class ServerArgs:
 
     scheduler_port: int = 5555
 
+    # Output directory for generated files
+    output_path: str | None = None
+
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
 
@@ -673,6 +676,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.webui_port,
             help="Whether to use webui for better display",
+        )
+        parser.add_argument(
+            "--output-path",
+            type=str,
+            default=ServerArgs.output_path,
+            help="Directory path to save generated images/videos",
         )
 
         # LoRA

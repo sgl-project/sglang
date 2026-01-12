@@ -318,6 +318,12 @@ class SamplingParams:
 
         self.data_type = server_args.pipeline_config.task_type.data_type()
 
+        if server_args.output_path is not None:
+            self.output_path = server_args.output_path
+            logger.debug(
+                f"Server mode: Using server-configured output_path: {self.output_path}"
+            )
+
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
             # avoid stripping default negative prompt: ' ' for qwen-image
@@ -494,12 +500,6 @@ class SamplingParams:
             type=str,
             default=SamplingParams.prompt_path,
             help="Path to a text file containing the prompt",
-        )
-        parser.add_argument(
-            "--output-path",
-            type=str,
-            default=SamplingParams.output_path,
-            help="Path to save the generated image/video",
         )
         parser.add_argument(
             "--output-file-name",
