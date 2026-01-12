@@ -67,10 +67,8 @@ class GptOssDetector(BaseFormatDetector):
                     calls.append(tool_call)
                     tool_index += 1
             elif event.event_type == "normal":
-                if not calls:
-                    normal_parts.append(event.content)
+                normal_parts.append(event.content)
             # Ignore reasoning events in function call context
-
         normal_text = " ".join(normal_parts).strip()
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
