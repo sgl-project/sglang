@@ -34,6 +34,8 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -96,10 +98,11 @@ class DbrxExperts(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.num_total_experts = config.ffn_config.moe_num_experts
+        self.num_experts = self.num_total_experts = config.ffn_config.moe_num_experts
         self.top_k = config.ffn_config.moe_top_k
-        self.d_model = config.d_model
+        self.hidden_size = self.d_model = config.d_model
         self.intermediate_size = config.ffn_config.ffn_hidden_size // self.tp_size
+        self.moe_runner_config = MoeRunnerConfig(inplace=True)
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -110,7 +113,6 @@ class DbrxExperts(nn.Module):
             self.top_k,
             renormalize=True,
         )
-        self.moe_runner_config = MoeRunnerConfig(inplace=True)
         self.ws = nn.Parameter(
             torch.empty(
                 self.num_total_experts,
@@ -177,14 +179,18 @@ class DbrxExperts(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = fused_moe(
-            hidden_states,
-            self.ws,
-            self.w2s,
-            topk_output,
-            self.moe_runner_config,
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            topk_output=topk_output,
         )
-
+        final_hidden_states = self.quant_method.apply(
+            layer=self, dispatch_output=dispatch_output
+        )
+        if isinstance(
+            final_hidden_states, CombineInput
+        ):  # quant_method use `UnquantizedFusedMoEMethod`
+            final_hidden_states = final_hidden_states.hidden_states
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
