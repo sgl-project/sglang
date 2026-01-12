@@ -124,27 +124,29 @@ def _discover_and_register_pipelines():
                 )
 
                 for cls in entry_cls_list:
-                    if hasattr(cls, "pipeline_name"):
-                        if cls.pipeline_name in _PIPELINE_REGISTRY:
-                            logger.warning(
-                                f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
-                            )
-                        _PIPELINE_REGISTRY[cls.pipeline_name] = cls
+                    if not issubclass(cls, ComposedPipelineBase):
+                        continue
+                    if cls.pipeline_name in _PIPELINE_REGISTRY:
+                        logger.warning(
+                            f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
+                        )
+                    _PIPELINE_REGISTRY[cls.pipeline_name] = cls
 
-                        # Auto-register config classes if Pipeline class has them defined
-                        # because comfyui get model from a single weight file, so we need to register the config classes here
-                        if hasattr(cls, "pipeline_config_cls") and hasattr(
-                            cls, "sampling_params_cls"
-                        ):
-                            _PIPELINE_CONFIG_REGISTRY[cls.pipeline_name] = (
-                                cls.pipeline_config_cls,
-                                cls.sampling_params_cls,
-                            )
-                            logger.debug(
-                                f"Auto-registered config classes for pipeline '{cls.pipeline_name}': "
-                                f"PipelineConfig={cls.pipeline_config_cls.__name__}, "
-                                f"SamplingParams={cls.sampling_params_cls.__name__}"
-                            )
+                    # Special handling for ComfyUI Pipelines:
+                    # Auto-register config classes if Pipeline class has them defined
+                    # since comfyui get model from a single weight file, so we need to register the config classes here
+                    if hasattr(cls, "pipeline_config_cls") and hasattr(
+                        cls, "sampling_params_cls"
+                    ):
+                        _PIPELINE_CONFIG_REGISTRY[cls.pipeline_name] = (
+                            cls.pipeline_config_cls,
+                            cls.sampling_params_cls,
+                        )
+                        logger.debug(
+                            f"Auto-registered config classes for pipeline '{cls.pipeline_name}': "
+                            f"PipelineConfig={cls.pipeline_config_cls.__name__}, "
+                            f"SamplingParams={cls.sampling_params_cls.__name__}"
+                        )
     logger.debug(
         f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
     )
@@ -155,12 +157,6 @@ def get_pipeline_config_classes(
 ) -> Tuple[Type[PipelineConfig], Type[Any]] | None:
     """
     Get the configuration classes for a pipeline.
-
-    Args:
-        pipeline_class_name: The name of the pipeline class
-
-    Returns:
-        A tuple of (PipelineConfig class, SamplingParams class) if found, None otherwise
     """
     # Ensure pipelines are discovered first
     _discover_and_register_pipelines()
@@ -325,11 +321,8 @@ def get_model_info(
        manually registered mapping based on the model path.
 
     Args:
-        model_path: Path to the model or HuggingFace model ID
         backend: Backend to use ('auto', 'sglang', 'diffusers'). If None, uses 'auto'.
 
-    Returns:
-        ModelInfo with the resolved pipeline class and config classes, or None if not found.
     """
     # import Backend enum here to avoid circular imports
     from sglang.multimodal_gen.runtime.server_args import Backend
