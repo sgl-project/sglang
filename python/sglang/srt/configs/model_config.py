@@ -447,7 +447,8 @@ class ModelConfig:
 
             elif "BaichuanForCausalLM" in self.hf_config.architectures:
                 self.use_alibi = True if self.hf_config.hidden_size != 4096 else False
-
+            elif "Gemma2ForSequenceClassification" in self.hf_config.architectures:
+                self.use_sdpa = True
             self.attention_arch = AttentionArch.MHA
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
@@ -1041,6 +1042,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
+        or "Gemma2ForSequenceClassification" in model_architectures
     ):
         return False
     else:

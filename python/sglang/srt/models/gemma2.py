@@ -41,12 +41,27 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import add_prefix, make_layers
 
+import functools
+import math
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
+class GELUTanh(nn.Module):
+    def __init__(self, use_gelu_tanh_python: bool = False):
+        super().__init__()
+        if use_gelu_tanh_python:
+            self.act = self._gelu_tanh_python
+        else:
+            self.act = functools.partial(nn.functional.gelu, approximate="tanh")
+    
+    def _gelu_tanh_python(self, input: torch.tensor) -> torch.tensor:
+        return input * 0.5 * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
+    
+    def forward(self, input: torch.tensor) -> torch.tensor:
+        return self.act(input)
 
 class Gemma2MLP(nn.Module):
     def __init__(
@@ -79,11 +94,13 @@ class Gemma2MLP(nn.Module):
                 "function. Please set `hidden_act` and `hidden_activation` to "
                 "`gelu_pytorch_tanh`."
             )
-        self.act_fn = GeluAndMul()
+        self.act_fn = GELUTanh()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        d = gate_up.shape[-1]//2
+        gate, up = gate_up[..., :d], gate_up[..., d:]
+        x = self.act_fn(gate) * up
         x, _ = self.down_proj(x)
         return x
 
@@ -294,7 +311,7 @@ class Gemma2Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=torch.float16)
+        normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype)
         hidden_states *= normalizer
 
         residual = None
