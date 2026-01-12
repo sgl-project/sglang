@@ -27,6 +27,8 @@ SUITES = {
         "test_lora_format_adapter.py",
         # cli test
         "../cli/test_generate_t2i_perf.py",
+        # unit tests (no server needed)
+        "../test_sampling_params_validate.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
