@@ -50,152 +50,122 @@ def flash_attn_varlen_func_fake(
     sm_margin: int = 0,
     return_softmax_lse: bool = False,
     sinks: Optional[torch.Tensor] = None,
-    ver: int = 3,
+    ver: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if window_size is None:
         window_size = [-1, -1]
-    if ver == 4:
-        q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
-        num_head, head_dim = q.shape[-2:]
-        if cu_seqlens_q is None:
-            batch_size, seqlen_q = q.shape[:2]
-            total_q = batch_size * seqlen_q
-        else:
-            batch_size = cu_seqlens_q.shape[0] - 1
-            seqlen_q = None
-            total_q = q.shape[0]
-        if page_table is not None:
-            assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
-            assert page_table.dtype == torch.int32, "page_table must be int32"
-            assert (
-                page_table.stride(-1) == 1
-            ), "page_table must be contiguous in the last dimension"
-            max_num_pages_per_seq = page_table.shape[1]
-            assert page_table.shape == (batch_size, max_num_pages_per_seq)
-            num_pages, page_size = k.shape[:2]
-            seqlen_k = num_pages * page_size
-        else:
-            num_pages, page_size = None, None
-            seqlen_k = k.shape[-3]
-        num_head_kv = k.shape[-2]
-        head_dim_v = v.shape[-1]
-        if cu_seqlens_k is None:
-            if page_table is None:
-                assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
-                assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
-            else:
-                assert k.shape == (num_pages, page_size, num_head_kv, head_dim)
-                assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
-        else:
-            assert k.shape == (seqlen_k, num_head_kv, head_dim)
-            assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
-            assert cu_seqlens_k.shape == (
-                batch_size + 1,
-            ), "cu_seqlens_k must have shape (batch_size + 1,)"
-        if cu_seqlens_q is not None:
-            assert cu_seqlens_q.shape == (
-                batch_size + 1,
-            ), "cu_seqlens_q must have shape (batch_size + 1,)"
-        assert seqused_q is None or seqused_q.shape == (
-            batch_size,
-        ), "seqused_q must have shape (batch_size,)"
-        assert seqused_k is None or seqused_k.shape == (
-            batch_size,
-        ), "seqused_k must have shape (batch_size,)"
-        assert q.dtype in [
-            torch.float16,
-            torch.bfloat16,
-        ], "inputs must be float16 or bfloat16"
-        assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
-        for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
-            if t is not None:
-                assert (
-                    t.dtype == torch.int32
-                ), "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be int32"
-                assert (
-                    t.stride(0) == 1
-                ), "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be contiguous"
-        if sinks is not None:
-            assert sinks.shape == (num_head,)
-            assert sinks.dtype == torch.bfloat16, "sinks must be bfloat16"
-        assert all(
-            t is None or t.is_cuda
-            for t in (
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                seqused_q,
-                seqused_k,
-                page_table,
-                sinks,
-            )
-        ), "inputs must be on CUDA device"
-        assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
-        assert head_dim <= 256, "head_dim must be less than or equal to 256"
-        alignment = 16 // q.element_size()
-        assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
+    assert ver == 4, "only support flash attention v4"
+    q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+    num_head, head_dim = q.shape[-2:]
+    if cu_seqlens_q is None:
+        batch_size, seqlen_q = q.shape[:2]
+        total_q = batch_size * seqlen_q
+    else:
+        batch_size = cu_seqlens_q.shape[0] - 1
+        seqlen_q = None
+        total_q = q.shape[0]
+    if page_table is not None:
+        assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
+        assert page_table.dtype == torch.int32, "page_table must be int32"
         assert (
-            head_dim_v % alignment == 0
-        ), f"head_dim_v must be divisible by {alignment}"
-        qhead_per_kvhead = num_head // num_head_kv
-        if pack_gqa is None:
-            pack_gqa = qhead_per_kvhead > 1
+            page_table.stride(-1) == 1
+        ), "page_table must be contiguous in the last dimension"
+        max_num_pages_per_seq = page_table.shape[1]
+        assert page_table.shape == (batch_size, max_num_pages_per_seq)
+        num_pages, page_size = k.shape[:2]
+        seqlen_k = num_pages * page_size
+    else:
+        num_pages, page_size = None, None
+        seqlen_k = k.shape[-3]
+    num_head_kv = k.shape[-2]
+    head_dim_v = v.shape[-1]
+    if cu_seqlens_k is None:
+        if page_table is None:
+            assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
+            assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+        else:
+            assert k.shape == (num_pages, page_size, num_head_kv, head_dim)
+            assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
+    else:
+        assert k.shape == (seqlen_k, num_head_kv, head_dim)
+        assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
+        assert cu_seqlens_k.shape == (
+            batch_size + 1,
+        ), "cu_seqlens_k must have shape (batch_size + 1,)"
+    if cu_seqlens_q is not None:
+        assert cu_seqlens_q.shape == (
+            batch_size + 1,
+        ), "cu_seqlens_q must have shape (batch_size + 1,)"
+    assert seqused_q is None or seqused_q.shape == (
+        batch_size,
+    ), "seqused_q must have shape (batch_size,)"
+    assert seqused_k is None or seqused_k.shape == (
+        batch_size,
+    ), "seqused_k must have shape (batch_size,)"
+    assert q.dtype in [
+        torch.float16,
+        torch.bfloat16,
+    ], "inputs must be float16 or bfloat16"
+    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
+        if t is not None:
+            assert (
+                t.dtype == torch.int32
+            ), "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be int32"
+            assert (
+                t.stride(0) == 1
+            ), "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be contiguous"
+    if sinks is not None:
+        assert sinks.shape == (num_head,)
+        assert sinks.dtype == torch.bfloat16, "sinks must be bfloat16"
+    assert all(
+        t is None or t.is_cuda
+        for t in (
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            page_table,
+            sinks,
+        )
+    ), "inputs must be on CUDA device"
+    assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
+    assert head_dim <= 256, "head_dim must be less than or equal to 256"
+    alignment = 16 // q.element_size()
+    assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
+    assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
+    qhead_per_kvhead = num_head // num_head_kv
+    if pack_gqa is None:
+        pack_gqa = qhead_per_kvhead > 1
 
-        out_torch_dtype = q.dtype
-        device = q.device
-        q_batch_seqlen_shape = (
-            (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
-        )
-        lse_shape = (
-            (batch_size, num_head, seqlen_q)
-            if cu_seqlens_q is None
-            else (num_head, total_q)
-        )
-        requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
-
-        out = torch.empty(
-            *q_batch_seqlen_shape,
-            num_head,
-            head_dim_v,
-            dtype=out_torch_dtype,
-            device=device,
-        )
-        lse = (
-            torch.empty(lse_shape, dtype=torch.float32, device=device)
-            if requires_grad or return_softmax_lse
-            else None
-        )
-        return (out, lse) if return_softmax_lse else out
-    assert ver == 3, "This path only supports Flash Attention v3."
-    return flash_attn_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        seqused_q=seqused_q,
-        seqused_k=seqused_k,
-        page_table=page_table,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        qv=qv,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        window_size=tuple(window_size),
-        attention_chunk=attention_chunk,
-        softcap=softcap,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        sm_margin=sm_margin,
-        return_softmax_lse=return_softmax_lse,
-        sinks=sinks,
-        ver=ver,
+    out_torch_dtype = q.dtype
+    device = q.device
+    q_batch_seqlen_shape = (
+        (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     )
+    lse_shape = (
+        (batch_size, num_head, seqlen_q)
+        if cu_seqlens_q is None
+        else (num_head, total_q)
+    )
+    requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
+
+    out = torch.empty(
+        *q_batch_seqlen_shape,
+        num_head,
+        head_dim_v,
+        dtype=out_torch_dtype,
+        device=device,
+    )
+    lse = (
+        torch.empty(lse_shape, dtype=torch.float32, device=device)
+        if requires_grad or return_softmax_lse
+        else None
+    )
+    return (out, lse) if return_softmax_lse else out
 
 
 @register_custom_op(fake_impl=flash_attn_varlen_func_fake)
@@ -224,7 +194,7 @@ def flash_attn_varlen_func_op(
     sm_margin: int = 0,
     return_softmax_lse: bool = False,
     sinks: Optional[torch.Tensor] = None,
-    ver: int = 3,
+    ver: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if window_size is None:
         window_size = [-1, -1]
@@ -458,7 +428,14 @@ class FlashAttentionImpl(AttentionImpl):
                 return out.reshape(bsz, seqlen, nheads_q, -1), softmax_lse
             return out.reshape(bsz, seqlen, nheads_q, d)
 
-        output = flash_attn_varlen_func_op(
+        if fa_ver == 3:
+            flash_attn_op = flash_attn_func
+        elif fa_ver == 4:
+            flash_attn_op = flash_attn_varlen_func_op
+        else:
+            raise ValueError(f"flash attention version {fa_ver} not supported.")
+
+        output = flash_attn_op(
             q=query,  # type: ignore[no-untyped-call]
             k=key,
             v=value,
