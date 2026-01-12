@@ -172,6 +172,11 @@ class Envs:
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     SGLANG_CI_SMALL_KV_SIZE = EnvInt(-1)
 
+    SGLANG_NPU_PROFILING = EnvBool(False)
+    SGLANG_NPU_PROFILING_BS = EnvInt(8)
+    SGLANG_NPU_PROFILING_STAGE = EnvStr("decode")
+    SGLANG_NPU_PROFILING_STEP = EnvInt(10)
+
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
