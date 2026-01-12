@@ -1,5 +1,4 @@
 import json
-import os
 import random
 import threading
 import time
@@ -11,95 +10,20 @@ from types import SimpleNamespace
 import numpy as np
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.test_utils import (
-    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-    run_logprob_check,
-)
+from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k_eval
+from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
+from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
+from sglang.test.test_utils import DEFAULT_TARGET_MODEL_EAGLE, run_logprob_check
 
-register_cuda_ci(est_time=473, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=1100, suite="stage-b-test-small-1-gpu")
 
 
-class TestEAGLEServer(CustomTestCase):
-    PROMPTS = [
-        "[INST] <<SYS>>\\nYou are a helpful assistant.\\n<</SYS>>\\nToday is a sunny day and I like[/INST]"
-        '[INST] <<SYS>>\\nYou are a helpful assistant.\\n<</SYS>>\\nWhat are the mental triggers in Jeff Walker\'s Product Launch Formula and "Launch" book?[/INST]',
-        "[INST] <<SYS>>\\nYou are a helpful assistant.\\n<</SYS>>\\nSummarize Russell Brunson's Perfect Webinar Script...[/INST]",
-        "[INST] <<SYS>>\\nYou are a helpful assistant.\\n<</SYS>>\\nwho are you?[/INST]",
-        "[INST] <<SYS>>\\nYou are a helpful assistant.\\n<</SYS>>\\nwhere are you from?[/INST]",
-    ]
+class TestEAGLEServerBasic(EagleServerBase):
+    extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
 
-    @classmethod
-    def setUpClass(cls):
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-                "--speculative-num-steps",
-                5,
-                "--speculative-eagle-topk",
-                8,
-                "--speculative-num-draft-tokens",
-                64,
-                "--mem-fraction-static",
-                0.7,
-                "--chunked-prefill-size",
-                128,
-                "--max-running-requests",
-                8,
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def send_request(self):
-        time.sleep(random.uniform(0, 2))
-        for prompt in self.PROMPTS:
-            url = self.base_url + "/generate"
-            data = {
-                "text": prompt,
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 1024,
-                },
-            }
-            response = requests.post(url, json=data)
-            assert response.status_code == 200
-
-    def send_requests_abort(self):
-        for prompt in self.PROMPTS:
-            try:
-                time.sleep(random.uniform(0, 2))
-                url = self.base_url + "/generate"
-                data = {
-                    "model": "base",
-                    "text": prompt,
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": 1024,
-                    },
-                }
-                # set timeout = 1s, mock disconnected
-                requests.post(url, json=data, timeout=1)
-            except Exception as e:
-                print(e)
-                pass
-
+    # FIXME(lsyin): move the test methods to kits
     def test_request_abort(self):
         concurrency = 4
         threads = [
@@ -112,6 +36,10 @@ class TestEAGLEServer(CustomTestCase):
             worker.start()
         for p in threads:
             p.join()
+
+    def test_radix_attention(self):
+        run_radix_attention_test(self.base_url)
+        self.assertIsNone(self.process.poll())
 
     def test_max_token_one(self):
         requests.get(self.base_url + "/flush_cache")
@@ -127,7 +55,7 @@ class TestEAGLEServer(CustomTestCase):
         )
 
         # Just run and check it does not hang
-        metrics = run_eval(args)
+        metrics = run_gsm8k_eval(args)
         self.assertGreater(metrics["output_throughput"], 50)
 
     def test_gsm8k(self):
@@ -143,11 +71,11 @@ class TestEAGLEServer(CustomTestCase):
             port=int(self.base_url.split(":")[-1]),
         )
 
-        metrics = run_eval(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.20)
 
-        server_info = requests.get(self.base_url + "/get_server_info").json()
+        server_info = requests.get(self.base_url + "/server_info").json()
         avg_spec_accept_length = server_info["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -301,32 +229,6 @@ class TestEAGLEServer(CustomTestCase):
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(func, args))
 
-    def run_decode(self, sampling_params):
-        return_logprob = True
-        top_logprobs_num = 5
-        return_text = True
-        n = 1
-
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": "Human: Write a travel blog post to Hawaii.\n\nAssistant:",
-                "sampling_params": {
-                    "max_new_tokens": 48,
-                    "n": n,
-                    "temperature": 0.7,
-                    **sampling_params,
-                },
-                "return_logprob": return_logprob,
-                "top_logprobs_num": top_logprobs_num,
-                "return_text_in_logprobs": return_text,
-                "logprob_start_len": 0,
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        print(json.dumps(response.json()))
-        print("=" * 100)
-
     def test_penalty_mixed(self):
         args = [
             {},
@@ -357,7 +259,7 @@ class TestEAGLEServer(CustomTestCase):
         response = requests.post(
             self.base_url + "/v1/chat/completions",
             json={
-                "model": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+                "model": DEFAULT_TARGET_MODEL_EAGLE,
                 "messages": messages,
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
@@ -384,130 +286,65 @@ class TestEAGLEServer(CustomTestCase):
         self.assertTrue(is_valid_json)
 
 
-class TestEAGLERetract(TestEAGLEServer):
+class TestEAGLERetract(TestEAGLEServerBasic):
+    extra_args = [
+        "--chunked-prefill-size=128",
+        "--max-running-requests=64",
+        "--max-total-tokens=4500",  # Set a smaller KV cache to trigger retract more easily
+    ]
+
     @classmethod
     def setUpClass(cls):
         # These config helps find a leak.
-        os.environ["SGLANG_CI_SMALL_KV_SIZE"] = "4500"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-                "--speculative-num-steps",
-                5,
-                "--speculative-eagle-topk",
-                8,
-                "--speculative-num-draft-tokens",
-                64,
-                "--mem-fraction-static",
-                0.7,
-                "--chunked-prefill-size",
-                128,
-                "--max-running-requests",
-                64,
-            ],
-        )
+        with envs.SGLANG_TEST_RETRACT.override(True):
+            super().setUpClass()
 
 
-class TestEAGLEServerTriton(TestEAGLEServer):
+class TestEAGLEServerTriton(TestEAGLEServerBasic):
+    extra_args = ["--attention-backend=triton", "--max-running-requests=8"]
+
+
+class TestEAGLEServerPageSize(TestEAGLEServerBasic):
+    spec_steps = 5
+    spec_topk = 1
+    spec_tokens = 6
+    extra_args = [
+        "--chunked-prefill-size=128",
+        "--max-running-requests=8",
+        "--page-size=4",
+        "--attention-backend=flashinfer",
+    ]
+
     @classmethod
     def setUpClass(cls):
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-                "--speculative-num-steps",
-                5,
-                "--speculative-eagle-topk",
-                8,
-                "--speculative-num-draft-tokens",
-                64,
-                "--mem-fraction-static",
-                0.7,
-                "--attention-backend",
-                "triton",
-                "--max-running-requests",
-                8,
-            ],
-        )
+        # Runtime check only supported for topk=1, and can help to find a leak.
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
+            super().setUpClass()
 
 
-class TestEAGLEServerPageSize(TestEAGLEServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-                "--speculative-num-steps",
-                5,
-                "--speculative-eagle-topk",
-                1,
-                "--speculative-num-draft-tokens",
-                6,
-                "--mem-fraction-static",
-                0.7,
-                "--chunked-prefill-size",
-                128,
-                "--max-running-requests",
-                8,
-                "--page-size",
-                4,
-                "--attention-backend",
-                "flashinfer",
-            ],
-        )
+class TestEAGLEServerPageSizeTopk(TestEAGLEServerBasic):
+    # default topk=8 and tokens=64
+    extra_args = [
+        "--chunked-prefill-size=128",
+        "--max-running-requests=8",
+        "--page-size=4",
+        "--attention-backend=flashinfer",
+    ]
 
 
-class TestEAGLEServerPageSizeTopk(TestEAGLEServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
-                "--speculative-num-steps",
-                5,
-                "--speculative-eagle-topk",
-                8,
-                "--speculative-num-draft-tokens",
-                64,
-                "--mem-fraction-static",
-                0.7,
-                "--chunked-prefill-size",
-                128,
-                "--max-running-requests",
-                8,
-                "--page-size",
-                4,
-                "--attention-backend",
-                "flashinfer",
-            ],
-        )
+class TestEAGLEServerPageSizeTopkFA3(TestEAGLEServerBasic):
+    # default topk=8 and tokens=64
+    spec_topk = 5
+    spec_steps = 8
+    spec_tokens = 64
+
+    extra_args = [
+        "--page-size=256",
+        "--attention-backend=fa3",
+        "--cuda-graph-max-bs=5",
+        "--dtype=float16",
+        "--max-running-requests=8",
+    ]
 
 
 if __name__ == "__main__":
