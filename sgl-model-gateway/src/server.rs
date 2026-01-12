@@ -20,14 +20,14 @@ use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 
 use crate::{
-    app_context::AppContext,
+    app_context::{AppContext, AppWorkflowEngine},
     config::{RouterConfig, RoutingMode},
     core::{
         job_queue::{JobQueue, JobQueueConfig},
         steps::{
-            create_external_worker_registration_workflow, create_mcp_registration_workflow,
-            create_tokenizer_registration_workflow, create_wasm_module_registration_workflow,
-            create_wasm_module_removal_workflow, create_worker_registration_workflow,
+            create_external_worker_workflow, create_local_worker_workflow,
+            create_mcp_registration_workflow, create_tokenizer_registration_workflow,
+            create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
             create_worker_removal_workflow, create_worker_update_workflow,
         },
         worker::WorkerType,
@@ -56,7 +56,7 @@ use crate::{
     routers::{conversations, parse, router_manager::RouterManager, tokenize, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
-    workflow::{LoggingSubscriber, WorkflowEngine},
+    workflow::LoggingSubscriber,
 };
 #[derive(Clone)]
 pub struct AppState {
@@ -731,7 +731,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .expect("JobQueue should only be initialized once");
 
     // Initialize workflow engine and register workflows
-    let engine = Arc::new(WorkflowEngine::new());
+    let engine = Arc::new(AppWorkflowEngine::new());
 
     engine
         .event_bus()
@@ -739,10 +739,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .await;
 
     engine
-        .register_workflow(create_worker_registration_workflow(&config.router_config))
-        .expect("worker_registration workflow should be valid");
+        .register_workflow(create_local_worker_workflow(&config.router_config))
+        .expect("local_worker_registration workflow should be valid");
     engine
-        .register_workflow(create_external_worker_registration_workflow())
+        .register_workflow(create_external_worker_workflow())
         .expect("external_worker_registration workflow should be valid");
     engine
         .register_workflow(create_worker_removal_workflow())

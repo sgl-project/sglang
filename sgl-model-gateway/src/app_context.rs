@@ -8,7 +8,10 @@ use tracing::{debug, info};
 
 use crate::{
     config::RouterConfig,
-    core::{JobQueue, LoadMonitor, WorkerRegistry, WorkerService, UNKNOWN_MODEL_ID},
+    core::{
+        steps::workflow_data::AnyWorkflowData, JobQueue, LoadMonitor, WorkerRegistry,
+        WorkerService, UNKNOWN_MODEL_ID,
+    },
     data_connector::{
         create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
     },
@@ -26,8 +29,11 @@ use crate::{
     },
     tool_parser::ParserFactory as ToolParserFactory,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    workflow::WorkflowEngine,
+    workflow::{InMemoryStore, WorkflowEngine},
 };
+
+/// Type alias for the concrete workflow engine used in the application
+pub type AppWorkflowEngine = WorkflowEngine<AnyWorkflowData, InMemoryStore<AnyWorkflowData>>;
 
 /// Error type for AppContext builder
 #[derive(Debug)]
@@ -59,11 +65,19 @@ pub struct AppContext {
     pub configured_reasoning_parser: Option<String>,
     pub configured_tool_parser: Option<String>,
     pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
-    pub workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>,
+    pub workflow_engine: Arc<OnceLock<Arc<AppWorkflowEngine>>>,
     pub mcp_manager: Arc<OnceLock<Arc<McpManager>>>,
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
+}
+
+impl std::fmt::Debug for AppContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppContext")
+            .field("router_config", &self.router_config)
+            .finish_non_exhaustive()
+    }
 }
 
 pub struct AppContextBuilder {
@@ -81,7 +95,7 @@ pub struct AppContextBuilder {
     conversation_item_storage: Option<Arc<dyn ConversationItemStorage>>,
     load_monitor: Option<Arc<LoadMonitor>>,
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
-    workflow_engine: Option<Arc<OnceLock<Arc<WorkflowEngine>>>>,
+    workflow_engine: Option<Arc<OnceLock<Arc<AppWorkflowEngine>>>>,
     mcp_manager: Option<Arc<OnceLock<Arc<McpManager>>>>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
 }
@@ -206,7 +220,10 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn workflow_engine(mut self, workflow_engine: Arc<OnceLock<Arc<WorkflowEngine>>>) -> Self {
+    pub fn workflow_engine(
+        mut self,
+        workflow_engine: Arc<OnceLock<Arc<AppWorkflowEngine>>>,
+    ) -> Self {
         self.workflow_engine = Some(workflow_engine);
         self
     }
