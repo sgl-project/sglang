@@ -395,26 +395,17 @@ class HiCacheController:
         bs = max(1, self.storage_batch_size)
         merge_tail = min(max(0, self.storage_batch_merge_tail_pages), bs)
 
-        q, r = divmod(num_pages, bs)
-        if r == 0:
-            for k in range(q):
-                start = k * bs
-                yield (start, start + bs)
-            return
+        start_page = 0
+        while start_page < num_pages:
+            end_page = min(start_page + bs, num_pages)
 
-        # If remainder is small, merge into the last full batch to reduce call count.
-        if merge_tail > 0 and r <= merge_tail and q >= 1:
-            for k in range(q - 1):
-                start = k * bs
-                yield (start, start + bs)
-            start = (q - 1) * bs
-            yield (start, num_pages)
-            return
+            # If the next batch would be a small tail, merge it into the current one.
+            remaining_pages = num_pages - end_page
+            if 0 < remaining_pages <= merge_tail:
+                end_page = num_pages
 
-        for k in range(q):
-            start = k * bs
-            yield (start, start + bs)
-        yield (q * bs, num_pages)
+            yield (start_page, end_page)
+            start_page = end_page
 
     def _generate_storage_config(
         self,
