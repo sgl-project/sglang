@@ -258,12 +258,14 @@ jobs:
             const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
 
             // Stage-b jobs to wait for (prefix matching handles matrix partitions)
-            const stageBJobPrefixes = [
-              'stage-b-test-small-1-gpu',   // 14 partitions (0-13)
-              'stage-b-test-large-1-gpu',   // 1 job
-              'stage-b-test-large-2-gpu',   // 2 partitions (0-1)
-              'stage-b-test-4-gpu-b200'     // 1 job
+            // Include expected counts to ensure all matrix jobs are created before checking completion
+            const stageBJobs = [
+              { prefix: 'stage-b-test-small-1-gpu', expectedCount: 14 },  // 14 partitions (0-13)
+              { prefix: 'stage-b-test-large-1-gpu', expectedCount: 1 },   // 1 job
+              { prefix: 'stage-b-test-large-2-gpu', expectedCount: 2 },   // 2 partitions (0-1)
+              { prefix: 'stage-b-test-4-gpu-b200', expectedCount: 1 }     // 1 job
             ];
+            const totalExpectedJobs = stageBJobs.reduce((sum, j) => sum + j.expectedCount, 0); // 18
 
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
               // Use paginate to get ALL jobs (handles workflows with many matrix jobs)
@@ -279,9 +281,15 @@ jobs:
               let completedCount = 0;
               let totalCount = 0;
 
-              for (const jobPrefix of stageBJobPrefixes) {
+              for (const { prefix, expectedCount } of stageBJobs) {
                 // Find all jobs that start with this prefix (handles matrix jobs like "stage-b-test-small-1-gpu (0)")
-                const matchingJobs = jobs.filter(job => job.name.startsWith(jobPrefix));
+                const matchingJobs = jobs.filter(job => job.name.startsWith(prefix));
+
+                if (matchingJobs.length < expectedCount) {
+                  console.log(`${prefix}: found ${matchingJobs.length}/${expectedCount} jobs (waiting for more to be created)`);
+                  allCompleted = false;
+                  continue;
+                }
 
                 for (const job of matchingJobs) {
                   totalCount++;
@@ -298,9 +306,9 @@ jobs:
                 }
               }
 
-              console.log(`Progress: ${completedCount}/${totalCount} jobs completed`);
+              console.log(`Progress: ${completedCount}/${totalCount} jobs completed (expected ${totalExpectedJobs})`);
 
-              if (allCompleted && totalCount > 0) {
+              if (allCompleted && totalCount >= totalExpectedJobs) {
                 if (anyFailed) {
                   core.setOutput('result', 'failure');
                   core.setFailed('One or more stage-b jobs failed');
