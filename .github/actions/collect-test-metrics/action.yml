@@ -1,0 +1,18 @@
+name: 'Collect Test Metrics'
+description: 'Collect, merge, and upload test metrics produced by dump_metric()'
+inputs:
+  metrics_dir:
+    description: 'Directory where raw metrics jsonl files are written'
+    required: false
+    default: '.ci_metrics'
+  output_file:
+    description: 'Merged output filename inside metrics_dir'
+    required: false
+    default: 'test_metrics.jsonl'
+  artifact_name:
+    description: 'Artifact name to upload'
+    required: true
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
+  post: 'dist/index.js'

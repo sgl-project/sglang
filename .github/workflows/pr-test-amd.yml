@@ -49,6 +49,11 @@ concurrency:
   group: pr-test-amd-${{ inputs.pr_head_sha || inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
+env:
+  SGLANG_IS_IN_CI: true
+  METRICS_DIR: ${{ github.workspace }}/.ci_metrics
+  SGLANG_TEST_METRICS_OUTPUT: ${{ github.workspace }}/.ci_metrics/test_metrics
+
 jobs:
   call-gate:
     uses: ./.github/workflows/pr-gate.yml
@@ -204,8 +209,6 @@ jobs:
         runner: [linux-mi325-gpu-1]
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     runs-on: ${{matrix.runner}}
-    env:
-      METRICS_DIR: ${{ github.workspace }}/.ci_metrics
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -302,8 +305,6 @@ jobs:
       matrix:
         runner: [linux-mi325-gpu-2]
     runs-on: ${{matrix.runner}}
-    env:
-      METRICS_DIR: ${{ github.workspace }}/.ci_metrics
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

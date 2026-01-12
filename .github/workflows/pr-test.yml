@@ -50,6 +50,8 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
+  METRICS_DIR: ${{ github.workspace }}/.ci_metrics
+  SGLANG_TEST_METRICS_OUTPUT: ${{ github.workspace }}/.ci_metrics/test_metrics
 
 jobs:
   # =============================================== check changes ====================================================
@@ -591,8 +593,6 @@ jobs:
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
-      METRICS_DIR: ${{ github.workspace }}/.ci_metrics
-      SGLANG_TEST_METRICS_OUTPUT: ${{ github.workspace }}/.ci_metrics/test_metrics
     strategy:
       fail-fast: false
       matrix:
@@ -602,6 +602,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Collect test metrics
+        uses: ./.github/actions/collect-test-metrics
+        with:
+          metrics_dir: ${{ env.METRICS_DIR }}
+          artifact_name: regression-metrics-${{ github.run_id }}-${{ github.job }}-partition-${{ matrix.partition }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -616,11 +622,6 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
-      - name: Setup metrics directory
-        run: |
-          rm -rf $METRICS_DIR || true
-          mkdir -p $METRICS_DIR
-
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -630,18 +631,6 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 $CONTINUE_ON_ERROR_FLAG
-
-      - name: Merge metrics
-        if: always()
-        run: |
-          python3 scripts/ci/merge_metrics.py "$SGLANG_TEST_METRICS_OUTPUT" "$METRICS_DIR/test_metrics.jsonl"
-
-      - name: Upload metrics artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: regression-metrics-${{ github.run_id }}-${{ github.job }}-partition-${{ matrix.partition }}
-          path: ${{ env.METRICS_DIR }}/
 
   stage-b-test-large-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
@@ -658,13 +647,17 @@ jobs:
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
-      METRICS_DIR: ${{ github.workspace }}/.ci_metrics
-      SGLANG_TEST_METRICS_OUTPUT: ${{ github.workspace }}/.ci_metrics/test_metrics
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Collect test metrics
+        uses: ./.github/actions/collect-test-metrics
+        with:
+          metrics_dir: ${{ env.METRICS_DIR }}
+          artifact_name: regression-metrics-${{ github.run_id }}-${{ github.job }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -679,11 +672,6 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
-      - name: Setup metrics directory
-        run: |
-          rm -rf $METRICS_DIR || true
-          mkdir -p $METRICS_DIR
-
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -693,18 +681,6 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu $CONTINUE_ON_ERROR_FLAG
-
-      - name: Merge metrics
-        if: always()
-        run: |
-          python3 scripts/ci/merge_metrics.py "$SGLANG_TEST_METRICS_OUTPUT" "$METRICS_DIR/test_metrics.jsonl"
-
-      - name: Upload metrics artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: regression-metrics-${{ github.run_id }}-${{ github.job }}
-          path: ${{ env.METRICS_DIR }}/
 
   stage-b-test-large-2-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
@@ -721,8 +697,6 @@ jobs:
     runs-on: 2-gpu-runner
     env:
       RUNNER_LABELS: 2-gpu-runner
-      METRICS_DIR: ${{ github.workspace }}/.ci_metrics
-      SGLANG_TEST_METRICS_OUTPUT: ${{ github.workspace }}/.ci_metrics/test_metrics
     strategy:
       fail-fast: false
       matrix:
@@ -732,6 +706,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Collect test metrics
+        uses: ./.github/actions/collect-test-metrics
+        with:
+          metrics_dir: ${{ env.METRICS_DIR }}
+          artifact_name: regression-metrics-${{ github.run_id }}-${{ github.job }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -746,11 +726,6 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
 
-      - name: Setup metrics directory
-        run: |
-          rm -rf $METRICS_DIR || true
-          mkdir -p $METRICS_DIR
-
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -760,18 +735,6 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG
-
-      - name: Merge metrics
-        if: always()
-        run: |
-          python3 scripts/ci/merge_metrics.py "$SGLANG_TEST_METRICS_OUTPUT" "$METRICS_DIR/test_metrics.jsonl"
-
-      - name: Upload metrics artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: regression-metrics-${{ github.run_id }}-${{ github.job }}
-          path: ${{ env.METRICS_DIR }}/
 
   stage-c-test-large-4-gpu:
     needs: [check-changes, call-gate, stage-b-test-small-1-gpu, stage-b-test-large-1-gpu, stage-b-test-large-2-gpu, sgl-kernel-build-wheels]
@@ -1018,8 +981,6 @@ jobs:
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
     env:
       RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
-      METRICS_DIR: ${{ github.workspace }}/.ci_metrics
-      SGLANG_TEST_METRICS_OUTPUT: ${{ github.workspace }}/.ci_metrics/test_metrics
     strategy:
       fail-fast: false
 
@@ -1028,6 +989,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Collect test metrics
+        uses: ./.github/actions/collect-test-metrics
+        with:
+          metrics_dir: ${{ env.METRICS_DIR }}
+          artifact_name: regression-metrics-${{ github.run_id }}-${{ github.job }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1042,11 +1009,6 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      - name: Setup metrics directory
-        run: |
-          rm -rf $METRICS_DIR || true
-          mkdir -p $METRICS_DIR
-
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -1056,18 +1018,6 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 $CONTINUE_ON_ERROR_FLAG
-
-      - name: Merge metrics
-        if: always()
-        run: |
-          python3 scripts/ci/merge_metrics.py "$SGLANG_TEST_METRICS_OUTPUT" "$METRICS_DIR/test_metrics.jsonl"
-
-      - name: Upload metrics artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: regression-metrics-${{ github.run_id }}-${{ github.job }}
-          path: ${{ env.METRICS_DIR }}/
 
 
   unit-test-backend-4-gpu:
