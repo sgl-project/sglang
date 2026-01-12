@@ -1267,7 +1267,7 @@ class NativeSparseAttnBackend(
             self.nsa_decode_impl
             if (
                 forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend()
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
             )
             else self.nsa_prefill_impl
         )
