@@ -51,6 +51,9 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+    ForwardBatchDeepSeekMHAMixin,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_compiler_backend, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align
@@ -61,9 +64,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.models.deepseek_common.attention_forward_methods import (
-        ForwardBatchDeepSeekMHAMixin,
-    )
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
