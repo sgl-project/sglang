@@ -4,6 +4,7 @@ Run: python test/manual/test_deepseek_smoke.py
 """
 
 import importlib.util
+
 import torch
 
 
@@ -30,12 +31,12 @@ def main():
 
     try:
         from sglang.srt.models.deepseek_common.utils import (
-            enable_nextn_moe_bf16_cast_to_fp8,
-            yarn_get_mscale,
-            _get_llama_4_scaling,
             FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
             NVFP4_CKPT_FP8_ATTN_QUANT_MODULES,
+            _get_llama_4_scaling,
             _is_cublas_ge_129,
+            enable_nextn_moe_bf16_cast_to_fp8,
+            yarn_get_mscale,
         )
 
     except ImportError as e:

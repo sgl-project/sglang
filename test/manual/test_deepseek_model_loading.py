@@ -5,8 +5,9 @@ Run: python test/manual/test_deepseek_model_loading.py
 """
 
 import importlib.util
-import torch
 import traceback
+
+import torch
 from transformers import AutoConfig
 
 

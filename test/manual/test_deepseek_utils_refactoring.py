@@ -4,8 +4,19 @@ Run: python test/manual/test_deepseek_utils_refactoring.py
 """
 
 import importlib.util
-import torch
 import traceback
+
+import torch
+
+from sglang.srt.models.deepseek_common.utils import (
+    FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
+    NVFP4_CKPT_FP8_ATTN_QUANT_MODULES,
+    _get_llama_4_scaling,
+    _is_cublas_ge_129,
+    add_forward_absorb_core_attention_backend,
+    enable_nextn_moe_bf16_cast_to_fp8,
+    yarn_get_mscale,
+)
 
 
 def test_constants():

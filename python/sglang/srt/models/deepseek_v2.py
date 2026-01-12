@@ -157,7 +157,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_npu,
     _use_aiter,
     _use_aiter_gfx95,
-    add_forward_absorb_core_attention_backend,
     enable_nextn_moe_bf16_cast_to_fp8,
     yarn_get_mscale,
 )
@@ -170,7 +169,6 @@ from sglang.srt.utils import (
     bind_or_assign,
     get_bool_env_var,
     is_non_idle_and_non_empty,
-    is_nvidia_cublas_cu12_version_ge_12_9,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
