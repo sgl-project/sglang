@@ -226,8 +226,8 @@ async fn test_min_group_concurrent_distribution_impl(cfg: TestManualConfig, base
     if cfg.redis_url.is_some() {
         for (worker, count) in &worker_counts {
             assert!(
-                *count >= 1 && *count <= 5,
-                "Worker {} should have 1-5 keys due to Redis racing, got {}. Distribution: {:?}",
+                *count >= 2 && *count <= 4,
+                "Worker {} should have 2-4 keys due to Redis racing, got {}. Distribution: {:?}",
                 worker, count, key_to_worker
             );
         }
