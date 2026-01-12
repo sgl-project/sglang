@@ -261,3 +261,8 @@ outputs/
 
 # setuptools-scm generated version file
 python/sglang/_version.py
+
+# Generated protobuf files (regenerate during wheel build or with compile_proto.py)
+python/sglang/srt/grpc/*_pb2.py
+python/sglang/srt/grpc/*_pb2_grpc.py
+python/sglang/srt/grpc/*_pb2.pyi
