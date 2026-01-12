@@ -834,7 +834,8 @@ class SchedulerDisaggregationDecodeMixin:
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
-            self.iter_start_time = time.time()
+            # Receive requests
+            self.iter_start_time = time.perf_counter()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
@@ -861,7 +862,8 @@ class SchedulerDisaggregationDecodeMixin:
         self.last_batch: Optional[ScheduleBatch] = None
 
         while True:
-            self.iter_start_time = time.time()
+            # Receive requests
+            self.iter_start_time = time.perf_counter()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache

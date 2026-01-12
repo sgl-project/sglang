@@ -1084,7 +1084,7 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             # Receive requests
-            self.iter_start_time = time.time()
+            self.iter_start_time = time.perf_counter()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
@@ -1121,7 +1121,7 @@ class Scheduler(
 
         while True:
             # Receive requests
-            self.iter_start_time = time.time()
+            self.iter_start_time = time.perf_counter()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:

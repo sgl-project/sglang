@@ -357,7 +357,7 @@ class SchedulerMetricsMixin:
         num_running_reqs = len(batch.reqs)
         num_running_reqs_offline_batch = 0
 
-        self.iter_finish_time = time.time()
+        self.iter_finish_time = time.perf_counter()
         generation_time = self.iter_finish_time - self.iter_start_time
         run_batch_time = self.iter_forward_finish_time - self.iter_forward_start_time
         iter_token_process_time = generation_time - run_batch_time
