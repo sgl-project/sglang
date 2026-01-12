@@ -518,12 +518,16 @@ class PipelineConfig:
         if model_path is None:
             raise ValueError("model_path is required in kwargs")
 
+        model_id: str | None = kwargs.get(
+            prefix_with_dot + "model_id", None
+        ) or kwargs.get("model_id")
+
         # 1. Get the pipeline config class from the registry
         from sglang.multimodal_gen.configs.pipeline_configs.flux import (
             Flux2PipelineConfig,
         )
 
-        model_info = get_model_info(model_path)
+        model_info = get_model_info(model_path, model_id=model_id)
 
         # 1.5. Adjust pipeline config for fine-tuned VAE if needed
         pipeline_config_cls = model_info.pipeline_config_cls

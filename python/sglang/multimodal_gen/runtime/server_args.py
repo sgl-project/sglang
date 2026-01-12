@@ -230,6 +230,9 @@ class ServerArgs:
     # Model and path configuration (for convenience)
     model_path: str
 
+    # Direct model ID for configuration resolution (takes precedence over model_path for config lookup)
+    model_id: str | None = None
+
     # Model backend (sglang native or diffusers)
     backend: Backend = Backend.AUTO
 
@@ -429,6 +432,16 @@ class ServerArgs:
             "--model-path",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--model-id",
+            type=str,
+            default=None,
+            help="Directly specify the model ID for configuration resolution. "
+                    "Use this when --model-path cannot correctly identify the model name. "
+                    "Example: 'Wan-AI/Wan2.2-TI2V-5B-Diffusers' for specific model variants. "
+                    "If provided, this takes precedence over --model-path for model configuration resolution. "
+                    "Note: This does not replace --model-path for weight loading, only for config lookup.",
         )
         parser.add_argument(
             "--vae-path",
