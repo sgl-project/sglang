@@ -2,6 +2,24 @@
 
 This document addresses engineering concerns raised in PR #16398 review.
 
+## Decode-Only Mode
+
+**Attention capture operates in decode mode only.** This is a deliberate design choice, not a limitation.
+
+**Why decode-only?**
+- **Prefill** processes all prompt tokens in parallel with causal masking. The attention patterns reflect parallel query positions attending to parallel key positions - useful for profiling but less interpretable for semantic analysis.
+- **Decode** generates tokens one at a time. Each attention pattern shows exactly which prior tokens influenced the generation of a specific output token - the model's "retrieval behavior" for that generation step.
+
+**UX Contract:**
+- Attention tokens appear in streaming responses starting from the first generated token
+- No attention data is returned during the prefill phase (prompt processing)
+- For prompts with no generation (e.g., `max_tokens=0`), no attention data is produced
+- The `attention_tokens` field in streaming chunks will be null/absent until decode begins
+
+If you need prompt-time attention patterns for profiling, consider hooking directly into the attention layers or using a separate forward pass with attention output enabled.
+
+---
+
 ## Concern 1: PagedAttention Index Translation
 
 **Risk:** Returning physical block offsets instead of logical token indices.

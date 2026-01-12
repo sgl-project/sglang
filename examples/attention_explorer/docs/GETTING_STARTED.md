@@ -65,6 +65,16 @@ python rapids_sidecar.py \
 
 ### 4. Make Requests with Attention Capture
 
+> **Important: Decode-Only Mode**
+>
+> Attention capture is **decode-only** by design. It captures attention patterns during autoregressive token generation (each new token), not during the prefill phase (processing the input prompt).
+>
+> This is intentional:
+> - **Prefill** processes all prompt tokens in parallel with causal masks - the attention patterns are less interpretable for semantic analysis
+> - **Decode** generates tokens one at a time, where each attention pattern reflects the model's "retrieval behavior" for that specific generation step
+>
+> If you need prompt-time attention patterns, consider using a separate profiling tool or extracting attention weights directly from the model layers.
+
 ```python
 from openai import OpenAI
 
@@ -246,6 +256,7 @@ python discovery/discovery_job.py \
 1. Ensure `--return-attention-tokens` is set on the server
 2. Use `extra_body={"return_attention_tokens": True}` in the client
 3. Verify `--attention-backend triton` is used
+4. **Note:** Attention tokens only appear during decode steps - you won't see them until the model generates output tokens (not during prefill)
 
 ### Discovery job fails with OOM
 

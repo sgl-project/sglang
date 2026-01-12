@@ -789,7 +789,7 @@ class MHATokenToKVPool(KVCache):
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
         self.data_strides = torch.tensor(
             [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
+                int(np.prod(x.shape[1:])) * x.dtype.itemsize
                 for x in self.k_buffer + self.v_buffer
             ],
             device=self.device,

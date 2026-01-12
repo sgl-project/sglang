@@ -1220,8 +1220,9 @@ def broadcast_pyobj(
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
 
+            # np.frombuffer returns readonly array; copy for torch compatibility
             tensor_data = torch.ByteTensor(
-                np.frombuffer(serialized_data, dtype=np.uint8)
+                np.frombuffer(serialized_data, dtype=np.uint8).copy()
             ).to(device)
             tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
