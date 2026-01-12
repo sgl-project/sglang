@@ -61,7 +61,7 @@ class TestLoRAPipelineLoading(CustomTestCase):
             tp_size=model_case.tp_size,
             lora_paths=adaptor_paths,
             max_loras_per_batch=model_case.max_loras_per_batch,
-            max_loaded_loras=model_case.max_loras_per_batch * 2,
+            max_loaded_loras=model_case.max_loaded_loras,
             disable_cuda_graph=True,
             disable_radix_cache=True,
             mem_fraction_static=0.65,
