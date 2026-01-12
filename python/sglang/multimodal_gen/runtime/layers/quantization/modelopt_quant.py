@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-from enum import IntEnum
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -18,9 +17,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
-from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.quantization.utils import is_layer_skipped, swizzle_blockscale
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
@@ -41,9 +39,6 @@ except ImportError:
     if current_platform.is_cuda():
         from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
     enable_flashinfer_fp4_gemm = False
-    reorder_rows_for_gated_act_gemm = None
-    shuffle_matrix_a = None
-    shuffle_matrix_sf_a = None
 
 
 # Initialize logger for the module
@@ -83,20 +78,21 @@ def fp4_gemm(
         return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
 
 
-if (
-    current_platform.is_cuda()
-    and (not current_platform.is_sm120())
-    and (fp4_quantize is not None)
-):
+# Comment out as it can't re-register the same sgl_kernel::scaled_fp4_quant
+# if (
+#     current_platform.is_cuda()
+#     and (not current_platform.is_sm120())
+#     and (fp4_quantize is not None)
+# ):
 
-    @register_fake_if_exists("sgl_kernel::scaled_fp4_quant")
-    def _sgl_kernel_scaled_fp4_quant_fake(
-        output, input, output_scale, input_global_scale
-    ):
-        return
+#     @register_fake_if_exists("sgl_kernel::scaled_fp4_quant")
+#     def _sgl_kernel_scaled_fp4_quant_fake(
+#         output, input, output_scale, input_global_scale
+#     ):
+#         return
 
 
-FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
+FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
 
@@ -135,6 +131,30 @@ class ModelOptQuantConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
+    @classmethod
+    def override_quantization_method(
+        cls, hf_quant_config, user_quant
+    ) -> Optional[str]:
+        """Shared ModelOpt quantization method override logic."""
+        if hf_quant_config is None:
+            return None
+
+        # Check if this is a ModelOpt config
+        quant_algo = hf_quant_config.get("quant_algo", "").upper()
+
+        # If user specified generic "modelopt", auto-detect the specific method
+        if user_quant == "modelopt":
+            if not ("NVFP4" in quant_algo or "FP4" in quant_algo):
+                logger.warning(
+                    f"Unsupported quant_algo '{quant_algo}' for user_quant 'modelopt'. Using the default 'modelopt_fp4' quant_algo."
+                )
+
+            # The hf_quant_config may be a parsed quant config, so we need to check the
+            # quant_method.if hf_quant_config.get("quant_method", "") == "modelopt_fp4":
+            return "modelopt_fp4"
+
+        return None
+
 
 class ModelOptFp4Config(ModelOptQuantConfig):
     """Config class for FP4."""
@@ -156,11 +176,6 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         self.group_size = group_size
 
     @classmethod
-    def override_quantization_method(cls, hf_quant_config, user_quant):
-        """Override quantization method based on the model's config."""
-        return cls._modelopt_override_quantization_method(hf_quant_config, user_quant)
-
-    @classmethod
     def get_name(cls) -> str:
         return "modelopt_fp4"
 
@@ -177,27 +192,24 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         """Return the unique group_size across the config; raise if missing/mismatched."""
         sizes = set()
 
+        def _add_group_size_from_dict(config: dict):
+            group_size = config.get("group_size")
+            if isinstance(group_size, int):
+                sizes.add(group_size)
+
         # Top-level and 'quantization' block
-        v = cfg.get("group_size")
-        if isinstance(v, int):
-            sizes.add(v)
-        q = cfg.get("quantization")
-        if isinstance(q, dict):
-            v = q.get("group_size")
-            if isinstance(v, int):
-                sizes.add(v)
+        _add_group_size_from_dict(cfg)
+        quantization = cfg.get("quantization")
+        if isinstance(quantization, dict):
+            _add_group_size_from_dict(quantization)
 
         # config_groups: accept group-level or nested dicts (e.g., weights/input_activations)
-        for g in (cfg.get("config_groups") or {}).values():
-            if isinstance(g, dict):
-                v = g.get("group_size")
-                if isinstance(v, int):
-                    sizes.add(v)
-                for sub in g.values():
-                    if isinstance(sub, dict):
-                        v = sub.get("group_size")
-                        if isinstance(v, int):
-                            sizes.add(v)
+        for config_groups in (cfg.get("config_groups") or {}).values():
+            if isinstance(config_groups, dict):
+                _add_group_size_from_dict(config_groups)
+                for config_group in config_groups.values():
+                    if isinstance(config_group, dict):
+                        _add_group_size_from_dict(config_group)
 
         if not sizes:
             raise ValueError("No group_size found in config.")
@@ -244,10 +256,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
 
-        if not quant_method in ["FP8", "NVFP4"]:
+        if not quant_method in ["NVFP4"]:
             raise ValueError(
-                f"ModelOpt currently only supports: FP8, NVFP4"
-                " quantizations in sglang. Please check the "
+                f"ModelOpt currently only supports: NVFP4 quantization in sglang diffusion. The provided quant_algo is {quant_method}. Please check the "
                 "quantization config for your model's configuration."
             )
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
@@ -330,6 +341,10 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 "NVFP4 quantization was selected, "
                 " dynamic quantization is not supported."
             )
+        if input_size_per_partition % 16 != 0:
+            raise ValueError(
+                f"Unsupported model when input features size is {input_size_per_partition}, not multiple of 16, for NVFP4 quantization."
+            )
 
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
@@ -338,16 +353,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
-        if input_size_per_partition % 16 != 0:
-            raise ValueError(
-                "Unsupported model when in features size is " "not multiple of 16"
-            )
-
-        weight_dtype = (
-            torch.float8_e4m3fn
-            if self.quant_config.is_checkpoint_nvfp4_serialized
-            else params_dtype
-        )
 
         weight = ModelWeightParameter(
             data=torch.empty(
@@ -379,7 +384,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition // self.quant_config.group_size,
-                dtype=weight_dtype,
+                dtype=torch.float8_e4m3fn,
             ),
             input_dim=1,
             output_dim=0,
@@ -399,7 +404,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.input_scale_inv = Parameter(
             (1 / input_scale_2).to(torch.float32), requires_grad=False
         )
-        if FLASHINFER_FP4_GEMM_BACKEND == "trtllm":
+
+        if FLASHINFER_FP4_GEMM_BACKEND != "trtllm":
+            # Pad and blockwise interleave weight_scale
+            padded_scales = swizzle_blockscale(layer.weight_scale)
+            layer.weight_scale_interleaved = Parameter(padded_scales, requires_grad=False)
+        else:
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
@@ -419,30 +429,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer.weight_scale_interleaved = Parameter(scale, requires_grad=False)
             layer.weight = Parameter(weight, requires_grad=False)
             return
-        # Pad and blockwise interleave weight_scale
-        scales = layer.weight_scale
-        scale_ndim = scales.ndim
-        if scale_ndim == 2:
-            scales = scales.unsqueeze(0)
-        assert scales.ndim == 3
-        B, M, K = scales.shape
-        round_up_multiple = lambda x, m: (x + m - 1) // m * m
-        M_padded = round_up_multiple(M, 128)
-        K_padded = round_up_multiple(K, 4)
-        padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
-        padded_scales[:B, :M, :K] = scales
-        batches, rows, cols = padded_scales.shape
-        assert rows % 128 == 0
-        assert cols % 4 == 0
-        padded_scales = padded_scales.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
-        padded_scales = padded_scales.permute((0, 1, 4, 3, 2, 5))
-        padded_scales = padded_scales.contiguous().cuda()
-        padded_scales = (
-            padded_scales.reshape(M_padded, K_padded)
-            if scale_ndim == 2
-            else padded_scales.reshape(B, M_padded, K_padded)
-        )
-        layer.weight_scale_interleaved = Parameter(padded_scales, requires_grad=False)
+
 
     def apply(
         self,

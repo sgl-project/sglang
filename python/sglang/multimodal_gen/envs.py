@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
-
+    SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
 
 def get_default_cache_root() -> str:
     return os.getenv(
@@ -271,6 +271,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # model loading
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
+    ),
+    "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
     ),
 }
 
