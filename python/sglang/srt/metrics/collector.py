@@ -25,6 +25,7 @@ from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
@@ -245,6 +246,22 @@ class SchedulerStats:
     lora_pool_slots_used: int = 0
     lora_pool_slots_total: int = 0
     lora_pool_utilization: float = 0.0
+
+    # Routing key metrics
+    num_unique_running_routing_keys: int = 0
+    routing_key_running_req_counts: List[int] = field(default_factory=list)
+    routing_key_all_req_counts: List[int] = field(default_factory=list)
+
+
+ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
+
+
+def compute_routing_key_stats(routing_keys: List[Optional[str]]) -> tuple:
+    """Returns (num_unique_keys, per_key_counts)."""
+    from collections import Counter
+
+    key_counts = Counter(k for k in routing_keys if k is not None)
+    return len(key_counts), list(key_counts.values())
 
 
 @dataclass
@@ -721,6 +738,25 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
+        self.num_unique_running_routing_keys = Gauge(
+            name="sglang:num_unique_running_routing_keys",
+            documentation="Number of unique routing keys in running batch.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.routing_key_running_req_count = GaugeHistogram(
+            name="sglang:routing_key_running_req_count",
+            documentation="Distribution of routing keys by running request count (gt < count <= le).",
+            labelnames=list(labels.keys()),
+            bucket_bounds=ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
+        )
+        self.routing_key_all_req_count = GaugeHistogram(
+            name="sglang:routing_key_all_req_count",
+            documentation="Distribution of routing keys by running+waiting request count (gt < count <= le).",
+            labelnames=list(labels.keys()),
+            bucket_bounds=ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
+        )
+
         self.new_token_ratio = Gauge(
             name="sglang:new_token_ratio",
             documentation="The new token ratio.",
@@ -980,6 +1016,16 @@ class SchedulerMetricsCollector:
             self._log_gauge(self.lora_pool_slots_used, stats.lora_pool_slots_used)
             self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
             self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
+
+        self._log_gauge(
+            self.num_unique_running_routing_keys, stats.num_unique_running_routing_keys
+        )
+        self.routing_key_running_req_count.set_by_current_observations(
+            self.labels, stats.routing_key_running_req_counts
+        )
+        self.routing_key_all_req_count.set_by_current_observations(
+            self.labels, stats.routing_key_all_req_counts
+        )
 
         self.last_log_time = time.perf_counter()
 

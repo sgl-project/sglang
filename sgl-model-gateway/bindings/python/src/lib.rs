@@ -31,6 +31,7 @@ pub enum HistoryBackendType {
     None,
     Oracle,
     Postgres,
+    Redis,
 }
 
 #[pyclass(eq)]
@@ -272,6 +273,40 @@ impl PyOracleConfig {
 
 #[pyclass]
 #[derive(Debug, Clone, PartialEq)]
+pub struct PyRedisConfig {
+    #[pyo3(get, set)]
+    pub url: String,
+    #[pyo3(get, set)]
+    pub pool_max: usize,
+    #[pyo3(get, set)]
+    pub retention_days: Option<u64>,
+}
+
+#[pymethods]
+impl PyRedisConfig {
+    #[new]
+    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30)))]
+    fn new(url: String, pool_max: usize, retention_days: Option<u64>) -> PyResult<Self> {
+        Ok(PyRedisConfig {
+            url,
+            pool_max,
+            retention_days,
+        })
+    }
+}
+
+impl PyRedisConfig {
+    pub fn to_config_redis(&self) -> config::RedisConfig {
+        config::RedisConfig {
+            url: self.url.clone(),
+            pool_max: self.pool_max,
+            retention_days: self.retention_days,
+        }
+    }
+}
+
+#[pyclass]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PyPostgresConfig {
     #[pyo3(get, set)]
     pub db_url: Option<String>,
@@ -374,6 +409,7 @@ struct Router {
     history_backend: HistoryBackendType,
     oracle_config: Option<PyOracleConfig>,
     postgres_config: Option<PyPostgresConfig>,
+    redis_config: Option<PyRedisConfig>,
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
@@ -486,6 +522,7 @@ impl Router {
             HistoryBackendType::None => config::HistoryBackend::None,
             HistoryBackendType::Oracle => config::HistoryBackend::Oracle,
             HistoryBackendType::Postgres => config::HistoryBackend::Postgres,
+            HistoryBackendType::Redis => config::HistoryBackend::Redis,
         };
 
         let oracle = if matches!(self.history_backend, HistoryBackendType::Oracle) {
@@ -500,6 +537,14 @@ impl Router {
             self.postgres_config
                 .as_ref()
                 .map(|cfg| cfg.to_config_postgres())
+        } else {
+            None
+        };
+
+        let redis_config = if matches!(self.history_backend, HistoryBackendType::Redis) {
+            self.redis_config
+                .as_ref()
+                .map(|cfg| cfg.to_config_redis())
         } else {
             None
         };
@@ -558,6 +603,7 @@ impl Router {
             .maybe_chat_template(self.chat_template.as_ref())
             .maybe_oracle(oracle)
             .maybe_postgres(postgres_config)
+            .maybe_redis(redis_config)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
@@ -654,6 +700,7 @@ impl Router {
         history_backend = HistoryBackendType::Memory,
         oracle_config = None,
         postgres_config = None,
+        redis_config = None,
         client_cert_path = None,
         client_key_path = None,
         ca_cert_paths = vec![],
@@ -737,6 +784,7 @@ impl Router {
         history_backend: HistoryBackendType,
         oracle_config: Option<PyOracleConfig>,
         postgres_config: Option<PyPostgresConfig>,
+        redis_config: Option<PyRedisConfig>,
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
         ca_cert_paths: Vec<String>,
@@ -834,6 +882,7 @@ impl Router {
             history_backend,
             oracle_config,
             postgres_config,
+            redis_config,
             client_cert_path,
             client_key_path,
             ca_cert_paths,
@@ -946,6 +995,7 @@ fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyControlPlaneAuthConfig>()?;
     m.add_class::<PyOracleConfig>()?;
     m.add_class::<PyPostgresConfig>()?;
+    m.add_class::<PyRedisConfig>()?;
     m.add_class::<Router>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
