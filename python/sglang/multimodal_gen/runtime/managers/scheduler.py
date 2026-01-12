@@ -202,7 +202,7 @@ class Scheduler:
                         prompt="",
                         is_warmup=True,
                     )
-
+                req.extra["cache_dit_num_inference_steps"] = 4  # min step for cache dit
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
