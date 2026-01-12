@@ -58,6 +58,11 @@ impl InFlightRequestTracker {
         self.requests.is_empty()
     }
 
+    pub fn compute_bucket_counts(&self) -> Vec<usize> {
+        let ages = self.collect_ages();
+        INFLIGHT_AGE_BOUNDS.compute_counts(&ages)
+    }
+
     fn collect_ages(&self) -> Vec<u64> {
         let now = Instant::now();
         self.requests
@@ -67,8 +72,7 @@ impl InFlightRequestTracker {
     }
 
     fn sample_and_record(&self) {
-        let ages = self.collect_ages();
-        let counts = INFLIGHT_AGE_BOUNDS.compute_counts(&ages);
+        let counts = self.compute_bucket_counts();
         INFLIGHT_AGE_HANDLE.set_counts(&counts);
     }
 }
