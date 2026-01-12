@@ -58,8 +58,8 @@ class TestGrok2PerfMI35x(unittest.TestCase):
 
     def test_grok2_perf(self):
         """Run Grok-2 performance benchmark on MI35x."""
-        batch_sizes = _parse_int_list_env("BATCH_SIZES", [1, 8, 16, 32])
-        input_lens = _parse_int_list_env("INPUT_LENS", [1024, 4096])
+        batch_sizes = _parse_int_list_env("BATCH_SIZES", "1,8,16,32")
+        input_lens = _parse_int_list_env("INPUT_LENS", "1024,4096")
         output_len = int(os.getenv("OUTPUT_LEN", "256"))
 
         env = os.environ.copy()
