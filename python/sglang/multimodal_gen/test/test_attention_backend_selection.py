@@ -121,7 +121,7 @@ def test_sm120_falls_back_to_torch_sdpa_when_sage_missing(monkeypatch):
     assert result == AttentionBackendEnum.TORCH_SDPA.import_path
 
 
-def test_blackwell_fa_ver4_and_head_size_fallback(monkeypatch):
+def test_blackwell_head_size_fallback_skips_fa_ver(monkeypatch):
     platform = _make_platform(
         is_sm120=False,
         is_blackwell=True,
@@ -154,7 +154,43 @@ def test_blackwell_fa_ver4_and_head_size_fallback(monkeypatch):
         dtype=torch.float16,
     )
     assert result == AttentionBackendEnum.TORCH_SDPA.import_path
-    assert 4 in fa_calls
+    assert fa_calls == []
+
+
+def test_blackwell_sets_fa_ver4_when_supported(monkeypatch):
+    platform = _make_platform(
+        is_sm120=False,
+        is_blackwell=True,
+        has_capability=True,
+    )
+    fa_calls = []
+
+    class DummyFlashAttentionBackend:
+        @staticmethod
+        def get_supported_head_sizes() -> list[int]:
+            return [64]
+
+    def set_fa_ver(ver: int) -> None:
+        fa_calls.append(ver)
+
+    flash_attn_mod = types.ModuleType(
+        "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn"
+    )
+    flash_attn_mod.FlashAttentionBackend = DummyFlashAttentionBackend
+    flash_attn_mod.set_fa_ver = set_fa_ver
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn",
+        flash_attn_mod,
+    )
+
+    result = platform.get_attn_backend_cls_str(
+        None,
+        head_size=64,
+        dtype=torch.float16,
+    )
+    assert result == AttentionBackendEnum.FA.import_path
+    assert fa_calls == [4]
 
 
 def test_hopper_selects_fa3_by_default(monkeypatch):
