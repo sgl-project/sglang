@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import enum
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -26,13 +26,13 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True)
 class AttentionBackendSpec:
+    imports: list[tuple[str, str | None]] = field(default_factory=list)
     fallback: str | None = None
     log_msg: str | None = None
     import_path: str | None = None
     fallback_msg: str | None = None
     error_prefix: str | None = None
     error_msg: str | None = None
-    imports: list[tuple[str, str | None]]
 
 
 class AttentionBackendEnum(enum.Enum):
@@ -151,8 +151,8 @@ class AttentionBackendEnum(enum.Enum):
         return self.value.import_path
 
     @property
-    def imports(self) -> tuple[tuple[str, str], ...]:
-        return self.value.imports
+    def imports(self) -> tuple[tuple[str, str | None], ...]:
+        return tuple(self.value.imports)
 
     @property
     def log_msg(self) -> str:
@@ -164,8 +164,14 @@ class AttentionBackendEnum(enum.Enum):
 
     @property
     def fallback(self) -> AttentionBackendEnum | None:
-        name = self.value.fallback_name
-        return None if name is None else AttentionBackendEnum[name]
+        fallback = self.value.fallback
+        if fallback is None:
+            return None
+        if isinstance(fallback, AttentionBackendEnum):
+            return fallback
+        if isinstance(fallback, str):
+            return AttentionBackendEnum[fallback.upper()]
+        raise TypeError(f"Invalid fallback type: {type(fallback)!r}")
 
     @property
     def error_prefix(self) -> str:

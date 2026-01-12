@@ -233,7 +233,7 @@ class CudaPlatformBase(Platform):
             dtype,
             selected_backend,
         )
-        return _use_backend(head_size, target_backend)
+        return _use_backend(cls, head_size, target_backend)
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
