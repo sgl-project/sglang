@@ -205,7 +205,7 @@ async fn test_min_group_concurrent_distribution_impl(cfg: TestManualConfig, base
 manual_routing_all_backend_test!(test_min_group_concurrent_distribution, 3910);
 
 async fn test_min_group_sequential_distribution_impl(cfg: TestManualConfig, base_port: u16) {
-    let worker_counts = test_min_group_distribution_raw(&cfg, base_port, 50, Some(200)).await;
+    let worker_counts = test_min_group_distribution_raw(&cfg, base_port, 3000, Some(100)).await;
 
     for (worker, count) in &worker_counts {
         assert_eq!(
