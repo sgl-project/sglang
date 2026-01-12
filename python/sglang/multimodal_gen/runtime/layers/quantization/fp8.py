@@ -18,6 +18,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.multimodal_gen.runtime.models.parameter import (
+    BlockQuantScaleParameter,
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import (
     cpu_has_amx_support,
@@ -25,11 +30,6 @@ from sglang.multimodal_gen.runtime.utils.common import (
     use_intel_amx_backend,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.parameter import (
-    BlockQuantScaleParameter,
-    ModelWeightParameter,
-    PerTensorScaleParameter,
-)
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
@@ -86,7 +86,7 @@ class Fp8Config(QuantizationConfig):
     ) -> None:
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
-            logger.info(logger, "Detected fp8 checkpoint.")
+            logger.info("Detected fp8 checkpoint.")
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
