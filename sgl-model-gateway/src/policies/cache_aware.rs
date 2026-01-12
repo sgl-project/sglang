@@ -345,7 +345,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
     }
 
-    fn on_request_complete(&self, worker_url: &str, success: bool) {
+    fn on_request_complete(&self, worker_url: &str, _request_id: Option<&str>, success: bool) {
         // Could track success rates per worker for more intelligent routing
         if !success {
             // Optionally reduce affinity for failed requests

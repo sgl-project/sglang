@@ -1,11 +1,11 @@
 //! Least load balancing policy
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
@@ -20,8 +20,8 @@ pub fn calculate_request_load(info: &SelectWorkerInfo) -> isize {
 struct WorkerState {
     /// Current total load
     load: isize,
-    /// Pending request loads (FIFO queue for decrement)
-    pending: VecDeque<isize>,
+    /// Pending request loads by request_id
+    pending: HashMap<String, isize>,
 }
 
 /// Least load policy
@@ -74,7 +74,16 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
         let url = workers[selected_idx].url().to_string();
         let worker_state = state.entry(url.clone()).or_default();
         worker_state.load += request_load;
-        worker_state.pending.push_back(request_load);
+
+        // Track load by request_id if available
+        if let Some(req_id) = info.request_id {
+            worker_state.pending.insert(req_id.to_string(), request_load);
+        } else {
+            warn!(
+                "LeastLoad: no request_id provided, load tracking may be inaccurate. \
+                 Set X-Request-ID header for precise load balancing."
+            );
+        }
 
         debug!(
             "Least load selection: selected {} with load {}, added {}",
@@ -87,11 +96,26 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
         Some(selected_idx)
     }
 
-    fn on_request_complete(&self, worker_url: &str, _success: bool) {
+    fn on_request_complete(&self, worker_url: &str, request_id: Option<&str>, _success: bool) {
+        if request_id.is_none() {
+            warn!(
+                "LeastLoad: on_request_complete called without request_id for {}, \
+                 falling back to default load decrement",
+                worker_url
+            );
+        }
+
         if let Ok(mut state) = self.state.lock() {
             if let Some(worker_state) = state.get_mut(worker_url) {
-                let load_to_remove = worker_state.pending.pop_front().unwrap_or(1);
+                let load_to_remove = request_id
+                    .and_then(|id| worker_state.pending.remove(id))
+                    .unwrap_or(1);
                 worker_state.load = (worker_state.load - load_to_remove).max(0);
+
+                debug!(
+                    "Least load complete: {} released {}, new load {}",
+                    worker_url, load_to_remove, worker_state.load
+                );
             }
         }
     }

@@ -52,7 +52,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ///
     /// This is called when a request completes (successfully or not) to allow
     /// policies to update their internal state.
-    fn on_request_complete(&self, _worker_url: &str, _success: bool) {
+    fn on_request_complete(&self, _worker_url: &str, _request_id: Option<&str>, _success: bool) {
         // Default: no-op for stateless policies
     }
 
@@ -160,6 +160,9 @@ pub struct SelectWorkerInfo<'a> {
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
+    /// Unique request ID for tracking request lifecycle
+    /// Used by stateful policies (e.g., LeastLoad) to correctly release load on completion
+    pub request_id: Option<&'a str>,
 }
 
 #[cfg(test)]

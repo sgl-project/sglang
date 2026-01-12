@@ -810,6 +810,7 @@ impl PDRouter {
                     tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
                     headers,
                     hash_ring,
+                    request_id: None, // TODO: pass request_id from middleware for stateful policies
                 },
             )
             .ok_or_else(|| {

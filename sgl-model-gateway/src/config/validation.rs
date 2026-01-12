@@ -150,7 +150,8 @@ impl ConfigValidator {
             PolicyConfig::Random
             | PolicyConfig::RoundRobin
             | PolicyConfig::Manual { .. }
-            | PolicyConfig::ConsistentHashing => {}
+            | PolicyConfig::ConsistentHashing
+            | PolicyConfig::LeastLoad => {}
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold: _,

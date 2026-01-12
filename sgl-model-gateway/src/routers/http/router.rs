@@ -24,7 +24,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{PolicyRegistry, SelectWorkerInfo},
+    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -130,12 +130,13 @@ impl Router {
     }
 
     /// Select worker for a specific model considering circuit breaker state
+    /// Returns (worker, policy, request_id) tuple for lifecycle tracking
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<(Arc<dyn Worker>, Arc<dyn LoadBalancingPolicy>, Option<String>)> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         // Get workers for the specified model O(1), filtered by connection mode
@@ -162,6 +163,12 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
+        // Extract request_id from headers for stateful policies
+        let request_id = headers
+            .and_then(|h| h.get("x-request-id"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self
             .worker_registry
@@ -174,6 +181,7 @@ impl Router {
                 tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
                 headers,
                 hash_ring,
+                request_id: request_id.as_deref(),
             },
         )?;
 
@@ -185,7 +193,7 @@ impl Router {
             policy.name(),
         );
 
-        Some(available[idx].clone())
+        Some((available[idx].clone(), policy, request_id))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -276,23 +284,20 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
-            Some(w) => w,
-            None => {
-                return error::service_unavailable(
-                    "no_available_workers",
-                    "No available workers (all circuits open or unhealthy)",
-                );
-            }
-        };
+        let (worker, policy, request_id) =
+            match self.select_worker_for_model(model_id, Some(text), headers) {
+                Some(result) => result,
+                None => {
+                    return error::service_unavailable(
+                        "no_available_workers",
+                        "No available workers (all circuits open or unhealthy)",
+                    );
+                }
+            };
+
+        let worker_url = worker.url().to_string();
 
         // Optional load tracking for cache-aware policy
-        // Get the policy for this model to check if it's cache-aware
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-
         let load_guard =
             (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
 
@@ -317,6 +322,9 @@ impl Router {
 
         let status = response.status();
         worker.record_outcome(status.is_success());
+
+        // Notify policy that request completed (for stateful policies like LeastLoad)
+        policy.on_request_complete(&worker_url, request_id.as_deref(), status.is_success());
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {

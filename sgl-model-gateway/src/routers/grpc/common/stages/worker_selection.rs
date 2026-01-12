@@ -173,6 +173,7 @@ impl WorkerSelectionStage {
                 tokens,
                 headers,
                 hash_ring,
+                request_id: None, // TODO: pass request_id for stateful policies
             },
         )?;
         let selected = available[idx].clone();
@@ -243,6 +244,7 @@ impl WorkerSelectionStage {
             tokens,
             headers,
             hash_ring,
+            request_id: None, // TODO: pass request_id for stateful policies
         };
         let prefill_idx = policy.select_worker(&available_prefill, &info)?;
         let decode_idx = policy.select_worker(&available_decode, &info)?;
