@@ -150,20 +150,22 @@ class ImageEncodingStage(PipelineStage):
                     image_grid_thw=image_inputs.image_grid_thw,
                     output_hidden_states=True,
                 )
-                neg_outputs = self.text_encoder(
-                    input_ids=neg_image_inputs.input_ids,
-                    attention_mask=neg_image_inputs.attention_mask,
-                    pixel_values=neg_image_inputs.pixel_values,
-                    image_grid_thw=neg_image_inputs.image_grid_thw,
-                    output_hidden_states=True,
-                )
+                if batch.guidance_scale > 1.0 and batch.negative_prompt is not None:
+                    neg_outputs = self.text_encoder(
+                        input_ids=neg_image_inputs.input_ids,
+                        attention_mask=neg_image_inputs.attention_mask,
+                        pixel_values=neg_image_inputs.pixel_values,
+                        image_grid_thw=neg_image_inputs.image_grid_thw,
+                        output_hidden_states=True,
+                    )
             batch.prompt_embeds.append(
                 self.encoding_qwen_image_edit(outputs, image_inputs)
             )
 
-            batch.negative_prompt_embeds.append(
-                self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
-            )
+            if batch.guidance_scale > 1.0 and batch.negative_prompt is not None:
+                batch.negative_prompt_embeds.append(
+                    self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
+                )
 
         self.offload_model()
 
