@@ -8,25 +8,25 @@ use std::{
 
 use super::{
     executor::StepExecutor,
-    types::{FailureAction, RetryPolicy, StepId, WorkflowId},
+    types::{FailureAction, RetryPolicy, StepId, WorkflowData, WorkflowId},
 };
 
 /// Definition of a single step within a workflow
-pub struct StepDefinition {
+pub struct StepDefinition<D: WorkflowData> {
     pub id: StepId,
     pub name: String,
-    pub executor: Arc<dyn StepExecutor>,
+    pub executor: Arc<dyn StepExecutor<D>>,
     pub retry_policy: Option<RetryPolicy>,
     pub timeout: Option<Duration>,
     pub on_failure: FailureAction,
     pub depends_on: Vec<StepId>,
 }
 
-impl StepDefinition {
+impl<D: WorkflowData> StepDefinition<D> {
     pub fn new(
         id: impl Into<String>,
         name: impl Into<String>,
-        executor: Arc<dyn StepExecutor>,
+        executor: Arc<dyn StepExecutor<D>>,
     ) -> Self {
         Self {
             id: StepId::new(id.into()),
@@ -64,15 +64,19 @@ impl StepDefinition {
 }
 
 /// Complete workflow definition
-pub struct WorkflowDefinition {
+pub struct WorkflowDefinition<D: WorkflowData> {
     pub id: WorkflowId,
     pub name: String,
-    pub steps: Vec<StepDefinition>,
+    pub steps: Vec<StepDefinition<D>>,
     pub default_retry_policy: RetryPolicy,
     pub default_timeout: Duration,
+    /// Pre-computed reverse dependencies: step_id -> indices of steps that depend on it
+    reverse_deps: HashMap<StepId, Vec<usize>>,
+    /// Pre-computed indices of steps with no dependencies (can start immediately)
+    initial_step_indices: Vec<usize>,
 }
 
-impl WorkflowDefinition {
+impl<D: WorkflowData> WorkflowDefinition<D> {
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             id: WorkflowId::new(id.into()),
@@ -80,10 +84,12 @@ impl WorkflowDefinition {
             steps: Vec::new(),
             default_retry_policy: RetryPolicy::default(),
             default_timeout: Duration::from_secs(300), // 5 minutes
+            reverse_deps: HashMap::new(),
+            initial_step_indices: Vec::new(),
         }
     }
 
-    pub fn add_step(mut self, step: StepDefinition) -> Self {
+    pub fn add_step(mut self, step: StepDefinition<D>) -> Self {
         self.steps.push(step);
         self
     }
@@ -99,24 +105,26 @@ impl WorkflowDefinition {
     }
 
     /// Get the retry policy for a step (step-specific or default)
-    pub fn get_retry_policy<'a>(&'a self, step: &'a StepDefinition) -> &'a RetryPolicy {
+    pub fn get_retry_policy<'a>(&'a self, step: &'a StepDefinition<D>) -> &'a RetryPolicy {
         step.retry_policy
             .as_ref()
             .unwrap_or(&self.default_retry_policy)
     }
 
     /// Get the timeout for a step (step-specific or default)
-    pub fn get_timeout(&self, step: &StepDefinition) -> Duration {
+    pub fn get_timeout(&self, step: &StepDefinition<D>) -> Duration {
         step.timeout.unwrap_or(self.default_timeout)
     }
 
-    /// Validate the workflow DAG structure.
+    /// Validate the workflow DAG structure and build dependency graph.
     /// Returns an error if:
     /// - A step depends on a non-existent step
     /// - There's a cycle in the dependencies
-    pub fn validate(&self) -> Result<(), String> {
+    ///
+    /// On success, pre-computes reverse dependencies for O(1) dependent lookup.
+    pub fn validate(&mut self) -> Result<(), String> {
         // Build HashMap for O(1) lookup instead of O(n) linear search
-        let steps_map: HashMap<&StepId, &StepDefinition> =
+        let steps_map: HashMap<&StepId, &StepDefinition<D>> =
             self.steps.iter().map(|s| (&s.id, s)).collect();
 
         // Check all dependencies exist
@@ -143,13 +151,33 @@ impl WorkflowDefinition {
             }
         }
 
+        // Build reverse dependency map: for each step, which steps depend on it?
+        self.reverse_deps.clear();
+        for (idx, step) in self.steps.iter().enumerate() {
+            for dep_id in &step.depends_on {
+                self.reverse_deps
+                    .entry(dep_id.clone())
+                    .or_default()
+                    .push(idx);
+            }
+        }
+
+        // Cache indices of steps with no dependencies (can start immediately)
+        self.initial_step_indices = self
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.depends_on.is_empty())
+            .map(|(i, _)| i)
+            .collect();
+
         Ok(())
     }
 
     /// DFS helper for cycle detection with O(1) HashMap lookup
     fn has_cycle<'a>(
         step_id: &'a StepId,
-        steps_map: &HashMap<&'a StepId, &'a StepDefinition>,
+        steps_map: &HashMap<&'a StepId, &'a StepDefinition<D>>,
         visited: &mut HashSet<&'a StepId>,
         rec_stack: &mut HashSet<&'a StepId>,
     ) -> bool {
@@ -176,19 +204,16 @@ impl WorkflowDefinition {
         false
     }
 
-    /// Get steps that have no dependencies (can run immediately)
-    pub fn get_initial_steps(&self) -> Vec<&StepDefinition> {
-        self.steps
-            .iter()
-            .filter(|s| s.depends_on.is_empty())
-            .collect()
+    /// Get indices of steps that depend on the given step
+    pub fn get_dependent_indices(&self, step_id: &StepId) -> &[usize] {
+        self.reverse_deps
+            .get(step_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
-    /// Get steps that depend on the given step
-    pub fn get_dependents(&self, step_id: &StepId) -> Vec<&StepDefinition> {
-        self.steps
-            .iter()
-            .filter(|s| s.depends_on.contains(step_id))
-            .collect()
+    /// Get indices of steps with no dependencies
+    pub fn get_initial_step_indices(&self) -> &[usize] {
+        &self.initial_step_indices
     }
 }

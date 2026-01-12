@@ -1,10 +1,132 @@
 use std::{
+    borrow::Cow,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
+use dashmap::DashMap;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+use once_cell::sync::Lazy;
+
+// =============================================================================
+// STRING INTERNING
+// =============================================================================
+//
+// Dynamic strings (model_id, worker URLs, paths) are interned to avoid repeated
+// heap allocations. The interner uses Arc<str> which is cheap to clone and
+// allows the metrics crate to store references without repeated allocations.
+//
+// Performance characteristics:
+// - First occurrence: One allocation + DashMap insert
+// - Subsequent occurrences: DashMap lookup + Arc::clone (very cheap)
+// - Memory: Strings are never freed (acceptable for bounded label cardinality)
+
+/// Global string interner for metric labels.
+/// Uses DashMap for lock-free concurrent access.
+static STRING_INTERNER: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
+
+/// Intern a string, returning a cheaply-cloneable Arc<str>.
+///
+/// This function is designed for high-throughput scenarios where the same
+/// strings (model IDs, worker URLs) appear repeatedly. The first call allocates,
+/// subsequent calls just clone the Arc (very cheap - just a ref count increment).
+pub(crate) fn intern_string(s: &str) -> Arc<str> {
+    // Fast path: check if already interned
+    if let Some(entry) = STRING_INTERNER.get(s) {
+        return Arc::clone(entry.value());
+    }
+
+    // Slow path: intern the string
+    // Use entry API to avoid TOCTOU race
+    STRING_INTERNER
+        .entry(s.to_string())
+        .or_insert_with(|| Arc::from(s))
+        .clone()
+}
+
+#[allow(dead_code)]
+pub(crate) fn interner_size() -> usize {
+    STRING_INTERNER.len()
+}
+
+// =============================================================================
+// STATIC STRING CONSTANTS
+// =============================================================================
+
+/// Static string constants for boolean labels to avoid allocations.
+pub const STREAMING_TRUE: &str = "true";
+pub const STREAMING_FALSE: &str = "false";
+
+pub const fn bool_to_static_str(b: bool) -> &'static str {
+    if b {
+        STREAMING_TRUE
+    } else {
+        STREAMING_FALSE
+    }
+}
+
+/// Static lookup table for common HTTP status codes to avoid allocations.
+/// Returns a static string for known codes, or None for unknown codes.
+#[inline]
+pub fn status_code_to_static_str(code: u16) -> Option<&'static str> {
+    // Using a match with explicit arms is faster than a lookup table for this size
+    match code {
+        200 => Some("200"),
+        201 => Some("201"),
+        204 => Some("204"),
+        400 => Some("400"),
+        401 => Some("401"),
+        403 => Some("403"),
+        404 => Some("404"),
+        408 => Some("408"),
+        422 => Some("422"),
+        429 => Some("429"),
+        500 => Some("500"),
+        502 => Some("502"),
+        503 => Some("503"),
+        504 => Some("504"),
+        _ => None,
+    }
+}
+
+/// Static HTTP method strings to avoid allocations on every request.
+pub(crate) mod http_methods {
+    pub const GET: &str = "GET";
+    pub const POST: &str = "POST";
+    pub const PUT: &str = "PUT";
+    pub const DELETE: &str = "DELETE";
+    pub const PATCH: &str = "PATCH";
+    pub const HEAD: &str = "HEAD";
+    pub const OPTIONS: &str = "OPTIONS";
+}
+
+/// Convert HTTP method to static string. Returns the method as-is for unknown methods.
+#[inline]
+pub fn method_to_static_str(method: &str) -> &'static str {
+    match method {
+        "GET" => http_methods::GET,
+        "POST" => http_methods::POST,
+        "PUT" => http_methods::PUT,
+        "DELETE" => http_methods::DELETE,
+        "PATCH" => http_methods::PATCH,
+        "HEAD" => http_methods::HEAD,
+        "OPTIONS" => http_methods::OPTIONS,
+        // For unknown methods, we return a static "OTHER" to avoid allocation
+        // This is acceptable since unknown methods are rare in practice
+        _ => "OTHER",
+    }
+}
+
+/// Get status code as Cow - static for common codes, allocated for rare ones.
+#[inline]
+pub fn status_code_to_cow(code: u16) -> Cow<'static, str> {
+    match status_code_to_static_str(code) {
+        Some(s) => Cow::Borrowed(s),
+        None => Cow::Owned(code.to_string()),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PrometheusConfig {
@@ -23,15 +145,19 @@ impl Default for PrometheusConfig {
     }
 }
 
-pub fn init_metrics() {
+pub(crate) fn init_metrics() {
     // Layer 1: HTTP metrics
     describe_counter!(
         "smg_http_requests_total",
-        "Total HTTP requests by method, path, and status"
+        "Total HTTP requests by method and path"
     );
     describe_histogram!(
         "smg_http_request_duration_seconds",
         "HTTP request duration by method and path"
+    );
+    describe_gauge!(
+        "smg_http_inflight_request_age_count",
+        "In-flight HTTP requests per age bucket (gt < age <= le, non-cumulative)"
     );
     describe_counter!(
         "smg_http_responses_total",
@@ -99,6 +225,10 @@ pub fn init_metrics() {
         "smg_worker_requests_active",
         "Currently running requests per worker"
     );
+    describe_gauge!(
+        "smg_worker_health",
+        "Worker health status (1=healthy, 0=unhealthy)"
+    );
     describe_counter!(
         "smg_worker_health_checks_total",
         "Health check results by worker_type and result"
@@ -110,6 +240,10 @@ pub fn init_metrics() {
     describe_counter!(
         "smg_worker_errors_total",
         "Worker-level errors by worker_type, connection_mode, error_type"
+    );
+    describe_gauge!(
+        "smg_manual_policy_cache_entries",
+        "Number of routing entries in manual policy cache"
     );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
@@ -247,6 +381,7 @@ pub mod metrics_labels {
     pub const ENDPOINT_COMPLETIONS: &str = "completions";
     pub const ENDPOINT_RERANK: &str = "rerank";
     pub const ENDPOINT_EMBEDDINGS: &str = "embeddings";
+    pub const ENDPOINT_CLASSIFY: &str = "classify";
 
     // Worker types
     pub const WORKER_REGULAR: &str = "regular";
@@ -309,7 +444,11 @@ pub mod metrics_labels {
     pub const ERROR_INTERNAL: &str = "internal_error";
 }
 
-/// SMG Metrics helper struct for the new layered metrics architecture
+/// SMG Metrics helper struct for the new layered metrics architecture.
+///
+/// Design principles for low overhead:
+/// - Dynamic labels use string interning (single allocation per unique value)
+/// - Static labels use the metrics crate's internal caching
 pub struct Metrics;
 
 /// Parameters for recording streaming metrics.
@@ -333,23 +472,27 @@ pub struct StreamingMetricsParams<'a> {
 }
 
 impl Metrics {
-    /// Record an HTTP request
-    pub fn record_http_request(method: &str, path: &str, status_class: &str) {
+    /// Record an HTTP request.
+    /// Here we want a metric to directly reflect user's experience ("I am sending a request")
+    /// when viewing the router as a blackbox, and is bumped immediately when the request arrives.
+    pub fn record_http_request(method: &'static str, path: &str) {
+        let path_interned = intern_string(path);
         counter!(
             "smg_http_requests_total",
-            "method" => method.to_string(),
-            "path" => path.to_string(),
-            "status" => status_class.to_string()
+            "method" => method,
+            "path" => path_interned,
         )
         .increment(1);
     }
 
-    /// Record HTTP request duration
-    pub fn record_http_duration(method: &str, path: &str, duration: Duration) {
+    /// Record HTTP request duration.
+    /// For best performance, pass static strings for method.
+    pub fn record_http_duration(method: &'static str, path: &str, duration: Duration) {
+        let path_interned = intern_string(path);
         histogram!(
             "smg_http_request_duration_seconds",
-            "method" => method.to_string(),
-            "path" => path.to_string()
+            "method" => method,
+            "path" => path_interned
         )
         .record(duration.as_secs_f64());
     }
@@ -359,17 +502,19 @@ impl Metrics {
         gauge!("smg_http_connections_active").set(count as f64);
     }
 
-    /// Record HTTP response
+    /// Record HTTP response.
     pub fn record_http_response(status_code: u16, error_code: &str) {
+        let status_str: Cow<'static, str> = status_code_to_cow(status_code);
+        let error_interned = intern_string(error_code);
         counter!(
             "smg_http_responses_total",
-            "status_code" => status_code.to_string(),
-            "error_code" => error_code.to_string()
+            "status_code" => status_str,
+            "error_code" => error_interned
         )
         .increment(1);
     }
 
-    /// Record rate limit decision
+    /// Record rate limit decision.
     pub fn record_http_rate_limit(result: &'static str) {
         counter!(
             "smg_http_rate_limit_total",
@@ -382,28 +527,35 @@ impl Metrics {
     // Layer 2: Router metrics
     // ========================================================================
 
-    /// Record a routed request
+    /// Record a routed request.
+    ///
+    /// Uses string interning for model_id to avoid repeated allocations.
+    ///
+    /// # Arguments
+    /// * `streaming` - Use `bool_to_static_str(request.stream)` or the constants
     pub fn record_router_request(
         router_type: &'static str,
         backend_type: &'static str,
         connection_mode: &'static str,
         model_id: &str,
         endpoint: &'static str,
-        streaming: bool,
+        streaming: &'static str,
     ) {
+        let model = intern_string(model_id);
         counter!(
             "smg_router_requests_total",
             "router_type" => router_type,
             "backend_type" => backend_type,
             "connection_mode" => connection_mode,
-            "model" => model_id.to_string(),
+            "model" => model,
             "endpoint" => endpoint,
-            "streaming" => streaming.to_string()
+            "streaming" => streaming
         )
         .increment(1);
     }
 
-    /// Record router request duration
+    /// Record router request duration.
+    /// Uses string interning for model_id.
     pub fn record_router_duration(
         router_type: &'static str,
         backend_type: &'static str,
@@ -412,18 +564,20 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
+        let model = intern_string(model_id);
         histogram!(
             "smg_router_request_duration_seconds",
             "router_type" => router_type,
             "backend_type" => backend_type,
             "connection_mode" => connection_mode,
-            "model" => model_id.to_string(),
+            "model" => model,
             "endpoint" => endpoint
         )
         .record(duration.as_secs_f64());
     }
 
-    /// Record a router error
+    /// Record a router error.
+    /// Uses string interning for model_id.
     pub fn record_router_error(
         router_type: &'static str,
         backend_type: &'static str,
@@ -432,19 +586,21 @@ impl Metrics {
         endpoint: &'static str,
         error_type: &'static str,
     ) {
+        let model = intern_string(model_id);
         counter!(
             "smg_router_request_errors_total",
             "router_type" => router_type,
             "backend_type" => backend_type,
             "connection_mode" => connection_mode,
-            "model" => model_id.to_string(),
+            "model" => model,
             "endpoint" => endpoint,
             "error_type" => error_type
         )
         .increment(1);
     }
 
-    /// Record pipeline stage duration (gRPC only)
+    /// Record pipeline stage duration (gRPC only).
+    /// All labels are static, so this is very fast.
     pub fn record_router_stage_duration(
         router_type: &'static str,
         stage: &'static str,
@@ -458,17 +614,20 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record upstream backend response
+    /// Record upstream backend response.
+    /// Uses static strings for common status codes and interning for error_code.
     pub fn record_router_upstream_response(
         router_type: &'static str,
         status_code: u16,
         error_code: &str,
     ) {
+        let status_str: Cow<'static, str> = status_code_to_cow(status_code);
+        let error_interned = intern_string(error_code);
         counter!(
             "smg_router_upstream_responses_total",
             "router_type" => router_type,
-            "status_code" => status_code.to_string(),
-            "error_code" => error_code.to_string()
+            "status_code" => status_str,
+            "error_code" => error_interned
         )
         .increment(1);
     }
@@ -477,7 +636,8 @@ impl Metrics {
     // Layer 2: Router inference metrics (gRPC only)
     // ========================================================================
 
-    /// Record time to first token
+    /// Record time to first token.
+    /// Uses string interning for model_id.
     pub fn record_router_ttft(
         router_type: &'static str,
         backend_type: &'static str,
@@ -485,11 +645,12 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
+        let model = intern_string(model_id);
         histogram!(
             "smg_router_ttft_seconds",
             "router_type" => router_type,
             "backend_type" => backend_type,
-            "model" => model_id.to_string(),
+            "model" => model,
             "endpoint" => endpoint
         )
         .record(duration.as_secs_f64());
@@ -503,11 +664,12 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
+        let model = intern_string(model_id);
         histogram!(
             "smg_router_tpot_seconds",
             "router_type" => router_type,
             "backend_type" => backend_type,
-            "model" => model_id.to_string(),
+            "model" => model,
             "endpoint" => endpoint
         )
         .record(duration.as_secs_f64());
@@ -522,18 +684,20 @@ impl Metrics {
         token_type: &'static str,
         count: u64,
     ) {
+        let model = intern_string(model_id);
         counter!(
             "smg_router_tokens_total",
             "router_type" => router_type,
             "backend_type" => backend_type,
-            "model" => model_id.to_string(),
+            "model" => model,
             "endpoint" => endpoint,
             "token_type" => token_type
         )
         .increment(count);
     }
 
-    /// Record total generation duration
+    /// Record total generation duration.
+    /// Uses string interning for model_id.
     pub fn record_router_generation_duration(
         router_type: &'static str,
         backend_type: &'static str,
@@ -541,11 +705,12 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
+        let model = intern_string(model_id);
         histogram!(
             "smg_router_generation_duration_seconds",
             "router_type" => router_type,
             "backend_type" => backend_type,
-            "model" => model_id.to_string(),
+            "model" => model,
             "endpoint" => endpoint
         )
         .record(duration.as_secs_f64());
@@ -566,9 +731,9 @@ impl Metrics {
             input_tokens,
             output_tokens,
         } = params;
-        // metrics-rs requires owned strings for dynamic labels (uses Cow<'static, str>).
-        // We allocate once and clone for each metric - unavoidable with this API.
-        let model = model_id.to_string();
+
+        // Intern model string once - Arc::clone is just a ref count increment
+        let model = intern_string(model_id);
 
         // TTFT and TPOT (only if we have a first token time)
         if let Some(ttft_duration) = ttft {
@@ -576,7 +741,7 @@ impl Metrics {
                 "smg_router_ttft_seconds",
                 "router_type" => router_type,
                 "backend_type" => backend_type,
-                "model" => model.clone(),
+                "model" => Arc::clone(&model),
                 "endpoint" => endpoint
             )
             .record(ttft_duration.as_secs_f64());
@@ -589,19 +754,19 @@ impl Metrics {
                     "smg_router_tpot_seconds",
                     "router_type" => router_type,
                     "backend_type" => backend_type,
-                    "model" => model.clone(),
+                    "model" => Arc::clone(&model),
                     "endpoint" => endpoint
                 )
                 .record(tpot.as_secs_f64());
             }
         }
 
-        // Generation duration
+        // Generation duration (always recorded)
         histogram!(
             "smg_router_generation_duration_seconds",
             "router_type" => router_type,
             "backend_type" => backend_type,
-            "model" => model.clone(),
+            "model" => Arc::clone(&model),
             "endpoint" => endpoint
         )
         .record(generation_duration.as_secs_f64());
@@ -612,14 +777,14 @@ impl Metrics {
                 "smg_router_tokens_total",
                 "router_type" => router_type,
                 "backend_type" => backend_type,
-                "model" => model.clone(),
+                "model" => Arc::clone(&model),
                 "endpoint" => endpoint,
                 "token_type" => metrics_labels::TOKEN_INPUT
             )
             .increment(input);
         }
 
-        // Output tokens
+        // Output tokens (always recorded - move model on final use)
         counter!(
             "smg_router_tokens_total",
             "router_type" => router_type,
@@ -642,11 +807,12 @@ impl Metrics {
         model_id: &str,
         size: usize,
     ) {
+        let model = intern_string(model_id);
         gauge!(
             "smg_worker_pool_size",
             "worker_type" => worker_type,
             "connection_mode" => connection_mode,
-            "model" => model_id.to_string()
+            "model" => model
         )
         .set(size as f64);
     }
@@ -682,11 +848,12 @@ impl Metrics {
         model_id: &str,
         policy: &'static str,
     ) {
+        let model = intern_string(model_id);
         counter!(
             "smg_worker_selection_total",
             "worker_type" => worker_type,
             "connection_mode" => connection_mode,
-            "model" => model_id.to_string(),
+            "model" => model,
             "policy" => policy
         )
         .increment(1);
@@ -707,13 +874,56 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record manual policy execution branch for routing decisions
+    pub fn record_worker_manual_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_manual_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Set manual policy cache entries count
+    pub fn set_manual_policy_cache_entries(count: usize) {
+        gauge!("smg_manual_policy_cache_entries").set(count as f64);
+    }
+
+    /// Record consistent hashing policy execution branch for routing decisions
+    pub fn record_worker_consistent_hashing_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_consistent_hashing_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Record prefix hash policy execution branch for routing decisions
+    pub fn record_worker_prefix_hash_policy_branch(branch: &'static str) {
+        counter!(
+            "smg_prefix_hash_policy_branch_total",
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
     /// Set running requests per worker
     pub fn set_worker_requests_active(worker: &str, count: usize) {
+        let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_requests_active",
-            "worker" => worker.to_string()
+            "worker" => worker_interned
         )
         .set(count as f64);
+    }
+
+    /// Set worker health status
+    pub fn set_worker_health(worker_url: &str, healthy: bool) {
+        let worker_interned = intern_string(worker_url);
+        gauge!(
+            "smg_worker_health",
+            "worker" => worker_interned
+        )
+        .set(if healthy { 1.0 } else { 0.0 });
     }
 
     // ========================================================================
@@ -722,18 +932,20 @@ impl Metrics {
 
     /// Set circuit breaker state (0=closed, 1=open, 2=half_open)
     pub fn set_worker_cb_state(worker: &str, state_code: u8) {
+        let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_cb_state",
-            "worker" => worker.to_string()
+            "worker" => worker_interned
         )
         .set(state_code as f64);
     }
 
     /// Record circuit breaker state transition
     pub fn record_worker_cb_transition(worker: &str, from: &'static str, to: &'static str) {
+        let worker_interned = intern_string(worker);
         counter!(
             "smg_worker_cb_transitions_total",
-            "worker" => worker.to_string(),
+            "worker" => worker_interned,
             "from" => from,
             "to" => to
         )
@@ -742,9 +954,10 @@ impl Metrics {
 
     /// Record circuit breaker outcome
     pub fn record_worker_cb_outcome(worker: &str, outcome: &'static str) {
+        let worker_interned = intern_string(worker);
         counter!(
             "smg_worker_cb_outcomes_total",
-            "worker" => worker.to_string(),
+            "worker" => worker_interned,
             "outcome" => outcome
         )
         .increment(1);
@@ -752,18 +965,20 @@ impl Metrics {
 
     /// Set circuit breaker consecutive failures
     pub fn set_worker_cb_consecutive_failures(worker: &str, count: u32) {
+        let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_cb_consecutive_failures",
-            "worker" => worker.to_string()
+            "worker" => worker_interned
         )
         .set(count as f64);
     }
 
     /// Set circuit breaker consecutive successes
     pub fn set_worker_cb_consecutive_successes(worker: &str, count: u32) {
+        let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_cb_consecutive_successes",
-            "worker" => worker.to_string()
+            "worker" => worker_interned
         )
         .set(count as f64);
     }
@@ -792,11 +1007,19 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Record retry backoff duration
+    /// Record retry backoff duration.
     pub fn record_worker_retry_backoff(attempt: u32, duration: Duration) {
+        let attempt_str: Cow<'static, str> = match attempt {
+            1 => Cow::Borrowed("1"),
+            2 => Cow::Borrowed("2"),
+            3 => Cow::Borrowed("3"),
+            4 => Cow::Borrowed("4"),
+            5 => Cow::Borrowed("5"),
+            _ => Cow::Owned(attempt.to_string()),
+        };
         histogram!(
             "smg_worker_retry_backoff_seconds",
-            "attempt" => attempt.to_string()
+            "attempt" => attempt_str
         )
         .record(duration.as_secs_f64());
     }
@@ -849,10 +1072,12 @@ impl Metrics {
 
     /// Record MCP tool call
     pub fn record_mcp_tool_call(model_id: &str, tool_name: &str, result: &'static str) {
+        let model = intern_string(model_id);
+        let tool = intern_string(tool_name);
         counter!(
             "smg_mcp_tool_calls_total",
-            "model" => model_id.to_string(),
-            "tool_name" => tool_name.to_string(),
+            "model" => model,
+            "tool_name" => tool,
             "result" => result
         )
         .increment(1);
@@ -860,10 +1085,12 @@ impl Metrics {
 
     /// Record MCP tool execution duration
     pub fn record_mcp_tool_duration(model_id: &str, tool_name: &str, duration: Duration) {
+        let model = intern_string(model_id);
+        let tool = intern_string(tool_name);
         histogram!(
             "smg_mcp_tool_duration_seconds",
-            "model" => model_id.to_string(),
-            "tool_name" => tool_name.to_string()
+            "model" => model,
+            "tool_name" => tool
         )
         .record(duration.as_secs_f64());
     }
@@ -875,9 +1102,10 @@ impl Metrics {
 
     /// Record MCP tool loop iteration
     pub fn record_mcp_tool_iteration(model_id: &str) {
+        let model = intern_string(model_id);
         counter!(
             "smg_mcp_tool_iterations_total",
-            "model" => model_id.to_string()
+            "model" => model
         )
         .increment(1);
     }
@@ -931,6 +1159,24 @@ impl Metrics {
             "storage_type" => storage_type
         )
         .increment(1);
+    }
+
+    // ========================================================================
+    // Worker cleanup
+    // ========================================================================
+
+    pub fn remove_worker_metrics(worker_url: &str) {
+        // Intern once, clone (cheap) for each metric
+        let worker = intern_string(worker_url);
+
+        gauge!("smg_worker_cb_consecutive_failures", "worker" => Arc::clone(&worker)).set(0.0);
+        gauge!("smg_worker_cb_consecutive_successes", "worker" => Arc::clone(&worker)).set(0.0);
+        gauge!("smg_worker_requests_active", "worker" => Arc::clone(&worker)).set(0.0);
+
+        // Zero for these metrics have special valid meaning, thus we set to -1 temporarily
+        // (and will remove them completely after https://github.com/metrics-rs/metrics/issues/653)
+        gauge!("smg_worker_cb_state", "worker" => Arc::clone(&worker)).set(-1.0);
+        gauge!("smg_worker_health", "worker" => worker).set(-1.0);
     }
 }
 
@@ -1170,5 +1416,88 @@ mod tests {
         let socket_addr = SocketAddr::new(ip_addr, config.port);
 
         assert_eq!(socket_addr.to_string(), "127.0.0.1:29000");
+    }
+
+    // ========================================================================
+    // String interning tests
+    // ========================================================================
+
+    #[test]
+    fn test_intern_string_returns_same_arc() {
+        let s1 = intern_string("test_model");
+        let s2 = intern_string("test_model");
+
+        // Should return the same Arc (pointer equality)
+        assert!(Arc::ptr_eq(&s1, &s2));
+        assert_eq!(&*s1, "test_model");
+    }
+
+    #[test]
+    fn test_intern_string_different_strings() {
+        let s1 = intern_string("model_a");
+        let s2 = intern_string("model_b");
+
+        // Different strings should have different Arcs
+        assert!(!Arc::ptr_eq(&s1, &s2));
+        assert_eq!(&*s1, "model_a");
+        assert_eq!(&*s2, "model_b");
+    }
+
+    #[test]
+    fn test_intern_string_empty() {
+        let s1 = intern_string("");
+        let s2 = intern_string("");
+
+        assert!(Arc::ptr_eq(&s1, &s2));
+        assert_eq!(&*s1, "");
+    }
+
+    #[test]
+    fn test_interner_size_grows() {
+        let initial_size = interner_size();
+
+        // Intern some unique strings
+        let unique = format!("unique_test_string_{}", initial_size);
+        intern_string(&unique);
+
+        assert!(interner_size() > initial_size);
+    }
+
+    #[test]
+    fn test_bool_to_static_str() {
+        assert_eq!(bool_to_static_str(true), "true");
+        assert_eq!(bool_to_static_str(false), "false");
+    }
+
+    #[test]
+    fn test_status_code_to_static_str() {
+        // Common codes should return static strings
+        assert_eq!(status_code_to_static_str(200), Some("200"));
+        assert_eq!(status_code_to_static_str(404), Some("404"));
+        assert_eq!(status_code_to_static_str(500), Some("500"));
+
+        // Uncommon codes should return None
+        assert_eq!(status_code_to_static_str(418), None);
+        assert_eq!(status_code_to_static_str(999), None);
+    }
+
+    #[test]
+    fn test_status_code_to_cow() {
+        // Common codes should be borrowed
+        let cow_200 = status_code_to_cow(200);
+        assert!(matches!(cow_200, Cow::Borrowed(_)));
+        assert_eq!(cow_200, "200");
+
+        // Uncommon codes should be owned
+        let cow_418 = status_code_to_cow(418);
+        assert!(matches!(cow_418, Cow::Owned(_)));
+        assert_eq!(cow_418, "418");
+    }
+
+    #[test]
+    fn test_method_to_static_str() {
+        assert_eq!(method_to_static_str("GET"), "GET");
+        assert_eq!(method_to_static_str("POST"), "POST");
+        assert_eq!(method_to_static_str("UNKNOWN"), "OTHER");
     }
 }

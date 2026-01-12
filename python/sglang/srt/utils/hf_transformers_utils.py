@@ -68,6 +68,7 @@ from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
+from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     ChatGLMConfig,
@@ -125,7 +126,7 @@ def get_hf_text_config(config: PretrainedConfig):
             # read the wrong values from the unused default text_config.
             # NOTE(HandH1998): We set `torch_dtype` of config to `torch.float16` for the weights, as
             # `torch.float16` is default used for image features in `python/sglang/srt/models/llava.py`.
-            setattr(config, "torch_dtype", torch.float16)
+            setattr(config, "dtype", torch.float16)
             return config
 
     if hasattr(config, "text_config"):
@@ -232,6 +233,17 @@ def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
     )
 
 
+def _override_deepseek_ocr_v_head_dim(config: DeepseekVLV2Config) -> None:
+    # FIXME: deepseek-ocr's v_head_dim is set to 0 in its config file.
+    # https://huggingface.co/deepseek-ai/DeepSeek-OCR/blob/main/config.json#L116
+    if config.text_config.v_head_dim == 0:
+        V_HEAD_DIM_PATCH = 128
+        config.text_config.v_head_dim = V_HEAD_DIM_PATCH
+        logger.warning(
+            f"Overriding deepseek-ocr's v_head_dim from 0 to {V_HEAD_DIM_PATCH} to avoid potential issues."
+        )
+
+
 @lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
@@ -303,6 +315,10 @@ def get_config(
                 model_type = "deepseek-ocr"
         config_class = _CONFIG_REGISTRY[model_type]
         config = config_class.from_pretrained(model, revision=revision)
+
+        if _is_deepseek_ocr_model(config):
+            _override_deepseek_ocr_v_head_dim(config)
+
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
 
@@ -486,6 +502,7 @@ def get_tokenizer(
         )
 
     attach_additional_stop_token_ids(tokenizer)
+    tokenizer = patch_tokenizer(tokenizer)
     return tokenizer
 
 
