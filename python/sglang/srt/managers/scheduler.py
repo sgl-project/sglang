@@ -1092,9 +1092,9 @@ class Scheduler(
 
         import os
         enable_profiling: bool = os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
-        prof_bs: int = os.getenv("PROFILING_BS", 8)
+        prof_bs: int = int(os.getenv("PROFILING_BS", 8))
         profiling_stage: str = os.getenv("PROFILING_STAGE", "decode")
-        prof_step: int = os.getenv("PROFILING_step", 10)
+        prof_step: int = int(os.getenv("PROFILING_step", 10))
         if enable_profiling:
             prof_cnt = 0
             import torch_npu
@@ -1144,7 +1144,7 @@ class Scheduler(
                     is_prof_stage = False
                     if (profiling_stage == "decode" and batch.forward_mode.is_decode()) or (profiling_stage == "prefill" and batch.forward_mode.is_extend()):
                         is_prof_stage = True
-                    
+
                     if len(batch.reqs) >= prof_bs and prof_cnt == 0 and is_prof_stage:
                         prof.start()
                         prof_cnt += 1
