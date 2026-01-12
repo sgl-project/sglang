@@ -425,6 +425,11 @@ pub enum PolicyConfig {
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },
+
+    /// Least load policy
+    /// Selects the worker with the lowest load among all healthy workers.
+    #[serde(rename = "least_load")]
+    LeastLoad,
 }
 
 fn default_prefix_token_count() -> usize {
@@ -454,6 +459,7 @@ impl PolicyConfig {
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
+            PolicyConfig::LeastLoad => "least_load",
         }
     }
 }
