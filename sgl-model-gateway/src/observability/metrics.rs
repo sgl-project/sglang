@@ -497,15 +497,6 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    pub fn set_inflight_request_age_count(gt: &'static str, le: &'static str, count: usize) {
-        gauge!(
-            "smg_http_inflight_request_age_count",
-            "gt" => gt,
-            "le" => le
-        )
-        .set(count as f64);
-    }
-
     /// Set active HTTP connections count
     pub fn set_http_connections_active(count: usize) {
         gauge!("smg_http_connections_active").set(count as f64);
