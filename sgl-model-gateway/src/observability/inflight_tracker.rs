@@ -8,16 +8,15 @@ use std::{
 
 use dashmap::DashMap;
 
-use super::gauge_histogram::{BucketLabels, GaugeHistogram};
+use super::gauge_histogram::{BucketBounds, GaugeHistogramHandle, GaugeHistogramVec};
 use crate::policies::utils::PeriodicTask;
 
-const INFLIGHT_AGE_BUCKET_BOUNDS: &[u64] =
-    &[30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400];
-static INFLIGHT_AGE_BUCKETS: LazyLock<BucketLabels> =
-    LazyLock::new(|| BucketLabels::new(INFLIGHT_AGE_BUCKET_BOUNDS));
-static INFLIGHT_AGE_GAUGE: LazyLock<GaugeHistogram> = LazyLock::new(|| {
-    GaugeHistogram::new("smg_http_inflight_request_age_count", &INFLIGHT_AGE_BUCKETS)
-});
+static INFLIGHT_AGE_BOUNDS: BucketBounds<11> =
+    BucketBounds::new([30, 60, 180, 300, 600, 1200, 3600, 7200, 14400, 28800, 86400]);
+static INFLIGHT_AGE_HISTOGRAM: GaugeHistogramVec<11> =
+    GaugeHistogramVec::new("smg_http_inflight_request_age_count", &INFLIGHT_AGE_BOUNDS);
+static INFLIGHT_AGE_HANDLE: LazyLock<GaugeHistogramHandle> =
+    LazyLock::new(|| INFLIGHT_AGE_HISTOGRAM.register_no_labels());
 
 pub struct InFlightRequestTracker {
     requests: DashMap<u64, Instant>,
@@ -69,7 +68,8 @@ impl InFlightRequestTracker {
 
     fn sample_and_record(&self) {
         let ages = self.collect_ages();
-        INFLIGHT_AGE_GAUGE.set_by_current_observations(&ages);
+        let counts = INFLIGHT_AGE_BOUNDS.compute_counts(&ages);
+        INFLIGHT_AGE_HANDLE.set_counts(&counts);
     }
 }
 
