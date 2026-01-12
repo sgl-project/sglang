@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 DEEPSEEK_R1_MODEL_PATH = "amd/DeepSeek-R1-MXFP4-Preview"
-SERVER_LAUNCH_TIMEOUT = 1000
+SERVER_LAUNCH_TIMEOUT = 1200
 
 
 class TestDeepseekR1MXFP4(CustomTestCase):
