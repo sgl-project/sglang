@@ -214,16 +214,12 @@ class GptOssDetector(BaseReasoningFormatDetector):
             [e.content for e in events if e.event_type == "reasoning"]
         )
         normal_parts = []
-        # Check if there's any reasoning content
-        has_reasoning = any(e.event_type == "reasoning" for e in events)
 
         for e in events:
             if e.event_type == "normal":
                 normal_parts.append(e.content)
             elif e.event_type == "tool_call":
-                # Only preserve tool_call in normal_text if there's NO reasoning content
-                # This allows function_call detector to parse pure tool calls
-                # but avoids duplication when tool calls appear after reasoning
+                # Use raw_text to preserve structural markers for function call detector
                 normal_parts.append(e.raw_text if e.raw_text else e.content)
         normal_text = "".join(normal_parts)
 
@@ -239,16 +235,12 @@ class GptOssDetector(BaseReasoningFormatDetector):
             [e.content for e in events if e.event_type == "reasoning"]
         )
         normal_parts = []
-        # Check if there's any reasoning content
-        has_reasoning = any(e.event_type == "reasoning" for e in events)
 
         for e in events:
             if e.event_type == "normal":
                 normal_parts.append(e.content)
             elif e.event_type == "tool_call":
-                # Only preserve tool_call in normal_text if there's NO reasoning content
-                # This allows function_call detector to parse pure tool calls
-                # but avoids duplication when tool calls appear after reasoning
+                # Use raw_text to preserve structural markers for function call detector
                 normal_parts.append(e.raw_text if e.raw_text else e.content)
         normal_text = "".join(normal_parts)
 

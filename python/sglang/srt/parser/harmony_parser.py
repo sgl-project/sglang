@@ -615,6 +615,8 @@ class EndMarkerOnlyStrategy:
 class HarmonyParser:
     """Facade for parsing Harmony format, switching between strategies."""
 
+    _COMMENTARY_FILTER_HISTORY_WINDOW = 5
+
     def __init__(self):
         self.strategy = None
         self._buffer = SemanticBuffer()
@@ -739,7 +741,7 @@ class HarmonyParser:
         """
         # Check the last few events in history (most recent ones first)
         # We only need to check a small window to avoid expensive full scans
-        check_limit = min(5, len(history))
+        check_limit = min(self._COMMENTARY_FILTER_HISTORY_WINDOW, len(history))
 
         for event in reversed(history[-check_limit:]):
             if event.event_type == "tool_call":
