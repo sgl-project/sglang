@@ -31,6 +31,21 @@ from sglang.test.test_utils import (
 # Register for AMD CI - GSM8K 2-GPU evaluation tests (~30 min)
 register_amd_ci(est_time=1800, suite="nightly-amd-accuracy-2-gpu", nightly=True)
 
+# Models known to fail on AMD - not cached locally or other issues
+FAILING_MODELS = {
+    # Models not cached locally on CI runner
+    "Qwen/Qwen2-57B-A14B-Instruct",  # Not cached locally
+    "Qwen/Qwen3-30B-A3B-Thinking-2507",  # Not cached locally
+    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8",  # Not cached locally
+    "neuralmagic/Qwen2-72B-Instruct-FP8",  # Not cached locally
+}
+
+
+def remove_failing_models(models_list):
+    """Remove models known to fail on AMD from the test list."""
+    return [m for m in models_list if m not in FAILING_MODELS]
+
+
 MODEL_SCORE_THRESHOLDS = {
     # Llama 3.1 series
     "meta-llama/Llama-3.1-70B-Instruct": 0.95,
@@ -48,7 +63,7 @@ MODEL_SCORE_THRESHOLDS = {
 }
 
 # 2-GPU models (TP=2) - models that require 2 GPUs
-TP2_MODELS = [
+_TP2_MODELS_ALL = [
     "meta-llama/Llama-3.1-70B-Instruct",
     "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "Qwen/Qwen2-57B-A14B-Instruct",
@@ -58,6 +73,9 @@ TP2_MODELS = [
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8",
     "Qwen/Qwen3-30B-A3B-Thinking-2507",
 ]
+
+# Filter out models that aren't cached locally
+TP2_MODELS = remove_failing_models(_TP2_MODELS_ALL)
 
 NO_MOE_PADDING_MODELS = {"neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8"}
 DISABLE_HF_XET_MODELS = {

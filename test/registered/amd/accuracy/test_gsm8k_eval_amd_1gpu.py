@@ -56,6 +56,12 @@ MODEL_SCORE_THRESHOLDS = {
 FAILING_MODELS = {
     "google/gemma-2-9b-it",  # OOM on single GPU (exit code -9)
     "neuralmagic/gemma-2-2b-it-FP8",  # OOM on single GPU (exit code -9)
+    # Models not cached locally on CI runner
+    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8",  # Not cached locally
+    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8",  # Not cached locally
+    "meta-llama/Llama-3.2-3B-Instruct",  # Not cached locally
+    "Qwen/Qwen2.5-7B-Instruct",  # Not cached locally
+    "Qwen/Qwen3-8B",  # Not cached locally
 }
 
 # 1-GPU models (TP=1) - models that fit on a single GPU
