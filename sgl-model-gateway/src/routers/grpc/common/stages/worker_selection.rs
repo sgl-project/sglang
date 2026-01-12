@@ -127,10 +127,10 @@ impl PipelineStage for WorkerSelectionStage {
             if let WorkerSelection::Dual { prefill, decode } = &workers {
                 match &mut ctx.input.request_type {
                     RequestType::Generate(req_arc) => {
-                        let text_length = (*req_arc).text
-                        .as_ref()
-                        .map(|text_str| text_str.len())
-                        .unwrap_or(0);
+                        let text_length = req_arc.text
+                            .as_ref()
+                            .map(|text_str| text_str.len())
+                            .unwrap_or(0);
                         let text_length = text_length
                             .try_into()
                             .map_err(|e| {
@@ -156,8 +156,13 @@ impl PipelineStage for WorkerSelectionStage {
                             error::internal_error("preparation_not_completed", "Preparation not completed")
                         })?;
                         let text = prep.processed_messages.as_ref().unwrap().text.clone();
+                        let text_len = text.chars().count().try_into()
+                            .map_err(|e| {
+                                error!("Failed to convert chat text length to size:{}", e);
+                                error::internal_error("dp_rank_selection_failed", format!("{}", e))
+                            })?;
                         let (prefill_rank, decode_rank) =
-                            self.select_data_parallel_rank(prefill.as_ref(), decode.as_ref(), text.chars().count().try_into().unwrap())
+                            self.select_data_parallel_rank(prefill.as_ref(), decode.as_ref(), text_len)
                                 .await.map_err(|e| {
                                     error!("select data_parallel_rank failed: {}", e);
                                     error::internal_error("dp_rank_selection_failed", e,)
