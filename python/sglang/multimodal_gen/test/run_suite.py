@@ -145,13 +145,9 @@ def run_pytest(files, filter_expr=None):
         sys.executable,
         "-m",
         "pytest",
-        "-s",  # Don't capture stdout/stderr
+        "-s",  # Don't capture stdout/stderr (shows all print statements)
         "-v",  # Verbose output
-        "--tb=long",  # Show full traceback
-        "--log-cli=true",  # Enable live logging
-        "--log-cli-level=INFO",  # Set log level to INFO
-        "--log-cli-format=%(asctime)s [%(levelname)8s] %(name)s: %(message)s",  # Log format
-        "--log-cli-date-format=%Y-%m-%d %H:%M:%S",  # Date format
+        "--tb=long",  # Show full traceback for better error visibility
     ]
 
     # Add pytest -k filter if provided
