@@ -7,12 +7,14 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from collections.abc import Generator
 from pathlib import Path
 
 import filelock
 import huggingface_hub.constants
 import torch
+from safetensors import SafetensorError
 from safetensors.torch import safe_open
 from tqdm.auto import tqdm
 
@@ -127,28 +129,87 @@ def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[s
 _BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
 
 
-def _validate_safetensors_file(file_path: str) -> bool:
+def _is_corruption_error(e: Exception) -> bool:
+    """
+    Determine if an exception indicates true file corruption vs temporary issues.
+
+    Args:
+        e: The exception to check
+
+    Returns:
+        True if the error indicates actual file corruption, False if it might be temporary
+    """
+    # SafetensorError from the library indicates actual parsing/validation failure
+    if isinstance(e, SafetensorError):
+        return True
+
+    # Check error message for corruption indicators
+    error_msg = str(e).lower()
+    corruption_indicators = ["invalid", "corrupt", "malformed", "truncated", "checksum"]
+    return any(indicator in error_msg for indicator in corruption_indicators)
+
+
+def _validate_safetensors_file(
+    file_path: str, max_retries: int = 3, retry_delay: float = 0.5
+) -> bool:
     """
     Validate that a safetensors file is readable and not corrupted.
 
+    This function includes retry logic to handle temporary I/O issues that may occur
+    in multi-process environments where multiple workers access the same files.
+
     Args:
         file_path: Path to the safetensors file
+        max_retries: Maximum number of retry attempts for temporary errors
+        retry_delay: Initial delay between retries in seconds (exponential backoff)
 
     Returns:
         True if file is valid, False if corrupted
     """
-    try:
-        with safe_open(file_path, framework="pt", device="cpu") as f:
-            _ = list(f.keys())
-        return True
-    except Exception as e:
-        logger.error(
-            "Corrupted safetensors file detected: %s - %s: %s",
-            file_path,
-            type(e).__name__,
-            str(e),
-        )
-        return False
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            with safe_open(file_path, framework="pt", device="cpu") as f:
+                _ = list(f.keys())
+            return True
+        except Exception as e:
+            last_exception = e
+
+            # If it's a true corruption error, don't retry
+            if _is_corruption_error(e):
+                logger.error(
+                    "Corrupted safetensors file detected: %s - %s: %s",
+                    file_path,
+                    type(e).__name__,
+                    str(e),
+                )
+                return False
+
+            # For temporary errors (OSError, IOError, etc.), retry with backoff
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2**attempt)
+                logger.warning(
+                    "Temporary error validating safetensors file %s (attempt %d/%d): %s: %s. "
+                    "Retrying in %.1fs...",
+                    os.path.basename(file_path),
+                    attempt + 1,
+                    max_retries,
+                    type(e).__name__,
+                    str(e),
+                    wait_time,
+                )
+                time.sleep(wait_time)
+
+    # All retries exhausted
+    logger.error(
+        "Failed to validate safetensors file after %d attempts: %s - %s: %s",
+        max_retries,
+        file_path,
+        type(last_exception).__name__,
+        str(last_exception),
+    )
+    return False
 
 
 def safetensors_weights_iterator(
@@ -170,33 +231,56 @@ def safetensors_weights_iterator(
     ]
 
     if corrupted_files:
-        # Delete corrupted files (both symlink and blob if applicable)
-        for file_path in corrupted_files:
-            try:
-                if os.path.islink(file_path):
-                    blob_path = os.path.realpath(file_path)
-                    os.remove(file_path)
-                    logger.info(
-                        "Removed corrupted symlink: %s", os.path.basename(file_path)
-                    )
-                    if os.path.exists(blob_path):
-                        os.remove(blob_path)
-                        logger.info(
-                            "Removed corrupted blob: %s", os.path.basename(blob_path)
-                        )
-                elif os.path.isfile(file_path):
-                    os.remove(file_path)
-                    logger.info(
-                        "Removed corrupted file: %s", os.path.basename(file_path)
-                    )
-            except Exception as e:
-                logger.warning("Failed to remove corrupted file %s: %s", file_path, e)
-
-        raise RuntimeError(
-            f"Found {len(corrupted_files)} corrupted safetensors file(s). "
-            f"Files have been removed: {[os.path.basename(f) for f in corrupted_files]}. "
-            "Please retry - the files will be re-downloaded automatically."
+        # Only rank 0 should delete files to avoid race conditions in multi-GPU setup
+        is_rank_0 = (
+            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
         )
+
+        if is_rank_0:
+            # Delete corrupted files (both symlink and blob if applicable)
+            for file_path in corrupted_files:
+                try:
+                    if os.path.islink(file_path):
+                        blob_path = os.path.realpath(file_path)
+                        os.remove(file_path)
+                        logger.info(
+                            "Removed corrupted symlink: %s", os.path.basename(file_path)
+                        )
+                        if os.path.exists(blob_path):
+                            os.remove(blob_path)
+                            logger.info(
+                                "Removed corrupted blob: %s",
+                                os.path.basename(blob_path),
+                            )
+                    elif os.path.isfile(file_path):
+                        os.remove(file_path)
+                        logger.info(
+                            "Removed corrupted file: %s", os.path.basename(file_path)
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to remove corrupted file %s: %s", file_path, e
+                    )
+
+            raise RuntimeError(
+                f"Found {len(corrupted_files)} corrupted safetensors file(s). "
+                f"Files have been removed: {[os.path.basename(f) for f in corrupted_files]}. "
+                "Please retry - the files will be re-downloaded automatically."
+            )
+        else:
+            # Non-rank-0 workers just log and raise without deleting
+            logger.error(
+                "Found %d corrupted safetensors file(s) on rank %d: %s. "
+                "Rank 0 will handle file cleanup.",
+                len(corrupted_files),
+                torch.distributed.get_rank(),
+                [os.path.basename(f) for f in corrupted_files],
+            )
+            raise RuntimeError(
+                f"Found {len(corrupted_files)} corrupted safetensors file(s): "
+                f"{[os.path.basename(f) for f in corrupted_files]}. "
+                "Please retry - the files will be re-downloaded automatically."
+            )
 
     if use_runai_model_streamer:
         with SafetensorsStreamer() as streamer:
