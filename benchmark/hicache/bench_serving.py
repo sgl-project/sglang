@@ -441,10 +441,10 @@ async def benchmark(
     assert inputs_requests_queue.empty()
 
     # Flush cache
-    if "sglang" in backend:
-        requests.post(base_url + "/flush_cache")
+    # if "sglang" in backend:
+    #     requests.post(base_url + "/flush_cache")
 
-    time.sleep(1.0)
+    # time.sleep(1.0)
 
     # Start profiler
     if profile:
