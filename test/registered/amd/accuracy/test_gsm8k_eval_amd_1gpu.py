@@ -29,7 +29,7 @@ from sglang.test.test_utils import (
 )
 
 # Register for AMD CI - GSM8K 1-GPU evaluation tests (~30 min)
-register_amd_ci(est_time=1800, suite="nightly-amd-1-gpu-accuracy", nightly=True)
+register_amd_ci(est_time=1800, suite="nightly-amd-accuracy-1-gpu", nightly=True)
 
 MODEL_SCORE_THRESHOLDS = {
     # Llama 3.1 series

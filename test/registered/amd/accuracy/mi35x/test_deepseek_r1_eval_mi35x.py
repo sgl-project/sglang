@@ -32,13 +32,11 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-# Register for AMD CI - MI35x DeepSeek-R1 accuracy tests (~120 min)
-# Disabled: Only MXFP4 version runs on MI35x (see test_deepseek_r1_mxfp4_eval_mi35x.py)
+# Register for AMD CI - MI35x DeepSeek-R1-0528 accuracy tests (~120 min)
 register_amd_ci(
     est_time=7200,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-r1",
+    suite="nightly-amd-accuracy-8-gpu-mi35x-deepseek-r1",
     nightly=True,
-    disabled="Only MXFP4 version runs on MI35x",
 )
 
 INVALID = -9999999

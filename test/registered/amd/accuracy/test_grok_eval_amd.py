@@ -27,8 +27,14 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-# Register for AMD CI - GROK accuracy tests (~45 min)
-register_amd_ci(est_time=2700, suite="nightly-amd-8-gpu-grok", nightly=True)
+# DISABLED: Split into individual files for each model variant
+# See: test_grok1_fp8_eval_amd.py, test_grok1_int4_eval_amd.py, test_grok2_eval_amd.py
+register_amd_ci(
+    est_time=2700,
+    suite="nightly-amd-8-gpu-grok",
+    nightly=True,
+    disabled="Split into test_grok1_fp8_eval_amd.py, test_grok1_int4_eval_amd.py, test_grok2_eval_amd.py",
+)
 
 INVALID = -9999999
 

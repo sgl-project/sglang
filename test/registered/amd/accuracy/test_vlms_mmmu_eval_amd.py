@@ -35,7 +35,7 @@ from sglang.test.test_utils import (
 )
 
 # Register for AMD CI - VLM MMMU evaluation tests (~120 min)
-register_amd_ci(est_time=7200, suite="nightly-amd-vlm", nightly=True)
+register_amd_ci(est_time=7200, suite="nightly-amd-accuracy-2-gpu-vlm", nightly=True)
 
 # AMD-verified VLM models with conservative thresholds on 100 MMMU samples
 # Format: (model_path, tp_size, accuracy_threshold, extra_args)
