@@ -36,7 +36,9 @@ class DFlashDraftInput(SpecInput):
     verified_id: torch.Tensor
 
     # Flattened context features for tokens that need to be appended into the draft cache.
-    # Shape: [sum(ctx_lens), num_draft_layers * hidden_size]
+    # Shape: [sum(ctx_lens), K * hidden_size], where K is the number of target-layer
+    # hidden-state features concatenated per token (len(dflash_config.target_layer_ids),
+    # or default K == draft_num_layers for existing checkpoints).
     target_hidden: torch.Tensor
 
     # Context lengths on CPU, one per request. Used to slice `target_hidden`.

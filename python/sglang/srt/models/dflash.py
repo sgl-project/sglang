@@ -20,6 +20,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.speculative.dflash_utils import get_dflash_config
 
 logger = logging.getLogger(__name__)
 
@@ -189,20 +190,38 @@ class DFlashDraftModel(nn.Module):
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
+        dflash_cfg_dict = get_dflash_config(config)
+
         self.layers = nn.ModuleList(
             [DFlashDecoderLayer(config=config, layer_id=i) for i in range(num_layers)]
         )
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         # Project per-token target context features:
-        # concat(num_layers * hidden_size) -> hidden_size
-        self.fc = nn.Linear(num_layers * hidden_size, hidden_size, bias=False)
+        # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
+        # feature tensors concatenated per token (not necessarily equal to num_layers).
+        target_layer_ids = dflash_cfg_dict.get("target_layer_ids", None)
+        if target_layer_ids is None:
+            num_context_features = num_layers
+        else:
+            if not isinstance(target_layer_ids, (list, tuple)):
+                raise ValueError(
+                    "DFLASH dflash_config.target_layer_ids must be a list of ints, "
+                    f"got type={type(target_layer_ids).__name__}."
+                )
+            if len(target_layer_ids) <= 0:
+                raise ValueError(
+                    "DFLASH dflash_config.target_layer_ids must be non-empty, got []."
+                )
+            num_context_features = len(target_layer_ids)
+
+        self.num_context_features = int(num_context_features)
+        self.fc = nn.Linear(
+            self.num_context_features * hidden_size, hidden_size, bias=False
+        )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-        dflash_cfg = getattr(config, "dflash_config", None)
-        dflash_block_size = None
-        if isinstance(dflash_cfg, dict):
-            dflash_block_size = dflash_cfg.get("block_size", None)
+        dflash_block_size = dflash_cfg_dict.get("block_size", None)
 
         block_size = (
             dflash_block_size
@@ -225,6 +244,16 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
+        expected = int(self.fc.in_features)
+        if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
+            raise ValueError(
+                "DFLASH target_hidden feature dim mismatch. "
+                f"Expected shape [N, {expected}] "
+                f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
+                f"but got shape={tuple(target_hidden.shape)}. "
+                "This usually means the target model is capturing a different number of layer features than "
+                "the draft checkpoint/config expects."
+            )
         return self.hidden_norm(self.fc(target_hidden))
 
     @torch.no_grad()
@@ -291,6 +320,16 @@ class DFlashDraftModel(nn.Module):
                     # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
                 param = params_dict[resolved_name]
+                if resolved_name.endswith("fc.weight") and tuple(loaded_weight.shape) != tuple(
+                    param.shape
+                ):
+                    raise ValueError(
+                        "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
+                        "number of context features (K) does not match this config. "
+                        f"Expected fc.weight.shape={tuple(param.shape)} "
+                        f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
+                        f"but got {tuple(loaded_weight.shape)} for weight '{name}'."
+                    )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

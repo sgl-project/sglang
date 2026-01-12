@@ -49,7 +49,7 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
     ]
 
 
-def _get_dflash_config(config: Any) -> dict:
+def get_dflash_config(config: Any) -> dict:
     cfg = getattr(config, "dflash_config", None)
     if cfg is None:
         return {}
@@ -73,8 +73,14 @@ def resolve_dflash_target_layer_ids(
     Precedence:
       1) `draft_hf_config.dflash_config.target_layer_ids`
       2) default `build_target_layer_ids(target_num_layers, draft_num_layers)`
+
+    Notes:
+        The number of draft transformer layers is *not* fundamentally tied to the number
+        of target-layer features (K) used as DFlash context. We treat
+        `len(target_layer_ids)` as K when explicitly provided. For backward compatibility
+        (and for current released checkpoints), the default still uses K == draft_num_layers.
     """
-    cfg = _get_dflash_config(draft_hf_config)
+    cfg = get_dflash_config(draft_hf_config)
     layer_ids = cfg.get("target_layer_ids", None)
     if layer_ids is None:
         return build_target_layer_ids(target_num_layers, draft_num_layers)
@@ -86,10 +92,10 @@ def resolve_dflash_target_layer_ids(
         )
 
     resolved: List[int] = [int(x) for x in layer_ids]
-    if len(resolved) != int(draft_num_layers):
+    if len(resolved) <= 0:
         raise ValueError(
-            "DFLASH target_layer_ids length must equal the draft num_hidden_layers. "
-            f"Got len(target_layer_ids)={len(resolved)}, draft_num_layers={int(draft_num_layers)}."
+            "DFLASH dflash_config.target_layer_ids must be non-empty. "
+            f"Got len(target_layer_ids)={len(resolved)}."
         )
 
     for idx, val in enumerate(resolved):
@@ -102,7 +108,7 @@ def resolve_dflash_target_layer_ids(
 
 
 def resolve_dflash_mask_token(*, draft_hf_config: Any) -> str:
-    cfg = _get_dflash_config(draft_hf_config)
+    cfg = get_dflash_config(draft_hf_config)
     mask_token = cfg.get("mask_token", None)
     if mask_token is None:
         return DEFAULT_DFLASH_MASK_TOKEN
