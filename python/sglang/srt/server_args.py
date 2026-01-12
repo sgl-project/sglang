@@ -2001,7 +2001,7 @@ class ServerArgs:
     def _handle_hicache(self):
         if (
             self.hicache_mem_layout == "page_first_direct"
-            and self.hicache_io_backend is "kernel"
+            and self.hicache_io_backend == "kernel"
         ):
             self.hicache_io_backend = "direct"
             logger.warning(
@@ -3328,8 +3328,8 @@ class ServerArgs:
                 "auto",
                 "round_robin",
                 "follow_bootstrap_room",
-                "shortest_queue",
-                "minimum_tokens",
+                "total_requests",
+                "total_tokens",
             ],
         )
         parser.add_argument(
