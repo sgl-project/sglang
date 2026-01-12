@@ -381,5 +381,137 @@ class TestEdgeCases:
             os.unlink(config_file)
 
 
+class TestTypeValidation:
+    """Tests for type validation in config parsing."""
+
+    def test_store_true_rejects_integer(self, merger):
+        """Test that store_true actions reject integer values."""
+        config_data = {
+            "model-path": "test-model",
+            "trust-remote-code": 1,  # Should be boolean, not int
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            cli_args = ["--config", config_file]
+            with pytest.raises(ValueError, match="Expected boolean"):
+                merger.parse_config(cli_args)
+        finally:
+            os.unlink(config_file)
+
+    def test_store_true_rejects_string(self, merger):
+        """Test that store_true actions reject string values."""
+        config_data = {
+            "model-path": "test-model",
+            "enable-metrics": "yes",  # Should be boolean, not string
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            cli_args = ["--config", config_file]
+            with pytest.raises(ValueError, match="Expected boolean"):
+                merger.parse_config(cli_args)
+        finally:
+            os.unlink(config_file)
+
+    def test_store_true_accepts_boolean_true(self, merger):
+        """Test that store_true actions accept True value."""
+        config_data = {
+            "model-path": "test-model",
+            "trust-remote-code": True,
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            cli_args = ["--config", config_file]
+            parsed_config = merger.parse_config(cli_args)
+            assert parsed_config["trust_remote_code"] is True
+        finally:
+            os.unlink(config_file)
+
+    def test_store_true_accepts_boolean_false(self, merger):
+        """Test that store_true actions accept False value."""
+        config_data = {
+            "model-path": "test-model",
+            "trust-remote-code": False,
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            cli_args = ["--config", config_file]
+            parsed_config = merger.parse_config(cli_args)
+            assert parsed_config["trust_remote_code"] is False
+        finally:
+            os.unlink(config_file)
+
+    def test_type_conversion_int(self, merger):
+        """Test that integer type conversion is applied."""
+        config_data = {
+            "model-path": "test-model",
+            "port": "30000",  # String that should be converted to int
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            cli_args = ["--config", config_file]
+            parsed_config = merger.parse_config(cli_args)
+            assert parsed_config["port"] == 30000
+            assert isinstance(parsed_config["port"], int)
+        finally:
+            os.unlink(config_file)
+
+    def test_type_conversion_failure(self, merger):
+        """Test that invalid type conversion raises ValueError."""
+        config_data = {
+            "model-path": "test-model",
+            "port": "not_a_number",  # Cannot be converted to int
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            cli_args = ["--config", config_file]
+            with pytest.raises(ValueError, match="Type conversion failed"):
+                merger.parse_config(cli_args)
+        finally:
+            os.unlink(config_file)
+
+    def test_type_conversion_float(self, merger):
+        """Test that float type conversion is applied."""
+        config_data = {
+            "model-path": "test-model",
+            "mem-fraction-static": "0.85",  # String that should be converted to float
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            cli_args = ["--config", config_file]
+            parsed_config = merger.parse_config(cli_args)
+            assert parsed_config["mem_fraction_static"] == 0.85
+            assert isinstance(parsed_config["mem_fraction_static"], float)
+        finally:
+            os.unlink(config_file)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

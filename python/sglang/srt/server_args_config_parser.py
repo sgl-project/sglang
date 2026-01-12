@@ -36,7 +36,7 @@ class ConfigArgumentMerger:
             and "-h" not in a.option_strings
         }
 
-    def parse_config(self, cli_args):
+    def parse_config(self, cli_args: List[str]) -> Dict[str, Any]:
         config_file_path = self._extract_config_file_path(cli_args)
         if not config_file_path:
             return {}
@@ -60,11 +60,25 @@ class ConfigArgumentMerger:
                         f"Invalid value for '{key}': {value}. Allowed choices: {action.choices}"
                     )
 
+                # Validate store_true actions accept only boolean values
+                if key_norm in self.store_true_actions and not isinstance(value, bool):
+                    raise ValueError(
+                        f"Invalid value for '{key}': {value}. Expected boolean (true/false), got {type(value).__name__}"
+                    )
+                # Apply type conversion if action.type is defined
+                elif action.type is not None and callable(action.type):
+                    try:
+                        value = action.type(value)
+                    except (ValueError, TypeError, argparse.ArgumentTypeError) as e:
+                        raise ValueError(
+                            f"Invalid value for '{key}': {value}. Type conversion failed: {e}"
+                        ) from e
+
                 parsed_config[action.dest] = value
 
         return parsed_config
 
-    def remove_config_from_argv(self, argv):
+    def remove_config_from_argv(self, argv: List[str]) -> List[str]:
         result = []
         skip_next = False
         for arg in argv:
