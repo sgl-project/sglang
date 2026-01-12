@@ -14,6 +14,9 @@ use super::{
     types::{FailureAction, RetryPolicy, StepId, WorkflowContext, WorkflowData, WorkflowId},
 };
 
+/// A condition function that determines whether a step should run.
+pub type StepCondition<D> = Arc<dyn Fn(&WorkflowContext<D>) -> bool + Send + Sync>;
+
 /// Errors that can occur during workflow validation
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ValidationError {
@@ -43,8 +46,7 @@ pub struct StepDefinition<D: WorkflowData> {
     /// Run step at or after this time (after dependencies satisfied)
     pub scheduled_at: Option<DateTime<Utc>>,
     /// Condition to evaluate; if false, step is skipped
-    #[allow(clippy::type_complexity)]
-    pub run_if: Option<Arc<dyn Fn(&WorkflowContext<D>) -> bool + Send + Sync>>,
+    pub run_if: Option<StepCondition<D>>,
 }
 
 impl<D: WorkflowData> fmt::Debug for StepDefinition<D> {
