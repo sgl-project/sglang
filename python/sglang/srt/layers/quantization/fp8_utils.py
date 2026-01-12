@@ -992,7 +992,9 @@ def apply_fp8_linear(
     # torch.scaled_mm supports per tensor weights + activations only
     # so fallback to naive if per channel or per token
     per_tensor_weights = weight_scale.numel() == 1
-    per_tensor_activations = x_scale.numel() == 1
+    # When the number of token is 1,
+    # per-token scale has shape (1, 1), per-tensor scale has shape (1) or ().
+    per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
 
     if (
         use_per_token_if_dynamic
@@ -1039,7 +1041,9 @@ def apply_fp8_linear(
             return _process_scaled_mm_output(output, input_2d.shape, output_shape)
 
     if per_tensor_weights and per_tensor_activations:
-        # Fused GEMM_DQ
+        # Fused GEMM_DQ; _scaled_mm with torch.compile requires len(weight_scale.shape) == len(x_scale.shape)
+        if weight_scale.ndim == 0 and x_scale.ndim == 1:
+            weight_scale = weight_scale.unsqueeze(0)
         output = torch._scaled_mm(
             qinput,
             weight,
