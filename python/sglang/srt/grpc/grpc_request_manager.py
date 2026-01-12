@@ -27,9 +27,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, kill_process_tree
+from sglang.srt.utils import get_or_create_event_loop, get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -80,6 +79,10 @@ class GrpcReqState:
     first_token_time: float = 0.0
     last_time: float = 0.0
     last_completion_tokens: int = 1
+
+    # perf_counter equivalents for accurate time calculations
+    finished_time_perf: float = 0.0
+    first_token_time_perf: float = 0.0
 
     # Streaming state
     stream_finished: bool = False
@@ -444,10 +447,11 @@ class GrpcRequestManager:
                 recv_obj = await self.recv_from_scheduler.recv_pyobj()
                 self.last_receive_tstamp = time.time()
 
-                # Check for pause
-                async with self.is_pause_cond:
-                    while self.is_pause:
-                        await self.is_pause_cond.wait()
+                # Check for pause (optimized: check flag before acquiring lock)
+                if self.is_pause:
+                    async with self.is_pause_cond:
+                        while self.is_pause:
+                            await self.is_pause_cond.wait()
 
                 # Handle different output types
                 if isinstance(recv_obj, BatchTokenIDOutput):
@@ -532,6 +536,12 @@ class GrpcRequestManager:
 
     async def _handle_batch_output(self, batch_out: BatchTokenIDOutput):
         """Handle batch generation output from scheduler."""
+        # Collect all queue.put() tasks for parallel execution
+        put_tasks = []
+        cleanup_tasks = []
+        now = time.time()
+        now_perf_counter = time.perf_counter()
+
         # Process each request in the batch
         for i, rid in enumerate(batch_out.rids):
             if rid not in self.rid_to_state:
@@ -545,9 +555,9 @@ class GrpcRequestManager:
                 continue
 
             # Update metrics
-            now = time.time()
             if state.first_token_time == 0.0:
                 state.first_token_time = now
+                state.first_token_time_perf = now_perf_counter
             state.last_time = now
 
             # Extract output for this request
@@ -639,22 +649,28 @@ class GrpcRequestManager:
             if output_data["token_ids"]:
                 state.output_ids.extend(output_data["token_ids"])
 
-            await state.out_queue.put(output_data)
+            # Add queue.put() to parallel task list
+            put_tasks.append(state.out_queue.put(output_data))
 
             # Handle completion
             if output_data["finished"]:
                 state.finished = True
                 state.finished_time = now
+                state.finished_time_perf = now_perf_counter
                 state.stream_finished = True
                 state.event.set()
 
                 # Remove from tracking after a delay
-                async def cleanup():
+                async def cleanup(request_id):
                     await asyncio.sleep(5.0)
-                    if rid in self.rid_to_state:
-                        del self.rid_to_state[rid]
+                    if request_id in self.rid_to_state:
+                        del self.rid_to_state[request_id]
 
-                asyncio.create_task(cleanup())
+                cleanup_tasks.append(asyncio.create_task(cleanup(rid)))
+
+        # Execute all queue.put() operations in parallel
+        if put_tasks:
+            await asyncio.gather(*put_tasks, return_exceptions=True)
 
     async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
@@ -672,7 +688,9 @@ class GrpcRequestManager:
                     batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0
                 ),
                 "finish_reason": (
-                    batch_out.finish_reason[i] if batch_out.finish_reason else None
+                    batch_out.finished_reasons[i]
+                    if batch_out.finished_reasons
+                    else None
                 ),
             }
 
@@ -682,6 +700,7 @@ class GrpcRequestManager:
             # Mark as finished
             state.finished = True
             state.finished_time = time.time()
+            state.finished_time_perf = time.perf_counter()
             state.event.set()
 
     async def _handle_health_check_output(self, health_out: HealthCheckOutput):
@@ -714,6 +733,7 @@ class GrpcRequestManager:
         # Mark as finished
         state.finished = True
         state.finished_time = time.time()
+        state.finished_time_perf = time.perf_counter()
         state.event.set()
 
     async def _handle_abort_req(self, recv_obj: AbortReq):
@@ -858,7 +878,7 @@ class GrpcRequestManager:
             return
 
         self.no_create_loop = True
-        loop = asyncio.get_event_loop()
+        loop = get_or_create_event_loop()
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )

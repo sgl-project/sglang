@@ -12,7 +12,7 @@ from sglang.srt.configs.dots_vlm import DotsVisionConfig
 from sglang.srt.distributed import parallel_state
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -154,21 +154,13 @@ class DotsVisionBlock(nn.Module):
         config: DotsVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        attn_implementation: str = "flash_attention_2",
     ):
         super().__init__()
-        if attn_implementation == "flash_attention_2":
-            qkv_backend = "fa3"
-            softmax_in_single_precision = False
-        else:
-            raise RuntimeError("Unimplemented")
         self.attn = VisionAttention(
             embed_dim=config.embed_dim,
             num_heads=config.num_attention_heads,
             projection_size=config.embed_dim,
             use_qkv_parallel=True,
-            qkv_backend=qkv_backend,
-            softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -211,9 +203,7 @@ class DotsVisionTransformer(PreTrainedModel):
         _num_hidden_layers = config.num_hidden_layers
         self.blocks = nn.ModuleList(
             [
-                DotsVisionBlock(
-                    config, quant_config, f"blocks.{i}", config.attn_implementation
-                )
+                DotsVisionBlock(config, quant_config, f"blocks.{i}")
                 for i in range(_num_hidden_layers)
             ]
         )
@@ -310,6 +300,7 @@ class DotsVisionTransformer(PreTrainedModel):
     def forward(
         self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, bf16=True
     ) -> torch.Tensor:
+        hidden_states = hidden_states.to(self.device)
         if bf16:
             hidden_states = hidden_states.bfloat16()
         hidden_states = self.patch_embed(hidden_states, grid_thw)
@@ -324,6 +315,9 @@ class DotsVisionTransformer(PreTrainedModel):
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if is_npu():
+            cu_seqlens = cu_seqlens.to("cpu")
 
         for blk in self.blocks:
             hidden_states = blk(

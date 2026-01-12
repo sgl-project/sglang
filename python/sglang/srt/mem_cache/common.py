@@ -7,15 +7,21 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+
+# Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
+MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +94,7 @@ def write_cache_indices(
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,
+            dtype=torch.uint64,
         )
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
         write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
@@ -292,9 +299,21 @@ def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
     num_reqs: int,
     reqs: list[Req] | None,
+    tree_cache: BasePrefixCache | None,
 ) -> list[int]:
     """Allocate request slots from the pool."""
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
+        mamba_available_size = req_to_token_pool.mamba_pool.available_size()
+        factor = (
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE
+            if isinstance(tree_cache, MambaRadixCache)
+            else MAMBA_STATE_PER_REQ_NO_CACHE
+        )
+        mamba_state_needed = num_reqs * factor
+        if mamba_available_size < mamba_state_needed:
+            if tree_cache is not None and isinstance(tree_cache, MambaRadixCache):
+                mamba_num = max(0, mamba_state_needed - mamba_available_size)
+                tree_cache.evict_mamba(mamba_num)
         req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
     else:
         req_pool_indices = req_to_token_pool.alloc(num_reqs)
@@ -323,9 +342,16 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req, pre_len in zip(batch.reqs, batch.prefix_lens):
-            batch.tree_cache.evict_swa(
-                req, pre_len, batch.model_config.attention_chunk_size
-            )
+            if batch.enable_overlap:
+                # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
+                if req.extend_batch_idx < 2:
+                    continue
+                else:
+                    batch.tree_cache.evict_swa(
+                        req, pre_len - batch.tree_cache.chunked_prefill_size
+                    )
+            else:
+                batch.tree_cache.evict_swa(req, pre_len)
 
     bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
@@ -337,7 +363,9 @@ def alloc_for_extend(
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
     # Allocate req slots
-    req_pool_indices = alloc_req_slots(batch.req_to_token_pool, bs, batch.reqs)
+    req_pool_indices = alloc_req_slots(
+        batch.req_to_token_pool, bs, batch.reqs, batch.tree_cache
+    )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
@@ -416,9 +444,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     if isinstance(batch.tree_cache, SWAChunkCache):
         for req in batch.reqs:
-            batch.tree_cache.evict_swa(
-                req, req.seqlen - 1, batch.model_config.attention_chunk_size
-            )
+            # We set evict_swa condition here with two reasons:
+            # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
+            # 2. Evict swa every window_size tokens to reduce the overhead.
+            if req.decode_batch_idx % batch.tree_cache.window_size == 1:
+                batch.tree_cache.evict_swa(req, req.seqlen - 1)
 
     bs = batch.seq_lens.shape[0]
 
@@ -450,6 +480,39 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     )
 
     return out_cache_loc
+
+
+def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    tree_cache.cache_finished_req(req, is_insert=is_insert)
+
+    # MambaRadixCache may alloc mamba state before alloc KV cache
+    if req.req_pool_idx is None:
+        assert isinstance(
+            tree_cache, MambaRadixCache
+        ), "Only MambaRadixCache can handle abort with prefix cache hit before alloc"
+        return
+
+    start_p, end_p = req.pop_overallocated_kv_cache()
+
+    global_server_args = get_global_server_args()
+    page_size = global_server_args.page_size
+    spec_algo = global_server_args.speculative_algorithm
+
+    if spec_algo is None:
+        assert (
+            start_p == end_p
+        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+
+    if page_size > 1:
+        start_p = ceil_align(start_p, page_size)
+
+    if start_p >= end_p:
+        return
+
+    indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
+        start_p:end_p
+    ]
+    tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
 
 
 def available_and_evictable_str(tree_cache) -> str:

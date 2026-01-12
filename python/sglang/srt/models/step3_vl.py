@@ -1,8 +1,7 @@
 import logging
 import math
-from collections.abc import Iterable
 from math import sqrt
-from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, TypedDict, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -130,6 +129,7 @@ class Step3TextMoEMLP(nn.Module):
             top_k=config.moe_top_k,
             renormalize=config.norm_expert_weight,
             use_grouped_topk=False,
+            layer_id=layer_id,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -338,12 +338,14 @@ class Step3TextDecoderLayer(nn.Module):
         self.is_previous_layer_sparse = (
             True if layer_id - 1 in moe_layers_idx else False
         )
+        self.is_next_layer_sparse = True if layer_id + 1 in moe_layers_idx else False
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=self.is_previous_layer_sparse,
+            is_next_layer_sparse=self.is_next_layer_sparse,
         )
 
         if not self.is_layer_sparse:
@@ -572,7 +574,6 @@ class Step3VisionAttention(nn.Module):
         self,
         dim: int,
         num_heads: int = 16,
-        qkv_backend="fa3",
         quant_config=None,
         prefix: str = "",
     ) -> None:
@@ -594,9 +595,7 @@ class Step3VisionAttention(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            rotary_embed="normal",
             proj_bias=True,
-            qkv_backend=qkv_backend,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )

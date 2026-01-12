@@ -2,7 +2,6 @@ import json
 import os
 import pickle
 import random
-from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -12,10 +11,10 @@ from nextqa import NExTQALoader
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
-
 from sglang.bench_serving import (
-    download_and_cache_file,
+    SHAREGPT_FILENAME,
+    SHAREGPT_REPO_ID,
+    download_and_cache_hf_file,
     gen_prompt,
     get_gen_prefix_cache_path,
 )
@@ -105,7 +104,10 @@ def sample_sharegpt_requests(
 
     # Download sharegpt if necessary
     if not os.path.isfile(dataset_path):
-        dataset_path = download_and_cache_file(SHAREGPT_URL)
+        dataset_path = download_and_cache_hf_file(
+            repo_id=SHAREGPT_REPO_ID,
+            filename=SHAREGPT_FILENAME,
+        )
 
     # Load the dataset.
     with open(dataset_path) as f:
@@ -368,7 +370,10 @@ def sample_random_requests(
 
         # Download sharegpt if necessary
         if not os.path.isfile(dataset_path):
-            dataset_path = download_and_cache_file(SHAREGPT_URL)
+            dataset_path = download_and_cache_hf_file(
+                repo_id=SHAREGPT_REPO_ID,
+                filename=SHAREGPT_FILENAME,
+            )
 
         # Load the dataset.
         with open(dataset_path) as f:
@@ -424,26 +429,6 @@ def sample_random_requests(
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
-
-
-def gen_prompt(tokenizer, token_num):
-    """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
-    selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
-
-
-def get_gen_prefix_cache_path(args, tokenizer):
-    """Create cache directory under ~/.cache/sglang/benchmark"""
-    cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
-
-    # Create a unique cache filename based on the generation parameters
-    cache_key = (
-        f"gsp_prefix_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
-        f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
-        f"{tokenizer.__class__.__name__}.pkl"
-    )
-    return cache_dir / cache_key
 
 
 def sample_generated_shared_prefix_requests(
