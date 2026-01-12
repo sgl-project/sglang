@@ -300,4 +300,7 @@ class OutputBatch:
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None
+
+    # For ComfyUI integration: noise prediction from denoising stage
+    noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
