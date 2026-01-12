@@ -413,7 +413,11 @@ class ServerManager:
                 self.model,
                 self.port,
                 process.pid,
-                "running" if process.poll() is None else f"exited (code {process.returncode})",
+                (
+                    "running"
+                    if process.poll() is None
+                    else f"exited (code {process.returncode})"
+                ),
                 stdout_path,
                 type(e).__name__,
                 str(e),
@@ -490,7 +494,7 @@ class ServerManager:
                             self.port,
                         )
                         return
-                    
+
                     # Periodically log recent content to help diagnose issues
                     current_time = time.time()
                     if current_time - last_log_check_time >= log_check_interval:
@@ -521,10 +525,14 @@ class ServerManager:
         # Timeout reached
         elapsed = int(time.time() - start)
         tail = self._get_log_tail(stdout_path, lines=500)
-        process_status = "running" if process.poll() is None else f"exited (code {process.returncode})"
+        process_status = (
+            "running"
+            if process.poll() is None
+            else f"exited (code {process.returncode})"
+        )
         tail_lines = tail.splitlines() if tail else []
         tail_line_count = len(tail_lines)
-        
+
         error_msg = (
             f"[server-test] Server startup TIMEOUT!\n"
             f"  Model: {self.model}\n"

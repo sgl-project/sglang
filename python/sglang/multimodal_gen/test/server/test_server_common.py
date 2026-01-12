@@ -107,7 +107,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         extra_args,
         server_args.num_gpus,
     )
-    
+
     manager = ServerManager(
         model=server_args.model_path,
         port=port,
@@ -115,7 +115,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         extra_args=extra_args,
         env_vars=env_vars,
     )
-    
+
     try:
         ctx = manager.start()
     except (TimeoutError, RuntimeError) as e:
