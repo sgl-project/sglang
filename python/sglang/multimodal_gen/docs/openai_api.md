@@ -241,17 +241,21 @@ The server supports dynamic loading, merging, and unmerging of LoRA adapters.
 
 #### Set LoRA Adapter
 
-Loads a LoRA adapter and merges its weights into the model.
+Loads one or more LoRA adapters and merges their weights into the model. Supports both single LoRA (backward compatible) and multiple LoRA adapters.
 
 **Endpoint:** `POST /v1/set_lora`
 
 **Parameters:**
-- `lora_nickname` (string, required): A unique identifier for this LoRA
-- `lora_path` (string, optional): Path to the `.safetensors` file or Hugging Face repo ID. Required for the first load; optional if re-activating a cached nickname
-- `target` (string, optional): Which transformer(s) to apply the LoRA to. One of "all" (default), "transformer", "transformer_2", "critic"
-- `strength` (float, optional): LoRA strength for merge, default 1.0. Values < 1.0 reduce the effect, values > 1.0 amplify the effect
+- `lora_nickname` (string or list of strings, required): A unique identifier for the LoRA adapter(s). Can be a single string or a list of strings for multiple LoRAs
+- `lora_path` (string or list of strings/None, optional): Path to the `.safetensors` file(s) or Hugging Face repo ID(s). Required for the first load; optional if re-activating a cached nickname. If a list, must match the length of `lora_nickname`
+- `target` (string or list of strings, optional): Which transformer(s) to apply the LoRA to. If a list, must match the length of `lora_nickname`. Valid values:
+  - `"all"` (default): Apply to all transformers
+  - `"transformer"`: Apply only to the primary transformer (high noise for Wan2.2)
+  - `"transformer_2"`: Apply only to transformer_2 (low noise for Wan2.2)
+  - `"critic"`: Apply only to the critic model
+- `strength` (float or list of floats, optional): LoRA strength for merge, default 1.0. If a list, must match the length of `lora_nickname`. Values < 1.0 reduce the effect, values > 1.0 amplify the effect
 
-**Curl Example:**
+**Single LoRA Example:**
 
 ```bash
 curl -X POST http://localhost:30010/v1/set_lora \
@@ -259,9 +263,42 @@ curl -X POST http://localhost:30010/v1/set_lora \
   -d '{
         "lora_nickname": "lora_name",
         "lora_path": "/path/to/lora.safetensors",
+        "target": "all",
         "strength": 0.8
       }'
 ```
+
+**Multiple LoRA Example:**
+
+```bash
+curl -X POST http://localhost:30010/v1/set_lora \
+  -H "Content-Type: application/json" \
+  -d '{
+        "lora_nickname": ["lora_1", "lora_2"],
+        "lora_path": ["/path/to/lora1.safetensors", "/path/to/lora2.safetensors"],
+        "target": ["transformer", "transformer_2"],
+        "strength": [0.8, 1.0]
+      }'
+```
+
+**Multiple LoRA with Same Target:**
+
+```bash
+curl -X POST http://localhost:30010/v1/set_lora \
+  -H "Content-Type: application/json" \
+  -d '{
+        "lora_nickname": ["style_lora", "character_lora"],
+        "lora_path": ["/path/to/style.safetensors", "/path/to/character.safetensors"],
+        "target": "all",
+        "strength": [0.7, 0.9]
+      }'
+```
+
+> [!NOTE]
+> When using multiple LoRAs:
+> - All list parameters (`lora_nickname`, `lora_path`, `target`, `strength`) must have the same length
+> - If `target` or `strength` is a single value, it will be applied to all LoRAs
+> - Multiple LoRAs applied to the same target will be merged in order
 
 
 #### Merge LoRA Weights
@@ -298,6 +335,43 @@ Unmerges the currently active LoRA weights from the base model, restoring it to 
 curl -X POST http://localhost:30010/v1/unmerge_lora_weights \
   -H "Content-Type: application/json"
 ```
+
+#### List LoRA Adapters
+
+Returns loaded LoRA adapters and current application status per module.
+
+**Endpoint:** `GET /v1/list_loras`
+
+**Curl Example:**
+
+```bash
+curl -sS -X GET "http://localhost:30010/v1/list_loras"
+```
+
+**Response Example:**
+
+```json
+{
+  "loaded_adapters": [
+    { "nickname": "lora_a", "path": "/weights/lora_a.safetensors" },
+    { "nickname": "lora_b", "path": "/weights/lora_b.safetensors" }
+  ],
+  "active": {
+    "transformer": [
+      {
+        "nickname": "lora2",
+        "path": "tarn59/pixel_art_style_lora_z_image_turbo",
+        "merged": true,
+        "strength": 1.0
+      }
+    ]
+  }
+}
+```
+
+Notes:
+- If LoRA is not enabled for the current pipeline, the server will return an error.
+- `num_lora_layers_with_weights` counts only layers that have LoRA weights applied for the active adapter.
 
 ### Example: Switching LoRAs
 

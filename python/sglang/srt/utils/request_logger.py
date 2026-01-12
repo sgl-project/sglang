@@ -14,19 +14,13 @@
 from __future__ import annotations
 
 import dataclasses
-import json
 import logging
-import os
-import socket
-from datetime import datetime
 from functools import lru_cache
-from logging.handlers import TimedRotatingFileHandler
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
-
-import torch.distributed as dist
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 if TYPE_CHECKING:
     import fastapi
@@ -67,9 +61,9 @@ class RequestLogger:
         self.log_exceeded_ms = envs.SGLANG_LOG_REQUEST_EXCEEDED_MS.get()
 
     def _setup_targets(self) -> List[logging.Logger]:
-        if not self.log_requests_target:
-            return [_create_log_target_stdout()]
-        return [_create_log_target(t) for t in self.log_requests_target]
+        return create_log_targets(
+            targets=self.log_requests_target, name_prefix=__name__
+        )
 
     def configure(
         self,
@@ -108,7 +102,7 @@ class RequestLogger:
             }
             if headers:
                 log_data["headers"] = headers
-            self._log_json("request.received", log_data)
+            log_json(self.targets, "request.received", log_data)
         else:
             headers_str = f", headers={headers}" if headers else ""
             self._log(
@@ -153,7 +147,7 @@ class RequestLogger:
                 log_data["out"] = _transform_data_for_logging(
                     out, max_length, out_skip_names
                 )
-            self._log_json("request.finished", log_data)
+            log_json(self.targets, "request.finished", log_data)
         else:
             obj_str = _dataclass_to_string_truncated(
                 obj, max_length, skip_names=skip_names
@@ -206,14 +200,6 @@ class RequestLogger:
                 )
         return max_length, skip_names, out_skip_names
 
-    def _log_json(self, event: str, data: dict) -> None:
-        log_data = {
-            "timestamp": datetime.now().isoformat(),
-            "event": event,
-            **data,
-        }
-        self._log(json.dumps(log_data, ensure_ascii=False))
-
     def _log(self, msg: str) -> None:
         for target in self.targets:
             target.info(msg)
@@ -223,39 +209,6 @@ class RequestLogger:
 @lru_cache(maxsize=2)
 def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
-
-
-def _create_log_target(target: str) -> logging.Logger:
-    if target.lower() == "stdout":
-        return _create_log_target_stdout()
-    return _create_log_target_file(target)
-
-
-def _create_log_target_stdout() -> logging.Logger:
-    return _create_logger_with_handler(f"{__name__}.stdout", logging.StreamHandler())
-
-
-def _create_log_target_file(directory: str) -> logging.Logger:
-    os.makedirs(directory, exist_ok=True)
-    hostname = socket.gethostname()
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    filename = os.path.join(directory, f"{hostname}_{rank}.log")
-    handler = TimedRotatingFileHandler(
-        filename, when="H", backupCount=0, encoding="utf-8"
-    )
-    return _create_logger_with_handler(
-        f"{__name__}.file.{directory}.{hostname}_{rank}", handler
-    )
-
-
-def _create_logger_with_handler(name: str, handler: logging.Handler) -> logging.Logger:
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    if not logger.handlers:
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        logger.addHandler(handler)
-    return logger
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough

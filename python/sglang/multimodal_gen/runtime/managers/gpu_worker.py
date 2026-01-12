@@ -4,7 +4,7 @@
 import multiprocessing as mp
 import os
 import time
-from typing import List
+from typing import List, Union
 
 import torch
 from setproctitle import setproctitle
@@ -116,7 +116,6 @@ class GPUWorker:
         Execute a forward pass.
         """
         assert self.pipeline is not None
-        # TODO: dealing with first req for now
         req = batch[0]
         output_batch = None
         try:
@@ -125,7 +124,18 @@ class GPUWorker:
 
             start_time = time.monotonic()
 
-            output_batch = self.pipeline.forward(req, self.server_args)
+            result = self.pipeline.forward(req, self.server_args)
+
+            if isinstance(result, Req):
+                output_batch = OutputBatch(
+                    output=result.output,
+                    timings=result.timings,
+                    trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
+                    trajectory_latents=getattr(result, "trajectory_latents", None),
+                    trajectory_decoded=getattr(result, "trajectory_decoded", None),
+                )
+            else:
+                output_batch = result
 
             if self.rank == 0:
                 peak_memory_bytes = torch.cuda.max_memory_allocated()
@@ -155,10 +165,6 @@ class GPUWorker:
                 f"Error executing request {req.request_id}: {e}", exc_info=True
             )
             if output_batch is None:
-                from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-                    OutputBatch,
-                )
-
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
         finally:
@@ -200,19 +206,20 @@ class GPUWorker:
 
     def set_lora(
         self,
-        lora_nickname: str,
-        lora_path: str | None = None,
-        target: str = "all",
-        strength: float = 1.0,
+        lora_nickname: Union[str, List[str]],
+        lora_path: Union[str, None, List[Union[str, None]]] = None,
+        target: Union[str, List[str]] = "all",
+        strength: Union[float, List[float]] = 1.0,
     ) -> OutputBatch:
         """
-        Set the LoRA adapter for the pipeline.
+        Set the LoRA adapter(s) for the pipeline.
+        Supports both single LoRA (backward compatible) and multiple LoRA adapters.
 
         Args:
-            lora_nickname: The nickname of the adapter.
-            lora_path: Path to the LoRA adapter.
-            target: Which transformer(s) to apply the LoRA to.
-            strength: LoRA strength for merge, default 1.0.
+            lora_nickname: The nickname(s) of the adapter(s). Can be a string or a list of strings.
+            lora_path: Path(s) to the LoRA adapter(s). Can be a string, None, or a list of strings/None.
+            target: Which transformer(s) to apply the LoRA to. Can be a string or a list of strings.
+            strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
@@ -245,6 +252,19 @@ class GPUWorker:
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.unmerge_lora_weights(target)
         return OutputBatch()
+
+    def list_loras(self) -> OutputBatch:
+        """
+        List loaded LoRA adapters and current application status per module.
+        """
+        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+            LoRAPipeline,
+        )
+
+        if not isinstance(self.pipeline, LoRAPipeline):
+            return OutputBatch(error="Lora is not enabled")
+        status = self.pipeline.get_lora_status()
+        return OutputBatch(output=status)
 
 
 def run_scheduler_process(
