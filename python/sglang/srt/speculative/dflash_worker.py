@@ -147,6 +147,10 @@ class DFlashWorker:
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gather_cap: int = 0
+        self._draft_greedy_best_rank_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_index_cap: int = 0
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = 0 if self._draft_block_ids_buf is None else int(self._draft_block_ids_buf.shape[0])
@@ -476,7 +480,8 @@ class DFlashWorker:
 
             # Convert local argmax indices to global token ids.
             if num_added == 0:
-                global_ids = org_vocab_start + local_arg
+                local_arg.add_(org_vocab_start)
+                global_ids = local_arg
             else:
                 global_ids = torch.empty((chunk_len,), dtype=torch.int64, device=hs.device)
                 is_base = local_arg < num_org
@@ -489,6 +494,7 @@ class DFlashWorker:
 
             # Gather per-rank maxima and associated global ids, then select the global max.
             needed = tp_size * chunk_len
+            chunk_cap = int(chunk_size)
             if (
                 self._draft_greedy_gather_cap < needed
                 or self._draft_greedy_gathered_max_buf is None
@@ -497,7 +503,7 @@ class DFlashWorker:
                 or self._draft_greedy_gathered_max_buf.device != hs.device
             ):
                 # Allocate enough space for the max chunk size to avoid reallocations.
-                cap = tp_size * int(chunk_size)
+                cap = tp_size * chunk_cap
                 self._draft_greedy_gathered_max_buf = torch.empty(
                     (cap,), dtype=local_max.dtype, device=hs.device
                 )
@@ -505,6 +511,25 @@ class DFlashWorker:
                     (cap,), dtype=global_ids.dtype, device=hs.device
                 )
                 self._draft_greedy_gather_cap = cap
+
+            if (
+                self._draft_greedy_index_cap < chunk_len
+                or self._draft_greedy_best_rank_buf is None
+                or self._draft_greedy_rank_index_buf is None
+                or self._draft_greedy_selected_ids_buf is None
+                or self._draft_greedy_best_rank_buf.device != hs.device
+                or self._draft_greedy_selected_ids_buf.device != hs.device
+            ):
+                self._draft_greedy_best_rank_buf = torch.empty(
+                    (chunk_cap,), dtype=torch.int64, device=hs.device
+                )
+                self._draft_greedy_rank_index_buf = torch.empty(
+                    (1, chunk_cap), dtype=torch.int64, device=hs.device
+                )
+                self._draft_greedy_selected_ids_buf = torch.empty(
+                    (1, chunk_cap), dtype=torch.int64, device=hs.device
+                )
+                self._draft_greedy_index_cap = chunk_cap
 
             gathered_max = self._draft_greedy_gathered_max_buf[:needed]
             gathered_ids = self._draft_greedy_gathered_ids_buf[:needed]
@@ -514,9 +539,14 @@ class DFlashWorker:
             gathered_max = gathered_max.view(tp_size, chunk_len)
             gathered_ids = gathered_ids.view(tp_size, chunk_len)
 
-            best_rank = torch.argmax(gathered_max, dim=0)
-            idx = torch.arange(chunk_len, device=hs.device)
-            out_token_ids[start:end] = gathered_ids[best_rank, idx].to(torch.long)
+            best_rank = self._draft_greedy_best_rank_buf[:chunk_len]
+            torch.argmax(gathered_max, dim=0, out=best_rank)
+
+            rank_index = self._draft_greedy_rank_index_buf[:, :chunk_len]
+            rank_index[0].copy_(best_rank)
+            selected_ids = self._draft_greedy_selected_ids_buf[:, :chunk_len]
+            torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
+            out_token_ids[start:end].copy_(selected_ids.view(-1))
 
         return out_token_ids
 
