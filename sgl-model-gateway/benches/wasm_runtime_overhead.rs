@@ -12,7 +12,7 @@ use tokio::runtime::Runtime;
 // For the purpose of this benchmark, we can use a placeholder
 // or ensure we have a valid component for the runtime to "instantiate".
 // Note: In a real environment, you'd load a .wasm file built from your guest examples.
-const DUMMY_WASM: &[u8] = include_bytes!("../tests/fixtures/wasm/minimal_middleware.wasm");
+const DUMMY_WASM: &[u8] = include_bytes!("../examples/wasm/wasm-guest-auth/target/wasm32-wasip2/release/wasm_guest_auth.component.wasm");
 
 fn bench_wasm_runtime_execution(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
