@@ -11,5 +11,5 @@ pub use definition::{StepDefinition, WorkflowDefinition};
 pub use engine::WorkflowEngine;
 pub use event::{EventBus, EventSubscriber, LoggingSubscriber, WorkflowEvent};
 pub use executor::{FunctionStep, StepExecutor};
-pub use state::WorkflowStateStore;
+pub use state::{InMemoryStore, StateStore};
 pub use types::*;

@@ -1,12 +1,12 @@
 //! Step to remove workers from worker registry.
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use crate::{
-    app_context::AppContext,
+    core::steps::workflow_data::AnyWorkflowData,
     observability::metrics::Metrics,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
@@ -17,10 +17,17 @@ use crate::{
 pub struct RemoveFromWorkerRegistryStep;
 
 #[async_trait]
-impl StepExecutor for RemoveFromWorkerRegistryStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
-        let worker_urls: Arc<Vec<String>> = context.get_or_err("worker_urls")?;
+impl StepExecutor<AnyWorkflowData> for RemoveFromWorkerRegistryStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<AnyWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let data = context.data.as_worker_removal()?;
+        let app_context = data
+            .app_context
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let worker_urls = &data.worker_urls;
 
         debug!(
             "Removing {} worker(s) from worker registry",
