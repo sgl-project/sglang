@@ -15,6 +15,8 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/56b325e977435af744f8b3dca7af0ca209663558/vllm/model_executor/models/gemma2.py
 
+import functools
+import math
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
@@ -22,7 +24,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -41,8 +42,6 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import add_prefix, make_layers
 
-import functools
-import math
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
@@ -57,12 +56,23 @@ class GELUTanh(nn.Module):
             self.act = self._gelu_tanh_python
         else:
             self.act = functools.partial(nn.functional.gelu, approximate="tanh")
-    
+
     def _gelu_tanh_python(self, input: torch.tensor) -> torch.tensor:
-        return input * 0.5 * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
-    
+        return (
+            input
+            * 0.5
+            * (
+                1.0
+                + torch.tanh(
+                    math.sqrt(2.0 / math.pi)
+                    * (input + 0.044715 * torch.pow(input, 3.0))
+                )
+            )
+        )
+
     def forward(self, input: torch.tensor) -> torch.tensor:
         return self.act(input)
+
 
 class Gemma2MLP(nn.Module):
     def __init__(
@@ -99,7 +109,7 @@ class Gemma2MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        d = gate_up.shape[-1]//2
+        d = gate_up.shape[-1] // 2
         gate, up = gate_up[..., :d], gate_up[..., d:]
         x = self.act_fn(gate) * up
         x, _ = self.down_proj(x)
@@ -312,7 +322,9 @@ class Gemma2Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype)
+        normalizer = torch.tensor(
+            self.config.hidden_size**0.5, dtype=hidden_states.dtype
+        )
         hidden_states *= normalizer
 
         residual = None
