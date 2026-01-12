@@ -21,7 +21,10 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    core::{metrics_manager::MetricPack, ConnectionMode, Worker, WorkerLoadManager, WorkerRegistry, WorkerType},
+    core::{
+        metrics_manager::MetricPack, ConnectionMode, Worker, WorkerLoadManager, WorkerRegistry,
+        WorkerType,
+    },
     policies::PolicyRegistry,
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
@@ -270,10 +273,13 @@ impl WorkerManager {
         match req.send().await {
             Ok(r) if r.status().is_success() => {
                 if let Ok(text) = r.text().await {
-                    return crate::core::metrics_manager::extract_gauge_metrics(text, "sglang_num_used_tokens");
+                    return crate::core::metrics_manager::extract_gauge_metrics(
+                        text,
+                        "sglang_num_used_tokens",
+                    );
                 }
                 HashMap::new()
-            },
+            }
             _ => HashMap::new(),
         }
     }
@@ -368,7 +374,15 @@ impl LoadMonitor {
         let tx = self.tx.clone();
 
         let handle = tokio::spawn(async move {
-            Self::monitor_loop(worker_registry, policy_registry, worker_load_manager, client, interval, tx).await;
+            Self::monitor_loop(
+                worker_registry,
+                policy_registry,
+                worker_load_manager,
+                client,
+                interval,
+                tx,
+            )
+            .await;
         });
 
         *handle_guard = Some(handle);

@@ -1,15 +1,11 @@
 //! Worker load
 //!
 //! Record and manage the DP group load of workers.
-use std::{
-    collections::HashMap,
-    fmt::Debug,
-    sync::RwLock,
-};
-
-use crate::core::Worker;
+use std::{collections::HashMap, fmt::Debug, sync::RwLock};
 
 use tracing::debug;
+
+use crate::core::Worker;
 
 #[derive(Debug, Default)]
 pub struct WorkerLoadManager {
@@ -47,7 +43,10 @@ impl WorkerLoadManager {
         // Add an increment to the load of dp group,
         // to prevent all request from being scheduled to the same DP group during the interval between two load reports.
         if let Ok(mut cached_loads) = self.dp_cached_loads.write() {
-            debug!("WorkerLoadManager load_increment map:{:?}, increment:{}", cached_loads, increment);
+            debug!(
+                "WorkerLoadManager load_increment map:{:?}, increment:{}",
+                cached_loads, increment
+            );
             if let Some(loads) = cached_loads.get_mut(worker.url()) {
                 if let Some(dp_load) = loads.get_mut(&dp_rank) {
                     *dp_load += increment;

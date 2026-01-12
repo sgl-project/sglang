@@ -1,4 +1,4 @@
-use smg::core::metrics_manager::{aggregate_metrics, MetricPack, extract_gauge_metrics};
+use smg::core::metrics_manager::{aggregate_metrics, extract_gauge_metrics, MetricPack};
 
 #[test]
 fn test_extract_gauge_metrics() {

@@ -1,6 +1,9 @@
-use anyhow::ensure;
-use openmetrics_parser::{MetricFamily, MetricsExposition, MetricNumber, PrometheusType, PrometheusValue};
 use std::collections::HashMap;
+
+use anyhow::ensure;
+use openmetrics_parser::{
+    MetricFamily, MetricNumber, MetricsExposition, PrometheusType, PrometheusValue,
+};
 use tracing::warn;
 
 #[derive(Debug)]
@@ -106,13 +109,14 @@ pub fn extract_gauge_metrics(text: String, target_metric_family: &str) -> HashMa
     extract_metrics(
         &exposition,
         target_metric_family,
-        &PrometheusValue::Gauge(MetricNumber::Float(0.0)))
+        &PrometheusValue::Gauge(MetricNumber::Float(0.0)),
+    )
 }
 
 pub fn extract_metrics(
     exposition: &PrometheusExposition,
     target_metric_family: &str,
-    target_value_type: &PrometheusValue
+    target_value_type: &PrometheusValue,
 ) -> HashMap<isize, isize> {
     let mut result = HashMap::new();
     let Some(target_families) = exposition.families.get(target_metric_family) else {
@@ -140,17 +144,21 @@ pub fn extract_metrics(
         let dp_rank = match dp_rank_str.parse::<isize>() {
             Ok(rank_num) => rank_num,
             Err(e) => {
-                warn!("Failed to parse dp_rank value {} as number: {}", dp_rank_str, e);
+                warn!(
+                    "Failed to parse dp_rank value {} as number: {}",
+                    dp_rank_str, e
+                );
                 0
             }
         };
 
         let metric_value = match (&target_value_type, &sample.value) {
-            (PrometheusValue::Gauge(_), PrometheusValue::Gauge(val)) => {
-                val.as_f64()
-            }
+            (PrometheusValue::Gauge(_), PrometheusValue::Gauge(val)) => val.as_f64(),
             (target_type, actual_type) => {
-                warn!("Unadapted PrometheusValue. Expected:{:?}, Actual:{:?}.", target_type, actual_type);
+                warn!(
+                    "Unadapted PrometheusValue. Expected:{:?}, Actual:{:?}.",
+                    target_type, actual_type
+                );
                 continue;
             }
         };

@@ -162,10 +162,7 @@ impl BasicWorkerBuilder {
             let default_port = match url::Url::parse(&self.url) {
                 Ok(parsed) => parsed.port().unwrap_or(8080).to_string(),
                 Err(_) => {
-                    tracing::warn!(
-                        "Failed to parse port '{}', defaulting to 8080",
-                        self.url
-                    );
+                    tracing::warn!("Failed to parse port '{}', defaulting to 8080", self.url);
                     "8080".to_string()
                 }
             };

@@ -8,12 +8,14 @@ use tracing::{error, warn};
 
 use super::PipelineStage;
 use crate::{
-    core::{ConnectionMode, Worker, WorkerLoadManager, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
+    core::{
+        ConnectionMode, Worker, WorkerLoadManager, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+    },
     observability::metrics::{metrics_labels, Metrics},
     policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
         error,
-        grpc::context::{RequestType, RequestContext, WorkerSelection},
+        grpc::context::{RequestContext, RequestType, WorkerSelection},
     },
 };
 
@@ -123,55 +125,65 @@ impl PipelineStage for WorkerSelectionStage {
             }
         };
 
-        if self.policy_registry.is_dp_minimum_tokens_scheduler_enabled() {
+        if self
+            .policy_registry
+            .is_dp_minimum_tokens_scheduler_enabled()
+        {
             if let WorkerSelection::Dual { prefill, decode } = &workers {
                 match &mut ctx.input.request_type {
                     RequestType::Generate(req_arc) => {
-                        let text_length = req_arc.text
+                        let text_length = req_arc
+                            .text
                             .as_ref()
                             .map(|text_str| text_str.len())
                             .unwrap_or(0);
-                        let text_length = text_length
-                            .try_into()
+                        let text_length = text_length.try_into().map_err(|e| {
+                            error!("Failed to convert length to size:{}", e);
+                            error::internal_error("length_conversion_failed", format!("{}", e))
+                        })?;
+                        let (prefill_rank, decode_rank) = self
+                            .select_data_parallel_rank(
+                                prefill.as_ref(),
+                                decode.as_ref(),
+                                text_length,
+                            )
+                            .await
                             .map_err(|e| {
-                                error!("Failed to convert length to size:{}", e);
-                                error::internal_error("length_conversion_failed", format!("{}", e))
+                                error!("select data_parallel_rank failed: {}", e);
+                                error::internal_error("dp_rank_selection_failed", e)
                             })?;
-                        let (prefill_rank, decode_rank) =
-                            self.select_data_parallel_rank(prefill.as_ref(), decode.as_ref(), text_length)
-                                .await.map_err(|e| {
-                                    error!("select data_parallel_rank failed: {}", e);
-                                    error::internal_error("dp_rank_selection_failed", e,)
-                                })?;
                         let req = Arc::make_mut(req_arc);
                         req.data_parallel_rank = Some(prefill_rank);
                         req.data_parallel_rank_decode = Some(decode_rank);
-                    },
+                    }
                     RequestType::Chat(chat_arc) => {
                         let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
                             error!(
                                 function = "ChatRequestBuildingStage::execute",
                                 "Preparation not completed"
                             );
-                            error::internal_error("preparation_not_completed", "Preparation not completed")
+                            error::internal_error(
+                                "preparation_not_completed",
+                                "Preparation not completed"
+                            )
                         })?;
                         let text = prep.processed_messages.as_ref().unwrap().text.clone();
-                        let text_len = text.chars().count().try_into()
+                        let text_len = text.chars().count().try_into().map_err(|e| {
+                            error!("Failed to convert chat text length to size:{}", e);
+                            error::internal_error("dp_rank_selection_failed", format!("{}", e))
+                        })?;
+                        let (prefill_rank, decode_rank) = self
+                            .select_data_parallel_rank(prefill.as_ref(), decode.as_ref(), text_len)
+                            .await
                             .map_err(|e| {
-                                error!("Failed to convert chat text length to size:{}", e);
-                                error::internal_error("dp_rank_selection_failed", format!("{}", e))
+                                error!("select data_parallel_rank failed: {}", e);
+                                error::internal_error("dp_rank_selection_failed", e,)
                             })?;
-                        let (prefill_rank, decode_rank) =
-                            self.select_data_parallel_rank(prefill.as_ref(), decode.as_ref(), text_len)
-                                .await.map_err(|e| {
-                                    error!("select data_parallel_rank failed: {}", e);
-                                    error::internal_error("dp_rank_selection_failed", e,)
-                                })?;
                         let req = Arc::make_mut(chat_arc);
                         req.data_parallel_rank = Some(prefill_rank);
                         req.data_parallel_rank_decode = Some(decode_rank);
-                    },
-                    _ => {},
+                    }
+                    _ => {}
                 }
             }
         }
@@ -341,7 +353,10 @@ impl WorkerSelectionStage {
             if let Some(dp_rank) = lowest_decode_dp_rank {
                 worker_load.load_increment(decode_worker, dp_rank, text_str);
             }
-            return Ok((lowest_prefill_dp_rank.unwrap_or(0) as i32, lowest_decode_dp_rank.unwrap_or(0) as i32));
+            return Ok((
+                lowest_prefill_dp_rank.unwrap_or(0) as i32,
+                lowest_decode_dp_rank.unwrap_or(0) as i32,
+            ));
         }
         Ok((0, 0))
     }
