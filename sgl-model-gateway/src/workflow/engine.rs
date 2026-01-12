@@ -100,6 +100,23 @@ impl Backoff for LinearBackoff {
     }
 }
 
+/// Enum-based backoff implementation to avoid heap allocation
+enum BackoffImpl {
+    Fixed(FixedBackoff),
+    Exponential(backoff::ExponentialBackoff),
+    Linear(LinearBackoff),
+}
+
+impl BackoffImpl {
+    fn next_backoff(&mut self) -> Option<Duration> {
+        match self {
+            BackoffImpl::Fixed(b) => b.next_backoff(),
+            BackoffImpl::Exponential(b) => b.next_backoff(),
+            BackoffImpl::Linear(b) => b.next_backoff(),
+        }
+    }
+}
+
 /// Main workflow execution engine
 ///
 /// # Type Parameters
@@ -299,7 +316,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     }
 
     /// Register a workflow definition
-    pub fn register_workflow(&self, mut definition: WorkflowDefinition<D>) -> Result<(), String> {
+    #[must_use = "registration result should be checked"]
+    pub fn register_workflow(
+        &self,
+        mut definition: WorkflowDefinition<D>,
+    ) -> Result<(), super::definition::ValidationError> {
         // Validate DAG and build dependency graph once at registration
         definition.validate()?;
 
@@ -321,6 +342,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     /// Start a new workflow instance
     ///
     /// Returns `Err(WorkflowError::ShuttingDown)` if the engine is shutting down.
+    #[must_use = "workflow instance ID should be stored or awaited"]
     pub async fn start_workflow(
         &self,
         definition_id: WorkflowId,
@@ -746,19 +768,19 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         }
     }
 
-    fn create_backoff(strategy: &BackoffStrategy) -> Box<dyn Backoff + Send> {
+    fn create_backoff(strategy: &BackoffStrategy) -> BackoffImpl {
         match strategy {
-            BackoffStrategy::Fixed(duration) => Box::new(FixedBackoff(*duration)),
+            BackoffStrategy::Fixed(duration) => BackoffImpl::Fixed(FixedBackoff(*duration)),
             BackoffStrategy::Exponential { base, max } => {
                 let backoff = ExponentialBackoffBuilder::new()
                     .with_initial_interval(*base)
                     .with_max_interval(*max)
                     .with_max_elapsed_time(None)
                     .build();
-                Box::new(backoff)
+                BackoffImpl::Exponential(backoff)
             }
             BackoffStrategy::Linear { increment, max } => {
-                Box::new(LinearBackoff::new(*increment, *max))
+                BackoffImpl::Linear(LinearBackoff::new(*increment, *max))
             }
         }
     }
