@@ -471,10 +471,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
         # determine the number of layers.
-        model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
+        self.model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None and self.model_config.num_nextn_predict_layers > 0
         model_num_layers = (
             self.model_config.num_nextn_predict_layers
-            if self.is_draft_worker and model_has_mtp_layers
+            if self.is_draft_worker and self.model_has_mtp_layers
             else max(
                 self.model_config.num_hidden_layers,
                 self.model_config.num_attention_layers,
@@ -492,7 +492,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.num_effective_layers = self.num_effective_layers * loop_num
 
         assert (
-            (not model_has_mtp_layers)
+            (not self.model_has_mtp_layers)
             or (self.spec_algorithm.is_none())
             or (
                 (not self.spec_algorithm.is_none())

@@ -117,7 +117,7 @@ class ModelRunnerKVCacheMixin:
         )
 
         # Get the number of layers used for KV cache calculation
-        if self.is_draft_worker:
+        if self.is_draft_worker and self.model_has_mtp_layers:
             num_layers = getattr(
                 self.model_config.hf_config,
                 "num_nextn_predict_layers",
