@@ -2480,6 +2480,20 @@ def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
 
 
+def round_up_to_multiple(x: int, multiple: int) -> int:
+    """
+    Rounds up x to the nearest multiple of 'multiple'.
+
+    :param x: The number to be rounded up.
+    :type x: int
+    :param multiple: The multiple to which x should be rounded up.
+    :type multiple: int
+    :return: The smallest multiple of 'multiple' that is greater than or equal to 'x'.
+    :rtype: int
+    """
+    return ((x + multiple - 1) // multiple) * multiple
+
+
 setattr(triton, "next_power_of_2", next_power_of_2)
 
 
