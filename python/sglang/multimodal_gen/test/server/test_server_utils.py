@@ -401,38 +401,26 @@ class ServerManager:
             self._wait_for_ready(process, stdout_path)
         except (TimeoutError, RuntimeError) as e:
             # Log additional diagnostic information before re-raising
-            logger.error(
-                "[server-test] Server startup failed!\n"
-                "  Model: %s\n"
-                "  Port: %s\n"
-                "  Process PID: %s\n"
-                "  Process status: %s\n"
-                "  Log file: %s\n"
-                "  Error type: %s\n"
-                "  Error message:\n%s",
-                self.model,
-                self.port,
-                process.pid,
-                (
-                    "running"
-                    if process.poll() is None
-                    else f"exited (code {process.returncode})"
-                ),
-                stdout_path,
-                type(e).__name__,
-                str(e),
+            additional_info = (
+                f"[server-test] Server startup failed!\n"
+                f"  Model: {self.model}\n"
+                f"  Port: {self.port}\n"
+                f"  Process PID: {process.pid}\n"
+                f"  Process status: {('running' if process.poll() is None else f'exited (code {process.returncode})')}\n"
+                f"  Log file: {stdout_path}\n"
+                f"  Error type: {type(e).__name__}\n"
+                f"  Error message:\n{str(e)}"
             )
             # Try to get more log context
             if stdout_path.exists():
                 try:
                     full_log_size = stdout_path.stat().st_size
-                    logger.error(
-                        "[server-test] Log file size: %s bytes, path: %s",
-                        full_log_size,
-                        stdout_path,
-                    )
+                    additional_info += f"\n  Log file size: {full_log_size} bytes"
                 except Exception:
                     pass
+            # Print to stdout so pytest can see it (pytest uses -s flag)
+            print(f"\n{additional_info}\n", flush=True)
+            logger.error(additional_info)
             raise
 
         return ServerContext(
@@ -479,6 +467,8 @@ class ServerManager:
                     f"  Last {min(500, tail_line_count)} lines of log:\n"
                     f"{'=' * 80}\n{tail}\n{'=' * 80}"
                 )
+                # Print to stdout so pytest can see it (pytest uses -s flag)
+                print(f"\n{error_msg}\n", flush=True)
                 logger.error(error_msg)
                 raise RuntimeError(error_msg)
 
@@ -546,6 +536,8 @@ class ServerManager:
             f"  Last {min(500, tail_line_count)} lines of log:\n"
             f"{'=' * 80}\n{tail}\n{'=' * 80}"
         )
+        # Print to stdout so pytest can see it (pytest uses -s flag)
+        print(f"\n{error_msg}\n", flush=True)
         logger.error(error_msg)
         raise TimeoutError(error_msg)
 

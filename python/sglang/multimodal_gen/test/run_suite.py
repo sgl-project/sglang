@@ -141,7 +141,18 @@ def run_pytest(files, filter_expr=None):
         print("No files to run.")
         return 0
 
-    base_cmd = [sys.executable, "-m", "pytest", "-s", "-v"]
+    base_cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-s",  # Don't capture stdout/stderr
+        "-v",  # Verbose output
+        "--tb=long",  # Show full traceback
+        "--log-cli=true",  # Enable live logging
+        "--log-cli-level=INFO",  # Set log level to INFO
+        "--log-cli-format=%(asctime)s [%(levelname)8s] %(name)s: %(message)s",  # Log format
+        "--log-cli-date-format=%Y-%m-%d %H:%M:%S",  # Date format
+    ]
 
     # Add pytest -k filter if provided
     if filter_expr:

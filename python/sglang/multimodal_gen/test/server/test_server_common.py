@@ -119,18 +119,16 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     try:
         ctx = manager.start()
     except (TimeoutError, RuntimeError) as e:
-        logger.error(
-            "[server-test] Failed to start server for test case: %s\n"
-            "  Model: %s\n"
-            "  Port: %s\n"
-            "  Error type: %s\n"
-            "  Error message:\n%s",
-            case.id,
-            server_args.model_path,
-            port,
-            type(e).__name__,
-            str(e),
+        error_info = (
+            f"[server-test] Failed to start server for test case: {case.id}\n"
+            f"  Model: {server_args.model_path}\n"
+            f"  Port: {port}\n"
+            f"  Error type: {type(e).__name__}\n"
+            f"  Error message:\n{str(e)}"
         )
+        # Print to stdout so pytest can see it (pytest uses -s flag)
+        print(f"\n{error_info}\n", flush=True)
+        logger.error(error_info)
         raise
 
     try:
