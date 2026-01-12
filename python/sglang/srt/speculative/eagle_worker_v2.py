@@ -14,7 +14,9 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_group
-from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLAMultiStepDraftBackend
+from sglang.srt.layers.attention.trtllm_mla_backend import (
+    TRTLLMMLAMultiStepDraftBackend,
+)
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
