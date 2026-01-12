@@ -198,8 +198,10 @@ def _fwd_kernel_stage1_quant_int8(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
-    stride_sz_kbs,  # scales_zeros stride for cache
-    stride_sz_kh,  # scales_zeros stride for head
+    stride_sz_kbs,
+    stride_sz_kh,
+    stride_sz_vbs,
+    stride_sz_vh,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -311,7 +313,7 @@ def _fwd_kernel_stage1_quant_int8(
             )
 
             # Load scales and zeros for V
-            offs_sz_v = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
+            offs_sz_v = kv_loc * stride_sz_vbs + cur_kv_head * stride_sz_vh
             v_scales = tl.load(
                 V_Scales_Zeros + offs_sz_v + 0,
                 mask=offs_n < split_kv_end,
@@ -382,8 +384,10 @@ def _fwd_kernel_stage1_quant_int4(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
-    stride_sz_kbs,  # scales_zeros stride for cache
-    stride_sz_kh,  # scales_zeros stride for head
+    stride_sz_kbs,
+    stride_sz_kh,
+    stride_sz_vbs,
+    stride_sz_vh,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -524,7 +528,7 @@ def _fwd_kernel_stage1_quant_int4(
             )
 
             # Load scales and zeros for V
-            offs_sz_v = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
+            offs_sz_v = kv_loc * stride_sz_vbs + cur_kv_head * stride_sz_vh
             v_scales = tl.load(
                 V_Scales_Zeros + offs_sz_v + 0,
                 mask=offs_n < split_kv_end,
@@ -1248,6 +1252,8 @@ def _decode_att_m_fwd_quant_int8(
         v_buffer.stride(1),
         k_scales_zeros.stride(0),
         k_scales_zeros.stride(1),
+        v_scales_zeros.stride(0),
+        v_scales_zeros.stride(1),
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -1330,6 +1336,8 @@ def _decode_att_m_fwd_quant_int4(
         v_buffer.stride(1),
         k_scales_zeros.stride(0),
         k_scales_zeros.stride(1),
+        v_scales_zeros.stride(0),
+        v_scales_zeros.stride(1),
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
