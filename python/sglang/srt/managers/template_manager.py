@@ -28,7 +28,7 @@ from sglang.srt.parser.code_completion_parser import (
     CompletionTemplate,
     FimPosition,
     completion_template_exists,
-    register_completion_template,
+    register_completion_template, define_completion_template,
 )
 from sglang.srt.parser.conversation import (
     Conversation,
@@ -194,6 +194,7 @@ class TemplateManager:
             self._load_json_completion_template(completion_template_arg)
         else:
             self._completion_template_name = completion_template_arg
+        define_completion_template(self._completion_template_name)
 
     def initialize_templates(
         self,
