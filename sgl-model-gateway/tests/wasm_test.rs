@@ -109,12 +109,12 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
 
     // Initialize WorkflowEngine and register workflows
     use smg::{
-        core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
+        core::steps::{create_local_worker_workflow, create_worker_removal_workflow},
         workflow::WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
     engine
-        .register_workflow(create_worker_registration_workflow(&config))
+        .register_workflow(create_local_worker_workflow(&config))
         .expect("worker_registration workflow should be valid");
     engine
         .register_workflow(create_worker_removal_workflow())
@@ -685,8 +685,11 @@ async fn test_wasm_module_execution() {
 
     // Create workflow context for registration
     use smg::{
-        core::steps::WasmModuleConfigRequest,
-        workflow::{WorkflowContext, WorkflowId, WorkflowInstanceId},
+        core::steps::{
+            workflow_data::{AnyWorkflowData, WasmRegistrationWorkflowData},
+            WasmModuleConfigRequest,
+        },
+        workflow::WorkflowId,
     };
 
     let descriptor = WasmModuleDescriptor {
@@ -700,16 +703,18 @@ async fn test_wasm_module_execution() {
     };
 
     let config_request = WasmModuleConfigRequest { descriptor };
-    let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-    workflow_context.set_arc("wasm_module_config", Arc::new(config_request));
-    workflow_context.set_arc("app_context", app_context.clone());
+    let workflow_data = AnyWorkflowData::WasmRegistration(WasmRegistrationWorkflowData {
+        config: config_request,
+        wasm_bytes: None,
+        sha256_hash: None,
+        file_size_bytes: None,
+        module_uuid: None,
+        app_context: Some(app_context.clone()),
+    });
 
     // Start workflow
     let instance_id = engine
-        .start_workflow(
-            WorkflowId::new("wasm_module_registration"),
-            workflow_context,
-        )
+        .start_workflow(WorkflowId::new("wasm_module_registration"), workflow_data)
         .await
         .expect("Failed to start workflow");
 
@@ -729,9 +734,9 @@ async fn test_wasm_module_execution() {
 
         match state.status {
             smg::workflow::WorkflowStatus::Completed => {
-                // Extract module UUID from context
-                if let Some(uuid_arc) = state.context.get::<Uuid>("module_uuid") {
-                    module_uuid = Some(*uuid_arc.as_ref());
+                // Extract module UUID from typed workflow data
+                if let AnyWorkflowData::WasmRegistration(ref data) = state.context.data {
+                    module_uuid = data.module_uuid;
                 }
                 break;
             }

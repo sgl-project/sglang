@@ -1,18 +1,18 @@
 //! Step to find workers to remove based on URL.
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 
 use async_trait::async_trait;
 use tracing::debug;
 
 use super::find_workers_by_url;
 use crate::{
-    app_context::AppContext,
+    core::steps::workflow_data::{AnyWorkflowData, WorkerList},
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
 /// Request structure for worker removal.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkerRemovalRequest {
     pub url: String,
     pub dp_aware: bool,
@@ -25,10 +25,17 @@ pub struct WorkerRemovalRequest {
 pub struct FindWorkersToRemoveStep;
 
 #[async_trait]
-impl StepExecutor for FindWorkersToRemoveStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let request: Arc<WorkerRemovalRequest> = context.get_or_err("removal_request")?;
-        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+impl StepExecutor<AnyWorkflowData> for FindWorkersToRemoveStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<AnyWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let data = context.data.as_worker_removal()?;
+        let request = &data.config;
+        let app_context = data
+            .app_context
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
         let workers_to_remove =
             find_workers_by_url(&app_context.worker_registry, &request.url, request.dp_aware);
@@ -62,9 +69,12 @@ impl StepExecutor for FindWorkersToRemoveStep {
             .map(|w| w.model_id().to_string())
             .collect();
 
-        context.set("workers_to_remove", workers_to_remove);
-        context.set("worker_urls", worker_urls);
-        context.set("affected_models", affected_models);
+        // Update workflow data
+        let data_mut = context.data.as_worker_removal_mut()?;
+        data_mut.workers_to_remove = Some(WorkerList::from_workers(&workers_to_remove));
+        data_mut.actual_workers_to_remove = Some(workers_to_remove);
+        data_mut.worker_urls = worker_urls;
+        data_mut.affected_models = affected_models;
 
         Ok(StepResult::Success)
     }

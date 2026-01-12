@@ -1,13 +1,12 @@
 //! Step to update policies for updated workers.
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 
 use async_trait::async_trait;
 use tracing::debug;
 
 use crate::{
-    app_context::AppContext,
-    core::Worker,
+    core::steps::workflow_data::AnyWorkflowData,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -18,10 +17,20 @@ use crate::{
 pub struct UpdatePoliciesForWorkerStep;
 
 #[async_trait]
-impl StepExecutor for UpdatePoliciesForWorkerStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
-        let updated_workers: Arc<Vec<Arc<dyn Worker>>> = context.get_or_err("updated_workers")?;
+impl StepExecutor<AnyWorkflowData> for UpdatePoliciesForWorkerStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<AnyWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let data = context.data.as_worker_update()?;
+        let app_context = data
+            .app_context
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let updated_workers = data
+            .updated_workers
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("updated_workers".to_string()))?;
 
         // Collect affected models
         let affected_models: HashSet<String> = updated_workers

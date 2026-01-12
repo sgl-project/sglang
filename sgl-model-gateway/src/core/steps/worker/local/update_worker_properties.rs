@@ -6,9 +6,7 @@ use async_trait::async_trait;
 use tracing::{debug, info};
 
 use crate::{
-    app_context::AppContext,
-    core::{BasicWorkerBuilder, HealthConfig, Worker},
-    protocols::worker_spec::WorkerUpdateRequest,
+    core::{steps::workflow_data::AnyWorkflowData, BasicWorkerBuilder, HealthConfig, Worker},
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -16,23 +14,26 @@ use crate::{
 ///
 /// This step creates new worker instances with updated properties and
 /// re-registers them to replace the old workers in the registry.
-///
-/// Expects the following context values:
-/// - "update_request": WorkerUpdateRequest (from protocols::worker_spec)
-/// - "app_context": Arc<AppContext>
-/// - "workers_to_update": Vec<Arc<dyn Worker>>
-///
-/// Sets the following context values:
-/// - "updated_workers": Vec<Arc<dyn Worker>>
 pub struct UpdateWorkerPropertiesStep;
 
 #[async_trait]
-impl StepExecutor for UpdateWorkerPropertiesStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let request: Arc<WorkerUpdateRequest> = context.get_or_err("update_request")?;
-        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
-        let workers_to_update: Arc<Vec<Arc<dyn Worker>>> =
-            context.get_or_err("workers_to_update")?;
+impl StepExecutor<AnyWorkflowData> for UpdateWorkerPropertiesStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<AnyWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let data = context.data.as_worker_update()?;
+        let request = &data.config;
+        let app_context = data
+            .app_context
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
+            .clone();
+        let workers_to_update = data
+            .workers_to_update
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("workers_to_update".to_string()))?
+            .clone();
 
         debug!(
             "Updating properties for {} worker(s)",
@@ -136,7 +137,7 @@ impl StepExecutor for UpdateWorkerPropertiesStep {
         }
 
         // Store updated workers for subsequent steps
-        context.set("updated_workers", updated_workers);
+        context.data.as_worker_update_mut()?.updated_workers = Some(updated_workers);
 
         Ok(StepResult::Success)
     }

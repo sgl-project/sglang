@@ -6,6 +6,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    marker::PhantomData,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -24,7 +25,7 @@ use tokio::{
 use super::{
     definition::{StepDefinition, WorkflowDefinition},
     event::{EventBus, WorkflowEvent},
-    state::WorkflowStateStore,
+    state::{InMemoryStore, StateStore},
     types::*,
 };
 
@@ -101,6 +102,11 @@ impl Backoff for LinearBackoff {
 
 /// Main workflow execution engine
 ///
+/// # Type Parameters
+///
+/// * `D` - The workflow data type that implements `WorkflowData`
+/// * `S` - The state store implementation (defaults to `InMemoryStore<D>`)
+///
 /// # Graceful Shutdown
 ///
 /// The engine supports graceful shutdown via [`shutdown()`](Self::shutdown):
@@ -115,9 +121,9 @@ impl Backoff for LinearBackoff {
 ///     engine.force_cancel_all().await;
 /// }
 /// ```
-pub struct WorkflowEngine {
-    definitions: Arc<RwLock<HashMap<WorkflowId, Arc<WorkflowDefinition>>>>,
-    state_store: WorkflowStateStore,
+pub struct WorkflowEngine<D: WorkflowData, S: StateStore<D> = InMemoryStore<D>> {
+    definitions: Arc<RwLock<HashMap<WorkflowId, Arc<WorkflowDefinition<D>>>>>,
+    state_store: S,
     event_bus: Arc<EventBus>,
     /// Shutdown signal sender - when true, engine is shutting down
     shutdown_tx: Arc<watch::Sender<bool>>,
@@ -125,18 +131,27 @@ pub struct WorkflowEngine {
     shutdown_rx: watch::Receiver<bool>,
     /// Count of active workflow executions
     active_workflows: Arc<AtomicUsize>,
+    _phantom: PhantomData<D>,
 }
 
-impl WorkflowEngine {
+impl<D: WorkflowData> WorkflowEngine<D, InMemoryStore<D>> {
     pub fn new() -> Self {
+        Self::with_store(InMemoryStore::new())
+    }
+}
+
+impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
+    /// Create a new workflow engine with a custom state store
+    pub fn with_store(state_store: S) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             definitions: Arc::new(RwLock::new(HashMap::new())),
-            state_store: WorkflowStateStore::new(),
+            state_store,
             event_bus: Arc::new(EventBus::new()),
             shutdown_tx: Arc::new(shutdown_tx),
             shutdown_rx,
             active_workflows: Arc::new(AtomicUsize::new(0)),
+            _phantom: PhantomData,
         }
     }
 
@@ -284,7 +299,7 @@ impl WorkflowEngine {
     }
 
     /// Register a workflow definition
-    pub fn register_workflow(&self, mut definition: WorkflowDefinition) -> Result<(), String> {
+    pub fn register_workflow(&self, mut definition: WorkflowDefinition<D>) -> Result<(), String> {
         // Validate DAG and build dependency graph once at registration
         definition.validate()?;
 
@@ -299,7 +314,7 @@ impl WorkflowEngine {
     }
 
     /// Get the state store
-    pub fn state_store(&self) -> &WorkflowStateStore {
+    pub fn state_store(&self) -> &S {
         &self.state_store
     }
 
@@ -309,7 +324,7 @@ impl WorkflowEngine {
     pub async fn start_workflow(
         &self,
         definition_id: WorkflowId,
-        context: WorkflowContext,
+        data: D,
     ) -> WorkflowResult<WorkflowInstanceId> {
         // Guard increments counter and decrements on drop unless committed.
         // This handles all error paths automatically.
@@ -326,10 +341,9 @@ impl WorkflowEngine {
             .cloned()
             .ok_or_else(|| WorkflowError::DefinitionNotFound(definition_id.clone()))?;
 
-        let instance_id = context.instance_id;
-        let mut state = WorkflowState::new(instance_id, definition_id.clone());
+        let instance_id = WorkflowInstanceId::new();
+        let mut state = WorkflowState::new(instance_id, definition_id.clone(), data);
         state.status = WorkflowStatus::Running;
-        state.context = context;
 
         for step in &definition.steps {
             state
@@ -369,7 +383,7 @@ impl WorkflowEngine {
     async fn execute_workflow(
         &self,
         instance_id: WorkflowInstanceId,
-        definition: Arc<WorkflowDefinition>,
+        definition: Arc<WorkflowDefinition<D>>,
     ) -> WorkflowResult<()> {
         let start_time = std::time::Instant::now();
         let step_count = definition.steps.len();
@@ -572,8 +586,8 @@ impl WorkflowEngine {
     async fn execute_step_with_retry(
         &self,
         instance_id: WorkflowInstanceId,
-        step: &StepDefinition,
-        definition: &WorkflowDefinition,
+        step: &StepDefinition<D>,
+        definition: &WorkflowDefinition<D>,
     ) -> WorkflowResult<StepResult> {
         let retry_policy = definition.get_retry_policy(step);
         let step_timeout = definition.get_timeout(step);
@@ -624,7 +638,7 @@ impl WorkflowEngine {
             let step_duration = step_start.elapsed();
 
             self.state_store.update(instance_id, |s| {
-                s.context = std::mem::replace(&mut context, WorkflowContext::new(instance_id));
+                s.context = context.clone();
             })?;
 
             match result {
@@ -763,7 +777,7 @@ impl WorkflowEngine {
     }
 
     /// Get workflow status
-    pub fn get_status(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<WorkflowState> {
+    pub fn get_status(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<WorkflowState<D>> {
         self.state_store.load(instance_id)
     }
 
@@ -776,6 +790,7 @@ impl WorkflowEngine {
             shutdown_tx: Arc::clone(&self.shutdown_tx),
             shutdown_rx: self.shutdown_rx.clone(),
             active_workflows: Arc::clone(&self.active_workflows),
+            _phantom: PhantomData,
         }
     }
 }
@@ -794,13 +809,13 @@ impl Drop for ActiveWorkflowGuard {
 
 /// RAII guard for start_workflow that increments on creation and decrements on drop
 /// unless commit() is called. Handles all error paths automatically.
-struct StartGuard<'a> {
-    engine: &'a WorkflowEngine,
+struct StartGuard<'a, D: WorkflowData, S: StateStore<D> + 'static> {
+    engine: &'a WorkflowEngine<D, S>,
     committed: bool,
 }
 
-impl<'a> StartGuard<'a> {
-    fn new(engine: &'a WorkflowEngine) -> Self {
+impl<'a, D: WorkflowData, S: StateStore<D> + 'static> StartGuard<'a, D, S> {
+    fn new(engine: &'a WorkflowEngine<D, S>) -> Self {
         engine.active_workflows.fetch_add(1, Ordering::AcqRel);
         Self {
             engine,
@@ -813,7 +828,7 @@ impl<'a> StartGuard<'a> {
     }
 }
 
-impl Drop for StartGuard<'_> {
+impl<D: WorkflowData, S: StateStore<D> + 'static> Drop for StartGuard<'_, D, S> {
     fn drop(&mut self) {
         if !self.committed {
             self.engine.workflow_finished();
@@ -821,23 +836,35 @@ impl Drop for StartGuard<'_> {
     }
 }
 
-impl Clone for WorkflowEngine {
+/// Clone implementation for internal use.
+///
+/// **Note**: This creates a shallow clone that shares state with the original engine.
+/// Both engines will share the same:
+/// - Workflow definitions
+/// - State store
+/// - Event bus
+/// - Shutdown signal
+/// - Active workflow counter
+///
+/// This is intentional for spawning async tasks that need access to the engine.
+/// For most use cases, prefer sharing the engine via `Arc<WorkflowEngine>` rather
+/// than cloning.
+impl<D: WorkflowData, S: StateStore<D> + 'static> Clone for WorkflowEngine<D, S> {
     fn clone(&self) -> Self {
         self.clone_for_execution()
     }
 }
 
-impl Default for WorkflowEngine {
+impl<D: WorkflowData> Default for WorkflowEngine<D, InMemoryStore<D>> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl std::fmt::Debug for WorkflowEngine {
+impl<D: WorkflowData, S: StateStore<D> + 'static> std::fmt::Debug for WorkflowEngine<D, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkflowEngine")
             .field("definitions_count", &self.definitions.read().len())
-            .field("state_count", &self.state_store.count())
             .finish()
     }
 }

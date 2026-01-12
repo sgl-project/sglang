@@ -358,12 +358,12 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
 
     // Initialize WorkflowEngine and register workflows
     use smg::{
-        core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
+        core::steps::{create_local_worker_workflow, create_worker_removal_workflow},
         workflow::WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
     engine
-        .register_workflow(create_worker_registration_workflow(&config))
+        .register_workflow(create_local_worker_workflow(&config))
         .expect("worker_registration workflow should be valid");
     engine
         .register_workflow(create_worker_removal_workflow())
@@ -491,12 +491,12 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
 
     // Initialize WorkflowEngine and register workflows
     use smg::{
-        core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
+        core::steps::{create_local_worker_workflow, create_worker_removal_workflow},
         workflow::WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
     engine
-        .register_workflow(create_worker_registration_workflow(&config))
+        .register_workflow(create_local_worker_workflow(&config))
         .expect("worker_registration workflow should be valid");
     engine
         .register_workflow(create_worker_removal_workflow())
@@ -624,12 +624,12 @@ pub async fn create_test_context_with_mcp_config(
 
     // Initialize WorkflowEngine and register workflows
     use smg::{
-        core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
+        core::steps::{create_local_worker_workflow, create_worker_removal_workflow},
         workflow::WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
     engine
-        .register_workflow(create_worker_registration_workflow(&config))
+        .register_workflow(create_local_worker_workflow(&config))
         .expect("worker_registration workflow should be valid");
     engine
         .register_workflow(create_worker_removal_workflow())

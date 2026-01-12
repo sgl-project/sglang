@@ -8,8 +8,24 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use smg::workflow::*;
 use tokio::time::sleep;
+
+/// Test workflow data type for integration tests.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TestWorkflowData {
+    /// Execution count for tracking step invocations
+    pub execution_count: u32,
+    /// Test key for context sharing tests
+    pub test_key: Option<String>,
+}
+
+impl WorkflowData for TestWorkflowData {
+    fn workflow_type() -> &'static str {
+        "test_workflow"
+    }
+}
 
 // Test step that counts invocations
 struct CountingStep {
@@ -18,12 +34,15 @@ struct CountingStep {
 }
 
 #[async_trait::async_trait]
-impl StepExecutor for CountingStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+impl StepExecutor<TestWorkflowData> for CountingStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
         let count = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
 
         // Store count in context
-        context.set("execution_count", count);
+        context.data.execution_count = count;
 
         if count >= self.should_succeed_after {
             Ok(StepResult::Success)
@@ -40,15 +59,18 @@ impl StepExecutor for CountingStep {
 struct AlwaysSucceedStep;
 
 #[async_trait::async_trait]
-impl StepExecutor for AlwaysSucceedStep {
-    async fn execute(&self, _context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+impl StepExecutor<TestWorkflowData> for AlwaysSucceedStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
         Ok(StepResult::Success)
     }
 }
 
 #[tokio::test]
 async fn test_simple_workflow_execution() {
-    let engine = WorkflowEngine::new();
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
     // Subscribe to events for logging
     engine
@@ -74,7 +96,7 @@ async fn test_simple_workflow_execution() {
 
     // Start workflow
     let instance_id = engine
-        .start_workflow(workflow_id, WorkflowContext::new(WorkflowInstanceId::new()))
+        .start_workflow(workflow_id, TestWorkflowData::default())
         .await
         .unwrap();
 
@@ -89,7 +111,7 @@ async fn test_simple_workflow_execution() {
 
 #[tokio::test]
 async fn test_workflow_with_retry() {
-    let engine = WorkflowEngine::new();
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
     engine
         .event_bus()
         .subscribe(Arc::new(LoggingSubscriber))
@@ -119,7 +141,7 @@ async fn test_workflow_with_retry() {
 
     // Start workflow
     let instance_id = engine
-        .start_workflow(workflow_id, WorkflowContext::new(WorkflowInstanceId::new()))
+        .start_workflow(workflow_id, TestWorkflowData::default())
         .await
         .unwrap();
 
@@ -140,7 +162,7 @@ async fn test_workflow_with_retry() {
 
 #[tokio::test]
 async fn test_workflow_failure_after_max_retries() {
-    let engine = WorkflowEngine::new();
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
     engine
         .event_bus()
         .subscribe(Arc::new(LoggingSubscriber))
@@ -170,7 +192,7 @@ async fn test_workflow_failure_after_max_retries() {
 
     // Start workflow
     let instance_id = engine
-        .start_workflow(workflow_id, WorkflowContext::new(WorkflowInstanceId::new()))
+        .start_workflow(workflow_id, TestWorkflowData::default())
         .await
         .unwrap();
 
@@ -191,7 +213,7 @@ async fn test_workflow_failure_after_max_retries() {
 
 #[tokio::test]
 async fn test_workflow_continue_on_failure() {
-    let engine = WorkflowEngine::new();
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
     engine
         .event_bus()
         .subscribe(Arc::new(LoggingSubscriber))
@@ -227,7 +249,7 @@ async fn test_workflow_continue_on_failure() {
 
     // Start workflow
     let instance_id = engine
-        .start_workflow(workflow_id, WorkflowContext::new(WorkflowInstanceId::new()))
+        .start_workflow(workflow_id, TestWorkflowData::default())
         .await
         .unwrap();
 
@@ -249,34 +271,40 @@ async fn test_workflow_continue_on_failure() {
 
 #[tokio::test]
 async fn test_workflow_context_sharing() {
-    let engine = WorkflowEngine::new();
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
     struct ContextWriterStep {
-        key: String,
         value: String,
     }
 
     #[async_trait::async_trait]
-    impl StepExecutor for ContextWriterStep {
-        async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-            context.set(self.key.clone(), self.value.clone());
+    impl StepExecutor<TestWorkflowData> for ContextWriterStep {
+        async fn execute(
+            &self,
+            context: &mut WorkflowContext<TestWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
+            context.data.test_key = Some(self.value.clone());
             Ok(StepResult::Success)
         }
     }
 
     struct ContextReaderStep {
-        key: String,
         expected_value: String,
     }
 
     #[async_trait::async_trait]
-    impl StepExecutor for ContextReaderStep {
-        async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-            let value: Arc<String> = context
-                .get(&self.key)
-                .ok_or_else(|| WorkflowError::ContextValueNotFound(self.key.clone()))?;
+    impl StepExecutor<TestWorkflowData> for ContextReaderStep {
+        async fn execute(
+            &self,
+            context: &mut WorkflowContext<TestWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
+            let value = context
+                .data
+                .test_key
+                .as_ref()
+                .ok_or_else(|| WorkflowError::ContextValueNotFound("test_key".to_string()))?;
 
-            if *value == self.expected_value {
+            if value == &self.expected_value {
                 Ok(StepResult::Success)
             } else {
                 Err(WorkflowError::StepFailed {
@@ -292,7 +320,6 @@ async fn test_workflow_context_sharing() {
             "writer",
             "Write to context",
             Arc::new(ContextWriterStep {
-                key: "test_key".to_string(),
                 value: "test_value".to_string(),
             }),
         ))
@@ -300,7 +327,6 @@ async fn test_workflow_context_sharing() {
             "reader",
             "Read from context",
             Arc::new(ContextReaderStep {
-                key: "test_key".to_string(),
                 expected_value: "test_value".to_string(),
             }),
         ));
@@ -309,7 +335,7 @@ async fn test_workflow_context_sharing() {
     engine.register_workflow(workflow).unwrap();
 
     let instance_id = engine
-        .start_workflow(workflow_id, WorkflowContext::new(WorkflowInstanceId::new()))
+        .start_workflow(workflow_id, TestWorkflowData::default())
         .await
         .unwrap();
 
@@ -332,8 +358,11 @@ struct TimingStep {
 }
 
 #[async_trait::async_trait]
-impl StepExecutor for TimingStep {
-    async fn execute(&self, _context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+impl StepExecutor<TestWorkflowData> for TimingStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
         let start = std::time::Instant::now();
         self.start_times
             .write()
@@ -351,7 +380,7 @@ impl StepExecutor for TimingStep {
 #[tokio::test]
 async fn test_parallel_execution_no_dependencies() {
     // Steps without dependencies should run in parallel
-    let engine = WorkflowEngine::new();
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
     let start_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
         Arc::new(parking_lot::RwLock::new(Vec::new()));
@@ -398,7 +427,7 @@ async fn test_parallel_execution_no_dependencies() {
 
     let overall_start = std::time::Instant::now();
     let instance_id = engine
-        .start_workflow(workflow_id, WorkflowContext::new(WorkflowInstanceId::new()))
+        .start_workflow(workflow_id, TestWorkflowData::default())
         .await
         .unwrap();
 
@@ -446,7 +475,7 @@ async fn test_dag_with_dependencies() {
     //   A ──┐
     //       ├──> C
     //   B ──┘
-    let engine = WorkflowEngine::new();
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
     let start_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
         Arc::new(parking_lot::RwLock::new(Vec::new()));
@@ -492,7 +521,7 @@ async fn test_dag_with_dependencies() {
     engine.register_workflow(workflow).unwrap();
 
     let instance_id = engine
-        .start_workflow(workflow_id, WorkflowContext::new(WorkflowInstanceId::new()))
+        .start_workflow(workflow_id, TestWorkflowData::default())
         .await
         .unwrap();
 
@@ -523,15 +552,18 @@ async fn test_dag_with_dependencies() {
 #[tokio::test]
 async fn test_dag_dependency_failure_blocks_dependents() {
     // If step A fails with FailWorkflow, step B (depends on A) should not run
-    let engine = WorkflowEngine::new();
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
     let b_executed = Arc::new(AtomicU32::new(0));
 
     struct FailingStep;
 
     #[async_trait::async_trait]
-    impl StepExecutor for FailingStep {
-        async fn execute(&self, _context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+    impl StepExecutor<TestWorkflowData> for FailingStep {
+        async fn execute(
+            &self,
+            _context: &mut WorkflowContext<TestWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
             Err(WorkflowError::StepFailed {
                 step_id: StepId::new("failing"),
                 message: "Intentional failure".to_string(),
@@ -548,8 +580,11 @@ async fn test_dag_dependency_failure_blocks_dependents() {
     }
 
     #[async_trait::async_trait]
-    impl StepExecutor for TrackingStep {
-        async fn execute(&self, _context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+    impl StepExecutor<TestWorkflowData> for TrackingStep {
+        async fn execute(
+            &self,
+            _context: &mut WorkflowContext<TestWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
             self.counter.fetch_add(1, Ordering::SeqCst);
             Ok(StepResult::Success)
         }
@@ -575,7 +610,7 @@ async fn test_dag_dependency_failure_blocks_dependents() {
     engine.register_workflow(workflow).unwrap();
 
     let instance_id = engine
-        .start_workflow(workflow_id, WorkflowContext::new(WorkflowInstanceId::new()))
+        .start_workflow(workflow_id, TestWorkflowData::default())
         .await
         .unwrap();
 

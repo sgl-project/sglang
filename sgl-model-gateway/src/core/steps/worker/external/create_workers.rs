@@ -6,14 +6,12 @@ use async_trait::async_trait;
 use tracing::{debug, info};
 
 use crate::{
-    app_context::AppContext,
     core::{
         circuit_breaker::CircuitBreakerConfig,
-        model_card::ModelCard,
+        steps::workflow_data::{AnyWorkflowData, WorkerList},
         worker::{HealthConfig, RuntimeType, WorkerType},
         BasicWorkerBuilder, ConnectionMode, Worker,
     },
-    protocols::worker_spec::WorkerConfigRequest,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -30,11 +28,18 @@ fn normalize_external_url(url: &str) -> String {
 pub struct CreateExternalWorkersStep;
 
 #[async_trait]
-impl StepExecutor for CreateExternalWorkersStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
-        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
-        let model_cards: Arc<Vec<ModelCard>> = context.get_or_err("model_cards")?;
+impl StepExecutor<AnyWorkflowData> for CreateExternalWorkersStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<AnyWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let data = context.data.as_external_worker()?;
+        let config = &data.config;
+        let app_context = data
+            .app_context
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let model_cards = &data.model_cards;
 
         // Build configs from router settings
         let circuit_breaker_config = {
@@ -144,8 +149,11 @@ impl StepExecutor for CreateExternalWorkersStep {
             );
         }
 
-        context.set("workers", workers);
-        context.set("labels", labels);
+        // Store results in workflow data
+        let data_mut = context.data.as_external_worker_mut()?;
+        data_mut.workers = Some(WorkerList::from_workers(&workers));
+        data_mut.actual_workers = Some(workers);
+        data_mut.labels = labels;
         Ok(StepResult::Success)
     }
 
