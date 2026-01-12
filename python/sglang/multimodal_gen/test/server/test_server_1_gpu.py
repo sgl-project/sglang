@@ -15,7 +15,7 @@ from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     diffusion_server,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
-    ONE_GPU_CASES_A,
+    ONE_GPU_CASES,
     DiffusionTestCase,
 )
 
@@ -25,7 +25,7 @@ logger = init_logger(__name__)
 class TestDiffusionServerOneGpu(DiffusionServerBase):
     """Performance tests for 1-GPU diffusion cases."""
 
-    @pytest.fixture(params=ONE_GPU_CASES_A, ids=lambda c: c.id)
+    @pytest.fixture(params=ONE_GPU_CASES, ids=lambda c: c.id)
     def case(self, request) -> DiffusionTestCase:
         """Provide a DiffusionTestCase for each 1-GPU test."""
         return request.param

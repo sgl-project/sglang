@@ -8,6 +8,7 @@ If the actual run is significantly better than the baseline, the improved cases 
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -43,10 +44,14 @@ from sglang.multimodal_gen.test.test_utils import (
 
 logger = init_logger(__name__)
 
+# Track test cases missing estimated_full_test_time_s for time measurement output
+_MISSING_ESTIMATED_TIME_CASES: set[str] = set()
+
 
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
+    _fixture_start_time = time.perf_counter()
     server_args = case.server_args
 
     # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
@@ -92,14 +97,46 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         env_vars["SGLANG_CACHE_DIT_ENABLED"] = "true"
 
     # start server
+    wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200"))
+    logger.info(
+        "[server-test] Starting server for test case: %s\n"
+        "  Model: %s\n"
+        "  Port: %s\n"
+        "  Wait deadline: %ss\n"
+        "  Extra args: %s\n"
+        "  Num GPUs: %s",
+        case.id,
+        server_args.model_path,
+        port,
+        wait_deadline,
+        extra_args,
+        server_args.num_gpus,
+    )
+    
     manager = ServerManager(
         model=server_args.model_path,
         port=port,
-        wait_deadline=float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200")),
+        wait_deadline=wait_deadline,
         extra_args=extra_args,
         env_vars=env_vars,
     )
-    ctx = manager.start()
+    
+    try:
+        ctx = manager.start()
+    except (TimeoutError, RuntimeError) as e:
+        logger.error(
+            "[server-test] Failed to start server for test case: %s\n"
+            "  Model: %s\n"
+            "  Port: %s\n"
+            "  Error type: %s\n"
+            "  Error message:\n%s",
+            case.id,
+            server_args.model_path,
+            port,
+            type(e).__name__,
+            str(e),
+        )
+        raise
 
     try:
         # Reconstruct output size for OpenAI API
@@ -151,6 +188,27 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         yield ctx
     finally:
         ctx.cleanup()
+
+        _fixture_end_time = time.perf_counter()
+        _measured_full_time = _fixture_end_time - _fixture_start_time
+
+        scenario = BASELINE_CONFIG.scenarios.get(case.id)
+        needs_estimated_time = (
+            scenario is None or scenario.estimated_full_test_time_s is None
+        )
+
+        if needs_estimated_time:
+            _MISSING_ESTIMATED_TIME_CASES.add(case.id)
+            logger.error(
+                f'\n{"=" * 60}\n'
+                f'Add "estimated_full_test_time_s" to scenario "{case.id}":\n\n'
+                f"File: python/sglang/multimodal_gen/test/server/perf_baselines.json\n\n"
+                f'    "{case.id}": {{\n'
+                f"        ...\n"
+                f'        "estimated_full_test_time_s": {_measured_full_time:.1f}\n'
+                f"    }}\n"
+                f'{"=" * 60}\n'
+            )
 
 
 class DiffusionServerBase:
@@ -242,6 +300,16 @@ Consider updating perf_baselines.json with the snippets below:
             if not is_baseline_generation_mode:
                 missing_scenario = True
 
+        # Check for missing estimated_full_test_time_s
+        missing_estimated_time = False
+        if (
+            not missing_scenario
+            and not is_baseline_generation_mode
+            and scenario.estimated_full_test_time_s is None
+        ):
+            missing_estimated_time = True
+            _MISSING_ESTIMATED_TIME_CASES.add(case.id)
+
         validator_name = case.server_args.custom_validator or "default"
         validator_class = VALIDATOR_REGISTRY.get(validator_name, PerformanceValidator)
 
@@ -258,6 +326,12 @@ Consider updating perf_baselines.json with the snippets below:
             if missing_scenario:
                 pytest.fail(f"Testcase '{case.id}' not found in perf_baselines.json")
             return
+
+        if missing_estimated_time:
+            pytest.fail(
+                f"Testcase '{case.id}' is missing \"estimated_full_test_time_s\" in perf_baselines.json",
+                pytrace=False,
+            )
 
         self._check_for_improvement(case, summary, scenario)
 
@@ -373,6 +447,7 @@ Consider updating perf_baselines.json with the snippets below:
         case: DiffusionTestCase,
         summary: "PerformanceSummary",
         missing_scenario: bool = False,
+        measured_full_time: float | None = None,
     ) -> None:
         """Dump performance metrics as a JSON scenario for baselines."""
         import json
@@ -389,6 +464,9 @@ Consider updating perf_baselines.json with the snippets below:
             "expected_avg_denoise_ms": round(summary.avg_denoise_ms, 2),
             "expected_median_denoise_ms": round(summary.median_denoise_ms, 2),
         }
+
+        if measured_full_time is not None:
+            baseline["estimated_full_test_time_s"] = round(measured_full_time, 1)
 
         # Video-specific metrics
         if case.server_args.modality == "video":

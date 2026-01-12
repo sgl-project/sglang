@@ -176,6 +176,30 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
+  # =============================================== Diffusion Partition Computation ====================================================
+  compute-diffusion-partitions:
+    # Runs on ubuntu-latest (lightweight), computes partition matrix for diffusion jobs.
+    # Diffusion jobs check result == 'success' before using the matrix.
+    needs: [check-changes, call-gate]
+    if: always() && !failure() && !cancelled()
+    runs-on: ubuntu-latest
+    outputs:
+      matrix-1gpu: ${{ steps.compute.outputs.matrix-1gpu }}
+      matrix-2gpu: ${{ steps.compute.outputs.matrix-2gpu }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Compute partitions
+        id: compute
+        run: |
+          python scripts/ci/compute_diffusion_partitions.py --target-time 1200 --max-partitions 10
+
   # =============================================== sgl-kernel ====================================================
 
   sgl-kernel-build-wheels:
@@ -805,9 +829,11 @@ jobs:
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-large-4-gpu-b200
 
   multimodal-gen-test-1-gpu:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, compute-diffusion-partitions, sgl-kernel-build-wheels]
     if: |
       always() &&
+      needs.compute-diffusion-partitions.result == 'success' &&
+      needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"include":[]}' &&
       (
         (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
         (
@@ -819,8 +845,7 @@ jobs:
     runs-on: 1-gpu-runner
     strategy:
       fail-fast: false
-      matrix:
-        part: [0, 1]
+      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-1gpu) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -839,6 +864,7 @@ jobs:
         timeout-minutes: 10
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh diffusion
+
       - name: Run diffusion server tests
         timeout-minutes: 60
         run: |
@@ -850,14 +876,23 @@ jobs:
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
+            --total-partitions ${{ matrix.total }} \
             $CONTINUE_ON_ERROR_FLAG
 
+      - name: Upload execution report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-report-1gpu-${{ matrix.part }}
+          path: python/sglang/multimodal_gen/test/execution_report_*.json
+          retention-days: 1
 
   multimodal-gen-test-2-gpu:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, compute-diffusion-partitions, sgl-kernel-build-wheels]
     if: |
       always() &&
+      needs.compute-diffusion-partitions.result == 'success' &&
+      needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"include":[]}' &&
       (
         (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
         (
@@ -869,8 +904,7 @@ jobs:
     runs-on: 2-gpu-runner
     strategy:
       fail-fast: false
-      matrix:
-        part: [0, 1]
+      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -901,8 +935,48 @@ jobs:
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 2-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
+            --total-partitions ${{ matrix.total }} \
             $CONTINUE_ON_ERROR_FLAG
+
+      - name: Upload execution report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-report-2gpu-${{ matrix.part }}
+          path: python/sglang/multimodal_gen/test/execution_report_*.json
+          retention-days: 1
+
+  diffusion-coverage-check:
+    needs: [check-changes, multimodal-gen-test-1-gpu, multimodal-gen-test-2-gpu]
+    if: |
+      always() &&
+        needs.check-changes.outputs.multimodal_gen == 'true' &&
+        (
+          needs.multimodal-gen-test-1-gpu.result == 'success' ||
+          needs.multimodal-gen-test-1-gpu.result == 'failure' ||
+          needs.multimodal-gen-test-2-gpu.result == 'success' ||
+          needs.multimodal-gen-test-2-gpu.result == 'failure'
+        )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download all execution reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports/
+          pattern: diffusion-report-*
+          merge-multiple: true
+
+      - name: Verify coverage
+        run: |
+          python scripts/ci/verify_diffusion_coverage.py --reports-dir reports/
 
   quantization-test:
       needs: [check-changes, call-gate, stage-a-test-1]
@@ -1714,6 +1788,7 @@ jobs:
       [
         call-gate,
         check-changes,
+        compute-diffusion-partitions,
 
         sgl-kernel-build-wheels,
         sgl-kernel-unit-test,
@@ -1725,6 +1800,7 @@ jobs:
 
         multimodal-gen-test-1-gpu,
         multimodal-gen-test-2-gpu,
+        diffusion-coverage-check,
 
         stage-a-test-1,
         stage-a-cpu-only,

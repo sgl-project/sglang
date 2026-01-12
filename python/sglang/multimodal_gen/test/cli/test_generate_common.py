@@ -6,16 +6,13 @@
 import dataclasses
 import os
 import shlex
-import subprocess
-import sys
 import unittest
-from typing import Optional
 
 from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.test_utils import check_image_size
+from sglang.multimodal_gen.test.test_utils import check_image_size, run_command
 
 logger = init_logger(__name__)
 
@@ -25,26 +22,6 @@ class TestResult:
     name: str
     key: str
     succeed: bool
-
-
-def run_command(command) -> Optional[float]:
-    """Runs a command and returns the execution time and status."""
-    print(f"Running command: {shlex.join(command)}")
-
-    with subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-    ) as process:
-        for line in process.stdout:
-            sys.stdout.write(line)
-        process.wait()
-        if process.returncode == 0:
-            return True
-        print(f"Command failed with exit code {process.returncode}")
-    return False
 
 
 class CLIBase(unittest.TestCase):
