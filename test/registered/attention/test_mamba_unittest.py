@@ -12,9 +12,10 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToToke
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=9, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestMamba(unittest.TestCase):
