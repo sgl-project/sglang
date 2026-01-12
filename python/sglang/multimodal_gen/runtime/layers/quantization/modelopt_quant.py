@@ -45,16 +45,6 @@ except ImportError:
     shuffle_matrix_a = None
     shuffle_matrix_sf_a = None
 
-try:
-    from flashinfer.fused_moe.core import ActivationType
-except ImportError:
-    flashinfer_cutlass_fused_moe = None
-
-    # Define a minimal ActivationType enum if flashinfer is not available
-    class ActivationType(IntEnum):
-        Swiglu = 3
-        Relu2 = 6
-
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
@@ -106,20 +96,9 @@ if (
         return
 
 
-CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
-    "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
-)
-
-# TODO make it true by default when the DeepEP PR is merged
-MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
-
-ACT_STR_TO_TYPE_MAP = {
-    "silu": ActivationType.Swiglu,  # This is the default
-    "relu2": ActivationType.Relu2,
-}
 
 
 class ModelOptQuantConfig(QuantizationConfig):
@@ -489,11 +468,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if enable_flashinfer_fp4_gemm:
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
-        # TODO(shuw@nvidia.com)
-        # Remove the default after flashinfer bumped to 0.5.1
-        backend = (
-            FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
-        )
         out = fp4_gemm(
             x_fp4,
             w,
