@@ -1,5 +1,8 @@
 """
 Test script to verify SGLang config file integration.
+
+Tests the ConfigArgumentMerger and prepare_server_args functionality,
+ensuring proper merging of YAML config files with CLI arguments.
 """
 
 import argparse
@@ -21,144 +24,361 @@ def merger():
     return ConfigArgumentMerger(parser)
 
 
-def test_server_args_config_parser(merger):
-    """Test the config parser functionality."""
-    # Create a temporary config file
-    config_data = {
-        "model-path": "microsoft/DialoGPT-medium",
-        "host": "0.0.0.0",
-        "port": 30000,
-        "tensor-parallel-size": 2,
-        "trust-remote-code": False,
-        "enable-metrics": True,
-        "stream-output": True,
-        "skip-server-warmup": False,
-        "log-requests": True,
-        "show-time-cost": True,
-        "is-embedding": False,
-    }
+class TestConfigArgumentMerger:
+    """Tests for ConfigArgumentMerger class."""
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        yaml.dump(config_data, f)
-        config_file = f.name
+    def test_parse_yaml_config_basic(self, merger):
+        """Test parsing a basic YAML config file."""
+        config_data = {
+            "model-path": "microsoft/DialoGPT-medium",
+            "host": "0.0.0.0",
+            "port": 30000,
+            "tensor-parallel-size": 2,
+        }
 
-    try:
-        # Test config parser directly
-        config_args = merger._parse_yaml_config(config_file)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
 
-        # Test merging with CLI args
-        cli_args = ["--config", config_file, "--max-running-requests", "128"]
-        merged_args = merger.merge_config_with_args(cli_args)
+        try:
+            config_args = merger._parse_yaml_config(config_file)
 
-        # Verify the merged args contain both config and CLI values
-        assert "--model-path" in merged_args
-        assert "microsoft/DialoGPT-medium" in merged_args
-        assert "--host" in merged_args
-        assert "0.0.0.0" in merged_args
-        assert "--port" in merged_args
-        assert "30000" in merged_args
-        assert "--tensor-parallel-size" in merged_args
-        assert "2" in merged_args
-        assert "--max-running-requests" in merged_args
-        assert "128" in merged_args
+            assert config_args["model-path"] == "microsoft/DialoGPT-medium"
+            assert config_args["host"] == "0.0.0.0"
+            assert config_args["port"] == 30000
+            assert config_args["tensor-parallel-size"] == 2
+        finally:
+            os.unlink(config_file)
 
-        # Test boolean arguments
-        assert "--enable-metrics" in merged_args  # True boolean
-        assert "--stream-output" in merged_args  # True boolean
-        assert "--log-requests" in merged_args  # True boolean
-        assert "--show-time-cost" in merged_args  # True boolean
-        # False booleans should not be present (only add flag if True)
-        assert "--trust-remote-code" not in merged_args  # False boolean
-        assert "--skip-server-warmup" not in merged_args  # False boolean
-        assert "--is-embedding" not in merged_args  # False boolean
+    def test_parse_config_returns_dict(self, merger):
+        """Test that parse_config returns a dictionary with normalized keys."""
+        config_data = {
+            "model-path": "microsoft/DialoGPT-medium",
+            "max-running-requests": 128,
+            "tensor-parallel-size": 2,
+        }
 
-    finally:
-        os.unlink(config_file)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
 
+        try:
+            cli_args = ["--config", config_file]
+            parsed_config = merger.parse_config(cli_args)
 
-def test_server_args_integration():
-    """Test the integration with server args."""
-    # Create a temporary config file
-    config_data = {
-        "model-path": "microsoft/DialoGPT-medium",
-        "host": "0.0.0.0",
-        "port": 30000,
-        "tensor-parallel-size": 1,
-        "max-running-requests": 256,
-    }
+            # Keys should be normalized to use underscores (argparse dest format)
+            assert "model_path" in parsed_config
+            assert parsed_config["model_path"] == "microsoft/DialoGPT-medium"
+            assert "max_running_requests" in parsed_config
+            assert parsed_config["max_running_requests"] == 128
+            assert "tensor_parallel_size" in parsed_config
+            assert parsed_config["tensor_parallel_size"] == 2
+        finally:
+            os.unlink(config_file)
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        yaml.dump(config_data, f)
-        config_file = f.name
+    def test_parse_config_with_boolean_values(self, merger):
+        """Test parsing config with boolean values."""
+        config_data = {
+            "model-path": "microsoft/DialoGPT-medium",
+            "trust-remote-code": True,
+            "enable-metrics": True,
+            "skip-server-warmup": False,
+            "log-requests": True,
+        }
 
-    try:
-        # Test with config file
-        argv = ["--config", config_file]
-        server_args = prepare_server_args(argv)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
 
-        # Verify that config values were loaded
-        assert server_args.model_path == "microsoft/DialoGPT-medium"
-        assert server_args.host == "0.0.0.0"
-        assert server_args.port == 30000
-        assert server_args.tp_size == 1
-        assert server_args.max_running_requests == 256
+        try:
+            cli_args = ["--config", config_file]
+            parsed_config = merger.parse_config(cli_args)
 
-    finally:
-        os.unlink(config_file)
+            assert parsed_config["trust_remote_code"] is True
+            assert parsed_config["enable_metrics"] is True
+            assert parsed_config["skip_server_warmup"] is False
+            assert parsed_config["log_requests"] is True
+        finally:
+            os.unlink(config_file)
 
-
-def test_cli_override():
-    """Test that CLI arguments override config file values."""
-    # Create a temporary config file
-    config_data = {
-        "model-path": "microsoft/DialoGPT-medium",
-        "port": 30000,
-        "tensor-parallel-size": 1,
-    }
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        yaml.dump(config_data, f)
-        config_file = f.name
-
-    try:
-        # Test CLI override (CLI should take precedence)
+    def test_remove_config_from_argv(self, merger):
+        """Test removing --config and its value from argv."""
         argv = [
             "--config",
-            config_file,
+            "config.yaml",
             "--port",
-            "40000",
+            "30000",
             "--tensor-parallel-size",
             "2",
         ]
-        server_args = prepare_server_args(argv)
+        result = merger.remove_config_from_argv(argv)
 
-        # Verify that CLI values override config values
-        assert server_args.model_path == "microsoft/DialoGPT-medium"  # From config
-        assert server_args.port == 40000  # From CLI (overrides config)
-        assert server_args.tp_size == 2  # From CLI (overrides config)
+        assert "--config" not in result
+        assert "config.yaml" not in result
+        assert "--port" in result
+        assert "30000" in result
 
-    finally:
-        os.unlink(config_file)
+    def test_invalid_choice_raises_error(self, merger):
+        """Test that invalid choice values raise ValueError."""
+        config_data = {
+            "model-path": "test-model",
+            "quantization": "invalid_quantization_method",
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            cli_args = ["--config", config_file]
+            with pytest.raises(ValueError, match="Invalid value"):
+                merger.parse_config(cli_args)
+        finally:
+            os.unlink(config_file)
 
 
-def test_error_handling():
-    """Test error handling for invalid config files."""
-    # Test non-existent config file
-    with pytest.raises(ValueError, match="Config file not found"):
-        argv = ["--config", "non-existent.yaml"]
-        prepare_server_args(argv)
+class TestPrepareServerArgs:
+    """Tests for prepare_server_args function."""
 
-    # Test invalid YAML file
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        f.write("invalid: yaml: content: [")
-        invalid_yaml_file = f.name
+    def test_basic_config_loading(self):
+        """Test loading basic configuration from YAML file."""
+        config_data = {
+            "model-path": "microsoft/DialoGPT-medium",
+            "host": "0.0.0.0",
+            "port": 30000,
+            "tensor-parallel-size": 1,
+            "max-running-requests": 256,
+        }
 
-    try:
-        with pytest.raises(Exception):
-            argv = ["--config", invalid_yaml_file]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            argv = ["--config", config_file]
+            server_args = prepare_server_args(argv)
+
+            assert server_args.model_path == "microsoft/DialoGPT-medium"
+            assert server_args.host == "0.0.0.0"
+            assert server_args.port == 30000
+            assert server_args.tp_size == 1
+            assert server_args.max_running_requests == 256
+        finally:
+            os.unlink(config_file)
+
+    def test_cli_overrides_config(self):
+        """Test that CLI arguments override config file values."""
+        config_data = {
+            "model-path": "microsoft/DialoGPT-medium",
+            "port": 30000,
+            "tensor-parallel-size": 1,
+            "max-running-requests": 128,
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            argv = [
+                "--config",
+                config_file,
+                "--port",
+                "40000",
+                "--tensor-parallel-size",
+                "2",
+            ]
+            server_args = prepare_server_args(argv)
+
+            # Config values that are NOT overridden
+            assert server_args.model_path == "microsoft/DialoGPT-medium"
+            assert server_args.max_running_requests == 128
+
+            # CLI values that override config
+            assert server_args.port == 40000
+            assert server_args.tp_size == 2
+        finally:
+            os.unlink(config_file)
+
+    def test_boolean_config_values(self):
+        """Test boolean values from config file."""
+        config_data = {
+            "model-path": "microsoft/DialoGPT-medium",
+            "enable-metrics": True,
+            "log-requests": True,
+            "show-time-cost": True,
+            "skip-server-warmup": True,
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            argv = ["--config", config_file]
+            server_args = prepare_server_args(argv)
+
+            assert server_args.enable_metrics is True
+            assert server_args.log_requests is True
+            assert server_args.show_time_cost is True
+            assert server_args.skip_server_warmup is True
+        finally:
+            os.unlink(config_file)
+
+    def test_boolean_false_config_values(self):
+        """Test that False boolean values are properly applied."""
+        config_data = {
+            "model-path": "microsoft/DialoGPT-medium",
+            "enable-metrics": False,
+            "log-requests": False,
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            argv = ["--config", config_file]
+            server_args = prepare_server_args(argv)
+
+            assert server_args.enable_metrics is False
+            assert server_args.log_requests is False
+        finally:
+            os.unlink(config_file)
+
+
+class TestErrorHandling:
+    """Tests for error handling in config parsing."""
+
+    def test_nonexistent_config_file(self):
+        """Test error handling for non-existent config file."""
+        with pytest.raises(ValueError, match="Config file not found"):
+            argv = ["--config", "non-existent-config-file.yaml"]
             prepare_server_args(argv)
-    finally:
-        os.unlink(invalid_yaml_file)
+
+    def test_invalid_yaml_syntax(self):
+        """Test error handling for invalid YAML syntax."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("invalid: yaml: content: [")
+            invalid_yaml_file = f.name
+
+        try:
+            with pytest.raises(Exception):
+                argv = ["--config", invalid_yaml_file]
+                prepare_server_args(argv)
+        finally:
+            os.unlink(invalid_yaml_file)
+
+    def test_non_yaml_file_extension(self):
+        """Test error handling for non-YAML file extension."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write('{"model-path": "test"}')
+            non_yaml_file = f.name
+
+        try:
+            with pytest.raises(ValueError, match="Config file must be YAML format"):
+                argv = ["--config", non_yaml_file]
+                prepare_server_args(argv)
+        finally:
+            os.unlink(non_yaml_file)
+
+    def test_multiple_config_files_error(self, merger):
+        """Test error when multiple config files are specified."""
+        with pytest.raises(ValueError, match="Multiple config files specified"):
+            merger.parse_config(["--config", "file1.yaml", "--config", "file2.yaml"])
+
+    def test_config_flag_without_path(self, merger):
+        """Test error when --config flag has no path."""
+        with pytest.raises(ValueError, match="No config file specified"):
+            merger.parse_config(["--config"])
+
+    def test_non_dict_root_config(self, merger):
+        """Test error when config file root is not a dictionary."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("- item1\n- item2\n- item3")
+            config_file = f.name
+
+        try:
+            with pytest.raises(ValueError, match="dictionary at root level"):
+                merger._parse_yaml_config(config_file)
+        finally:
+            os.unlink(config_file)
+
+
+class TestEdgeCases:
+    """Tests for edge cases in config parsing."""
+
+    def test_empty_config_file(self, merger):
+        """Test handling of empty config file."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("")
+            config_file = f.name
+
+        try:
+            config_args = merger._parse_yaml_config(config_file)
+            assert config_args == {}
+        finally:
+            os.unlink(config_file)
+
+    def test_no_config_returns_empty_dict(self, merger):
+        """Test that parse_config returns empty dict when no config specified."""
+        result = merger.parse_config(["--port", "30000"])
+        assert result == {}
+
+    def test_config_with_underscore_keys(self, merger):
+        """Test that config keys with underscores are properly handled."""
+        config_data = {
+            "model_path": "microsoft/DialoGPT-medium",
+            "max_running_requests": 128,
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            cli_args = ["--config", config_file]
+            parsed_config = merger.parse_config(cli_args)
+
+            assert "model_path" in parsed_config
+            assert parsed_config["model_path"] == "microsoft/DialoGPT-medium"
+        finally:
+            os.unlink(config_file)
+
+    def test_config_with_list_values(self):
+        """Test config file with list values."""
+        config_data = {
+            "model-path": "microsoft/DialoGPT-medium",
+            "additional-ports": [30001, 30002, 30003],
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            argv = ["--config", config_file]
+            server_args = prepare_server_args(argv)
+
+            assert server_args.additional_ports == [30001, 30002, 30003]
+        finally:
+            os.unlink(config_file)
+
+    def test_yml_extension(self, merger):
+        """Test that .yml extension is also accepted."""
+        config_data = {
+            "model-path": "microsoft/DialoGPT-medium",
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            config_args = merger._parse_yaml_config(config_file)
+            assert config_args["model-path"] == "microsoft/DialoGPT-medium"
+        finally:
+            os.unlink(config_file)
 
 
 if __name__ == "__main__":
