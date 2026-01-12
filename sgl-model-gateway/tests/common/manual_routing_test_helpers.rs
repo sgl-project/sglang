@@ -102,9 +102,8 @@ pub fn random_prefix(test_name: &str) -> String {
         .unwrap()
         .as_nanos() as u64;
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let thread_id = std::thread::current().id();
 
-    format!("{}:{:x}:{:x}:{:?}:", test_name, timestamp, count, thread_id)
+    format!("{}:{:x}:{:x}:", test_name, timestamp, count)
 }
 
 pub async fn send_request(app: axum::Router, routing_key: &str) -> (String, String) {
