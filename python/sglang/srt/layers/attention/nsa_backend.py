@@ -314,19 +314,6 @@ class NativeSparseAttnBackend(
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
-        if self.speculative_num_draft_tokens is not None:
-            self.spec_tokens_range = torch.arange(
-                1,
-                self.speculative_num_draft_tokens + 1,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            self.spec_tokens_neg_range = torch.arange(
-                -self.speculative_num_draft_tokens + 1,
-                1,
-                dtype=torch.int32,
-                device=self.device,
-            )
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
@@ -452,6 +439,21 @@ class NativeSparseAttnBackend(
                 dtype=torch.int32,
                 device=device,
             )
+            seqlens_expanded = torch.cat(
+                [
+                    torch.arange(
+                        kv_len - qo_len + 1,
+                        kv_len + 1,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    for qo_len, kv_len in zip(
+                        forward_batch.extend_seq_lens_cpu,
+                        forward_batch.seq_lens_cpu.tolist(),
+                        strict=True,
+                    )
+                ]
+            )
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL speculated
                 # tokens upfront. All requests extend by the same fixed
@@ -459,31 +461,12 @@ class NativeSparseAttnBackend(
                 page_table = torch.repeat_interleave(
                     page_table, repeats=self.speculative_num_draft_tokens, dim=0
                 )
-                seqlens_expanded = (
-                    forward_batch.seq_lens.to(torch.int32).view(-1, 1)
-                    + self.spec_tokens_neg_range
-                ).view(-1)
             else:
                 # DRAFT_EXTEND (v1): V1 worker extends by (accept_length + 1) per request
                 # after verification. Lengths vary per request based on how many tokens
                 # were accepted.
                 page_table = torch.repeat_interleave(
                     page_table, repeats=forward_batch.extend_seq_lens, dim=0
-                )
-                seqlens_expanded = torch.cat(
-                    [
-                        torch.arange(
-                            kv_len - qo_len + 1,
-                            kv_len + 1,
-                            dtype=torch.int32,
-                            device=device,
-                        )
-                        for qo_len, kv_len in zip(
-                            forward_batch.extend_seq_lens_cpu,
-                            forward_batch.seq_lens_cpu.tolist(),
-                            strict=True,
-                        )
-                    ]
                 )
         elif forward_batch.forward_mode.is_extend():
             assert (
@@ -841,9 +824,28 @@ class NativeSparseAttnBackend(
                 dtype=torch.int32,
                 device=self.device,
             )
-            seqlens_expanded = (
-                seq_lens.to(torch.int32).view(-1, 1) + self.spec_tokens_range
-            ).view(-1)
+
+            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
+
+            seqlens_int32_cpu = [
+                self.speculative_num_draft_tokens + kv_len
+                for kv_len in seq_lens.tolist()
+            ]
+            seqlens_expanded = torch.cat(
+                [
+                    torch.arange(
+                        kv_len - qo_len + 1,
+                        kv_len + 1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    for qo_len, kv_len in zip(
+                        extend_seq_lens_cpu,
+                        seqlens_int32_cpu,
+                        strict=True,
+                    )
+                ]
+            )
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
                 seqlens_expanded, nsa_index_topk=self.nsa_index_topk
             )
@@ -966,7 +968,27 @@ class NativeSparseAttnBackend(
                 page_indices, repeats=self.speculative_num_draft_tokens, dim=0
             )
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
-            seqlens_expanded = (seq_lens.view(-1, 1) + self.spec_tokens_range).view(-1)
+            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
+
+            seqlens_int32_cpu = [
+                self.speculative_num_draft_tokens + kv_len
+                for kv_len in seq_lens_cpu.tolist()
+            ]
+            seqlens_expanded = torch.cat(
+                [
+                    torch.arange(
+                        kv_len - qo_len + 1,
+                        kv_len + 1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    for qo_len, kv_len in zip(
+                        extend_seq_lens_cpu,
+                        seqlens_int32_cpu,
+                        strict=True,
+                    )
+                ]
+            )
             metadata.nsa_seqlens_expanded.copy_(seqlens_expanded)
             nsa_cache_seqlens = compute_nsa_seqlens(
                 seqlens_expanded, self.nsa_index_topk
@@ -979,38 +1001,32 @@ class NativeSparseAttnBackend(
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
-            page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
-            if forward_mode.is_draft_extend_v2():
-                page_indices = torch.repeat_interleave(
-                    page_indices, repeats=self.speculative_num_draft_tokens, dim=0
-                )
-                seqlens_expanded = (
-                    seq_lens.to(torch.int32).view(-1, 1) + self.spec_tokens_neg_range
-                ).view(-1)
-            else:
-                extend_seq_lens = spec_info.accept_length[:bs]
-                extend_seq_lens_cpu = extend_seq_lens.tolist()
 
-                page_indices = torch.repeat_interleave(
-                    page_indices, repeats=extend_seq_lens, dim=0
-                )
-                seqlens_expanded = torch.cat(
-                    [
-                        torch.arange(
-                            kv_len - qo_len + 1,
-                            kv_len + 1,
-                            dtype=torch.int32,
-                            device=self.device,
-                        )
-                        for qo_len, kv_len in zip(
-                            extend_seq_lens_cpu,
-                            seq_lens_cpu.tolist(),
-                            strict=True,
-                        )
-                    ]
-                )
+            extend_seq_lens = spec_info.accept_length[:bs]
+            extend_seq_lens_cpu = extend_seq_lens.tolist()
+
+            page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
+            page_indices = torch.repeat_interleave(
+                page_indices, repeats=extend_seq_lens, dim=0
+            )
             metadata.page_table_1[: page_indices.shape[0], :max_seqlen_k].copy_(
                 page_indices
+            )
+
+            seqlens_expanded = torch.cat(
+                [
+                    torch.arange(
+                        kv_len - qo_len + 1,
+                        kv_len + 1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    for qo_len, kv_len in zip(
+                        extend_seq_lens_cpu,
+                        seq_lens_cpu.tolist(),
+                        strict=True,
+                    )
+                ]
             )
             metadata.nsa_seqlens_expanded[: seqlens_expanded.shape[0]].copy_(
                 seqlens_expanded
