@@ -2787,37 +2787,20 @@ def run_scheduler_process(
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
-    # Flag to track graceful shutdown request
-    graceful_shutdown_requested = False
-
     def sigterm_handler(signum, frame):
         """Handle SIGTERM for graceful shutdown of scheduler process.
 
         The key here is to let the process exit normally so that Python/C++
         cleanup mechanisms can run properly:
-        1. atexit handlers - registered by Mooncake's ResourceTracker
-        2. Object destructors - PyClient::~PyClient(), ~TransferEngine()
-        3. Mooncake's signal handler may also be triggered
 
         We use sys.exit(0) which allows:
         - Python's atexit handlers to run
         - Object __del__ methods to be called during garbage collection
         - C++ destructors to run for extension modules
         """
-        nonlocal graceful_shutdown_requested
-        logger.info(
-            f"SIGTERM received in scheduler process{prefix}. "
-            "Initiating graceful shutdown to allow Mooncake/hicache cleanup via "
-            "atexit handlers and destructors..."
-        )
-        graceful_shutdown_requested = True
+        logger.info(f"SIGTERM received in scheduler process{prefix}. ")
 
         # Exit normally to trigger cleanup mechanisms:
-        # - Python atexit handlers
-        # - Object destructors (__del__)
-        # - Mooncake's ResourceTracker::exitHandler (registered via std::atexit)
-        # - Mooncake's PyClient::~PyClient() -> tearDownAll_internal()
-        # - Mooncake's ~TransferEngine() -> freeEngine()
         logger.info(f"Scheduler process{prefix} exiting to allow cleanup...")
         sys.exit(0)
 

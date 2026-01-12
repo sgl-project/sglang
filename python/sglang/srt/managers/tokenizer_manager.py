@@ -2071,10 +2071,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # The timeout can be configured via SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT env var.
         shutdown_timeout = float(
             os.environ.get(
-                CHILD_PROCESS_SHUTDOWN_TIMEOUT_ENV, DEFAULT_CHILD_PROCESS_SHUTDOWN_TIMEOUT
+                CHILD_PROCESS_SHUTDOWN_TIMEOUT_ENV,
+                DEFAULT_CHILD_PROCESS_SHUTDOWN_TIMEOUT,
             )
         )
-        graceful_kill_process_tree(os.getpid(), include_parent=False, timeout=shutdown_timeout)
+        graceful_kill_process_tree(
+            os.getpid(), include_parent=False, timeout=shutdown_timeout
+        )
         # Use os._exit() instead of sys.exit() to avoid SystemExit exception
         # being caught by asyncio event loop, which would interrupt FastAPI's
         # lifespan cleanup and prevent graceful shutdown of uvicorn server.

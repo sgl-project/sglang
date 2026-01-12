@@ -1098,9 +1098,7 @@ def graceful_kill_process_tree(
         skip_pid: Process ID to skip.
         timeout: Time in seconds to wait for graceful shutdown before SIGKILL.
     """
-    import logging
-
-    logger = logging.getLogger(__name__)
+    # Use the module-level logger (logging is already imported at the top of this file)
 
     # Remove sigchld handler to avoid spammy logs.
     if threading.current_thread() is threading.main_thread():
@@ -1125,7 +1123,9 @@ def graceful_kill_process_tree(
         if child.pid == skip_pid:
             continue
         try:
-            logger.info(f"Sending SIGTERM to child process {child.pid} ({child.name()})")
+            logger.info(
+                f"Sending SIGTERM to child process {child.pid} ({child.name()})"
+            )
             child.terminate()  # Send SIGTERM
             alive_children.append(child)
         except psutil.NoSuchProcess:
@@ -1156,12 +1156,11 @@ def graceful_kill_process_tree(
             # Wait a bit for SIGKILL to take effect
             psutil.wait_procs(alive, timeout=3)
 
-    # Handle parent process if requested (not recommended for graceful shutdown)
+    # Handle parent process if requested
+    # Note: This is typically not recommended for graceful shutdown scenarios
+    # as the parent process should handle its own cleanup
     if include_parent:
         try:
-            if parent_pid == os.getpid():
-                itself.kill()
-                sys.exit(0)
             itself.kill()
         except psutil.NoSuchProcess:
             pass
