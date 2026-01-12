@@ -1,4 +1,28 @@
-"""Inference-only AFMoE model."""
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+# Adapted from vLLM implementation:
+# https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/afmoe.py
+"""Inference-only AfMoE model compatible with HuggingFace weights.
+
+AfMoE is a Mixture-of-Experts model with:
+- Gated attention with sigmoid gating
+- Q/K normalization with RMSNorm
+- Dual normalization (pre/post for both attention and MLP)
+- Sliding window attention for local layers
+- muP (maximal update parameterization) scaling support
+"""
 
 from __future__ import annotations
 
@@ -174,7 +198,7 @@ class AfmoeMoE(nn.Module):
                     hidden_act=config.hidden_act,
                     quant_config=quant_config,
                     reduce_results=False,
-                    prefix=add_prefix(f"{idx}.experts", prefix),
+                    prefix=add_prefix(f"experts.{idx}", prefix),
                 )
                 for idx in range(self.n_routed_experts)
             ]
@@ -339,6 +363,7 @@ class AfmoeAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            is_neox_style=True,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -561,6 +586,7 @@ class AfmoeForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         stacked_params_mapping = [
+            # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
@@ -569,53 +595,44 @@ class AfmoeForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        buffers_dict = dict(self.named_buffers())
         for name, loaded_weight in weights:
+            # Skip rotary embedding inverse frequencies
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            if ".self_attn.gate_up_proj." in name:
-                remapped_name = name.replace("gate_up_proj", "gate_proj")
-                param = params_dict.get(remapped_name, None)
-                if param is not None:
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, loaded_weight)
-                    continue
-
-            routed = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                if ".self_attn." in name and weight_name in {"gate_proj", "up_proj"}:
-                    continue
-                new_name = name.replace(weight_name, param_name)
-                if new_name.endswith(".bias") and new_name not in params_dict:
-                    routed = True
-                    break
-                if (
-                    "mlp.experts." in new_name or "mlp.shared_experts." in new_name
-                ) and new_name not in params_dict:
-                    routed = True
-                    break
-                param = params_dict[new_name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                routed = True
-                break
-            if routed:
-                continue
-
+            # Remap router gate weights: HF uses .mlp.router.gate., SGLang uses .mlp.gate.
             if ".mlp.router.gate." in name:
                 name = name.replace(".mlp.router.gate.", ".mlp.gate.")
 
+            # Handle stacked params (qkv_proj, gate_up_proj)
+            handled = False
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                # Skip gate_proj/up_proj stacking for self_attn (attention uses separate gate_proj)
+                if ".self_attn." in name and weight_name in {"gate_proj", "up_proj"}:
+                    continue
+
+                new_name = name.replace(weight_name, param_name)
+                # Skip if parameter doesn't exist (e.g., bias for layers without bias)
+                if new_name not in params_dict:
+                    handled = True
+                    break
+
+                param = params_dict[new_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight, shard_id)
+                handled = True
+                break
+
+            if handled:
+                continue
+
+            # Load remaining weights directly
             if name in params_dict:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            elif name in buffers_dict:
-                # For buffers like expert_bias.
-                buffer = buffers_dict[name]
-                buffer.copy_(loaded_weight)
 
 
 EntryClass = AfmoeForCausalLM
