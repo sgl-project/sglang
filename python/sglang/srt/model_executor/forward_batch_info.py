@@ -621,26 +621,34 @@ class ForwardBatch:
 
         # Init attention token capture (per-request gating)
         # Only capture if feature is enabled on server AND at least one request in batch wants it
+        # IMPORTANT: Only capture during DECODE mode, not during EXTEND/prefill
+        # Prefill can have very long sequences and attention capture would be expensive
         _should_capture_attention = False
         if model_runner.server_args.return_attention_tokens and batch.capture_attention_tokens:
-            # Backend compatibility guard: attention capture only works with Triton backend
-            # FlashInfer and other backends don't have the top-k capture kernel implemented
-            global _attention_backend_warned
-            decode_backend = getattr(model_runner, 'decode_attention_backend_str', None)
-            if decode_backend is None:
-                decode_backend = model_runner.server_args.attention_backend
-
-            if decode_backend != "triton":
-                if not _attention_backend_warned:
-                    logger.warning(
-                        f"Attention visualization is only supported with --attention-backend triton. "
-                        f"Current backend: {decode_backend}. Ignoring attention capture request."
-                    )
-                    _attention_backend_warned = True
-                # Skip capture setup - leave ret.capture_attention_tokens as False
+            # Forward mode guard: only capture during DECODE, not during prefill/EXTEND
+            # Prefill attention patterns are different and capturing is expensive for long contexts
+            if not ret.forward_mode.is_decode():
+                # Skip capture during prefill - this is expected, not a warning
+                pass
             else:
-                # Backend is triton - proceed with capture setup
-                _should_capture_attention = True
+                # Backend compatibility guard: attention capture only works with Triton backend
+                # FlashInfer and other backends don't have the top-k capture kernel implemented
+                global _attention_backend_warned
+                decode_backend = getattr(model_runner, 'decode_attention_backend_str', None)
+                if decode_backend is None:
+                    decode_backend = model_runner.server_args.attention_backend
+
+                if decode_backend != "triton":
+                    if not _attention_backend_warned:
+                        logger.warning(
+                            f"Attention visualization is only supported with --attention-backend triton. "
+                            f"Current backend: {decode_backend}. Ignoring attention capture request."
+                        )
+                        _attention_backend_warned = True
+                    # Skip capture setup - leave ret.capture_attention_tokens as False
+                else:
+                    # Backend is triton and forward mode is DECODE - proceed with capture setup
+                    _should_capture_attention = True
 
         if _should_capture_attention:
             ret.capture_attention_tokens = True
