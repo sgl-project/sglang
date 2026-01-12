@@ -33,7 +33,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init
 
 logger = init_logger(__name__)
 
-MINIMUM_PNG_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 
 class Scheduler:
@@ -169,7 +169,7 @@ class Scheduler:
                     os.makedirs(uploads_dir, exist_ok=True)
                     input_path = asyncio.run(
                         save_image_to_path(
-                            MINIMUM_PNG_PICTURE_BASE64_FOR_WARMUP,
+                            MINIMUM_PICTURE_BASE64_FOR_WARMUP,
                             os.path.join(uploads_dir, f"warmup_image.jpg"),
                         )
                     )
