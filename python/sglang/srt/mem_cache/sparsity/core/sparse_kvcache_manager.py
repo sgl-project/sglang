@@ -17,9 +17,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
-from sglang.srt.mem_cache.sparsity.kernel.token_wise_diff_kernel import (
-    invoke_sparse_diff_kernel,
-)
+from sglang.srt.mem_cache.sparsity.kernel.diff_kernel import invoke_sparse_diff_kernel
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -103,12 +101,12 @@ class SparseKVCacheManager:
         self,
         req_pool_indices,
         top_k_result,
-        out_cache_loc,
         seq_lens,
         sparse_mask,
         page_table,
         layer_id,
         page_size,
+        out_cache_loc,
     ):
         """
         Swap in selected top-k pages/tokens from host to device memory.
@@ -120,44 +118,52 @@ class SparseKVCacheManager:
         """
         batch_size = sparse_mask.shape[0]
 
-        # TODO: Invoke page wise / token wise diff kernel according to page_size
         invoke_sparse_diff_kernel(
-            self.req_states.prev_top_k_result,
+            self.req_states.last_top_k_result,
             top_k_result,
-            self.req_states.prev_device_indices,
+            self.req_states.last_device_indices,
             self.req_states.curr_device_indices,
             self.bitmap,
-            self.req_states.full_host_indices,
+            self.req_states.req_to_tokens_host,
             self.req_states.should_load_device_indices,
             self.req_states.should_load_host_indices,
-            out_cache_loc,
             seq_lens,
             req_pool_indices,
             sparse_mask,
             page_table,
             layer_id,
+            self.req_states.topk_tokens_cnt,
+            self.req_states.device_buffer_cnt,
             page_size,
-            self.req_states.lru_len,
         )
-
         swap_target_device_slots = self.req_states.should_load_device_indices[
-            :batch_size, : self.req_states.top_k
+            :batch_size, : self.req_states.topk_tokens_cnt
         ]
         swap_source_host_slots = self.req_states.should_load_host_indices[
-            :batch_size, : self.req_states.top_k
+            :batch_size, : self.req_states.topk_tokens_cnt
         ]
+        swap_target_device_slots = swap_target_device_slots[
+            swap_target_device_slots != -1
+        ]
+        swap_source_host_slots = swap_source_host_slots[swap_source_host_slots != -1]
+
+        assert (
+            swap_target_device_slots.numel() == swap_source_host_slots.numel()
+        ), "Swap target device slots and source host slots must have the same number of elements"
 
         # Load cache from host to device
-        self.host_mem_pool.load_to_device_per_layer(
-            self.host_mem_pool.device_pool,
-            swap_source_host_slots.flatten(),
-            swap_target_device_slots.flatten(),
-            layer_id,
-            "kernel",
-            io_block_num=batch_size,
-        )
+        if swap_target_device_slots.numel() > 0:
+            self.host_mem_pool.load_to_device_per_layer(
+                self.host_mem_pool.device_pool,
+                swap_source_host_slots.flatten(),
+                swap_target_device_slots.flatten(),
+                layer_id,
+                "kernel",
+            )
 
-        return self.req_states.curr_device_indices[:batch_size, : self.req_states.top_k]
+        return self.req_states.curr_device_indices[
+            :batch_size, : self.req_states.topk_tokens_cnt // page_size
+        ]
 
     def offload_decode_token_kvcache(
         self, req_pool_indices, device_cache_locs, seq_lens
@@ -212,8 +218,8 @@ class SparseKVCacheManager:
         host_indices, req_pool_indices, seq_lens = (
             self.pending_sparse_decode_offloads.pop(offload_ids[0])
         )
-        self.req_states.full_host_indices[req_pool_indices, seq_lens] = host_indices.to(
-            self.req_states.device
+        self.req_states.req_to_tokens_host[req_pool_indices, seq_lens] = (
+            host_indices.to(self.req_states.device)
         )
 
     def offload_prompt_kvcache(self, req):
@@ -273,9 +279,9 @@ class SparseKVCacheManager:
             finish_event.synchronize()
 
             host_indices, req = self.pending_sparse_prompt_offloads.pop(offload_ids[0])
-            self.req_states.full_host_indices[req.req_pool_idx][: len(host_indices)] = (
-                host_indices.to(self.req_states.device)
-            )
+            self.req_states.req_to_tokens_host[req.req_pool_idx][
+                : len(host_indices)
+            ] = host_indices.to(self.req_states.device)
             completed_reqs.append(req)
             completed_count -= 1
 

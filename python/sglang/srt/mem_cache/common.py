@@ -526,9 +526,9 @@ def alloc_for_hierarchical_sparse_decode(
             batch.req_pool_indices[truncated_indices],
             rolling_positions,
         ]
-        logger.info(
-            f"Allocated {num_truncated} truncated sparse decode, rolling positions:{rolling_positions.tolist()}, out_cache_loc:{out_cache_loc[truncated_indices].tolist()}"
-        )
+        # logger.info(
+        #     f"Allocated {num_truncated} truncated sparse decode, rolling positions:{rolling_positions.tolist()}, out_cache_loc:{out_cache_loc[truncated_indices].tolist()}"
+        # )
 
     # Handle non-truncated requests: allocate normally
     if (~truncated_mask).any():

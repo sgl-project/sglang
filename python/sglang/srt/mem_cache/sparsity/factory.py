@@ -73,7 +73,6 @@ def _parse_sparse_config(server_args) -> SparseConfig:
             # Extract algorithm and backend
             algorithm = extra_config.pop("algorithm", "quest")
             backend = extra_config.pop("backend", "flashattention")
-            min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", 2048)
 
             # Everything else goes to algorithm_extra_config
             sparse_extra_config = extra_config
@@ -86,7 +85,6 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         algorithm=algorithm,
         backend=backend,
         page_size=server_args.page_size,
-        min_sparse_prompt_len=min_sparse_prompt_len,
         sparse_extra_config=sparse_extra_config,
     )
     return config

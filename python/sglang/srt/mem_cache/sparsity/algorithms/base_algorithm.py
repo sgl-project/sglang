@@ -198,9 +198,10 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         forward_batch,
     ) -> torch.Tensor:
         num_pages = seq_lens // self.page_size
+        prompt_lens = self.states.prompt_lens[req_pool_indices]
         valid_mask = (
             ~self.states.repr_constructed[req_pool_indices]
-            & (seq_lens >= self.states.min_sparse_prompt_len)
+            & (prompt_lens >= self.states.device_buffer_cnt)
             & (num_pages > 0)
         )
 
