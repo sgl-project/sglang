@@ -6,23 +6,23 @@ use async_trait::async_trait;
 use tracing::debug;
 
 use crate::{
-    core::steps::workflow_data::AnyWorkflowData,
+    core::steps::workflow_data::WorkerRegistrationData,
     observability::metrics::Metrics,
-    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
+    workflow::{
+        StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+    },
 };
 
 /// Unified step to register workers in the registry.
 ///
 /// Works with both single workers and batches. Always expects `workers` key
 /// in context containing `Vec<Arc<dyn Worker>>`.
+/// Works with any workflow data type that implements `WorkerRegistrationData`.
 pub struct RegisterWorkersStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for RegisterWorkersStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
+impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorkersStep {
+    async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
         let app_context = context
             .data
             .get_app_context()

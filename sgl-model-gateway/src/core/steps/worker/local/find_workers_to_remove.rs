@@ -7,7 +7,7 @@ use tracing::debug;
 
 use super::find_workers_by_url;
 use crate::{
-    core::steps::workflow_data::{AnyWorkflowData, WorkerList},
+    core::steps::workflow_data::{WorkerList, WorkerRemovalWorkflowData},
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -25,14 +25,14 @@ pub struct WorkerRemovalRequest {
 pub struct FindWorkersToRemoveStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for FindWorkersToRemoveStep {
+impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_worker_removal()?;
-        let request = &data.config;
-        let app_context = data
+        let request = &context.data.config;
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
@@ -70,11 +70,10 @@ impl StepExecutor<AnyWorkflowData> for FindWorkersToRemoveStep {
             .collect();
 
         // Update workflow data
-        let data_mut = context.data.as_worker_removal_mut()?;
-        data_mut.workers_to_remove = Some(WorkerList::from_workers(&workers_to_remove));
-        data_mut.actual_workers_to_remove = Some(workers_to_remove);
-        data_mut.worker_urls = worker_urls;
-        data_mut.affected_models = affected_models;
+        context.data.workers_to_remove = Some(WorkerList::from_workers(&workers_to_remove));
+        context.data.actual_workers_to_remove = Some(workers_to_remove);
+        context.data.worker_urls = worker_urls;
+        context.data.affected_models = affected_models;
 
         Ok(StepResult::Success)
     }

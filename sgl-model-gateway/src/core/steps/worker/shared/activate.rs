@@ -4,21 +4,21 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::{
-    core::steps::workflow_data::AnyWorkflowData,
-    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
+    core::steps::workflow_data::WorkerRegistrationData,
+    workflow::{
+        StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+    },
 };
 
 /// Unified step to activate workers by marking them as healthy.
 ///
 /// This is the final step in any worker registration workflow.
+/// Works with any workflow data type that implements `WorkerRegistrationData`.
 pub struct ActivateWorkersStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for ActivateWorkersStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
+impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorkersStep {
+    async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
         let workers = context
             .data
             .get_actual_workers()

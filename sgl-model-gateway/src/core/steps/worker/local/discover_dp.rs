@@ -5,7 +5,7 @@ use tracing::debug;
 
 use super::discover_metadata::get_server_info;
 use crate::{
-    core::{steps::workflow_data::AnyWorkflowData, UNKNOWN_MODEL_ID},
+    core::{steps::workflow_data::LocalWorkerWorkflowData, UNKNOWN_MODEL_ID},
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -41,13 +41,12 @@ pub async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, Str
 pub struct DiscoverDPInfoStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for DiscoverDPInfoStep {
+impl StepExecutor<LocalWorkerWorkflowData> for DiscoverDPInfoStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<LocalWorkerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_local_worker()?;
-        let config = &data.config;
+        let config = &context.data.config;
 
         if !config.dp_aware {
             debug!(
@@ -71,7 +70,7 @@ impl StepExecutor<AnyWorkflowData> for DiscoverDPInfoStep {
             dp_info.dp_size, config.url, dp_info.model_id
         );
 
-        context.data.as_local_worker_mut()?.dp_info = Some(dp_info);
+        context.data.dp_info = Some(dp_info);
         Ok(StepResult::Success)
     }
 

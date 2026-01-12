@@ -12,6 +12,7 @@ pub mod wasm_module_registration;
 pub mod wasm_module_removal;
 pub mod worker;
 pub mod workflow_data;
+pub mod workflow_engines;
 
 // Worker management (registration, removal)
 pub use mcp_registration::{
@@ -75,8 +76,10 @@ pub use worker::{
 };
 // Typed workflow data structures
 pub use workflow_data::{
-    AnyWorkflowData, ExternalWorkerWorkflowData, LocalWorkerWorkflowData, McpWorkflowData,
-    ProtocolUpdateRequest, TokenizerWorkflowData, WasmRegistrationWorkflowData,
-    WasmRemovalWorkflowData, WorkerConfigRequest, WorkerList as WorkflowWorkerList,
+    ExternalWorkerWorkflowData, LocalWorkerWorkflowData, McpWorkflowData, ProtocolUpdateRequest,
+    TokenizerWorkflowData, WasmRegistrationWorkflowData, WasmRemovalWorkflowData,
+    WorkerConfigRequest, WorkerList as WorkflowWorkerList, WorkerRegistrationData,
     WorkerRemovalWorkflowData, WorkerUpdateWorkflowData,
 };
+// Typed workflow engines
+pub use workflow_engines::WorkflowEngines;

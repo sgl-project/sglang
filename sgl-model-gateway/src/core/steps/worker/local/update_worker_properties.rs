@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use tracing::{debug, info};
 
 use crate::{
-    core::{steps::workflow_data::AnyWorkflowData, BasicWorkerBuilder, HealthConfig, Worker},
+    core::{
+        steps::workflow_data::WorkerUpdateWorkflowData, BasicWorkerBuilder, HealthConfig, Worker,
+    },
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -17,19 +19,20 @@ use crate::{
 pub struct UpdateWorkerPropertiesStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for UpdateWorkerPropertiesStep {
+impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WorkerUpdateWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_worker_update()?;
-        let request = &data.config;
-        let app_context = data
+        let request = &context.data.config;
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
             .clone();
-        let workers_to_update = data
+        let workers_to_update = context
+            .data
             .workers_to_update
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers_to_update".to_string()))?
@@ -137,7 +140,7 @@ impl StepExecutor<AnyWorkflowData> for UpdateWorkerPropertiesStep {
         }
 
         // Store updated workers for subsequent steps
-        context.data.as_worker_update_mut()?.updated_workers = Some(updated_workers);
+        context.data.updated_workers = Some(updated_workers);
 
         Ok(StepResult::Success)
     }

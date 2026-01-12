@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use wasmtime::{component::Component, Config, Engine};
 
-use super::workflow_data::{AnyWorkflowData, WasmRegistrationWorkflowData};
+use super::workflow_data::WasmRegistrationWorkflowData;
 use crate::{
     app_context::AppContext,
     wasm::module::{WasmModule, WasmModuleDescriptor, WasmModuleMeta},
@@ -65,13 +65,12 @@ fn has_wasm_extension(path: &Path) -> bool {
 pub struct ValidateDescriptorStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for ValidateDescriptorStep {
+impl StepExecutor<WasmRegistrationWorkflowData> for ValidateDescriptorStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_wasm_registration()?;
-        let descriptor = &data.config.descriptor;
+        let descriptor = &context.data.config.descriptor;
 
         debug!("Validating WASM module descriptor: {}", descriptor.name);
 
@@ -207,8 +206,7 @@ impl StepExecutor<AnyWorkflowData> for ValidateDescriptorStep {
         let module_name = descriptor.name.clone();
 
         // Store file size in typed data
-        let data_mut = context.data.as_wasm_registration_mut()?;
-        data_mut.file_size_bytes = Some(metadata.len());
+        context.data.file_size_bytes = Some(metadata.len());
 
         info!(
             "Descriptor validated successfully for module: {}",
@@ -229,13 +227,12 @@ impl StepExecutor<AnyWorkflowData> for ValidateDescriptorStep {
 pub struct CalculateHashStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for CalculateHashStep {
+impl StepExecutor<WasmRegistrationWorkflowData> for CalculateHashStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_wasm_registration()?;
-        let file_path = &data.config.descriptor.file_path;
+        let file_path = &context.data.config.descriptor.file_path;
 
         debug!("Calculating SHA256 hash for: {}", file_path);
 
@@ -274,8 +271,7 @@ impl StepExecutor<AnyWorkflowData> for CalculateHashStep {
         let path_for_log = file_path.clone();
 
         // Store hash in typed data
-        let data_mut = context.data.as_wasm_registration_mut()?;
-        data_mut.sha256_hash = Some(hash);
+        context.data.sha256_hash = Some(hash);
 
         info!("SHA256 hash calculated for: {}", path_for_log);
         Ok(StepResult::Success)
@@ -293,24 +289,25 @@ impl StepExecutor<AnyWorkflowData> for CalculateHashStep {
 pub struct CheckDuplicateStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for CheckDuplicateStep {
+impl StepExecutor<WasmRegistrationWorkflowData> for CheckDuplicateStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_wasm_registration()?;
-        let app_context = data
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let sha256_hash = data
+        let sha256_hash = context
+            .data
             .sha256_hash
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("sha256_hash".to_string()))?;
 
         debug!(
             "Checking for duplicate SHA256 hash for module: {}",
-            data.config.descriptor.name
+            context.data.config.descriptor.name
         );
 
         // Get WASM module manager from app context
@@ -333,7 +330,7 @@ impl StepExecutor<AnyWorkflowData> for CheckDuplicateStep {
 
         info!(
             "No duplicate found for module: {}",
-            data.config.descriptor.name
+            context.data.config.descriptor.name
         );
         Ok(StepResult::Success)
     }
@@ -350,13 +347,12 @@ impl StepExecutor<AnyWorkflowData> for CheckDuplicateStep {
 pub struct LoadWasmBytesStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for LoadWasmBytesStep {
+impl StepExecutor<WasmRegistrationWorkflowData> for LoadWasmBytesStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_wasm_registration()?;
-        let file_path = &data.config.descriptor.file_path;
+        let file_path = &context.data.config.descriptor.file_path;
 
         debug!("Loading WASM bytes from: {}", file_path);
 
@@ -372,8 +368,7 @@ impl StepExecutor<AnyWorkflowData> for LoadWasmBytesStep {
                 })?;
 
         // Store WASM bytes in typed data
-        let data_mut = context.data.as_wasm_registration_mut()?;
-        data_mut.wasm_bytes = Some(wasm_bytes);
+        context.data.wasm_bytes = Some(wasm_bytes);
 
         info!("WASM bytes loaded from: {}", path_for_log);
         Ok(StepResult::Success)
@@ -391,20 +386,20 @@ impl StepExecutor<AnyWorkflowData> for LoadWasmBytesStep {
 pub struct ValidateWasmComponentStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for ValidateWasmComponentStep {
+impl StepExecutor<WasmRegistrationWorkflowData> for ValidateWasmComponentStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_wasm_registration()?;
-        let wasm_bytes = data
+        let wasm_bytes = context
+            .data
             .wasm_bytes
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_bytes".to_string()))?;
 
         debug!(
             "Validating WASM component format for module: {}",
-            data.config.descriptor.name
+            context.data.config.descriptor.name
         );
 
         // Create a temporary engine to validate the component
@@ -431,7 +426,7 @@ impl StepExecutor<AnyWorkflowData> for ValidateWasmComponentStep {
 
         info!(
             "WASM component validated successfully for module: {}",
-            data.config.descriptor.name
+            context.data.config.descriptor.name
         );
         Ok(StepResult::Success)
     }
@@ -448,29 +443,32 @@ impl StepExecutor<AnyWorkflowData> for ValidateWasmComponentStep {
 pub struct RegisterModuleStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for RegisterModuleStep {
+impl StepExecutor<WasmRegistrationWorkflowData> for RegisterModuleStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_wasm_registration()?;
-        let app_context = data
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let sha256_hash = data
+        let sha256_hash = context
+            .data
             .sha256_hash
             .ok_or_else(|| WorkflowError::ContextValueNotFound("sha256_hash".to_string()))?;
-        let file_size_bytes = data
+        let file_size_bytes = context
+            .data
             .file_size_bytes
             .ok_or_else(|| WorkflowError::ContextValueNotFound("file_size_bytes".to_string()))?;
-        let wasm_bytes = data
+        let wasm_bytes = context
+            .data
             .wasm_bytes
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_bytes".to_string()))?
             .clone();
 
-        let descriptor = &data.config.descriptor;
+        let descriptor = &context.data.config.descriptor;
 
         debug!("Registering WASM module in manager: {}", descriptor.name);
 
@@ -519,8 +517,7 @@ impl StepExecutor<AnyWorkflowData> for RegisterModuleStep {
             })?;
 
         // Store module UUID in typed data
-        let data_mut = context.data.as_wasm_registration_mut()?;
-        data_mut.module_uuid = Some(module_uuid);
+        context.data.module_uuid = Some(module_uuid);
 
         info!(
             "WASM module registered successfully: {} (UUID: {})",
@@ -552,7 +549,8 @@ impl StepExecutor<AnyWorkflowData> for RegisterModuleStep {
 /// - LoadWasmBytes: 3 retries, 60s timeout (I/O intensive)
 /// - ValidateWasmComponent: No retry, 30s timeout (CPU intensive validation)
 /// - RegisterModule: No retry, 5s timeout (fast registration)
-pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition<AnyWorkflowData> {
+pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition<WasmRegistrationWorkflowData>
+{
     WorkflowDefinition::new("wasm_module_registration", "WASM Module Registration")
         .add_step(
             StepDefinition::new(
@@ -627,13 +625,13 @@ pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition<AnyWorkf
 pub fn create_wasm_registration_workflow_data(
     config: WasmModuleConfigRequest,
     app_context: Arc<AppContext>,
-) -> AnyWorkflowData {
-    AnyWorkflowData::WasmRegistration(WasmRegistrationWorkflowData {
+) -> WasmRegistrationWorkflowData {
+    WasmRegistrationWorkflowData {
         config,
         wasm_bytes: None,
         sha256_hash: None,
         file_size_bytes: None,
         module_uuid: None,
         app_context: Some(app_context),
-    })
+    }
 }

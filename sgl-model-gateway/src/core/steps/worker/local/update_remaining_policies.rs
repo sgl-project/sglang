@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tracing::{debug, info};
 
 use crate::{
-    core::steps::workflow_data::AnyWorkflowData,
+    core::steps::workflow_data::WorkerRemovalWorkflowData,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -15,18 +15,18 @@ use crate::{
 pub struct UpdateRemainingPoliciesStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for UpdateRemainingPoliciesStep {
+impl StepExecutor<WorkerRemovalWorkflowData> for UpdateRemainingPoliciesStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_worker_removal()?;
-        let app_context = data
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let affected_models = &data.affected_models;
-        let worker_urls = &data.worker_urls;
+        let affected_models = &context.data.affected_models;
+        let worker_urls = &context.data.worker_urls;
 
         debug!(
             "Updating cache-aware policies for {} affected model(s)",

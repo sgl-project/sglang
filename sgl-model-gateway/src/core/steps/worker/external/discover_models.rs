@@ -13,7 +13,7 @@ use crate::{
     core::{
         model_card::{ModelCard, ProviderType},
         model_type::ModelType,
-        steps::workflow_data::AnyWorkflowData,
+        steps::workflow_data::ExternalWorkerWorkflowData,
     },
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
@@ -225,13 +225,12 @@ async fn fetch_models(url: &str, api_key: Option<&str>) -> Result<Vec<ModelCard>
 pub struct DiscoverModelsStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for DiscoverModelsStep {
+impl StepExecutor<ExternalWorkerWorkflowData> for DiscoverModelsStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<ExternalWorkerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_external_worker()?;
-        let config = &data.config;
+        let config = &context.data.config;
 
         // If no API key is provided, skip model discovery and use wildcard mode.
         if config.api_key.as_ref().is_none_or(|k| k.is_empty()) {
@@ -267,7 +266,7 @@ impl StepExecutor<AnyWorkflowData> for DiscoverModelsStep {
             model_cards.iter().map(|c| &c.id).collect::<Vec<_>>()
         );
 
-        context.data.as_external_worker_mut()?.model_cards = model_cards;
+        context.data.model_cards = model_cards;
         Ok(StepResult::Success)
     }
 

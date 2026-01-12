@@ -8,7 +8,7 @@ use tracing::{debug, info};
 use crate::{
     core::{
         circuit_breaker::CircuitBreakerConfig,
-        steps::workflow_data::{AnyWorkflowData, WorkerList},
+        steps::workflow_data::{ExternalWorkerWorkflowData, WorkerList},
         worker::{HealthConfig, RuntimeType, WorkerType},
         BasicWorkerBuilder, ConnectionMode, Worker,
     },
@@ -28,18 +28,18 @@ fn normalize_external_url(url: &str) -> String {
 pub struct CreateExternalWorkersStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for CreateExternalWorkersStep {
+impl StepExecutor<ExternalWorkerWorkflowData> for CreateExternalWorkersStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<ExternalWorkerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_external_worker()?;
-        let config = &data.config;
-        let app_context = data
+        let config = &context.data.config;
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let model_cards = &data.model_cards;
+        let model_cards = &context.data.model_cards;
 
         // Build configs from router settings
         let circuit_breaker_config = {
@@ -150,10 +150,9 @@ impl StepExecutor<AnyWorkflowData> for CreateExternalWorkersStep {
         }
 
         // Store results in workflow data
-        let data_mut = context.data.as_external_worker_mut()?;
-        data_mut.workers = Some(WorkerList::from_workers(&workers));
-        data_mut.actual_workers = Some(workers);
-        data_mut.labels = labels;
+        context.data.workers = Some(WorkerList::from_workers(&workers));
+        context.data.actual_workers = Some(workers);
+        context.data.labels = labels;
         Ok(StepResult::Success)
     }
 

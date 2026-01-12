@@ -5,7 +5,7 @@ use tracing::debug;
 
 use super::find_workers_by_url;
 use crate::{
-    core::steps::workflow_data::AnyWorkflowData,
+    core::steps::workflow_data::WorkerUpdateWorkflowData,
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -16,15 +16,15 @@ use crate::{
 pub struct FindWorkerToUpdateStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for FindWorkerToUpdateStep {
+impl StepExecutor<WorkerUpdateWorkflowData> for FindWorkerToUpdateStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WorkerUpdateWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_worker_update()?;
-        let worker_url = &data.worker_url;
-        let dp_aware = data.dp_aware;
-        let app_context = data
+        let worker_url = &context.data.worker_url;
+        let dp_aware = context.data.dp_aware;
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
@@ -50,7 +50,7 @@ impl StepExecutor<AnyWorkflowData> for FindWorkerToUpdateStep {
             worker_url
         );
 
-        context.data.as_worker_update_mut()?.workers_to_update = Some(workers_to_update);
+        context.data.workers_to_update = Some(workers_to_update);
 
         Ok(StepResult::Success)
     }

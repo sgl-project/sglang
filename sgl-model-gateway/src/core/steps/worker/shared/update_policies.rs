@@ -6,8 +6,10 @@ use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use crate::{
-    core::{steps::workflow_data::AnyWorkflowData, Worker},
-    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
+    core::{steps::workflow_data::WorkerRegistrationData, Worker},
+    workflow::{
+        StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+    },
 };
 
 /// Unified step to update policy registry for registered workers.
@@ -81,11 +83,8 @@ impl UpdatePoliciesStep {
 }
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for UpdatePoliciesStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
+impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePoliciesStep {
+    async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
         let app_context = context
             .data
             .get_app_context()
