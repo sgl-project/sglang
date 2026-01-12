@@ -103,10 +103,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
 )
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.layers.moe.utils import (
-    RoutingMethodType,
-    filter_moe_weight_param_global_expert,
-)
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -146,9 +143,13 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import (
+    FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
+    NVFP4_CKPT_FP8_ATTN_QUANT_MODULES,
     _device_sm,
+    _get_llama_4_scaling,
     _is_cpu,
     _is_cpu_amx_available,
+    _is_cublas_ge_129,
     _is_cuda,
     _is_fp8_fnuz,
     _is_gfx95_supported,
@@ -156,6 +157,9 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_npu,
     _use_aiter,
     _use_aiter_gfx95,
+    add_forward_absorb_core_attention_backend,
+    enable_nextn_moe_bf16_cast_to_fp8,
+    yarn_get_mscale,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -227,38 +231,7 @@ elif _is_npu:
 else:
     pass
 
-_is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
-
 logger = logging.getLogger(__name__)
-
-
-# Optional quantization for DeepSeek nvfp4 checkpoint
-NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
-
-
-def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
-    return (
-        envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get()
-        and quant_config is not None
-        and quant_config.get_name() == "modelopt_fp4"
-        and get_moe_runner_backend().is_deep_gemm()
-    )
-
-
-FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
-    "fa3",
-    "nsa",
-    "flashinfer",
-    "cutlass_mla",
-    "trtllm_mla",
-    "ascend",
-]
-
-
-def add_forward_absorb_core_attention_backend(backend_name):
-    if backend_name not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-        FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append(backend_name)
-        logger.info(f"Added {backend_name} to FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.")
 
 
 class DeepseekV2MLP(nn.Module):
@@ -590,9 +563,6 @@ class DeepseekV2MoE(nn.Module):
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
-            and filter_moe_weight_param_global_expert(
-                name, x, self.experts.num_local_experts
-            )
         ]
 
     def forward(
@@ -1054,24 +1024,6 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
 
         state.hidden_states_mlp_output = final_hidden_states
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    import math
-
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def _get_llama_4_scaling(
-    original_max_position_embeddings: int, scaling_beta: float, positions: torch.Tensor
-) -> torch.Tensor:
-    scaling = 1 + scaling_beta * torch.log(
-        1 + torch.floor(positions / original_max_position_embeddings)
-    )
-    # Broadcast over num_heads and head_dim
-    return scaling[..., None, None]
 
 
 class DeepseekV2AttentionMLA(nn.Module):
@@ -1672,7 +1624,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         q_lora = None
-        topk_indices = None
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -1729,39 +1680,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             if self.use_nsa:
                 q_lora = q
 
-            # overlap q_b_proj and indexer during decode
-            if (
-                self.alt_stream is not None
-                and get_is_capture_mode()
-                and forward_batch.forward_mode.is_decode_or_idle()
-                and q_lora is not None
-            ):
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
-                    k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj(q)[0].view(
-                        -1, self.num_local_heads, self.qk_head_dim
-                    )
-                topk_indices = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                )
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-                if q_lora is not None:
-                    topk_indices = self.indexer(
-                        x=hidden_states,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=self.layer_id,
-                    )
+            k_nope = k_nope.unsqueeze(1)
+            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -1855,6 +1775,15 @@ class DeepseekV2AttentionMLA(nn.Module):
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
+            )
+        topk_indices = None
+        if q_lora is not None:
+            topk_indices = self.indexer(
+                x=hidden_states,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
             )
 
         return (
