@@ -13,9 +13,14 @@ from sglang.srt.managers.io_struct import GetLoadReqInput, GetLoadReqOutput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
+from sglang.srt.metrics.collector import (
+    SchedulerMetricsCollector,
+    SchedulerStats,
+    compute_routing_key_stats,
+)
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer
+from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
@@ -95,7 +100,9 @@ class SchedulerMetricsMixin:
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
             self.metrics_collector = SchedulerMetricsCollector(
-                labels=labels, enable_lora=self.enable_lora
+                labels=labels,
+                enable_lora=self.enable_lora,
+                server_args=self.server_args,
             )
 
             if ENABLE_METRICS_DEVICE_TIMER:
@@ -105,6 +112,8 @@ class SchedulerMetricsMixin:
 
         if self.enable_kv_cache_events:
             self.init_kv_events(self.server_args.kv_events_config)
+
+        self.scheduler_status_logger = SchedulerStatusLogger.maybe_create()
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
@@ -218,7 +227,7 @@ class SchedulerMetricsMixin:
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
             self.stats.num_queue_reqs = len(self.waiting_queue)
-            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
@@ -384,7 +393,7 @@ class SchedulerMetricsMixin:
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
-            self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
+            self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
@@ -414,6 +423,16 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue
                 )
 
+            running_routing_keys = [r.routing_key for r in batch.reqs]
+            waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
+            (
+                self.stats.num_unique_running_routing_keys,
+                self.stats.routing_key_running_req_counts,
+            ) = compute_routing_key_stats(running_routing_keys)
+            _, self.stats.routing_key_all_req_counts = compute_routing_key_stats(
+                running_routing_keys + waiting_routing_keys
+            )
+
             # Others
             self.calculate_utilization()
             self.update_lora_metrics()
@@ -424,11 +443,15 @@ class SchedulerMetricsMixin:
     def log_decode_stats_every_iteration(
         self: Scheduler, batch: ScheduleBatch, num_accepted_tokens: int
     ):
-        self.metrics_collector.increment_realtime_tokens(
-            # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
-            decode_tokens=batch.batch_size() + num_accepted_tokens,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
+        if self.enable_metrics:
+            self.metrics_collector.increment_realtime_tokens(
+                # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
+                decode_tokens=batch.batch_size() + num_accepted_tokens,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+
+        if x := self.scheduler_status_logger:
+            x.maybe_dump(batch, self.waiting_queue)
 
     def log_batch_result_stats(
         self: Scheduler,

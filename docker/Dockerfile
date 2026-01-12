@@ -273,6 +273,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install \
     datamodel_code_generator \
+    mooncake-transfer-engine==0.3.8.post1 \
     pre-commit \
     pytest \
     black \
@@ -285,14 +286,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     py-spy \
     cubloaty \
     google-cloud-storage
-
-# Install mooncake
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$GRACE_BLACKWELL" = "1" ]; then \
-        python3 -m pip install mooncake-transfer-engine==0.3.7.post2; \
-    else \
-        python3 -m pip install mooncake-transfer-engine==0.3.8.post1; \
-    fi
 
 # Build and install sgl-model-gateway (install Rust, build, then remove to save space)
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -315,12 +308,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cutlass-dsl==4.3.0 --force-reinstall --no-deps ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
     python3 -m pip install nixl-cu13 ; \
-    python3 -m pip install nvidia-cutlass-dsl==4.3.1 --force-reinstall --no-deps ; \
+    python3 -m pip install cuda-python==13.1.1 ; \
 fi
 
 # Install development tools
