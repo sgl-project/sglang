@@ -122,6 +122,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 except ValueError as e:
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
+                    logger.info(f"❎ accepted wrong")
                     error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
                     release_kv_cache(req, self.tree_cache)
                     prepare_abort(

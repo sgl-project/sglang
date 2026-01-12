@@ -279,6 +279,8 @@ class DecodePreallocQueue:
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
+        
+        logger.info(f"🤔{ kv_args.aux_data_ptrs = } {kv_args.aux_data_lens = } {kv_args.aux_item_lens = }")
 
         if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
             state_data_ptrs, state_data_lens, state_item_lens = (
@@ -568,6 +570,18 @@ class DecodePreallocQueue:
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
+            if "HEALTH_CHECK" not in decode_req.req.rid:
+                import ctypes
+                idx = decode_req.metadata_buffer_index
+                # base_addr + index * item_size
+                target_addr = (
+                    self.kv_manager.kv_args.aux_data_ptrs[0] + 
+                    idx * self.kv_manager.kv_args.aux_item_lens[0]
+                )
+                
+                ctypes.c_int32.from_address(target_addr).value = -1
+                
+                logger.info(f"🛡️ Sentinel set to -1 at {target_addr:#x} for idx {idx}")
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
             decode_req.kv_receiver.init(
@@ -738,8 +752,14 @@ class DecodeTransferQueue:
             output_topk_index,
             output_hidden_states,
         ) = self.metadata_buffers.get_buf(idx)
-
+        logger.info(f"{decode_req.req.rid = }")
+        if "HEALTH_CHECK" not in decode_req.req.rid:
+            while output_id[0].item() == -1:
+                pass 
+        actual_addr = output_id.data_ptr() 
         decode_req.req.output_ids.append(output_id[0].item())
+        logger.info(f"📍 [CHECK_DECODE_ADDR]  | "
+                    f"idx={idx} | addr={actual_addr:#x} | val={output_id[0].item()}")
         decode_req.req.cached_tokens = cached_tokens[0].item()
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
