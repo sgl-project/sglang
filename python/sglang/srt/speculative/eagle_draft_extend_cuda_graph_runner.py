@@ -263,7 +263,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
             self.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
-                    [bs] * self.dp_size,
+                    [num_tokens] * self.dp_size,
                     dtype=torch.int32,
                     device=self.input_ids.device,
                 )
@@ -279,7 +279,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
             self.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
-                    [bs],
+                    [num_tokens],
                     dtype=torch.int32,
                     device=self.input_ids.device,
                 )
@@ -419,7 +419,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            self.global_num_tokens_for_logprob_gpu.fill_(bs)
+            self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
