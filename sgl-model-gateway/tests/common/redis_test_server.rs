@@ -41,16 +41,17 @@ impl RedisTestServer {
             "no",
         ]);
 
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                cmd.pre_exec(|| {
-                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                    Ok(())
-                });
-            }
-        }
+        // TODO handle
+        // #[cfg(target_os = "linux")]
+        // {
+        //     use std::os::unix::process::CommandExt;
+        //     unsafe {
+        //         cmd.pre_exec(|| {
+        //             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        //             Ok(())
+        //         });
+        //     }
+        // }
 
         info!("Starting redis server... cmd={cmd:?}");
         let process = cmd.spawn().map_err(|e| {
