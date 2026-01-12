@@ -562,15 +562,6 @@ class MooncakeKVManager(CommonKVManager):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
-            if i == 0:
-                try:
-                    src_val = ctypes.c_int32.from_address(src_addr).value
-                    logger.info(f"🔍 [CHECK_PREFILL_SRC]  | "
-                                f"src_addr={src_addr:#x} | val={src_val} | "
-                                f"idx={prefill_aux_index} | "
-                                f"dst_addr={dst_addr:#x}")
-                except Exception as e:
-                    logger.error(f"Failed to read src_val: {e}")
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
@@ -612,8 +603,6 @@ class MooncakeKVManager(CommonKVManager):
         socket = self._connect(
             format_tcp_address(remote, dst_port), is_ipv6=is_valid_ipv6_address(remote)
         )
-
-        logger.info(f"🌕 { aux_index = }")
 
         socket.send_multipart(
             [
@@ -920,7 +909,6 @@ class MooncakeKVManager(CommonKVManager):
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
                         )
-                        logger.info(f"🍎 { expected_response_num = }" )
                         if arrived_response_num == expected_response_num:
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
@@ -1036,7 +1024,6 @@ class MooncakeKVManager(CommonKVManager):
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
-        # logger.info(f"🔄 Updating {bootstrap_room = } to {status = }", stack_info=(True if status == KVPoll.Success else False))
         if bootstrap_room not in self.request_status:
             self.request_status[bootstrap_room] = status
         else:
@@ -1254,7 +1241,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
-        logger.info(f"🐯 {aux_index = }")
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
