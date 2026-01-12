@@ -7,7 +7,7 @@ Handles image preprocessing for OpenVLA's dual vision backbone (DINOv2 + SigLIP)
 """
 
 import asyncio
-from typing import Dict, List, Optional, Union
+from typing import List, Union
 
 import numpy as np
 from PIL import Image

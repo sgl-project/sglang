@@ -22,18 +22,14 @@ References:
     - Model: https://huggingface.co/openvla/openvla-7b
 """
 
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
 from torch import nn
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
@@ -73,7 +69,9 @@ class PrismaticVisionBackbone(nn.Module):
         try:
             import timm
         except ImportError:
-            raise ImportError("timm is required for OpenVLA. Install with: pip install timm")
+            raise ImportError(
+                "timm is required for OpenVLA. Install with: pip install timm"
+            )
 
         # Get image size from config (default 224 for OpenVLA)
         img_size = self.image_sizes[0] if self.image_sizes else 224
@@ -208,7 +206,9 @@ class OpenVLAForActionPrediction(nn.Module):
             ["vit_large_patch14_reg4_dinov2.lvd142m", "vit_so400m_patch14_siglip_224"],
         )
         self.image_sizes = getattr(config, "image_sizes", [224, 224])
-        self.use_fused_vision_backbone = getattr(config, "use_fused_vision_backbone", True)
+        self.use_fused_vision_backbone = getattr(
+            config, "use_fused_vision_backbone", True
+        )
 
         # Vision backbone
         self.vision_backbone = PrismaticVisionBackbone(
@@ -276,9 +276,7 @@ class OpenVLAForActionPrediction(nn.Module):
             # Replace single image token with num_patches padding tokens
             pad_value = pad_values[idx % len(pad_values)]
             input_ids = (
-                input_ids[:offset]
-                + [pad_value] * num_patches
-                + input_ids[offset + 1:]
+                input_ids[:offset] + [pad_value] * num_patches + input_ids[offset + 1 :]
             )
 
             image_inputs.image_offsets.append(offset)
@@ -377,7 +375,9 @@ class OpenVLAForActionPrediction(nn.Module):
                         seq_len = extend_seq_lens[i]
                         prefix_len = prefix_lens_cpu[i]
 
-                        for img_idx, image_offset in enumerate(image_inputs[i].image_offsets):
+                        for img_idx, image_offset in enumerate(
+                            image_inputs[i].image_offsets
+                        ):
                             pad_len = image_inputs[i].image_pad_len[img_idx]
 
                             if image_offset + pad_len <= prefix_len:
@@ -397,7 +397,9 @@ class OpenVLAForActionPrediction(nn.Module):
                             if input_offset < 0:
                                 img_feature = img_feature[-input_offset:]
                             if right_idx > start_idx + seq_len:
-                                img_feature = img_feature[:start_idx + seq_len - right_idx]
+                                img_feature = img_feature[
+                                    : start_idx + seq_len - right_idx
+                                ]
                                 right_idx = start_idx + seq_len
 
                             try:
@@ -449,7 +451,7 @@ class OpenVLAForActionPrediction(nn.Module):
         for name, loaded_weight in weights:
             # Handle language model weights
             if name.startswith("language_model."):
-                lm_name = name[len("language_model."):]
+                lm_name = name[len("language_model.") :]
                 self.language_model.load_weights([(lm_name, loaded_weight)])
                 continue
 
@@ -462,7 +464,10 @@ class OpenVLAForActionPrediction(nn.Module):
                         param = params_dict[tgt_name]
 
                         # Handle potential size mismatch for positional embeddings
-                        if "pos_embed" in tgt_name and param.shape != loaded_weight.shape:
+                        if (
+                            "pos_embed" in tgt_name
+                            and param.shape != loaded_weight.shape
+                        ):
                             logger.warning(
                                 f"Position embedding size mismatch for {tgt_name}: "
                                 f"param={param.shape}, weight={loaded_weight.shape}. "
@@ -472,7 +477,9 @@ class OpenVLAForActionPrediction(nn.Module):
                                 loaded_weight, param.shape
                             )
 
-                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
                         weight_loader(param, loaded_weight)
                         matched = True
                     break
@@ -493,7 +500,9 @@ class OpenVLAForActionPrediction(nn.Module):
                             loaded_weight, param.shape
                         )
 
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
 
     def _interpolate_pos_embed(
@@ -519,8 +528,8 @@ class OpenVLAForActionPrediction(nn.Module):
             return pos_embed
 
         # Reshape for 2D interpolation: (1, dim, sqrt(src_len), sqrt(src_len))
-        src_size = int(src_len ** 0.5)
-        tgt_size = int(tgt_len ** 0.5)
+        src_size = int(src_len**0.5)
+        tgt_size = int(tgt_len**0.5)
 
         # Reshape: (1, src_len, dim) -> (1, dim, src_size, src_size)
         pos_embed_2d = pos_embed.permute(0, 2, 1).reshape(1, -1, src_size, src_size)
