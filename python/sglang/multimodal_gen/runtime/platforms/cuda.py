@@ -152,92 +152,90 @@ class CudaPlatformBase(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
-        def _choose_default_backend(
-            cls,
-            dtype: torch.dtype,
-            selected_backend: AttentionBackendEnum | None,
-        ) -> AttentionBackendEnum:
-            if selected_backend is not None:
-                return selected_backend
-            # For Blackwell SM12.x, use sage attention if available
-            if cls.is_sm120():
-                return AttentionBackendEnum.SAGE_ATTN
-            # For other blackwell GPUs, use fa4
-            elif cls.is_blackwell():
-                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-                    set_fa_ver,
-                )
-
-                set_fa_ver(4)
-                return AttentionBackendEnum.FA
-            if not cls.has_device_capability(80):
-                logger.info(
-                    "Cannot use FlashAttention backend for Volta and Turing GPUs."
-                )
-                return AttentionBackendEnum.TORCH_SDPA
-            elif dtype not in (torch.float16, torch.bfloat16):
-                logger.info(
-                    "Cannot use FlashAttention backend for dtype other than "
-                    "torch.float16 or torch.bfloat16."
-                )
-                return AttentionBackendEnum.TORCH_SDPA
-            return AttentionBackendEnum.FA
-
-        def _ensure_import(module_path: str, symbol: str | None = None) -> None:
-            module = importlib.import_module(module_path)
-            if symbol is not None:
-                try:
-                    getattr(module, symbol)
-                except AttributeError as e:
-                    raise ImportError(
-                        f"Cannot import {symbol} from {module_path}"
-                    ) from e
-
-        def _use_backend(
-            cls,
-            head_size: int,
-            attention_backend: AttentionBackendEnum,
-        ) -> str:
-            try:
-                for module_path, symbol in attention_backend.imports:
-                    _ensure_import(module_path, symbol)
-                logger.info(attention_backend.log_msg)
-                if attention_backend == AttentionBackendEnum.FA:
-                    from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
-                        FlashAttentionBackend,
-                        set_fa_ver,
-                    )
-
-                    supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
-                    if head_size not in supported_sizes:
-                        logger.info(
-                            "Cannot use FlashAttention backend for head size %d.",
-                            head_size,
-                        )
-                        attention_backend = AttentionBackendEnum.TORCH_SDPA
-                    elif cls.is_blackwell():
-                        set_fa_ver(4)
-                return attention_backend.import_path
-            except ImportError as e:
-                if attention_backend.fallback:
-                    logger.info(attention_backend.fallback_msg)
-                    return attention_backend.fallback.import_path
-                else:
-                    raise ImportError(
-                        f"{attention_backend.error_prefix}: "
-                        f"{attention_backend.error_msg}"
-                    ) from e
-
-        target_backend = _choose_default_backend(
-            cls,
+        target_backend = cls._choose_default_backend(
             dtype,
             selected_backend,
         )
-        return _use_backend(cls, head_size, target_backend)
+        return cls._use_backend(head_size, target_backend)
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
+
+    @classmethod
+    def _choose_default_backend(
+        cls,
+        dtype: torch.dtype,
+        selected_backend: AttentionBackendEnum | None,
+    ) -> AttentionBackendEnum:
+        if selected_backend is not None:
+            return selected_backend
+        # For Blackwell SM12.x, use sage attention if available
+        if cls.is_sm120():
+            return AttentionBackendEnum.SAGE_ATTN
+        # For other blackwell GPUs, use fa4
+        elif cls.is_blackwell():
+            from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+                set_fa_ver,
+            )
+
+            set_fa_ver(4)
+            return AttentionBackendEnum.FA
+        if not cls.has_device_capability(80):
+            logger.info("Cannot use FlashAttention backend for Volta and Turing GPUs.")
+            return AttentionBackendEnum.TORCH_SDPA
+        elif dtype not in (torch.float16, torch.bfloat16):
+            logger.info(
+                "Cannot use FlashAttention backend for dtype other than "
+                "torch.float16 or torch.bfloat16."
+            )
+            return AttentionBackendEnum.TORCH_SDPA
+        return AttentionBackendEnum.FA
+
+    @staticmethod
+    def _ensure_import(module_path: str, symbol: str | None = None) -> None:
+        module = importlib.import_module(module_path)
+        if symbol is not None:
+            try:
+                getattr(module, symbol)
+            except AttributeError as e:
+                raise ImportError(f"Cannot import {symbol} from {module_path}") from e
+
+    @classmethod
+    def _use_backend(
+        cls,
+        head_size: int,
+        attention_backend: AttentionBackendEnum,
+    ) -> str:
+        try:
+            for module_path, symbol in attention_backend.imports:
+                cls._ensure_import(module_path, symbol)
+            logger.info(attention_backend.log_msg)
+            if attention_backend == AttentionBackendEnum.FA:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
+                    FlashAttentionBackend,
+                    set_fa_ver,
+                )
+
+                supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
+                if head_size not in supported_sizes:
+                    logger.info(
+                        "Cannot use FlashAttention backend for head size %d.",
+                        head_size,
+                    )
+                    attention_backend = AttentionBackendEnum.TORCH_SDPA
+                elif cls.is_blackwell():
+                    set_fa_ver(4)
+            return attention_backend.import_path
+        except ImportError as e:
+            if attention_backend.fallback:
+                logger.info(attention_backend.fallback_msg)
+                return attention_backend.fallback.import_path
+            else:
+                raise ImportError(
+                    f"{attention_backend.error_prefix}: "
+                    f"{attention_backend.error_msg}"
+                ) from e
 
 
 # NVML utils
