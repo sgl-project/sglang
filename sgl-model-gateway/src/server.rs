@@ -729,39 +729,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let engines = WorkflowEngines::new(&config.router_config);
 
     // Subscribe logging to all workflow engines
-    let subscriber = Arc::new(LoggingSubscriber);
-    engines
-        .local_worker
-        .event_bus()
-        .subscribe(subscriber.clone())
-        .await;
-    engines
-        .external_worker
-        .event_bus()
-        .subscribe(subscriber.clone())
-        .await;
-    engines
-        .worker_removal
-        .event_bus()
-        .subscribe(subscriber.clone())
-        .await;
-    engines
-        .worker_update
-        .event_bus()
-        .subscribe(subscriber.clone())
-        .await;
-    engines.mcp.event_bus().subscribe(subscriber.clone()).await;
-    engines
-        .tokenizer
-        .event_bus()
-        .subscribe(subscriber.clone())
-        .await;
-    engines
-        .wasm_registration
-        .event_bus()
-        .subscribe(subscriber.clone())
-        .await;
-    engines.wasm_removal.event_bus().subscribe(subscriber).await;
+    engines.subscribe_all(Arc::new(LoggingSubscriber)).await;
 
     app_context
         .workflow_engines

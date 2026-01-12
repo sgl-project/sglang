@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     config::RouterConfig,
-    workflow::{InMemoryStore, WorkflowEngine},
+    workflow::{EventSubscriber, InMemoryStore, WorkflowEngine},
 };
 
 /// Type alias for local worker workflow engine
@@ -133,5 +133,35 @@ impl WorkflowEngines {
             wasm_registration: Arc::new(wasm_registration),
             wasm_removal: Arc::new(wasm_removal),
         }
+    }
+
+    /// Subscribe an event subscriber to all workflow engines
+    pub async fn subscribe_all<S: EventSubscriber + 'static>(&self, subscriber: Arc<S>) {
+        self.local_worker
+            .event_bus()
+            .subscribe(subscriber.clone())
+            .await;
+        self.external_worker
+            .event_bus()
+            .subscribe(subscriber.clone())
+            .await;
+        self.worker_removal
+            .event_bus()
+            .subscribe(subscriber.clone())
+            .await;
+        self.worker_update
+            .event_bus()
+            .subscribe(subscriber.clone())
+            .await;
+        self.mcp.event_bus().subscribe(subscriber.clone()).await;
+        self.tokenizer
+            .event_bus()
+            .subscribe(subscriber.clone())
+            .await;
+        self.wasm_registration
+            .event_bus()
+            .subscribe(subscriber.clone())
+            .await;
+        self.wasm_removal.event_bus().subscribe(subscriber).await;
     }
 }
