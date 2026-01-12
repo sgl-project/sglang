@@ -52,8 +52,9 @@ MODEL_SCORE_THRESHOLDS = {
     "meta-llama/Llama-3.1-70B-Instruct": 0.95,
     # Mistral series
     "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.61,
-    # Google Gemma (moved from 1-GPU due to AITER kernel compile time)
+    # Google Gemma (moved from 1-GPU due to OOM/AITER kernel compile time)
     "google/gemma-2-27b-it": 0.91,
+    "google/gemma-2-9b-it": 0.72,
     # Qwen2 series
     "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
     # Qwen3 series
@@ -63,19 +64,25 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Qwen2-72B-Instruct-FP8": 0.94,
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.86,
     "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.62,
+    "neuralmagic/gemma-2-2b-it-FP8": 0.50,  # Moved from 1-GPU (OOM)
 }
 
 # 2-GPU models (TP=2) - models that require 2 GPUs
 _TP2_MODELS_ALL = [
     "meta-llama/Llama-3.1-70B-Instruct",
     "mistralai/Mixtral-8x7B-Instruct-v0.1",
-    "google/gemma-2-27b-it",  # Moved from 1-GPU (AITER kernel compile faster with TP=2)
+    # Gemma models (moved from 1-GPU due to OOM/AITER kernel compile time)
+    "google/gemma-2-27b-it",
+    "google/gemma-2-9b-it",
+    "neuralmagic/gemma-2-2b-it-FP8",
+    # Qwen models
     "Qwen/Qwen2-57B-A14B-Instruct",
+    "Qwen/Qwen3-30B-A3B-Thinking-2507",
+    # FP8 quantized models
     "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8",
     "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
     "neuralmagic/Qwen2-72B-Instruct-FP8",
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8",
-    "Qwen/Qwen3-30B-A3B-Thinking-2507",
 ]
 
 # Filter out models that aren't cached locally

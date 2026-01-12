@@ -44,9 +44,7 @@ MODEL_SCORE_THRESHOLDS = {
     "Qwen/Qwen2.5-7B-Instruct": 0.85,
     # Qwen3 series
     "Qwen/Qwen3-8B": 0.77,
-    # Google Gemma
-    "google/gemma-2-27b-it": 0.91,
-    "google/gemma-2-9b-it": 0.72,
+    # Google Gemma models moved to 2-GPU test (OOM on single GPU)
     # FP8 quantized models
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.8,
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
@@ -54,9 +52,7 @@ MODEL_SCORE_THRESHOLDS = {
 
 # Models known to fail on AMD
 FAILING_MODELS = {
-    "google/gemma-2-9b-it",  # OOM on single GPU (exit code -9)
-    # google/gemma-2-27b-it moved to 2-GPU test (AITER kernel compile faster with TP=2)
-    "neuralmagic/gemma-2-2b-it-FP8",  # OOM on single GPU (exit code -9)
+    # Gemma models moved to 2-GPU test (OOM on single GPU)
     # Models not cached locally on CI runner
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8",  # Not cached locally
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8",  # Not cached locally
@@ -70,7 +66,6 @@ TP1_MODELS = [
     "meta-llama/Llama-3.1-8B-Instruct",
     "mistralai/Mistral-7B-Instruct-v0.3",
     "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
-    # google/gemma-2-27b-it moved to 2-GPU test (AITER kernel compile faster with TP=2)
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8",
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8",
     "meta-llama/Llama-3.2-3B-Instruct",
