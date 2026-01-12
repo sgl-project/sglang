@@ -236,10 +236,10 @@ class HiRadixCache(RadixCache):
             assert len(node.host_value) > 0
             # Save snapshot to prevent data loss when node is split before write_backup_storage
             self.ongoing_write_through[node.id] = {
-                'node': node,
-                'key': RadixKey(token_ids=node.key.token_ids.clone()),
-                'hash_value': list(node.hash_value) if node.hash_value else None,
-                'host_value': host_indices,
+                "node": node,
+                "key": RadixKey(token_ids=node.key.token_ids.clone()),
+                "hash_value": list(node.hash_value) if node.hash_value else None,
+                "host_value": host_indices,
             }
             if not write_back:
                 # no need to lock nodes if write back
@@ -310,7 +310,7 @@ class HiRadixCache(RadixCache):
             finish_event.synchronize()
             for ack_id in ack_list:
                 snapshot = self.ongoing_write_through.pop(ack_id)
-                node = snapshot['node']
+                node = snapshot["node"]
                 self.dec_lock_ref(node)
                 if self.enable_storage:
                     # Use snapshot data to write to storage, preventing data loss
@@ -319,16 +319,17 @@ class HiRadixCache(RadixCache):
                     current_hash_value = node.hash_value
                     current_host_value = node.host_value
 
-                    node.key = snapshot['key']
-                    node.hash_value = snapshot['hash_value']
-                    node.host_value = snapshot['host_value']
+                    try:
+                        node.key = snapshot["key"]
+                        node.hash_value = snapshot["hash_value"]
+                        node.host_value = snapshot["host_value"]
 
-                    self.write_backup_storage(node)
-
-                    # Restore current values to keep tree structure intact
-                    node.key = current_key
-                    node.hash_value = current_hash_value
-                    node.host_value = current_host_value
+                        self.write_backup_storage(node)
+                    finally:
+                        # Restore current values to keep tree structure intact
+                        node.key = current_key
+                        node.hash_value = current_hash_value
+                        node.host_value = current_host_value
             finish_count -= 1
 
     def loading_check(self):
