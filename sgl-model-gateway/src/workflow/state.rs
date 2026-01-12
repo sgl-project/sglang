@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use parking_lot::RwLock;
 
 use super::types::{
@@ -13,39 +14,43 @@ use super::types::{
 ///
 /// Implement this trait to provide custom storage backends (e.g., PostgreSQL, Redis).
 /// The default implementation is `InMemoryStore` which keeps state in memory.
+#[async_trait]
 pub trait StateStore<D: WorkflowData>: Send + Sync + Clone {
     /// Save workflow state
-    fn save(&self, state: WorkflowState<D>) -> WorkflowResult<()>;
+    async fn save(&self, state: WorkflowState<D>) -> WorkflowResult<()>;
 
     /// Load workflow state by instance ID
-    fn load(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<WorkflowState<D>>;
+    async fn load(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<WorkflowState<D>>;
 
     /// Update workflow state using a closure
-    fn update<F>(&self, instance_id: WorkflowInstanceId, f: F) -> WorkflowResult<()>
+    async fn update<F>(&self, instance_id: WorkflowInstanceId, f: F) -> WorkflowResult<()>
     where
-        F: FnOnce(&mut WorkflowState<D>);
+        F: FnOnce(&mut WorkflowState<D>) + Send;
 
     /// Delete workflow state
-    fn delete(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<()>;
+    async fn delete(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<()>;
 
     /// List all active workflows (Running or Pending)
-    fn list_active(&self) -> WorkflowResult<Vec<WorkflowState<D>>>;
+    async fn list_active(&self) -> WorkflowResult<Vec<WorkflowState<D>>>;
 
     /// List all workflows
-    fn list_all(&self) -> WorkflowResult<Vec<WorkflowState<D>>>;
+    async fn list_all(&self) -> WorkflowResult<Vec<WorkflowState<D>>>;
 
     /// Check if workflow is cancelled without loading full state
-    fn is_cancelled(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<bool>;
+    async fn is_cancelled(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<bool>;
 
     /// Clean up old completed/failed/cancelled workflows beyond a time threshold
-    fn cleanup_old_workflows(&self, ttl: Duration) -> usize;
+    async fn cleanup_old_workflows(&self, ttl: Duration) -> usize;
 
     /// Get just the workflow context without cloning the entire state
-    fn get_context(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<WorkflowContext<D>>;
+    async fn get_context(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> WorkflowResult<WorkflowContext<D>>;
 
     /// Clean up a specific workflow immediately if it's in a terminal state
     /// Returns true if the workflow was removed, false otherwise
-    fn cleanup_if_terminal(&self, instance_id: WorkflowInstanceId) -> bool;
+    async fn cleanup_if_terminal(&self, instance_id: WorkflowInstanceId) -> bool;
 }
 
 /// In-memory state storage for workflow instances
@@ -84,13 +89,14 @@ impl<D: WorkflowData> Default for InMemoryStore<D> {
     }
 }
 
+#[async_trait]
 impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
-    fn save(&self, state: WorkflowState<D>) -> WorkflowResult<()> {
+    async fn save(&self, state: WorkflowState<D>) -> WorkflowResult<()> {
         self.states.write().insert(state.instance_id, state);
         Ok(())
     }
 
-    fn load(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<WorkflowState<D>> {
+    async fn load(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<WorkflowState<D>> {
         self.states
             .read()
             .get(&instance_id)
@@ -98,28 +104,9 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
             .ok_or(WorkflowError::NotFound(instance_id))
     }
 
-    fn list_active(&self) -> WorkflowResult<Vec<WorkflowState<D>>> {
-        let states = self.states.read();
-        Ok(states
-            .values()
-            .filter(|s| matches!(s.status, WorkflowStatus::Running | WorkflowStatus::Pending))
-            .cloned()
-            .collect())
-    }
-
-    fn list_all(&self) -> WorkflowResult<Vec<WorkflowState<D>>> {
-        let states = self.states.read();
-        Ok(states.values().cloned().collect())
-    }
-
-    fn delete(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<()> {
-        self.states.write().remove(&instance_id);
-        Ok(())
-    }
-
-    fn update<F>(&self, instance_id: WorkflowInstanceId, f: F) -> WorkflowResult<()>
+    async fn update<F>(&self, instance_id: WorkflowInstanceId, f: F) -> WorkflowResult<()>
     where
-        F: FnOnce(&mut WorkflowState<D>),
+        F: FnOnce(&mut WorkflowState<D>) + Send,
     {
         let mut states = self.states.write();
         let state = states
@@ -130,15 +117,26 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
         Ok(())
     }
 
-    fn get_context(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<WorkflowContext<D>> {
-        self.states
-            .read()
-            .get(&instance_id)
-            .map(|s| s.context.clone())
-            .ok_or(WorkflowError::NotFound(instance_id))
+    async fn delete(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<()> {
+        self.states.write().remove(&instance_id);
+        Ok(())
     }
 
-    fn is_cancelled(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<bool> {
+    async fn list_active(&self) -> WorkflowResult<Vec<WorkflowState<D>>> {
+        let states = self.states.read();
+        Ok(states
+            .values()
+            .filter(|s| matches!(s.status, WorkflowStatus::Running | WorkflowStatus::Pending))
+            .cloned()
+            .collect())
+    }
+
+    async fn list_all(&self) -> WorkflowResult<Vec<WorkflowState<D>>> {
+        let states = self.states.read();
+        Ok(states.values().cloned().collect())
+    }
+
+    async fn is_cancelled(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<bool> {
         self.states
             .read()
             .get(&instance_id)
@@ -146,7 +144,7 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
             .ok_or(WorkflowError::NotFound(instance_id))
     }
 
-    fn cleanup_old_workflows(&self, ttl: Duration) -> usize {
+    async fn cleanup_old_workflows(&self, ttl: Duration) -> usize {
         let now = chrono::Utc::now();
         let mut states = self.states.write();
         let initial_count = states.len();
@@ -179,7 +177,18 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
         removed_count
     }
 
-    fn cleanup_if_terminal(&self, instance_id: WorkflowInstanceId) -> bool {
+    async fn get_context(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> WorkflowResult<WorkflowContext<D>> {
+        self.states
+            .read()
+            .get(&instance_id)
+            .map(|s| s.context.clone())
+            .ok_or(WorkflowError::NotFound(instance_id))
+    }
+
+    async fn cleanup_if_terminal(&self, instance_id: WorkflowInstanceId) -> bool {
         let mut states = self.states.write();
         if let Some(state) = states.get(&instance_id) {
             if matches!(

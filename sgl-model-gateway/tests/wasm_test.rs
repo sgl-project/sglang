@@ -710,6 +710,7 @@ async fn test_wasm_module_execution() {
         let state = engines
             .wasm_registration
             .get_status(instance_id)
+            .await
             .expect("Failed to get workflow status");
 
         match state.status {
