@@ -103,6 +103,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
@@ -1060,6 +1061,21 @@ async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
             result,
             status_code=HTTPStatus.BAD_REQUEST,
         )
+
+
+@app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
+async def load_lora_adapter_from_tensors(
+    obj: LoadLoRAAdapterFromTensorsReqInput, request: Request
+):
+    """Load a new LoRA adapter from tensors without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
+        obj, request
+    )
+
+    if result.success:
+        return ORJSONResponse(result, status_code=HTTPStatus.OK)
+    else:
+        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
