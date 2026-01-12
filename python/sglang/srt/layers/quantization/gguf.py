@@ -43,7 +43,8 @@ if _is_cuda:
         ggml_mul_mat_vec_a8,
     )
 else:
-    warnings.warn(f"Only CUDA support GGUF quantization currently.")
+    if not _is_hip:
+        warnings.warn(f"Only CUDA support GGUF quantization currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,8 @@ class GGUFConfig(QuantizationConfig):
 
     def __init__(self, modules_to_not_convert: list[str] | None = None) -> None:
         super().__init__()
+        if _is_hip:
+            warnings.warn(f"Only CUDA support GGUF quantization currently.")
         self.modules_to_not_convert = modules_to_not_convert or []
 
     def __repr__(self) -> str:
