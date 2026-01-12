@@ -316,7 +316,7 @@ def prepare_extend_inputs_for_correctness_test(
         req.fill_ids += input_ids[i][bench_args.cut_len :]
         req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
             i, : bench_args.cut_len
-        ]
+        ].to(req.prefix_indices.dtype)
         req.logprob_start_len = -1
         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
     return reqs
