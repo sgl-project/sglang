@@ -933,9 +933,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        # #region agent log
-        import json; open('/lustre/raplab/client/xutingz/workspace/gdn_log/sglang_debug.log', 'a').write(json.dumps({"hypothesisId": "H5", "location": "forward_decode:entry", "message": "decode_entry", "data": {"ssm_k_last": self.ssm_k_last}}) + '\n')
-        # #endregion
         mixed_qkv = kwargs["mixed_qkv"]
         conv_weights = kwargs["conv_weights"]
         bias = kwargs["bias"]
