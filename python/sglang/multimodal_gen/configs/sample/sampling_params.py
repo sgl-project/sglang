@@ -100,11 +100,11 @@ class SamplingParams:
 
     # Batch info
     num_outputs_per_prompt: int = 1
-    seed: int = 1024
+    seed: int = 42
     generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
 
     # Original dimensions (before VAE scaling)
-    num_frames: int = 125
+    num_frames: int = 1  # Default for image models
     num_frames_round_down: bool = (
         False  # Whether to round down num_frames if it's not divisible by num_gpus
     )
@@ -122,7 +122,7 @@ class SamplingParams:
 
     # Denoising parameters
     num_inference_steps: int = None
-    guidance_scale: float = None
+    guidance_scale: float = 1.0
     guidance_scale_2: float = None
     true_cfg_scale: float = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
