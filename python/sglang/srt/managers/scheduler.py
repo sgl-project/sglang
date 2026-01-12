@@ -1122,6 +1122,7 @@ class Scheduler(
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+
             else:
                 batch_result = None
 
