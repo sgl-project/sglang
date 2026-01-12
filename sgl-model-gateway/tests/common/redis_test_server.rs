@@ -3,7 +3,7 @@ use std::{
     sync::OnceLock,
     time::Duration,
 };
-
+use redis::RedisError;
 use tracing::{info, warn};
 
 static SHARED_SERVER: OnceLock<RedisTestServer> = OnceLock::new();
@@ -69,10 +69,11 @@ impl RedisTestServer {
 
     pub fn wait_ready(&self) {
         for _ in 0..100 {
-            if self.is_ready().is_ok() {
-                return;
+            match self.is_ready() {
+                Ok(()) => return,
+                Err(e) => info!("wait_ready failed, will retry (e={e})"),
             }
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(1000));
         }
         panic!("Timeout waiting Redis server ready on port {}", self.port);
     }
