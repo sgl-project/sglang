@@ -38,7 +38,7 @@ class TestPiecewiseGraphPrefillCorrectness(CustomTestCase):
                 128,
                 "--enable-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-tokens",
-                TOKENS_TO_CAPTURE,
+                *TOKENS_TO_CAPTURE,
             ],
         )
 
