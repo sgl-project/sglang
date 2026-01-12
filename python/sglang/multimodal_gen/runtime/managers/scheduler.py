@@ -170,7 +170,7 @@ class Scheduler:
                     input_path = asyncio.run(
                         save_image_to_path(
                             MINIMUM_PICTURE_BASE64_FOR_WARMUP,
-                            os.path.join(uploads_dir, "warmup_image"),
+                            os.path.join(uploads_dir, "warmup_image.jpg"),
                         )
                     )
                     req = Req(
