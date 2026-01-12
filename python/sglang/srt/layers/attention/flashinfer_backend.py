@@ -935,20 +935,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(*args, **kwargs)
 
         # Call the wrapped function
-        o, s = decode_wrapper.forward_return_lse(
-            q.view(-1, layer.tp_q_head_num * self.dcp_size, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        with use_symmetric_memory(get_dcp_group()):
+            o, s = decode_wrapper.forward_return_lse(
+                q.view(-1, layer.tp_q_head_num * self.dcp_size, layer.head_dim),
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
         if self.dcp_size > 1:
-            with use_symmetric_memory(get_dcp_group()) as sm_context:
-                if isinstance(sm_context, SymmetricMemoryContext):
-                    o = o.clone()
-                    s = s.clone()
             o = cp_lse_ag_out_rs(o, s, get_dcp_group())
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
