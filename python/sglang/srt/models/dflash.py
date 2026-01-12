@@ -174,7 +174,7 @@ class DFlashDecoderLayer(nn.Module):
 
 
 class DFlashDraftModel(nn.Module):
-    """SGLang-native DFlash draft model (no embedding / lm_head weights).
+    """SGLang DFlash draft model (no embedding / lm_head weights).
 
     The checkpoint provides:
       - transformer weights for `layers.*`

@@ -53,7 +53,7 @@ class DFlashWorker:
         self._warned_forced_greedy = False
         self._logged_first_verify = False
 
-        # Native (SGLang) draft runner (separate KV cache + attention backend).
+        # Draft runner (separate KV cache + attention backend).
         # Share req_to_token_pool + token_to_kv_pool_allocator with the target worker (EAGLE3-style),
         # while keeping a separate draft KV cache pool (the draft model has different KV values).
         shared_req_to_token_pool, shared_token_to_kv_pool_allocator = (
@@ -87,7 +87,7 @@ class DFlashWorker:
         draft_server_args.attention_backend = draft_backend
         # Keep draft context length aligned with the target.
         draft_server_args.context_length = target_worker.model_runner.model_config.context_len
-        self.native_draft_worker = TpModelWorker(
+        self.draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
@@ -99,14 +99,14 @@ class DFlashWorker:
             req_to_token_pool=shared_req_to_token_pool,
             token_to_kv_pool_allocator=shared_token_to_kv_pool_allocator,
         )
-        self.native_draft_model_runner = self.native_draft_worker.model_runner
-        self.native_draft_model = self.native_draft_model_runner.model
+        self.draft_model_runner = self.draft_worker.model_runner
+        self.draft_model = self.draft_model_runner.model
         if server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
-            self.block_size = int(getattr(self.native_draft_model, "block_size", 16))
+            self.block_size = int(getattr(self.draft_model, "block_size", 16))
         else:
             self.block_size = int(server_args.speculative_num_draft_tokens)
-            model_block_size = getattr(self.native_draft_model, "block_size", None)
+            model_block_size = getattr(self.draft_model, "block_size", None)
             if model_block_size is not None and int(model_block_size) != int(self.block_size):
                 logger.warning(
                     "DFLASH block size mismatch: using speculative_num_draft_tokens=%s but draft config block_size=%s.",
@@ -115,18 +115,18 @@ class DFlashWorker:
                 )
 
         self._mask_token = resolve_dflash_mask_token(
-            draft_hf_config=self.native_draft_model_runner.model_config.hf_config
+            draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
         self._mask_token_id = self._resolve_mask_token_id(mask_token=self._mask_token)
         if self.tp_rank == 0:
             logger.info(
-                "Initialized native DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s",
+                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s",
                 getattr(draft_server_args, "attention_backend", None),
-                self.native_draft_model.__class__.__name__,
+                self.draft_model.__class__.__name__,
                 self.block_size,
             )
             logger.info(
-                "DFLASH draft impl selected. impl=native, mask_token=%s, mask_token_id=%s",
+                "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s",
                 self._mask_token,
                 self._mask_token_id,
             )
@@ -213,8 +213,8 @@ class DFlashWorker:
         bs = batch.batch_size()
         device = self.model_runner.device
 
-        # --- 1) Append any newly committed tokens into the native draft KV cache.
-        self._append_target_hidden_to_native_draft_kv(batch, draft_input)
+        # --- 1) Append any newly committed tokens into the draft KV cache.
+        self._append_target_hidden_to_draft_kv(batch, draft_input)
 
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
@@ -225,7 +225,7 @@ class DFlashWorker:
                 "`shard_indices` attributes."
             )
 
-        # --- 2) Draft a non-causal block with the native draft model.
+        # --- 2) Draft a non-causal block with the draft model.
         block_ids = torch.full(
             (bs, self.block_size),
             self._mask_token_id,
@@ -243,7 +243,7 @@ class DFlashWorker:
             (bs,), int(self.block_size), dtype=torch.int32, device=device
         )
         positions, extend_start_loc = compute_position(
-            self.native_draft_model_runner.server_args.attention_backend,
+            self.draft_model_runner.server_args.attention_backend,
             prefix_lens,
             extend_lens,
             bs * self.block_size,
@@ -251,18 +251,18 @@ class DFlashWorker:
 
         block_start = prefix_lens.to(torch.int64)
         block_end = block_start + int(self.block_size)
-        allocator = self.native_draft_model_runner.token_to_kv_pool_allocator
+        allocator = self.draft_model_runner.token_to_kv_pool_allocator
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
             block_cache_loc = allocator.alloc(bs * self.block_size)
             if block_cache_loc is None:
                 raise RuntimeError(
-                    f"DFLASH native draft OOM when allocating {bs * self.block_size} block tokens."
+                    f"DFLASH draft OOM when allocating {bs * self.block_size} block tokens."
                 )
 
             assign_req_to_token_pool_func(
                 batch.req_pool_indices,
-                self.native_draft_model_runner.req_to_token_pool.req_to_token,
+                self.draft_model_runner.req_to_token_pool.req_to_token,
                 block_start,
                 block_end,
                 block_cache_loc,
@@ -290,9 +290,9 @@ class DFlashWorker:
                 seq_lens_sum=int(seq_lens.sum().item()),
                 seq_lens_cpu=torch.tensor(prefix_lens_cpu, dtype=torch.int32),
                 positions=positions,
-                req_to_token_pool=self.native_draft_model_runner.req_to_token_pool,
-                token_to_kv_pool=self.native_draft_model_runner.token_to_kv_pool,
-                attn_backend=self.native_draft_model_runner.attn_backend,
+                req_to_token_pool=self.draft_model_runner.req_to_token_pool,
+                token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
+                attn_backend=self.draft_model_runner.attn_backend,
                 input_embeds=input_embeds,
                 spec_algorithm=SpeculativeAlgorithm.DFLASH,
                 spec_info=draft_spec_info,
@@ -300,7 +300,7 @@ class DFlashWorker:
             )
 
             with torch.inference_mode():
-                draft_hidden = self.native_draft_model_runner.forward(
+                draft_hidden = self.draft_model_runner.forward(
                     forward_batch
                 ).logits_output
         finally:
@@ -439,12 +439,12 @@ class DFlashWorker:
 
         return out_token_ids
 
-    def _append_target_hidden_to_native_draft_kv(
+    def _append_target_hidden_to_draft_kv(
         self,
         batch: ScheduleBatch,
         draft_input: DFlashDraftInput,
     ) -> None:
-        """Materialize the target hidden-state features into the native draft KV cache.
+        """Materialize the target hidden-state features into the draft KV cache.
 
         This must be run before exposing new tokens to radix cache (prefix hits), otherwise
         another request could reuse target KV indices without having draft KV values.
@@ -475,7 +475,7 @@ class DFlashWorker:
         ):
             if int(cache_len) + int(ctx_len) != int(start_pos):
                 raise RuntimeError(
-                    "DFLASH native draft cache length mismatch. "
+                    "DFLASH draft cache length mismatch. "
                     f"cache_len={int(cache_len)}, ctx_len={int(ctx_len)}, start_pos={int(start_pos)}."
                 )
 
@@ -483,7 +483,7 @@ class DFlashWorker:
         if total_ctx <= 0:
             return
 
-        req_to_token = self.native_draft_model_runner.req_to_token_pool.req_to_token
+        req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
         req_pool_indices_cpu = batch.req_pool_indices.tolist()
 
         ctx_cache_loc_chunks: List[torch.Tensor] = []
@@ -518,11 +518,11 @@ class DFlashWorker:
         )
 
         with torch.inference_mode():
-            ctx_hidden = self.native_draft_model.project_target_hidden(
+            ctx_hidden = self.draft_model.project_target_hidden(
                 draft_input.target_hidden
             )  # [sum(ctx), hidden]
 
-            for layer in self.native_draft_model.layers:
+            for layer in self.draft_model.layers:
                 attn = layer.self_attn
                 qkv, _ = attn.qkv_proj(ctx_hidden)
                 q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
@@ -537,7 +537,7 @@ class DFlashWorker:
                 q, k = attn.rotary_emb(ctx_positions, q, k)
                 k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                 v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-                self.native_draft_model_runner.token_to_kv_pool.set_kv_buffer(
+                self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                     attn.attn,
                     ctx_cache_loc,
                     k,
@@ -592,7 +592,7 @@ class DFlashWorker:
                 ctx_lens_cpu=[int(x) for x in model_worker_batch.extend_seq_lens],
                 draft_seq_lens_cpu=[int(x) for x in model_worker_batch.extend_prefix_lens],
             )
-            self._append_target_hidden_to_native_draft_kv(batch, draft_input)
+            self._append_target_hidden_to_draft_kv(batch, draft_input)
             batch.spec_info = draft_input
             for req, draft_len in zip(batch.reqs, draft_input.draft_seq_lens_cpu, strict=True):
                 req.dflash_draft_seq_len = int(draft_len)
@@ -643,7 +643,7 @@ class DFlashWorker:
         draft_input.verified_id = new_verified_id
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens_cpu = commit_lens.cpu().tolist()
-        self._append_target_hidden_to_native_draft_kv(batch, draft_input)
+        self._append_target_hidden_to_draft_kv(batch, draft_input)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
