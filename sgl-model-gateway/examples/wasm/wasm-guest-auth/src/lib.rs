@@ -15,7 +15,7 @@ use exports::sgl::model_gateway::{
     middleware_on_request::Guest as OnRequestGuest,
     middleware_on_response::Guest as OnResponseGuest,
 };
-use sgl::router::middleware_types::{Action, Request, Response};
+use sgl::model_gateway::middleware_types::{Action, Request, Response};
 
 /// Expected API Key (in production, this should be passed as configuration)
 const EXPECTED_API_KEY: &str = "secret-api-key-12345";
