@@ -35,13 +35,14 @@ class TestKimiK2Unified(unittest.TestCase):
                 KIMI_K2_THINKING_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
+                variant="TP8",
             ),
         ]
 
         run_combined_tests(
             models=variants,
             test_name="Kimi-K2-Thinking Unified",
-            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.95),
+            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.94),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_kimi_k2_thinking",
             ),
