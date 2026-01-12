@@ -79,7 +79,7 @@ impl RedisTestServer {
         panic!("Timeout waiting Redis server ready on port {}", self.port);
     }
 
-    pub fn is_ready(&self) -> Result<(), redis::RedisError> {
+    pub fn is_ready(&self) -> Result<(), RedisError> {
         let client = redis::Client::open(self.url.as_str())?;
         let mut conn = client.get_connection()?;
         redis::cmd("PING").query::<String>(&mut conn)?;
