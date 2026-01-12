@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     is_hip,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
     is_triton_kernels_available,
     log_info_on_rank0,
     mxfp_supported,
@@ -54,6 +55,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
+_is_sm120_supported = is_cuda() and is_sm120_supported()
 _is_sm90_supported = is_cuda() and is_sm90_supported()
 has_triton_kernels = is_triton_kernels_available()
 
@@ -98,23 +100,38 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
     from triton_kernels.tensor_details import layout
 
-    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-        mx_axis=1
-    )
-    scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
-        mx_axis=1, num_warps=num_warps
-    )
-    if _is_sm100_supported:
+    if _is_sm120_supported:
+        # SM120 (Blackwell desktop) doesn't support persistent kernels / TMA block layout
+        # Use StridedLayout and disable persistent kernels to avoid assertion errors
+        from triton_kernels.tensor_details.layout import StridedLayout
+
+        value_layout = StridedLayout
+        value_layout_opts = {}
+        scale_layout = StridedLayout
+        scale_layout_opts = {}
         constraints = {
-            "is_persistent": True,
-            "epilogue_subtile": 1,
+            "is_persistent": False,
+            "num_stages": 1,
         }
         opt_flags.update_opt_flags_constraints(constraints)
-    elif _is_sm90_supported:
-        constraints = {
-            "split_k": 1,
-        }
-        opt_flags.update_opt_flags_constraints(constraints)
+    else:
+        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
+            mx_axis=1
+        )
+        scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
+            mx_axis=1, num_warps=num_warps
+        )
+        if _is_sm100_supported:
+            constraints = {
+                "is_persistent": True,
+                "epilogue_subtile": 1,
+            }
+            opt_flags.update_opt_flags_constraints(constraints)
+        elif _is_sm90_supported:
+            constraints = {
+                "split_k": 1,
+            }
+            opt_flags.update_opt_flags_constraints(constraints)
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
