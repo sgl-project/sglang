@@ -1,11 +1,12 @@
 import torch
+from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 
 from sglang.srt.utils import BumpAllocator
 
-__all__ = ["fused_qk_rope_cat"]
+__all__ = ["fused_qk_rope_cat", "fused_qk_rope_cat_and_cache_mla"]
 
 
 def aiter_dsv3_router_gemm(
