@@ -231,10 +231,10 @@ class ModelRunnerKVCacheMixin:
                 self.full_max_total_num_tokens * swa_full_tokens_ratio
             )
 
-            self.full_max_total_num_tokens = (
+            self.full_max_total_num_tokens = int(
                 self.full_max_total_num_tokens // page_size * page_size
             )
-            self.swa_max_total_num_tokens = (
+            self.swa_max_total_num_tokens = int(
                 self.swa_max_total_num_tokens // page_size * page_size
             )
 
