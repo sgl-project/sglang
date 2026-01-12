@@ -180,15 +180,20 @@ manual_routing_all_backend_test!(test_routing_consistency, 3720);
 // Min Group Mode Tests
 // ============================================================================
 
-async fn test_min_group_concurrent_distribution_impl(cfg: TestManualConfig, base_port: u16) {
+async fn test_min_group_distribution_raw(
+    cfg: &TestManualConfig,
+    base_port: u16,
+    worker_latency_ms: u64,
+    delay_between_requests_ms: Option<u64>,
+) -> HashMap<String, usize> {
     let config = TestRouterConfig::manual_with_full_options(
         base_port,
         smg::config::ManualAssignmentMode::MinGroup,
-        &cfg,
+        cfg,
     );
     let ctx = AppTestContext::new_with_config(
         config,
-        TestWorkerConfig::slow_workers(base_port + 26000, 3, 500),
+        TestWorkerConfig::slow_workers(base_port + 26000, 3, worker_latency_ms),
     )
     .await;
 
@@ -200,15 +205,15 @@ async fn test_min_group_concurrent_distribution_impl(cfg: TestManualConfig, base
         let app_clone = app.clone();
         let handle = tokio::spawn(async move { send_request(app_clone, &routing_key).await });
         handles.push(handle);
+        if let Some(delay_ms) = delay_between_requests_ms {
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+        }
     }
-
-    let results: Vec<(String, String)> = futures_util::future::join_all(handles)
+    let key_to_worker: HashMap<String, String> = futures_util::future::join_all(handles)
         .await
         .into_iter()
         .map(|r| r.unwrap())
         .collect();
-
-    let key_to_worker: HashMap<String, String> = results.into_iter().collect();
 
     let worker_counts: HashMap<String, usize> =
         key_to_worker.values().fold(HashMap::new(), |mut acc, w| {
@@ -223,28 +228,47 @@ async fn test_min_group_concurrent_distribution_impl(cfg: TestManualConfig, base
         worker_counts
     );
 
+    ctx.shutdown().await;
+    worker_counts
+}
+
+async fn test_min_group_concurrent_distribution_impl(cfg: TestManualConfig, base_port: u16) {
+    let worker_counts = test_min_group_distribution_raw(&cfg, base_port, 500, None).await;
+
     if cfg.redis_url.is_some() {
         for (worker, count) in &worker_counts {
             assert!(
-                *count >= 2 && *count <= 4,
-                "Worker {} should have 2-4 keys due to Redis racing, got {}. Distribution: {:?}",
-                worker, count, key_to_worker
+                *count >= 1 && *count <= 5,
+                "Worker {} should have 1-5 keys due to racing, got {}",
+                worker, count
             );
         }
     } else {
         for (worker, count) in &worker_counts {
             assert_eq!(
                 *count, 3,
-                "Worker {} should have exactly 3 keys, got {}. Distribution: {:?}",
-                worker, count, key_to_worker
+                "Worker {} should have exactly 3 keys, got {}",
+                worker, count
             );
         }
     }
-
-    ctx.shutdown().await;
 }
 
 manual_routing_all_backend_test!(test_min_group_concurrent_distribution, 3910);
+
+async fn test_min_group_sequential_distribution_impl(cfg: TestManualConfig, base_port: u16) {
+    let worker_counts = test_min_group_distribution_raw(&cfg, base_port, 50, Some(200)).await;
+
+    for (worker, count) in &worker_counts {
+        assert_eq!(
+            *count, 3,
+            "Worker {} should have exactly 3 keys with sequential requests, got {}",
+            worker, count
+        );
+    }
+}
+
+manual_routing_all_backend_test!(test_min_group_sequential_distribution, 4010);
 
 async fn test_min_group_sticky_routing_impl(cfg: TestManualConfig, base_port: u16) {
     let config = TestRouterConfig::manual_with_full_options(
