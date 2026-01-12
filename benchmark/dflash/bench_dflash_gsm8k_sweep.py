@@ -15,6 +15,7 @@ import ast
 import os
 import re
 import time
+import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
@@ -89,6 +90,8 @@ def _send_generate(
 ) -> dict:
     sampling_params: dict = {
         "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 1,
         "max_new_tokens": int(max_new_tokens),
     }
     if stop:
@@ -133,6 +136,7 @@ def _run_gsm8k_requests(
     start = time.perf_counter()
     total_tokens = 0
     spec_verify_ct_sum = 0
+    spec_accept_lengths: list[float] = []
     correct = 0
     invalid = 0
 
@@ -154,6 +158,11 @@ def _run_gsm8k_requests(
             meta = out.get("meta_info", {}) or {}
             total_tokens += int(meta.get("completion_tokens", 0))
             spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
+            if "spec_accept_length" in meta:
+                try:
+                    spec_accept_lengths.append(float(meta["spec_accept_length"]))
+                except (TypeError, ValueError):
+                    pass
 
             if labels is not None:
                 pred = _get_answer_value(out.get("text", ""))
@@ -172,7 +181,7 @@ def _run_gsm8k_requests(
         )
 
     spec_accept_length = (
-        (total_tokens / spec_verify_ct_sum) if spec_verify_ct_sum > 0 else None
+        float(statistics.mean(spec_accept_lengths)) if spec_accept_lengths else None
     )
 
     if labels is None:
@@ -233,7 +242,6 @@ def main() -> None:
     parser.add_argument("--mem-fraction-static", type=float, default=0.75)
     parser.add_argument("--disable-radix-cache", action="store_true")
     parser.add_argument("--dtype", type=str, default="bfloat16")
-    parser.add_argument("--chunked-prefill-size", type=int, default=1024)
     parser.add_argument("--max-running-requests", type=int, default=64)
     parser.add_argument(
         "--tp-sizes",
@@ -368,18 +376,10 @@ def main() -> None:
                 str(args.mem_fraction_static),
                 "--max-running-requests",
                 str(args.max_running_requests),
-                "--chunked-prefill-size",
-                str(args.chunked_prefill_size),
-                "--cuda-graph-bs",
-                "1",
-                "2",
-                "4",
-                "8",
-                "16",
-                "32",
-                "--cuda-graph-max-bs",
-                "32",
             ]
+            common_server_args.extend(
+                ["--cuda-graph-bs", *[str(i) for i in range(1, 33)], "--cuda-graph-max-bs", "32"]
+            )
             if args.disable_radix_cache:
                 common_server_args.append("--disable-radix-cache")
 
@@ -585,7 +585,7 @@ def main() -> None:
         )
         md_lines.append("")
 
-        md_lines.append("### DFLASH acceptance length (completion_tokens / spec_verify_ct)")
+        md_lines.append("### DFLASH acceptance length (mean per-request spec_accept_length)")
         md_lines.append(
             _format_table(
                 tp_sizes=tp_sizes,
