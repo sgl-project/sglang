@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -11,9 +11,11 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda
+from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
 
 if is_cuda():
     from sgl_kernel import (
@@ -23,11 +25,15 @@ if is_cuda():
         top_p_renorm_prob,
     )
 
+if is_npu():
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+_CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
+_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
 class Sampler(nn.Module):
@@ -112,7 +118,11 @@ class Sampler(nn.Module):
 
             # Post process logits
             logits.div_(sampling_info.temperatures)
-            logits[:] = torch.softmax(logits, dim=-1)
+            # For ascend backend, softmax is not needed before sampling
+            if not get_global_server_args().sampling_backend == "ascend" or (
+                return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB
+            ):
+                logits[:] = torch.softmax(logits, dim=-1)
             probs = logits
             del logits
 
@@ -149,6 +159,14 @@ class Sampler(nn.Module):
                         sampling_info.need_min_p_sampling,
                         sampling_info.sampling_seed,
                         positions,
+                    )
+                elif get_global_server_args().sampling_backend == "ascend":
+                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_ascend(
+                        probs,
+                        sampling_info.top_ks,
+                        sampling_info.top_ps,
+                        sampling_info.min_ps,
+                        sampling_info.need_min_p_sampling,
                     )
                 else:
                     raise ValueError(
@@ -253,6 +271,42 @@ class Sampler(nn.Module):
             ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
 
 
+def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> None:
+    """Register a custom sampler factory for a backend string."""
+
+    if not backend:
+        raise ValueError("backend must be a non-empty string")
+
+    from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
+
+    if backend in _CUSTOM_SAMPLER_FACTORIES:
+        logger.warning("Overriding existing sampler factory for backend '%s'", backend)
+    SAMPLING_BACKEND_CHOICES.add(backend)
+    _CUSTOM_SAMPLER_FACTORIES[backend] = factory
+
+
+def create_sampler(backend: Optional[str] = None) -> "Sampler":
+    """Create a sampler honoring custom backend registrations."""
+
+    server_args = get_global_server_args()
+    backend = backend or (server_args.sampling_backend if server_args else None)
+
+    if backend in _CUSTOM_SAMPLER_FACTORIES:
+        sampler = _CUSTOM_SAMPLER_FACTORIES[backend]()
+        if not isinstance(sampler, Sampler):
+            raise TypeError(
+                f"Custom sampler factory for backend '{backend}' must return a Sampler"
+            )
+        return sampler
+
+    if backend is None or backend in _BUILT_IN_SAMPLING_BACKENDS:
+        return Sampler()
+
+    raise ValueError(
+        f"Unknown sampling backend '{backend}'. Register it via register_sampler_backend()."
+    )
+
+
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -286,6 +340,55 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
+
+
+def top_k_top_p_min_p_sampling_from_probs_ascend(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+):
+    """A top-k, top-p and min-p sampling implementation for ascend npu with torch_npu interface."""
+    # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
+    if hasattr(torch_npu, "npu_top_k_top_p") and torch.all(
+        (top_ks <= 1024) & (top_ks >= 1)
+    ):
+        logits_top_k_top_p = torch_npu.npu_top_k_top_p(probs, top_ps, top_ks)
+        probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
+
+        if need_min_p_sampling:
+            min_p_thresholds = probs_top_k_top_p.max(dim=-1) * min_ps
+            min_p_mask = probs_top_k_top_p < min_p_thresholds.view(-1, 1)
+            probs_top_k_top_p.masked_fill_(min_p_mask, 0.0)
+
+        batch_next_token_ids = torch.multinomial(probs_top_k_top_p, num_samples=1)
+    else:
+        probs = torch.softmax(probs, dim=-1)
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+
+        # when top_k is -1 (in which sglang turns it to TOP_K_ALL), make it explicitly equal to logit's size
+        topk_all_mask = top_ks == TOP_K_ALL
+        top_ks.masked_fill_(topk_all_mask, probs.shape[1])
+        top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
+            1, -1
+        ) >= top_ks.view(-1, 1)
+        probs_sort.masked_fill_(top_k_mask, 0.0)
+
+        probs_sum = torch.cumsum(probs_sort, dim=-1)
+        top_p_mask = probs_sum - probs_sort > top_ps.view(-1, 1)
+        probs_sort.masked_fill_(top_p_mask, 0.0)
+
+        if need_min_p_sampling:
+            min_p_thresholds = probs_sort[:, 0] * min_ps
+            min_p_mask = probs_sort < min_p_thresholds.view(-1, 1)
+            probs_sort.masked_fill_(min_p_mask, 0.0)
+
+        sampled_index = torch.multinomial(probs_sort, num_samples=1)
+        probs_idx = probs_idx.to(torch.int32)
+        batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
+
+    return batch_next_token_ids.view(-1)
 
 
 def multinomial_with_seed(
@@ -348,27 +451,6 @@ def top_p_normalize_probs_torch(
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
-
-
-def get_top_logprobs(
-    logprobs: torch.Tensor,
-    top_logprobs_nums: List[int],
-):
-    max_k = max(top_logprobs_nums)
-    ret = logprobs.topk(max_k, dim=1)
-    values = ret.values.tolist()
-    indices = ret.indices.tolist()
-
-    output_top_logprobs_val = []
-    output_top_logprobs_idx = []
-    for i, k in enumerate(top_logprobs_nums):
-        output_top_logprobs_val.append(values[i][:k])
-        output_top_logprobs_idx.append(indices[i][:k])
-
-    return (
-        output_top_logprobs_val,
-        output_top_logprobs_idx,
-    )
 
 
 def get_token_ids_logprobs_batch_optimized(
@@ -457,23 +539,6 @@ def get_token_ids_logprobs_batch_optimized(
             output_token_ids_logprobs_idx.append([])
 
     return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
-
-
-def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List[int]]):
-    output_token_ids_logprobs_val = []
-    output_token_ids_logprobs_idx = []
-    for i, token_ids in enumerate(token_ids_logprobs):
-        if token_ids is not None:
-            output_token_ids_logprobs_val.append(logprobs[i, token_ids].tolist())
-            output_token_ids_logprobs_idx.append(token_ids)
-        else:
-            output_token_ids_logprobs_val.append([])
-            output_token_ids_logprobs_idx.append([])
-
-    return (
-        output_token_ids_logprobs_val,
-        output_token_ids_logprobs_idx,
-    )
 
 
 def apply_custom_logit_processor(

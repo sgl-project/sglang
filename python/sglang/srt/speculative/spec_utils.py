@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
@@ -19,6 +19,8 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.common import get_last_loc
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
@@ -46,6 +48,14 @@ SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+
+
+def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
+    if server_args is None:
+        server_args = get_global_server_args()
+
+    # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
+    return not server_args.enable_multi_layer_eagle
 
 
 @triton.jit
@@ -117,26 +127,15 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
-    if _is_cuda or _is_hip:
-        assign_req_to_token_pool[(batch_size,)](
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-            req_to_token.shape[1],
-            next_power_of_2(batch_size),
-        )
-    elif _is_npu:
-        import sgl_kernel_npu  # noqa: F401
-
-        torch.ops.npu.cache_loc_assign(
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-        )
+    assign_req_to_token_pool[(batch_size,)](
+        req_pool_indices,
+        req_to_token,
+        start_offset,
+        end_offset,
+        out_cache_loc,
+        req_to_token.shape[1],
+        next_power_of_2(batch_size),
+    )
 
 
 @triton.jit
@@ -147,6 +146,10 @@ def assign_draft_cache_locs(
     extend_lens,
     num_new_pages_per_topk,
     out_cache_loc,
+    source_cache_loc,
+    target_cache_loc,
+    last_page_lens_cumsum,
+    duplicate_cache_len: tl.constexpr,
     pool_len: tl.constexpr,
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
@@ -175,44 +178,73 @@ def assign_draft_cache_locs(
         mask = copy_offset < copy_len
         data = tl.load(out_cache_ptr + copy_offset, mask=mask)
         tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
-
-    if page_size == 1 or topk == 1:
-        return
-
-    # Part 2: Copy the indices for the last partial page
-    prefix_len = tl.load(seq_lens + pid)
-    last_page_len = prefix_len % page_size
-    offsets = tl.arange(0, page_size)
-    mask = offsets < last_page_len
-    num_new_pages_per_topk_ = tl.load(num_new_pages_per_topk + pid)
-    prefix_base = token_pool + prefix_len - last_page_len
-
-    for topk_id in range(topk):
-        value = tl.load(prefix_base + offsets, mask=mask)
-        tl.store(
-            prefix_base + topk_id * num_new_pages_per_topk_ * page_size + offsets,
-            value,
-            mask=mask,
-        )
-
-    # Part 3: Remove the padding in out_cache_loc
-    iter_offest = tl.arange(0, iter_upper)
-    for topk_id in range(topk):
-        indices = tl.load(
-            prefix_base
-            + topk_id * num_new_pages_per_topk_ * page_size
-            + last_page_len
-            + iter_offest,
-            mask=iter_offest < speculative_num_steps,
-        )
-        tl.store(
-            out_cache_loc
-            + pid * topk * speculative_num_steps
-            + topk_id * speculative_num_steps
-            + iter_offest,
-            indices,
-            mask=iter_offest < speculative_num_steps,
-        )
+    if page_size != 1 and topk != 1 and duplicate_cache_len > 0:
+        # Part 2: Copy indices into source_cache_loc and target_cache_loc
+        # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
+        prefix_len = tl.load(seq_lens + pid)
+        last_page_len = prefix_len % page_size
+        offsets = tl.arange(0, page_size)
+        mask = offsets < last_page_len
+        num_new_pages_per_topk_ = tl.load(num_new_pages_per_topk + pid)
+        prefix_base = token_pool + prefix_len - last_page_len
+        src_indices = tl.load(prefix_base + offsets, mask=mask)
+        last_page_lens_cumsum_ = tl.load(last_page_lens_cumsum + pid)
+        # Skip the first one since no copy is needed
+        for topk_id in range(1, topk):
+            tl.store(
+                source_cache_loc
+                + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
+                + (topk_id - 1) * last_page_len
+                + offsets,
+                src_indices,
+                mask=mask,
+            )
+            tgt_indices = tl.load(
+                prefix_base + topk_id * num_new_pages_per_topk_ * page_size + offsets,
+                mask=mask,
+            )
+            tl.store(
+                target_cache_loc
+                + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
+                + (topk_id - 1) * last_page_len
+                + offsets,
+                tgt_indices,
+                mask=mask,
+            )
+        # Part 3: Copy and remove the used indices for duplication
+        # speculative_num_steps=5, page_size=4, num_new_pages_per_topk_=2, last_page_len=1
+        #  - xxxxx .. | - xxxxx .. |
+        #   topk=0        topk=1
+        #  "-" means prefix tokens
+        #  "x" means speculative draft tokens
+        #  "." means padded tokens
+        # we only want to copy the "x" part.
+        iter_offset = tl.arange(0, iter_upper)
+        for topk_id in range(topk):
+            mask_upper = iter_offset < (speculative_num_steps + last_page_len)
+            mask_lower = iter_offset >= last_page_len
+            combined_mask = mask_upper & mask_lower
+            indices = tl.load(
+                prefix_base
+                + topk_id * num_new_pages_per_topk_ * page_size
+                + iter_offset,
+                mask=combined_mask,
+                other=0,
+            )
+            # Shift from previous batches
+            ptr_offset = pid * speculative_num_steps * topk
+            # Subtract last_page_len to fill the gap of duplicated last page tokens.
+            # For example, token pool is (1, 2, 3, 4 ,5) and last page is 1,
+            # we write 2, 3, 4 to the front of out_cache_loc.
+            tl.store(
+                out_cache_loc
+                + ptr_offset
+                + topk_id * speculative_num_steps
+                - last_page_len
+                + iter_offset,
+                indices,
+                mask=combined_mask,
+            )
 
 
 @triton.jit
@@ -443,13 +475,14 @@ def select_top_k_tokens(
     if i == 0:
         # The first step after extend
         input_ids = topk_index.flatten()
-        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+        if hidden_states is not None:
+            hidden_states = hidden_states.repeat_interleave(topk, dim=0)
         scores = topk_p  # shape: (b, topk)
 
         tree_info = (
             topk_p.unsqueeze(1),  # shape: (b, 1, topk)
             topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device=hidden_states.device)
+            torch.arange(-1, topk, dtype=torch.long, device=input_ids.device)
             .unsqueeze(0)
             .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
         )
@@ -468,7 +501,7 @@ def select_top_k_tokens(
 
         if hidden_states.shape[0] > 0:
             selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-                0, hidden_states.shape[0], step=topk, device="cuda"
+                0, hidden_states.shape[0], step=topk, device=topk_index.device
             ).repeat_interleave(topk)
             hidden_states = hidden_states[selected_input_index, :]
 
@@ -547,8 +580,6 @@ def traverse_tree(
     assert (
         retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
     )
-
-    allocate_token_bitmask.fill_(0)
 
     def dfs(
         curr: int,
@@ -675,3 +706,39 @@ def detect_nan(logits_output: LogitsProcessorOutput):
     if torch.any(torch.isnan(logits)):
         logger.error("Detected errors during sampling! NaN in the logits.")
         raise ValueError("Detected errors during sampling! NaN in the logits.")
+
+
+# Disable torch.compile for this function because it will be
+# even slower.
+# @torch.compile(dynamic=True)
+def get_last_loc_large_page_size_large_top_k(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    speculative_num_steps: int,
+    topk: int,
+    page_size: int,
+):
+    prefix_lens = seq_lens
+    last_page_lens = prefix_lens % page_size
+    num_new_pages_per_topk = (
+        last_page_lens + speculative_num_steps + page_size - 1
+    ) // page_size
+    seq_lens = prefix_lens // page_size * page_size + num_new_pages_per_topk * (
+        page_size * topk
+    )
+    extend_lens = seq_lens - prefix_lens
+    last_loc = get_last_loc(
+        req_to_token,
+        req_pool_indices,
+        prefix_lens,
+    )
+
+    return (
+        prefix_lens,
+        seq_lens,
+        last_loc,
+        num_new_pages_per_topk,
+        extend_lens,
+        last_page_lens,
+    )

@@ -16,12 +16,16 @@ The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Scheduler).
 """
 
+from __future__ import annotations
+
 import copy
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+
+import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -80,18 +84,22 @@ class RequestTimingMetricsMixin:
     #   - Prefill instance (P): timestamp when prefill forward pass begins
     #   - Decode instance (D): timestamp when decode forward pass begins
     # Note: This is NOT the same as prefill_start_time. There may be a delay between
-    # forward_entry_time and prefill_start_time (see prefill_delay).
+    # forward_entry_time and prefill_start_time (see prefill_launch_delay).
     forward_entry_time: Optional[List[Optional[float]]]
 
-    # Prefill delay: time spent waiting between forward entry and prefill start.
+    # Prefill launch delay: time spent waiting between forward entry and prefill start.
     # Calculated as: prefill_start_time - forward_entry_time
     # This represents the delay between when the request enters the forward stage
     # and when prefill computation actually begins.
-    prefill_delay: Optional[List[Optional[float]]]
+    prefill_launch_delay: Optional[List[Optional[float]]]
 
-    # Prefill latency: time spent during prefill computation.
-    # Calculated as: prefill_end_time - prefill_start_time
-    prefill_latency: Optional[List[Optional[float]]]
+    # Prefill launch latency: time spent during prefill kernel launch.
+    # Calculated as: prefill_end_time_host - prefill_start_time_host
+    prefill_launch_latency: Optional[List[Optional[float]]]
+
+    # Prefill finished time: timestamp when prefill phase completes (wall clock time).
+    # This marks when the prefill computation finishes.
+    prefill_finished_ts: Optional[List[Optional[float]]]
 
 
 @dataclass
@@ -108,6 +116,23 @@ class SpeculativeDecodingMetricsMixin:
 
     # Accepted tokens: Number of accepted tokens during speculative decoding
     spec_accepted_tokens: List[int]
+
+
+@dataclass
+class APIServingTimingMixin:
+    # Validation step duration
+    validation_time: Optional[float] = None
+
+    # For metrics
+    received_time: Optional[float] = None
+
+    # Perf_counter equivalents for accurate time calculations
+    received_time_perf: Optional[float] = None
+
+
+_API_SERVING_TIMING_MIXIN_FIELDS = tuple(
+    APIServingTimingMixin.__dataclass_fields__.keys()
+)
 
 
 # Parameters for a session
@@ -138,7 +163,7 @@ MultimodalDataInputFormat = Union[
 
 
 @dataclass
-class GenerateReqInput(BaseReq):
+class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
@@ -175,6 +200,8 @@ class GenerateReqInput(BaseReq):
     log_metrics: bool = True
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
+    # Whether to return captured routed experts
+    return_routed_experts: bool = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -196,9 +223,10 @@ class GenerateReqInput(BaseReq):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
+    decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
-    # Validation step duration
-    validation_time: Optional[float] = None
+    # Require reasoning for the request (hybrid reasoning model only)
+    require_reasoning: bool = False
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -215,6 +243,9 @@ class GenerateReqInput(BaseReq):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
@@ -226,6 +257,19 @@ class GenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    # Propagates trace context via Engine.generate/async_generate
+    external_trace_header: Optional[Dict] = None
+
+    # For EPD-disaggregated inference
+    need_wait_for_image: Optional[bool] = None
+    num_items_assigned: Optional[List] = None
+
+    # Multimodal tiling controls (extensions)
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+    image_max_dynamic_patch: Optional[int] = None
+    video_max_dynamic_patch: Optional[int] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -592,6 +636,7 @@ class GenerateReqInput(BaseReq):
                 if isinstance(self.return_hidden_states, list)
                 else self.return_hidden_states
             ),
+            return_routed_experts=self.return_routed_experts,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -616,7 +661,9 @@ class GenerateReqInput(BaseReq):
                 if self.bootstrap_pair_key is not None
                 else None
             ),
-            validation_time=self.validation_time,
+            decode_tp_size=(
+                self.decode_tp_size[i] if self.decode_tp_size is not None else None
+            ),
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
@@ -627,7 +674,12 @@ class GenerateReqInput(BaseReq):
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
+            external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
+            **{
+                field: getattr(self, field)
+                for field in _API_SERVING_TIMING_MIXIN_FIELDS
+            },
         )
 
 
@@ -655,6 +707,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether to return captured routed experts
+    return_routed_experts: bool = False
+
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
@@ -674,6 +729,10 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
+    decode_tp_size: Optional[int] = None
+
+    # Require reasoning for the request (hybrid reasoning model only)
+    require_reasoning: bool = False
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
@@ -683,6 +742,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
+
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -695,6 +757,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    need_wait_for_image: bool = False
+    num_items_assigned: Optional[List] = None
 
 
 @dataclass
@@ -713,7 +778,7 @@ class BatchTokenizedGenerateReqInput(BaseBatchReq):
 
 
 @dataclass
-class EmbeddingReqInput(BaseReq):
+class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -743,12 +808,14 @@ class EmbeddingReqInput(BaseReq):
     is_cross_encoder_request: bool = False
     # Priority for the request
     priority: Optional[int] = None
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
 
-    # tracing context
-    trace_context: Optional[Dict] = None
+    # Propagates trace context via Engine.encode/async_encode
+    external_trace_header: Optional[Dict] = None
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
@@ -829,9 +896,13 @@ class EmbeddingReqInput(BaseReq):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
-            validation_time=self.validation_time,
+            external_trace_header=self.external_trace_header,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
+            **{
+                field: getattr(self, field)
+                for field in _API_SERVING_TIMING_MIXIN_FIELDS
+            },
         )
 
 
@@ -910,6 +981,9 @@ class BatchTokenIDOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The routed experts for each output token
+    output_routed_experts: List[torch.Tensor]
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -921,6 +995,11 @@ class BatchTokenIDOutput(
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
+
+    # Load for DP balance
+    load: GetLoadReqOutput = None
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclass
@@ -989,6 +1068,9 @@ class BatchStrOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The routed experts for each output token
+    output_routed_experts: List[List[int]]
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -1000,6 +1082,12 @@ class BatchStrOutput(
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
+
+    # Load for DP balance
+    load: GetLoadReqOutput = None
+
+    # Customized info
+    customized_info: Optional[Dict[str, List[Any]]] = None
 
 
 @dataclass
@@ -1065,6 +1153,41 @@ class FlushCacheReqOutput(BaseReq):
 
 
 @dataclass
+class PauseGenerationReqInput(BaseReq):
+    """
+    Note that the PauseGenerationRequests is only supported in SGLang Server.
+    abort: Abort and return all requests currently being processed.
+
+    in_place: Pause the scheduler's event_loop from performing inference;
+            only non-inference requests (e.g., control commands) will be handled.
+            The requests in the engine will be paused and stay in the event_loop,
+            then continue generation after continue_generation with the old kv cache.
+            Note: In 'inplace' mode, flush_cache will fail if there are any requests
+            in the running_batch.
+
+    retract: Pause the scheduler's event loop from performing inference;
+            only non-inference requests will be handled, and all currently running
+            requests will be retracted back to the waiting_queue.
+            Note: The KV cache can be flushed in this mode and will be automatically
+            recomputed after continue_generation.
+    """
+
+    mode: Literal["abort", "retract", "in_place"] = "abort"
+
+    def __post_init__(self):
+        allowed = ["abort", "retract", "in_place"]
+        if self.mode not in allowed:
+            raise ValueError(
+                f"Invalid mode: {self.mode!r}. " f"Expected one of {allowed}."
+            )
+
+
+@dataclass
+class ContinueGenerationReqInput(BaseReq):
+    pass
+
+
+@dataclass
 class UpdateWeightFromDiskReqInput(BaseReq):
     # The model path with the new weights
     model_path: str
@@ -1084,6 +1207,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     recapture_cuda_graph: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
 
 
 @dataclass
@@ -1107,6 +1232,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Optional format specification for loading
+    load_format: Optional[str] = None
 
 
 @dataclass
@@ -1273,6 +1400,17 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 
 
 @dataclass
+class CheckWeightsReqInput(BaseReq):
+    action: str
+
+
+@dataclass
+class CheckWeightsReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class SlowDownReqInput(BaseReq):
     forward_sleep_time: Optional[float]
 
@@ -1321,17 +1459,26 @@ class SetInternalStateReqOutput(BaseReq):
 class ProfileReqInput(BaseReq):
     # The output directory
     output_dir: Optional[str] = None
+    # Specify the steps to start the profiling
+    start_step: Optional[int] = None
     # If set, it profile as many as this number of steps.
     # If it is set, profiling is automatically stopped after this step, and
     # the caller doesn't need to run stop_profile.
-    start_step: Optional[int] = None
     num_steps: Optional[int] = None
+    # The activities to record. The choices are ["CPU", "GPU", "MEM", "RPD"]
     activities: Optional[List[str]] = None
+    # Whether profile by stages (e.g., prefill and decode) separately
     profile_by_stage: bool = False
+    # Whether to record source information (file and line number) for the ops.
     with_stack: Optional[bool] = None
+    # Whether to save information about operator’s input shapes.
     record_shapes: Optional[bool] = None
     # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
+    # The prefix of the profile filenames
+    profile_prefix: Optional[str] = None
+    # Only profile these stages and ignore others
+    profile_stages: Optional[List[str]] = None
 
 
 class ProfileReqType(Enum):
@@ -1350,8 +1497,9 @@ class ProfileReq(BaseReq):
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
-    # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
+    profile_prefix: Optional[str] = None
+    profile_stages: Optional[List[str]] = None
 
 
 @dataclass
@@ -1369,6 +1517,7 @@ class FreezeGCReq(BaseReq):
 class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
+    log_requests_format: Optional[str] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
@@ -1495,13 +1644,33 @@ class UnloadLoRAAdapterReqInput(BaseReq):
 
 
 @dataclass
+class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
+    lora_name: str
+    config_dict: Dict[str, Any]
+    serialized_tensors: str
+    pinned: bool = False
+    added_tokens_config: Optional[Dict[str, Any]] = None
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path="__tensor__",
+            pinned=self.pinned,
+        )
+
+
+@dataclass
 class LoRAUpdateOutput(BaseReq):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, LoRARef]] = None
 
 
-LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateOutput
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
+    LoadLoRAAdapterFromTensorsReqOutput
+) = LoRAUpdateOutput
 
 
 class BlockReqType(Enum):
@@ -1525,6 +1694,7 @@ class GetLoadReqOutput(BaseReq):
     num_reqs: int
     num_waiting_reqs: int
     num_tokens: int
+    ts_tic: float
 
 
 @dataclass

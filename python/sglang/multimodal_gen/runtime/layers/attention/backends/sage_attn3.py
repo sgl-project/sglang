@@ -3,23 +3,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+import torch.nn.functional as F
+from sageattn3 import sageattn3_blackwell
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
-    AttentionMetadataBuilder,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.sageattn.api import (
-    sageattn_blackwell,
-)
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 
 class SageAttention3Backend(AttentionBackend):
-
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -27,8 +25,8 @@ class SageAttention3Backend(AttentionBackend):
         return [64, 128, 256]
 
     @staticmethod
-    def get_name() -> str:
-        return "SAGE_ATTN_THREE"
+    def get_enum() -> AttentionBackendEnum:
+        return AttentionBackendEnum.SAGE_ATTN_3
 
     @staticmethod
     def get_impl_cls() -> type["SageAttention3Impl"]:
@@ -38,16 +36,9 @@ class SageAttention3Backend(AttentionBackend):
     def get_metadata_cls() -> type["AttentionMetadata"]:
         raise NotImplementedError
 
-    @staticmethod
-    def get_builder_cls() -> type["AttentionMetadataBuilder"]:
-        raise NotImplementedError
-
-    # @staticmethod
-    # def get_metadata_cls() -> Type["AttentionMetadata"]:
-    #     return FlashAttentionMetadata
-
 
 class SageAttention3Impl(AttentionImpl):
+    _warned_gqa_fallback_global: bool = False
 
     def __init__(
         self,
@@ -73,6 +64,29 @@ class SageAttention3Impl(AttentionImpl):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
-        output = sageattn_blackwell(query, key, value, is_causal=self.causal)
+        # SageAttention3's Blackwell kernel assumes MHA (Hq == Hkv). For GQA/MQA
+        # (Hq != Hkv), fall back to torch SDPA which supports GQA.
+        if key.shape[1] != query.shape[1]:
+            if query.shape[1] % key.shape[1] != 0:
+                raise ValueError(
+                    "GQA/MQA requires query heads to be a multiple of KV heads, "
+                    f"got q_heads={query.shape[1]} and kv_heads={key.shape[1]}"
+                )
+            if not type(self)._warned_gqa_fallback_global:
+                logger.warning(
+                    "SageAttention3 does not support GQA/MQA (Hq != Hkv); falling back to torch SDPA."
+                )
+                type(self)._warned_gqa_fallback_global = True
+            output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                is_causal=self.causal,
+                dropout_p=self.dropout,
+                scale=self.softmax_scale,
+                enable_gqa=True,
+            )
+        else:
+            output = sageattn3_blackwell(query, key, value, is_causal=self.causal)
         output = output.transpose(1, 2)
         return output

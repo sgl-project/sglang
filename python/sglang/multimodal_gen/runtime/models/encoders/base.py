@@ -25,7 +25,7 @@ class TextEncoder(nn.Module, ABC):
     def __init__(self, config: TextEncoderConfig) -> None:
         super().__init__()
         self.config = config
-        self._fsdp_shard_conditions = config._fsdp_shard_conditions
+        self._fsdp_shard_conditions = config.arch_config._fsdp_shard_conditions
         self._stacked_params_mapping = config.arch_config.stacked_params_mapping
         if not self.supported_attention_backends:
             raise ValueError(

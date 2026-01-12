@@ -44,14 +44,17 @@ folder_names = [
     "docs",
     "examples",
     "python/sglang/lang",
+    "python/sglang/jit_kernel",
     "python/sglang/srt",
     "python/sglang/test",
     "python/sglang/utils.py",
     "python/sglang/README.md",
     "sgl-kernel",
-    "test/lang",
+    "test/manual",
+    "test/registered",
     "test/srt",
     "test/README.md",
+    "test/run_suite.py",
     "README.md",
 ]
 

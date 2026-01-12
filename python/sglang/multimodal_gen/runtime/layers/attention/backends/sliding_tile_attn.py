@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import dict_to_3d_list
 
@@ -55,8 +56,8 @@ class SlidingTileAttentionBackend(AttentionBackend):
         return [32, 64, 96, 128, 160, 192, 224, 256]
 
     @staticmethod
-    def get_name() -> str:
-        return "SLIDING_TILE_ATTN"
+    def get_enum() -> AttentionBackendEnum:
+        return AttentionBackendEnum.SLIDING_TILE_ATTN
 
     @staticmethod
     def get_impl_cls() -> type["SlidingTileAttentionImpl"]:
@@ -119,9 +120,9 @@ class SlidingTileAttentionImpl(AttentionImpl):
             raise ValueError("st attn not supported")
         # TODO(will-refactor): for now this is the mask strategy, but maybe we should
         # have a more general config for STA?
-        config_file = envs.SGL_DIFFUSION_ATTENTION_CONFIG
+        config_file = envs.SGLANG_DIFFUSION_ATTENTION_CONFIG
         if config_file is None:
-            raise ValueError("SGL_DIFFUSION_ATTENTION_CONFIG is not set")
+            raise ValueError("SGLANG_DIFFUSION_ATTENTION_CONFIG is not set")
 
         # TODO(kevin): get mask strategy for different STA modes
         with open(config_file) as f:
