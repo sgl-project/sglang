@@ -129,6 +129,44 @@ class DFlashWorker:
                 self._mask_token_id,
             )
 
+        self._block_pos_offsets = torch.arange(
+            self.block_size, device=self.device, dtype=torch.int64
+        )
+        self._draft_block_ids_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size]
+        self._draft_block_positions_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size]
+        self._draft_block_tokens_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size]
+        self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
+        self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
+        self._draft_block_spec_info = DFlashVerifyInput(
+            draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
+            positions=torch.empty((0,), dtype=torch.int64, device=self.device),
+            draft_token_num=int(self.block_size),
+            custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+
+    def _ensure_draft_block_buffers(self, bs: int) -> None:
+        cap = 0 if self._draft_block_ids_buf is None else int(self._draft_block_ids_buf.shape[0])
+        if cap >= int(bs):
+            return
+
+        new_cap = max(int(bs), cap * 2 if cap > 0 else int(bs))
+        device = self.device
+        block_size = int(self.block_size)
+        self._draft_block_ids_buf = torch.empty(
+            (new_cap, block_size), dtype=torch.long, device=device
+        )
+        self._draft_block_positions_buf = torch.empty(
+            (new_cap, block_size), dtype=torch.int64, device=device
+        )
+        self._draft_block_tokens_buf = torch.empty(
+            (new_cap, block_size), dtype=torch.long, device=device
+        )
+        self._draft_block_end_buf = torch.empty(
+            (new_cap,), dtype=torch.int32, device=device
+        )
+        self._draft_seq_lens_cpu_buf = torch.empty((new_cap,), dtype=torch.int32, device="cpu")
+
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker.
         return getattr(self.target_worker, name)
@@ -224,26 +262,35 @@ class DFlashWorker:
             )
 
         # --- 2) Draft a non-causal block with the draft model.
-        block_ids = torch.full(
-            (bs, self.block_size),
-            self._mask_token_id,
-            dtype=torch.long,
-            device=device,
-        )
-        block_ids[:, 0] = draft_input.verified_id.to(torch.long)
+        self._ensure_draft_block_buffers(bs)
+        assert self._draft_block_ids_buf is not None
+        assert self._draft_block_positions_buf is not None
+        assert self._draft_block_tokens_buf is not None
+        assert self._draft_block_end_buf is not None
+        assert self._draft_seq_lens_cpu_buf is not None
+
+        block_ids = self._draft_block_ids_buf[:bs]
+        block_ids.fill_(int(self._mask_token_id))
+        block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
 
         noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
-        prefix_lens_cpu = [int(x) for x in draft_input.draft_seq_lens_cpu]
-        prefix_lens = torch.tensor(prefix_lens_cpu, dtype=torch.int32, device=device)
-        positions = (
-            prefix_lens.to(torch.long).unsqueeze(1)
-            + torch.arange(self.block_size, device=device, dtype=torch.long)[None, :]
-        ).flatten()
+        # For spec-v1, the draft KV cache is always materialized to the current target
+        # prefix before drafting the next block.
+        prefix_lens = batch.seq_lens  # int32, device
 
-        block_start = prefix_lens.to(torch.int64)
-        block_end = block_start + int(self.block_size)
+        positions_2d = self._draft_block_positions_buf[:bs]
+        torch.add(prefix_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d)
+        positions = positions_2d.reshape(-1)
+
+        block_start = prefix_lens
+        block_end = self._draft_block_end_buf[:bs]
+        torch.add(block_start, int(self.block_size), out=block_end)
+
+        seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+        for i, ln in enumerate(batch.seq_lens_cpu):
+            seq_lens_cpu[i] = int(ln)
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
@@ -265,15 +312,9 @@ class DFlashWorker:
             # Use TARGET_VERIFY mode (cuda-graphable) to run a fixed-size draft block.
             # In this mode, `seq_lens` stores the prefix lengths; attention backends
             # derive kv_len by adding `draft_token_num`.
-            draft_spec_info = DFlashVerifyInput(
-                draft_token=torch.empty((0,), dtype=torch.long, device=device),
-                positions=torch.empty((0,), dtype=torch.int64, device=device),
-                draft_token_num=int(self.block_size),
-                custom_mask=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-            )
-            seq_lens = prefix_lens.to(torch.int32)
-            seq_lens_sum = int(sum(prefix_lens_cpu))
+            draft_spec_info = self._draft_block_spec_info
+            seq_lens = prefix_lens
+            seq_lens_sum = int(batch.seq_lens_sum)
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 batch_size=bs,
@@ -282,7 +323,7 @@ class DFlashWorker:
                 seq_lens=seq_lens,
                 out_cache_loc=block_cache_loc,
                 seq_lens_sum=seq_lens_sum,
-                seq_lens_cpu=torch.tensor(prefix_lens_cpu, dtype=torch.int32),
+                seq_lens_cpu=seq_lens_cpu,
                 positions=positions,
                 req_to_token_pool=self.draft_model_runner.req_to_token_pool,
                 token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
@@ -306,14 +347,13 @@ class DFlashWorker:
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,
         ).view(bs, self.block_size - 1)
-        draft_tokens = torch.cat([block_ids[:, :1], draft_next], dim=1)  # [bs, block_size]
-        positions = (
-            batch.seq_lens.to(torch.long).unsqueeze(1)
-            + torch.arange(self.block_size, device=device, dtype=torch.long)[None, :]
-        ).flatten()
+        draft_tokens = self._draft_block_tokens_buf[:bs]
+        draft_tokens[:, 0].copy_(block_ids[:, 0])
+        draft_tokens[:, 1:].copy_(draft_next)
+        positions = positions_2d.reshape(-1)
 
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.flatten(),
+            draft_token=draft_tokens.reshape(-1),
             positions=positions,
             draft_token_num=self.block_size,
         )
