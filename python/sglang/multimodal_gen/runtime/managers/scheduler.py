@@ -94,6 +94,9 @@ class Scheduler:
 
         # whether we've send the necessary warmup reqs
         self.warmed_up = False
+        # warmup progress tracking
+        self._warmup_total = 0
+        self._warmup_processed = 0
 
         self.prepare_server_warmup_reqs()
 
@@ -121,9 +124,15 @@ class Scheduler:
         return self.worker.list_loras()
 
     def _handle_generation(self, reqs: List[Req]):
-        has_warmup = any(req.is_warmup for req in reqs)
-        if has_warmup:
-            logger.info("Processing warmup req...")
+        warmup_reqs = [req for req in reqs if req.is_warmup]
+        if warmup_reqs:
+            self._warmup_processed += len(warmup_reqs)
+            if self._warmup_total > 0:
+                logger.info(
+                    f"Processing warmup req... ({self._warmup_processed}/{self._warmup_total})"
+                )
+            else:
+                logger.info("Processing warmup req...")
         return self.worker.execute_forward(reqs)
 
     def return_result(
@@ -155,6 +164,9 @@ class Scheduler:
             and self.server_args.warmup_resolutions is not None
         ):
             # insert warmup reqs constructed with each warmup-resolution
+            self._warmup_total = len(self.server_args.warmup_resolutions)
+            self._warmup_processed = 0
+
             for resolution in self.server_args.warmup_resolutions:
                 width, height = _parse_size(resolution)
                 task_type = self.server_args.pipeline_config.task_type
@@ -215,7 +227,9 @@ class Scheduler:
             warmup_req.extra["cache_dit_num_inference_steps"] = req.num_inference_steps
             warmup_req.num_inference_steps = 1
             recv_reqs.insert(0, (identity, warmup_req))
-            logger.info("Server warming up....")
+            self._warmup_total = 1
+            self._warmup_processed = 1
+            logger.info("Processing warmup req... (1/1)")
             self.warmed_up = True
         return recv_reqs
 
@@ -346,12 +360,23 @@ class Scheduler:
                 )
                 if is_warmup:
                     if output_batch.error is None:
-                        logger.info(
-                            f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
-                            output_batch.timings.total_duration_s,
-                        )
+                        if self._warmup_total > 0:
+                            logger.info(
+                                f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processed in {GREEN}%.2f{RESET} seconds",
+                                output_batch.timings.total_duration_s,
+                            )
+                        else:
+                            logger.info(
+                                f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
+                                output_batch.timings.total_duration_s,
+                            )
                     else:
-                        logger.info(f"Warmup req processing failed")
+                        if self._warmup_total > 0:
+                            logger.info(
+                                f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processing failed"
+                            )
+                        else:
+                            logger.info(f"Warmup req processing failed")
 
                 # TODO: Support sending back to multiple identities if batched
                 self.return_result(output_batch, identities[0], is_warmup=is_warmup)
