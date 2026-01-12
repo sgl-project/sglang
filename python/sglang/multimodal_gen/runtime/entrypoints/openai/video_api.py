@@ -213,9 +213,11 @@ async def create_video(
             seed=seed,
             generator_device=generator_device,
             negative_prompt=negative_prompt,
-            guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
+            **(
+                {"guidance_scale": guidance_scale} if guidance_scale is not None else {}
+            ),
         )
     else:
         try:
