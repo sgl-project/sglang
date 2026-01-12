@@ -901,7 +901,7 @@ class V1RerankReqInput(BaseModel):
         "If specified value is greater than the total number of documents, all documents will be returned.",
     )
     return_documents: bool = Field(
-        default=False,
+        default=True,
         description="Whether to return documents in the response. Only included when set to true.",
     )
 
