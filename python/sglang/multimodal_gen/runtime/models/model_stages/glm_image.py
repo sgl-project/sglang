@@ -1,24 +1,6 @@
 import inspect
-import time
-from typing import List, Optional, Union
-
-import numpy as np
-import torch
-from diffusers.image_processor import VaeImageProcessor
-from diffusers.utils.torch_utils import randn_tensor
-
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
-from sglang.multimodal_gen.runtime.models.vision_utils import load_image
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
-
-import inspect
 import re
+import time
 from math import sqrt
 from typing import List, Optional, Tuple, Union
 
@@ -28,7 +10,6 @@ import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL, GlmImageTransformer2DModel
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import (
     ByT5Tokenizer,
@@ -37,9 +18,16 @@ from transformers import (
     T5EncoderModel,
 )
 
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
+from sglang.multimodal_gen.runtime.models.vision_utils import load_image
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-logger = logging.get_logger(__name__)
+logger = init_logger(__name__)
 
 
 def calculate_shift(

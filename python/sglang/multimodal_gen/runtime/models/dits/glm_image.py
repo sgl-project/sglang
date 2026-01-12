@@ -656,14 +656,6 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             to determine the resolution as `sample_size * vae_scale_factor => 128 * 8 => 1024`
     """
 
-    _supports_gradient_checkpointing = True
-    _no_split_modules = [
-        "GlmImageTransformerBlock",
-        "GlmImageImageProjector",
-        "GlmImageImageProjector",
-    ]
-    _skip_layerwise_casting_patterns = ["patch_embed", "norm", "proj_out"]
-
     def __init__(
         self,
         config: GlmImageDitConfig,
@@ -755,7 +747,6 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         target_size: torch.Tensor,
         crop_coords: torch.Tensor,
         attention_kwargs: Optional[Dict[str, Any]] = None,
-        return_dict: bool = True,
         attention_mask: Optional[torch.Tensor] = None,
         kv_caches: Optional[GlmImageKVCache] = None,
         kv_caches_mode: Optional[str] = None,
@@ -820,9 +811,6 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             batch_size, post_patch_height, post_patch_width, -1, p, p
         )
         output = hidden_states.permute(0, 3, 1, 4, 2, 5).flatten(4, 5).flatten(2, 3)
-
-        if not return_dict:
-            return (output,)
 
         return output.float()
         # float()
