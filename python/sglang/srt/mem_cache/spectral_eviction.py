@@ -324,7 +324,19 @@ class SpectralEvictionStrategy(EvictionStrategy):
             retention_ratio: Fraction of tokens to keep (0.3 = 30%)
             spectral_weight: Weight of spectral score vs LRU (0.7 = 70% spectral)
             fallback_strategy: Strategy when no spectral data ("lru", "lfu", "fifo")
+
+        Raises:
+            ImportError: If sklearn is not installed (required for spectral computation)
         """
+        # Explicit startup error if sklearn is missing
+        # User explicitly selected spectral eviction, so fail fast rather than silently degrade
+        if not HAS_SKLEARN:
+            raise ImportError(
+                "SpectralEvictionStrategy requires scikit-learn but it is not installed. "
+                "Install with: pip install scikit-learn\n"
+                "Or use a different eviction policy: --radix-eviction-policy lru"
+            )
+
         self.retention_ratio = retention_ratio
         self.spectral_weight = spectral_weight
         self.fallback = LRUStrategy()
