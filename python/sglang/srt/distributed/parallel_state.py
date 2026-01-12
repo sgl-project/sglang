@@ -64,6 +64,19 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
+if _is_npu:
+    def _get_npu_hccl_pg_options():
+        """Helper to create ProcessGroupHCCL options for NPU."""
+        import torch_npu
+        options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+        hccl_buffer_size = int(
+            os.environ.get("DEEPEP_HCCL_BUFFSIZE")
+            or os.environ.get("HCCL_BUFFSIZE")
+            or 200
+        )
+        options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+        return options
+
 
 @dataclass
 class GraphCaptureContext:
@@ -240,21 +253,12 @@ class GroupCoordinator:
 
         for ranks in group_ranks:
             if _is_npu and group_name != "attention_tp":
-                import torch_npu
-                options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-                hccl_buffer_size = int(
-                    os.environ.get("SGLANG_HCCL_BUFFSIZE") 
-                    or os.environ.get("HCCL_BUFFSIZE") 
-                    or 200
-                )
-                options.hccl_config = {"hccl_buffer_size":hccl_buffer_size}
-                device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend, pg_options=options
-                )
+                pg_options = _get_npu_hccl_pg_options()
             else:
-                device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
-                )
+                pg_options=None
+            device_group = torch.distributed.new_group(
+                ranks, backend=torch_distributed_backend, pg_options=pg_options
+            )
             # a cpu_group to allow direct coordination between processes through
             # the CPU. The backend is chosen based on `torch_distributed_backend`
             if "mooncake" in torch_distributed_backend:
@@ -1502,31 +1506,19 @@ def init_distributed_environment(
             timeout = timedelta(seconds=timeout)
         
         if _is_npu:
-            import torch_npu
-            options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-            hccl_buffer_size = int(
-                os.environ.get("SGLANG_HCCL_BUFFSIZE") 
-                or os.environ.get("HCCL_BUFFSIZE") 
-                or 200
-            )
-            options.hccl_config = {"hccl_buffer_size":hccl_buffer_size}
-            torch.distributed.init_process_group(
-                backend=backend,
-                init_method=distributed_init_method,
-                world_size=world_size,
-                rank=rank,
-                timeout=timeout,
-                pg_options=options
-            )
+            pg_options = _get_npu_hccl_pg_options()
         else:
-            # this backend is used for WORLD
-            torch.distributed.init_process_group(
-                backend=backend,
-                init_method=distributed_init_method,
-                world_size=world_size,
-                rank=rank,
-                timeout=timeout,
-            )
+            pg_options = None
+
+        # this backend is used for WORLD
+        torch.distributed.init_process_group(
+            backend=backend,
+            init_method=distributed_init_method,
+            world_size=world_size,
+            rank=rank,
+            timeout=timeout,
+            pg_options=pg_options
+        )
 
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
