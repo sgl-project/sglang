@@ -311,6 +311,11 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    enable_prefill_delayer: bool = False
+    prefill_delayer_max_delay_passes: int = 30
+    prefill_delayer_token_usage_low_watermark: Optional[float] = None
+    prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
+    prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
 
     # Runtime options
     device: Optional[str] = None
@@ -665,6 +670,9 @@ class ServerArgs:
         # Handle deprecated arguments.
         self._handle_deprecated_args()
 
+        # Handle deprecated environment variables for prefill delayer.
+        self._handle_prefill_delayer_env_compat()
+
         # Set missing default values.
         self._handle_missing_default_values()
 
@@ -682,9 +690,6 @@ class ServerArgs:
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
 
-        # Handle Hicache settings.
-        self._handle_hicache()
-
         # Set kernel backends.
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
@@ -692,6 +697,9 @@ class ServerArgs:
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_grammar_backend()
+
+        # Handle Hicache settings.
+        self._handle_hicache()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -777,6 +785,14 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
+
+    def _handle_prefill_delayer_env_compat(self):
+        if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
+            self.enable_prefill_delayer = True
+        if x := envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get():
+            self.prefill_delayer_max_delay_passes = x
+        if x := envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get():
+            self.prefill_delayer_token_usage_low_watermark = x
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -934,10 +950,13 @@ class ServerArgs:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
         if self.piecewise_cuda_graph_max_tokens is None:
-            # Capture piecewise cuda graph tokens up to the chunked prefill size. Two benefits:
-            # 1. cuda graph acceleration for all prefill lengths.
-            # 2. do not need more temporary memory for activations. Less fragmentation.
-            self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
+            # Refer to pr #15927, by default we set the piecewise cuda graph max tokens to the chunked prefill size by default.
+            # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
+            # To avoid the performance regression, we set the max tokens to 2048 by default.
+            if not self.use_mla_backend():
+                self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
+            else:
+                self.piecewise_cuda_graph_max_tokens = 2048
 
         if self.piecewise_cuda_graph_tokens is None:
             self.piecewise_cuda_graph_tokens = (
@@ -967,6 +986,11 @@ class ServerArgs:
                 if self.cuda_graph_max_bs > 300:
                     reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
 
+            # For piecewise cuda graphs
+            if self.enable_piecewise_cuda_graph:
+                # Only calculate the memory overhead for Non-Torch Memory use since the Torch Memory can be reused with Cuda Graph Capture
+                reserved_mem += len(self.piecewise_cuda_graph_tokens) * 8
+
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
@@ -977,10 +1001,6 @@ class ServerArgs:
                 elif self.speculative_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
-
-            # For piecewise cuda graphs
-            if self.enable_piecewise_cuda_graph:
-                reserved_mem += self.piecewise_cuda_graph_max_tokens // 8
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -1033,8 +1053,9 @@ class ServerArgs:
             list(range(4, 33, 4))
             + list(range(48, 257, 16))
             + list(range(288, 513, 32))
-            + list(range(640, 4096 + 1, 128))
-            + list(range(4352, self.piecewise_cuda_graph_max_tokens + 1, 256))
+            + list(range(640, 1024 + 1, 64))
+            + list(range(1280, 4096 + 1, 256))
+            + list(range(4608, self.piecewise_cuda_graph_max_tokens + 1, 512))
         )
 
         capture_sizes = [
@@ -1977,23 +1998,14 @@ class ServerArgs:
             )
 
     def _handle_hicache(self):
-        if self.hicache_storage_backend == "mooncake":
-            if self.hicache_mem_layout == "layer_first":
-                if self.hicache_io_backend == "direct":
-                    self.hicache_mem_layout = "page_first_direct"
-                elif self.hicache_io_backend == "kernel":
-                    self.hicache_mem_layout = "page_first"
-                logger.warning(
-                    f"Mooncake storage backend does not support layer_first layout, "
-                    f"switching to {self.hicache_mem_layout} layout for {self.hicache_io_backend} io backend"
-                )
-
-        if self.hicache_mem_layout == "page_first_direct":
-            if self.hicache_io_backend not in ["direct", "kernel_ascend"]:
-                self.hicache_io_backend = "direct"
-                logger.warning(
-                    "Page first direct layout only support direct io backend"
-                )
+        if (
+            self.hicache_mem_layout == "page_first_direct"
+            and self.hicache_io_backend == "kernel"
+        ):
+            self.hicache_io_backend = "direct"
+            logger.warning(
+                "Kernel io backend does not support page first direct layout"
+            )
 
         if (
             self.enable_hierarchical_cache
@@ -2025,6 +2037,17 @@ class ServerArgs:
                         "FlashAttention3 decode backend is not compatible with hierarchical cache. "
                         "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                     )
+
+        if self.hicache_storage_backend == "mooncake":
+            if self.hicache_mem_layout == "layer_first":
+                if self.hicache_io_backend == "direct":
+                    self.hicache_mem_layout = "page_first_direct"
+                elif self.hicache_io_backend == "kernel":
+                    self.hicache_mem_layout = "page_first"
+                logger.warning(
+                    f"Mooncake storage backend does not support layer_first layout, "
+                    f"switching to {self.hicache_mem_layout} layout for {self.hicache_io_backend} io backend"
+                )
 
     def _handle_speculative_decoding(self):
         if (
@@ -2821,7 +2844,15 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight", "lof", "priority"],
+            choices=[
+                "lpm",
+                "random",
+                "fcfs",
+                "dfs-weight",
+                "lof",
+                "priority",
+                "routing-key",
+            ],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
@@ -2883,6 +2914,37 @@ class ServerArgs:
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
             help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
+        )
+        parser.add_argument(
+            "--enable-prefill-delayer",
+            action="store_true",
+            help="Enable prefill delayer for DP attention to reduce idle time.",
+        )
+        parser.add_argument(
+            "--prefill-delayer-max-delay-passes",
+            type=int,
+            default=ServerArgs.prefill_delayer_max_delay_passes,
+            help="Maximum forward passes to delay prefill.",
+        )
+        parser.add_argument(
+            "--prefill-delayer-token-usage-low-watermark",
+            type=float,
+            default=None,
+            help="Token usage low watermark for prefill delayer.",
+        )
+        parser.add_argument(
+            "--prefill-delayer-forward-passes-buckets",
+            type=float,
+            nargs="+",
+            default=None,
+            help="Custom buckets for prefill delayer forward passes histogram. 0 and max_delay_passes-1 will be auto-added.",
+        )
+        parser.add_argument(
+            "--prefill-delayer-wait-seconds-buckets",
+            type=float,
+            nargs="+",
+            default=None,
+            help="Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
         )
 
         # Runtime options
@@ -3265,8 +3327,8 @@ class ServerArgs:
                 "auto",
                 "round_robin",
                 "follow_bootstrap_room",
-                "shortest_queue",
-                "minimum_tokens",
+                "total_requests",
+                "total_tokens",
             ],
         )
         parser.add_argument(
@@ -4120,9 +4182,9 @@ class ServerArgs:
         )
         parser.add_argument(
             "--piecewise-cuda-graph-tokens",
-            type=json_list_type,
-            default=ServerArgs.piecewise_cuda_graph_tokens,
-            help="Set the list of tokens when using piecewise cuda graph.",
+            type=int,
+            nargs="+",
+            help="Set the list of token lengths for piecewise cuda graph capture.",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-compiler",

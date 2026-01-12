@@ -521,6 +521,7 @@ class Req:
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
     ):
@@ -580,6 +581,7 @@ class Req:
 
         self.extra_key = extra_key
         self.lora_id = lora_id
+        self.routing_key = routing_key
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -717,6 +719,7 @@ class Req:
         self.embedding = None
 
         # Constrained decoding
+        self.grammar_key: Optional[str] = None
         self.grammar: Optional[BaseGrammarObject] = None
         self.grammar_wait_ct = 0
 
@@ -1311,7 +1314,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
             has_stream=any(req.stream for req in reqs),
-            has_grammar=any(req.sampling_params.has_grammar_constraint for req in reqs),
+            has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
@@ -2039,9 +2042,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.token_ids_logprobs = None
 
         self.has_stream = any(req.stream for req in self.reqs)
-        self.has_grammar = any(
-            req.sampling_params.has_grammar_constraint for req in self.reqs
-        )
+        self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         # NOTE: spec_info filtered before batch filtering only happens in:

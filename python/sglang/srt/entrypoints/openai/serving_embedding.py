@@ -130,6 +130,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
             **prompt_kwargs,
             rid=request.rid,
             priority=request.priority,
+            routing_key=self.extract_routing_key(raw_request),
             dimensions=request.dimensions,
         )
 

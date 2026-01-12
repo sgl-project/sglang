@@ -20,7 +20,6 @@ import signal
 import sys
 import time
 from collections import deque
-from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -35,10 +34,7 @@ from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained.base_grammar_backend import (
-    INVALID_GRAMMAR_OBJ,
-    create_grammar_backend,
-)
+from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -60,10 +56,14 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.layers.dp_attention import (
+    compute_dp_attention_world_info,
+    get_attention_tp_group,
+)
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.io_struct import (
@@ -92,6 +92,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
+    LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
@@ -206,7 +208,6 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
-GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
 @dataclass
@@ -257,6 +258,9 @@ class Scheduler(
         pp_rank: int,
         dp_rank: Optional[int],
     ):
+        self.is_initializing = True
+        self.init_soft_watchdog(server_args)
+
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
@@ -334,6 +338,9 @@ class Scheduler(
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
+        if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
+            time.sleep(t)
+
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
 
@@ -342,9 +349,6 @@ class Scheduler(
 
         # Init chunked prefill
         self.init_chunked_prefill()
-
-        # Init the grammar backend for constrained generation
-        self.init_grammar_backend()
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -366,6 +370,11 @@ class Scheduler(
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+        # Init the grammar backend for constrained generation
+        self.grammar_manager = GrammarManager(self)
+
+        self.is_initializing = False
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -536,25 +545,24 @@ class Scheduler(
                 self.max_running_requests // self.pp_size, 1
             )
 
-        self.tp_group = self.tp_worker.get_tp_group()
+        self.tp_group = get_tp_group()
         self.tp_cpu_group = self.tp_group.cpu_group
-        self.attn_tp_group = self.tp_worker.get_attention_tp_group()
-        self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
+        self.attn_tp_group = get_attention_tp_group()
+        self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
-        # With DP attention enabled, the entry rank is attn_tp_rank==0;
-        # otherwise the entry rank is TP group local rank 0.
-        # For #11910, use the CPU communication group to broadcast VLM Python objects,
-        # avoiding any coupling with CUDA streams/devices.
-        if self.server_args.enable_dp_attention:
-            self.cpu_group = self.attn_tp_cpu_group
-            self.entry_rank = self.attn_tp_group.first_rank
-            self.is_entry_rank = self.attn_tp_rank == 0
-        else:
-            self.cpu_group = self.tp_cpu_group
-            self.entry_rank = self.tp_group.first_rank
-            self.is_entry_rank = self.tp_group.rank_in_group == 0
+        # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
+        # When DP attention is enabled, scope to the attention-TP group; otherwise use
+        # the base TP group. Entry rank is the local rank 0 in that group.
+        # Use the CPU (gloo) group to broadcast VLM Python objects and avoid CUDA
+        # stream/device coupling (#11910).
+        self.dp_tp_group = (
+            self.attn_tp_group
+            if self.server_args.enable_dp_attention
+            else self.tp_group
+        )
+        self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
@@ -743,18 +751,6 @@ class Scheduler(
                 )
                 self.enable_dynamic_chunking = False
 
-    def init_grammar_backend(self):
-        self.grammar_queue: List[Req] = []
-        if not self.server_args.skip_tokenizer_init:
-            self.grammar_backend = create_grammar_backend(
-                self.server_args,
-                self.tokenizer,
-                self.model_config.vocab_size,
-                self.model_config.hf_eos_token_id,
-            )
-        else:
-            self.grammar_backend = None
-
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
@@ -765,7 +761,7 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
-        if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
+        if self.server_args.enable_prefill_delayer:
             self.prefill_delayer = PrefillDelayer(
                 dp_size=self.dp_size,
                 attn_tp_size=self.attn_tp_size,
@@ -774,10 +770,8 @@ class Scheduler(
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
-                max_delay_passes=envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get(),
-                token_usage_low_watermark=(
-                    envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get()
-                ),
+                max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
+                token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
@@ -795,15 +789,17 @@ class Scheduler(
         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
 
+    def init_soft_watchdog(self, server_args: ServerArgs):
+        if (x := server_args.soft_watchdog_timeout) is not None:
+            self.soft_watchdog = create_scheduler_watchdog(
+                self, watchdog_timeout=x, soft=True
+            )
+
     def init_watch_dog_memory_saver_input_blocker(self):
         # Start watchdog thread
         self.watchdog = create_scheduler_watchdog(
             self, watchdog_timeout=self.server_args.watchdog_timeout
         )
-        if (x := self.server_args.soft_watchdog_timeout) is not None:
-            self.soft_watchdog = create_scheduler_watchdog(
-                self, watchdog_timeout=x, soft=True
-            )
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1044,6 +1040,10 @@ class Scheduler(
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
+                (
+                    LoadLoRAAdapterFromTensorsReqInput,
+                    self.load_lora_adapter_from_tensors,
+                ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
                 (PauseGenerationReqInput, self.pause_generation),
@@ -1344,10 +1344,10 @@ class Scheduler(
             if (
                 torch.distributed.is_available()
                 and torch.distributed.is_initialized()
-                and self.cpu_group is not None
+                and self.dp_tp_cpu_group is not None
             ):
                 group_world_size = torch.distributed.get_world_size(
-                    group=self.cpu_group
+                    group=self.dp_tp_cpu_group
                 )
         except Exception as e:
             logger.warning(
@@ -1360,14 +1360,16 @@ class Scheduler(
         # Since the Scheduler is single-threaded, any large CPU cost will impact
         # handling of other messages. For example, CPU hits 99.9% can significantly
         # increase the CUDA kernel launch time.
-        if self.is_entry_rank:
+        if self.dp_tp_group.rank_in_group == 0:
             # Only the entry rank materializes once from dict.
             image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
             # Broadcast to other TP ranks (use src=0 within the group).
             if group_world_size > 1:
                 obj_list = [image_inputs]
                 torch.distributed.broadcast_object_list(
-                    obj_list, src=self.entry_rank, group=self.cpu_group
+                    obj_list,
+                    src=self.dp_tp_group.first_rank,
+                    group=self.dp_tp_cpu_group,
                 )
                 image_inputs = obj_list[0]
         else:
@@ -1375,7 +1377,9 @@ class Scheduler(
             if group_world_size > 1:
                 obj_list = [None]
                 torch.distributed.broadcast_object_list(
-                    obj_list, src=self.entry_rank, group=self.cpu_group
+                    obj_list,
+                    src=self.dp_tp_group.first_rank,
+                    group=self.dp_tp_cpu_group,
                 )
                 image_inputs = obj_list[0]
             else:
@@ -1435,6 +1439,7 @@ class Scheduler(
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
+                routing_key=recv_req.routing_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
             )
@@ -1532,55 +1537,8 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        # When TP>1 only rank 0 compiles grammars to avoid duplicating work across all ranks.
-        # All ranks add requests to the grammar_queue for synchronization. Each rank still
-        # maintains its own cache populated with ready grammars. Rank 0 broadcasts readiness.
-        add_to_grammar_queue = False
-        if req.sampling_params.has_grammar_constraint:
-            if req.sampling_params.json_schema is not None:
-                key = ("json", req.sampling_params.json_schema)
-            elif req.sampling_params.regex is not None:
-                key = ("regex", req.sampling_params.regex)
-            elif req.sampling_params.ebnf is not None:
-                key = ("ebnf", req.sampling_params.ebnf)
-            else:
-                key = ("structural_tag", req.sampling_params.structural_tag)
-
-            if self.tp_rank == 0:
-                # Only rank 0 compiles grammar and manages the cache
-                if self.server_args.grammar_backend == "none":
-                    error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
-                    req.set_finish_with_abort(error_msg)
-                    if self.tp_size > 1:
-                        add_to_grammar_queue = True
-                else:
-                    value, cache_hit = self.grammar_backend.get_cached_or_future_value(
-                        key, req.require_reasoning
-                    )
-                    req.grammar = value
-                    req.grammar_key = key
-
-                    if cache_hit and value is INVALID_GRAMMAR_OBJ:
-                        error_msg = f"Invalid grammar request with cache hit: {key=}"
-                        req.set_finish_with_abort(error_msg)
-
-                    # When TP > 1, always add to grammar_queue for synchronization across ranks
-                    if self.tp_size > 1:
-                        add_to_grammar_queue = True
-                    elif not cache_hit:
-                        # TP == 1: only add to queue if we didn't get a cache hit.
-                        add_to_grammar_queue = True
-            else:
-                # Non-rank-0 workers add to grammar queue for synchronization, but no compilation.
-                if self.server_args.grammar_backend == "none":
-                    error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
-                    req.set_finish_with_abort(error_msg)
-                req.grammar_key = key
-                add_to_grammar_queue = True
-
-        if add_to_grammar_queue:
-            self.grammar_queue.append(req)
-        else:
+        added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
+        if not added_to_grammar_queue:
             self._add_request_to_queue(req)
 
     def handle_batch_generate_request(
@@ -1879,8 +1837,10 @@ class Scheduler(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
-        if self.grammar_queue:
-            self.move_ready_grammar_requests()
+        if self.grammar_manager.has_waiting_grammars():
+            ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
+            for req in ready_grammar_requests:
+                self._add_request_to_queue(req)
 
         if self.try_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -1909,7 +1869,7 @@ class Scheduler(
             self.tree_cache.check_hicache_events()
 
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue)
+        self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -1957,14 +1917,11 @@ class Scheduler(
                     | set([req.lora_id])
                 )
                 if not self.tp_worker.can_run_lora_batch(new_lora_set):
-                    # If this is a LoRA request that would exceed the LoRA slot limit,
-                    # skip it and continue to try scheduling non-LoRA requests.
-                    # Non-LoRA requests (lora_id=None) share a single reserved slot
-                    # and should never cause this check to fail.
-                    if req.lora_id is not None:
-                        # Skip this LoRA request - it would trigger adapter eviction/loading
-                        # which is slow. We'll try to schedule it in a future iteration.
-                        continue
+                    # Batch would exceed the LoRA slot limit.
+                    # Skip this request and try scheduling it in a future iteration.
+                    # Note: When eviction is needed, the eviction policy prefers to
+                    # evict LoRA adapters over base model (None) - see mem_pool.py.
+                    continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
@@ -2362,145 +2319,6 @@ class Scheduler(
             self.return_health_check_ct -= 1
             self.send_to_tokenizer.send_output(HealthCheckOutput())
 
-    def move_ready_grammar_requests(self):
-        """
-        Move requests whose grammar objects are ready from grammar_queue to waiting_queue.
-
-        When TP>1, rank 0 counts the compiled or timed out grammars and broadcasts this to
-        all other ranks. All ranks process the same number of requests and non-entry workers
-        fetch the compiled grammars from their local cache.
-        """
-        num_ready_reqs = 0
-        num_timeout_reqs = 0
-        invalid_indices = []
-
-        if self.server_args.enable_dp_attention:
-            tp_size = self.attn_tp_size
-            tp_group = self.attn_tp_cpu_group
-        else:
-            tp_size = self.tp_size
-            tp_group = self.tp_cpu_group
-
-        # Count how many requests have ready grammars (non-blocking check).
-        # For TP>1, only rank 0 actually checks Future completion; others just count.
-        for req in self.grammar_queue:
-            try:
-                if req.finished():  # It is aborted by AbortReq
-                    num_ready_reqs += 1
-                    continue
-
-                if tp_size > 1:
-                    # TP>1: Non-rank-0 workers have req.grammar=None (they don't compile).
-                    # They still count requests as "ready" to stay in sync with rank 0.
-                    # Rank 0 with cache hits will have a compiled grammar (not a Future).
-                    # Only rank 0 with cache misses has Futures that need .result() below.
-                    if req.grammar is None or not isinstance(
-                        req.grammar, futures.Future
-                    ):
-                        num_ready_reqs += 1
-                        continue
-
-                req.grammar = req.grammar.result(timeout=0.03)
-                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-                if req.grammar is INVALID_GRAMMAR_OBJ:
-                    invalid_indices.append(num_ready_reqs)
-
-                num_ready_reqs += 1
-            except futures._base.TimeoutError:
-                req.grammar_wait_ct += 1
-                # NOTE(lianmin): this timeout is the waiting time of the above line. It is
-                # not the waiting time from it enters the grammar queue.
-                if req.grammar_wait_ct > GRAMMAR_TIMEOUT / 0.03:
-                    num_timeout_reqs = 1
-                break
-
-        if tp_size > 1:
-            # Rank 0 broadcasts its ready/timeout/invalid counts
-            num_invalid = len(invalid_indices)
-            tensor = torch.tensor(
-                [num_ready_reqs, num_timeout_reqs, num_invalid], dtype=torch.int32
-            )
-
-            # Broadcast from local rank 0 within the TP group, using group_src (local rank)
-            # rather than src (global rank) to be consistent with other self.tp_rank == 0 checks
-            torch.distributed.broadcast(tensor, group_src=0, group=tp_group)
-            num_ready_reqs_rank_0, num_timeout_reqs_rank_0, num_invalid = (
-                tensor.tolist()
-            )
-
-            # In order to have the consistent abort request state, we must broadcast the invalid indices
-            if num_invalid > 0:
-                if self.tp_rank == 0:
-                    # On rank 0, we create our tensor with our invalid indices data (to send)
-                    invalid_tensor = torch.tensor(invalid_indices, dtype=torch.int32)
-                else:
-                    # On non-entry ranks, we create our empty tensors (to receive)
-                    invalid_tensor = torch.zeros(num_invalid, dtype=torch.int32)
-                torch.distributed.broadcast(invalid_tensor, group_src=0, group=tp_group)
-
-                # All ranks abort invalid requests
-                for idx in invalid_tensor.tolist():
-                    req = self.grammar_queue[idx]
-                    if not req.finished():
-                        req.set_finish_with_abort(
-                            f"Invalid grammar request: {req.grammar_key=}"
-                        )
-        else:
-            num_ready_reqs_rank_0 = num_ready_reqs
-            num_timeout_reqs_rank_0 = num_timeout_reqs
-
-            # Non TP>1: Handle invalid grammars directly
-            for idx in invalid_indices:
-                req = self.grammar_queue[idx]
-                req.set_finish_with_abort(
-                    f"Invalid grammar request: {req.grammar_key=}"
-                )
-
-        # Handle timed-out requests: all ranks must abort to maintain consistency.
-        for i in range(
-            num_ready_reqs_rank_0, num_ready_reqs_rank_0 + num_timeout_reqs_rank_0
-        ):
-            req = self.grammar_queue[i]
-            # Only rank 0 has futures to cancel and cache to update
-            if self.tp_rank == 0 and isinstance(req.grammar, futures.Future):
-                req.grammar.cancel()
-                self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
-            error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
-            req.set_finish_with_abort(error_msg)
-
-        num_ready_reqs = num_ready_reqs_rank_0 + num_timeout_reqs_rank_0
-
-        # Move synchronized requests from grammar_queue to waiting_queue.
-        for req in self.grammar_queue[:num_ready_reqs]:
-            # Skip cache lookup for already-finished requests (invalid/timed-out/aborted)
-            if (
-                not req.finished()
-                and req.grammar is None
-                and self.grammar_backend is not None
-                and req.grammar_key is not None
-            ):
-                # TP>1: Non-rank-0 workers fetch grammar from rank 0's cache.
-                grammar_obj, cache_hit = (
-                    self.grammar_backend.get_cached_or_future_value(
-                        req.grammar_key, req.require_reasoning
-                    )
-                )
-
-                # If we got a Future, wait for compilation to complete.
-                if isinstance(grammar_obj, futures.Future):
-                    grammar_obj = grammar_obj.result()
-                    self.grammar_backend.set_cache(req.grammar_key, grammar_obj.copy())
-
-                if grammar_obj is INVALID_GRAMMAR_OBJ:
-                    req.set_finish_with_abort(
-                        f"Invalid grammar request: {req.grammar_key=}"
-                    )
-                else:
-                    req.grammar = grammar_obj
-
-            self._add_request_to_queue(req)
-        self.grammar_queue = self.grammar_queue[num_ready_reqs:]
-
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success = self.flush_cache()
         return FlushCacheReqOutput(success=success)
@@ -2543,8 +2361,7 @@ class Scheduler(
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
-            if self.grammar_backend:
-                self.grammar_backend.reset()
+            self.grammar_manager.clear()
             self.reset_metrics()
 
             if self.draft_worker:
@@ -2681,15 +2498,10 @@ class Scheduler(
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
-        for req in self.grammar_queue:
-            # Abort method 2: call `set_finish_with_abort`
-            # The request will still run one prefill forward pass.
-            # In this case, we change the input_ids to be only one token to make this prefill cheap.
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                logger.debug(f"Abort grammar queue request. {req.rid=}")
-                if req.grammar:
-                    req.grammar.cancel()
-                req.set_finish_with_abort("Aborted by AbortReq.")
+        # Abort method 2: call `set_finish_with_abort`
+        # The request will still run one prefill forward pass.
+        # In this case, we change the input_ids to be only one token to make this prefill cheap.
+        self.grammar_manager.abort_requests(recv_req)
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2779,6 +2591,14 @@ class Scheduler(
         """In-place loading a new lora adapter from disk or huggingface."""
 
         result = self.tp_worker.load_lora_adapter(recv_req)
+        return result
+
+    def load_lora_adapter_from_tensors(
+        self, recv_req: LoadLoRAAdapterFromTensorsReqInput
+    ) -> LoadLoRAAdapterFromTensorsReqOutput:
+        """In-place loading a new lora adapter from serialized tensors."""
+
+        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
         return result
 
     def unload_lora_adapter(
