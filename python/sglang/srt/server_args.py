@@ -3531,7 +3531,7 @@ class ServerArgs:
             "--compilation-config",
             type=str,
             default=None,
-            help="Compilation config.",
+            help="Represents JSON serialized instance of 'CompilationConfig' class to provide compilation details.",
         )
 
         # Speculative decoding
