@@ -11,7 +11,7 @@ wit_bindgen::generate!({
     world: "sgl-model-gateway",
 });
 
-use exports::sgl::router::{
+use exports::sgl::model_gateway::{
     middleware_on_request::Guest as OnRequestGuest,
     middleware_on_response::Guest as OnResponseGuest,
 };
@@ -25,7 +25,7 @@ struct Middleware;
 
 // Helper function to find header value
 fn find_header_value(
-    headers: &[sgl::router::middleware_types::Header],
+    headers: &[sgl::model_gateway::middleware_types::Header],
     name: &str,
 ) -> Option<String> {
     headers
