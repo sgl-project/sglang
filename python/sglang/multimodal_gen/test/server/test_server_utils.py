@@ -390,13 +390,46 @@ class ServerManager:
             log_thread.start()
 
         logger.info(
-            "[server-test] Starting server pid=%s, model=%s, log=%s",
+            "[server-test] Starting server pid=%s, model=%s, log=%s, wait_deadline=%ss",
             process.pid,
             self.model,
             stdout_path,
+            self.wait_deadline,
         )
 
-        self._wait_for_ready(process, stdout_path)
+        try:
+            self._wait_for_ready(process, stdout_path)
+        except (TimeoutError, RuntimeError) as e:
+            # Log additional diagnostic information before re-raising
+            logger.error(
+                "[server-test] Server startup failed!\n"
+                "  Model: %s\n"
+                "  Port: %s\n"
+                "  Process PID: %s\n"
+                "  Process status: %s\n"
+                "  Log file: %s\n"
+                "  Error type: %s\n"
+                "  Error message:\n%s",
+                self.model,
+                self.port,
+                process.pid,
+                "running" if process.poll() is None else f"exited (code {process.returncode})",
+                stdout_path,
+                type(e).__name__,
+                str(e),
+            )
+            # Try to get more log context
+            if stdout_path.exists():
+                try:
+                    full_log_size = stdout_path.stat().st_size
+                    logger.error(
+                        "[server-test] Log file size: %s bytes, path: %s",
+                        full_log_size,
+                        stdout_path,
+                    )
+                except Exception:
+                    pass
+            raise
 
         return ServerContext(
             port=self.port,
@@ -415,40 +448,114 @@ class ServerManager:
         ready_message = "Application startup complete."
         log_period = 30
         prev_log_period_count = 0
+        last_log_check_time = 0
+        log_check_interval = 60  # Check log content every 60 seconds
+
+        logger.info(
+            "[server-test] Waiting for server startup (timeout=%ss, model=%s, port=%s)",
+            self.wait_deadline,
+            self.model,
+            self.port,
+        )
 
         while time.time() - start < self.wait_deadline:
             if process.poll() is not None:
-                tail = self._get_log_tail(stdout_path)
-                raise RuntimeError(
-                    f"Server exited early (code {process.returncode}).\n{tail}"
+                tail = self._get_log_tail(stdout_path, lines=500)
+                elapsed = int(time.time() - start)
+                tail_lines = tail.splitlines() if tail else []
+                tail_line_count = len(tail_lines)
+                error_msg = (
+                    f"[server-test] Server process exited early!\n"
+                    f"  Model: {self.model}\n"
+                    f"  Port: {self.port}\n"
+                    f"  Process PID: {process.pid}\n"
+                    f"  Exit code: {process.returncode}\n"
+                    f"  Elapsed time: {elapsed}s\n"
+                    f"  Log file: {stdout_path}\n"
+                    f"  Last {min(500, tail_line_count)} lines of log:\n"
+                    f"{'=' * 80}\n{tail}\n{'=' * 80}"
                 )
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
 
             if stdout_path.exists():
                 try:
                     content = stdout_path.read_text(encoding="utf-8", errors="ignore")
                     if ready_message in content:
-                        logger.info("[server-test] Server ready")
+                        elapsed = int(time.time() - start)
+                        logger.info(
+                            "[server-test] Server ready after %ss (model=%s, port=%s)",
+                            elapsed,
+                            self.model,
+                            self.port,
+                        )
                         return
+                    
+                    # Periodically log recent content to help diagnose issues
+                    current_time = time.time()
+                    if current_time - last_log_check_time >= log_check_interval:
+                        last_log_check_time = current_time
+                        elapsed = int(current_time - start)
+                        recent_lines = "\n".join(content.splitlines()[-50:])
+                        logger.info(
+                            "[server-test] Still waiting... elapsed=%ss/%ss. Recent log (last 50 lines):\n%s",
+                            elapsed,
+                            int(self.wait_deadline),
+                            recent_lines,
+                        )
                 except Exception as e:
                     logger.debug("Could not read log yet: %s", e)
 
             elapsed = int(time.time() - start)
             if (elapsed // log_period) > prev_log_period_count:
                 prev_log_period_count = elapsed // log_period
-                logger.info("[server-test] Waiting for server... elapsed=%ss", elapsed)
+                logger.info(
+                    "[server-test] Waiting for server... elapsed=%ss/%ss (model=%s, port=%s)",
+                    elapsed,
+                    int(self.wait_deadline),
+                    self.model,
+                    self.port,
+                )
             time.sleep(1)
 
-        tail = self._get_log_tail(stdout_path)
-        raise TimeoutError(f"Server not ready within {self.wait_deadline}s.\n{tail}")
+        # Timeout reached
+        elapsed = int(time.time() - start)
+        tail = self._get_log_tail(stdout_path, lines=500)
+        process_status = "running" if process.poll() is None else f"exited (code {process.returncode})"
+        tail_lines = tail.splitlines() if tail else []
+        tail_line_count = len(tail_lines)
+        
+        error_msg = (
+            f"[server-test] Server startup TIMEOUT!\n"
+            f"  Model: {self.model}\n"
+            f"  Port: {self.port}\n"
+            f"  Process PID: {process.pid}\n"
+            f"  Process status: {process_status}\n"
+            f"  Timeout: {self.wait_deadline}s\n"
+            f"  Elapsed: {elapsed}s\n"
+            f"  Log file: {stdout_path}\n"
+            f"  Ready message '{ready_message}' not found in log\n"
+            f"  Last {min(500, tail_line_count)} lines of log:\n"
+            f"{'=' * 80}\n{tail}\n{'=' * 80}"
+        )
+        logger.error(error_msg)
+        raise TimeoutError(error_msg)
 
     @staticmethod
     def _get_log_tail(path: Path, lines: int = 200) -> str:
         """Get the last N lines from a log file."""
         try:
+            if not path.exists():
+                return f"[Log file does not exist: {path}]"
             content = path.read_text(encoding="utf-8", errors="ignore")
-            return "\n".join(content.splitlines()[-lines:])
-        except Exception:
-            return ""
+            if not content:
+                return f"[Log file is empty: {path}]"
+            log_lines = content.splitlines()
+            if len(log_lines) <= lines:
+                return content
+            return "\n".join(log_lines[-lines:])
+        except Exception as e:
+            return f"[Error reading log file {path}: {e}]"
 
 
 class WarmupRunner:
