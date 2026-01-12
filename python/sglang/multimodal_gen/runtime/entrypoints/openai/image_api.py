@@ -84,9 +84,9 @@ def _build_sampling_params_from_request(
         output_file_name=f"{request_id}.{ext}",
         seed=seed,
         generator_device=generator_device,
-        guidance_scale=guidance_scale,
         num_inference_steps=num_inference_steps,
         enable_teacache=enable_teacache,
+        **({"guidance_scale": guidance_scale} if guidance_scale is not None else {}),
         **({"negative_prompt": negative_prompt} if negative_prompt is not None else {}),
         **({"true_cfg_scale": true_cfg_scale} if true_cfg_scale is not None else {}),
     )
