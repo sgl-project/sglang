@@ -1,8 +1,8 @@
 import logging
+import math
 from typing import Optional
 
 import torch
-import math
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_runner_backend
@@ -48,7 +48,9 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
 ]
 
 
-def enable_nextn_moe_bf16_cast_to_fp8(quant_config: Optional[QuantizationConfig]) -> bool:
+def enable_nextn_moe_bf16_cast_to_fp8(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
     return (
         envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get()
         and quant_config is not None
