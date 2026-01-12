@@ -120,7 +120,13 @@ class DFlashVerifyInput(SpecInput):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 
-    def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
+    def prepare_for_verify(
+        self,
+        batch: ScheduleBatch,
+        page_size: int,
+        *,
+        build_custom_mask: bool = True,
+    ):
         if batch.forward_mode.is_idle():
             return
 
@@ -160,23 +166,34 @@ class DFlashVerifyInput(SpecInput):
             bs,
         )
 
-        # Build a standard causal attention *allow* mask over [prefix + verify_block] for each request.
-        # Layout matches other speculative inputs: flatten per request, row-major over
-        # [q_len=draft_token_num, kv_len=prefix_len + draft_token_num].
+        if not build_custom_mask:
+            self.custom_mask = None
+            return
+
         if self.draft_token_num <= 0:
-            raise ValueError(f"DFLASH draft_token_num must be positive, got {self.draft_token_num}.")
+            raise ValueError(
+                f"DFLASH draft_token_num must be positive, got {self.draft_token_num}."
+            )
         mask_chunks: List[torch.Tensor] = []
         q_len = int(self.draft_token_num)
-        q_idx = torch.arange(q_len, device=batch.device, dtype=torch.int32).unsqueeze(1)
+        q_idx = torch.arange(
+            q_len, device=batch.device, dtype=torch.int32
+        ).unsqueeze(1)
         for prefix_len in batch.seq_lens_cpu.tolist():
             prefix_len_i = int(prefix_len)
             kv_len = prefix_len_i + q_len
-            k_idx = torch.arange(kv_len, device=batch.device, dtype=torch.int32).unsqueeze(0)
+            k_idx = torch.arange(
+                kv_len, device=batch.device, dtype=torch.int32
+            ).unsqueeze(0)
             # Allow attending to the full prefix and to tokens up to (and including) the
             # current query position within the verify block (standard causal masking).
             allow = k_idx <= (prefix_len_i + q_idx)
             mask_chunks.append(allow.flatten())
-        self.custom_mask = torch.cat(mask_chunks, dim=0) if mask_chunks else torch.empty((0,), dtype=torch.bool, device=batch.device)
+        self.custom_mask = (
+            torch.cat(mask_chunks, dim=0)
+            if mask_chunks
+            else torch.empty((0,), dtype=torch.bool, device=batch.device)
+        )
 
     def generate_attn_arg_prefill(
         self,
@@ -268,9 +285,17 @@ class DFlashVerifyInput(SpecInput):
             target_predict=target_predict,
         )
 
-        candidates_cpu = candidates.cpu().tolist()
-        accept_len_cpu = accept_len.cpu().tolist()
-        bonus_cpu = bonus.cpu().tolist()
+        packed = torch.empty(
+            (bs, self.draft_token_num + 2), dtype=torch.int64, device=device
+        )
+        packed[:, : self.draft_token_num].copy_(candidates)
+        packed[:, self.draft_token_num].copy_(accept_len)
+        packed[:, self.draft_token_num + 1].copy_(bonus)
+        packed_cpu = packed.cpu()
+
+        candidates_cpu = packed_cpu[:, : self.draft_token_num].tolist()
+        accept_len_cpu = packed_cpu[:, self.draft_token_num].tolist()
+        bonus_cpu = packed_cpu[:, self.draft_token_num + 1].tolist()
 
         commit_lens_cpu: List[int] = []
         new_verified_cpu: List[int] = []

@@ -14,7 +14,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
-    compute_position,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
@@ -239,15 +238,10 @@ class DFlashWorker:
 
         prefix_lens_cpu = [int(x) for x in draft_input.draft_seq_lens_cpu]
         prefix_lens = torch.tensor(prefix_lens_cpu, dtype=torch.int32, device=device)
-        extend_lens = torch.full(
-            (bs,), int(self.block_size), dtype=torch.int32, device=device
-        )
-        positions, extend_start_loc = compute_position(
-            self.draft_model_runner.server_args.attention_backend,
-            prefix_lens,
-            extend_lens,
-            bs * self.block_size,
-        )
+        positions = (
+            prefix_lens.to(torch.long).unsqueeze(1)
+            + torch.arange(self.block_size, device=device, dtype=torch.long)[None, :]
+        ).flatten()
 
         block_start = prefix_lens.to(torch.int64)
         block_end = block_start + int(self.block_size)
@@ -280,6 +274,7 @@ class DFlashWorker:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
             )
             seq_lens = prefix_lens.to(torch.int32)
+            seq_lens_sum = int(sum(prefix_lens_cpu))
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 batch_size=bs,
@@ -287,7 +282,7 @@ class DFlashWorker:
                 req_pool_indices=batch.req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=block_cache_loc,
-                seq_lens_sum=int(seq_lens.sum().item()),
+                seq_lens_sum=seq_lens_sum,
                 seq_lens_cpu=torch.tensor(prefix_lens_cpu, dtype=torch.int32),
                 positions=positions,
                 req_to_token_pool=self.draft_model_runner.req_to_token_pool,
@@ -323,7 +318,20 @@ class DFlashWorker:
             positions=positions,
             draft_token_num=self.block_size,
         )
-        verify_input.prepare_for_verify(batch, self.page_size)
+        backend_name = type(self.model_runner.attn_backend).__name__
+        skip_custom_mask = backend_name in {
+            "FlashInferAttnBackend",
+            "FlashInferMLAAttnBackend",
+            "FlashAttentionBackend",
+            "TRTLLMHAAttnBackend",
+            "TRTLLMMLABackend",
+        }
+        build_custom_mask = not skip_custom_mask
+        verify_input.prepare_for_verify(
+            batch,
+            self.page_size,
+            build_custom_mask=build_custom_mask,
+        )
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         batch.spec_info = verify_input
@@ -484,16 +492,20 @@ class DFlashWorker:
             return
 
         req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
-        req_pool_indices_cpu = batch.req_pool_indices.tolist()
+
+        req_pool_indices = batch.req_pool_indices
+        if req_pool_indices.dtype != torch.int64:
+            req_pool_indices = req_pool_indices.to(torch.int64)
 
         ctx_cache_loc_chunks: List[torch.Tensor] = []
         ctx_positions_chunks: List[torch.Tensor] = []
         new_draft_seq_lens_cpu: List[int] = []
-        for req_pool_idx, cache_len, ctx_len in zip(
-            req_pool_indices_cpu,
-            draft_input.draft_seq_lens_cpu,
-            draft_input.ctx_lens_cpu,
-            strict=True,
+        for i, (cache_len, ctx_len) in enumerate(
+            zip(
+                draft_input.draft_seq_lens_cpu,
+                draft_input.ctx_lens_cpu,
+                strict=True,
+            )
         ):
             cache_len_i = int(cache_len)
             ctx_len_i = int(ctx_len)
@@ -502,8 +514,11 @@ class DFlashWorker:
                 continue
             s = cache_len_i
             e = cache_len_i + ctx_len_i
+            req_pool_idx = req_pool_indices[i]
             ctx_cache_loc_chunks.append(req_to_token[req_pool_idx, s:e].to(torch.int64))
-            ctx_positions_chunks.append(torch.arange(s, e, device=device, dtype=torch.int64))
+            ctx_positions_chunks.append(
+                torch.arange(s, e, device=device, dtype=torch.int64)
+            )
 
         ctx_cache_loc = (
             torch.cat(ctx_cache_loc_chunks, dim=0)
