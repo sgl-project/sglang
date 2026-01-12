@@ -94,6 +94,7 @@ impl RedisTestServer {
 impl Drop for RedisTestServer {
     fn drop(&mut self) {
         if let Some(mut process) = self.process.take() {
+            info!("Killing redis server... process={process:?}");
             if let Err(e) = process.kill() {
                 warn!("Failed to kill redis-server process: {}", e);
             }
