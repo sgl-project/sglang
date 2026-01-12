@@ -857,7 +857,7 @@ def _post_prepare_topk_ids(
             scale_factor,
             N,  # base id for shared experts
         )
-    return topk_ids
+    return topk_ids, topk_weights
 
 
 def select_experts(
@@ -963,7 +963,7 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    topk_ids = _post_prepare_topk_ids(
+    topk_ids, topk_weights = _post_prepare_topk_ids(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
         topk_config=topk_config,
