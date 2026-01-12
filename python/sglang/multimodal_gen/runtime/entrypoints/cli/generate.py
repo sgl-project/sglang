@@ -5,10 +5,10 @@
 
 import argparse
 import dataclasses
+import json
 import os
 from typing import cast
 
-import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen import DiffGenerator
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
@@ -74,6 +74,7 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
 
     timings = RequestTimings(request_id=timings_dict.get("request_id"))
     timings.stages = timings_dict.get("stages", {})
+    timings.steps = timings_dict.get("steps", [])
     timings.total_duration_ms = timings_dict.get("total_duration_ms", 0)
 
     PerformanceLogger.dump_benchmark_report(
@@ -89,23 +90,36 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
 
 def generate_cmd(args: argparse.Namespace):
     """The entry point for the generate command."""
-    # FIXME(mick): do not hard code
-    args.request_id = generate_request_id()
-
-    # Auto-enable stage logging if dump path is provided
-    if args.perf_dump_path:
-        os.environ["SGLANG_DIFFUSION_STAGE_LOGGING"] = "True"
-        envs.SGLANG_DIFFUSION_STAGE_LOGGING = True
+    args.request_id = "mocked_fake_id_for_offline_generate"
 
     server_args = ServerArgs.from_cli_args(args)
+
     sampling_params_kwargs = SamplingParams.get_cli_args(args)
+    sampling_params_kwargs["request_id"] = generate_request_id()
+
+    # Handle diffusers-specific kwargs passed via CLI
+    if hasattr(args, "diffusers_kwargs") and args.diffusers_kwargs:
+        try:
+            sampling_params_kwargs["diffusers_kwargs"] = json.loads(
+                args.diffusers_kwargs
+            )
+            logger.info(
+                "Parsed diffusers_kwargs: %s",
+                sampling_params_kwargs["diffusers_kwargs"],
+            )
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse --diffusers-kwargs as JSON: %s", e)
+            raise ValueError(
+                f"--diffusers-kwargs must be valid JSON. Got: {args.diffusers_kwargs}"
+            ) from e
+
     generator = DiffGenerator.from_pretrained(
-        model_path=server_args.model_path, server_args=server_args
+        model_path=server_args.model_path, server_args=server_args, local_mode=True
     )
 
     results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
 
-    prompt = sampling_params_kwargs.get("prompt", None)
+    prompt = sampling_params_kwargs.get("prompt")
     maybe_dump_performance(args, server_args, prompt, results)
 
 

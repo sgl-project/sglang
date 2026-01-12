@@ -19,7 +19,10 @@ from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternTokenPairs
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternTokenPairs,
+    general_mm_embed_routine,
+)
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -35,7 +38,10 @@ from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_cuda
 from sglang.utils import logger
+
+_is_cuda = is_cuda()
 
 
 class InternAttention(nn.Module):
@@ -44,6 +50,7 @@ class InternAttention(nn.Module):
         config,
         quant_config: QuantizationConfig = None,
         use_data_parallel: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.config = config
@@ -66,6 +73,7 @@ class InternAttention(nn.Module):
             or getattr(config, "use_qk_norm", False),
             flatten_batch=False,
             use_data_parallel=use_data_parallel,
+            aux_stream=aux_stream,
         )
 
         self.proj_drop = nn.Dropout(config.dropout)
@@ -219,6 +227,7 @@ class InternVisionEncoderLayer(nn.Module):
         drop_path_rate: float,
         quant_config: QuantizationConfig = None,
         use_data_parallel: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -228,6 +237,7 @@ class InternVisionEncoderLayer(nn.Module):
             config=config,
             quant_config=quant_config,
             use_data_parallel=use_data_parallel,
+            aux_stream=aux_stream,
         )
         self.mlp = InternMLP(config, use_data_parallel)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
@@ -293,10 +303,11 @@ class InternVisionEncoder(nn.Module):
             x.item()
             for x in torch.linspace(0, config.drop_path_rate, config.num_hidden_layers)
         ]
+        aux_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
             [
                 InternVisionEncoderLayer(
-                    config, dpr[idx], quant_config, use_data_parallel
+                    config, dpr[idx], quant_config, use_data_parallel, aux_stream
                 )
                 for idx in range(config.num_hidden_layers)
             ]
@@ -528,6 +539,7 @@ class InternVLChatModel(nn.Module):
 
         self.external_mm_data_embedding_funcs = {
             Modality.IMAGE: self.get_image_feature,
+            Modality.VIDEO: self.get_video_feature,
         }
 
         self.model = self.language_model.model
@@ -583,6 +595,13 @@ class InternVLChatModel(nn.Module):
         image_features = self.extract_feature(pixel_values)
         return image_features
 
+    def get_video_feature(self, items: List[MultimodalDataItem]):
+        # items: each item corresponds to one video (recommended)
+        # item.feature shape: [num_frames, 3, 448, 448]  (or [num_tiles, 3, 448, 448])
+        pixel_values = torch.cat([item.feature for item in items], dim=0)
+        video_features = self.extract_feature(pixel_values)
+        return video_features
+
     @torch.no_grad()
     def forward(
         self,
@@ -592,21 +611,12 @@ class InternVLChatModel(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
 
-        input_embeds = forward_batch.input_embeds
-        # It may seem strange to assign input_embeds again even after passing it as an argument.
-        # This is for compatibility considerations.
-        # In the 'extend' scenario, this forward function is called from two places:
-        # 1. model_runner calls forward directly,
-        # 2. piece_wise_cuda_graph_runner calls forward and replay.
-
-        # Currently,
-        # In 'extend', input_embeds is passed in.
-        # In 'decode', input_ids is passed in.
-
-        hidden_states = self.language_model(
+        hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            input_embeds=input_embeds,
+            language_model=self.language_model,
+            multimodal_model=self,
+            data_embedding_funcs=self.external_mm_data_embedding_funcs,
             positions=positions,
         )
 

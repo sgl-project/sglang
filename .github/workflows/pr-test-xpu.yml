@@ -6,24 +6,51 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests (for releasing or testing purpose)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
-  group: pr-test-xpu-${{ github.ref }}
-  cancel-in-progress: true
+  group: pr-test-xpu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
   # ==================== Check Changes ==================== #
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.filter.outputs.main_package }}
+      main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          # Run all tests for workflow_call (when ref input is provided)
+          # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+            echo "Run mode: ALL TESTS (run_all_tests=${{ inputs.run_all_tests }})"
+          else
+            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
+          fi
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
             main_package:
@@ -53,6 +80,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -86,7 +114,7 @@ jobs:
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
-          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
+          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN} '
           docker exec -u root "$cid" /bin/bash -c "ln -sf /home/sdp/miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
 
       - name: Run E2E Bfloat16 tests
