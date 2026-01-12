@@ -10,11 +10,12 @@ from sglang.srt.parser.harmony_parser import (
     prefix_hold,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="stage-a-cpu-only")
 
 
-class TestEvent(unittest.TestCase):
+class TestEvent(CustomTestCase):
     def test_init(self):
         """Test Event dataclass initialization."""
         event = Event("reasoning", "content")
@@ -22,7 +23,7 @@ class TestEvent(unittest.TestCase):
         self.assertEqual(event.content, "content")
 
 
-class TestToken(unittest.TestCase):
+class TestToken(CustomTestCase):
     def test_init(self):
         """Test Token dataclass initialization."""
         token = Token("START", 0, 7)
@@ -31,7 +32,7 @@ class TestToken(unittest.TestCase):
         self.assertEqual(token.end, 7)
 
 
-class TestPrefixHold(unittest.TestCase):
+class TestPrefixHold(CustomTestCase):
     def test_empty_text(self):
         """Test prefix_hold with empty text."""
         emit, hold = prefix_hold("", ["<|start|>"])
@@ -63,7 +64,7 @@ class TestPrefixHold(unittest.TestCase):
         self.assertEqual(hold, "")
 
 
-class TestIterTokens(unittest.TestCase):
+class TestIterTokens(CustomTestCase):
     def test_empty_text(self):
         """Test iter_tokens with empty text."""
         tokens = list(iter_tokens(""))
@@ -146,7 +147,7 @@ class TestIterTokens(unittest.TestCase):
             self.assertEqual(token.type, expected_type)
 
 
-class TestCanonicalStrategy(unittest.TestCase):
+class TestCanonicalStrategy(CustomTestCase):
     def setUp(self):
         self.strategy = CanonicalStrategy()
 
@@ -321,7 +322,7 @@ class TestCanonicalStrategy(unittest.TestCase):
         )
 
 
-class TestTextStrategy(unittest.TestCase):
+class TestTextStrategy(CustomTestCase):
     def setUp(self):
         self.strategy = TextStrategy()
 
@@ -428,7 +429,7 @@ class TestTextStrategy(unittest.TestCase):
         )
 
 
-class TestHarmonyParser(unittest.TestCase):
+class TestHarmonyParser(CustomTestCase):
     def setUp(self):
         self.parser = HarmonyParser()
 
@@ -614,7 +615,7 @@ class TestHarmonyParser(unittest.TestCase):
         self.assertEqual(normal_events[0].content, "Unable to fetch weather data")
 
 
-class TestIntegrationScenarios(unittest.TestCase):
+class TestIntegrationScenarios(CustomTestCase):
     """Integration tests for realistic Harmony parsing scenarios."""
 
     def test_complete_reasoning_flow(self):
@@ -795,7 +796,7 @@ class TestIntegrationScenarios(unittest.TestCase):
         self.assertEqual(normal_oneshot.strip(), normal_chunked.strip())
 
 
-class TestEdgeCases(unittest.TestCase):
+class TestEdgeCases(CustomTestCase):
     """Test edge cases and error conditions."""
 
     def test_malformed_channel_headers(self):
@@ -879,7 +880,7 @@ class TestEdgeCases(unittest.TestCase):
         self.assertEqual(events[1].content, "second reasoning")
 
 
-class TestStreamingBufferManagement(unittest.TestCase):
+class TestStreamingBufferManagement(CustomTestCase):
     """Test cases to reproduce streaming buffer management issues from RFC."""
 
     def test_multiple_end_markers_data_loss(self):
