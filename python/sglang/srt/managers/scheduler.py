@@ -1089,14 +1089,11 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        import os
+        enable_profiling = envs.SGLANG_NPU_PROFILING and self.tp_rank == 0
+        prof_bs = envs.SGLANG_NPU_PROFILING_BS
+        profiling_stage = envs.SGLANG_NPU_PROFILING_STAGE
+        prof_step = envs.SGLANG_NPU_PROFILING_STEP
 
-        enable_profiling: bool = (
-            os.getenv("ENABLE_PROFILING", "0") == "1" and self.tp_rank == 0
-        )
-        prof_bs: int = int(os.getenv("PROFILING_BS", 8))
-        profiling_stage: str = os.getenv("PROFILING_STAGE", "decode")
-        prof_step: int = int(os.getenv("PROFILING_step", 10))
         if enable_profiling:
             prof_cnt = 0
             import torch_npu
@@ -1874,7 +1871,7 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         if (
-            not self.chunked_req
+            (not chunked_back or self.chunked_req)
             and self.schedule_enhancer
             and not self.schedule_enhancer.get_schedule_decision(
                 self.running_batch, self.max_prefill_bs
