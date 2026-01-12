@@ -1,12 +1,10 @@
 //! Step to update cache-aware policies for remaining workers after removal.
 
-use std::{collections::HashSet, sync::Arc};
-
 use async_trait::async_trait;
 use tracing::{debug, info};
 
 use crate::{
-    app_context::AppContext,
+    core::steps::workflow_data::AnyWorkflowData,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -17,11 +15,18 @@ use crate::{
 pub struct UpdateRemainingPoliciesStep;
 
 #[async_trait]
-impl StepExecutor for UpdateRemainingPoliciesStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
-        let affected_models: Arc<HashSet<String>> = context.get_or_err("affected_models")?;
-        let worker_urls: Arc<Vec<String>> = context.get_or_err("worker_urls")?;
+impl StepExecutor<AnyWorkflowData> for UpdateRemainingPoliciesStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<AnyWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let data = context.data.as_worker_removal()?;
+        let app_context = data
+            .app_context
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let affected_models = &data.affected_models;
+        let worker_urls = &data.worker_urls;
 
         debug!(
             "Updating cache-aware policies for {} affected model(s)",

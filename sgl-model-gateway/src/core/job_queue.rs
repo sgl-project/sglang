@@ -14,15 +14,19 @@ use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    app_context::AppContext,
+    app_context::{AppContext, AppWorkflowEngine},
     config::{RouterConfig, RoutingMode},
     core::steps::{
+        create_external_worker_workflow_data, create_local_worker_workflow_data,
+        create_mcp_workflow_data, create_tokenizer_workflow_data,
+        create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
+        create_worker_removal_workflow_data, create_worker_update_workflow_data,
         McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
-        WasmModuleConfigRequest, WasmModuleRemovalRequest, WorkerRemovalRequest,
+        WasmModuleConfigRequest, WasmModuleRemovalRequest,
     },
     mcp::McpConfig,
     protocols::worker_spec::{JobStatus, WorkerConfigRequest, WorkerUpdateRequest},
-    workflow::{WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus},
+    workflow::{WorkflowId, WorkflowInstanceId, WorkflowStatus},
 };
 
 /// Job types for control plane operations
@@ -404,17 +408,11 @@ impl JobQueue {
                     .get()
                     .ok_or_else(|| "Workflow engine not initialized".to_string())?;
 
-                let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-                // Convert Box to Arc for context storage
-                let config_arc: Arc<WasmModuleConfigRequest> = Arc::new(*config.clone());
-                workflow_context.set_arc("wasm_module_config", config_arc);
-                workflow_context.set_arc("app_context", Arc::clone(context));
+                let workflow_data =
+                    create_wasm_registration_workflow_data(*config.clone(), Arc::clone(context));
 
                 let instance_id = engine
-                    .start_workflow(
-                        WorkflowId::new("wasm_module_registration"),
-                        workflow_context,
-                    )
+                    .start_workflow(WorkflowId::new("wasm_module_registration"), workflow_data)
                     .await
                     .map_err(|e| {
                         format!("Failed to start WASM module registration workflow: {:?}", e)
@@ -441,14 +439,11 @@ impl JobQueue {
                     .get()
                     .ok_or_else(|| "Workflow engine not initialized".to_string())?;
 
-                let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-                // Convert Box to Arc for context storage
-                let request_arc: Arc<WasmModuleRemovalRequest> = Arc::new(*request.clone());
-                workflow_context.set_arc("wasm_module_removal_request", request_arc);
-                workflow_context.set_arc("app_context", Arc::clone(context));
+                let workflow_data =
+                    create_wasm_removal_workflow_data(*request.clone(), Arc::clone(context));
 
                 let instance_id = engine
-                    .start_workflow(WorkflowId::new("wasm_module_removal"), workflow_context)
+                    .start_workflow(WorkflowId::new("wasm_module_removal"), workflow_data)
                     .await
                     .map_err(|e| {
                         format!("Failed to start WASM module removal workflow: {:?}", e)
@@ -674,13 +669,11 @@ impl JobQueue {
                     .get()
                     .ok_or_else(|| "Workflow engine not initialized".to_string())?;
 
-                let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-                let config_arc: Arc<TokenizerConfigRequest> = Arc::new(*config.clone());
-                workflow_context.set_arc("tokenizer_config", config_arc);
-                workflow_context.set_arc("app_context", Arc::clone(context));
+                let workflow_data =
+                    create_tokenizer_workflow_data(*config.clone(), Arc::clone(context));
 
                 let instance_id = engine
-                    .start_workflow(WorkflowId::new("tokenizer_registration"), workflow_context)
+                    .start_workflow(WorkflowId::new("tokenizer_registration"), workflow_data)
                     .await
                     .map_err(|e| {
                         format!("Failed to start tokenizer registration workflow: {:?}", e)
@@ -719,86 +712,82 @@ impl JobQueue {
 
     /// Start a workflow and return its instance ID
     async fn start_worker_workflow(
-        engine: &Arc<WorkflowEngine>,
+        engine: &Arc<AppWorkflowEngine>,
         config: &WorkerConfigRequest,
         context: &Arc<AppContext>,
     ) -> Result<WorkflowInstanceId, String> {
-        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-        workflow_context.set("worker_config", config.clone());
-        workflow_context.set_arc("app_context", Arc::clone(context));
-
         // Select workflow based on runtime field
-        let workflow_id = match config.runtime.as_deref() {
-            Some("external") => WorkflowId::new("external_worker_registration"),
-            _ => WorkflowId::new("local_worker_registration"),
+        let (workflow_id, workflow_data) = match config.runtime.as_deref() {
+            Some("external") => (
+                WorkflowId::new("external_worker_registration"),
+                create_external_worker_workflow_data(config.clone(), Arc::clone(context)),
+            ),
+            _ => (
+                WorkflowId::new("local_worker_registration"),
+                create_local_worker_workflow_data(config.clone(), Arc::clone(context)),
+            ),
         };
 
         engine
-            .start_workflow(workflow_id, workflow_context)
+            .start_workflow(workflow_id, workflow_data)
             .await
             .map_err(|e| format!("Failed to start worker registration workflow: {:?}", e))
     }
 
     /// Start worker removal workflow
     async fn start_worker_removal_workflow(
-        engine: &Arc<WorkflowEngine>,
+        engine: &Arc<AppWorkflowEngine>,
         url: &str,
         context: &Arc<AppContext>,
     ) -> Result<WorkflowInstanceId, String> {
-        let removal_request = WorkerRemovalRequest {
-            url: url.to_string(),
-            dp_aware: context.router_config.dp_aware,
-        };
-
-        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-        workflow_context.set("removal_request", removal_request);
-        workflow_context.set_arc("app_context", Arc::clone(context));
+        let workflow_data = create_worker_removal_workflow_data(
+            url.to_string(),
+            context.router_config.dp_aware,
+            Arc::clone(context),
+        );
 
         engine
-            .start_workflow(WorkflowId::new("worker_removal"), workflow_context)
+            .start_workflow(WorkflowId::new("worker_removal"), workflow_data)
             .await
             .map_err(|e| format!("Failed to start worker removal workflow: {:?}", e))
     }
 
     /// Start worker update workflow
     async fn start_worker_update_workflow(
-        engine: &Arc<WorkflowEngine>,
+        engine: &Arc<AppWorkflowEngine>,
         url: &str,
         update: &WorkerUpdateRequest,
         context: &Arc<AppContext>,
     ) -> Result<WorkflowInstanceId, String> {
-        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-        // Pass URL and dp_aware separately, workflow step handles the rest
-        workflow_context.set("worker_url", url.to_string());
-        workflow_context.set("dp_aware", context.router_config.dp_aware);
-        workflow_context.set("update_request", update.clone());
-        workflow_context.set_arc("app_context", Arc::clone(context));
+        let workflow_data = create_worker_update_workflow_data(
+            url.to_string(),
+            update.clone(),
+            Arc::clone(context),
+        );
 
         engine
-            .start_workflow(WorkflowId::new("worker_update"), workflow_context)
+            .start_workflow(WorkflowId::new("worker_update"), workflow_data)
             .await
             .map_err(|e| format!("Failed to start worker update workflow: {:?}", e))
     }
 
     /// Start MCP server registration workflow
     async fn start_mcp_registration_workflow(
-        engine: &Arc<WorkflowEngine>,
+        engine: &Arc<AppWorkflowEngine>,
         config: &McpServerConfigRequest,
         context: &Arc<AppContext>,
     ) -> Result<WorkflowInstanceId, String> {
-        let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-        workflow_context.set("mcp_server_config", config.clone());
-        workflow_context.set_arc("app_context", Arc::clone(context));
+        let workflow_data = create_mcp_workflow_data(config.clone(), Arc::clone(context));
 
         engine
-            .start_workflow(WorkflowId::new("mcp_registration"), workflow_context)
+            .start_workflow(WorkflowId::new("mcp_registration"), workflow_data)
             .await
             .map_err(|e| format!("Failed to start MCP registration workflow: {:?}", e))
     }
 
     /// Wait for workflow completion with adaptive polling
     async fn wait_for_workflow_completion(
-        engine: &Arc<WorkflowEngine>,
+        engine: &Arc<AppWorkflowEngine>,
         instance_id: WorkflowInstanceId,
         worker_url: &str,
         timeout_duration: Duration,
