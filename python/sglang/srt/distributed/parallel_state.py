@@ -239,9 +239,22 @@ class GroupCoordinator:
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            if _is_npu and group_name != "attention_tp":
+                import torch_npu
+                options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+                hccl_buffer_size = int(
+                    os.environ.get("SGLANG_HCCL_BUFFSIZE") 
+                    or os.environ.get("HCCL_BUFFSIZE") 
+                    or 200
+                )
+                options.hccl_config = {"hccl_buffer_size":hccl_buffer_size}
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend, pg_options=options
+                )
+            else:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
             # a cpu_group to allow direct coordination between processes through
             # the CPU. The backend is chosen based on `torch_distributed_backend`
             if "mooncake" in torch_distributed_backend:
@@ -1487,15 +1500,33 @@ def init_distributed_environment(
             assert isinstance(timeout, (int)), "timeout must be a number"
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)
-
-        # this backend is used for WORLD
-        torch.distributed.init_process_group(
-            backend=backend,
-            init_method=distributed_init_method,
-            world_size=world_size,
-            rank=rank,
-            timeout=timeout,
-        )
+        
+        if _is_npu:
+            import torch_npu
+            options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+            hccl_buffer_size = int(
+                os.environ.get("SGLANG_HCCL_BUFFSIZE") 
+                or os.environ.get("HCCL_BUFFSIZE") 
+                or 200
+            )
+            options.hccl_config = {"hccl_buffer_size":hccl_buffer_size}
+            torch.distributed.init_process_group(
+                backend=backend,
+                init_method=distributed_init_method,
+                world_size=world_size,
+                rank=rank,
+                timeout=timeout,
+                pg_options=options
+            )
+        else:
+            # this backend is used for WORLD
+            torch.distributed.init_process_group(
+                backend=backend,
+                init_method=distributed_init_method,
+                world_size=world_size,
+                rank=rank,
+                timeout=timeout,
+            )
 
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
