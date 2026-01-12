@@ -358,7 +358,6 @@ class Scheduler:
                     processed_req.is_warmup if isinstance(processed_req, Req) else False
                 )
                 if is_warmup:
-                    self._warmup_processed += 1
                     if output_batch.error is None:
                         if self._warmup_total > 0:
                             logger.info(
