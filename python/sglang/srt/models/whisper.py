@@ -83,21 +83,129 @@ class WhisperAttention(torch.nn.Module):
 
         if self.is_cross_attention:
             q, _ = self.q_proj(hidden_states)
-            kv, _ = self.kv_proj(cross_hidden_states)
-            k, v = kv.chunk(chunks=2, dim=-1)
+            # For cross-attention: compute K,V from encoder outputs
+            # cross_hidden_states should always be provided (from encoder cache)
+            if cross_hidden_states is not None:
+                kv, _ = self.kv_proj(cross_hidden_states)
+                k, v = kv.chunk(chunks=2, dim=-1)
+            else:
+                # Fallback for warmup or missing encoder outputs
+                k = torch.zeros_like(q)
+                v = torch.zeros_like(q)
+
+            # Apply scaling to Q
+            q = q * self.scaling
+
+            # For cross-attention, use direct scaled dot product attention
+            # because the attention backend's decode path reads from KV cache
+            # which doesn't have our encoder K,V
+            num_heads = self.attn.tp_q_head_num
+            head_dim = self.attn.head_dim
+
+            q = q.view(-1, num_heads, head_dim)
+            k = k.view(-1, num_heads, head_dim)
+            v = v.view(-1, num_heads, head_dim)
+
+            q_len = q.shape[0]
+            kv_len = k.shape[0]
+
+            # Compute attention: Q @ K^T -> softmax -> @ V
+            # Q: (q_len, num_heads, head_dim) -> (num_heads, q_len, head_dim)
+            # K: (kv_len, num_heads, head_dim) -> (num_heads, kv_len, head_dim)
+            # V: (kv_len, num_heads, head_dim) -> (num_heads, kv_len, head_dim)
+            q = q.transpose(0, 1)  # (num_heads, q_len, head_dim)
+            k = k.transpose(0, 1)  # (num_heads, kv_len, head_dim)
+            v = v.transpose(0, 1)  # (num_heads, kv_len, head_dim)
+
+            # Compute attention weights: (num_heads, q_len, head_dim) @ (num_heads, head_dim, kv_len)
+            attn_weights = torch.bmm(q, k.transpose(1, 2))  # (num_heads, q_len, kv_len)
+
+            # Apply cross-attention mask for batched requests
+            # When multiple requests are batched, each decoder should only attend
+            # to its own request's encoder outputs, not other requests' encoders
+            batch_size = forward_batch.batch_size if forward_batch else 1
+            if batch_size > 1 and kv_len > 0:
+                # Each request has equal encoder output length (1500 for Whisper 30s audio)
+                encoder_len_per_request = kv_len // batch_size
+                if encoder_len_per_request * batch_size == kv_len:
+                    # Build block-diagonal mask
+                    # In decode mode: q_len = batch_size (1 token per request)
+                    # In prefill mode: q_len = sum of prefill lengths
+                    is_decode = forward_batch.forward_mode.is_decode()
+                    if is_decode:
+                        # Decode: each request contributes 1 decoder token
+                        # q[i] should attend to k[i*enc_len:(i+1)*enc_len]
+                        mask = torch.zeros((q_len, kv_len), device=q.device, dtype=torch.bool)
+                        for i in range(batch_size):
+                            enc_start = i * encoder_len_per_request
+                            enc_end = (i + 1) * encoder_len_per_request
+                            mask[i, enc_start:enc_end] = True
+                        # Apply mask: positions with False get -inf
+                        attn_weights = attn_weights.masked_fill(~mask.unsqueeze(0), float('-inf'))
+                    else:
+                        # Prefill: need seq_lens to determine decoder token boundaries
+                        seq_lens = forward_batch.seq_lens
+                        if seq_lens is not None and len(seq_lens) == batch_size:
+                            seq_lens_list = seq_lens.tolist()
+                            mask = torch.zeros((q_len, kv_len), device=q.device, dtype=torch.bool)
+                            q_start = 0
+                            for i, dec_len in enumerate(seq_lens_list):
+                                enc_start = i * encoder_len_per_request
+                                enc_end = (i + 1) * encoder_len_per_request
+                                q_end = q_start + dec_len
+                                mask[q_start:q_end, enc_start:enc_end] = True
+                                q_start = q_end
+                            attn_weights = attn_weights.masked_fill(~mask.unsqueeze(0), float('-inf'))
+
+            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+
+            # Compute output: (num_heads, q_len, kv_len) @ (num_heads, kv_len, head_dim)
+            attn_output = torch.bmm(attn_weights, v)  # (num_heads, q_len, head_dim)
+
+            # Transpose back: (num_heads, q_len, head_dim) -> (q_len, num_heads, head_dim)
+            attn_output = attn_output.transpose(0, 1)
+            attn_output = attn_output.reshape(-1, num_heads * head_dim)
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.chunk(chunks=3, dim=-1)
-        # Scaling is susceptible to floating point arithmetics' inprecisions
-        # which can lead to different results (this is dependent from model
-        # to model, e.g. whisper is one such case). We therefore keep the
-        # original order of scaling to follow the original implementation
-        # and enforce no scaling (1.0) in the attention call below.
-        q = q * self.scaling
+            # Apply scaling to Q for self-attention
+            q = q * self.scaling
 
-        attn_output = self.attn(
-            q, k, v, forward_batch, save_kv_cache=not self.is_encoder
-        )
+            if self.is_encoder:
+                # For encoder: use direct attention (no KV cache, no RadixAttention)
+                # Encoder hidden_states may have batch dim: [batch, seq_len, embed_dim]
+                num_heads = self.attn.tp_q_head_num
+                head_dim = self.attn.head_dim
+
+                has_batch_dim = hidden_states.ndim == 3
+                if has_batch_dim:
+                    batch_size, seq_len, _ = hidden_states.shape
+                    # Reshape: [batch, seq_len, embed_dim] -> [batch, seq_len, num_heads, head_dim]
+                    q = q.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)  # [batch, num_heads, seq_len, head_dim]
+                    k = k.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
+                    v = v.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
+
+                    # Use PyTorch's scaled_dot_product_attention for efficiency
+                    attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=1.0)  # scaling already applied to q
+
+                    # [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, embed_dim]
+                    attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_heads * head_dim)
+                else:
+                    seq_len = hidden_states.shape[0]
+                    q = q.view(seq_len, num_heads, head_dim).transpose(0, 1)  # [num_heads, seq_len, head_dim]
+                    k = k.view(seq_len, num_heads, head_dim).transpose(0, 1)
+                    v = v.view(seq_len, num_heads, head_dim).transpose(0, 1)
+
+                    attn_weights = torch.bmm(q, k.transpose(1, 2))
+                    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+                    attn_output = torch.bmm(attn_weights, v)
+
+                    attn_output = attn_output.transpose(0, 1).reshape(seq_len, num_heads * head_dim)
+            else:
+                # For decoder self-attention: use RadixAttention with KV cache
+                attn_output = self.attn(
+                    q, k, v, forward_batch, save_kv_cache=True
+                )
 
         attn_output, _ = self.out_proj(attn_output)
 
@@ -170,10 +278,17 @@ class WhisperDecoderLayer(torch.nn.Module):
         super().__init__()
         self.embed_dim = config.d_model
 
+        # Offset decoder layer IDs to avoid overlap with encoder layers
+        # Encoder uses layer IDs 0 to encoder_layers-1
+        # Decoder self-attention uses encoder_layers to encoder_layers + decoder_layers - 1
+        # Decoder cross-attention uses encoder_layers + decoder_layers to encoder_layers + 2*decoder_layers - 1
+        decoder_self_attn_layer_id = config.encoder_layers + layer_id
+        decoder_cross_attn_layer_id = config.encoder_layers + config.decoder_layers + layer_id
+
         self.self_attn = WhisperAttention(
             embed_dim=self.embed_dim,
             num_heads=config.decoder_attention_heads,
-            layer_id=layer_id,
+            layer_id=decoder_self_attn_layer_id,
             quant_config=quant_config,
         )
 
@@ -185,7 +300,7 @@ class WhisperDecoderLayer(torch.nn.Module):
         self.encoder_attn = WhisperAttention(
             embed_dim=self.embed_dim,
             num_heads=config.decoder_attention_heads,
-            layer_id=layer_id,
+            layer_id=decoder_cross_attn_layer_id,
             quant_config=quant_config,
             is_cross_attention=True,
         )
@@ -197,7 +312,7 @@ class WhisperDecoderLayer(torch.nn.Module):
     def forward(
         self,
         decoder_hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
 
@@ -312,7 +427,7 @@ class WhisperDecoder(torch.nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
         position_ids=None,
     ):
@@ -347,6 +462,9 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.config = config
+        # Cache encoder outputs per request for use during decode
+        # Key: request_id, Value: encoder_outputs tensor
+        self._encoder_cache = {}
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -399,9 +517,10 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        image_inputs.num_image_tokens = image_inputs.mm_items[0].feature.shape[1] // 2
-        # Whisper models handle text/audio separately, so we don't need to pad input ids
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        # For Whisper, we manage encoder outputs at the model level (_encoder_cache)
+        # rather than using the attention backend's encoder cache mechanism.
+        # Therefore, we don't need to prepend placeholder tokens or set num_image_tokens.
         return input_ids
 
     def forward(
@@ -411,19 +530,85 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ) -> LogitsProcessorOutput:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
-        mm_inputs = forward_batch.merge_mm_inputs()
-        assert mm_inputs is not None
-        features = mm_inputs.mm_items[0].feature
         dtype = self.encoder.conv1.weight.dtype
+        device = input_ids.device
 
-        encoder_position_ids = torch.cat(
-            [torch.arange(length) for length in forward_batch.encoder_lens_cpu]
-        ).to(features.device, non_blocking=True)
+        # Check if we're in decode mode - use forward_mode instead of mm_inputs
+        # because mm_inputs can persist across prefill and decode
+        is_decode = forward_batch.forward_mode.is_decode()
 
-        encoder_outputs = self.encoder(
-            features.to(dtype), encoder_position_ids, forward_batch
-        )
+        if get_is_capture_mode():
+            # During CUDA graph capture, create dummy encoder outputs
+            total_encoder_len = forward_batch.batch_size
+            encoder_outputs = torch.zeros(
+                total_encoder_len, self.config.d_model, dtype=dtype, device=device
+            )
+        elif is_decode:
+            # Decode phase: retrieve cached encoder outputs for all requests in batch
+            # Each request needs its own encoder outputs for cross-attention
+            encoder_outputs = None
+            if forward_batch.req_pool_indices is not None:
+                req_indices = forward_batch.req_pool_indices.tolist()
+                encoder_list = []
+                for req_idx in req_indices:
+                    if req_idx in self._encoder_cache:
+                        encoder_list.append(self._encoder_cache[req_idx])
+
+                if encoder_list:
+                    if len(encoder_list) == 1:
+                        encoder_outputs = encoder_list[0]
+                    else:
+                        # Concatenate encoder outputs for batched decode
+                        # This aligns with how decoder hidden states are concatenated
+                        encoder_outputs = torch.cat(encoder_list, dim=0)
+        else:
+            # Prefill (extend) phase: process each request's audio separately
+            encoder_list = []
+
+            # Access per-request multimodal inputs instead of merged
+            mm_inputs_list = forward_batch.mm_inputs if forward_batch.mm_inputs else []
+            req_indices = forward_batch.req_pool_indices.tolist() if forward_batch.req_pool_indices is not None else []
+
+            # Process each request's audio separately and cache
+            for i, (req_idx, mm_input) in enumerate(zip(req_indices, mm_inputs_list)):
+                if mm_input is None or not mm_input.mm_items:
+                    continue
+
+                features = mm_input.mm_items[0].feature
+
+                # Add batch dimension if needed
+                if features.ndim == 2:
+                    features = features.unsqueeze(0)
+
+                # Compute encoder output length from features
+                encoder_len = features.shape[-1] // 2
+                encoder_position_ids = torch.arange(encoder_len).to(
+                    features.device, non_blocking=True
+                )
+
+                req_encoder_outputs = self.encoder(
+                    features.to(dtype), encoder_position_ids, forward_batch
+                )
+
+                # Squeeze batch dimension if present
+                if req_encoder_outputs.ndim == 3 and req_encoder_outputs.shape[0] == 1:
+                    req_encoder_outputs = req_encoder_outputs.squeeze(0)
+
+                # Cache this request's encoder outputs
+                self._encoder_cache[req_idx] = req_encoder_outputs
+                encoder_list.append(req_encoder_outputs)
+
+            # Concatenate encoder outputs for all requests in batch
+            if encoder_list:
+                if len(encoder_list) == 1:
+                    encoder_outputs = encoder_list[0]
+                else:
+                    encoder_outputs = torch.cat(encoder_list, dim=0)
+            else:
+                encoder_outputs = None
+
         decoder_outputs = self.decoder(
             input_ids, encoder_outputs, forward_batch, positions
         )
