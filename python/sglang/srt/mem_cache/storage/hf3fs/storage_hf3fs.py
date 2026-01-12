@@ -406,6 +406,16 @@ class HiCacheHF3FS(HiCacheStorage):
         indices = self.metadata_client.reserve_and_allocate_page_indices(
             self.rank, key_with_prefix
         )
+        if len(indices) != len(keys):
+            logger.error(
+                f"[Rank {self.rank}] HiCacheHF3FS batch_get: mismatched lengths {len(indices)} != {len(keys)}"
+            )
+            # free allocated pages
+            if indices:
+                self.metadata_client.confirm_write(
+                    self.rank, [], [index[1] for index in indices]
+                )
+            return [False] * len(keys)
         batch_indices, file_offsets, file_values = [], [], []
         pages_to_release = []
 
@@ -418,14 +428,6 @@ class HiCacheHF3FS(HiCacheStorage):
             assert value.is_contiguous()
             file_values.append(value)
 
-        if len(indices) != len(keys):
-            logger.error(
-                f"[Rank {self.rank}] HiCacheHF3FS set: indices length {len(indices)} mismatch keys length {len(keys)}."
-            )
-            # release all allocated pages
-            if batch_indices:
-                self.metadata_client.confirm_write(self.rank, [], batch_indices)
-            return [False] * len(keys)
         start_time = time.perf_counter()
 
         futures = [

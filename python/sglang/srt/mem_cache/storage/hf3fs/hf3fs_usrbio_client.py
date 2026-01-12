@@ -142,8 +142,12 @@ class Hf3fsUsrBioClient(Hf3fsClient):
             logger.error(f"Error submitting batch read: {e}")
             return results
         # results
-        hf3fs_utils.read_shm(self.shm_r_tensor, tensors)
-        results = [res.result for res in resv]
+        try:
+            hf3fs_utils.read_shm(self.shm_r_tensor, tensors)
+            results = [res.result for res in resv]
+        except Exception as e:
+            logger.error(f"[Hf3fsUsrBioClient] read_shm failed: {e}", exc_info=True)
+            return results
 
         return results
 
