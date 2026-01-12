@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean
 
@@ -125,6 +124,7 @@ class SamplingParams:
     num_inference_steps: int = None
     guidance_scale: float = None
     guidance_scale_2: float = None
+    true_cfg_scale: float = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
     boundary_ratio: float | None = None
 
@@ -208,20 +208,90 @@ class SamplingParams:
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
 
-        # Auto-enable stage logging if dump path is provided
-        if self.perf_dump_path:
-            envs.SGLANG_DIFFUSION_STAGE_LOGGING = True
-
     def _validate(self):
         """
         check if the sampling params is correct by itself
         """
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
-            raise ValueError("prompt_path must be a txt file")
+            raise ValueError(
+                f"prompt_path must be a txt file, got {self.prompt_path!r}"
+            )
+
+        # These are always required to be sane regardless of pipeline.
+        if (
+            not isinstance(self.num_outputs_per_prompt, int)
+            or self.num_outputs_per_prompt <= 0
+        ):
+            raise ValueError(
+                f"num_outputs_per_prompt must be a positive int, got {self.num_outputs_per_prompt!r}"
+            )
+
+        # Used by seconds() and video writer; fps <= 0 is always invalid.
+        if not isinstance(self.fps, int) or self.fps <= 0:
+            raise ValueError(f"fps must be a positive int, got {self.fps!r}")
+
+        # num_frames is already asserted in __post_init__, but keep a friendly error here too
+        # (e.g., when validation is triggered from other code paths).
+        if not isinstance(self.num_frames, int) or self.num_frames <= 0:
+            raise ValueError(
+                f"num_frames must be a positive int, got {self.num_frames!r}"
+            )
+
+        if self.num_inference_steps is not None:
+            if (
+                not isinstance(self.num_inference_steps, int)
+                or self.num_inference_steps <= 0
+            ):
+                raise ValueError(
+                    f"num_inference_steps must be a positive int, got {self.num_inference_steps!r}"
+                )
+
+        # Numeric hyperparams should not be NaN/Inf and should be within basic ranges.
+        # Note: bool is a subclass of int; reject it explicitly to avoid silent surprises.
+        def _finite_non_negative_float(
+            name: str, value: Any, allow_none: bool = True
+        ) -> None:
+            if value is None and allow_none:
+                return
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a number, got {value!r}")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite, got {value!r}")
+            if float(value) < 0.0:
+                raise ValueError(f"{name} must be non-negative, got {value!r}")
+
+        _finite_non_negative_float(
+            "guidance_scale", self.guidance_scale, allow_none=True
+        )
+        _finite_non_negative_float(
+            "guidance_scale_2", self.guidance_scale_2, allow_none=True
+        )
+        _finite_non_negative_float(
+            "true_cfg_scale", self.true_cfg_scale, allow_none=True
+        )
+        _finite_non_negative_float(
+            "guidance_rescale", self.guidance_rescale, allow_none=False
+        )
+
+        if self.boundary_ratio is not None:
+            if isinstance(self.boundary_ratio, bool) or not isinstance(
+                self.boundary_ratio, (int, float)
+            ):
+                raise ValueError(
+                    f"boundary_ratio must be a number, got {self.boundary_ratio!r}"
+                )
+            if not math.isfinite(float(self.boundary_ratio)):
+                raise ValueError(
+                    f"boundary_ratio must be finite, got {self.boundary_ratio!r}"
+                )
+            if not (0.0 <= float(self.boundary_ratio) <= 1.0):
+                raise ValueError(
+                    f"boundary_ratio must be within [0, 1], got {self.boundary_ratio!r}"
+                )
 
     def check_sampling_param(self):
-        if self.prompt_path and not self.prompt_path.endswith(".txt"):
-            raise ValueError("prompt_path must be a txt file")
+        # Keep backward-compatibility for old call sites.
+        self._validate()
 
     def _validate_with_pipeline_config(self, pipeline_config):
         """
@@ -285,7 +355,7 @@ class SamplingParams:
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
-                logger.debug(f"num_frames set to 1 for image generation model")
+                logger.debug(f"Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
 
         elif self.adjust_frames:
@@ -584,6 +654,13 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.return_trajectory_decoded,
             help="Whether to return the decoded trajectory",
+        )
+        parser.add_argument(
+            "--diffusers-kwargs",
+            type=str,
+            default=None,
+            help="JSON string of extra kwargs to pass to diffusers pipeline. "
+            'Example: \'{"output_type": "latent", "clip_skip": 2}\'',
         )
         parser.add_argument(
             "--no-override-protected-fields",

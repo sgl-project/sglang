@@ -1,10 +1,10 @@
 use super::*;
 
 /// Configuration validator
-pub struct ConfigValidator;
+pub(crate) struct ConfigValidator;
 
 impl ConfigValidator {
-    pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
+    pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
@@ -149,7 +149,7 @@ impl ConfigValidator {
         match policy {
             PolicyConfig::Random
             | PolicyConfig::RoundRobin
-            | PolicyConfig::Manual
+            | PolicyConfig::Manual { .. }
             | PolicyConfig::ConsistentHashing => {}
             PolicyConfig::CacheAware {
                 cache_threshold,
