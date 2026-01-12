@@ -12,7 +12,7 @@ import time
 import weakref
 from collections.abc import Iterable
 from functools import lru_cache
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from einops import rearrange
@@ -61,9 +61,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
-    LayerwiseOffloadManager,
-)
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
@@ -95,9 +93,8 @@ class DenoisingStage(PipelineStage):
 
         # torch compile
         if self.server_args.enable_torch_compile:
-            self.torch_compile_module(self.transformer)
-            if transformer_2 is not None:
-                self.torch_compile_module(self.transformer_2)
+            for transformer in filter(None, [self.transformer, self.transformer_2]):
+                self.compile_module_with_torch_compile(transformer)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -117,8 +114,9 @@ class DenoisingStage(PipelineStage):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
+        self._is_warmed_up = False
 
-    def torch_compile_module(self, module):
+    def compile_module_with_torch_compile(self, module):
         """
         Compile a module's forward with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object has no forward.
@@ -489,24 +487,26 @@ class DenoisingStage(PipelineStage):
         """
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
+        # NOTE: In warmup requests we may override req.num_inference_steps (e.g. set to 1)
+        # for latency amortization, but cache-dit needs the *original* total steps to
+        # initialize/refresh its context correctly.
+        cache_dit_num_inference_steps = batch.extra.get(
+            "cache_dit_num_inference_steps", batch.num_inference_steps
+        )
         if not server_args.model_loaded["transformer"]:
+            # FIXME: reuse more code
             loader = TransformerLoader()
             self.transformer = loader.load(
-                server_args.model_paths["transformer"], server_args
+                server_args.model_paths["transformer"], server_args, "transformer"
             )
-
             # enable cache-dit before torch.compile (delayed mounting)
-            self._maybe_enable_cache_dit(batch.num_inference_steps)
-
-            if self.server_args.enable_torch_compile:
-                self.transformer = torch.compile(
-                    self.transformer, mode="max-autotune", fullgraph=True
-                )
+            self._maybe_enable_cache_dit(cache_dit_num_inference_steps)
+            self.compile_module_with_torch_compile(self.transformer)
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
         else:
-            self._maybe_enable_cache_dit(batch.num_inference_steps)
+            self._maybe_enable_cache_dit(cache_dit_num_inference_steps)
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
@@ -668,6 +668,7 @@ class DenoisingStage(PipelineStage):
         trajectory_latents: list,
         trajectory_timesteps: list,
         server_args: ServerArgs,
+        is_warmup: bool = False,
     ):
         # Gather results if using sequence parallelism
         if trajectory_latents:
@@ -704,14 +705,15 @@ class DenoisingStage(PipelineStage):
 
         # Save STA mask search results if needed
         if (
-            self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
+            not is_warmup
+            and self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
             and server_args.STA_mode == STA_Mode.STA_SEARCHING
         ):
             self.save_sta_search_results(batch)
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
-        if torch.backends.mps.is_available():
+        if torch.backends.mps.is_available() and not is_warmup:
             logger.info(
                 "Memory before deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
@@ -725,13 +727,10 @@ class DenoisingStage(PipelineStage):
                 torch.mps.current_allocated_memory(),
             )
 
-        # reset offload manager with prefetching first layer for next forward
-        offload_mgr: Optional[LayerwiseOffloadManager] = None
-        for transformer in filter(None, [self.transformer, self.transformer_2]):
-            if (
-                offload_mgr := getattr(transformer, "_layerwise_offload_manager", None)
-            ) is not None:
-                offload_mgr.prepare_for_next_denoise(non_blocking=True)
+        # reset offload managers with prefetching first layer for next forward
+        for dit in filter(None, [self.transformer, self.transformer_2]):
+            if isinstance(dit, OffloadableDiTMixin):
+                dit.prepare_for_next_denoise()
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
@@ -959,7 +958,7 @@ class DenoisingStage(PipelineStage):
         denoising_start_time = time.time()
 
         # to avoid device-sync caused by timestep comparison
-
+        is_warmup = batch.is_warmup
         self.scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
@@ -1056,11 +1055,12 @@ class DenoisingStage(PipelineStage):
                         ):
                             progress_bar.update()
 
-                        self.step_profile()
+                        if not is_warmup:
+                            self.step_profile()
 
         denoising_end_time = time.time()
 
-        if num_timesteps > 0:
+        if num_timesteps > 0 and not is_warmup:
             self.log_info(
                 "average time per step: %.4f seconds",
                 (denoising_end_time - denoising_start_time) / len(timesteps),
@@ -1072,6 +1072,7 @@ class DenoisingStage(PipelineStage):
             trajectory_latents=trajectory_latents,
             trajectory_timesteps=trajectory_timesteps,
             server_args=server_args,
+            is_warmup=is_warmup,
         )
         return batch
 

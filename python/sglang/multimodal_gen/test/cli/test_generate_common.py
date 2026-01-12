@@ -3,105 +3,114 @@
 """
     Common generate cli test, one test for image and video each
 """
-
+import dataclasses
 import os
+import shlex
+import subprocess
+import sys
 import unittest
-from pathlib import Path
+from typing import Optional
 
 from PIL import Image
 
-from sglang.multimodal_gen.test.test_utils import (
-    TestCLIBase,
-    check_image_size,
-    is_mp4,
-    run_command,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.test.test_utils import check_image_size
+
+logger = init_logger(__name__)
 
 
-class TestGenerate(TestCLIBase):
-    model_path = "black-forest-labs/FLUX.1-dev"
-    launch_file_name = "launch_flux.json"
-    output_name = "FLUX.1-dev, single gpu"
-    ext = "jpg"
+@dataclasses.dataclass
+class TestResult:
+    name: str
+    key: str
+    succeed: bool
 
-    def test_generate_with_config(self):
-        test_dir = Path(__file__).parent
-        config_path = (
-            (test_dir / ".." / "test_files" / self.launch_file_name)
-            .resolve()
-            .as_posix()
+
+def run_command(command) -> Optional[float]:
+    """Runs a command and returns the execution time and status."""
+    print(f"Running command: {shlex.join(command)}")
+
+    with subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+    ) as process:
+        for line in process.stdout:
+            sys.stdout.write(line)
+        process.wait()
+        if process.returncode == 0:
+            return True
+        print(f"Command failed with exit code {process.returncode}")
+    return False
+
+
+class CLIBase(unittest.TestCase):
+    model_path: str = None
+    extra_args = []
+    data_type: DataType = None
+    # tested on h100
+
+    width: int = 720
+    height: int = 720
+    output_path: str = "test_outputs"
+
+    def get_base_command(self):
+        return [
+            "sglang",
+            "generate",
+            "--prompt",
+            "A curious raccoon",
+            "--save-output",
+            "--log-level=debug",
+            f"--width={self.width}",
+            f"--height={self.height}",
+            f"--output-path={self.output_path}",
+        ]
+
+    def _run_command(self, name: str, model_path: str, args=[]):
+        command = (
+            self.get_base_command()
+            + [f"--model-path={model_path}"]
+            + shlex.split(args or "")
+            + ["--output-file-name", f"{name}"]
+            + self.extra_args
         )
-        command = [
-            "sgl_diffusion",
-            "generate",
-            f"--config={config_path}",
-        ]
-        duration = run_command(command)
+        succeed = run_command(command)
+        status = "Success" if succeed else "Failed"
 
-        self.assertIsNotNone(duration, f"Run command failed: {command}")
+        return name, status
 
-        # verify
-        self.verify_image(self.output_name)
+    def _run_test(self, name: str, args, model_path: str, test_key: str):
+        name, status = self._run_command(name, args=args, model_path=model_path)
+        self.verify(status, name)
 
-    def test_generate_multiple_outputs(self):
-        command = [
-            "sglang",
-            "generate",
-            "--prompt",
-            "A curious raccoon",
-            "--output-path=outputs",
-            f"--model-path={self.model_path}",
-            "--save-output",
-            f"--output-file-name={self.output_name}",
-            "--num-outputs-per-prompt=2",
-            "--width=720",
-            "--height=720",
-        ]
-        duration = run_command(command)
-        self.assertIsNotNone(duration, f"Run command failed: {command}")
+    def verify(self, status, name):
+        print("-" * 80)
+        print("\n" * 3)
 
-        self.verify_image(f"{self.output_name}_0.{self.ext}")
-        self.verify_image(f"{self.output_name}_1.{self.ext}")
+        # test task status
+        self.assertEqual(status, "Success", f"{name} command failed")
 
-    def verify_image(self, output_name):
-        path = os.path.join("outputs", output_name)
-        with Image.open(path) as image:
-            check_image_size(self, image, 720, 720)
+        # test output file
+        path = os.path.join(
+            self.output_path, f"{name}.{self.data_type.get_default_extension()}"
+        )
+        self.assertTrue(os.path.exists(path), f"Output file not exist for {path}")
+        if self.data_type == DataType.IMAGE:
+            with Image.open(path) as image:
+                check_image_size(self, image, self.width, self.height)
 
-    def verify_video(self, output_name):
-        path = os.path.join("outputs", output_name)
-        with open(path, "rb") as f:
-            header = f.read(12)
-            assert is_mp4(header)
+    def model_name(self):
+        return self.model_path.split("/")[-1]
 
-
-class TestWanGenerate(TestGenerate):
-    model_path = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-    launch_file_name = "launch_wan.json"
-    output_name = "Wan2.1-T2V-1.3B-Diffusers, single gpu"
-    ext = "mp4"
-
-    def test_generate_multiple_outputs(self):
-        command = [
-            "sglang",
-            "generate",
-            "--prompt",
-            "A curious raccoon",
-            "--output-path=outputs",
-            f"--model-path={self.model_path}",
-            "--save-output",
-            f"--output-file-name={self.output_name}",
-            "--num-outputs-per-prompt=2",
-            "--width=720",
-            "--height=720",
-        ]
-        duration = run_command(command)
-        self.assertIsNotNone(duration, f"Run command failed: {command}")
-
-        self.verify_video(f"{self.output_name}_0.{self.ext}")
-        # FIXME: second video is a meaningless output
-        self.verify_video(f"{self.output_name}_1.{self.ext}")
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_single_gpu(self):
+        """single gpu"""
+        self._run_test(
+            name=f"{self.model_name()}_single_gpu",
+            args=None,
+            model_path=self.model_path,
+            test_key="test_single_gpu",
+        )
