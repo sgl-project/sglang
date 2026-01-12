@@ -618,6 +618,7 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    disaggregation_async_transfer: bool = False
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -2287,6 +2288,21 @@ class ServerArgs:
                 self.disable_cuda_graph = True
                 logger.warning(
                     "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
+                )
+
+            if self.disaggregation_async_transfer:
+                assert (
+                    self.disaggregation_transfer_backend == "mooncake"
+                ), "Async KV transfer mode is only supported for mooncake backend."
+                assert (
+                    not self.disable_overlap_schedule
+                ), "Async KV transfer mode requires overlap mode to be enabled."
+                logger.info(
+                    "Async KV transfer mode is enabled for disaggregation prefill."
+                )
+            else:
+                logger.info(
+                    "Async KV transfer mode is disabled for disaggregation prefill."
                 )
 
     def _handle_encoder_disaggregation(self):
@@ -4479,6 +4495,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+        parser.add_argument(
+            "--disaggregation-async-transfer",
+            action="store_true",
+            default=ServerArgs.disaggregation_async_transfer,
+            help="Enable async KV transfer mode for disaggregation prefill. "
+            "When enabled, KV transfer is triggered immediately after forward "
+            "and metadata buffer population is done asynchronously by transfer workers.",
         )
 
         # Encode prefill disaggregation
