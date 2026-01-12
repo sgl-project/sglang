@@ -42,6 +42,10 @@ pub trait StateStore<D: WorkflowData>: Send + Sync + Clone {
 
     /// Get just the workflow context without cloning the entire state
     fn get_context(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<WorkflowContext<D>>;
+
+    /// Clean up a specific workflow immediately if it's in a terminal state
+    /// Returns true if the workflow was removed, false otherwise
+    fn cleanup_if_terminal(&self, instance_id: WorkflowInstanceId) -> bool;
 }
 
 /// In-memory state storage for workflow instances
@@ -71,21 +75,6 @@ impl<D: WorkflowData> InMemoryStore<D> {
     /// Get total count of all workflows
     pub fn count(&self) -> usize {
         self.states.read().len()
-    }
-
-    /// Clean up a specific completed workflow immediately
-    pub fn cleanup_if_terminal(&self, instance_id: WorkflowInstanceId) -> bool {
-        let mut states = self.states.write();
-        if let Some(state) = states.get(&instance_id) {
-            if matches!(
-                state.status,
-                WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
-            ) {
-                states.remove(&instance_id);
-                return true;
-            }
-        }
-        false
     }
 }
 
@@ -188,5 +177,19 @@ impl<D: WorkflowData> StateStore<D> for InMemoryStore<D> {
             );
         }
         removed_count
+    }
+
+    fn cleanup_if_terminal(&self, instance_id: WorkflowInstanceId) -> bool {
+        let mut states = self.states.write();
+        if let Some(state) = states.get(&instance_id) {
+            if matches!(
+                state.status,
+                WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+            ) {
+                states.remove(&instance_id);
+                return true;
+            }
+        }
+        false
     }
 }

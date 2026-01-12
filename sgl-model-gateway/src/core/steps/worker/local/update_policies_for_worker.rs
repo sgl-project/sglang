@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tracing::debug;
 
 use crate::{
-    core::steps::workflow_data::AnyWorkflowData,
+    core::steps::workflow_data::WorkerUpdateWorkflowData,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -17,20 +17,20 @@ use crate::{
 pub struct UpdatePoliciesForWorkerStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for UpdatePoliciesForWorkerStep {
+impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WorkerUpdateWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_worker_update()?;
-        let app_context = data
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let updated_workers = data
-            .updated_workers
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("updated_workers".to_string()))?;
+        let updated_workers =
+            context.data.updated_workers.as_ref().ok_or_else(|| {
+                WorkflowError::ContextValueNotFound("updated_workers".to_string())
+            })?;
 
         // Collect affected models
         let affected_models: HashSet<String> = updated_workers

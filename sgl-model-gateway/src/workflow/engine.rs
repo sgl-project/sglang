@@ -781,6 +781,65 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         self.state_store.load(instance_id)
     }
 
+    /// Wait for a workflow to complete with adaptive polling
+    ///
+    /// Returns Ok with success message on completion, Err on failure/timeout/cancellation.
+    /// Automatically cleans up terminal workflow states.
+    pub async fn wait_for_completion(
+        &self,
+        instance_id: WorkflowInstanceId,
+        label: &str,
+        timeout_duration: Duration,
+    ) -> Result<String, String> {
+        let start = std::time::Instant::now();
+        let mut poll_interval = Duration::from_millis(100);
+        let max_poll_interval = Duration::from_millis(2000);
+        let poll_backoff = Duration::from_millis(200);
+
+        loop {
+            if start.elapsed() > timeout_duration {
+                return Err(format!(
+                    "Workflow timeout after {}s for {}",
+                    timeout_duration.as_secs(),
+                    label
+                ));
+            }
+
+            let state = self
+                .get_status(instance_id)
+                .map_err(|e| format!("Failed to get workflow status: {:?}", e))?;
+
+            let result = match state.status {
+                WorkflowStatus::Completed => {
+                    Ok(format!("{} completed successfully via workflow", label))
+                }
+                WorkflowStatus::Failed => {
+                    let current_step = state.current_step.as_ref();
+                    let step_name = current_step
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let error_msg = current_step
+                        .and_then(|step_id| state.step_states.get(step_id))
+                        .and_then(|s| s.last_error.as_deref())
+                        .unwrap_or("Unknown error");
+                    Err(format!(
+                        "Workflow failed at step {}: {}",
+                        step_name, error_msg
+                    ))
+                }
+                WorkflowStatus::Cancelled => Err(format!("Workflow cancelled for {}", label)),
+                WorkflowStatus::Pending | WorkflowStatus::Paused | WorkflowStatus::Running => {
+                    tokio::time::sleep(poll_interval).await;
+                    poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
+                    continue;
+                }
+            };
+
+            self.state_store.cleanup_if_terminal(instance_id);
+            return result;
+        }
+    }
+
     /// Clone engine for async execution
     fn clone_for_execution(&self) -> Self {
         Self {

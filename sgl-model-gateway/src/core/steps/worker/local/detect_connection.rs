@@ -8,7 +8,7 @@ use tracing::debug;
 
 use super::strip_protocol;
 use crate::{
-    core::{steps::workflow_data::AnyWorkflowData, ConnectionMode},
+    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
     routers::grpc::client::GrpcClient,
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
@@ -86,14 +86,14 @@ async fn try_grpc_health_check(
 pub struct DetectConnectionModeStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for DetectConnectionModeStep {
+impl StepExecutor<LocalWorkerWorkflowData> for DetectConnectionModeStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<LocalWorkerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_local_worker()?;
-        let config = &data.config;
-        let app_context = data
+        let config = &context.data.config;
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
@@ -134,7 +134,7 @@ impl StepExecutor<AnyWorkflowData> for DetectConnectionModeStep {
             }
         };
 
-        context.data.as_local_worker_mut()?.connection_mode = Some(connection_mode);
+        context.data.connection_mode = Some(connection_mode);
         Ok(StepResult::Success)
     }
 

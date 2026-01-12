@@ -20,16 +20,11 @@ use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 
 use crate::{
-    app_context::{AppContext, AppWorkflowEngine},
+    app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::{
         job_queue::{JobQueue, JobQueueConfig},
-        steps::{
-            create_external_worker_workflow, create_local_worker_workflow,
-            create_mcp_registration_workflow, create_tokenizer_registration_workflow,
-            create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
-            create_worker_removal_workflow, create_worker_update_workflow,
-        },
+        steps::WorkflowEngines,
         worker::WorkerType,
         worker_manager::WorkerManager,
         Job,
@@ -730,44 +725,50 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .set(worker_job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize workflow engine and register workflows
-    let engine = Arc::new(AppWorkflowEngine::new());
+    // Initialize typed workflow engines
+    let engines = WorkflowEngines::new(&config.router_config);
 
-    engine
+    // Subscribe logging to all workflow engines
+    let subscriber = Arc::new(LoggingSubscriber);
+    engines
+        .local_worker
         .event_bus()
-        .subscribe(Arc::new(LoggingSubscriber))
+        .subscribe(subscriber.clone())
         .await;
+    engines
+        .external_worker
+        .event_bus()
+        .subscribe(subscriber.clone())
+        .await;
+    engines
+        .worker_removal
+        .event_bus()
+        .subscribe(subscriber.clone())
+        .await;
+    engines
+        .worker_update
+        .event_bus()
+        .subscribe(subscriber.clone())
+        .await;
+    engines.mcp.event_bus().subscribe(subscriber.clone()).await;
+    engines
+        .tokenizer
+        .event_bus()
+        .subscribe(subscriber.clone())
+        .await;
+    engines
+        .wasm_registration
+        .event_bus()
+        .subscribe(subscriber.clone())
+        .await;
+    engines.wasm_removal.event_bus().subscribe(subscriber).await;
 
-    engine
-        .register_workflow(create_local_worker_workflow(&config.router_config))
-        .expect("local_worker_registration workflow should be valid");
-    engine
-        .register_workflow(create_external_worker_workflow())
-        .expect("external_worker_registration workflow should be valid");
-    engine
-        .register_workflow(create_worker_removal_workflow())
-        .expect("worker_removal workflow should be valid");
-    engine
-        .register_workflow(create_worker_update_workflow())
-        .expect("worker_update workflow should be valid");
-    engine
-        .register_workflow(create_mcp_registration_workflow())
-        .expect("mcp_registration workflow should be valid");
-    engine
-        .register_workflow(create_wasm_module_registration_workflow())
-        .expect("wasm_module_registration workflow should be valid");
-    engine
-        .register_workflow(create_wasm_module_removal_workflow())
-        .expect("wasm_module_removal workflow should be valid");
-    engine
-        .register_workflow(create_tokenizer_registration_workflow())
-        .expect("tokenizer_registration workflow should be valid");
     app_context
-        .workflow_engine
-        .set(engine)
-        .expect("WorkflowEngine should only be initialized once");
+        .workflow_engines
+        .set(engines)
+        .expect("WorkflowEngines should only be initialized once");
     debug!(
-        "Workflow engine initialized with worker and MCP registration workflows (health check timeout: {}s)",
+        "Workflow engines initialized (health check timeout: {}s)",
         config.router_config.health_check.timeout_secs
     );
 

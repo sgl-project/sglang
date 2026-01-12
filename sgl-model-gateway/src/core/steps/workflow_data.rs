@@ -1,7 +1,14 @@
 //! Typed workflow data structures
 //!
 //! This module defines the typed data structures for all workflows, enabling
-//! compile-time type safety and state persistence.
+//! compile-time type safety and state persistence. Each workflow has its own
+//! strongly-typed data structure, and steps are typed to their specific workflow.
+//!
+//! # Shared Step Trait
+//!
+//! For steps that are shared between local and external worker workflows,
+//! we use the `WorkerRegistrationData` trait. This trait provides a common
+//! interface for accessing worker data while maintaining full type safety.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -25,6 +32,26 @@ use crate::{
     },
     workflow::{WorkflowData, WorkflowError},
 };
+
+// ============================================================================
+// Shared trait for worker registration workflows
+// ============================================================================
+
+/// Trait for workflow data that supports worker registration operations.
+///
+/// This trait is implemented by both `LocalWorkerWorkflowData` and
+/// `ExternalWorkerWorkflowData`, allowing shared steps to work with either
+/// workflow type while maintaining full type safety.
+pub trait WorkerRegistrationData: WorkflowData {
+    /// Get the application context (transient, not serialized).
+    fn get_app_context(&self) -> Option<&Arc<AppContext>>;
+
+    /// Get the actual worker objects (transient, not serialized).
+    fn get_actual_workers(&self) -> Option<&Vec<Arc<dyn Worker>>>;
+
+    /// Get the labels for policy registration.
+    fn get_labels(&self) -> Option<&HashMap<String, String>>;
+}
 
 /// Wrapper for worker list that can be serialized
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -119,6 +146,20 @@ impl LocalWorkerWorkflowData {
     }
 }
 
+impl WorkerRegistrationData for LocalWorkerWorkflowData {
+    fn get_app_context(&self) -> Option<&Arc<AppContext>> {
+        self.app_context.as_ref()
+    }
+
+    fn get_actual_workers(&self) -> Option<&Vec<Arc<dyn Worker>>> {
+        self.actual_workers.as_ref()
+    }
+
+    fn get_labels(&self) -> Option<&HashMap<String, String>> {
+        Some(&self.final_labels)
+    }
+}
+
 /// Data for external worker registration workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalWorkerWorkflowData {
@@ -151,6 +192,20 @@ impl ExternalWorkerWorkflowData {
             ));
         }
         Ok(())
+    }
+}
+
+impl WorkerRegistrationData for ExternalWorkerWorkflowData {
+    fn get_app_context(&self) -> Option<&Arc<AppContext>> {
+        self.app_context.as_ref()
+    }
+
+    fn get_actual_workers(&self) -> Option<&Vec<Arc<dyn Worker>>> {
+        self.actual_workers.as_ref()
+    }
+
+    fn get_labels(&self) -> Option<&HashMap<String, String>> {
+        Some(&self.labels)
     }
 }
 
@@ -316,244 +371,5 @@ impl WasmRemovalWorkflowData {
             ));
         }
         Ok(())
-    }
-}
-
-// ============================================================================
-// Unified enum for all workflow types
-// ============================================================================
-
-/// Macro to generate type-safe accessor methods for AnyWorkflowData variants.
-///
-/// This reduces boilerplate and ensures consistent error handling across all accessors.
-macro_rules! impl_workflow_accessor {
-    ($fn_name:ident, $fn_name_mut:ident, $variant:ident, $ty:ty, $type_name:expr) => {
-        /// Extract the inner data, returning an error if this is a different variant.
-        #[must_use = "this returns the result of the operation, without modifying the original"]
-        pub fn $fn_name(&self) -> Result<&$ty, WorkflowError> {
-            match self {
-                AnyWorkflowData::$variant(data) => Ok(data),
-                _ => Err(WorkflowError::TypeMismatch {
-                    expected: $type_name,
-                    actual: self.concrete_type(),
-                }),
-            }
-        }
-
-        /// Extract the inner data mutably, returning an error if this is a different variant.
-        pub fn $fn_name_mut(&mut self) -> Result<&mut $ty, WorkflowError> {
-            // Store the type name before the mutable borrow
-            let actual = self.concrete_type();
-            match self {
-                AnyWorkflowData::$variant(data) => Ok(data),
-                _ => Err(WorkflowError::TypeMismatch {
-                    expected: $type_name,
-                    actual,
-                }),
-            }
-        }
-    };
-}
-
-/// Macro to generate From implementations for AnyWorkflowData variants.
-macro_rules! impl_from_workflow_data {
-    ($variant:ident, $ty:ty) => {
-        impl From<$ty> for AnyWorkflowData {
-            fn from(data: $ty) -> Self {
-                AnyWorkflowData::$variant(data)
-            }
-        }
-    };
-}
-
-/// Unified workflow data enum covering all workflow types.
-///
-/// This allows a single `WorkflowEngine<AnyWorkflowData>` to handle all workflows
-/// while maintaining type safety at the step level.
-///
-/// # Type Erasure
-///
-/// `AnyWorkflowData` implements `WorkflowData` with `workflow_type()` returning `"any"`.
-/// This is intentional: the static method cannot know the runtime variant. Use
-/// [`concrete_type()`](Self::concrete_type) to get the actual workflow type at runtime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AnyWorkflowData {
-    Tokenizer(TokenizerWorkflowData),
-    LocalWorker(LocalWorkerWorkflowData),
-    ExternalWorker(ExternalWorkerWorkflowData),
-    WorkerRemoval(WorkerRemovalWorkflowData),
-    WorkerUpdate(WorkerUpdateWorkflowData),
-    Mcp(McpWorkflowData),
-    WasmRegistration(WasmRegistrationWorkflowData),
-    WasmRemoval(WasmRemovalWorkflowData),
-}
-
-impl WorkflowData for AnyWorkflowData {
-    /// Returns `"any"` as this is a type-erased container.
-    ///
-    /// Use [`concrete_type()`](Self::concrete_type) to get the actual workflow type at runtime.
-    fn workflow_type() -> &'static str {
-        "any"
-    }
-}
-
-// Generate From implementations for ergonomic construction
-impl_from_workflow_data!(Tokenizer, TokenizerWorkflowData);
-impl_from_workflow_data!(LocalWorker, LocalWorkerWorkflowData);
-impl_from_workflow_data!(ExternalWorker, ExternalWorkerWorkflowData);
-impl_from_workflow_data!(WorkerRemoval, WorkerRemovalWorkflowData);
-impl_from_workflow_data!(WorkerUpdate, WorkerUpdateWorkflowData);
-impl_from_workflow_data!(Mcp, McpWorkflowData);
-impl_from_workflow_data!(WasmRegistration, WasmRegistrationWorkflowData);
-impl_from_workflow_data!(WasmRemoval, WasmRemovalWorkflowData);
-
-impl AnyWorkflowData {
-    /// Get the concrete workflow type name at runtime.
-    ///
-    /// Unlike the static `workflow_type()` method, this returns the actual
-    /// type of the contained workflow data.
-    #[must_use]
-    pub fn concrete_type(&self) -> &'static str {
-        match self {
-            AnyWorkflowData::Tokenizer(_) => TokenizerWorkflowData::workflow_type(),
-            AnyWorkflowData::LocalWorker(_) => LocalWorkerWorkflowData::workflow_type(),
-            AnyWorkflowData::ExternalWorker(_) => ExternalWorkerWorkflowData::workflow_type(),
-            AnyWorkflowData::WorkerRemoval(_) => WorkerRemovalWorkflowData::workflow_type(),
-            AnyWorkflowData::WorkerUpdate(_) => WorkerUpdateWorkflowData::workflow_type(),
-            AnyWorkflowData::Mcp(_) => McpWorkflowData::workflow_type(),
-            AnyWorkflowData::WasmRegistration(_) => WasmRegistrationWorkflowData::workflow_type(),
-            AnyWorkflowData::WasmRemoval(_) => WasmRemovalWorkflowData::workflow_type(),
-        }
-    }
-
-    // Generate all accessor methods using the macro
-    impl_workflow_accessor!(
-        as_tokenizer,
-        as_tokenizer_mut,
-        Tokenizer,
-        TokenizerWorkflowData,
-        "tokenizer_registration"
-    );
-    impl_workflow_accessor!(
-        as_local_worker,
-        as_local_worker_mut,
-        LocalWorker,
-        LocalWorkerWorkflowData,
-        "local_worker_registration"
-    );
-    impl_workflow_accessor!(
-        as_external_worker,
-        as_external_worker_mut,
-        ExternalWorker,
-        ExternalWorkerWorkflowData,
-        "external_worker_registration"
-    );
-    impl_workflow_accessor!(
-        as_worker_removal,
-        as_worker_removal_mut,
-        WorkerRemoval,
-        WorkerRemovalWorkflowData,
-        "worker_removal"
-    );
-    impl_workflow_accessor!(
-        as_worker_update,
-        as_worker_update_mut,
-        WorkerUpdate,
-        WorkerUpdateWorkflowData,
-        "worker_update"
-    );
-    impl_workflow_accessor!(as_mcp, as_mcp_mut, Mcp, McpWorkflowData, "mcp_registration");
-    impl_workflow_accessor!(
-        as_wasm_registration,
-        as_wasm_registration_mut,
-        WasmRegistration,
-        WasmRegistrationWorkflowData,
-        "wasm_module_registration"
-    );
-    impl_workflow_accessor!(
-        as_wasm_removal,
-        as_wasm_removal_mut,
-        WasmRemoval,
-        WasmRemovalWorkflowData,
-        "wasm_module_removal"
-    );
-
-    // ========================================================================
-    // Helper methods for shared worker steps
-    // ========================================================================
-
-    /// Get app_context from any workflow data type that has it.
-    #[must_use]
-    pub fn get_app_context(&self) -> Option<&Arc<AppContext>> {
-        match self {
-            AnyWorkflowData::Tokenizer(d) => d.app_context.as_ref(),
-            AnyWorkflowData::LocalWorker(d) => d.app_context.as_ref(),
-            AnyWorkflowData::ExternalWorker(d) => d.app_context.as_ref(),
-            AnyWorkflowData::WorkerRemoval(d) => d.app_context.as_ref(),
-            AnyWorkflowData::WorkerUpdate(d) => d.app_context.as_ref(),
-            AnyWorkflowData::Mcp(d) => d.app_context.as_ref(),
-            AnyWorkflowData::WasmRegistration(d) => d.app_context.as_ref(),
-            AnyWorkflowData::WasmRemoval(d) => d.app_context.as_ref(),
-        }
-    }
-
-    /// Get actual workers from local or external worker workflows.
-    #[must_use]
-    pub fn get_actual_workers(&self) -> Option<&Vec<Arc<dyn Worker>>> {
-        match self {
-            AnyWorkflowData::LocalWorker(d) => d.actual_workers.as_ref(),
-            AnyWorkflowData::ExternalWorker(d) => d.actual_workers.as_ref(),
-            _ => None,
-        }
-    }
-
-    /// Set actual workers for local or external worker workflows.
-    pub fn set_actual_workers(
-        &mut self,
-        workers: Vec<Arc<dyn Worker>>,
-    ) -> Result<(), WorkflowError> {
-        match self {
-            AnyWorkflowData::LocalWorker(d) => {
-                d.workers = Some(WorkerList::from_workers(&workers));
-                d.actual_workers = Some(workers);
-                Ok(())
-            }
-            AnyWorkflowData::ExternalWorker(d) => {
-                d.workers = Some(WorkerList::from_workers(&workers));
-                d.actual_workers = Some(workers);
-                Ok(())
-            }
-            _ => Err(WorkflowError::TypeMismatch {
-                expected: "LocalWorker or ExternalWorker",
-                actual: self.concrete_type(),
-            }),
-        }
-    }
-
-    /// Get labels for policy configuration (from local or external worker workflows).
-    #[must_use]
-    pub fn get_labels(&self) -> Option<&HashMap<String, String>> {
-        match self {
-            AnyWorkflowData::LocalWorker(d) => Some(&d.final_labels),
-            AnyWorkflowData::ExternalWorker(d) => Some(&d.labels),
-            _ => None,
-        }
-    }
-
-    /// Validate that all transient fields are properly initialized.
-    ///
-    /// Call this after deserializing workflow state to ensure runtime fields
-    /// have been repopulated.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        match self {
-            AnyWorkflowData::Tokenizer(d) => d.validate_initialized(),
-            AnyWorkflowData::LocalWorker(d) => d.validate_initialized(),
-            AnyWorkflowData::ExternalWorker(d) => d.validate_initialized(),
-            AnyWorkflowData::WorkerRemoval(d) => d.validate_initialized(),
-            AnyWorkflowData::WorkerUpdate(d) => d.validate_initialized(),
-            AnyWorkflowData::Mcp(d) => d.validate_initialized(),
-            AnyWorkflowData::WasmRegistration(d) => d.validate_initialized(),
-            AnyWorkflowData::WasmRemoval(d) => d.validate_initialized(),
-        }
     }
 }

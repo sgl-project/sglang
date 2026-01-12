@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use super::workflow_data::{AnyWorkflowData, WasmRemovalWorkflowData};
+use super::workflow_data::WasmRemovalWorkflowData;
 use crate::{
     app_context::AppContext,
     workflow::{
@@ -37,14 +37,14 @@ impl WasmModuleRemovalRequest {
 pub struct FindModuleToRemoveStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for FindModuleToRemoveStep {
+impl StepExecutor<WasmRemovalWorkflowData> for FindModuleToRemoveStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WasmRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_wasm_removal()?;
-        let removal_request = &data.config;
-        let app_context = data
+        let removal_request = &context.data.config;
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
@@ -80,8 +80,7 @@ impl StepExecutor<AnyWorkflowData> for FindModuleToRemoveStep {
         let module_uuid = removal_request.module_uuid;
 
         // Store the module ID in typed data
-        let data_mut = context.data.as_wasm_removal_mut()?;
-        data_mut.module_id = Some(module_uuid.to_string());
+        context.data.module_id = Some(module_uuid.to_string());
 
         info!("Module found for removal: {}", module_uuid);
         Ok(StepResult::Success)
@@ -98,14 +97,14 @@ impl StepExecutor<AnyWorkflowData> for FindModuleToRemoveStep {
 pub struct RemoveModuleStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for RemoveModuleStep {
+impl StepExecutor<WasmRemovalWorkflowData> for RemoveModuleStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WasmRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_wasm_removal()?;
-        let removal_request = &data.config;
-        let app_context = data
+        let removal_request = &context.data.config;
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
@@ -151,7 +150,7 @@ impl StepExecutor<AnyWorkflowData> for RemoveModuleStep {
 /// Workflow configuration:
 /// - FindModuleToRemove: No retry, 5s timeout (fast lookup)
 /// - RemoveModule: No retry, 5s timeout (fast removal)
-pub fn create_wasm_module_removal_workflow() -> WorkflowDefinition<AnyWorkflowData> {
+pub fn create_wasm_module_removal_workflow() -> WorkflowDefinition<WasmRemovalWorkflowData> {
     WorkflowDefinition::new("wasm_module_removal", "WASM Module Removal")
         .add_step(
             StepDefinition::new(
@@ -174,10 +173,10 @@ pub fn create_wasm_module_removal_workflow() -> WorkflowDefinition<AnyWorkflowDa
 pub fn create_wasm_removal_workflow_data(
     config: WasmModuleRemovalRequest,
     app_context: Arc<AppContext>,
-) -> AnyWorkflowData {
-    AnyWorkflowData::WasmRemoval(WasmRemovalWorkflowData {
+) -> WasmRemovalWorkflowData {
+    WasmRemovalWorkflowData {
         config,
         module_id: None,
         app_context: Some(app_context),
-    })
+    }
 }

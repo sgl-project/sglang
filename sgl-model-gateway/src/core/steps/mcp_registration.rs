@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use tracing::{debug, error, info, warn};
 
-use super::workflow_data::{AnyWorkflowData, McpWorkflowData};
+use super::workflow_data::McpWorkflowData;
 use crate::{
     app_context::AppContext,
     mcp::{config::McpServerConfig, manager::McpManager},
@@ -38,14 +38,14 @@ impl McpServerConfigRequest {
 pub struct ConnectMcpServerStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for ConnectMcpServerStep {
+impl StepExecutor<McpWorkflowData> for ConnectMcpServerStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<McpWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_mcp()?;
-        let config_request = &data.config;
-        let app_context = data
+        let config_request = &context.data.config;
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
@@ -76,8 +76,7 @@ impl StepExecutor<AnyWorkflowData> for ConnectMcpServerStep {
         );
 
         // Store client in typed data
-        let data_mut = context.data.as_mcp_mut()?;
-        data_mut.mcp_client = Some(Arc::new(client));
+        context.data.mcp_client = Some(Arc::new(client));
 
         Ok(StepResult::Success)
     }
@@ -96,18 +95,19 @@ impl StepExecutor<AnyWorkflowData> for ConnectMcpServerStep {
 pub struct DiscoverMcpInventoryStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for DiscoverMcpInventoryStep {
+impl StepExecutor<McpWorkflowData> for DiscoverMcpInventoryStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<McpWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_mcp()?;
-        let config_request = &data.config;
-        let app_context = data
+        let config_request = &context.data.config;
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let mcp_client = data
+        let mcp_client = context
+            .data
             .mcp_client
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_client".to_string()))?;
@@ -149,18 +149,19 @@ impl StepExecutor<AnyWorkflowData> for DiscoverMcpInventoryStep {
 pub struct RegisterMcpServerStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for RegisterMcpServerStep {
+impl StepExecutor<McpWorkflowData> for RegisterMcpServerStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<McpWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_mcp()?;
-        let config_request = &data.config;
-        let app_context = data
+        let config_request = &context.data.config;
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let mcp_client = data
+        let mcp_client = context
+            .data
             .mcp_client
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("mcp_client".to_string()))?
@@ -203,15 +204,13 @@ impl StepExecutor<AnyWorkflowData> for RegisterMcpServerStep {
 pub struct ValidateRegistrationStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for ValidateRegistrationStep {
+impl StepExecutor<McpWorkflowData> for ValidateRegistrationStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<McpWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_mcp()?;
-        let config_request = &data.config;
-
-        let client_registered = data.mcp_client.is_some();
+        let config_request = &context.data.config;
+        let client_registered = context.data.mcp_client.is_some();
 
         if client_registered {
             info!(
@@ -220,8 +219,7 @@ impl StepExecutor<AnyWorkflowData> for ValidateRegistrationStep {
             );
 
             // Mark as validated
-            let data_mut = context.data.as_mcp_mut()?;
-            data_mut.validated = true;
+            context.data.validated = true;
 
             return Ok(StepResult::Success);
         }
@@ -263,7 +261,7 @@ impl StepExecutor<AnyWorkflowData> for ValidateRegistrationStep {
 /// - DiscoverMcpInventory: 3 retries, 10s timeout (discovery + caching)
 /// - RegisterMcpServer: No retry, 5s timeout (fast registration)
 /// - ValidateRegistration: Final validation step
-pub fn create_mcp_registration_workflow() -> WorkflowDefinition<AnyWorkflowData> {
+pub fn create_mcp_registration_workflow() -> WorkflowDefinition<McpWorkflowData> {
     WorkflowDefinition::new("mcp_registration", "MCP Server Registration")
         .add_step(
             StepDefinition::new(
@@ -321,11 +319,11 @@ pub fn create_mcp_registration_workflow() -> WorkflowDefinition<AnyWorkflowData>
 pub fn create_mcp_workflow_data(
     config: McpServerConfigRequest,
     app_context: Arc<AppContext>,
-) -> AnyWorkflowData {
-    AnyWorkflowData::Mcp(McpWorkflowData {
+) -> McpWorkflowData {
+    McpWorkflowData {
         config,
         validated: false,
         app_context: Some(app_context),
         mcp_client: None,
-    })
+    }
 }
