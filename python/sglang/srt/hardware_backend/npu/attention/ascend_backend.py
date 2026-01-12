@@ -212,6 +212,11 @@ class AscendAttnBackend(AttentionBackend):
             self.q_head_dim = (
                 self.qk_rope_head_dim + model_runner.model_config.qk_nope_head_dim
             )
+        else:
+            if hasattr(
+                model_runner.model_config, "use_sdpa"
+            ):
+                self.use_sdpa = True
         self.native_attn = TorchNativeAttnBackend(model_runner)
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
@@ -647,6 +652,21 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             else:
+                if hasattr(self, "use_sdpa"):
+                    use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+                    attn_output = torch.nn.functional.scaled_dot_product_attention(
+                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).unsqueeze(0).transpose(1, 2),
+                        k.view(-1, layer.tp_k_head_num, layer.qk_head_dim).unsqueeze(0).transpose(1, 2),
+                        v.view(-1, layer.tp_k_head_num, layer.v_head_dim).unsqueeze(0).transpose(1, 2),
+                        attn_mask=None,
+                        dropout_p=0.0,
+                        enable_gqa=use_gqa,
+                        scale=layer.scaling,
+                        is_causal=True,
+                    )
+                    attn_output = attn_output.transpose(1, 2).contiguous()
+                    attn_output = attn_output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).contiguous().squeeze(0)
+                    return attn_output
                 if layer.qk_head_dim <= 128:
                     query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
                     attn_output = torch.empty(
