@@ -907,8 +907,8 @@ class ForwardBatch:
                 self.mamba_track_seqlens, bs
             )
 
-        if self.mrope_positions is not None:
-            self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
+        # if self.mrope_positions is not None:
+        #     self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
 
         # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:
