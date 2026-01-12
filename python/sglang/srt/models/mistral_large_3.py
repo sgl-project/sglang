@@ -1,5 +1,5 @@
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/mistral_large_3.py
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 
 import regex as re
@@ -71,9 +71,6 @@ class MistralLarge3ForCausalLM(DeepseekV3ForCausalLM):
                 name = re.sub(r"\.qscale_act$", ".input_scale", name)
             elif name.endswith(".qscale_weight"):
                 name = re.sub(r"\.qscale_weight$", ".weight_scale", name)
-
-            if name.endswith(".weight_scale") and ".experts." not in name:
-                name = re.sub(r"\.weight_scale$", ".weight_scale_inv", name)
 
             yield name, loaded_weight
 
