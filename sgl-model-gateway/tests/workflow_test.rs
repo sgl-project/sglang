@@ -649,7 +649,10 @@ fn test_dag_validation_cycle_detection() {
 
     let result = workflow.validate();
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("Cycle detected"));
+    assert!(matches!(
+        result.unwrap_err(),
+        ValidationError::CycleDetected(_)
+    ));
 }
 
 #[test]
@@ -668,7 +671,10 @@ fn test_dag_validation_missing_dependency() {
 
     let result = workflow.validate();
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("non-existent step"));
+    assert!(matches!(
+        result.unwrap_err(),
+        ValidationError::MissingDependency { .. }
+    ));
 }
 
 #[test]

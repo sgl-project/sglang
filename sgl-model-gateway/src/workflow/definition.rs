@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     sync::Arc,
     time::Duration,
 };
@@ -10,6 +11,18 @@ use super::{
     executor::StepExecutor,
     types::{FailureAction, RetryPolicy, StepId, WorkflowData, WorkflowId},
 };
+
+/// Errors that can occur during workflow validation
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ValidationError {
+    /// A step depends on another step that doesn't exist
+    #[error("Step '{step}' depends on non-existent step '{dependency}'")]
+    MissingDependency { step: StepId, dependency: StepId },
+
+    /// A cycle was detected in the workflow DAG
+    #[error("Cycle detected involving step '{0}'")]
+    CycleDetected(StepId),
+}
 
 /// Definition of a single step within a workflow
 pub struct StepDefinition<D: WorkflowData> {
@@ -20,6 +33,19 @@ pub struct StepDefinition<D: WorkflowData> {
     pub timeout: Option<Duration>,
     pub on_failure: FailureAction,
     pub depends_on: Vec<StepId>,
+}
+
+impl<D: WorkflowData> fmt::Debug for StepDefinition<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StepDefinition")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("retry_policy", &self.retry_policy)
+            .field("timeout", &self.timeout)
+            .field("on_failure", &self.on_failure)
+            .field("depends_on", &self.depends_on)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<D: WorkflowData> StepDefinition<D> {
@@ -76,6 +102,18 @@ pub struct WorkflowDefinition<D: WorkflowData> {
     initial_step_indices: Vec<usize>,
 }
 
+impl<D: WorkflowData> fmt::Debug for WorkflowDefinition<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkflowDefinition")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("steps", &self.steps)
+            .field("default_retry_policy", &self.default_retry_policy)
+            .field("default_timeout", &self.default_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<D: WorkflowData> WorkflowDefinition<D> {
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
@@ -122,7 +160,8 @@ impl<D: WorkflowData> WorkflowDefinition<D> {
     /// - There's a cycle in the dependencies
     ///
     /// On success, pre-computes reverse dependencies for O(1) dependent lookup.
-    pub fn validate(&mut self) -> Result<(), String> {
+    #[must_use = "validation result should be checked"]
+    pub fn validate(&mut self) -> Result<(), ValidationError> {
         // Build HashMap for O(1) lookup instead of O(n) linear search
         let steps_map: HashMap<&StepId, &StepDefinition<D>> =
             self.steps.iter().map(|s| (&s.id, s)).collect();
@@ -131,10 +170,10 @@ impl<D: WorkflowData> WorkflowDefinition<D> {
         for step in &self.steps {
             for dep in &step.depends_on {
                 if !steps_map.contains_key(dep) {
-                    return Err(format!(
-                        "Step '{}' depends on non-existent step '{}'",
-                        step.id, dep
-                    ));
+                    return Err(ValidationError::MissingDependency {
+                        step: step.id.clone(),
+                        dependency: dep.clone(),
+                    });
                 }
             }
         }
@@ -147,7 +186,7 @@ impl<D: WorkflowData> WorkflowDefinition<D> {
             if !visited.contains(&step.id)
                 && Self::has_cycle(&step.id, &steps_map, &mut visited, &mut rec_stack)
             {
-                return Err(format!("Cycle detected involving step '{}'", step.id));
+                return Err(ValidationError::CycleDetected(step.id.clone()));
             }
         }
 
