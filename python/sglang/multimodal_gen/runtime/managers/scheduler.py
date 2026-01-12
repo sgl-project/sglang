@@ -228,8 +228,7 @@ class Scheduler:
             warmup_req.num_inference_steps = 1
             recv_reqs.insert(0, (identity, warmup_req))
             self._warmup_total = 1
-            self._warmup_processed = 1
-            logger.info("Processing warmup req... (1/1)")
+            self._warmup_processed = 0
             self.warmed_up = True
         return recv_reqs
 
@@ -359,6 +358,7 @@ class Scheduler:
                     processed_req.is_warmup if isinstance(processed_req, Req) else False
                 )
                 if is_warmup:
+                    self._warmup_processed += 1
                     if output_batch.error is None:
                         if self._warmup_total > 0:
                             logger.info(
