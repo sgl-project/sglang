@@ -4786,7 +4786,7 @@ class ServerArgs:
 
         if self.enable_lora:
             # Validate compatibility with speculative decoding
-            if self.speculative_algorithm not in ["NGRAM", None]:
+            if self.speculative_algorithm not in ["NGRAM", "SUFFIX", None]:
                 raise ValueError(
                     "Currently LoRA is only compatible with NGRAM speculative decoding."
                 )
