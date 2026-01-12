@@ -281,3 +281,28 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
         _warned_bool_env_var_keys.add(value)
 
     return value in truthy_values
+
+
+try:
+    import sgl_kernel  # noqa: F401
+
+    is_intel_amx_backend_available = hasattr(
+        torch.ops.sgl_kernel, "convert_weight_packed"
+    )
+except:
+    is_intel_amx_backend_available = False
+
+try:
+    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
+    # to support torch compile
+    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
+except:
+    is_amx_tile_supported = False
+
+
+def cpu_has_amx_support():
+    return is_amx_tile_supported and is_intel_amx_backend_available
+
+
+def use_intel_amx_backend(layer):
+    return getattr(layer, "use_intel_amx_backend", False)

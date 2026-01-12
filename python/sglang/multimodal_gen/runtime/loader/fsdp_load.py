@@ -255,6 +255,7 @@ def load_model_from_full_model_state_dict(
     )  # type: ignore
     for target_param_name, full_tensor in custom_param_sd.items():
         meta_sharded_param = meta_sd.get(target_param_name)
+        meta_sharded_param_dtype = meta_sharded_param.dtype
         if meta_sharded_param is None:
             if strict:
                 raise ValueError(
@@ -266,7 +267,7 @@ def load_model_from_full_model_state_dict(
                 )
                 continue
         if not hasattr(meta_sharded_param, "device_mesh"):
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
+            full_tensor = full_tensor.to(device=device, dtype=meta_sharded_param_dtype)
             actual_param = param_dict.get(target_param_name)
             weight_loader = (
                 getattr(actual_param, "weight_loader", None)
@@ -275,7 +276,7 @@ def load_model_from_full_model_state_dict(
             )
             if weight_loader is not None:
                 sharded_tensor = torch.empty_like(
-                    meta_sharded_param, device=device, dtype=param_dtype
+                    meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
                 )
                 temp_param = nn.Parameter(sharded_tensor)
                 for attr in ["output_dim", "input_dim", "is_sharded_weight"]:
@@ -286,7 +287,7 @@ def load_model_from_full_model_state_dict(
             else:
                 sharded_tensor = full_tensor
         else:
-            full_tensor = full_tensor.to(device=device, dtype=param_dtype)
+            full_tensor = full_tensor.to(device=device, dtype=meta_sharded_param_dtype)
             sharded_tensor = distribute_tensor(
                 full_tensor,
                 meta_sharded_param.device_mesh,
@@ -294,6 +295,8 @@ def load_model_from_full_model_state_dict(
             )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
+        if target_param_name == "proj_out.weight_scale_inv":
+            sharded_tensor = sharded_tensor.unsqueeze(0)
         sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
@@ -315,15 +318,16 @@ def load_model_from_full_model_state_dict(
                 f"Currently only parameters containing {ALLOWED_NEW_PARAM_PATTERNS} are allowed."
             )
         meta_sharded_param = meta_sd.get(new_param_name)
+        meta_sharded_param_dtype = meta_sharded_param.dtype
         if not hasattr(meta_sharded_param, "device_mesh"):
             # Initialize with zeros
             sharded_tensor = torch.zeros_like(
-                meta_sharded_param, device=device, dtype=param_dtype
+                meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
             )
         else:
             # Initialize with zeros and distribute
             full_tensor = torch.zeros_like(
-                meta_sharded_param, device=device, dtype=param_dtype
+                meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
             )
             sharded_tensor = distribute_tensor(
                 full_tensor,

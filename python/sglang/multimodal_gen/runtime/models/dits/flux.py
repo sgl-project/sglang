@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     apply_flashinfer_rope_qk_inplace,
@@ -81,6 +82,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         out_dim: int = None,
         context_pre_only: Optional[bool] = None,
         pre_only: bool = False,
+        quant_config: QuantizationConfig = None,
     ):
         super().__init__()
 
@@ -100,20 +102,36 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
         self.to_q = ColumnParallelLinear(
-            query_dim, self.inner_dim, bias=bias, gather_output=True
+            query_dim,
+            self.inner_dim,
+            bias=bias,
+            gather_output=True,
+            quant_config=quant_config,
         )
         self.to_k = ColumnParallelLinear(
-            query_dim, self.inner_dim, bias=bias, gather_output=True
+            query_dim,
+            self.inner_dim,
+            bias=bias,
+            gather_output=True,
+            quant_config=quant_config,
         )
         self.to_v = ColumnParallelLinear(
-            query_dim, self.inner_dim, bias=bias, gather_output=True
+            query_dim,
+            self.inner_dim,
+            bias=bias,
+            gather_output=True,
+            quant_config=quant_config,
         )
 
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
             self.to_out.append(
                 ColumnParallelLinear(
-                    self.inner_dim, self.out_dim, bias=out_bias, gather_output=True
+                    self.inner_dim,
+                    self.out_dim,
+                    bias=out_bias,
+                    gather_output=True,
+                    quant_config=quant_config,
                 )
             )
             if dropout != 0.0:
@@ -127,21 +145,28 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 self.inner_dim,
                 bias=added_proj_bias,
                 gather_output=True,
+                quant_config=quant_config,
             )
             self.add_k_proj = ColumnParallelLinear(
                 added_kv_proj_dim,
                 self.inner_dim,
                 bias=added_proj_bias,
                 gather_output=True,
+                quant_config=quant_config,
             )
             self.add_v_proj = ColumnParallelLinear(
                 added_kv_proj_dim,
                 self.inner_dim,
                 bias=added_proj_bias,
                 gather_output=True,
+                quant_config=quant_config,
             )
             self.to_add_out = ColumnParallelLinear(
-                self.inner_dim, query_dim, bias=out_bias, gather_output=True
+                self.inner_dim,
+                query_dim,
+                bias=out_bias,
+                gather_output=True,
+                quant_config=quant_config,
             )
 
         self.attn = USPAttention(
@@ -223,17 +248,26 @@ class FluxSingleTransformerBlock(nn.Module):
         num_attention_heads: int,
         attention_head_dim: int,
         mlp_ratio: float = 4.0,
+        quant_config: QuantizationConfig = None,
     ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         self.norm = AdaLayerNormZeroSingle(dim)
         self.proj_mlp = ColumnParallelLinear(
-            dim, self.mlp_hidden_dim, bias=True, gather_output=True
+            dim,
+            self.mlp_hidden_dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
         )
         self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = ColumnParallelLinear(
-            dim + self.mlp_hidden_dim, dim, bias=True, gather_output=True
+            dim + self.mlp_hidden_dim,
+            dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
         )
 
         self.attn = FluxAttention(
@@ -244,6 +278,7 @@ class FluxSingleTransformerBlock(nn.Module):
             bias=True,
             eps=1e-6,
             pre_only=True,
+            quant_config=quant_config,
         )
 
     def forward(
@@ -291,6 +326,7 @@ class FluxTransformerBlock(nn.Module):
         attention_head_dim: int,
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
+        quant_config: QuantizationConfig = None,
     ):
         super().__init__()
 
@@ -306,17 +342,26 @@ class FluxTransformerBlock(nn.Module):
             context_pre_only=False,
             bias=True,
             eps=eps,
+            quant_config=quant_config,
         )
 
         self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.ff = MLP(
-            input_dim=dim, mlp_hidden_dim=dim * 4, output_dim=dim, act_type="gelu"
+            input_dim=dim,
+            mlp_hidden_dim=dim * 4,
+            output_dim=dim,
+            act_type="gelu",
+            quant_config=quant_config,
         )
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
         self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.ff_context = MLP(
-            input_dim=dim, mlp_hidden_dim=dim * 4, output_dim=dim, act_type="gelu"
+            input_dim=dim,
+            mlp_hidden_dim=dim * 4,
+            output_dim=dim,
+            act_type="gelu",
+            quant_config=quant_config,
         )
 
         self.ff_context = FeedForward(
@@ -417,7 +462,12 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     param_names_mapping = FluxConfig().arch_config.param_names_mapping
 
-    def __init__(self, config: FluxConfig, hf_config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: FluxConfig,
+        hf_config: dict[str, Any],
+        quant_config: QuantizationConfig = None,
+    ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         self.config = config.arch_config
 
@@ -455,6 +505,7 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     dim=self.inner_dim,
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
+                    quant_config=quant_config,
                 )
                 for _ in range(self.config.num_layers)
             ]
@@ -466,6 +517,7 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     dim=self.inner_dim,
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
+                    quant_config=quant_config,
                 )
                 for _ in range(self.config.num_single_layers)
             ]
@@ -479,6 +531,7 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             self.config.patch_size * self.config.patch_size * self.out_channels,
             bias=True,
             gather_output=True,
+            quant_config=quant_config,
         )
 
         self.layer_names = [
