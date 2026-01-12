@@ -42,6 +42,7 @@ _ENABLE_DP_ATTENTION_FLAG: bool = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+prefill_padding_max = get_bool_env_var("PREFILL_PADDING_MAX")
 
 
 class DpPaddingMode(IntEnum):
@@ -62,8 +63,10 @@ class DpPaddingMode(IntEnum):
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
         if is_extend_in_batch:
-            return DpPaddingMode.SUM_LEN
-
+            if prefill_padding_max:
+                return DpPaddingMode.MAX_LEN
+            else:
+                return DpPaddingMode.SUM_LEN
         # we choose the mode that minimizes the communication cost
         max_len = max(global_num_tokens)
         sum_len = sum(global_num_tokens)

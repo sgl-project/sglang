@@ -1874,7 +1874,7 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         if (
-            not self.chunked_req
+            (not self.chunked_req and not chunked_back)
             and self.schedule_enhancer
             and not self.schedule_enhancer.get_schedule_decision(
                 self.running_batch, self.max_prefill_bs

@@ -59,6 +59,7 @@ class NgramVerifyInput(SpecInput):
         retrive_next_token: torch.Tensor,
         retrive_next_sibling: torch.Tensor,
         draft_token_num: int,
+        accept_length: torch.Tensor = None,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
@@ -69,11 +70,30 @@ class NgramVerifyInput(SpecInput):
         self.retrive_next_sibling = retrive_next_sibling
         self.draft_token_num = draft_token_num
         self.device = self.custom_mask.device
+        self.accept_length = accept_length
+
+    @classmethod
+    def create_idle_input(
+        cls,
+        draft_token_num: int,
+        device: torch.device,
+    ):
+        return cls(
+            draft_token=torch.empty((0,), device=device, dtype=torch.int64),
+            tree_mask=torch.empty((0,), device=device, dtype=torch.bool),
+            positions=torch.empty((0,), device=device, dtype=torch.int64),
+            retrive_index=torch.empty((0,), device=device, dtype=torch.int64),
+            retrive_next_token=torch.empty((0,), device=device, dtype=torch.int64),
+            retrive_next_sibling=torch.empty((0,), device=device, dtype=torch.int64),
+            draft_token_num=draft_token_num,
+            accept_length=torch.empty((0,), device=device, dtype=torch.int32),
+        )
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
+        self.num_tokens_per_batch = self.draft_token_num + 1
         if batch.forward_mode.is_idle():
             return
 
@@ -264,7 +284,6 @@ class NgramVerifyInput(SpecInput):
                     tgt_cache_loc, src_cache_loc
                 )
 
-
             batch.out_cache_loc = tgt_cache_loc
 
         accept_length_list = accept_length_cpu.tolist()
@@ -386,6 +405,11 @@ class NgramVerifyInput(SpecInput):
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
     ) -> torch.Tensor:
+
+        if batch.forward_mode.is_idle():
+            self.verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+            return logits_output, self.verified_id, 0
+
         bs = self.retrive_index.shape[0]
         sampling_info = batch.sampling_info
 
@@ -426,11 +450,11 @@ class NgramVerifyInput(SpecInput):
         is_all_greedy = (
             sampling_info.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
         )
-        if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
-            logger.warning(
-                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
-                "Falling back to greedy verification."
-            )
+        # if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
+        #     logger.warning(
+        #         "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
+        #         "Falling back to greedy verification."
+        #     )
 
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             self._greedy_verify(batch, logits_output)

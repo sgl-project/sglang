@@ -235,9 +235,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
-        if is_npu():
-            layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
-            layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
@@ -303,6 +300,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             layer.w2_weight.data = layer.w2_weight.data.reshape(
                 layer.num_local_experts, *new_shape_w2
             )
+
+        if _is_npu:
+            import torch_npu
+
+            tmp = torch_npu.npu_format_cast(layer.w13_weight.data, 29)
+            layer.w13_weight.data.untyped_storage().resize_(0)
+            layer.w13_weight.data = tmp
+            tmp2 = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
+            layer.w2_weight.data.untyped_storage().resize_(0)
+            layer.w2_weight.data = tmp2
 
         return
 
@@ -481,23 +488,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         topk_ids = topk_ids.to(torch.int32)
         num_experts = layer.num_experts
         top_k = layer.top_k
-        row_idx_len = num_tokens * top_k
-        row_idx = (
-            torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
-            .view(top_k, -1)
-            .permute(1, 0)
-            .contiguous()
-        )
 
-        hidden_states, expanded_row_idx, expanded_expert_idx = (
-            torch_npu.npu_moe_init_routing(
-                x, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
+        hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
+            torch_npu.npu_moe_init_routing_v2(
+                x,
+                topk_ids,
+                active_num=num_tokens * top_k,
+                expert_num=num_experts,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                quant_mode=-1,
+                active_expert_range=[0, num_experts],
             )
         )
 
-        expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
-            expanded_expert_idx, num_experts
-        )
+        expanded_row_idx = expanded_row_idx.view(-1, top_k).permute(1, 0).reshape(-1)
 
         expert_tokens = expert_tokens.to(torch.int64)
         if layer.w13_weight.shape[-1] == layer.hidden_size:
@@ -509,7 +514,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             x=[hidden_states],
             weight=[w13],
             split_item=2,
-            group_list_type=0,
+            group_list_type=1,
             group_type=0,
             group_list=expert_tokens,
             output_dtype=original_dtype,
@@ -528,7 +533,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             x=[hidden_states],
             weight=[w2],
             split_item=2,
-            group_list_type=0,
+            group_list_type=1,
             group_type=0,
             group_list=expert_tokens,
             output_dtype=original_dtype,
