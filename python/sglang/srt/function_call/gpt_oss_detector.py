@@ -67,7 +67,8 @@ class GptOssDetector(BaseFormatDetector):
                     calls.append(tool_call)
                     tool_index += 1
             elif event.event_type == "normal":
-                normal_parts.append(event.content)
+                if not calls:
+                    normal_parts.append(event.content)
             # Ignore reasoning events in function call context
 
         normal_text = " ".join(normal_parts).strip()
@@ -109,6 +110,7 @@ class GptOssDetector(BaseFormatDetector):
         if (
             "<|channel|>commentary to=" not in self._buffer
             and not self.current_tool_name_sent
+            and self.current_tool_id == -1
         ):
             # No tool calls detected, check for final content
             if (
@@ -187,7 +189,8 @@ class GptOssDetector(BaseFormatDetector):
                     self.current_tool_name_sent = False
 
             elif event.event_type == "normal":
-                normal_text += event.content
+                if self.current_tool_id == -1:
+                    normal_text += event.content
 
         # Clear buffer since HarmonyParser handles buffering
         self._buffer = ""
