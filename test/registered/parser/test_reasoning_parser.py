@@ -10,12 +10,11 @@ from sglang.srt.parser.reasoning_parser import (
     StreamingParseResult,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 
-class TestStreamingParseResult(CustomTestCase):
+class TestStreamingParseResult(unittest.TestCase):
     def test_init_default(self):
         """Test default initialization of StreamingParseResult."""
         result = StreamingParseResult()
@@ -29,7 +28,7 @@ class TestStreamingParseResult(CustomTestCase):
         self.assertEqual(result.reasoning_text, "reasoning")
 
 
-class TestBaseReasoningFormatDetector(CustomTestCase):
+class TestBaseReasoningFormatDetector(unittest.TestCase):
     def setUp(self):
         self.detector = BaseReasoningFormatDetector(
             think_start_token="<think>",
@@ -151,7 +150,7 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "normal")
 
 
-class TestDeepSeekR1Detector(CustomTestCase):
+class TestDeepSeekR1Detector(unittest.TestCase):
     def setUp(self):
         self.detector = DeepSeekR1Detector()
 
@@ -193,7 +192,7 @@ class TestDeepSeekR1Detector(CustomTestCase):
         self.assertEqual(result.normal_text, "The answer is 42.")
 
 
-class TestQwen3Detector(CustomTestCase):
+class TestQwen3Detector(unittest.TestCase):
     def setUp(self):
         self.detector = Qwen3Detector()
 
@@ -219,7 +218,7 @@ class TestQwen3Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
 
 
-class TestQwen3ForcedReasoningDetector(CustomTestCase):
+class TestQwen3ForcedReasoningDetector(unittest.TestCase):
     def setUp(self):
         self.detector = Qwen3Detector(force_reasoning=True)
 
@@ -265,7 +264,7 @@ class TestQwen3ForcedReasoningDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "The answer is 42.")
 
 
-class TestKimiDetector(CustomTestCase):
+class TestKimiDetector(unittest.TestCase):
     def setUp(self):
         self.detector = KimiDetector()
 
@@ -314,7 +313,7 @@ class TestKimiDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "answer")
 
 
-class TestReasoningParser(CustomTestCase):
+class TestReasoningParser(unittest.TestCase):
     def test_init_valid_model(self):
         """Test initialization with valid model types."""
         parser = ReasoningParser("deepseek-r1")
@@ -385,7 +384,7 @@ class TestReasoningParser(CustomTestCase):
         self.assertTrue(parser.detector.stream_reasoning)
 
 
-class TestIntegrationScenarios(CustomTestCase):
+class TestIntegrationScenarios(unittest.TestCase):
     """Integration tests for realistic usage scenarios."""
 
     def test_deepseek_r1_complete_response(self):
@@ -491,7 +490,7 @@ class TestIntegrationScenarios(CustomTestCase):
         self.assertIn("final answer", all_normal)
 
 
-class TestBufferLossBugFix(CustomTestCase):
+class TestBufferLossBugFix(unittest.TestCase):
     """Test cases for the buffer loss bug fix in parse_streaming_increment."""
 
     def test_partial_end_tag_buffer_loss_bug(self):
@@ -603,7 +602,7 @@ class TestBufferLossBugFix(CustomTestCase):
         self.assertTrue(detector.stripped_think_start)
 
 
-class TestGptOssDetector(CustomTestCase):
+class TestGptOssDetector(unittest.TestCase):
     """Test cases for GptOssDetector, including fix for tool_choice='required' bug."""
 
     def setUp(self):
@@ -705,6 +704,118 @@ class TestGptOssDetector(CustomTestCase):
         result = self.detector.parse_streaming_increment(' {"tool": "test"}')
         self.assertEqual(result.reasoning_text, "")
         self.assertEqual(result.normal_text, ' {"tool": "test"}')
+
+    def test_tool_call_not_leak_to_normal_text(self):
+        """Test that tool_call events do not leak into normal_text.
+
+        This test verifies the fix for a bug where tool_call events from HarmonyParser
+        were incorrectly added to normal_parts in GptOssDetector, causing tool call
+        content to appear in both reasoning/normal content AND tool_calls field.
+
+        The bug manifested when model output contained:
+        1. <|channel|>analysis block (reasoning)
+        2. <|channel|>commentary block with tool call
+
+        Expected behavior:
+        - Reasoning content appears in reasoning_text
+        - Tool call content does NOT appear in normal_text (handled by function_call detector)
+        """
+        # Model output with analysis block followed by tool call
+        model_output = (
+            "<|channel|>analysis<|message|>The user says they got error because "
+            "previous response didn't use a tool. Indeed, I responded with "
+            "attempt_completion directly, but the system expects a tool call. "
+            "I should call attempt_completion now, as the task is complete. "
+            "The prior attempt was not via tool. So I need to call attempt_completion "
+            "tool with final result.\n\nLet's do that.<|end|><|start|>assistant"
+            "<|channel|>commentary to=functions.attempt_completion <|constrain|>json"
+            '<|message|>{"result": "已完成待办事项工具的完整测试：创建待办列表、'
+            '逐步更新状态直至全部标记为完成。"}<|call|>'
+        )
+
+        # Parse with reasoning parser
+        result = self.detector.detect_and_parse(model_output)
+
+        # Expected: reasoning_text should contain analysis content
+        self.assertIn(
+            "The user says they got error",
+            result.reasoning_text,
+            "Analysis content should be in reasoning_text",
+        )
+
+        # With detect_and_parse (one-shot), tool call content should NOT be in normal_text
+        # because it comes after reasoning content
+        # This prevents duplication when both reasoning and tool call are present
+        self.assertNotIn(
+            "已完成待办事项工具的完整测试",
+            result.normal_text,
+            "Tool call content should NOT be in normal_text in one-shot parsing",
+        )
+        self.assertNotIn(
+            "attempt_completion",
+            result.normal_text,
+            "Tool call structural markers should NOT be in normal_text in one-shot parsing",
+        )
+        self.assertNotIn(
+            "<|channel|>commentary",
+            result.normal_text,
+            "Tool call channel markers should NOT be in normal_text",
+        )
+
+    def test_tool_call_not_leak_in_streaming(self):
+        """Test streaming parsing to ensure tool_call doesn't leak to normal_text.
+
+        This test verifies the bug fix in streaming mode where tool_call events
+        from HarmonyParser were incorrectly added to normal_parts incrementally.
+        """
+        # Chunk 1: Analysis block (reasoning)
+        chunk1 = (
+            "<|channel|>analysis<|message|>The user says they got error because "
+            "previous response didn't use a tool. Indeed, I responded with "
+            "attempt_completion directly, but the system expects a tool call. "
+            "I should call attempt_completion now, as the task is complete. "
+            "The prior attempt was not via tool. So I need to call attempt_completion "
+            "tool with final result.\n\nLet's do that.<|end|>"
+        )
+
+        result1 = self.detector.parse_streaming_increment(chunk1)
+
+        # Chunk 1 should emit reasoning content
+        self.assertIn(
+            "The user says they got error",
+            result1.reasoning_text,
+            "Chunk 1 should contain reasoning text",
+        )
+        # With stream_reasoning=True, reasoning content is returned immediately
+        # and normal_text should be empty
+        self.assertEqual(result1.normal_text, "", "Chunk 1 normal_text should be empty")
+
+        # Chunk 2: Tool call (standalone after reasoning)
+        # With stream_reasoning=True, tool call raw_text should be in normal_text
+        # because there's no reasoning in this chunk
+        chunk2 = (
+            "<|start|>assistant<|channel|>commentary to=functions.attempt_completion "
+            '<|constrain|>json<|message|>{"result": "已完成待办事项工具的完整测试：'
+            '创建待办列表、 逐步更新状态直至全部标记为完成。"}<|call|>'
+        )
+
+        result2 = self.detector.parse_streaming_increment(chunk2)
+
+        # With stream_reasoning=True, tool call content IS expected in normal_text
+        # so function_call detector can parse it
+        self.assertIn(
+            "已完成待办事项工具的完整测试",
+            result2.normal_text,
+            "Chunk 2: Tool call content should be in normal_text with stream_reasoning=True",
+        )
+        self.assertIn(
+            "attempt_completion",
+            result2.normal_text,
+            "Chunk 2: Tool call markers should be in normal_text with stream_reasoning=True",
+        )
+        self.assertEqual(
+            result2.reasoning_text, "", "Chunk 2 reasoning_text should be empty"
+        )
 
 
 if __name__ == "__main__":
