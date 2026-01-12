@@ -24,6 +24,54 @@ if _use_aiter_gfx95:
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
+# Configs for DeepSeek-V3:
+# num_local_heads = 128
+# qk_nope_head_dim = 128
+# qk_rope_head_dim = 64
+# qk_head_dim = qk_nope_head_dim + qk_rope_head_dim = 192
+# v_head_dim = 128
+
+# Configs for kv chunking strategy:
+# sum_prefix_length:
+#   Total number of tokens to be fetched from kv cache for current batch.
+#   e.g: For batch with 2 sequences, seq_lens_kv = [1024, 2048], seq_lens_q = [512, 1024], then sum_prefix_length = (1024 - 512) + (2048 - 1024) = 1536
+# sum_extended_length:
+#   Total number of tokens in the extended part of the current batch. (=sum(seq_lens_q))
+# chunked_prefix_cache_threshold:
+#   The minimum sum_prefix_length to enable mha with kv chunking, 8192 by default (can be changed with SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD)
+#   For batches with smaller sum_prefix_length > 0, MLA kernel with absorption will be used instead.
+# max_kv_chunk_capacity:
+#   The maximum number of tokens in each kv chunk, 128 * 1024 by default (can be get with forward_batch.get_max_chunk_capacity())
+
+# The forward methods for MHA in DeepSeek models:
+#
+# 1. forward_normal: AttnForwardMethod.MHA
+#    use multi-head attention with empty kv cache (the first batch of chunked prefill, prefix lens = 0)
+#    q: [sum_extended_length, num_local_heads, qk_head_dim]
+#    k: [sum_extended_length, num_local_heads, qk_head_dim]
+#    v: [sum_extended_length, num_local_heads, v_head_dim]
+#
+# 2. forward_normal_one_shot: AttnForwardMethod.MHA_ONE_SHOT
+#    use multi-head attention with short kv prefix length (chunked_prefix_cache_threshold <= sum_prefix_lens <= max_kv_chunk_capacity)
+#    the kv latent vectors are fetched from memory pool, with combined kv_indices of prefix part and extended part
+#    q: [batch_size, num_local_heads, qk_head_dim]
+#    k: [sum_extended_length + sum_prefix_length, num_local_heads, qk_head_dim]
+#    v: [sum_extended_length + sum_prefix_length, num_local_heads, v_head_dim]
+#
+# 3. forward_normal_chunked_kv: AttnForwardMethod.MHA_CHUNKED_KV
+#    multiple phases of multi-head attention with chunked kv cache (sum_prefix_length > max_kv_chunk_capacity)
+#    For the first phase, it will execute normal forward method, and returns output o_1 and lse_1,
+#       q_1: [sum_extended_length, num_local_heads, qk_head_dim],
+#       k_1: [sum_extended_length, num_local_heads, qk_head_dim],
+#       v_1: [sum_extended_length, num_local_heads, qk_head_dim],
+#       acc_o_1, acc_lse_1 = o_1, lse_1
+#    For i in range(2, n), (n-1 is the number of prefix chunks), kv latent vectors are fetched from memory pool with prefix kv indices
+#       q_i: [sum_extended_length, num_local_heads, qk_head_dim],
+#       k_i: [chunk_size, num_local_heads, qk_head_dim],
+#       v_i: [chunk_size, num_local_heads, v_head_dim],
+#       acc_o_i, acc_lse_i = merge_state(acc_o_{i-1}, acc_lse_{i-1}, o_i, lse_i)
+#       The final output is the accumulated output acc_o_n
+
 
 class DeepseekMHAForwardMixin:
 
@@ -139,7 +187,7 @@ class DeepseekMHAForwardMixin:
         ):
             if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
                 # FP8 path: dequantize NSA-specific FP8 format to BF16
-                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8(forward_batch)
+                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
                 kv_a, k_pe = self._get_mla_kv_buffer(
@@ -350,7 +398,7 @@ class DeepseekMHAForwardMixin:
             kv_a = kv_a.squeeze(1).contiguous()
         return kv_a, k_pe
 
-    def _get_mla_kv_buffer_from_fp8(
+    def _get_mla_kv_buffer_from_fp8_for_nsa(
         self,
         forward_batch: ForwardBatch,
     ):
