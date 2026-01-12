@@ -279,14 +279,16 @@ class CudaGraphRunner:
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
             or model_runner.spec_algorithm.is_ngram()
+            or model_runner.spec_algorithm.is_dflash()
         ):
             if self.model_runner.is_draft_worker:
-                raise RuntimeError("This should not happen")
-            else:
-                self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-                self.num_tokens_per_bs = (
-                    self.model_runner.server_args.speculative_num_draft_tokens
-                )
+                # EAGLE/standalone/ngram draft workers use separate cuda-graph runners; do not
+                # capture TARGET_VERIFY graphs here. DFLASH draft uses a fixed-size block and
+                # reuses TARGET_VERIFY graphs for performance.
+                if not self.model_runner.spec_algorithm.is_dflash():
+                    raise RuntimeError("This should not happen")
+            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+            self.num_tokens_per_bs = self.model_runner.server_args.speculative_num_draft_tokens
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -354,6 +356,15 @@ class CudaGraphRunner:
             and model_runner.eagle_use_aux_hidden_state
         ):
             self.model_runner.model.set_eagle3_layers_to_capture()
+        if model_runner.spec_algorithm.is_dflash() and model_runner.dflash_use_aux_hidden_state:
+            if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
+                raise ValueError(
+                    f"Model {self.model_runner.model.__class__.__name__} does not implement set_dflash_layers_to_capture, "
+                    "which is required for DFLASH aux hidden capture."
+                )
+            self.model_runner.model.set_dflash_layers_to_capture(
+                self.model_runner.dflash_target_layer_ids
+            )
 
         # Capture
         try:
@@ -706,6 +717,12 @@ class CudaGraphRunner:
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                 )
+            if (
+                self.model_runner.spec_algorithm.is_dflash()
+                and self.model_runner.is_draft_worker
+                and "input_embeds" in inspect.signature(forward).parameters
+            ):
+                kwargs["input_embeds"] = buffers.input_embeds[:num_tokens]
 
             logits_output_or_pp_proxy_tensors = forward(
                 input_ids,
@@ -803,6 +820,14 @@ class CudaGraphRunner:
             ),
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if (
+            self.model_runner.spec_algorithm.is_dflash()
+            and self.model_runner.is_draft_worker
+            and forward_batch.input_embeds is not None
+        ):
+            buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
+            if bs != raw_bs:
+                buffers.input_embeds[raw_num_token : bs * self.num_tokens_per_bs].zero_()
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
@@ -848,6 +873,14 @@ class CudaGraphRunner:
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if (
+                self.model_runner.spec_algorithm.is_dflash()
+                and self.model_runner.is_draft_worker
+                and forward_batch.input_embeds is not None
+            ):
+                self.buffers.input_embeds[: self.raw_num_token].copy_(
+                    forward_batch.input_embeds
+                )
 
         # Replay
         if self.enable_pdmux:
@@ -857,6 +890,8 @@ class CudaGraphRunner:
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 
+        if isinstance(output, torch.Tensor):
+            return output[: self.raw_num_token]
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
@@ -904,6 +939,32 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+        elif self.model_runner.spec_algorithm.is_dflash():
+            from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+            backend_name = type(self.model_runner.attn_backend).__name__
+            # Avoid enabling custom-mask modes during graph capture for backends that
+            # can express DFLASH verify via their built-in causal path.
+            skip_custom_mask = backend_name in {
+                "FlashInferAttnBackend",
+                "FlashInferMLAAttnBackend",
+                "FlashAttentionBackend",
+                "TRTLLMHAAttnBackend",
+                "TRTLLMMLABackend",
+            }
+            spec_info = DFlashVerifyInput(
+                draft_token=None,
+                positions=None,
+                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                custom_mask=None
+                if (self.model_runner.is_draft_worker or skip_custom_mask)
+                else self.buffers.custom_mask,
+                capture_hidden_mode=(
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.is_draft_worker
+                    else CaptureHiddenMode.FULL
+                ),
+            )
 
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput

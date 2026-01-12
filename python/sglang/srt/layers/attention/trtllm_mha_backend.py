@@ -698,42 +698,28 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         bmm1_scale = q_scale * k_scale * layer.scaling
         bmm2_scale = 1.0
 
-        if forward_batch.forward_mode.is_target_verify():
-            o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                query=q,
-                kv_cache=kv_cache,
-                workspace_buffer=self.workspace_buffer,
-                block_tables=self.forward_metadata.page_table,
-                seq_lens=self.forward_metadata.cache_seqlens_int32,
-                max_seq_len=self.max_context_len,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
-                window_left=layer.sliding_window_size,
-                # TODO: add attention_sink operation or nvfp4 scale factor if needed
-                sinks=attention_sink,
-                out_dtype=self.q_data_type,  # model_runner.dtype
-                q_len_per_req=self.forward_metadata.max_seq_len_q,
-            )
-        else:
-
-            o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-                query=q,
-                kv_cache=kv_cache,
-                workspace_buffer=self.workspace_buffer,
-                block_tables=self.forward_metadata.page_table,
-                seq_lens=self.forward_metadata.cache_seqlens_int32,
-                max_q_len=self.forward_metadata.max_seq_len_q,
-                max_kv_len=self.max_context_len,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
-                batch_size=forward_batch.batch_size,
-                cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
-                cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-                window_left=layer.sliding_window_size,
-                # TODO: add attention_sink operation or nvfp4 scale factor if needed
-                sinks=attention_sink,
-                out_dtype=self.q_data_type,  # model_runner.dtype
-            )
+        # Target-verify runs a multi-token causal "block prefill" over draft tokens.
+        # Use the context (prefill) kernel so each query token only attends to the
+        # prefix and earlier tokens in the verify block. The decode kernel treats
+        # each query token independently and can leak future tokens when q_len > 1.
+        o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            query=q,
+            kv_cache=kv_cache,
+            workspace_buffer=self.workspace_buffer,
+            block_tables=self.forward_metadata.page_table,
+            seq_lens=self.forward_metadata.cache_seqlens_int32,
+            max_q_len=self.forward_metadata.max_seq_len_q,
+            max_kv_len=self.max_context_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            batch_size=forward_batch.batch_size,
+            cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+            cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
+            window_left=layer.sliding_window_size,
+            # TODO: add attention_sink operation or nvfp4 scale factor if needed
+            sinks=attention_sink,
+            out_dtype=self.q_data_type,  # model_runner.dtype
+        )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
