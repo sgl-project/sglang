@@ -21,6 +21,7 @@ on:
         default: 'all'
         options:
           - 'all'
+          - 'nightly-test-1-gpu'
           - 'nightly-test-2-gpu'
           - 'nightly-test-2-gpu-vlm'
           - 'nightly-test-8-gpu-gpt-oss'
@@ -55,6 +56,35 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
+  # 1-GPU tests - platform-agnostic nightly tests (LoRA, debug utils, scheduler, etc.)
+  nightly-test-1-gpu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-1-gpu')
+    runs-on: linux-mi325-gpu-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Nightly Test (1-GPU)
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-1-gpu --nightly --timeout-per-file 600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
   # 2-GPU tests (TP=2)
   nightly-test-2-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-2-gpu')
@@ -508,6 +538,7 @@ jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
     needs:
       # MI325 jobs
+      - nightly-test-1-gpu
       - nightly-test-2-gpu
       - nightly-test-2-gpu-vlm
       - nightly-test-8-gpu-gpt-oss
