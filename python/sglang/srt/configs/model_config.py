@@ -94,9 +94,6 @@ class ModelConfig:
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
-        hybrid_kvcache_ratio: Optional[
-            float
-        ] = None,  # TODO: remove this, it is not a model config
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
@@ -160,6 +157,7 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
+        self.sliding_window_size = self._get_sliding_window_size()
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
@@ -188,6 +186,9 @@ class ModelConfig:
             and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
         )
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
+        self.is_local_attention_model = is_local_attention_model(
+            self.hf_config.architectures
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
@@ -195,7 +196,7 @@ class ModelConfig:
         self._derive_model_shapes()
 
         # Update hybrid model
-        self._derive_hybrid_model(hybrid_kvcache_ratio)
+        self._derive_hybrid_model()
 
         # Verify quantization
         self._verify_quantization()
@@ -247,7 +248,6 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=quantization,
-            hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
@@ -300,15 +300,11 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
-    def _derive_hybrid_model(self, hybrid_kvcache_ratio: Optional[float] = None):
+    def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
-        self.is_hybrid_swa = is_hybrid_model(
-            self.hf_config.architectures,
-            hybrid_kvcache_ratio=hybrid_kvcache_ratio,
-            context_length=self.context_len,
-            attention_chunk_size=self.attention_chunk_size,
-        )
-        if self.is_hybrid_swa is not None:
+        self.is_hybrid_swa = is_hybrid_swa_model(self.hf_config.architectures)
+
+        if self.is_hybrid_swa:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures,
@@ -669,6 +665,12 @@ class ModelConfig:
             return "fp8"
         else:
             return "fp8"  # Default fallback
+
+    def _get_sliding_window_size(self) -> Optional[int]:
+        sliding_window_size = getattr(self.hf_text_config, "sliding_window_size", None)
+        if sliding_window_size is None:
+            sliding_window_size = getattr(self.hf_text_config, "sliding_window", None)
+        return sliding_window_size
 
     def _validate_quantize_and_serve_config(self):
         """Validate quantize_and_serve configuration."""
@@ -1047,7 +1049,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
-    "GlmasrForConditionalGeneration",
+    "GlmAsrForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
@@ -1116,6 +1118,10 @@ def is_encoder_decoder_model(model_architectures: List[str]):
     return "MllamaForConditionalGeneration" in model_architectures
 
 
+def is_local_attention_model(model_architectures: List[str]):
+    return "Llama4ForConditionalGeneration" in model_architectures
+
+
 def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
     """Check if chunked prefill is supported for a MultiModal model."""
     unsupported = [
@@ -1137,27 +1143,14 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-def is_hybrid_model(
-    model_architectures: List[str],
-    hybrid_kvcache_ratio: Optional[float],
-    context_length: Optional[int],
-    attention_chunk_size: Optional[int],
-):
-    if model_architectures[0] in [
+def is_hybrid_swa_model(model_architectures: List[str]):
+
+    hybrid_swa_archs = {
+        "Llama4ForConditionalGeneration",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
-    ]:
-        return 1
-    if hybrid_kvcache_ratio is None:
-        return None
-    elif (
-        hybrid_kvcache_ratio > 0
-        and model_architectures[0] == "Llama4ForConditionalGeneration"
-        and context_length > attention_chunk_size
-    ):
-        return hybrid_kvcache_ratio
-    else:
-        return None
+    }
+    return any(arch in hybrid_swa_archs for arch in model_architectures)
 
 
 def get_hybrid_layer_ids(

@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputFormat,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import envs, is_npu, load_audio, load_image, load_video, logger
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
@@ -299,7 +300,7 @@ class BaseMultimodalProcessor(ABC):
         if audios:
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
-                "GlmasrProcessor",
+                "GlmAsrProcessor",
                 "Qwen2AudioProcessor",
                 "Qwen3OmniMoeProcessor",
             }:
@@ -316,7 +317,9 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessorFast)
             and not self.server_args.disable_fast_image_processor
         ):
-            if not _is_npu:
+            if get_global_server_args().rl_on_policy_target is not None:
+                kwargs["device"] = "cpu"
+            elif not _is_npu:
                 kwargs["device"] = "cuda"
             elif processor.__class__.__name__ not in {
                 "Qwen2_5_VLProcessor",
@@ -877,6 +880,8 @@ class BaseMultimodalProcessor(ABC):
                             info_data=item.feature,
                             sync_buffer_meta=sync_flag,
                         )
+                    elif not self.server_args.keep_mm_feature_on_device:
+                        item.feature = item.feature.cpu()
                 elif (
                     isinstance(item.precomputed_embeddings, torch.Tensor)
                     and item.precomputed_embeddings.is_cuda
@@ -897,5 +902,7 @@ class BaseMultimodalProcessor(ABC):
                             info_data=item.precomputed_embeddings,
                             sync_buffer_meta=sync_flag,
                         )
+                    elif not self.server_args.keep_mm_feature_on_device:
+                        item.precomputed_embeddings = item.precomputed_embeddings.cpu()
 
         return all_collected_items, input_ids, ret

@@ -2,24 +2,53 @@
 //!
 //! Provides thread-safe, deduplicated tokenizer loading for IGW mode where
 //! multiple routers (HTTP and gRPC) need to share tokenizers across workers.
+//!
+//! ## ID vs Name Lookup
+//!
+//! Tokenizers are stored with two keys:
+//! - **ID (UUID)**: Unique identifier generated at registration, immutable
+//! - **Name**: User-provided identifier, must be unique
+//!
+//! Lookup behavior:
+//! - `get(key)`: Tries name first, then ID (backward compatible)
+//! - `get_by_id(id)`: Exact ID match only
+//! - `get_by_name(name)`: Exact name match only
+//! - `remove(name)`: Removes by name
+//! - `remove_by_id(id)`: Removes by ID
 
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 use super::traits::Tokenizer;
 
-/// Registry for managing tokenizers keyed by served_model_name
+/// Metadata and tokenizer instance for a registered tokenizer
+#[derive(Clone)]
+pub struct TokenizerEntry {
+    /// Unique identifier (UUID)
+    pub id: String,
+    /// User-provided name
+    pub name: String,
+    /// Source path or HuggingFace model ID
+    pub source: String,
+    /// The tokenizer instance
+    pub tokenizer: Arc<dyn Tokenizer>,
+}
+
+/// Registry for managing tokenizers keyed by UUID
 ///
 /// Features:
 /// - Thread-safe concurrent access using DashMap
 /// - Per-key locking to prevent duplicate loading
-/// - Simple key scheme: served_model_name
+/// - Lookup by UUID (primary) or name (secondary index)
 pub struct TokenizerRegistry {
-    /// Storage for loaded tokenizers
-    tokenizers: DashMap<String, Arc<dyn Tokenizer>>,
+    /// Storage for loaded tokenizers, keyed by UUID
+    tokenizers: DashMap<String, TokenizerEntry>,
+    /// Secondary index: name -> UUID for lookup
+    name_to_id: DashMap<String, String>,
     /// Per-key locks to prevent duplicate loading
     loading_locks: DashMap<String, Arc<Mutex<()>>>,
 }
@@ -29,130 +58,163 @@ impl TokenizerRegistry {
     pub fn new() -> Self {
         Self {
             tokenizers: DashMap::new(),
+            name_to_id: DashMap::new(),
             loading_locks: DashMap::new(),
         }
     }
 
-    /// Load and register a tokenizer by model ID
+    /// Generate a new UUID for a tokenizer
+    pub fn generate_id() -> String {
+        Uuid::new_v4().to_string()
+    }
+
+    /// Load and register a tokenizer with a pre-generated ID
     ///
-    /// If the tokenizer is already loaded, returns true immediately.
+    /// If the tokenizer is already loaded (by name), returns the existing ID.
     /// Otherwise, uses the provided loader function to load it.
-    /// Per-key locking ensures only one load happens per model, preventing race conditions.
+    /// Per-key locking ensures only one load happens per name, preventing race conditions.
     ///
     /// # Arguments
-    /// * `model_id` - The model identifier to use as key
+    /// * `id` - Pre-generated UUID for this tokenizer
+    /// * `name` - User-provided name
+    /// * `source` - Source path or HuggingFace model ID
     /// * `loader` - Async function that loads the tokenizer
     ///
     /// # Returns
-    /// * `Ok(true)` - Successfully loaded and registered (or already registered)
+    /// * `Ok(id)` - Successfully loaded and registered (returns the ID)
     /// * `Err(message)` - Error message if loading fails
-    ///
-    /// # Example
-    /// ```ignore
-    /// registry.load("meta-llama/Llama-2-7b", || async {
-    ///     create_tokenizer_async("/path/to/tokenizer").await
-    /// }).await?;
-    /// ```
-    pub async fn load<F, Fut>(&self, model_id: &str, loader: F) -> Result<bool, String>
+    pub async fn load<F, Fut>(
+        &self,
+        id: &str,
+        name: &str,
+        source: &str,
+        loader: F,
+    ) -> Result<String, String>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Arc<dyn Tokenizer>, String>>,
     {
-        // Fast path: already loaded
-        if self.tokenizers.contains_key(model_id) {
-            debug!("Tokenizer already registered for model: {}", model_id);
-            return Ok(true);
+        // Fast path: already loaded by name
+        if let Some(existing_id) = self.name_to_id.get(name) {
+            debug!("Tokenizer already registered for name: {}", name);
+            return Ok(existing_id.clone());
         }
 
-        debug!("Tokenizer cache miss for model: {}", model_id);
+        debug!("Tokenizer cache miss for name: {}", name);
 
-        // Acquire per-key lock to prevent duplicate loading
+        // Acquire per-name lock to prevent duplicate loading
         let lock = self
             .loading_locks
-            .entry(model_id.to_string())
+            .entry(name.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
 
         let _guard = lock.lock().await;
 
         // Double-check after acquiring lock (another thread may have loaded it)
-        if self.tokenizers.contains_key(model_id) {
-            debug!("Tokenizer loaded by another thread for model: {}", model_id);
-            return Ok(true);
+        if let Some(existing_id) = self.name_to_id.get(name) {
+            debug!("Tokenizer loaded by another thread for name: {}", name);
+            return Ok(existing_id.clone());
         }
 
         // Load tokenizer
-        info!("Loading tokenizer for model: {}", model_id);
-        let tokenizer = loader().await?;
+        info!("Loading tokenizer '{}' from source: {}", name, source);
+        let result = loader().await;
+
+        // Always clean up the lock, whether loading succeeded or failed
+        self.loading_locks.remove(name);
+
+        let tokenizer = result?;
+
+        // Create entry
+        let entry = TokenizerEntry {
+            id: id.to_string(),
+            name: name.to_string(),
+            source: source.to_string(),
+            tokenizer,
+        };
 
         // Store in registry
-        self.tokenizers.insert(model_id.to_string(), tokenizer);
-
-        // Remove the lock since it's no longer needed for this model.
-        self.loading_locks.remove(model_id);
+        self.tokenizers.insert(id.to_string(), entry);
+        self.name_to_id.insert(name.to_string(), id.to_string());
 
         info!(
-            "Successfully loaded and registered tokenizer for model: {}",
-            model_id
+            "Successfully registered tokenizer '{}' with id: {}",
+            name, id
         );
 
-        Ok(true)
+        Ok(id.to_string())
     }
 
-    /// Register a pre-loaded tokenizer
+    /// Register a pre-loaded tokenizer with a pre-generated ID
     ///
     /// Atomically inserts a tokenizer into the registry only if no tokenizer
-    /// with the same model_name exists. Returns true if the tokenizer was inserted,
-    /// false if one already existed.
-    ///
-    /// This method is thread-safe and uses atomic operations to prevent race conditions.
-    /// If you need to replace an existing tokenizer, first use `remove()` then `register()`.
-    ///
-    /// # Arguments
-    /// * `model_name` - The served_model_name to use as key
-    /// * `tokenizer` - The tokenizer to register
+    /// with the same name exists. Returns the ID if successful.
     ///
     /// # Returns
-    /// * `true` - If the tokenizer was successfully registered (didn't exist before)
-    /// * `false` - If a tokenizer with this model_name already existed
-    ///
-    /// # Example
-    /// ```ignore
-    /// let tokenizer = create_tokenizer_blocking("/path/to/tokenizer")?;
-    /// if registry.register("meta-llama/Llama-2-7b", tokenizer) {
-    ///     info!("Tokenizer registered successfully");
-    /// } else {
-    ///     info!("Tokenizer already exists");
-    /// }
-    /// ```
-    pub fn register(&self, model_name: &str, tokenizer: Arc<dyn Tokenizer>) -> bool {
+    /// * `Some(id)` - If the tokenizer was successfully registered
+    /// * `None` - If a tokenizer with this name already existed
+    pub fn register(
+        &self,
+        id: &str,
+        name: &str,
+        source: &str,
+        tokenizer: Arc<dyn Tokenizer>,
+    ) -> Option<String> {
         use dashmap::mapref::entry::Entry;
-        match self.tokenizers.entry(model_name.to_string()) {
+
+        // Check if name already exists
+        match self.name_to_id.entry(name.to_string()) {
             Entry::Occupied(_) => {
                 debug!(
-                    "Tokenizer already exists for model: {}, skipping registration",
-                    model_name
+                    "Tokenizer already exists for name: {}, skipping registration",
+                    name
                 );
-                false
+                None
             }
-            Entry::Vacant(entry) => {
-                info!("Registering tokenizer for model: {}", model_name);
-                entry.insert(tokenizer);
-                true
+            Entry::Vacant(name_entry) => {
+                let entry = TokenizerEntry {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    source: source.to_string(),
+                    tokenizer,
+                };
+
+                info!("Registering tokenizer '{}' with id: {}", name, id);
+                self.tokenizers.insert(id.to_string(), entry);
+                name_entry.insert(id.to_string());
+                Some(id.to_string())
             }
         }
     }
 
-    /// Get a tokenizer if it's already loaded
-    ///
-    /// Returns None if the tokenizer hasn't been loaded yet.
-    pub fn get(&self, model_name: &str) -> Option<Arc<dyn Tokenizer>> {
-        self.tokenizers.get(model_name).map(|t| t.clone())
+    /// Get a tokenizer by UUID
+    pub fn get_by_id(&self, id: &str) -> Option<TokenizerEntry> {
+        self.tokenizers.get(id).map(|e| e.clone())
     }
 
-    /// Check if a tokenizer is loaded for the given model
-    pub fn contains(&self, model_name: &str) -> bool {
-        self.tokenizers.contains_key(model_name)
+    /// Get a tokenizer by name
+    pub fn get_by_name(&self, name: &str) -> Option<TokenizerEntry> {
+        self.name_to_id
+            .get(name)
+            .and_then(|id| self.tokenizers.get(id.as_str()).map(|e| e.clone()))
+    }
+
+    /// Get a tokenizer (for backward compatibility, tries name first then ID)
+    pub fn get(&self, name_or_id: &str) -> Option<Arc<dyn Tokenizer>> {
+        self.get_by_name(name_or_id)
+            .or_else(|| self.get_by_id(name_or_id))
+            .map(|e| e.tokenizer)
+    }
+
+    /// Check if a tokenizer is registered by name
+    pub fn contains(&self, name: &str) -> bool {
+        self.name_to_id.contains_key(name)
+    }
+
+    /// Check if a tokenizer is registered by ID
+    pub fn contains_id(&self, id: &str) -> bool {
+        self.tokenizers.contains_key(id)
     }
 
     /// Get the number of loaded tokenizers
@@ -165,30 +227,41 @@ impl TokenizerRegistry {
         self.tokenizers.is_empty()
     }
 
-    /// List all registered tokenizer keys (model names)
-    ///
-    /// Returns a sorted vector of model names that have registered tokenizers.
-    /// Returns an empty vector if no tokenizers are registered.
-    pub fn list(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self
-            .tokenizers
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-        keys.sort();
-        keys
+    /// List all registered tokenizers
+    pub fn list(&self) -> Vec<TokenizerEntry> {
+        let mut entries: Vec<TokenizerEntry> =
+            self.tokenizers.iter().map(|e| e.value().clone()).collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries
     }
 
-    /// Remove a tokenizer from the registry
+    /// Remove a tokenizer by ID
     ///
-    /// Returns the tokenizer if it was present.
-    pub fn remove(&self, model_name: &str) -> Option<Arc<dyn Tokenizer>> {
-        self.tokenizers.remove(model_name).map(|(_, v)| v)
+    /// Returns the entry if it was present.
+    pub fn remove_by_id(&self, id: &str) -> Option<TokenizerEntry> {
+        if let Some((_, entry)) = self.tokenizers.remove(id) {
+            self.name_to_id.remove(&entry.name);
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// Remove a tokenizer by name
+    ///
+    /// Returns the entry if it was present.
+    pub fn remove(&self, name: &str) -> Option<TokenizerEntry> {
+        if let Some((_, id)) = self.name_to_id.remove(name) {
+            self.tokenizers.remove(&id).map(|(_, e)| e)
+        } else {
+            None
+        }
     }
 
     /// Clear all tokenizers from the registry
     pub fn clear(&self) {
         self.tokenizers.clear();
+        self.name_to_id.clear();
         self.loading_locks.clear();
     }
 }
@@ -218,8 +291,9 @@ mod tests {
         assert!(!registry.contains("model1"));
 
         // Load and register a tokenizer
+        let id = TokenizerRegistry::generate_id();
         registry
-            .load("model1", || async {
+            .load(&id, "model1", "path/to/model", || async {
                 Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
             })
             .await
@@ -229,16 +303,16 @@ mod tests {
         assert!(!registry.is_empty());
         assert_eq!(registry.len(), 1);
         assert!(registry.contains("model1"));
+        assert!(registry.contains_id(&id));
 
         // Get returns the tokenizer
-        let tokenizer = registry.get("model1").unwrap();
-        assert_eq!(
-            tokenizer.vocab_size(),
-            MockTokenizer::default().vocab_size()
-        );
+        let entry = registry.get_by_name("model1").unwrap();
+        assert_eq!(entry.id, id);
+        assert_eq!(entry.name, "model1");
+        assert_eq!(entry.source, "path/to/model");
 
         // Remove works
-        let removed = registry.remove("model1");
+        let removed = registry.remove_by_id(&id);
         assert!(removed.is_some());
         assert!(registry.is_empty());
     }
@@ -250,12 +324,13 @@ mod tests {
 
         // Spawn multiple tasks trying to load the same tokenizer
         let mut handles = vec![];
-        for _ in 0..10 {
+        for i in 0..10 {
             let registry = registry.clone();
             let load_count = load_count.clone();
+            let id = format!("id-{}", i);
             let handle = tokio::spawn(async move {
                 registry
-                    .load("model1", || async {
+                    .load(&id, "model1", "source", || async {
                         // Simulate slow loading
                         sleep(Duration::from_millis(10)).await;
                         load_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -287,8 +362,9 @@ mod tests {
         // Load multiple tokenizers
         for i in 1..=5 {
             let model_name = format!("model{}", i);
+            let id = TokenizerRegistry::generate_id();
             registry
-                .load(&model_name, || async {
+                .load(&id, &model_name, "source", || async {
                     Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
                 })
                 .await
@@ -300,6 +376,11 @@ mod tests {
         assert!(registry.contains("model5"));
         assert!(!registry.contains("model6"));
 
+        // List returns all with metadata
+        let entries = registry.list();
+        assert_eq!(entries.len(), 5);
+        assert!(entries.iter().any(|e| e.name == "model1"));
+
         // Clear all
         registry.clear();
         assert!(registry.is_empty());
@@ -308,10 +389,13 @@ mod tests {
     #[tokio::test]
     async fn test_load_failure() {
         let registry = TokenizerRegistry::new();
+        let id = TokenizerRegistry::generate_id();
 
         // Try to load with a failing loader
         let result = registry
-            .load("failing_model", || async { Err("Load failed".to_string()) })
+            .load(&id, "failing_model", "source", || async {
+                Err("Load failed".to_string())
+            })
             .await;
 
         assert!(result.is_err());
@@ -320,90 +404,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_different_models() {
-        let registry = Arc::new(TokenizerRegistry::new());
-        let mut handles = vec![];
+    async fn test_get_by_name_and_id() {
+        let registry = TokenizerRegistry::new();
+        let id = TokenizerRegistry::generate_id();
 
-        // Load different models concurrently
-        for i in 1..=10 {
-            let registry = registry.clone();
-            let handle = tokio::spawn(async move {
-                let model_name = format!("model{}", i);
-                registry
-                    .load(&model_name, || async {
-                        sleep(Duration::from_millis(5)).await;
-                        Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
-                    })
-                    .await
-            });
-            handles.push(handle);
-        }
+        registry
+            .load(&id, "my-model", "hf/model", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
 
-        for handle in handles {
-            handle.await.unwrap().unwrap();
-        }
+        // Get by name
+        let by_name = registry.get_by_name("my-model");
+        assert!(by_name.is_some());
+        assert_eq!(by_name.as_ref().unwrap().id, id);
 
-        assert_eq!(registry.len(), 10);
+        // Get by ID
+        let by_id = registry.get_by_id(&id);
+        assert!(by_id.is_some());
+        assert_eq!(by_id.as_ref().unwrap().name, "my-model");
+
+        // Generic get works with both
+        assert!(registry.get("my-model").is_some());
+        assert!(registry.get(&id).is_some());
     }
 
     #[tokio::test]
     async fn test_register_only_if_absent() {
         let registry = TokenizerRegistry::new();
+        let id1 = TokenizerRegistry::generate_id();
+        let id2 = TokenizerRegistry::generate_id();
         let tokenizer1 = Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>;
         let tokenizer2 = Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>;
 
         // First registration should succeed
-        assert!(registry.register("model1", tokenizer1.clone()));
-        assert_eq!(registry.len(), 1);
-        assert!(registry.contains("model1"));
-
-        // Second registration with same key should fail
-        assert!(!registry.register("model1", tokenizer2.clone()));
+        let result1 = registry.register(&id1, "model1", "source1", tokenizer1.clone());
+        assert!(result1.is_some());
         assert_eq!(registry.len(), 1);
 
-        // Verify the original tokenizer is still there (not replaced)
-        let retrieved = registry.get("model1").unwrap();
-        assert_eq!(
-            Arc::as_ptr(&retrieved),
-            Arc::as_ptr(&tokenizer1),
-            "Original tokenizer should not be replaced"
-        );
+        // Second registration with same name should fail
+        let result2 = registry.register(&id2, "model1", "source2", tokenizer2.clone());
+        assert!(result2.is_none());
+        assert_eq!(registry.len(), 1);
 
-        // Registration with different key should succeed
-        assert!(registry.register("model2", tokenizer2));
+        // Original tokenizer should still be there
+        let entry = registry.get_by_name("model1").unwrap();
+        assert_eq!(entry.id, id1);
+        assert_eq!(entry.source, "source1");
+
+        // Registration with different name should succeed
+        let id3 = TokenizerRegistry::generate_id();
+        let result3 = registry.register(&id3, "model2", "source2", tokenizer2);
+        assert!(result3.is_some());
         assert_eq!(registry.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_register_same_model() {
-        let registry = Arc::new(TokenizerRegistry::new());
-        let success_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-        // Spawn multiple tasks trying to register the same model
-        let mut handles = vec![];
-        for _ in 0..10 {
-            let registry = registry.clone();
-            let success_count = success_count.clone();
-            let handle = tokio::spawn(async move {
-                let tokenizer = Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>;
-                if registry.register("model1", tokenizer) {
-                    success_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            });
-            handles.push(handle);
-        }
-
-        // Wait for all tasks
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        // Verify only one registration succeeded
-        assert_eq!(
-            success_count.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "Only one concurrent registration should succeed"
-        );
-        assert_eq!(registry.len(), 1);
     }
 }

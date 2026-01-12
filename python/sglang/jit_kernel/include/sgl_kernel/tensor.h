@@ -23,6 +23,7 @@
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #endif
 
 namespace host {
@@ -64,6 +65,10 @@ struct dtype_trait<__half> {
 template <>
 struct dtype_trait<__nv_bfloat16> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLBfloat, .bits = 16, .lanes = 1};
+};
+template <>
+struct dtype_trait<__nv_fp8_e4m3> {
+  inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat8_e4m3fn, .bits = 8, .lanes = 1};
 };
 #endif
 
@@ -147,6 +152,11 @@ inline auto& operator<<(std::ostream& os, PrintAbleSpan<T> span) {
 }
 
 }  // namespace details
+
+template <typename T>
+inline bool is_type(DLDataType dtype) {
+  return dtype == details::dtype_trait<T>::value;
+}
 
 struct SymbolicSize {
  public:
@@ -252,6 +262,11 @@ struct SymbolicDType {
     } else {
       this->set_value(dtype);
     }
+  }
+
+  template <typename T>
+  auto is_type() const -> bool {
+    return ::host::is_type<T>(m_value);
   }
 
  private:
