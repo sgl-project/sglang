@@ -31,7 +31,8 @@ static STRING_INTERNER: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new
 ///
 /// This function is designed for high-throughput scenarios where the same
 /// strings (model IDs, worker URLs) appear repeatedly. The first call allocates,
-pub fn intern_string(s: &str) -> Arc<str> {
+/// subsequent calls just clone the Arc (very cheap - just a ref count increment).
+pub(crate) fn intern_string(s: &str) -> Arc<str> {
     // Fast path: check if already interned
     if let Some(entry) = STRING_INTERNER.get(s) {
         return Arc::clone(entry.value());
@@ -45,7 +46,8 @@ pub fn intern_string(s: &str) -> Arc<str> {
         .clone()
 }
 
-pub fn interner_size() -> usize {
+#[allow(dead_code)]
+pub(crate) fn interner_size() -> usize {
     STRING_INTERNER.len()
 }
 
@@ -90,7 +92,7 @@ pub fn status_code_to_static_str(code: u16) -> Option<&'static str> {
 }
 
 /// Static HTTP method strings to avoid allocations on every request.
-pub mod http_methods {
+pub(crate) mod http_methods {
     pub const GET: &str = "GET";
     pub const POST: &str = "POST";
     pub const PUT: &str = "PUT";
@@ -143,7 +145,7 @@ impl Default for PrometheusConfig {
     }
 }
 
-pub fn init_metrics() {
+pub(crate) fn init_metrics() {
     // Layer 1: HTTP metrics
     describe_counter!(
         "smg_http_requests_total",
@@ -152,6 +154,10 @@ pub fn init_metrics() {
     describe_histogram!(
         "smg_http_request_duration_seconds",
         "HTTP request duration by method and path"
+    );
+    describe_gauge!(
+        "smg_http_inflight_request_age_count",
+        "In-flight HTTP requests per age bucket (gt < age <= le, non-cumulative)"
     );
     describe_counter!(
         "smg_http_responses_total",
@@ -375,6 +381,7 @@ pub mod metrics_labels {
     pub const ENDPOINT_COMPLETIONS: &str = "completions";
     pub const ENDPOINT_RERANK: &str = "rerank";
     pub const ENDPOINT_EMBEDDINGS: &str = "embeddings";
+    pub const ENDPOINT_CLASSIFY: &str = "classify";
 
     // Worker types
     pub const WORKER_REGULAR: &str = "regular";
@@ -490,7 +497,7 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Set active HTTP connections count.
+    /// Set active HTTP connections count
     pub fn set_http_connections_active(count: usize) {
         gauge!("smg_http_connections_active").set(count as f64);
     }
