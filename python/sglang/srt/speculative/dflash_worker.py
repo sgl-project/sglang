@@ -144,6 +144,9 @@ class DFlashWorker:
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_gather_cap: int = 0
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = 0 if self._draft_block_ids_buf is None else int(self._draft_block_ids_buf.shape[0])
@@ -485,16 +488,27 @@ class DFlashWorker:
                 continue
 
             # Gather per-rank maxima and associated global ids, then select the global max.
-            gathered_max = torch.empty(
-                (tp_size * chunk_len,),
-                dtype=local_max.dtype,
-                device=hs.device,
-            )
-            gathered_ids = torch.empty(
-                (tp_size * chunk_len,),
-                dtype=global_ids.dtype,
-                device=hs.device,
-            )
+            needed = tp_size * chunk_len
+            if (
+                self._draft_greedy_gather_cap < needed
+                or self._draft_greedy_gathered_max_buf is None
+                or self._draft_greedy_gathered_ids_buf is None
+                or self._draft_greedy_gathered_max_buf.dtype != local_max.dtype
+                or self._draft_greedy_gathered_max_buf.device != hs.device
+            ):
+                # Allocate enough space for the max chunk size to avoid reallocations.
+                cap = tp_size * int(chunk_size)
+                self._draft_greedy_gathered_max_buf = torch.empty(
+                    (cap,), dtype=local_max.dtype, device=hs.device
+                )
+                self._draft_greedy_gathered_ids_buf = torch.empty(
+                    (cap,), dtype=global_ids.dtype, device=hs.device
+                )
+                self._draft_greedy_gather_cap = cap
+
+            gathered_max = self._draft_greedy_gathered_max_buf[:needed]
+            gathered_ids = self._draft_greedy_gathered_ids_buf[:needed]
+
             tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
             tp_group.all_gather_into_tensor(gathered_ids, global_ids.contiguous())
             gathered_max = gathered_max.view(tp_size, chunk_len)
