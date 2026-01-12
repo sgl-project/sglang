@@ -84,6 +84,8 @@ MI35X_DEEPSEEK_R1_MODELS = [
             "--mem-fraction-static",
             "0.85",
             "--trust-remote-code",
+            "--watchdog-timeout",
+            "1200",  # 20 minutes for weight loading
         ],
         env_vars={"SGLANG_USE_AITER": "1"},
     ),
@@ -108,6 +110,8 @@ MI35X_DEEPSEEK_R1_MODELS = [
             "--mem-fraction-static",
             "0.7",
             "--trust-remote-code",
+            "--watchdog-timeout",
+            "1200",  # 20 minutes for weight loading
         ],
         env_vars={"SGLANG_USE_AITER": "1"},
     ),
@@ -127,6 +131,8 @@ MI35X_DEEPSEEK_R1_MODELS = [
             "--mem-fraction-static",
             "0.85",
             "--trust-remote-code",
+            "--watchdog-timeout",
+            "1800",  # 30 minutes for DP weight loading
         ],
         env_vars={
             "SGLANG_USE_ROCM700A": "1",
@@ -150,6 +156,8 @@ MI35X_DEEPSEEK_R1_MODELS = [
             "--enable-torch-compile",
             "--disable-cuda-graph",
             "--trust-remote-code",
+            "--watchdog-timeout",
+            "3600",  # 60 minutes for torch compile warmup
         ],
         env_vars={
             "SGLANG_USE_ROCM700A": "1",
