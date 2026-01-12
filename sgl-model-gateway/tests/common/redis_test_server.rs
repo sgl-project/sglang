@@ -12,7 +12,7 @@ pub fn get_shared_server() -> &'static RedisTestServer {
     // TODO improve
     super::init_test_tracing();
 
-    let server = SHARED_SERVER.get_or_init(|| RedisTestServer::start().expect("Failed to start shared Redis server"))
+    let server = SHARED_SERVER.get_or_init(|| RedisTestServer::start().expect("Failed to start shared Redis server"));
     server.wait_ready();
     server
 }
