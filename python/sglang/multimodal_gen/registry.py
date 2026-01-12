@@ -186,18 +186,36 @@ def get_model_short_name(model_id: str) -> str:
         return model_id
 
 
-def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
+def _get_config_info(model_path: str, model_id: str | None = None) -> Optional[ConfigInfo]:
     """
     Gets the ConfigInfo for a given model path using mappings and detectors.
     """
+
+    if model_id and model_id in _CONFIG_REGISTRY:
+        logger.debug(f"Resolved model using provided model_id: '{model_id}'")
+        return _CONFIG_REGISTRY.get(model_id)
+    
+    try:
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+        server_args = get_global_server_args()
+        # 如果提供了model_id，使用它代替model_path
+        if server_args.model_id:
+            logger.info(f"Using model_id '{server_args.model_id}' for configuration lookup")
+            effective_path = server_args.model_id
+        else:
+            effective_path = model_path
+    except Exception:
+        # 如果无法获取全局server_args，使用原model_path
+        effective_path = model_path
+
     # 1. Exact match
-    if model_path in _MODEL_HF_PATH_TO_NAME:
-        model_id = _MODEL_HF_PATH_TO_NAME[model_path]
-        logger.debug(f"Resolved model path '{model_path}' from exact path match.")
+    if effective_path in _MODEL_HF_PATH_TO_NAME:
+        model_id = _MODEL_HF_PATH_TO_NAME[effective_path]
+        logger.debug(f"Resolved model path '{effective_path}' from exact path match.")
         return _CONFIG_REGISTRY.get(model_id)
 
     # 2. Partial match: find the best (longest) match against all registered model hf paths.
-    model_name = get_model_short_name(model_path.lower())
+    model_name = get_model_short_name(effective_path.lower())
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
     for registered_model_hf_id in all_model_hf_paths:
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
@@ -278,6 +296,7 @@ def _get_diffusers_model_info(model_path: str) -> ModelInfo:
 def get_model_info(
     model_path: str,
     backend: Optional[Union[str, "Backend"]] = None,
+    model_id: str | None = None
 ) -> Optional[ModelInfo]:
     """
     Resolves all necessary classes (pipeline, sampling, config) for a given model path.
@@ -353,7 +372,7 @@ def get_model_info(
             return None
 
     # 3. Get configuration classes (sampling, pipeline config)
-    config_info = _get_config_info(model_path)
+    config_info = _get_config_info(model_path, model_id)
     if not config_info:
         if backend == Backend.AUTO:
             logger.warning(
