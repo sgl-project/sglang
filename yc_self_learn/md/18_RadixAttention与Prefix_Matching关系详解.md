@@ -82,6 +82,96 @@ class RadixCache(BasePrefixCache):
 - ✅ **缓存淘汰**: LRU/LFU 策略
 - ✅ **树结构管理**: Radix Tree 的构建和维护
 
+#### match_prefix 的详细实现
+
+**代码位置**: `python/sglang/srt/mem_cache/radix_cache.py:525`
+
+**核心算法**: `_match_prefix_helper` 实现了最长前缀匹配的核心逻辑
+
+```python
+def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+    """在 Radix Tree 中查找最长匹配前缀"""
+    node.last_access_time = time.monotonic()  # 更新访问时间（LRU/LFU）
+    
+    child_key = self.get_child_key_fn(key)  # 获取子节点的键（第一个 token 或 page）
+    value = []  # 收集匹配到的 KV Cache 索引
+    
+    # 循环：从根节点开始，向下遍历树
+    while len(key) > 0 and child_key in node.children.keys():
+        child = node.children[child_key]  # 找到匹配的子节点
+        child.last_access_time = time.monotonic()  # 更新访问时间
+        
+        # 计算匹配长度：child.key 和 key 的共同前缀长度
+        prefix_len = self.key_match_fn(child.key, key)
+        
+        if prefix_len < len(child.key):
+            # 情况 1: 部分匹配（匹配在节点中间结束）
+            # 例如：child.key = [1,2,3,4,5]，key = [1,2,3,6,7]，prefix_len = 3
+            # 需要将节点 split：new_node([1,2,3]) -> child([4,5])
+            new_node = self._split_node(child.key, child, prefix_len)
+            value.append(new_node.value)  # 只添加匹配部分的 KV Cache
+            node = new_node
+            break  # 匹配结束，退出循环
+        else:
+            # 情况 2: 完全匹配（匹配了整个节点）
+            # 例如：child.key = [1,2,3]，key = [1,2,3,4,5]，prefix_len = 3 = len(child.key)
+            value.append(child.value)  # 添加整个节点的 KV Cache
+            node = child  # 移动到子节点
+            key = key[prefix_len:]  # 截取剩余部分继续匹配
+            
+            if len(key):
+                child_key = self.get_child_key_fn(key)  # 获取下一个子节点键
+    
+    return value, node  # 返回收集的 KV Cache 索引列表和最后匹配的节点
+```
+
+**关键步骤详解**:
+
+1. **获取子节点键**: `get_child_key_fn(key)` 
+   - `page_size=1`: 返回第一个 token ID
+   - `page_size>1`: 返回第一个 page（多个 token 的元组）
+   - 考虑 `extra_key`（用于隔离不同 LoRA/sampling 参数）
+
+2. **匹配前缀长度**: `key_match_fn(child.key, key)`
+   - 逐个 token 比较（或按 page 比较）
+   - 返回最长公共前缀的长度
+   - 检查 `extra_key` 是否相同（不同则返回 0）
+
+3. **部分匹配处理**: `_split_node()`
+   - 当匹配在节点中间结束时，需要拆分节点
+   - 例如：节点存储 `[1,2,3,4,5]`，匹配到 `[1,2,3]`
+   - 拆分后：`new_node([1,2,3]) -> child([4,5])`
+   - 目的：为后续精确匹配做准备，不重复存储数据
+
+4. **完全匹配**: 继续向下遍历
+   - 如果整个节点都匹配，收集该节点的 KV Cache
+   - 截取剩余 key，继续在子树中匹配
+
+**返回结果**: `MatchResult`
+- `device_indices`: 所有匹配节点的 KV Cache 索引拼接成的 tensor
+- `last_device_node`: 最后匹配到的节点（用于后续插入）
+- `last_host_node`: 主机端节点（通常与 device 节点相同）
+
+**时间复杂度**: O(m)，其中 m 是匹配的前缀长度（因为 Radix Tree 将相同前缀压缩）
+
+**示例**:
+```
+Radix Tree:
+root
+  └─ [1,2,3] (value: [10,11,12])
+      ├─ [4,5] (value: [13,14])
+      └─ [6,7,8] (value: [15,16,17])
+
+匹配 key = [1,2,3,6,7,9]:
+1. 匹配 [1,2,3]: 完全匹配，收集 [10,11,12]，key 剩余 [6,7,9]
+2. 尝试匹配 [4,5]: child_key=6 不匹配
+3. 匹配 [6,7,8]: prefix_len=2 < 3，部分匹配
+   拆分: new_node([6,7]) -> child([8])
+4. 收集 new_node.value（匹配部分），返回
+
+结果: device_indices = [10,11,12,15,16], last_node = new_node([6,7])
+```
+
 ---
 
 ### 2.2 组件 2: RadixAttention Layer（注意力层）
