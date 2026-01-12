@@ -104,7 +104,7 @@ async fn test_simple_workflow_execution() {
     sleep(Duration::from_millis(100)).await;
 
     // Check status
-    let state = engine.get_status(instance_id).unwrap();
+    let state = engine.get_status(instance_id).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Completed);
     assert_eq!(state.step_states.len(), 2);
 }
@@ -149,7 +149,7 @@ async fn test_workflow_with_retry() {
     sleep(Duration::from_millis(500)).await;
 
     // Check that step was retried and eventually succeeded
-    let state = engine.get_status(instance_id).unwrap();
+    let state = engine.get_status(instance_id).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Completed);
 
     let step_state = state.step_states.get(&StepId::new("retry_step")).unwrap();
@@ -200,7 +200,7 @@ async fn test_workflow_failure_after_max_retries() {
     sleep(Duration::from_millis(500)).await;
 
     // Check that workflow failed
-    let state = engine.get_status(instance_id).unwrap();
+    let state = engine.get_status(instance_id).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Failed);
 
     let step_state = state.step_states.get(&StepId::new("failing_step")).unwrap();
@@ -257,7 +257,7 @@ async fn test_workflow_continue_on_failure() {
     sleep(Duration::from_millis(500)).await;
 
     // Workflow should complete despite first step failing
-    let state = engine.get_status(instance_id).unwrap();
+    let state = engine.get_status(instance_id).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Completed);
 
     // First step should be skipped
@@ -341,7 +341,7 @@ async fn test_workflow_context_sharing() {
 
     sleep(Duration::from_millis(100)).await;
 
-    let state = engine.get_status(instance_id).unwrap();
+    let state = engine.get_status(instance_id).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Completed);
 }
 
@@ -434,7 +434,7 @@ async fn test_parallel_execution_no_dependencies() {
     // Wait for completion - give enough time for async scheduling
     for _ in 0..50 {
         sleep(Duration::from_millis(50)).await;
-        let state = engine.get_status(instance_id).unwrap();
+        let state = engine.get_status(instance_id).await.unwrap();
         if state.status != WorkflowStatus::Running {
             break;
         }
@@ -442,7 +442,7 @@ async fn test_parallel_execution_no_dependencies() {
 
     let overall_duration = overall_start.elapsed();
 
-    let state = engine.get_status(instance_id).unwrap();
+    let state = engine.get_status(instance_id).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Completed);
 
     // Check that all steps completed
@@ -528,13 +528,13 @@ async fn test_dag_with_dependencies() {
     // Poll until workflow completes (or timeout)
     for _ in 0..50 {
         sleep(Duration::from_millis(50)).await;
-        let state = engine.get_status(instance_id).unwrap();
+        let state = engine.get_status(instance_id).await.unwrap();
         if state.status != WorkflowStatus::Running {
             break;
         }
     }
 
-    let state = engine.get_status(instance_id).unwrap();
+    let state = engine.get_status(instance_id).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Completed);
 
     // Verify step C started after both A and B finished
@@ -617,13 +617,13 @@ async fn test_dag_dependency_failure_blocks_dependents() {
     // Poll until workflow completes (or timeout)
     for _ in 0..50 {
         sleep(Duration::from_millis(50)).await;
-        let state = engine.get_status(instance_id).unwrap();
+        let state = engine.get_status(instance_id).await.unwrap();
         if state.status != WorkflowStatus::Running {
             break;
         }
     }
 
-    let state = engine.get_status(instance_id).unwrap();
+    let state = engine.get_status(instance_id).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Failed);
 
     // Step B should not have executed

@@ -229,7 +229,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     /// to ensure all workflows are stopped. Note that this cancels workflows
     /// at the state level; running steps may still complete.
     pub async fn force_cancel_all(&self) -> usize {
-        let active_states = match self.state_store.list_active() {
+        let active_states = match self.state_store.list_active().await {
             Ok(states) => states,
             Err(e) => {
                 tracing::error!(error = ?e, "Failed to list active workflows for force cancel");
@@ -304,7 +304,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        state_store.cleanup_old_workflows(ttl);
+                        state_store.cleanup_old_workflows(ttl).await;
                     }
                     _ = shutdown_rx.changed() => {
                         tracing::info!("Cleanup task stopping due to shutdown");
@@ -373,7 +373,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 .insert(step.id.clone(), StepState::default());
         }
 
-        self.state_store.save(state)?;
+        self.state_store.save(state).await?;
 
         self.event_bus
             .publish(WorkflowEvent::WorkflowStarted {
@@ -421,7 +421,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             .collect();
 
         loop {
-            if self.state_store.is_cancelled(instance_id)? {
+            if self.state_store.is_cancelled(instance_id).await? {
                 self.event_bus
                     .publish(WorkflowEvent::WorkflowCancelled { instance_id })
                     .await;
@@ -460,9 +460,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     "Workflow deadlocked: no steps ready and none running. This may indicate a scheduler bug.".to_string()
                 };
 
-                self.state_store.update(instance_id, |s| {
-                    s.status = WorkflowStatus::Failed;
-                })?;
+                self.state_store
+                    .update(instance_id, |s| {
+                        s.status = WorkflowStatus::Failed;
+                    })
+                    .await?;
                 self.event_bus
                     .publish(WorkflowEvent::WorkflowFailed {
                         instance_id,
@@ -498,37 +500,31 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                         Err(_) => StepResult::Failure,
                     };
 
-                    {
+                    // Track whether we need to update state to Skipped after releasing lock
+                    let needs_skip_update = {
                         let mut t = tracker.write();
                         t.running.remove(&step_id);
 
-                        match result {
+                        let needs_update = match result {
                             Ok(StepResult::Success) => {
                                 t.completed.insert(step_id.clone());
+                                false
                             }
                             Ok(StepResult::Skip) => {
                                 t.skipped.insert(step_id.clone());
+                                false
                             }
                             Ok(StepResult::Failure) | Err(_) => match step.on_failure {
                                 FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => {
                                     t.failed.insert(step_id.clone());
+                                    false
                                 }
                                 FailureAction::ContinueNextStep => {
-                                    if let Err(e) = engine.state_store.update(instance_id, |s| {
-                                        if let Some(step_state) = s.step_states.get_mut(&step_id) {
-                                            step_state.status = StepStatus::Skipped;
-                                        }
-                                    }) {
-                                        tracing::warn!(
-                                            step_id = %step_id,
-                                            error = ?e,
-                                            "Failed to update step state to Skipped"
-                                        );
-                                    }
                                     t.skipped.insert(step_id.clone());
+                                    true // Need to update state store after releasing lock
                                 }
                             },
-                        }
+                        };
 
                         if let Err(e) = tx.try_send((step_id.clone(), signal)) {
                             use mpsc::error::TrySendError;
@@ -546,6 +542,27 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                                     );
                                 }
                             }
+                        }
+
+                        needs_update
+                    };
+
+                    // Perform async state update after releasing the tracker lock
+                    if needs_skip_update {
+                        if let Err(e) = engine
+                            .state_store
+                            .update(instance_id, |s| {
+                                if let Some(step_state) = s.step_states.get_mut(&step_id) {
+                                    step_state.status = StepStatus::Skipped;
+                                }
+                            })
+                            .await
+                        {
+                            tracing::warn!(
+                                step_id = %step_id,
+                                error = ?e,
+                                "Failed to update step state to Skipped"
+                            );
                         }
                     }
                 });
@@ -577,9 +594,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         };
 
         if let Some(ref step) = failed_step {
-            self.state_store.update(instance_id, |s| {
-                s.status = WorkflowStatus::Failed;
-            })?;
+            self.state_store
+                .update(instance_id, |s| {
+                    s.status = WorkflowStatus::Failed;
+                })
+                .await?;
             self.event_bus
                 .publish(WorkflowEvent::WorkflowFailed {
                     instance_id,
@@ -588,9 +607,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 })
                 .await;
         } else {
-            self.state_store.update(instance_id, |s| {
-                s.status = WorkflowStatus::Completed;
-            })?;
+            self.state_store
+                .update(instance_id, |s| {
+                    s.status = WorkflowStatus::Completed;
+                })
+                .await?;
 
             let duration = start_time.elapsed();
             self.event_bus
@@ -624,23 +645,25 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let mut backoff = Self::create_backoff(&retry_policy.backoff);
 
         loop {
-            if self.state_store.is_cancelled(instance_id)? {
+            if self.state_store.is_cancelled(instance_id).await? {
                 return Err(WorkflowError::Cancelled(instance_id));
             }
 
             // Update step state
-            self.state_store.update(instance_id, |s| {
-                s.current_step = Some(step.id.clone());
-                if let Some(step_state) = s.step_states.get_mut(&step.id) {
-                    step_state.status = if attempt == 1 {
-                        StepStatus::Running
-                    } else {
-                        StepStatus::Retrying
-                    };
-                    step_state.attempt = attempt;
-                    step_state.started_at = Some(Utc::now());
-                }
-            })?;
+            self.state_store
+                .update(instance_id, |s| {
+                    s.current_step = Some(step.id.clone());
+                    if let Some(step_state) = s.step_states.get_mut(&step.id) {
+                        step_state.status = if attempt == 1 {
+                            StepStatus::Running
+                        } else {
+                            StepStatus::Retrying
+                        };
+                        step_state.attempt = attempt;
+                        step_state.started_at = Some(Utc::now());
+                    }
+                })
+                .await?;
 
             // Emit step started event
             self.event_bus
@@ -651,7 +674,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 })
                 .await;
 
-            let mut context = self.state_store.get_context(instance_id)?;
+            let mut context = self.state_store.get_context(instance_id).await?;
 
             // Execute step with timeout
             let step_start = std::time::Instant::now();
@@ -659,19 +682,23 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
             let step_duration = step_start.elapsed();
 
-            self.state_store.update(instance_id, |s| {
-                s.context = context.clone();
-            })?;
+            self.state_store
+                .update(instance_id, |s| {
+                    s.context = context.clone();
+                })
+                .await?;
 
             match result {
                 Ok(Ok(StepResult::Success)) => {
                     // Step succeeded
-                    self.state_store.update(instance_id, |s| {
-                        if let Some(step_state) = s.step_states.get_mut(&step.id) {
-                            step_state.status = StepStatus::Succeeded;
-                            step_state.completed_at = Some(Utc::now());
-                        }
-                    })?;
+                    self.state_store
+                        .update(instance_id, |s| {
+                            if let Some(step_state) = s.step_states.get_mut(&step.id) {
+                                step_state.status = StepStatus::Succeeded;
+                                step_state.completed_at = Some(Utc::now());
+                            }
+                        })
+                        .await?;
 
                     self.event_bus
                         .publish(WorkflowEvent::StepSucceeded {
@@ -708,19 +735,21 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     let will_retry = should_retry && attempt < max_attempts;
 
                     // Update step state
-                    self.state_store.update(instance_id, |s| {
-                        if let Some(step_state) = s.step_states.get_mut(&step.id) {
-                            step_state.status = if will_retry {
-                                StepStatus::Retrying
-                            } else {
-                                StepStatus::Failed
-                            };
-                            step_state.last_error = Some(error_msg.clone());
-                            if !will_retry {
-                                step_state.completed_at = Some(Utc::now());
+                    self.state_store
+                        .update(instance_id, |s| {
+                            if let Some(step_state) = s.step_states.get_mut(&step.id) {
+                                step_state.status = if will_retry {
+                                    StepStatus::Retrying
+                                } else {
+                                    StepStatus::Failed
+                                };
+                                step_state.last_error = Some(error_msg.clone());
+                                if !will_retry {
+                                    step_state.completed_at = Some(Utc::now());
+                                }
                             }
-                        }
-                    })?;
+                        })
+                        .await?;
 
                     // Emit step failed event
                     self.event_bus
@@ -787,9 +816,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
     /// Cancel a running workflow
     pub async fn cancel_workflow(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<()> {
-        self.state_store.update(instance_id, |s| {
-            s.status = WorkflowStatus::Cancelled;
-        })?;
+        self.state_store
+            .update(instance_id, |s| {
+                s.status = WorkflowStatus::Cancelled;
+            })
+            .await?;
 
         self.event_bus
             .publish(WorkflowEvent::WorkflowCancelled { instance_id })
@@ -799,8 +830,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     }
 
     /// Get workflow status
-    pub fn get_status(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<WorkflowState<D>> {
-        self.state_store.load(instance_id)
+    pub async fn get_status(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> WorkflowResult<WorkflowState<D>> {
+        self.state_store.load(instance_id).await
     }
 
     /// Wait for a workflow to complete with adaptive polling
@@ -829,6 +863,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
             let state = self
                 .get_status(instance_id)
+                .await
                 .map_err(|e| format!("Failed to get workflow status: {:?}", e))?;
 
             let result = match state.status {
@@ -857,7 +892,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 }
             };
 
-            self.state_store.cleanup_if_terminal(instance_id);
+            self.state_store.cleanup_if_terminal(instance_id).await;
             return result;
         }
     }
