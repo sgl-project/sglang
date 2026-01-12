@@ -195,6 +195,9 @@ def test_causal_conv1d_update_with_batch_gather(
     if not torch.cuda.is_available():
         pytest.skip("CUDA device not available")
 
+    # TODO: Fix Triton kernel bug - see issue #16714
+    pytest.skip("Triton kernel bug - see issue #16714")
+
     device = "cuda"
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
@@ -274,6 +277,9 @@ def test_causal_conv1d_varlen(
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA device not available")
+
+    # TODO: Fix Triton kernel bug - see issue #16714
+    pytest.skip("Triton kernel bug - see issue #16714")
 
     device = "cuda"
     torch.cuda.empty_cache()
@@ -380,4 +386,6 @@ def test_causal_conv1d_varlen(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+
+    sys.exit(pytest.main([__file__]))

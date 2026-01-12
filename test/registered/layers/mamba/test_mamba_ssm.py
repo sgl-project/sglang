@@ -297,4 +297,6 @@ def test_selective_state_update_with_heads_with_batch_indices(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+
+    sys.exit(pytest.main([__file__]))

@@ -25,6 +25,7 @@ from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
@@ -246,6 +247,22 @@ class SchedulerStats:
     lora_pool_slots_total: int = 0
     lora_pool_utilization: float = 0.0
 
+    # Routing key metrics
+    num_unique_running_routing_keys: int = 0
+    routing_key_running_req_counts: List[int] = field(default_factory=list)
+    routing_key_all_req_counts: List[int] = field(default_factory=list)
+
+
+ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
+
+
+def compute_routing_key_stats(routing_keys: List[Optional[str]]) -> tuple:
+    """Returns (num_unique_keys, per_key_counts)."""
+    from collections import Counter
+
+    key_counts = Counter(k for k in routing_keys if k is not None)
+    return len(key_counts), list(key_counts.values())
+
 
 @dataclass
 class DPCooperationInfo:
@@ -271,6 +288,7 @@ class SchedulerMetricsCollector:
         self,
         labels: Dict[str, str],
         enable_lora: bool = False,
+        server_args: Optional["ServerArgs"] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Gauge, Histogram, Summary
@@ -720,6 +738,25 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
+        self.num_unique_running_routing_keys = Gauge(
+            name="sglang:num_unique_running_routing_keys",
+            documentation="Number of unique routing keys in running batch.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.routing_key_running_req_count = GaugeHistogram(
+            name="sglang:routing_key_running_req_count",
+            documentation="Distribution of routing keys by running request count (gt < count <= le).",
+            labelnames=list(labels.keys()),
+            bucket_bounds=ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
+        )
+        self.routing_key_all_req_count = GaugeHistogram(
+            name="sglang:routing_key_all_req_count",
+            documentation="Distribution of routing keys by running+waiting request count (gt < count <= le).",
+            labelnames=list(labels.keys()),
+            bucket_bounds=ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
+        )
+
         self.new_token_ratio = Gauge(
             name="sglang:new_token_ratio",
             documentation="The new token ratio.",
@@ -761,6 +798,49 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
         )
 
+        max_delay = server_args.prefill_delayer_max_delay_passes
+        self.prefill_delayer_wait_forward_passes = Histogram(
+            name="sglang:prefill_delayer_wait_forward_passes",
+            documentation="Histogram of forward passes waited by prefill delayer.",
+            labelnames=labels.keys(),
+            buckets=sorted(
+                set(
+                    x
+                    for x in (
+                        server_args.prefill_delayer_forward_passes_buckets
+                        or [5, 20, 50, 100, 200]
+                    )
+                    if x < max_delay
+                )
+                # Need bucket "<=0" for zero-delay cases, and "max_delay-1" to distinguish "max_delay" timeout passes
+                | {0, max_delay - 1}
+            ),
+        )
+        self.prefill_delayer_wait_seconds = Histogram(
+            name="sglang:prefill_delayer_wait_seconds",
+            documentation="Histogram of wait time in seconds by prefill delayer.",
+            labelnames=labels.keys(),
+            buckets=sorted(
+                set(
+                    server_args.prefill_delayer_wait_seconds_buckets
+                    or [1, 2, 5, 10, 20, 50, 100, 200, 500]
+                )
+                # Need bucket "<=0" for zero-delay cases
+                | {0}
+            ),
+        )
+        self.prefill_delayer_outcomes_total = Counter(
+            name="sglang:prefill_delayer_outcomes_total",
+            documentation="Prefill delayer outcome counts.",
+            labelnames=[
+                *labels.keys(),
+                "input_estimation",
+                "output_allow",
+                "output_reason",
+                "actual_execution",
+            ],
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -780,6 +860,29 @@ class SchedulerMetricsCollector:
 
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
+
+    def observe_prefill_delayer_outcome(
+        self,
+        forward_passes: int,
+        wait_seconds: float,
+        input_estimation: str,
+        output_allow: bool,
+        output_reason: str,
+        actual_execution: bool,
+    ) -> None:
+        if output_allow and actual_execution:
+            self._log_histogram(
+                self.prefill_delayer_wait_forward_passes, forward_passes
+            )
+            self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
+
+        self.prefill_delayer_outcomes_total.labels(
+            **self.labels,
+            input_estimation=input_estimation,
+            output_allow=str(output_allow).lower(),
+            output_reason=output_reason,
+            actual_execution=str(actual_execution).lower(),
+        ).inc(1)
 
     def increment_retracted_reqs(
         self,
@@ -913,6 +1016,16 @@ class SchedulerMetricsCollector:
             self._log_gauge(self.lora_pool_slots_used, stats.lora_pool_slots_used)
             self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
             self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
+
+        self._log_gauge(
+            self.num_unique_running_routing_keys, stats.num_unique_running_routing_keys
+        )
+        self.routing_key_running_req_count.set_by_current_observations(
+            self.labels, stats.routing_key_running_req_counts
+        )
+        self.routing_key_all_req_count.set_by_current_observations(
+            self.labels, stats.routing_key_all_req_counts
+        )
 
         self.last_log_time = time.perf_counter()
 
