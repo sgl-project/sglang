@@ -30,7 +30,7 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, supports_custom_op
+from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 Qwen3Config = None
 
@@ -39,7 +39,7 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 if _is_npu:
-    if supports_custom_op() and get_global_server_args().enable_torch_compile:
+    if get_global_server_args().enable_torch_compile:
         from sglang.srt.hardware_backend.npu.cmo import get_weight_cache
         from sglang.srt.hardware_backend.npu.cmo_custom_ops import (
             get_cmo_stream,

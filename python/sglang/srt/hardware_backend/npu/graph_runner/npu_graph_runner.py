@@ -37,7 +37,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_compiler_backend,
     is_npu,
-    supports_custom_op,
 )
 
 is_npu = is_npu()
@@ -131,7 +130,7 @@ class NPUGraphRunner(CudaGraphRunner):
     def _init_dp_gathered_buffer(
         self, global_dp_buffer_len: int, local_dp_buffer_len: int, dp_max_padding: bool
     ):
-        if supports_custom_op() and get_global_server_args().enable_torch_compile:
+        if get_global_server_args().enable_torch_compile:
             _set_dp_buffer_len(
                 global_dp_buffer_len, local_dp_buffer_len, dp_max_padding
             )

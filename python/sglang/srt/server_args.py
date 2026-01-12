@@ -33,7 +33,6 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.utils import supports_custom_op
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -2534,19 +2533,6 @@ class ServerArgs:
             logger.warning(
                 "The option --enable-npu-torchair-compile is ignored, this option is available for Ascend NPU only"
             )
-
-        if is_npu() and not supports_custom_op():
-            if self.enable_torch_compile:
-                self.enable_torch_compile = False
-                logger.warning(
-                    "Torch compile is disabled because custom ops are not supported"
-                )
-
-            if self.enable_npu_torchair_compile:
-                self.enable_npu_torchair_compile = False
-                logger.warning(
-                    "NPU TorchAir compile is disabled because custom ops are not supported"
-                )
 
         # Validate limit_mm_per_prompt modalities
         if self.limit_mm_data_per_request:
