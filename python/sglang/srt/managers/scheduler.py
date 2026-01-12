@@ -1434,6 +1434,8 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 disagg_mode=self.disaggregation_mode,
                 data_parallel_rank=recv_req.data_parallel_rank,
+                prefill_dp_rank=recv_req.prefill_dp_rank,
+                decode_dp_rank=recv_req.decode_dp_rank,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
@@ -1675,6 +1677,8 @@ class Scheduler(
             recv_req.input_ids,
             recv_req.sampling_params,
             token_type_ids=recv_req.token_type_ids,
+            prefill_dp_rank=recv_req.prefill_dp_rank,
+            decode_dp_rank=recv_req.decode_dp_rank,
             priority=recv_req.priority,
             dimensions=recv_req.dimensions,
             http_worker_ipc=recv_req.http_worker_ipc,
