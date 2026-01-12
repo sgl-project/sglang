@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use crate::{
-    core::steps::workflow_data::AnyWorkflowData,
+    core::steps::workflow_data::WorkerRemovalWorkflowData,
     observability::metrics::Metrics,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
@@ -17,17 +17,17 @@ use crate::{
 pub struct RemoveFromWorkerRegistryStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for RemoveFromWorkerRegistryStep {
+impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_worker_removal()?;
-        let app_context = data
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let worker_urls = &data.worker_urls;
+        let worker_urls = &context.data.worker_urls;
 
         debug!(
             "Removing {} worker(s) from worker registry",

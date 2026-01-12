@@ -40,8 +40,7 @@ use crate::{
     config::RouterConfig,
     core::{
         steps::workflow_data::{
-            AnyWorkflowData, LocalWorkerWorkflowData, WorkerRemovalWorkflowData,
-            WorkerUpdateWorkflowData,
+            LocalWorkerWorkflowData, WorkerRemovalWorkflowData, WorkerUpdateWorkflowData,
         },
         Worker, WorkerRegistry,
     },
@@ -76,7 +75,7 @@ pub(crate) fn find_workers_by_url(
 
 pub fn create_local_worker_workflow(
     router_config: &RouterConfig,
-) -> WorkflowDefinition<AnyWorkflowData> {
+) -> WorkflowDefinition<LocalWorkerWorkflowData> {
     let detect_timeout = Duration::from_secs(router_config.worker_startup_timeout_secs);
 
     // Calculate max_attempts based on timeout
@@ -208,7 +207,7 @@ pub fn create_local_worker_workflow(
 ///              │
 ///     update_remaining_policies
 /// ```
-pub fn create_worker_removal_workflow() -> WorkflowDefinition<AnyWorkflowData> {
+pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkflowData> {
     WorkflowDefinition::new("worker_removal", "Remove worker from router")
         .add_step(
             StepDefinition::new(
@@ -273,7 +272,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<AnyWorkflowData> {
 ///              │
 ///     update_policies_for_worker
 /// ```
-pub fn create_worker_update_workflow() -> WorkflowDefinition<AnyWorkflowData> {
+pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflowData> {
     WorkflowDefinition::new("worker_update", "Update worker properties")
         .add_step(
             StepDefinition::new(
@@ -319,8 +318,8 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<AnyWorkflowData> {
 pub fn create_local_worker_workflow_data(
     config: WorkerConfigRequest,
     app_context: Arc<AppContext>,
-) -> AnyWorkflowData {
-    AnyWorkflowData::LocalWorker(LocalWorkerWorkflowData {
+) -> LocalWorkerWorkflowData {
+    LocalWorkerWorkflowData {
         config,
         connection_mode: None,
         discovered_labels: std::collections::HashMap::new(),
@@ -330,7 +329,7 @@ pub fn create_local_worker_workflow_data(
         detected_runtime_type: None,
         app_context: Some(app_context),
         actual_workers: None,
-    })
+    }
 }
 
 /// Helper to create initial workflow data for worker removal
@@ -338,15 +337,15 @@ pub fn create_worker_removal_workflow_data(
     url: String,
     dp_aware: bool,
     app_context: Arc<AppContext>,
-) -> AnyWorkflowData {
-    AnyWorkflowData::WorkerRemoval(WorkerRemovalWorkflowData {
+) -> WorkerRemovalWorkflowData {
+    WorkerRemovalWorkflowData {
         config: WorkerRemovalRequest { url, dp_aware },
         workers_to_remove: None,
         worker_urls: Vec::new(),
         affected_models: std::collections::HashSet::new(),
         app_context: Some(app_context),
         actual_workers_to_remove: None,
-    })
+    }
 }
 
 /// Helper to create initial workflow data for worker update
@@ -354,15 +353,15 @@ pub fn create_worker_update_workflow_data(
     worker_url: String,
     update_config: WorkerUpdateRequest,
     app_context: Arc<AppContext>,
-) -> AnyWorkflowData {
+) -> WorkerUpdateWorkflowData {
     // Determine if this is a DP-aware update based on URL pattern
     let dp_aware = worker_url.contains('@');
-    AnyWorkflowData::WorkerUpdate(WorkerUpdateWorkflowData {
+    WorkerUpdateWorkflowData {
         config: update_config,
         worker_url,
         dp_aware,
         app_context: Some(app_context),
         workers_to_update: None,
         updated_workers: None,
-    })
+    }
 }

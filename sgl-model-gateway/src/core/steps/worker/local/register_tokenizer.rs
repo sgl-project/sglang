@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use crate::{
-    core::steps::workflow_data::AnyWorkflowData,
+    core::steps::workflow_data::LocalWorkerWorkflowData,
     tokenizer::{factory, TokenizerRegistry},
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
@@ -13,18 +13,19 @@ use crate::{
 pub struct RegisterTokenizerStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for RegisterTokenizerStep {
+impl StepExecutor<LocalWorkerWorkflowData> for RegisterTokenizerStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<LocalWorkerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_local_worker()?;
-        let labels = &data.final_labels;
-        let app_context = data
+        let labels = &context.data.final_labels;
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let workers = data
+        let workers = context
+            .data
             .actual_workers
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;

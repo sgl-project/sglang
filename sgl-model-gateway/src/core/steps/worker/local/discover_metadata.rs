@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use super::strip_protocol;
 use crate::{
-    core::{steps::workflow_data::AnyWorkflowData, ConnectionMode},
+    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
     routers::grpc::client::GrpcClient,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
@@ -218,17 +218,16 @@ async fn fetch_grpc_metadata(
 pub struct DiscoverMetadataStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for DiscoverMetadataStep {
+impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<LocalWorkerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_local_worker()?;
-        let config = &data.config;
-        let connection_mode = data
-            .connection_mode
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("connection_mode".to_string()))?;
+        let config = &context.data.config;
+        let connection_mode =
+            context.data.connection_mode.as_ref().ok_or_else(|| {
+                WorkflowError::ContextValueNotFound("connection_mode".to_string())
+            })?;
 
         debug!(
             "Discovering metadata for {} ({:?})",
@@ -301,11 +300,10 @@ impl StepExecutor<AnyWorkflowData> for DiscoverMetadataStep {
         );
 
         // Update workflow data
-        let data_mut = context.data.as_local_worker_mut()?;
-        data_mut.discovered_labels = discovered_labels;
+        context.data.discovered_labels = discovered_labels;
         if let Some(runtime) = detected_runtime {
             debug!("Detected runtime type: {}", runtime);
-            data_mut.detected_runtime_type = Some(runtime);
+            context.data.detected_runtime_type = Some(runtime);
         }
 
         Ok(StepResult::Success)

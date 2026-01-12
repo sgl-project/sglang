@@ -10,7 +10,7 @@ use crate::{
     core::{
         circuit_breaker::CircuitBreakerConfig,
         model_card::ModelCard,
-        steps::workflow_data::{AnyWorkflowData, LocalWorkerWorkflowData},
+        steps::workflow_data::LocalWorkerWorkflowData,
         worker::{HealthConfig, RuntimeType, WorkerType},
         BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, UNKNOWN_MODEL_ID,
     },
@@ -29,22 +29,22 @@ use crate::{
 pub struct CreateLocalWorkerStep;
 
 #[async_trait]
-impl StepExecutor<AnyWorkflowData> for CreateLocalWorkerStep {
+impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<AnyWorkflowData>,
+        context: &mut WorkflowContext<LocalWorkerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let data = context.data.as_local_worker()?;
-        let config = &data.config;
-        let app_context = data
+        let config = &context.data.config;
+        let app_context = context
+            .data
             .app_context
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-        let connection_mode = data
-            .connection_mode
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("connection_mode".to_string()))?;
-        let discovered_labels = &data.discovered_labels;
+        let connection_mode =
+            context.data.connection_mode.as_ref().ok_or_else(|| {
+                WorkflowError::ContextValueNotFound("connection_mode".to_string())
+            })?;
+        let discovered_labels = &context.data.discovered_labels;
 
         // Check if worker already exists
         if app_context
@@ -100,7 +100,7 @@ impl StepExecutor<AnyWorkflowData> for CreateLocalWorkerStep {
         let worker_type = parse_worker_type(config);
 
         // Get runtime type (for gRPC workers)
-        let runtime_type = determine_runtime_type(connection_mode, data, config);
+        let runtime_type = determine_runtime_type(connection_mode, &context.data, config);
 
         // Build circuit breaker config
         let circuit_breaker_config = build_circuit_breaker_config(app_context);
@@ -121,7 +121,7 @@ impl StepExecutor<AnyWorkflowData> for CreateLocalWorkerStep {
         // Create workers - always output as Vec for unified downstream handling
         let workers = if config.dp_aware {
             create_dp_aware_workers(
-                data,
+                &context.data,
                 &normalized_url,
                 model_card,
                 worker_type,
@@ -147,9 +147,8 @@ impl StepExecutor<AnyWorkflowData> for CreateLocalWorkerStep {
         };
 
         // Update workflow data
-        let data_mut = context.data.as_local_worker_mut()?;
-        data_mut.actual_workers = Some(workers);
-        data_mut.final_labels = final_labels;
+        context.data.actual_workers = Some(workers);
+        context.data.final_labels = final_labels;
         Ok(StepResult::Success)
     }
 
