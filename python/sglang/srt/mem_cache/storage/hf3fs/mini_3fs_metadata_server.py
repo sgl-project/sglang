@@ -36,8 +36,6 @@ class RankMetadata:
     def exists_keys(self, keys: List[str]) -> List[bool]:
         """Check if keys exist in metadata."""
         with self.lock:
-            logging.info(f"Checking if {len(keys)} keys exist in metadata")
-            logging.info(f"Checking if keys exist in metadata: {keys}")
             return [key in self.key_to_index for key in keys]
 
     def reserve_and_allocate_page_indices(
@@ -47,8 +45,7 @@ class RankMetadata:
         with self.lock:
             results = [None] * len(keys)
             new_keys_to_process = []
-            logging.info(f"Reserving and allocating page indices for {len(keys)} keys")
-            logging.info(f"Reserving and allocating page indices for {keys} keys")
+
             for i, (key, prefix_key) in enumerate(keys):
                 if key in self.key_to_index:
                     results[i] = (True, self.key_to_index[key])
@@ -74,8 +71,6 @@ class RankMetadata:
     ) -> None:
         """Confirm write operations and release pages."""
         with self.lock:
-            logging.info(f"Confirming write for {len(written_keys_to_confirm)} keys")
-            logging.info(f"Confirming write for {written_keys_to_confirm} keys")
             for key, page_index in written_keys_to_confirm:
                 self.key_to_index[key] = page_index
                 self.key_to_index.move_to_end(key)
@@ -199,7 +194,6 @@ class Hf3fsMetadataServer:
     """HF3FS Metadata Server that manages metadata for multiple ranks."""
 
     def __init__(self, persistence_path: Optional[str] = None, save_interval: int = 60):
-        print("---in Hf3fsMetadataServer--")
         self.state = GlobalMetadataState(persistence_path, save_interval)
         self.app = FastAPI(default_response_class=ORJSONResponse)
 
@@ -239,15 +233,13 @@ class Hf3fsMetadataServer:
         """Initialize a rank with specified number of pages."""
         data = await self._read_json(request)
         num_pages = data["num_pages"]
-        print(rank, num_pages)
         with self.state.global_lock:
-            print(f"---initialize------- rank {rank} -- {self.state.ranks}")
             if rank in self.state.ranks:
                 logging.info(
                     f"Rank {rank} already exists. Initialization request ignored."
                 )
                 if self.state.ranks[rank].num_pages != num_pages:
-                    logging.info(
+                    logging.warning(
                         f"Rank {rank} initialized with different num_pages. Existing: {self.state.ranks[rank].num_pages}, New: {num_pages}"
                     )
             else:
@@ -268,8 +260,6 @@ class Hf3fsMetadataServer:
         data = await self._read_json(request)
         metadata = self.get_rank_metadata(rank)
         keys = data["keys"]
-        print(f"---reserve_and_allocate_page_indices------- rank {rank} --")
-        print(keys)
         results = metadata.reserve_and_allocate_page_indices(keys)
         return self._json_response({"indices": results})
 
@@ -278,8 +268,6 @@ class Hf3fsMetadataServer:
         data = await self._read_json(request)
         metadata = self.get_rank_metadata(rank)
         success_written_keys = data.get("written_keys_to_confirm", [])
-        print(f"---confirm_write------- rank {rank} --")
-        print(success_written_keys)
         released_pages = data.get("pages_to_release", [])
 
         metadata.confirm_write(success_written_keys, released_pages)
