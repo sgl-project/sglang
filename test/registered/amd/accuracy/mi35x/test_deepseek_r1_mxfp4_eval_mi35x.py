@@ -1,9 +1,9 @@
-"""MI35x DeepSeek-R1 GSM8K Completion Evaluation Test (8-GPU)
+"""MI35x DeepSeek-R1-MXFP4 GSM8K Completion Evaluation Test (8-GPU)
 
-Tests DeepSeek-R1-0528 with multiple configurations (basic, MTP, DP, TC)
-using few-shot completion benchmark on MI35x.
+Tests DeepSeek-R1-MXFP4 quantized model with multiple configurations
+(basic, MTP, DP, TC) using few-shot completion benchmark on MI35x.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-r1 suite
+Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4 suite
 """
 
 import ast
@@ -32,16 +32,27 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-# Register for AMD CI - MI35x DeepSeek-R1 accuracy tests (~120 min)
-# Disabled: Only MXFP4 version runs on MI35x (see test_deepseek_r1_mxfp4_eval_mi35x.py)
+# Register for AMD CI - MI35x DeepSeek-R1-MXFP4 accuracy tests (~120 min)
 register_amd_ci(
-    est_time=7200,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-r1",
-    nightly=True,
-    disabled="Only MXFP4 version runs on MI35x",
+    est_time=7200, suite="nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4", nightly=True
 )
 
 INVALID = -9999999
+
+# Model path configuration for MI35x DeepSeek-R1-MXFP4
+# Priority: 1) env var, 2) local path, 3) HuggingFace model ID
+DEEPSEEK_R1_MXFP4_LOCAL_PATH = "/data2/models/amd-DeepSeek-R1-MXFP4-Preview"
+DEEPSEEK_R1_MXFP4_HF_MODEL_ID = "amd/DeepSeek-R1-MXFP4-Preview"
+
+
+def get_model_path() -> str:
+    """Get effective model path: env var > local path > HF model ID."""
+    env_path = os.environ.get("DEEPSEEK_R1_MXFP4_MODEL_PATH")
+    if env_path:
+        return env_path
+    if os.path.exists(DEEPSEEK_R1_MXFP4_LOCAL_PATH):
+        return DEEPSEEK_R1_MXFP4_LOCAL_PATH
+    return DEEPSEEK_R1_MXFP4_HF_MODEL_ID
 
 
 @dataclass
@@ -68,97 +79,55 @@ class ModelConfig:
         return self.model_path
 
 
-# DeepSeek-R1 models for MI35x (same model as MI300X for consistency)
-MI35X_DEEPSEEK_R1_MODELS = [
-    # DeepSeek-R1-0528 basic
-    ModelConfig(
-        model_path="deepseek-ai/DeepSeek-R1-0528",
-        tp_size=8,
-        accuracy_threshold=0.93,
-        timeout=3600,
-        variant="basic",
-        other_args=[
-            "--attention-backend",
-            "aiter",
-            "--chunked-prefill-size",
-            "131072",
-            "--disable-radix-cache",
-            "--mem-fraction-static",
-            "0.85",
-            "--trust-remote-code",
-        ],
-        env_vars={"SGLANG_USE_AITER": "1"},
-    ),
-    # DeepSeek-R1-0528 with MTP (EAGLE)
-    ModelConfig(
-        model_path="deepseek-ai/DeepSeek-R1-0528",
-        tp_size=8,
-        accuracy_threshold=0.93,
-        timeout=3600,
-        variant="MTP",
-        other_args=[
-            "--chunked-prefill-size",
-            "131072",
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-num-steps",
-            "3",
-            "--speculative-eagle-topk",
-            "1",
-            "--speculative-num-draft-tokens",
-            "4",
-            "--mem-fraction-static",
-            "0.7",
-            "--trust-remote-code",
-        ],
-        env_vars={"SGLANG_USE_AITER": "1"},
-    ),
-    # DeepSeek-R1-0528 with DP attention
-    ModelConfig(
-        model_path="deepseek-ai/DeepSeek-R1-0528",
-        tp_size=8,
-        accuracy_threshold=0.93,
-        timeout=3600,
-        variant="DP",
-        other_args=[
-            "--chunked-prefill-size",
-            "131072",
-            "--dp-size",
-            "8",
-            "--enable-dp-attention",
-            "--mem-fraction-static",
-            "0.85",
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "SGLANG_USE_ROCM700A": "1",
-            "SGLANG_USE_AITER": "1",
-        },
-    ),
-    # DeepSeek-R1-0528 with torch compile
-    ModelConfig(
-        model_path="deepseek-ai/DeepSeek-R1-0528",
-        tp_size=8,
-        accuracy_threshold=0.93,
-        timeout=7200,
-        variant="TC",
-        other_args=[
-            "--chunked-prefill-size",
-            "131072",
-            "--mem-fraction-static",
-            "0.70",
-            "--cuda-graph-max-bs",
-            "8",
-            "--enable-torch-compile",
-            "--disable-cuda-graph",
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "SGLANG_USE_ROCM700A": "1",
-            "SGLANG_USE_AITER": "1",
-        },
-    ),
-]
+def get_mxfp4_models() -> List[ModelConfig]:
+    """Get DeepSeek-R1-MXFP4 model configurations for MI35x."""
+    model_path = get_model_path()
+    return [
+        # DeepSeek-R1-MXFP4 basic
+        ModelConfig(
+            model_path=model_path,
+            tp_size=8,
+            accuracy_threshold=0.93,
+            timeout=3600,
+            variant="basic",
+            other_args=[
+                "--attention-backend",
+                "aiter",
+                "--chunked-prefill-size",
+                "131072",
+                "--disable-radix-cache",
+                "--mem-fraction-static",
+                "0.85",
+                "--trust-remote-code",
+            ],
+            env_vars={"SGLANG_USE_AITER": "1"},
+        ),
+        # DeepSeek-R1-MXFP4 with MTP (EAGLE)
+        ModelConfig(
+            model_path=model_path,
+            tp_size=8,
+            accuracy_threshold=0.93,
+            timeout=3600,
+            variant="MTP",
+            other_args=[
+                "--chunked-prefill-size",
+                "131072",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
+                "--mem-fraction-static",
+                "0.7",
+                "--trust-remote-code",
+            ],
+            env_vars={"SGLANG_USE_AITER": "1"},
+        ),
+        # Note: DP and TC variants are not supported for MXFP4 on MI35x
+    ]
 
 
 def get_one_example(lines, i, include_answer):
@@ -236,19 +205,32 @@ def run_gsm8k_benchmark(
     return float(acc), float(invalid), float(latency)
 
 
-class TestDeepSeekR1EvalMI35x(unittest.TestCase):
-    """DeepSeek-R1 GSM8K Completion Evaluation Test for AMD MI35x."""
+class TestDeepSeekR1MXFP4EvalMI35x(unittest.TestCase):
+    """DeepSeek-R1-MXFP4 GSM8K Completion Evaluation Test for AMD MI35x."""
 
     @classmethod
     def setUpClass(cls):
-        cls.models = MI35X_DEEPSEEK_R1_MODELS
+        cls.models = get_mxfp4_models()
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
 
-    def test_deepseek_r1_accuracy(self):
-        """Test DeepSeek-R1 models with GSM8K completion benchmark."""
+    def test_deepseek_r1_mxfp4_accuracy(self):
+        """Test DeepSeek-R1-MXFP4 models with GSM8K completion benchmark."""
+        # Check if model exists
+        model_path = get_model_path()
+        is_local_path = model_path.startswith("/")
+        if is_local_path and not os.path.exists(model_path):
+            print(f"\n⏭️ SKIPPING: Local model not found at {model_path}")
+            self.skipTest(f"Local model not found at {model_path}")
+            return
+
+        if is_local_path:
+            print(f"📁 Using local model: {model_path}")
+        else:
+            print(f"📥 Using HuggingFace model: {model_path}")
+
         all_results = []
-        summary = "### DeepSeek-R1 Models (MI35x)\n\n"
+        summary = "### DeepSeek-R1-MXFP4 Models (MI35x)\n\n"
         summary += "| Model | Variant | TP | Accuracy | Threshold | Status |\n"
         summary += "| ----- | ------- | -- | -------- | --------- | ------ |\n"
 

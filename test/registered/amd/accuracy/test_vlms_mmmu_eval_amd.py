@@ -1,5 +1,5 @@
 """
-AMD VLM MMMU Evaluation Test (Migrated from test/srt/nightly/)
+AMD VLM MMMU Evaluation Test - MI30x Only
 
 This test evaluates Vision-Language Models (VLMs) on the MMMU benchmark on AMD GPUs.
 Models are selected based on compatibility with AMD/ROCm platform.
@@ -11,6 +11,7 @@ VLMs tested here:
 - deepseek-vl2-small
 
 Note: Some VLMs from the Nvidia test are excluded due to AMD compatibility issues.
+Note: This test runs only on MI30x runners (linux-mi325-gpu-2), not on MI35x.
 
 Registry: nightly-amd-vlm suite (2-GPU VLM tests)
 """
