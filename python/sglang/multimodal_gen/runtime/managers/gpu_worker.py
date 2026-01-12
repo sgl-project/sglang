@@ -267,14 +267,16 @@ class GPUWorker:
         return OutputBatch(output=status)
 
 
-OOM_MSG = f"""OOM detected. Possible solutions:
-    - If the OOM occurs during loading:
-        1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
-    - If the OOM occurs during runtime:
-        1. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
-        2. Enable SP and/or TP
-        3. Enable a sparse-attention backend
-    Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose"""
+OOM_MSG = f"""
+OOM detected. Possible solutions:
+  - If the OOM occurs during loading:
+    1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
+  - If the OOM occurs during runtime:
+    1. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
+    2. Enable SP and/or TP
+    3. Enable a sparse-attention backend
+  Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
+"""
 
 
 def run_scheduler_process(
