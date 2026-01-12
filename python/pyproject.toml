@@ -18,6 +18,7 @@ dependencies = [
   "IPython",
   "aiohttp",
   "anthropic>=0.20.0",
+  "apache-tvm-ffi>=0.1.8,<0.2",
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' and platform_machine == 'armv7l')",
   "blobfile==3.0.0",
   "build",
