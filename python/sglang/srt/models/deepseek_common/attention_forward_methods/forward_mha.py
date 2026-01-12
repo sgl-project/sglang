@@ -1,3 +1,5 @@
+from typing import TYPE_CHECKING
+
 import torch
 
 from sglang.srt.environ import envs
@@ -12,9 +14,11 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_npu,
     _use_aiter_gfx95,
 )
-from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator
+
+if TYPE_CHECKING:
+    from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
     from sgl_kernel import concat_mla_k, merge_state_v2
