@@ -4,7 +4,7 @@
 import multiprocessing as mp
 import os
 import time
-from typing import List
+from typing import List, Union
 
 import torch
 from setproctitle import setproctitle
@@ -132,6 +132,7 @@ class GPUWorker:
                     timings=result.timings,
                     trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
                     trajectory_latents=getattr(result, "trajectory_latents", None),
+                    noise_pred=getattr(result, "noise_pred", None),
                     trajectory_decoded=getattr(result, "trajectory_decoded", None),
                 )
             else:
@@ -206,19 +207,20 @@ class GPUWorker:
 
     def set_lora(
         self,
-        lora_nickname: str,
-        lora_path: str | None = None,
-        target: str = "all",
-        strength: float = 1.0,
+        lora_nickname: Union[str, List[str]],
+        lora_path: Union[str, None, List[Union[str, None]]] = None,
+        target: Union[str, List[str]] = "all",
+        strength: Union[float, List[float]] = 1.0,
     ) -> OutputBatch:
         """
-        Set the LoRA adapter for the pipeline.
+        Set the LoRA adapter(s) for the pipeline.
+        Supports both single LoRA (backward compatible) and multiple LoRA adapters.
 
         Args:
-            lora_nickname: The nickname of the adapter.
-            lora_path: Path to the LoRA adapter.
-            target: Which transformer(s) to apply the LoRA to.
-            strength: LoRA strength for merge, default 1.0.
+            lora_nickname: The nickname(s) of the adapter(s). Can be a string or a list of strings.
+            lora_path: Path(s) to the LoRA adapter(s). Can be a string, None, or a list of strings/None.
+            target: Which transformer(s) to apply the LoRA to. Can be a string or a list of strings.
+            strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")

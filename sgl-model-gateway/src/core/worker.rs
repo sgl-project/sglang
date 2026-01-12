@@ -838,18 +838,27 @@ impl Worker for BasicWorker {
         let url = self.normalised_url()?;
         let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
 
-        let mut req = WORKER_CLIENT.get(health_url).timeout(timeout);
+        let mut req = WORKER_CLIENT.get(&health_url).timeout(timeout);
         if let Some(api_key) = &self.metadata.api_key {
             req = req.bearer_auth(api_key);
         }
 
         match req.send().await {
-            Ok(resp) => Ok(resp.status().is_success()),
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    Ok(true)
+                } else {
+                    tracing::warn!(
+                        "HTTP health check returned non-success status for {}: {}",
+                        health_url,
+                        status
+                    );
+                    Ok(false)
+                }
+            }
             Err(err) => {
-                tracing::warn!(
-                    "HTTP health check failed for {}: {err:?}",
-                    self.metadata.url
-                );
+                tracing::warn!("HTTP health check failed for {}: {err:?}", health_url);
                 Ok(false)
             }
         }
