@@ -43,7 +43,7 @@ def write_req_to_token_pool_triton(
     req_pool_index = tl.load(req_pool_indices + pid)
     pre_len = tl.load(pre_lens + pid)
     seq_len = tl.load(seq_lens + pid)
-    prefix_tensor = tl.load(prefix_tensors + pid).to(tl.pointer_type(tl.int32))
+    prefix_tensor = tl.load(prefix_tensors + pid).to(tl.pointer_type(tl.int64))
 
     # write prefix
     num_loop = tl.cdiv(pre_len, BLOCK_SIZE)
