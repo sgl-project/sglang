@@ -246,119 +246,117 @@ def _define_kernels():
 
         cute.arch.barrier()
 
-        # Setup source tensor for initial state loading
-        gSrc_batch = h0_source[(cache_idx * HV + i_hv, None, None)]
-        gDst_h0 = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (cache_idx * HV + i_hv, None, 0))
-        gSrc = cute.local_tile(gSrc_batch, (TILE_V, TILE_K), (None, 0))
-        
-        thr_copy_load = tiled_copy_load.get_slice(tidx)
-
-        # ===================================================================
-        # Main loop: v_tiles (outer) x time_steps (inner)
-        # With store-compute overlap optimization
-        # ===================================================================
-        prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles)
-        
-        # Prefetch first v_tile(s)
-        for v_tiles in range(prefetch_count):
-            stage = v_tiles % NUM_STAGES
-            gSrc_tile = gSrc[(None, None, v_tiles)]
-            sData_stage = sData[(None, None, stage)]
-            thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
-            thr_sData = thr_copy_load.partition_D(sData_stage)
-            cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-            cute.arch.cp_async_commit_group()
-
-        # Process each v_tile
-        for v_tiles in range(num_v_tiles):
-            stage = v_tiles % NUM_STAGES
+        # Skip all computation for invalid batch entries (CUDA Graph padding slots where cache_idx < 0)
+        if cache_idx >= 0:
+            # Setup source tensor for initial state loading
+            gSrc_batch = h0_source[(cache_idx * HV + i_hv, None, None)]
+            gDst_h0 = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (cache_idx * HV + i_hv, None, 0))
+            gSrc = cute.local_tile(gSrc_batch, (TILE_V, TILE_K), (None, 0))
             
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()
+            thr_copy_load = tiled_copy_load.get_slice(tidx)
+
+            # ===================================================================
+            # Main loop: v_tiles (outer) x time_steps (inner)
+            # With store-compute overlap optimization
+            # ===================================================================
+            prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles)
             
-            # Prefetch next v_tile
-            next_v_tiles = v_tiles + prefetch_count
-            if next_v_tiles < num_v_tiles:
-                next_stage = next_v_tiles % NUM_STAGES
-                gSrc_next = gSrc[(None, None, next_v_tiles)]
-                sData_next = sData[(None, None, next_stage)]
-                thr_gSrc = thr_copy_load.partition_S(gSrc_next)
-                thr_sData = thr_copy_load.partition_D(sData_next)
+            # Prefetch first v_tile(s)
+            for v_tiles in range(prefetch_count):
+                stage = v_tiles % NUM_STAGES
+                gSrc_tile = gSrc[(None, None, v_tiles)]
+                sData_stage = sData[(None, None, stage)]
+                thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
+                thr_sData = thr_copy_load.partition_D(sData_stage)
                 cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
                 cute.arch.cp_async_commit_group()
 
-            # Inner loop: all time steps for this v_tile
-            for i_t in range(T):
-                # Load pre-computed values from shared memory
-                for i in range(vec_size):
-                    r_q[i] = sQ[(i_t, i * 32 + lane_id)]
-                    r_k[i] = sK[(i_t, i * 32 + lane_id)]
+            # Process each v_tile
+            for v_tiles in range(num_v_tiles):
+                stage = v_tiles % NUM_STAGES
                 
-                r_g = sG[i_t]
-                r_beta = sBeta[i_t]
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.barrier()
+                
+                # Prefetch next v_tile
+                next_v_tiles = v_tiles + prefetch_count
+                if next_v_tiles < num_v_tiles:
+                    next_stage = next_v_tiles % NUM_STAGES
+                    gSrc_next = gSrc[(None, None, next_v_tiles)]
+                    sData_next = sData[(None, None, next_stage)]
+                    thr_gSrc = thr_copy_load.partition_S(gSrc_next)
+                    thr_sData = thr_copy_load.partition_D(sData_next)
+                    cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
+                    cute.arch.cp_async_commit_group()
 
-                # Compute delta rule for this v_tile
-                for row in range(0, TILE_V, 4):
-                    row_offset = tidx // 32
+                # Inner loop: all time steps for this v_tile
+                for i_t in range(T):
+                    # Load pre-computed values from shared memory
+                    for i in range(vec_size):
+                        r_q[i] = sQ[(i_t, i * 32 + lane_id)]
+                        r_k[i] = sK[(i_t, i * 32 + lane_id)]
                     
-                    # Load h from sData, apply decay
-                    for i in range(vec_size):
-                        r_h[i] = sData[(row + row_offset, i * 32 + lane_id, stage)] * r_g
-                    
-                    # Compute sum_hk = h @ k
-                    sum_hk = 0.0
-                    for i in range(vec_size):
-                        sum_hk += r_h[i] * r_k[i]
+                    r_g = sG[i_t]
+                    r_beta = sBeta[i_t]
 
-                    for offset in [16, 8, 4, 2, 1]:
-                        sum_hk += cute.arch.shuffle_sync_bfly(sum_hk, offset=offset, mask=-1, mask_and_clamp=31)
+                    # Compute delta rule for this v_tile
+                    for row in range(0, TILE_V, 4):
+                        row_offset = tidx // 32
+                        
+                        # Load h from sData, apply decay
+                        for i in range(vec_size):
+                            r_h[i] = sData[(row + row_offset, i * 32 + lane_id, stage)] * r_g
+                        
+                        # Compute sum_hk = h @ k
+                        sum_hk = 0.0
+                        for i in range(vec_size):
+                            sum_hk += r_h[i] * r_k[i]
 
-                    # Delta rule update
-                    v_idx = v_tiles * TILE_V + row + row_offset
-                    v_new = sV[(i_t, v_idx)] - sum_hk
-                    v_new = v_new * r_beta
+                        for offset in [16, 8, 4, 2, 1]:
+                            sum_hk += cute.arch.shuffle_sync_bfly(sum_hk, offset=offset, mask=-1, mask_and_clamp=31)
 
-                    # Update h and write back to sData
-                    for i in range(vec_size):
-                        r_h[i] += r_k[i] * v_new
-                        sData[(row + row_offset, i * 32 + lane_id, stage)] = r_h[i]
-                    
-                    # Store intermediate state INSIDE row loop (overlap store with sum_hq compute)
-                    # Note: Use i_n (batch index 0 to B-1) for intermediate states, not cache_idx
-                    # because intermediate_state_cache is indexed sequentially per request
-                    # Skip for invalid batch entries (CUDA Graph padding slots where cache_idx < 0)
-                    if cache_intermediate_states and cache_idx >= 0:
-                        flat_idx = i_n * T * HV + i_t * HV + i_hv
-                        if v_idx < V:
-                            for i in range(vec_size):
-                                intermediate_states[(flat_idx, v_idx, i * 32 + lane_id)] = r_h[i]
-                    
-                    # Compute sum_hq = h @ q (overlaps with store above)
-                    sum_hq = 0.0
-                    for i in range(vec_size):
-                        sum_hq += r_h[i] * r_q[i]
+                        # Delta rule update
+                        v_idx = v_tiles * TILE_V + row + row_offset
+                        v_new = sV[(i_t, v_idx)] - sum_hk
+                        v_new = v_new * r_beta
 
-                    for offset in [16, 8, 4, 2, 1]:
-                        sum_hq += cute.arch.shuffle_sync_bfly(sum_hq, offset=offset, mask=-1, mask_and_clamp=31)
+                        # Update h and write back to sData
+                        for i in range(vec_size):
+                            r_h[i] += r_k[i] * v_new
+                            sData[(row + row_offset, i * 32 + lane_id, stage)] = r_h[i]
+                        
+                        # Store intermediate state INSIDE row loop (overlap store with sum_hq compute)
+                        # Note: Use i_n (batch index 0 to B-1) for intermediate states, not cache_idx
+                        # because intermediate_state_cache is indexed sequentially per request
+                        if cache_intermediate_states:
+                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            if v_idx < V:
+                                for i in range(vec_size):
+                                    intermediate_states[(flat_idx, v_idx, i * 32 + lane_id)] = r_h[i]
+                        
+                        # Compute sum_hq = h @ q (overlaps with store above)
+                        sum_hq = 0.0
+                        for i in range(vec_size):
+                            sum_hq += r_h[i] * r_q[i]
 
-                    o_idx = v_tiles * TILE_V + row + row_offset
-                    if lane_id == 0 and o_idx < V:
-                        sOutput[(i_t, o_idx)] = cutlass.Float32(sum_hq)
+                        for offset in [16, 8, 4, 2, 1]:
+                            sum_hq += cute.arch.shuffle_sync_bfly(sum_hq, offset=offset, mask=-1, mask_and_clamp=31)
 
-            # Write final h for this v_tile to h0_source
-            # Skip for invalid batch entries (CUDA Graph padding slots where cache_idx < 0)
-            if not disable_state_update and cache_idx >= 0:
-                for row in range(0, TILE_V, 4):
-                    row_offset = tidx // 32
-                    for i in range(vec_size):
-                        gDst_h0[(0, row + row_offset, i * 32 + lane_id, v_tiles)] = sData[(row + row_offset, i * 32 + lane_id, stage)]
+                        o_idx = v_tiles * TILE_V + row + row_offset
+                        if lane_id == 0 and o_idx < V:
+                            sOutput[(i_t, o_idx)] = cutlass.Float32(sum_hq)
+
+                # Write final h for this v_tile to h0_source
+                if not disable_state_update:
+                    for row in range(0, TILE_V, 4):
+                        row_offset = tidx // 32
+                        for i in range(vec_size):
+                            gDst_h0[(0, row + row_offset, i * 32 + lane_id, v_tiles)] = sData[(row + row_offset, i * 32 + lane_id, stage)]
 
 
-        # Final writeback
-        cute.arch.barrier()
-        
-        # Only write output for valid batch entries (skip CUDA Graph padding slots)
-        if cache_idx >= 0:
+            # Final writeback
+            cute.arch.barrier()
+            
             for i_t in range(T):
                 o[(i_n, i_t, i_hv, tidx)] = cutlass.BFloat16(sOutput[(i_t, tidx)])
 
