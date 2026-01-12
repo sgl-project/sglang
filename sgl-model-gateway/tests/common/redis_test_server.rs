@@ -83,6 +83,7 @@ impl RedisTestServer {
         let client = redis::Client::open(self.url.as_str())?;
         let mut conn = client.get_connection()?;
         redis::cmd("PING").query::<String>(&mut conn)?;
+        info!("Redis is_ready=true url={}", self.url);
         Ok(())
     }
 
