@@ -164,7 +164,7 @@ impl PipelineStage for WorkerSelectionStage {
                             );
                             error::internal_error(
                                 "preparation_not_completed",
-                                "Preparation not completed"
+                                "Preparation not completed",
                             )
                         })?;
                         let text = prep.processed_messages.as_ref().unwrap().text.clone();
@@ -177,7 +177,7 @@ impl PipelineStage for WorkerSelectionStage {
                             .await
                             .map_err(|e| {
                                 error!("select data_parallel_rank failed: {}", e);
-                                error::internal_error("dp_rank_selection_failed", e,)
+                                error::internal_error("dp_rank_selection_failed", e)
                             })?;
                         let req = Arc::make_mut(chat_arc);
                         req.data_parallel_rank = Some(prefill_rank);
