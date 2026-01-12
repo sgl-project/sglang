@@ -244,7 +244,7 @@ pub enum StepResult {
 }
 
 /// Error kinds for workflow operations
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum WorkflowError {
     #[error("Workflow not found: {0}")]
     NotFound(WorkflowInstanceId),
@@ -269,6 +269,9 @@ pub enum WorkflowError {
 
     #[error("Context value not found: {0}")]
     ContextValueNotFound(String),
+
+    #[error("Engine is shutting down, not accepting new workflows")]
+    ShuttingDown,
 }
 
 pub type WorkflowResult<T> = Result<T, WorkflowError>;

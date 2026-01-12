@@ -38,8 +38,8 @@ class TestPiecewiseGraphPrefillCorrectness(CustomTestCase):
                 128,
                 "--enable-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-tokens",
-                TOKENS_TO_CAPTURE,
-            ],
+            ]
+            + TOKENS_TO_CAPTURE,
         )
 
     @classmethod
@@ -79,8 +79,8 @@ class TestPiecewiseGraphPrefillBenchmark(CustomTestCase):
                 "ascend",
                 "--enable-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-tokens",
-                TOKENS_TO_CAPTURE,
-            ],
+            ]
+            + TOKENS_TO_CAPTURE,
         )
         self.assertLess(prefill_latency, EXP_PREFILL_LATENCY)
 
