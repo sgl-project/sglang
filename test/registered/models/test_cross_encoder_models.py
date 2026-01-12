@@ -2,7 +2,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Cross encoder model tests
 register_cuda_ci(est_time=100, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=150, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=150, suite="stage-b-test-small-1-gpu-amd")
 
 import multiprocessing as mp
 import random
