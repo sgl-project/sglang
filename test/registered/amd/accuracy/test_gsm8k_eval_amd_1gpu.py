@@ -55,6 +55,7 @@ MODEL_SCORE_THRESHOLDS = {
 # Models known to fail on AMD
 FAILING_MODELS = {
     "google/gemma-2-9b-it",  # OOM on single GPU (exit code -9)
+    "google/gemma-2-27b-it",  # AITER kernel compilation timeout (>5min)
     "neuralmagic/gemma-2-2b-it-FP8",  # OOM on single GPU (exit code -9)
     # Models not cached locally on CI runner
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8",  # Not cached locally
