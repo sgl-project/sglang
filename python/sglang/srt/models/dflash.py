@@ -13,8 +13,14 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -123,21 +129,72 @@ class DFlashAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def kv_proj_only(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project hidden_states to K/V only (skip Q).
+
+        This is used by DFlash to materialize ctx tokens into the draft KV cache:
+        we only need K/V for the cached tokens; Q is never consumed.
+        """
+        # Fast path for unquantized weights: slice the fused QKV weight and run one GEMM.
+        if isinstance(getattr(self.qkv_proj, "quant_method", None), UnquantizedLinearMethod):
+            kv_slice = slice(self.q_size, self.q_size + 2 * self.kv_size)
+            weight = self.qkv_proj.weight[kv_slice]
+            bias = self.qkv_proj.bias[kv_slice] if self.qkv_proj.bias is not None else None
+            kv = F.linear(hidden_states, weight, bias)
+            k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
+            return k, v
+
+        # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
+        qkv, _ = self.qkv_proj(hidden_states)
+        _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        return k, v
+
+    def apply_k_norm(self, k: torch.Tensor) -> torch.Tensor:
+        k_by_head = k.reshape(-1, self.head_dim)
+        k_by_head = self.k_norm(k_by_head)
+        return k_by_head.view_as(k)
+
+    def apply_k_rope(self, positions: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        # Use a minimal dummy query (1 head) to avoid doing full-Q work.
+        dummy_q = k.new_empty((k.shape[0], self.head_dim))
+        _, k = self.rotary_emb(positions, dummy_q, k)
+        return k
+
 
 class DFlashMLP(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         intermediate_size = int(getattr(config, "intermediate_size", 0))
         if intermediate_size <= 0:
             raise ValueError(f"Invalid intermediate_size={intermediate_size} for DFlash MLP.")
 
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix="gate_up_proj" if not prefix else f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix="down_proj" if not prefix else f"{prefix}.down_proj",
+        )
+        hidden_act = getattr(config, "hidden_act", "silu")
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported DFlash activation: {hidden_act}. Only silu is supported for now."
+            )
+        self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
 
 
 class DFlashDecoderLayer(nn.Module):
@@ -156,21 +213,29 @@ class DFlashDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hidden_states.numel() == 0:
+            # Keep return types consistent for upstream callers.
+            if residual is None:
+                residual = hidden_states
+            return hidden_states, residual
+
+        # Pre-norm attention with fused residual+norm when possible (Qwen3-style).
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        attn_out = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, residual
 
 
 class DFlashDraftModel(nn.Module):
@@ -271,13 +336,17 @@ class DFlashDraftModel(nn.Module):
                 "DFlashDraftModel requires `input_embeds` (use the target embedding)."
             )
         hidden_states = input_embeds
+        residual: Optional[torch.Tensor] = None
 
         for layer in self.layers:
-            hidden_states = layer(positions, hidden_states, forward_batch)
+            hidden_states, residual = layer(positions, hidden_states, forward_batch, residual)
 
         if hidden_states.numel() == 0:
             return hidden_states
-        return self.norm(hidden_states)
+        if residual is None:
+            return self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -285,6 +354,8 @@ class DFlashDraftModel(nn.Module):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
         ]
 
         params_dict = dict(self.named_parameters())

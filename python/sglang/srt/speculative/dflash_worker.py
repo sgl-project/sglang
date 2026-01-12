@@ -9,7 +9,6 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -539,17 +538,9 @@ class DFlashWorker:
 
             for layer in self.draft_model.layers:
                 attn = layer.self_attn
-                qkv, _ = attn.qkv_proj(ctx_hidden)
-                q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
-
-                q, k = apply_qk_norm(
-                    q=q,
-                    k=k,
-                    q_norm=attn.q_norm,
-                    k_norm=attn.k_norm,
-                    head_dim=attn.head_dim,
-                )
-                q, k = attn.rotary_emb(ctx_positions, q, k)
+                k, v = attn.kv_proj_only(ctx_hidden)
+                k = attn.apply_k_norm(k)
+                k = attn.apply_k_rope(ctx_positions, k)
                 k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                 v = v.view(-1, attn.num_kv_heads, attn.head_dim)
                 self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
