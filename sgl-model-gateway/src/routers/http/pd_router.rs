@@ -19,14 +19,15 @@ use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
+        WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry},
+    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{InputIds, StringOrArray},
@@ -58,8 +59,8 @@ struct PDRequestContext<'a> {
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<String>,
-    routing_id: Option<String>,
     model_id: Option<&'a str>,
+    headers: Option<HeaderMap>,
 }
 
 impl PDRouter {
@@ -306,8 +307,8 @@ impl PDRouter {
                         let (prefill, decode) = match self
                             .select_pd_pair(
                                 context.request_text.as_deref(),
-                                context.routing_id.as_deref(),
                                 context.model_id,
+                                context.headers.as_ref(),
                             )
                             .await
                         {
@@ -564,9 +565,10 @@ impl PDRouter {
         );
 
         // Send both requests concurrently and wait for both
+        // Note: Using borrowed references avoids heap allocation
         events::RequestPDSentEvent {
-            prefill_url: prefill.url().to_string(),
-            decode_url: decode.url().to_string(),
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
         }
         .emit();
 
@@ -696,8 +698,8 @@ impl PDRouter {
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
-        routing_id: Option<&str>,
         model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -708,7 +710,7 @@ impl PDRouter {
 
         let prefill_workers = if let Some(model) = effective_model_id {
             self.worker_registry
-                .get_by_model_fast(model)
+                .get_by_model(model)
                 .iter()
                 .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
                 .cloned()
@@ -719,7 +721,7 @@ impl PDRouter {
 
         let decode_workers = if let Some(model) = effective_model_id {
             self.worker_registry
-                .get_by_model_fast(model)
+                .get_by_model(model)
                 .iter()
                 .filter(|w| matches!(w.worker_type(), WorkerType::Decode))
                 .cloned()
@@ -731,16 +733,28 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
-        let info = crate::policies::SelectWorkerInfo {
+        // Get cached hash ring for consistent hashing
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
+        let prefill = Self::pick_worker_by_policy_arc(
+            &prefill_workers,
+            &*prefill_policy,
             request_text,
-            routing_id,
-        };
+            headers,
+            hash_ring.clone(),
+            "prefill",
+        )?;
 
-        let prefill =
-            Self::pick_worker_by_policy_arc(&prefill_workers, &*prefill_policy, &info, "prefill")?;
-
-        let decode =
-            Self::pick_worker_by_policy_arc(&decode_workers, &*decode_policy, &info, "decode")?;
+        let decode = Self::pick_worker_by_policy_arc(
+            &decode_workers,
+            &*decode_policy,
+            request_text,
+            headers,
+            hash_ring,
+            "decode",
+        )?;
 
         // Record worker selection metrics (Layer 3)
         let model = model_id.unwrap_or("default");
@@ -763,7 +777,9 @@ impl PDRouter {
     fn pick_worker_by_policy_arc(
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
-        info: &crate::policies::SelectWorkerInfo,
+        request_text: Option<&str>,
+        headers: Option<&HeaderMap>,
+        hash_ring: Option<Arc<HashRing>>,
         worker_type: &str,
     ) -> Result<Arc<dyn Worker>, String> {
         if workers.is_empty() {
@@ -787,7 +803,15 @@ impl PDRouter {
         }
 
         let selected_idx = policy
-            .select_worker(&available_workers, info)
+            .select_worker(
+                &available_workers,
+                &SelectWorkerInfo {
+                    request_text,
+                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    headers,
+                    hash_ring,
+                },
+            )
             .ok_or_else(|| {
                 format!(
                     "Policy {} failed to select a {} worker",
@@ -811,7 +835,7 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
-        use crate::core::attach_guards_to_response;
+        use crate::core::AttachedBody;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -861,7 +885,7 @@ impl PDRouter {
         // Attach load guards to response body for proper RAII lifecycle
         // Guards are dropped when response body is consumed or client disconnects
         let guards = vec![WorkerLoadGuard::new(prefill), WorkerLoadGuard::new(decode)];
-        attach_guards_to_response(guards, response)
+        AttachedBody::wrap_response(response, guards)
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -1021,17 +1045,7 @@ impl PDRouter {
         }
         if let Some(headers) = headers {
             for (name, value) in headers.iter() {
-                let name_lc = name.as_str().to_ascii_lowercase();
-                // Whitelist important end-to-end headers, skip hop-by-hop
-                let forward = matches!(
-                    name_lc.as_str(),
-                    "authorization"
-                    | "x-request-id"
-                    | "x-correlation-id"
-                    | "traceparent"      // W3C Trace Context
-                    | "tracestate" // W3C Trace Context
-                ) || name_lc.starts_with("x-request-id-");
-                if forward {
+                if header_utils::should_forward_request_header(name.as_str()) {
                     if let Ok(val) = value.to_str() {
                         request = request.header(name, val);
                     }
@@ -1245,8 +1259,8 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
-            routing_id: body.routing_id.clone(),
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1287,8 +1301,8 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
-            routing_id: body.routing_id.clone(),
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1321,8 +1335,8 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
-            routing_id: body.routing_id.clone(),
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1334,6 +1348,7 @@ impl RouterTrait for PDRouter {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
+        // Extract text for cache-aware routing
         let req_text = if self.policies_need_request_text() {
             Some(body.query.clone())
         } else {
@@ -1346,8 +1361,8 @@ impl RouterTrait for PDRouter {
             is_stream: false,
             return_logprob: false,
             request_text: req_text,
-            routing_id: body.routing_id.clone(),
             model_id,
+            headers: headers.cloned(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
