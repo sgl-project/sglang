@@ -124,6 +124,7 @@ class SamplingParams:
     num_inference_steps: int = None
     guidance_scale: float = None
     guidance_scale_2: float = None
+    true_cfg_scale: float = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
     boundary_ratio: float | None = None
 
@@ -212,11 +213,85 @@ class SamplingParams:
         check if the sampling params is correct by itself
         """
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
-            raise ValueError("prompt_path must be a txt file")
+            raise ValueError(
+                f"prompt_path must be a txt file, got {self.prompt_path!r}"
+            )
+
+        # These are always required to be sane regardless of pipeline.
+        if (
+            not isinstance(self.num_outputs_per_prompt, int)
+            or self.num_outputs_per_prompt <= 0
+        ):
+            raise ValueError(
+                f"num_outputs_per_prompt must be a positive int, got {self.num_outputs_per_prompt!r}"
+            )
+
+        # Used by seconds() and video writer; fps <= 0 is always invalid.
+        if not isinstance(self.fps, int) or self.fps <= 0:
+            raise ValueError(f"fps must be a positive int, got {self.fps!r}")
+
+        # num_frames is already asserted in __post_init__, but keep a friendly error here too
+        # (e.g., when validation is triggered from other code paths).
+        if not isinstance(self.num_frames, int) or self.num_frames <= 0:
+            raise ValueError(
+                f"num_frames must be a positive int, got {self.num_frames!r}"
+            )
+
+        if self.num_inference_steps is not None:
+            if (
+                not isinstance(self.num_inference_steps, int)
+                or self.num_inference_steps <= 0
+            ):
+                raise ValueError(
+                    f"num_inference_steps must be a positive int, got {self.num_inference_steps!r}"
+                )
+
+        # Numeric hyperparams should not be NaN/Inf and should be within basic ranges.
+        # Note: bool is a subclass of int; reject it explicitly to avoid silent surprises.
+        def _finite_non_negative_float(
+            name: str, value: Any, allow_none: bool = True
+        ) -> None:
+            if value is None and allow_none:
+                return
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a number, got {value!r}")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite, got {value!r}")
+            if float(value) < 0.0:
+                raise ValueError(f"{name} must be non-negative, got {value!r}")
+
+        _finite_non_negative_float(
+            "guidance_scale", self.guidance_scale, allow_none=True
+        )
+        _finite_non_negative_float(
+            "guidance_scale_2", self.guidance_scale_2, allow_none=True
+        )
+        _finite_non_negative_float(
+            "true_cfg_scale", self.true_cfg_scale, allow_none=True
+        )
+        _finite_non_negative_float(
+            "guidance_rescale", self.guidance_rescale, allow_none=False
+        )
+
+        if self.boundary_ratio is not None:
+            if isinstance(self.boundary_ratio, bool) or not isinstance(
+                self.boundary_ratio, (int, float)
+            ):
+                raise ValueError(
+                    f"boundary_ratio must be a number, got {self.boundary_ratio!r}"
+                )
+            if not math.isfinite(float(self.boundary_ratio)):
+                raise ValueError(
+                    f"boundary_ratio must be finite, got {self.boundary_ratio!r}"
+                )
+            if not (0.0 <= float(self.boundary_ratio) <= 1.0):
+                raise ValueError(
+                    f"boundary_ratio must be within [0, 1], got {self.boundary_ratio!r}"
+                )
 
     def check_sampling_param(self):
-        if self.prompt_path and not self.prompt_path.endswith(".txt"):
-            raise ValueError("prompt_path must be a txt file")
+        # Keep backward-compatibility for old call sites.
+        self._validate()
 
     def _validate_with_pipeline_config(self, pipeline_config):
         """
@@ -579,6 +654,13 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.return_trajectory_decoded,
             help="Whether to return the decoded trajectory",
+        )
+        parser.add_argument(
+            "--diffusers-kwargs",
+            type=str,
+            default=None,
+            help="JSON string of extra kwargs to pass to diffusers pipeline. "
+            'Example: \'{"output_type": "latent", "clip_skip": 2}\'',
         )
         parser.add_argument(
             "--no-override-protected-fields",
