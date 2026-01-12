@@ -844,7 +844,19 @@ impl Worker for BasicWorker {
         }
 
         match req.send().await {
-            Ok(resp) => Ok(resp.status().is_success()),
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    Ok(true)
+                } else {
+                    tracing::warn!(
+                        "HTTP health check returned non-success status for {}: {}",
+                        self.metadata.url,
+                        status
+                    );
+                    Ok(false)
+                }
+            }
             Err(err) => {
                 tracing::warn!(
                     "HTTP health check failed for {}: {err:?}",
