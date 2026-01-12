@@ -1079,7 +1079,7 @@ class SchedulerPPMixin:
         """
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
-            self.tp_worker.get_attention_tp_cpu_group(),
+            self.attn_tp_cpu_group,
         )
         rids: List = []
         for poll_statuses in poll_statuses_group:
