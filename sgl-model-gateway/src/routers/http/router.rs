@@ -3,29 +3,28 @@ use std::{sync::Arc, time::Instant};
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
-        HeaderMap, HeaderValue, Method, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
 
 use crate::{
+    app_context::AppContext,
     config::types::RetryConfig,
     core::{
-        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
+        is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
+        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
-        metrics::RouterMetrics,
+        metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::PolicyRegistry,
+    policies::{PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -36,11 +35,14 @@ use crate::{
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::{header_utils, RouterTrait},
+    routers::{
+        error::{self, extract_error_code_from_response},
+        grpc::utils::{error_type_from_status, route_to_endpoint},
+        header_utils, RouterTrait,
+    },
 };
 
 /// Regular router that uses injected load balancing policies
-#[derive(Debug)]
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
@@ -50,19 +52,22 @@ pub struct Router {
     retry_config: RetryConfig,
 }
 
+impl std::fmt::Debug for Router {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Router")
+            .field("worker_registry", &self.worker_registry)
+            .field("policy_registry", &self.policy_registry)
+            .field("client", &self.client)
+            .field("dp_aware", &self.dp_aware)
+            .field("enable_igw", &self.enable_igw)
+            .field("retry_config", &self.retry_config)
+            .finish()
+    }
+}
+
 impl Router {
     /// Create a new router with injected policy and client
-    pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
-        let workers = ctx.worker_registry.get_workers_filtered(
-            None, // any model
-            Some(WorkerType::Regular),
-            Some(ConnectionMode::Http),
-            None,  // any runtime type
-            false, // include all workers
-        );
-
-        RouterMetrics::set_active_workers(workers.len());
-
+    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
@@ -83,7 +88,6 @@ impl Router {
         }
     }
 
-    // Helper method to proxy GET requests to the first available worker
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
         let headers = header_utils::copy_request_headers(&req);
 
@@ -91,8 +95,7 @@ impl Router {
             Ok(worker_url) => {
                 let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
                 for (name, value) in headers {
-                    let name_lc = name.to_lowercase();
-                    if name_lc != "content-type" && name_lc != "content-length" {
+                    if header_utils::should_forward_request_header(&name) {
                         request_builder = request_builder.header(name, value);
                     }
                 }
@@ -113,21 +116,16 @@ impl Router {
                                 *response.headers_mut() = response_headers;
                                 response
                             }
-                            Err(e) => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
+                            Err(e) => error::internal_error(
+                                "read_response_failed",
                                 format!("Failed to read response: {}", e),
-                            )
-                                .into_response(),
+                            ),
                         }
                     }
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Request failed: {}", e),
-                    )
-                        .into_response(),
+                    Err(e) => convert_reqwest_error(e),
                 }
             }
-            Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+            Err(e) => error::service_unavailable("no_workers", e),
         }
     }
 
@@ -136,6 +134,7 @@ impl Router {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
+        headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -163,7 +162,29 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let idx = policy.select_worker(&available, text)?;
+        // Get cached hash ring for consistent hashing (O(log n) lookup)
+        let hash_ring = self
+            .worker_registry
+            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+
+        let idx = policy.select_worker(
+            &available,
+            &SelectWorkerInfo {
+                request_text: text,
+                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                headers,
+                hash_ring,
+            },
+        )?;
+
+        // Record worker selection metric (Layer 3)
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model_id.unwrap_or("default"),
+            policy.name(),
+        );
+
         Some(available[idx].clone())
     }
 
@@ -171,108 +192,139 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &str,
+        route: &'static str,
         model_id: Option<&str>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        let model = model_id.unwrap_or("default");
+        let endpoint = route_to_endpoint(route);
+
+        // Record request start (Layer 2)
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            endpoint,
+            bool_to_static_str(is_stream),
+        );
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text)) {
-                    Some(w) => w,
-                    None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "No available workers (all circuits open or unhealthy)",
-                        )
-                            .into_response();
-                    }
-                };
-
-                // Optional load tracking for cache-aware policy
-                // Get the policy for this model to check if it's cache-aware
-                let policy = match model_id {
-                    Some(model) => self.policy_registry.get_policy_or_default(model),
-                    None => self.policy_registry.get_default_policy(),
-                };
-
-                let load_incremented = if policy.name() == "cache_aware" {
-                    worker.increment_load();
-                    RouterMetrics::set_running_requests(worker.url(), worker.load());
-                    true
-                } else {
-                    false
-                };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
-                } else {
-                    None
-                };
-
-                events::RequestSentEvent {
-                    url: worker.url().to_string(),
-                }
-                .emit();
-                let mut headers_with_trace = headers.cloned().unwrap_or_default();
-                let headers = match inject_trace_context_http(&mut headers_with_trace) {
-                    Ok(()) => Some(&headers_with_trace),
-                    Err(_) => headers,
-                };
-
-                let response = self
-                    .send_typed_request(
-                        headers,
-                        typed_req,
-                        route,
-                        worker.url(),
-                        is_stream,
-                        load_incremented,
-                    )
+                let res = self
+                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
                     .await;
 
-                events::RequestReceivedEvent {}.emit();
+                // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                Metrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    res.status().as_u16(),
+                    extract_error_code_from_response(&res),
+                );
 
-                worker.record_outcome(response.status().is_success());
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
-                }
-
-                response
+                res
             },
             // should_retry predicate
             |res, _attempt| is_retryable_status(res.status()),
             // on_backoff hook
             |delay, attempt| {
-                RouterMetrics::record_retry(route);
-                RouterMetrics::record_retry_backoff_duration(delay, attempt);
+                // Layer 3 worker metrics
+                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                Metrics::record_worker_retry_backoff(attempt, delay);
             },
             // on_exhausted hook
-            || RouterMetrics::record_retries_exhausted(route),
+            || {
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+            },
         )
         .await;
 
         if response.status().is_success() {
             let duration = start.elapsed();
-            RouterMetrics::record_request(route);
-            RouterMetrics::record_generate_duration(duration);
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                duration,
+            );
         } else if !is_retryable_status(response.status()) {
-            RouterMetrics::record_request_error(route, "non_retryable_error");
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
+        }
+
+        response
+    }
+
+    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &'static str,
+        model_id: Option<&str>,
+        is_stream: bool,
+        text: &str,
+    ) -> Response {
+        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
+            Some(w) => w,
+            None => {
+                return error::service_unavailable(
+                    "no_available_workers",
+                    "No available workers (all circuits open or unhealthy)",
+                );
+            }
+        };
+
+        // Optional load tracking for cache-aware policy
+        // Get the policy for this model to check if it's cache-aware
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+
+        let load_guard =
+            (policy.name() == "cache_aware").then(|| WorkerLoadGuard::new(worker.clone()));
+
+        // Note: Using borrowed reference avoids heap allocation
+        events::RequestSentEvent { url: worker.url() }.emit();
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
+
+        let response = self
+            .send_typed_request(
+                headers,
+                typed_req,
+                route,
+                worker.url(),
+                is_stream,
+                load_guard,
+            )
+            .await;
+
+        events::RequestReceivedEvent {}.emit();
+
+        let status = response.status();
+        worker.record_outcome(status.is_success());
+
+        // Record worker errors for server errors (5xx)
+        if status.is_server_error() {
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                error_type_from_status(status),
+            );
         }
 
         response
@@ -299,81 +351,97 @@ impl Router {
         // Eventually, we need to have router to manage the chat history with a proper database, will update this implementation accordingly.
         let workers = self.worker_registry.get_all();
         if workers.is_empty() {
-            return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
+            return error::service_unavailable("no_workers", "No available workers");
         }
 
-        let mut last_response: Option<Response> = None;
-        for worker in workers {
-            let worker_url = worker.url();
-            let base = self.worker_base_url(worker_url);
+        let filtered_headers: Vec<_> = headers
+            .map(|hdrs| {
+                hdrs.iter()
+                    .filter(|(name, _)| header_utils::should_forward_request_header(name.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-            let url = format!("{}/{}", base, endpoint);
-            let mut request_builder = match method {
-                Method::GET => self.client.get(url),
-                Method::POST => self.client.post(url),
-                _ => {
-                    return (
-                        StatusCode::METHOD_NOT_ALLOWED,
-                        "Unsupported method for simple routing",
-                    )
-                        .into_response()
-                }
-            };
+        let futures: Vec<_> = workers
+            .into_iter()
+            .map(|worker| {
+                let worker_url = worker.url();
+                let base = self.worker_base_url(worker_url);
+                let url = format!("{}/{}", base, endpoint);
+                let client = self.client.clone();
+                let method = method.clone();
 
-            if let Some(api_key) = worker.api_key() {
-                request_builder =
-                    request_builder.header("Authorization", format!("Bearer {}", api_key));
-            }
+                let headers = filtered_headers.clone();
 
-            if let Some(hdrs) = headers {
-                for (name, value) in hdrs {
-                    let name_lc = name.as_str().to_lowercase();
-                    if name_lc != "content-type" && name_lc != "content-length" {
-                        request_builder = request_builder.header(name, value);
+                let api_key = worker.api_key().clone();
+
+                async move {
+                    let mut request_builder = match method {
+                        Method::GET => client.get(url),
+                        Method::POST => client.post(url),
+                        _ => {
+                            return Err(error::method_not_allowed(
+                                "unsupported_method",
+                                "Unsupported method for simple routing",
+                            ))
+                        }
+                    };
+
+                    if let Some(key) = api_key {
+                        let mut auth_header = String::with_capacity(7 + key.len());
+                        auth_header.push_str("Bearer ");
+                        auth_header.push_str(&key);
+                        request_builder = request_builder.header("Authorization", auth_header);
                     }
-                }
-            }
 
-            match request_builder.send().await {
+                    for (name, value) in headers {
+                        request_builder = request_builder.header(name.clone(), value.clone());
+                    }
+
+                    request_builder.send().await.map_err(convert_reqwest_error)
+                }
+            })
+            .collect();
+
+        // Now execute the collected futures concurrently
+        let mut stream = stream::iter(futures).buffer_unordered(32);
+        let mut last_response: Option<Response> = None;
+
+        while let Some(result) = stream.next().await {
+            match result {
                 Ok(res) => {
                     let status = StatusCode::from_u16(res.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
                     let response_headers = header_utils::preserve_response_headers(res.headers());
+
                     match res.bytes().await {
                         Ok(body) => {
                             let mut response = Response::new(Body::from(body));
                             *response.status_mut() = status;
                             *response.headers_mut() = response_headers;
+
                             if status.is_success() {
                                 return response;
                             }
                             last_response = Some(response);
                         }
                         Err(e) => {
-                            last_response = Some(
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    format!("Failed to read response: {}", e),
-                                )
-                                    .into_response(),
-                            );
+                            last_response = Some(error::internal_error(
+                                "read_response_failed",
+                                format!("Failed to read response: {}", e),
+                            ));
                         }
                     }
                 }
                 Err(e) => {
-                    last_response = Some(
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Request failed: {}", e),
-                        )
-                            .into_response(),
-                    );
+                    last_response = Some(e);
                 }
             }
         }
 
         last_response
-            .unwrap_or_else(|| (StatusCode::BAD_GATEWAY, "No worker response").into_response())
+            .unwrap_or_else(|| error::bad_gateway("no_worker_response", "No worker response"))
     }
 
     // Route a GET request with provided headers to a specific endpoint
@@ -414,56 +482,55 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &str,
+        route: &'static str,
         worker_url: &str,
         is_stream: bool,
-        load_incremented: bool, // Whether load was incremented for this request
+        load_guard: Option<WorkerLoadGuard>,
     ) -> Response {
-        // Get the worker's API key if available
-        let api_key = self
-            .worker_registry
-            .get_by_url(worker_url)
-            .and_then(|w| w.api_key().clone());
+        // Get the worker once and reuse for API key and load tracking
+        let worker = self.worker_registry.get_by_url(worker_url);
+        let api_key = worker.as_ref().and_then(|w| w.api_key().clone());
+
+        // Static key string to avoid per-request allocations
+        const DP_RANK_KEY: &str = "data_parallel_rank";
 
         let mut request_builder = if self.dp_aware {
             let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
                 Ok(tup) => tup,
                 Err(e) => {
                     error!("Failed to extract dp_rank: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                    return error::internal_error(
+                        "dp_rank_extraction_failed",
                         format!("Failed to extract dp_rank: {}", e),
-                    )
-                        .into_response();
+                    );
                 }
             };
 
             let mut json_val = match serde_json::to_value(typed_req) {
                 Ok(j) => j,
                 Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
+                    return error::bad_request(
+                        "serialization_failed",
                         format!("Convert into serde_json::Value failed: {}", e),
-                    )
-                        .into_response();
+                    );
                 }
             };
 
             if let Some(map) = json_val.as_object_mut() {
-                map.insert(
-                    String::from("data_parallel_rank"),
-                    serde_json::json!(dp_rank),
-                );
-                debug!(
-                    "Modified request body: {}",
-                    serde_json::to_string(&json_val).unwrap_or(String::from("ERR"))
-                );
+                // Use static key string to avoid allocation
+                map.insert(DP_RANK_KEY.to_string(), serde_json::json!(dp_rank));
+                // Only serialize if debug logging is enabled to avoid CPU overhead
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    debug!(
+                        "Modified request body: {}",
+                        serde_json::to_string(&json_val).unwrap_or_else(|_| String::from("ERR"))
+                    );
+                }
             } else {
-                return (
-                    StatusCode::BAD_REQUEST,
+                return error::bad_request(
+                    "dp_rank_insertion_failed",
                     "Failed to insert the data_parallel_rank field into the request body",
-                )
-                    .into_response();
+                );
             }
 
             self.client
@@ -476,14 +543,16 @@ impl Router {
         };
 
         if let Some(key) = api_key {
-            request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
+            // Pre-allocate string with capacity to avoid reallocation
+            let mut auth_header = String::with_capacity(7 + key.len());
+            auth_header.push_str("Bearer ");
+            auth_header.push_str(&key);
+            request_builder = request_builder.header("Authorization", auth_header);
         }
 
-        // Copy all headers from original request if provided
         if let Some(headers) = headers {
             for (name, value) in headers {
-                // Skip Content-Type and Content-Length as .json() sets them
-                if *name != CONTENT_TYPE && *name != CONTENT_LENGTH {
+                if header_utils::should_forward_request_header(name.as_str()) {
                     request_builder = request_builder.header(name, value);
                 }
             }
@@ -497,19 +566,7 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
-
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Request failed: {}", e),
-                )
-                    .into_response();
+                return convert_reqwest_error(e);
             }
         };
 
@@ -528,87 +585,14 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
+                    error::internal_error("read_response_body_failed", error_msg)
                 }
             };
 
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
-            }
-
-            response
-        } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            let registry = Arc::clone(&self.worker_registry);
-            let worker_url = worker_url.to_string();
-
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream and detect completion
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let mut decremented = false;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            // Check for stream end marker
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
-                                }
-                            }
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-                if !decremented {
-                    if let Some(worker) = registry.get_by_url(&worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
-                    }
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
+            // load_guard dropped here automatically after response body is read
             response
         } else {
-            // For requests without load tracking, just stream
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
@@ -641,6 +625,12 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
+
+            // Attach load guard to response body for proper RAII lifecycle
+            // Guard is dropped when response body is consumed or client disconnects
+            if let Some(guard) = load_guard {
+                response = AttachedBody::wrap_response(response, guard);
+            }
             response
         }
     }
@@ -663,6 +653,58 @@ impl Router {
         }
         Ok(Json(rerank_response).into_response())
     }
+}
+
+fn convert_reqwest_error(e: reqwest::Error) -> Response {
+    let url = e
+        .url()
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let message = format!("{}. URL: {}", e, url);
+
+    // TODO improve error status code
+    let (status, code) = if let Some(upstream_status) = e.status() {
+        (upstream_status, "call_upstream_status_error")
+    } else if e.is_builder() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_builder_error",
+        )
+    } else if e.is_request() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_request_error",
+        )
+    } else if e.is_redirect() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_redirect_error",
+        )
+    } else if e.is_body() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_body_error",
+        )
+    } else if e.is_decode() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_decode_error",
+        )
+    } else if e.is_timeout() {
+        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
+    } else if e.is_connect() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_connection_failed",
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_request_failed",
+        )
+    };
+
+    error::create_error(status, code, message)
 }
 
 use async_trait::async_trait;
@@ -750,22 +792,8 @@ impl RouterTrait for Router {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Record embeddings-specific metrics in addition to general request metrics
-        let start = Instant::now();
-        let res = self
-            .route_typed_request(headers, body, "/v1/embeddings", model_id)
-            .await;
-
-        // Embedding specific metrics
-        if res.status().is_success() {
-            RouterMetrics::record_embeddings_request();
-            RouterMetrics::record_embeddings_duration(start.elapsed());
-        } else {
-            let error_type = format!("http_{}", res.status().as_u16());
-            RouterMetrics::record_embeddings_error(&error_type);
-        }
-
-        res
+        self.route_typed_request(headers, body, "/v1/embeddings", model_id)
+            .await
     }
 
     async fn route_classify(
@@ -774,22 +802,8 @@ impl RouterTrait for Router {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Record classification-specific metrics in addition to general request metrics
-        let start = Instant::now();
-        let res = self
-            .route_typed_request(headers, body, "/v1/classify", model_id)
-            .await;
-
-        // Classification specific metrics
-        if res.status().is_success() {
-            RouterMetrics::record_classify_request();
-            RouterMetrics::record_classify_duration(start.elapsed());
-        } else {
-            let error_type = format!("http_{}", res.status().as_u16());
-            RouterMetrics::record_classify_error(&error_type);
-        }
-
-        res
+        self.route_typed_request(headers, body, "/v1/classify", model_id)
+            .await
     }
 
     async fn route_rerank(
@@ -806,11 +820,10 @@ impl RouterTrait for Router {
                 Ok(rerank_response) => rerank_response,
                 Err(e) => {
                     error!("Failed to build rerank response: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to build rerank response".to_string(),
-                    )
-                        .into_response();
+                    return error::internal_error(
+                        "rerank_response_build_failed",
+                        "Failed to build rerank response",
+                    );
                 }
             }
         } else {

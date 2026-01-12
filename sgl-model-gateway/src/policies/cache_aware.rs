@@ -59,14 +59,17 @@
     during the next eviction cycle.
 */
 
-use std::{sync::Arc, thread, time::Duration};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use rand::Rng;
 use tracing::debug;
 
-use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy};
-use crate::{core::Worker, observability::metrics::RouterMetrics};
+use super::{
+    get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
+    CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
+};
+use crate::core::Worker;
 
 /// Cache-aware routing policy
 ///
@@ -77,7 +80,7 @@ use crate::{core::Worker, observability::metrics::RouterMetrics};
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
-    eviction_handle: Option<thread::JoinHandle<()>>,
+    _eviction_task: Option<PeriodicTask>,
 }
 
 impl CacheAwarePolicy {
@@ -89,25 +92,26 @@ impl CacheAwarePolicy {
         let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
 
         // Start background eviction thread if configured
-        let eviction_handle = if config.eviction_interval_secs > 0 {
+        let eviction_task = if config.eviction_interval_secs > 0 {
             let trees_clone = Arc::clone(&trees);
             let max_tree_size = config.max_tree_size;
-            let interval = config.eviction_interval_secs;
 
-            Some(thread::spawn(move || loop {
-                thread::sleep(Duration::from_secs(interval));
+            Some(PeriodicTask::spawn(
+                config.eviction_interval_secs,
+                "Eviction",
+                move || {
+                    for tree_ref in trees_clone.iter() {
+                        let model_id = tree_ref.key();
+                        let tree = tree_ref.value();
+                        tree.evict_tenant_by_size(max_tree_size);
 
-                // Evict for all model trees
-                for tree_ref in trees_clone.iter() {
-                    let model_id = tree_ref.key();
-                    let tree = tree_ref.value();
-                    tree.evict_tenant_by_size(max_tree_size);
-                    debug!(
-                        "Cache eviction completed for model {}, max_size: {}",
-                        model_id, max_tree_size
-                    );
-                }
-            }))
+                        debug!(
+                            "Cache eviction completed for model {}, max_size: {}",
+                            model_id, max_tree_size
+                        );
+                    }
+                },
+            ))
         } else {
             None
         };
@@ -115,7 +119,7 @@ impl CacheAwarePolicy {
         Self {
             config,
             trees,
-            eviction_handle,
+            _eviction_task: eviction_task,
         }
     }
 
@@ -125,13 +129,7 @@ impl CacheAwarePolicy {
         let mut model_workers: std::collections::HashMap<String, Vec<&Arc<dyn Worker>>> =
             std::collections::HashMap::new();
         for worker in workers {
-            // Use "default" for unknown/empty model_ids for backward compatibility
-            let model_id = worker.model_id();
-            let tree_key = if model_id.is_empty() || model_id == "unknown" {
-                "default"
-            } else {
-                model_id
-            };
+            let tree_key = normalize_model_key(worker.model_id());
             model_workers
                 .entry(tree_key.to_string())
                 .or_default()
@@ -152,14 +150,7 @@ impl CacheAwarePolicy {
 
     /// Add a single worker to the tree (incremental update)
     pub fn add_worker(&self, worker: &dyn Worker) {
-        // For backward compatibility: if model_id is "unknown" or empty,
-        // use a default tree. This preserves existing behavior for single-model routers.
-        let model_id = worker.model_id();
-        let tree_key = if model_id.is_empty() || model_id == "unknown" {
-            "default"
-        } else {
-            model_id
-        };
+        let tree_key = normalize_model_key(worker.model_id());
         let tree = self
             .trees
             .entry(tree_key.to_string())
@@ -178,13 +169,7 @@ impl CacheAwarePolicy {
 
     /// Remove a worker from the tree
     pub fn remove_worker(&self, worker: &dyn Worker) {
-        // Use same logic as add_worker for consistency
-        let model_id = worker.model_id();
-        let tree_key = if model_id.is_empty() || model_id == "unknown" {
-            "default"
-        } else {
-            model_id
-        };
+        let tree_key = normalize_model_key(worker.model_id());
         if let Some(tree) = self.trees.get(tree_key) {
             tree.remove_tenant(worker.url());
         }
@@ -210,14 +195,59 @@ impl CacheAwarePolicy {
             );
         }
     }
+
+    fn select_worker_min_load(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: &Option<&str>,
+        healthy_indices: &[usize],
+        model_id: &str,
+        max_load: usize,
+        min_load: usize,
+    ) -> Option<usize> {
+        // Log load balancing trigger (only compute worker loads if debug enabled)
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let worker_loads: Vec<(&str, usize)> =
+                workers.iter().map(|w| (w.url(), w.load())).collect();
+            debug!(
+                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
+                max_load, min_load, worker_loads
+            );
+        }
+
+        // Use shortest queue when imbalanced
+        let min_load_idx = healthy_indices
+            .iter()
+            .min_by_key(|&&idx| workers[idx].load())
+            .copied()?;
+
+        // Even in imbalanced mode, update the tree to maintain cache state
+        if let Some(text) = request_text {
+            // Get the tree reference without locking the entire HashMap
+            // DashMap only locks the specific shard containing this key
+            let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+
+            if let Some(tree) = tree {
+                // Now we can work with the tree without holding the HashMap lock
+                tree.insert(text, workers[min_load_idx].url());
+            } else {
+                debug!(
+                    "Warning: No tree found for model '{}', skipping cache update",
+                    model_id
+                );
+            }
+        }
+
+        // Increment processed counter
+        workers[min_load_idx].increment_processed();
+
+        Some(min_load_idx)
+    }
 }
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
-    fn select_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<usize> {
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+        let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
@@ -226,66 +256,28 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
-        let first_model = workers[healthy_indices[0]].model_id();
-        let model_id = if first_model.is_empty() || first_model == "unknown" {
-            "default"
-        } else {
-            first_model
-        };
+        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
 
-        // Get current load statistics
-        let loads: Vec<usize> = workers.iter().map(|w| w.load()).collect();
-        let max_load = *loads.iter().max().unwrap_or(&0);
-        let min_load = *loads.iter().min().unwrap_or(&0);
+        // Get current load statistics - compute min/max in single pass without allocation
+        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
+            let load = w.load();
+            (min.min(load), max.max(load))
+        });
+        let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
         // Check if load is imbalanced
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
         if is_imbalanced {
-            // Log load balancing trigger
-            let worker_loads: Vec<(String, usize)> = workers
-                .iter()
-                .map(|w| (w.url().to_string(), w.load()))
-                .collect();
-
-            debug!(
-                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-                max_load, min_load, worker_loads
+            return self.select_worker_min_load(
+                workers,
+                &request_text,
+                &healthy_indices,
+                model_id,
+                max_load,
+                min_load,
             );
-
-            RouterMetrics::record_load_balancing_event();
-            RouterMetrics::set_load_range(max_load, min_load);
-
-            // Use shortest queue when imbalanced
-            let min_load_idx = healthy_indices
-                .iter()
-                .min_by_key(|&&idx| workers[idx].load())
-                .copied()?;
-
-            // Even in imbalanced mode, update the tree to maintain cache state
-            if let Some(text) = request_text {
-                // Get the tree reference without locking the entire HashMap
-                // DashMap only locks the specific shard containing this key
-                let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-
-                if let Some(tree) = tree {
-                    // Now we can work with the tree without holding the HashMap lock
-                    tree.insert(text, workers[min_load_idx].url());
-                } else {
-                    debug!(
-                        "Warning: No tree found for model '{}', skipping cache update",
-                        model_id
-                    );
-                }
-            }
-
-            // Increment processed counter
-            workers[min_load_idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[min_load_idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
-
-            return Some(min_load_idx);
         }
 
         // Use cache-aware routing when balanced
@@ -297,38 +289,45 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
         if let Some(tree) = tree {
             // Now we work with the tree without holding the HashMap lock
-            let (matched_text, matched_worker) = tree.prefix_match(text);
-            let match_rate = if text.is_empty() {
+            // Use prefix_match_with_counts to avoid redundant chars().count() calls
+            let result = tree.prefix_match_with_counts(text);
+            let match_rate = if result.input_char_count == 0 {
                 0.0
             } else {
-                matched_text.chars().count() as f32 / text.chars().count() as f32
+                result.matched_char_count as f32 / result.input_char_count as f32
             };
 
-            let selected_url = if match_rate > self.config.cache_threshold {
-                RouterMetrics::record_cache_hit();
-                matched_worker.to_string()
+            // Select worker without String allocation
+            let selected_idx = if match_rate > self.config.cache_threshold {
+                // Cache hit path: find worker by URL (compare &str directly, no allocation)
+                let tenant_url: &str = &result.tenant;
+                workers
+                    .iter()
+                    .position(|w| w.url() == tenant_url)
+                    .filter(|&idx| workers[idx].is_healthy())
             } else {
-                RouterMetrics::record_cache_miss();
-                tree.get_smallest_tenant()
+                // Low cache match: use worker with minimum load
+                healthy_indices
+                    .iter()
+                    .min_by_key(|&&idx| workers[idx].load())
+                    .copied()
             };
 
-            // Find the index of the selected worker
-            if let Some(selected_idx) = workers.iter().position(|w| w.url() == selected_url) {
-                // Only proceed if the worker is healthy
-                if workers[selected_idx].is_healthy() {
-                    // Update the tree with this request
-                    tree.insert(text, &selected_url);
+            if let Some(idx) = selected_idx {
+                // Update the tree with this request (use worker URL directly, no allocation)
+                tree.insert(text, workers[idx].url());
 
-                    // Increment processed counter
-                    workers[selected_idx].increment_processed();
-                    RouterMetrics::record_processed_request(&selected_url);
+                // Increment processed counter
+                workers[idx].increment_processed();
 
-                    return Some(selected_idx);
-                }
-            } else {
-                // Selected worker no longer exists, remove it from tree
-                tree.remove_tenant(&selected_url);
-                debug!("Removed stale worker {} from cache tree", selected_url);
+                return Some(idx);
+            }
+
+            // Selected worker no longer exists or unhealthy, remove stale tenant from tree
+            if match_rate > self.config.cache_threshold {
+                let tenant_url: &str = &result.tenant;
+                tree.remove_tenant(tenant_url);
+                debug!("Removed stale worker {} from cache tree", tenant_url);
             }
 
             // Fallback to first healthy worker
@@ -344,37 +343,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let random_idx = rng.random_range(0..healthy_indices.len());
             Some(healthy_indices[random_idx])
         }
-    }
-
-    fn select_worker_pair(
-        &self,
-        prefill_workers: &[Arc<dyn Worker>],
-        decode_workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<(usize, usize)> {
-        // DEPRECATED: This method is no longer used when separate policies are configured.
-        // The PD router now uses separate policies for prefill and decode selection.
-        // This implementation remains for backward compatibility when a single policy is used.
-
-        // In PD mode with single policy:
-        // - Prefill: Use cache-aware routing for better cache utilization
-        // - Decode: Use least-load routing for better load distribution
-
-        // Select prefill worker using cache-aware logic
-        let prefill_idx = self.select_worker(prefill_workers, request_text)?;
-
-        // Select decode worker using least-load logic
-        let healthy_decode = get_healthy_worker_indices(decode_workers);
-        if healthy_decode.is_empty() {
-            return None;
-        }
-
-        let decode_idx = healthy_decode
-            .iter()
-            .min_by_key(|&&idx| decode_workers[idx].load())
-            .copied()?;
-
-        Some((prefill_idx, decode_idx))
     }
 
     fn on_request_complete(&self, worker_url: &str, success: bool) {
@@ -405,18 +373,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 impl Default for CacheAwarePolicy {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for CacheAwarePolicy {
-    fn drop(&mut self) {
-        // Note: We can't properly stop the eviction thread since it's in an infinite loop
-        // In a production system, we'd use a channel or atomic flag to signal shutdown
-        if let Some(handle) = self.eviction_handle.take() {
-            // The thread will continue running until the program exits
-            // This is acceptable for now since the router typically runs for the lifetime of the program
-            drop(handle);
-        }
     }
 }
 
@@ -452,14 +408,38 @@ mod tests {
         policy.init_workers(&workers);
 
         // First request should be distributed
-        let idx1 = policy.select_worker(&workers, Some("hello world")).unwrap();
+        let idx1 = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello world"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         // Same request should go to same worker (cache hit)
-        let idx2 = policy.select_worker(&workers, Some("hello world")).unwrap();
+        let idx2 = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello world"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(idx1, idx2);
 
         // Similar request should also go to same worker
-        let idx3 = policy.select_worker(&workers, Some("hello")).unwrap();
+        let idx3 = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(idx1, idx3);
     }
 
@@ -490,8 +470,12 @@ mod tests {
         policy.init_workers(&workers);
 
         // Should select worker2 (lower load) despite cache affinity
+        let info = SelectWorkerInfo {
+            request_text: Some("test"),
+            ..Default::default()
+        };
         for _ in 0..5 {
-            let idx = policy.select_worker(&workers, Some("test")).unwrap();
+            let idx = policy.select_worker(&workers, &info).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
     }
@@ -519,15 +503,35 @@ mod tests {
         policy.init_workers(&workers);
 
         // Route some requests
-        policy.select_worker(&workers, Some("test1"));
-        policy.select_worker(&workers, Some("test2"));
+        policy.select_worker(
+            &workers,
+            &SelectWorkerInfo {
+                request_text: Some("test1"),
+                ..Default::default()
+            },
+        );
+        policy.select_worker(
+            &workers,
+            &SelectWorkerInfo {
+                request_text: Some("test2"),
+                ..Default::default()
+            },
+        );
 
         // Remove a worker
         policy.remove_worker_by_url("http://w1:8000");
         workers[0].set_healthy(false);
 
         // All requests should now go to worker2
-        let idx = policy.select_worker(&workers, Some("test1")).unwrap();
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("test1"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(idx, 1);
     }
 }

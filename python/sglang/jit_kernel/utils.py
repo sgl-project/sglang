@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import functools
 import pathlib
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
+
+import torch
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -53,6 +56,14 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
             return "true" if arg else "false"
         if isinstance(arg, (int, float)):
             return str(arg)
+        if isinstance(arg, torch.dtype):
+            if arg == torch.float:
+                return "float"
+            if arg == torch.float16:
+                return "__half"
+            if arg == torch.bfloat16:
+                return "nv_bfloat16"
+            raise TypeError(f"Not implement this arg wrapper yet: {arg}")
         raise TypeError(f"Unsupported argument type for cpp template: {type(arg)}")
 
     return CPPArgList(_convert(arg) for arg in args)
@@ -70,6 +81,36 @@ def load_jit(
     extra_include_paths: List[str] | None = None,
     build_directory: str | None = None,
 ) -> Module:
+    """
+    Loading a JIT module from C++/CUDA source files.
+    We define a wrapper as a tuple of (export_name, kernel_name),
+    where `export_name` is the name used to called from Python,
+    and `kernel_name` is the name of the kernel class in C++/CUDA source.
+
+    :param args: Unique marker of the JIT module. Must be distinct for different kernels.
+    :type args: str
+    :param cpp_files: A list of C++ source files.
+    :type cpp_files: List[str] | None
+    :param cuda_files: A list of CUDA source files.
+    :type cuda_files: List[str] | None
+    :param cpp_wrappers: A list of C++ wrappers, defining the export name and kernel name.
+    :type cpp_wrappers: List[Tuple[str, str]] | None
+    :param cuda_wrappers: A list of CUDA wrappers, defining the export name and kernel name.
+    :type cuda_wrappers: List[Tuple[str, str]] | None
+    :param extra_cflags: Extra C++ compiler flags.
+    :type extra_cflags: List[str] | None
+    :param extra_cuda_cflags: Extra CUDA compiler flags.
+    :type extra_cuda_cflags: List[str] | None
+    :param extra_ldflags: Extra linker flags.
+    :type extra_ldflags: List[str] | None
+    :param extra_include_paths: Extra include paths.
+    :type extra_include_paths: List[str] | None
+    :param build_directory: The build directory for JIT compilation.
+    :type build_directory: str | None
+    :return: A just-in-time(JIT) compiled module.
+    :rtype: Module
+    """
+
     from tvm_ffi.cpp import load_inline
 
     cpp_files = cpp_files or []
@@ -101,3 +142,31 @@ def load_jit(
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
     )
+
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def cache_once(fn: F) -> F:
+    """
+    NOTE: `functools.lru_cache` is not compatible with `torch.compile`
+    So we manually implement a simple cache_once decorator to replace it.
+    """
+    result_map = {}
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        key = (args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
+        if key not in result_map:
+            result_map[key] = fn(*args, **kwargs)
+        return result_map[key]
+
+    return wrapper  # type: ignore
+
+
+@cache_once
+def is_arch_support_pdl() -> bool:
+    import torch
+
+    device = torch.cuda.current_device()
+    return torch.cuda.get_device_capability(device)[0] >= 9

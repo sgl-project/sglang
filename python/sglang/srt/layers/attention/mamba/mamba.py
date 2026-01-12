@@ -339,7 +339,6 @@ class MambaMixer2(torch.nn.Module):
             input_is_parallel=True,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
-            reduce_results=False,
         )
 
         self.norm = Mixer2RMSNormGated(
@@ -535,6 +534,9 @@ class MambaMixer2(torch.nn.Module):
                     layer_cache, MambaPool.SpeculativeState
                 ), "layer_cache must be SpeculativeState for speculative decoding"
                 draft_token_num = metadata.draft_token_num
+                self.intermediate_state_indices = torch.arange(
+                    num_decodes, dtype=torch.int32, device=state_indices_tensor_d.device
+                )
 
                 # Reshape for batch processing
                 hidden_states_B_C_d_reshaped = hidden_states_B_C_d.view(
@@ -549,6 +551,7 @@ class MambaMixer2(torch.nn.Module):
                     self.activation,
                     conv_state_indices=state_indices_tensor_d[:num_decodes],
                     intermediate_conv_window=layer_cache.intermediate_conv_window[0],
+                    intermediate_state_indices=self.intermediate_state_indices,
                     retrieve_next_token=metadata.retrieve_next_token,
                     retrieve_next_sibling=metadata.retrieve_next_sibling,
                     retrieve_parent_token=metadata.retrieve_parent_token,
@@ -622,6 +625,7 @@ class MambaMixer2(torch.nn.Module):
                     intermediate_states_buffer=layer_cache.intermediate_ssm,
                     cache_steps=draft_token_num,
                     retrieve_parent_token=metadata.retrieve_parent_token,
+                    intermediate_state_indices=self.intermediate_state_indices,
                 )
             else:
                 selective_state_update(

@@ -5,18 +5,20 @@ use axum::response::Response;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::routers::grpc::{
-    client::GrpcClient,
-    common::stages::{helpers, PipelineStage},
-    context::{ClientSelection, RequestContext, WorkerSelection},
+use crate::routers::{
     error,
-    proto_wrapper::ProtoGenerateRequest,
+    grpc::{
+        client::GrpcClient,
+        common::stages::{helpers, PipelineStage},
+        context::{ClientSelection, RequestContext, WorkerSelection},
+        proto_wrapper::ProtoGenerateRequest,
+    },
 };
 
 /// Chat request building stage
 ///
 /// Extracts chat-specific request building logic from the old unified RequestBuildingStage.
-pub struct ChatRequestBuildingStage {
+pub(crate) struct ChatRequestBuildingStage {
     inject_pd_metadata: bool,
 }
 
@@ -34,7 +36,7 @@ impl PipelineStage for ChatRequestBuildingStage {
                 function = "ChatRequestBuildingStage::execute",
                 "Preparation not completed"
             );
-            error::internal_error("Preparation not completed")
+            error::internal_error("preparation_not_completed", "Preparation not completed")
         })?;
 
         let clients = ctx.state.clients.as_ref().ok_or_else(|| {
@@ -42,7 +44,10 @@ impl PipelineStage for ChatRequestBuildingStage {
                 function = "ChatRequestBuildingStage::execute",
                 "Client acquisition not completed"
             );
-            error::internal_error("Client acquisition not completed")
+            error::internal_error(
+                "client_acquisition_not_completed",
+                "Client acquisition not completed",
+            )
         })?;
 
         let chat_request = ctx.chat_request_arc();
@@ -75,7 +80,7 @@ impl PipelineStage for ChatRequestBuildingStage {
                     )
                     .map_err(|e| {
                         error!(function = "ChatRequestBuildingStage::execute", error = %e, "Failed to build SGLang generate request");
-                        error::bad_request(format!("Invalid request parameters: {}", e))
+                        error::bad_request("invalid_request_parameters", format!("Invalid request parameters: {}", e))
                     })?;
                 ProtoGenerateRequest::Sglang(Box::new(req))
             }
@@ -90,7 +95,7 @@ impl PipelineStage for ChatRequestBuildingStage {
                     )
                     .map_err(|e| {
                         error!(function = "ChatRequestBuildingStage::execute", error = %e, "Failed to build vLLM generate request");
-                        error::bad_request(format!("Invalid request parameters: {}", e))
+                        error::bad_request("invalid_request_parameters", format!("Invalid request parameters: {}", e))
                     })?;
                 ProtoGenerateRequest::Vllm(Box::new(req))
             }
@@ -103,7 +108,9 @@ impl PipelineStage for ChatRequestBuildingStage {
             }
         }
 
-        ctx.state.proto_request = Some(proto_request);
+        ctx.state.proto_request = Some(
+            crate::routers::grpc::proto_wrapper::ProtoRequest::Generate(proto_request),
+        );
         Ok(None)
     }
 

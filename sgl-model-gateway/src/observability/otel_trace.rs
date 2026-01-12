@@ -1,5 +1,6 @@
+//! OpenTelemetry tracing integration.
+
 use std::{
-    collections::HashSet,
     sync::{
         atomic::{AtomicBool, Ordering},
         OnceLock,
@@ -18,6 +19,7 @@ use opentelemetry_sdk::{
     Resource,
 };
 use tokio::task::spawn_blocking;
+use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing::{Metadata, Subscriber};
 use tracing_opentelemetry::{self, OpenTelemetrySpanExt};
 use tracing_subscriber::{
@@ -25,25 +27,44 @@ use tracing_subscriber::{
     Layer,
 };
 
-use super::events::get_module_path as http_router_get_module_path;
+use super::events::get_module_path as events_module_path;
 
+/// Whether OpenTelemetry tracing is enabled.
+///
+/// This flag guards access to TRACER and PROVIDER. We use Release/Acquire
+/// ordering to ensure proper synchronization: writes to TRACER/PROVIDER
+/// happen-before the Release store, and Acquire loads happen-before reads.
 static ENABLED: AtomicBool = AtomicBool::new(false);
-
-// global tracer
 static TRACER: OnceLock<SdkTracer> = OnceLock::new();
 static PROVIDER: OnceLock<TracerProvider> = OnceLock::new();
+static ALLOWED_TARGETS: OnceLock<[&'static str; 3]> = OnceLock::new();
 
-pub struct CustomOtelFilter {
-    allowed_targets: HashSet<String>,
+#[inline]
+fn get_allowed_targets() -> &'static [&'static str; 3] {
+    ALLOWED_TARGETS.get_or_init(|| {
+        [
+            "smg::otel-trace",
+            "smg::observability::otel_trace",
+            events_module_path(),
+        ]
+    })
 }
 
-impl CustomOtelFilter {
-    pub fn new() -> Self {
-        let mut allowed_targets = HashSet::new();
-        allowed_targets.insert("sgl_model_gateway::otel-trace".to_string());
-        allowed_targets.insert(http_router_get_module_path().to_string());
+/// Filter that only allows specific module targets to be exported to OTEL.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CustomOtelFilter;
 
-        Self { allowed_targets }
+impl CustomOtelFilter {
+    #[inline]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    #[inline]
+    fn is_allowed(target: &str) -> bool {
+        get_allowed_targets()
+            .iter()
+            .any(|allowed| target.starts_with(allowed))
     }
 }
 
@@ -51,12 +72,14 @@ impl<S> Filter<S> for CustomOtelFilter
 where
     S: Subscriber,
 {
+    #[inline]
     fn enabled(&self, meta: &Metadata<'_>, _cx: &Context<'_, S>) -> bool {
-        self.allowed_targets.contains(meta.target())
+        Self::is_allowed(meta.target())
     }
 
+    #[inline]
     fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> tracing::subscriber::Interest {
-        if self.allowed_targets.contains(meta.target()) {
+        if Self::is_allowed(meta.target()) {
             tracing::subscriber::Interest::always()
         } else {
             tracing::subscriber::Interest::never()
@@ -64,16 +87,10 @@ where
     }
 }
 
-impl Default for CustomOtelFilter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// init OpenTelemetry connection
 pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()> {
     if !enable {
-        ENABLED.store(false, Ordering::Relaxed);
+        // Use Release to ensure any prior OTEL state changes are visible
+        ENABLED.store(false, Ordering::Release);
         return Ok(());
     }
 
@@ -84,95 +101,83 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
         endpoint.to_string()
     };
 
-    let result = std::panic::catch_unwind(|| -> Result<()> {
-        global::set_text_map_propagator(TraceContextPropagator::new());
+    global::set_text_map_propagator(TraceContextPropagator::new());
 
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint(endpoint)
-            .with_protocol(opentelemetry_otlp::Protocol::Grpc)
-            .build()?;
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(&endpoint)
+        .with_protocol(opentelemetry_otlp::Protocol::Grpc)
+        .build()
+        .map_err(|e| {
+            eprintln!("[tracing] Failed to create OTLP exporter: {}", e);
+            anyhow::anyhow!("Failed to create OTLP exporter: {}", e)
+        })?;
 
-        let batch_config = BatchConfigBuilder::default()
-            .with_scheduled_delay(Duration::from_millis(500))
-            .with_max_export_batch_size(64)
-            .build();
+    let batch_config = BatchConfigBuilder::default()
+        .with_scheduled_delay(Duration::from_millis(500))
+        .with_max_export_batch_size(64)
+        .build();
 
-        let span_processor = BatchSpanProcessor::builder(exporter, runtime::Tokio)
-            .with_batch_config(batch_config)
-            .build();
+    let span_processor = BatchSpanProcessor::builder(exporter, runtime::Tokio)
+        .with_batch_config(batch_config)
+        .build();
 
-        let resource = Resource::default().merge(&Resource::new(vec![KeyValue::new(
-            "service.name",
-            "sgl-router",
-        )]));
+    let resource =
+        Resource::default().merge(&Resource::new(vec![KeyValue::new("service.name", "smg")]));
 
-        let provider = TracerProvider::builder()
-            .with_span_processor(span_processor)
-            .with_resource(resource)
-            .build();
-        PROVIDER
-            .set(provider.clone())
-            .map_err(|_| anyhow::anyhow!("Provider already initialized"))?;
+    let provider = TracerProvider::builder()
+        .with_span_processor(span_processor)
+        .with_resource(resource)
+        .build();
 
-        let tracer = provider.tracer("sgl-router");
+    PROVIDER
+        .set(provider.clone())
+        .map_err(|_| anyhow::anyhow!("Provider already initialized"))?;
 
-        TRACER
-            .set(tracer)
-            .map_err(|_| anyhow::anyhow!("Tracer already initialized"))?;
+    let tracer = provider.tracer("smg");
 
-        let _ = global::set_tracer_provider(provider);
+    TRACER
+        .set(tracer)
+        .map_err(|_| anyhow::anyhow!("Tracer already initialized"))?;
 
-        ENABLED.store(true, Ordering::Relaxed);
+    let _ = global::set_tracer_provider(provider);
 
-        Ok(())
-    });
+    // Use Release ordering: all writes to TRACER/PROVIDER happen-before this store,
+    // so any thread that loads ENABLED with Acquire will see the initialized state.
+    ENABLED.store(true, Ordering::Release);
 
-    match result {
-        Ok(Ok(())) => {
-            eprintln!(
-                "[tracing] OpenTelemetry initialized successfully, enabled: {}",
-                ENABLED.load(Ordering::Relaxed)
-            );
-            Ok(())
-        }
-        Ok(Err(e)) => {
-            eprintln!("[tracing] Failed to initialize OTLP tracer: {}", e);
-            ENABLED.store(false, Ordering::Relaxed);
-            Err(e)
-        }
-        Err(_) => {
-            eprintln!("[tracing] Panic during OpenTelemetry initialization");
-            ENABLED.store(false, Ordering::Relaxed);
-            Err(anyhow::anyhow!("Panic during initialization"))
-        }
-    }
+    eprintln!("[tracing] OpenTelemetry initialized successfully");
+    Ok(())
 }
 
-pub fn get_otel_layer<S>() -> Result<Box<dyn Layer<S> + Send + Sync + 'static>, &'static str>
+/// Get the OpenTelemetry tracing layer. Must be called after `otel_tracing_init`.
+pub fn get_otel_layer<S>() -> Result<Box<dyn Layer<S> + Send + Sync + 'static>>
 where
     S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
 {
     if !is_otel_enabled() {
-        return Err("OpenTelemetry is not enabled");
+        anyhow::bail!("OpenTelemetry is not enabled");
     }
 
     let tracer = TRACER
         .get()
-        .ok_or("Tracer not initialized. Call otel_tracing_init first.")?
+        .ok_or_else(|| anyhow::anyhow!("Tracer not initialized. Call otel_tracing_init first."))?
         .clone();
-
-    let custom_filter = CustomOtelFilter::new();
 
     let layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
-        .with_filter(custom_filter);
+        .with_filter(CustomOtelFilter::new());
 
     Ok(Box::new(layer))
 }
 
+/// Check if OpenTelemetry tracing is enabled.
+///
+/// Uses Acquire ordering to synchronize with the Release store in `otel_tracing_init`,
+/// ensuring that if this returns true, TRACER and PROVIDER are fully initialized.
+#[inline]
 pub fn is_otel_enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+    ENABLED.load(Ordering::Acquire)
 }
 
 pub async fn flush_spans_async() -> Result<()> {
@@ -180,39 +185,41 @@ pub async fn flush_spans_async() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(provider) = PROVIDER.get() {
-        let provider = provider.clone();
+    let provider = PROVIDER
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Provider not initialized"))?
+        .clone();
 
-        spawn_blocking(move || provider.force_flush())
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to join blocking task for flushing spans: {}", e)
-            })?;
+    spawn_blocking(move || provider.force_flush())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to flush spans: {}", e))?;
 
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("Provider not initialized"))
-    }
+    Ok(())
 }
 
 pub fn shutdown_otel() {
-    if ENABLED.load(Ordering::Relaxed) {
+    // Use Acquire to ensure we see any prior OTEL operations
+    if ENABLED.load(Ordering::Acquire) {
         global::shutdown_tracer_provider();
-        ENABLED.store(false, Ordering::Relaxed);
+        // Use Release to ensure shutdown completes before flag is cleared
+        ENABLED.store(false, Ordering::Release);
         eprintln!("[tracing] OpenTelemetry shut down");
     }
 }
 
-pub fn inject_trace_context_http(headers: &mut HeaderMap) -> Result<()> {
+/// Inject W3C trace context headers into an HTTP request.
+#[inline]
+pub fn inject_trace_context_http(headers: &mut HeaderMap) {
     if !is_otel_enabled() {
-        return Err(anyhow::anyhow!("OTEL not enabled"));
+        return;
     }
 
     let context = tracing::Span::current().context();
 
     struct HeaderInjector<'a>(&'a mut HeaderMap);
 
-    impl<'a> opentelemetry::propagation::Injector for HeaderInjector<'a> {
+    impl opentelemetry::propagation::Injector for HeaderInjector<'_> {
+        #[inline]
         fn set(&mut self, key: &str, value: String) {
             if let Ok(header_name) = HeaderName::from_bytes(key.as_bytes()) {
                 if let Ok(header_value) = HeaderValue::from_str(&value) {
@@ -225,5 +232,31 @@ pub fn inject_trace_context_http(headers: &mut HeaderMap) -> Result<()> {
     global::get_text_map_propagator(|propagator| {
         propagator.inject_context(&context, &mut HeaderInjector(headers));
     });
-    Ok(())
+}
+
+/// Inject W3C trace context into gRPC metadata.
+#[inline]
+pub fn inject_trace_context_grpc(metadata: &mut MetadataMap) {
+    if !is_otel_enabled() {
+        return;
+    }
+
+    let context = tracing::Span::current().context();
+
+    struct MetadataInjector<'a>(&'a mut MetadataMap);
+
+    impl opentelemetry::propagation::Injector for MetadataInjector<'_> {
+        #[inline]
+        fn set(&mut self, key: &str, value: String) {
+            if let Ok(metadata_key) = MetadataKey::from_bytes(key.as_bytes()) {
+                if let Ok(metadata_value) = MetadataValue::try_from(&value) {
+                    self.0.insert(metadata_key, metadata_value);
+                }
+            }
+        }
+    }
+
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut MetadataInjector(metadata));
+    });
 }

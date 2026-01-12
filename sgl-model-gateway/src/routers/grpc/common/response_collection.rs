@@ -5,8 +5,9 @@
 
 use axum::response::Response;
 
-use crate::routers::grpc::{
-    context::ExecutionResult, error, proto_wrapper::ProtoGenerateComplete, utils,
+use crate::routers::{
+    error,
+    grpc::{context::ExecutionResult, proto_wrapper::ProtoGenerateComplete, utils},
 };
 
 /// Collect and merge responses from execution result
@@ -20,7 +21,7 @@ use crate::routers::grpc::{
 ///
 /// # Returns
 /// Vector of GenerateComplete responses, one per index (n parameter)
-pub async fn collect_responses(
+pub(crate) async fn collect_responses(
     execution_result: ExecutionResult,
     merge_logprobs: bool,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
@@ -54,10 +55,20 @@ pub async fn collect_responses(
 
             decode_responses
         }
+        ExecutionResult::Embedding { .. } => {
+            // Embeddings do not support this path (no generate complete response)
+            return Err(error::internal_error(
+                "invalid_execution_mode",
+                "Embedding result encountered in response collection",
+            ));
+        }
     };
 
     if all_responses.is_empty() {
-        return Err(error::internal_error("No responses from server"));
+        return Err(error::internal_error(
+            "no_responses_from_server",
+            "No responses from server",
+        ));
     }
 
     Ok(all_responses)
@@ -74,7 +85,9 @@ fn merge_prefill_logprobs(
 ) {
     // Only SGLang supports PD mode and has input_logprobs
     if let Some(ProtoGenerateComplete::Sglang(prefill_first)) = prefill_responses.first() {
-        if let Some(prefill_input_logprobs) = prefill_first.input_logprobs.clone() {
+        // Use ref to borrow input_logprobs instead of cloning upfront
+        // This avoids one allocation when the Option is Some
+        if let Some(ref prefill_input_logprobs) = prefill_first.input_logprobs {
             for response in decode_responses.iter_mut() {
                 if let ProtoGenerateComplete::Sglang(decode_resp) = response {
                     decode_resp.input_logprobs = Some(prefill_input_logprobs.clone());

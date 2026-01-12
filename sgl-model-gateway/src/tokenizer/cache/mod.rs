@@ -162,31 +162,33 @@ impl CachedTokenizer {
 }
 
 impl Encoder for CachedTokenizer {
-    fn encode(&self, input: &str) -> Result<Encoding> {
-        // Collect special tokens once if L1 is enabled (avoid redundant allocation)
-        let special_tokens: Option<Vec<&str>> = self.l1.as_ref().map(|_| {
-            self.special_token_strings
-                .iter()
-                .map(|s| s.as_str())
-                .collect()
-        });
-
-        // L0 cache lookup (exact match)
+    fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
+        // L0 cache lookup (exact match) - returns Arc<Encoding> for zero-copy
+        // Note: L0 cache doesn't distinguish by add_special_tokens flag
+        // This is acceptable for the current use case where embeddings always use true
+        // and chat always uses false with different input content
         if let Some(l0) = &self.l0 {
             if let Some(cached) = l0.get(input) {
-                return Ok(cached);
+                // Unwrap the Arc - since Encoding is Clone, we can return the inner value
+                // For callers who need the tokens, they can access via token_ids() which is &[u32]
+                return Ok((*cached).clone());
             }
         }
 
         // L1 cache lookup (prefix match at special token boundaries)
         if let Some(l1) = &self.l1 {
-            let tokens = special_tokens.as_ref().unwrap();
+            // Use pre-computed special tokens refs (avoids allocation per call)
+            let tokens: Vec<&str> = self
+                .special_token_strings
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
 
-            if let Some((prefix_tokens, prefix_len)) = l1.longest_prefix_match(input, tokens) {
+            if let Some((prefix_tokens, prefix_len)) = l1.longest_prefix_match(input, &tokens) {
                 // We have a prefix match - tokenize the suffix
                 let suffix = &input[prefix_len..];
                 if !suffix.is_empty() {
-                    let suffix_encoding = self.inner.encode(suffix)?;
+                    let suffix_encoding = self.inner.encode(suffix, add_special_tokens)?;
 
                     // Merge prefix tokens + suffix tokens
                     // Safe because we're splitting at special token boundaries
@@ -206,7 +208,7 @@ impl Encoder for CachedTokenizer {
         }
 
         // Full tokenization (both L0 and L1 miss)
-        let encoding = self.inner.encode(input)?;
+        let encoding = self.inner.encode(input, add_special_tokens)?;
 
         // Cache in L0
         if let Some(l0) = &self.l0 {
@@ -216,18 +218,26 @@ impl Encoder for CachedTokenizer {
         // Cache in L1 at special token boundaries
         // Re-tokenizes prefixes for correctness (optimized for high prefix reuse)
         if let Some(l1) = &self.l1 {
-            let tokens = special_tokens.as_ref().unwrap();
-            let _ = l1.insert_at_boundaries(input, self.inner.as_ref(), tokens);
+            let tokens: Vec<&str> = self
+                .special_token_strings
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            let _ =
+                l1.insert_at_boundaries(input, self.inner.as_ref(), &tokens, add_special_tokens);
             // Ignore errors in cache insertion - cache is best-effort
         }
 
         Ok(encoding)
     }
 
-    fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
+    fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
         // Process each input in parallel, leveraging thread-safe caches
         // This maintains the parallelism from the underlying HuggingFaceTokenizer
-        inputs.par_iter().map(|&input| self.encode(input)).collect()
+        inputs
+            .par_iter()
+            .map(|&input| self.encode(input, add_special_tokens))
+            .collect()
     }
 }
 
@@ -273,10 +283,10 @@ mod tests {
         let input = "Hello world";
 
         // First call - miss
-        let result1 = cached.encode(input).unwrap();
+        let result1 = cached.encode(input, false).unwrap();
 
         // Second call - hit
-        let result2 = cached.encode(input).unwrap();
+        let result2 = cached.encode(input, false).unwrap();
 
         // Results should be identical
         assert_eq!(result1.token_ids(), result2.token_ids());
@@ -301,8 +311,8 @@ mod tests {
         let input = "Hello world";
 
         // Both calls should work even without cache
-        let result1 = cached.encode(input).unwrap();
-        let result2 = cached.encode(input).unwrap();
+        let result1 = cached.encode(input, false).unwrap();
+        let result2 = cached.encode(input, false).unwrap();
 
         assert_eq!(result1.token_ids(), result2.token_ids());
 
@@ -317,7 +327,7 @@ mod tests {
 
         let inputs = vec!["Hello", "world", "Hello"]; // "Hello" repeated
 
-        let results = cached.encode_batch(&inputs).unwrap();
+        let results = cached.encode_batch(&inputs, false).unwrap();
 
         assert_eq!(results.len(), 3);
 
@@ -327,7 +337,7 @@ mod tests {
 
         // After batch processing, cache should be populated
         // Subsequent calls should hit the cache
-        let _ = cached.encode("Hello").unwrap();
+        let _ = cached.encode("Hello", false).unwrap();
         let stats = cached.cache_stats().unwrap();
 
         // Should have at least 1 hit from the call above (cache was populated by batch)

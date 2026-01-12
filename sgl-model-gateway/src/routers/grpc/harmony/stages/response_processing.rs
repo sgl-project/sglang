@@ -7,17 +7,22 @@ use axum::response::Response;
 use tracing::error;
 
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
-use crate::routers::grpc::{
-    common::stages::PipelineStage,
-    context::{FinalResponse, RequestContext, RequestType},
-    error,
+use crate::{
+    core::AttachedBody,
+    routers::{
+        error,
+        grpc::{
+            common::stages::PipelineStage,
+            context::{FinalResponse, RequestContext, RequestType},
+        },
+    },
 };
 
 /// Harmony Response Processing stage: Parse and format Harmony responses
 ///
 /// Takes output tokens from execution and parses them using HarmonyParserAdapter
 /// to extract analysis, tool calls, and final response text from Harmony channels.
-pub struct HarmonyResponseProcessingStage {
+pub(crate) struct HarmonyResponseProcessingStage {
     processor: HarmonyResponseProcessor,
     streaming_processor: Arc<HarmonyStreamingProcessor>,
 }
@@ -54,7 +59,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                             request_type = "Chat",
                             "No execution result available"
                         );
-                        error::internal_error("No execution result")
+                        error::internal_error("no_execution_result", "No execution result")
                     })?;
 
                 let dispatch = ctx.state.dispatch.as_ref().cloned().ok_or_else(|| {
@@ -63,20 +68,27 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                         request_type = "Chat",
                         "Dispatch metadata not set"
                     );
-                    error::internal_error("Dispatch metadata not set")
+                    error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
                 })?;
 
                 // For streaming, delegate to streaming processor and return SSE response
                 if is_streaming {
-                    return Ok(Some(
-                        self.streaming_processor
-                            .clone()
-                            .process_streaming_chat_response(
-                                execution_result,
-                                ctx.chat_request_arc(),
-                                dispatch,
-                            ),
-                    ));
+                    let response = self
+                        .streaming_processor
+                        .clone()
+                        .process_streaming_chat_response(
+                            execution_result,
+                            ctx.chat_request_arc(),
+                            dispatch,
+                        );
+
+                    // Attach load guards to response body for proper RAII lifecycle
+                    let response = match ctx.state.load_guards.take() {
+                        Some(guards) => AttachedBody::wrap_response(response, guards),
+                        None => response,
+                    };
+
+                    return Ok(Some(response));
                 }
 
                 // For non-streaming, delegate to Harmony response processor to build ChatCompletionResponse
@@ -105,7 +117,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                             request_type = "Responses",
                             "No execution result available"
                         );
-                        error::internal_error("No execution result")
+                        error::internal_error("no_execution_result", "No execution result")
                     })?;
 
                 let dispatch = ctx.state.dispatch.as_ref().cloned().ok_or_else(|| {
@@ -114,7 +126,7 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                         request_type = "Responses",
                         "Dispatch metadata not set"
                     );
-                    error::internal_error("Dispatch metadata not set")
+                    error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
                 })?;
 
                 let responses_request = ctx.responses_request_arc();
@@ -126,13 +138,14 @@ impl PipelineStage for HarmonyResponseProcessingStage {
                 ctx.state.response.responses_iteration_result = Some(iteration_result);
                 Ok(None)
             }
-            RequestType::Generate(_) => {
+            RequestType::Generate(_) | RequestType::Embedding(_) | RequestType::Classify(_) => {
                 error!(
                     function = "HarmonyResponseProcessingStage::execute",
-                    "Generate request type not supported in Harmony pipeline"
+                    "Generate/Embedding/Classify request type not supported in Harmony pipeline"
                 );
                 Err(error::internal_error(
-                    "Generate requests not supported in Harmony pipeline",
+                    "requests_not_supported_in_harmony",
+                    "Generate/Embedding/Classify requests not supported in Harmony pipeline",
                 ))
             }
         }
