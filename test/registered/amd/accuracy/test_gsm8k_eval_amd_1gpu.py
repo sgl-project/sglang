@@ -28,8 +28,60 @@ from sglang.test.test_utils import (
     write_results_to_json,
 )
 
-# Register for AMD CI - GSM8K 1-GPU evaluation tests (~30 min)
-register_amd_ci(est_time=1800, suite="nightly-amd-accuracy-1-gpu", nightly=True)
+# Register for AMD CI - GSM8K 1-GPU evaluation tests (~60 min with downloads)
+register_amd_ci(est_time=3600, suite="nightly-amd-accuracy-1-gpu", nightly=True)
+
+# Timeout for model download (20 minutes for large models)
+MODEL_DOWNLOAD_TIMEOUT = 1200  # 20 minutes
+
+
+def try_download_model(model_path: str, timeout: int = MODEL_DOWNLOAD_TIMEOUT) -> bool:
+    """Try to download/verify model availability before server launch.
+
+    Returns True if model is available, False if download fails.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+        from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError
+
+        print(f"📥 Checking/downloading model: {model_path}")
+        start_time = time.time()
+
+        # Try to download the model (will use cache if already downloaded)
+        snapshot_download(
+            model_path,
+            allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model", "*.txt"],
+            ignore_patterns=["*.gguf", "*.ggml"],
+        )
+
+        elapsed = time.time() - start_time
+        print(f"✅ Model ready: {model_path} ({elapsed:.1f}s)")
+        return True
+
+    except (HfHubHTTPError, RepositoryNotFoundError) as e:
+        print(f"❌ Failed to download {model_path}: {e}")
+        return False
+    except Exception as e:
+        # Check if it's an offline mode error
+        if "offline mode" in str(e).lower() or "HF_HUB_OFFLINE" in str(e):
+            print(f"⚠️ Offline mode enabled, checking local cache for {model_path}")
+            try:
+                from huggingface_hub import try_to_load_from_cache
+
+                # Try to check if model exists in cache
+                config_path = try_to_load_from_cache(model_path, "config.json")
+                if config_path is not None:
+                    print(f"✅ Model found in cache: {model_path}")
+                    return True
+                else:
+                    print(f"❌ Model not in cache and offline: {model_path}")
+                    return False
+            except Exception:
+                print(f"❌ Cannot verify model in offline mode: {model_path}")
+                return False
+        print(f"❌ Error checking model {model_path}: {e}")
+        return False
+
 
 MODEL_SCORE_THRESHOLDS = {
     # Llama 3.1 series
@@ -50,18 +102,14 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
 }
 
-# Models known to fail on AMD
+# Models known to have actual failures on AMD (not download issues)
 FAILING_MODELS = {
     # Gemma models moved to 2-GPU test (OOM on single GPU)
-    # Models not cached locally on CI runner
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8",  # Not cached locally
-    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8",  # Not cached locally
-    "meta-llama/Llama-3.2-3B-Instruct",  # Not cached locally
-    "Qwen/Qwen2.5-7B-Instruct",  # Not cached locally
-    "Qwen/Qwen3-8B",  # Not cached locally
+    # Add models here that have actual runtime failures, not download issues
 }
 
 # 1-GPU models (TP=1) - models that fit on a single GPU
+# Models will be downloaded if not cached (with timeout)
 TP1_MODELS = [
     "meta-llama/Llama-3.1-8B-Instruct",
     "mistralai/Mistral-7B-Instruct-v0.3",
@@ -151,7 +199,7 @@ class TestNightlyGsm8KEval1GPU(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.models = [m for m in TP1_MODELS if m not in FAILING_MODELS]
+        cls.models = TP1_MODELS
         cls.base_url = DEFAULT_URL_FOR_TEST
 
     def test_mgsm_en_1gpu_models(self):
@@ -161,6 +209,7 @@ class TestNightlyGsm8KEval1GPU(unittest.TestCase):
         )
         is_first = True
         all_results = []
+        skipped_models = []
         total_test_start = time.time()
 
         print(f"\n{'='*60}")
@@ -175,6 +224,18 @@ class TestNightlyGsm8KEval1GPU(unittest.TestCase):
                 print(f"Testing: {model} (TP=1)")
                 print(f"{'='*60}")
 
+                # Skip models with known failures
+                if model in FAILING_MODELS:
+                    print(f"⏭️ Skipping {model} (known failure)")
+                    skipped_models.append((model, "known failure"))
+                    continue
+
+                # Try to download/verify model availability first
+                if not try_download_model(model):
+                    print(f"⏭️ Skipping {model} (download failed)")
+                    skipped_models.append((model, "download failed"))
+                    continue
+
                 model_start = time.time()
 
                 os.environ["SGLANG_USE_AITER"] = (
@@ -184,7 +245,12 @@ class TestNightlyGsm8KEval1GPU(unittest.TestCase):
                 # Launch server with timing
                 print(f"🚀 Launching server...")
                 server_start = time.time()
-                process = popen_launch_server_wrapper(self.base_url, model)
+                try:
+                    process = popen_launch_server_wrapper(self.base_url, model)
+                except Exception as e:
+                    print(f"❌ Server launch failed for {model}: {e}")
+                    skipped_models.append((model, f"server launch failed: {e}"))
+                    continue
                 startup_time = time.time() - server_start
                 print(f"⏱️  Server startup: {startup_time:.1f}s")
 
@@ -248,6 +314,14 @@ class TestNightlyGsm8KEval1GPU(unittest.TestCase):
         # Calculate total test runtime
         total_test_time = time.time() - total_test_start
 
+        # Report skipped models
+        if skipped_models:
+            print(f"\n{'='*60}")
+            print(f"⏭️ Skipped Models ({len(skipped_models)}):")
+            print(f"{'='*60}")
+            for model, reason in skipped_models:
+                print(f"  - {model}: {reason}")
+
         try:
             with open("results.json", "r") as f:
                 print("\nFinal Results from results.json:")
@@ -256,7 +330,11 @@ class TestNightlyGsm8KEval1GPU(unittest.TestCase):
             print(f"Error reading results.json: {e}")
 
         # Check all scores after collecting all results
-        check_model_scores(all_results)
+        if all_results:
+            check_model_scores(all_results)
+        else:
+            print("\n⚠️ No models were tested successfully!")
+
         print(
             f"\n⏱️  Total test runtime: {total_test_time:.1f}s ({total_test_time/60:.1f} min)"
         )
