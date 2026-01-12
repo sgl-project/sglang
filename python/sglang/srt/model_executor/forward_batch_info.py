@@ -619,36 +619,39 @@ class ForwardBatch:
         if model_runner.server_args.enable_lora:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        # Init attention token capture (per-request gating)
-        # Only capture if feature is enabled on server AND at least one request in batch wants it
-        # IMPORTANT: Only capture during DECODE mode, not during EXTEND/prefill
-        # Prefill can have very long sequences and attention capture would be expensive
+        # Init attention token capture - linear predicate chain for clarity
+        # Attention capture is produced only for decode steps; prefill is skipped by design.
+        #
+        # Gate 1: Feature requested? (server flag AND request flag)
+        # Gate 2: Decode mode? (skip prefill silently - no warning)
+        # Gate 3: Triton backend? (warn once if not triton)
+        # Gate 4: Enable capture
         _should_capture_attention = False
-        if model_runner.server_args.return_attention_tokens and batch.capture_attention_tokens:
-            # Forward mode guard: only capture during DECODE, not during prefill/EXTEND
-            # Prefill attention patterns are different and capturing is expensive for long contexts
-            if not ret.forward_mode.is_decode():
-                # Skip capture during prefill - this is expected, not a warning
-                pass
-            else:
-                # Backend compatibility guard: attention capture only works with Triton backend
-                # FlashInfer and other backends don't have the top-k capture kernel implemented
-                global _attention_backend_warned
-                decode_backend = getattr(model_runner, 'decode_attention_backend_str', None)
-                if decode_backend is None:
-                    decode_backend = model_runner.server_args.attention_backend
 
-                if decode_backend != "triton":
-                    if not _attention_backend_warned:
-                        logger.warning(
-                            f"Attention visualization is only supported with --attention-backend triton. "
-                            f"Current backend: {decode_backend}. Ignoring attention capture request."
-                        )
-                        _attention_backend_warned = True
-                    # Skip capture setup - leave ret.capture_attention_tokens as False
-                else:
-                    # Backend is triton and forward mode is DECODE - proceed with capture setup
-                    _should_capture_attention = True
+        # Gate 1: Check if capture is requested
+        if not (model_runner.server_args.return_attention_tokens and batch.capture_attention_tokens):
+            pass  # Not requested - skip silently
+        # Gate 2: Check if decode mode (prefill is skipped by design, no warning)
+        elif not ret.forward_mode.is_decode():
+            pass  # Prefill/EXTEND - skip silently (attention capture is decode-only)
+        else:
+            # Gate 3: Check backend compatibility
+            global _attention_backend_warned
+            decode_backend = getattr(model_runner, 'decode_attention_backend_str', None)
+            if decode_backend is None:
+                decode_backend = model_runner.server_args.attention_backend
+
+            if decode_backend != "triton":
+                # Non-triton backend - warn once and skip
+                if not _attention_backend_warned:
+                    logger.warning(
+                        f"Attention capture requires --attention-backend triton. "
+                        f"Current backend: {decode_backend}. Skipping capture."
+                    )
+                    _attention_backend_warned = True
+            else:
+                # Gate 4: All conditions met - enable capture
+                _should_capture_attention = True
 
         if _should_capture_attention:
             ret.capture_attention_tokens = True
