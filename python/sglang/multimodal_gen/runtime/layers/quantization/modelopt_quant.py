@@ -20,7 +20,6 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.utils import is_layer_skipped, swizzle_blockscale
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 try:
     if current_platform.is_sm120():
@@ -132,9 +131,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         return []
 
     @classmethod
-    def override_quantization_method(
-        cls, hf_quant_config, user_quant
-    ) -> Optional[str]:
+    def override_quantization_method(cls, hf_quant_config, user_quant) -> Optional[str]:
         """Shared ModelOpt quantization method override logic."""
         if hf_quant_config is None:
             return None
@@ -408,7 +405,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if FLASHINFER_FP4_GEMM_BACKEND != "trtllm":
             # Pad and blockwise interleave weight_scale
             padded_scales = swizzle_blockscale(layer.weight_scale)
-            layer.weight_scale_interleaved = Parameter(padded_scales, requires_grad=False)
+            layer.weight_scale_interleaved = Parameter(
+                padded_scales, requires_grad=False
+            )
         else:
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
@@ -429,7 +428,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer.weight_scale_interleaved = Parameter(scale, requires_grad=False)
             layer.weight = Parameter(weight, requires_grad=False)
             return
-
 
     def apply(
         self,

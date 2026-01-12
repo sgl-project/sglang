@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
 
+
 def get_default_cache_root() -> str:
     return os.getenv(
         "XDG_CACHE_HOME",
