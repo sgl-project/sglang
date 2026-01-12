@@ -1,0 +1,41 @@
+"""DeepSeek common utilities and shared components."""
+
+from sglang.srt.models.deepseek_common.utils import (
+    FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
+    NVFP4_CKPT_FP8_ATTN_QUANT_MODULES,
+    _device_sm,
+    _get_llama_4_scaling,
+    _is_cpu,
+    _is_cpu_amx_available,
+    _is_cublas_ge_129,
+    _is_cuda,
+    _is_fp8_fnuz,
+    _is_gfx95_supported,
+    _is_hip,
+    _is_npu,
+    _use_aiter,
+    _use_aiter_gfx95,
+    add_forward_absorb_core_attention_backend,
+    enable_nextn_moe_bf16_cast_to_fp8,
+    yarn_get_mscale,
+)
+
+__all__ = [
+    "FORWARD_ABSORB_CORE_ATTENTION_BACKENDS",
+    "NVFP4_CKPT_FP8_ATTN_QUANT_MODULES",
+    "_device_sm",
+    "_get_llama_4_scaling",
+    "_is_cpu",
+    "_is_cpu_amx_available",
+    "_is_cublas_ge_129",
+    "_is_cuda",
+    "_is_fp8_fnuz",
+    "_is_gfx95_supported",
+    "_is_hip",
+    "_is_npu",
+    "_use_aiter",
+    "_use_aiter_gfx95",
+    "add_forward_absorb_core_attention_backend",
+    "enable_nextn_moe_bf16_cast_to_fp8",
+    "yarn_get_mscale",
+]

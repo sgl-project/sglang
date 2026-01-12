@@ -16,7 +16,7 @@ def main():
     
     print("\n--- Testing Imports ---")
     try:
-        from sglang.srt.models.deepseek_v2 import (
+        from sglang.srt.models.deepseek_v2 import (  # noqa: F401
             DeepseekV2ForCausalLM,
             DeepseekV3ForCausalLM,
             DeepseekV32ForCausalLM,
@@ -24,17 +24,16 @@ def main():
         print("Main model classes imported")
         
         from sglang.srt.models.deepseek_common.utils import (
-            enable_nextn_moe_bf16_cast_to_fp8,
-            add_forward_absorb_core_attention_backend,
-            yarn_get_mscale,
-            _get_llama_4_scaling,
             FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
             NVFP4_CKPT_FP8_ATTN_QUANT_MODULES,
+            _get_llama_4_scaling,
             _is_cublas_ge_129,
+            enable_nextn_moe_bf16_cast_to_fp8,
+            yarn_get_mscale,
         )
         print("All utility functions imported")
         
-        from sglang.srt.models.deepseek_nextn import DeepseekModelNextN
+        from sglang.srt.models.deepseek_nextn import DeepseekModelNextN  # noqa: F401
         print("DeepSeek NextN imported")
         
     except ImportError as e:
@@ -60,7 +59,7 @@ def main():
         # Test enable_nextn_moe_bf16_cast_to_fp8
         result = enable_nextn_moe_bf16_cast_to_fp8(None)
         print(f"enable_nextn_moe_bf16_cast_to_fp8(None) = {result}")
-        
+
     except Exception as e:
         print(f"Function test failed: {e}")
 
