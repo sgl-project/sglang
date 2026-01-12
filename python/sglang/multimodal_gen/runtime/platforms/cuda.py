@@ -174,14 +174,7 @@ class CudaPlatformBase(Platform):
         if cls.is_sm120():
             return AttentionBackendEnum.SAGE_ATTN
         # For other blackwell GPUs, use fa4
-        elif cls.is_blackwell():
-            from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-                set_fa_ver,
-            )
-
-            set_fa_ver(4)
-            return AttentionBackendEnum.FA
-        if not cls.has_device_capability(80):
+        elif not cls.has_device_capability(80):
             logger.info("Cannot use FlashAttention backend for Volta and Turing GPUs.")
             return AttentionBackendEnum.TORCH_SDPA
         elif dtype not in (torch.float16, torch.bfloat16):
