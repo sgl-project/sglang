@@ -289,8 +289,10 @@ class DFlashWorker:
         torch.add(block_start, int(self.block_size), out=block_end)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
-        for i, ln in enumerate(batch.seq_lens_cpu):
-            seq_lens_cpu[i] = int(ln)
+        if batch.seq_lens_cpu.dtype == torch.int32:
+            seq_lens_cpu.copy_(batch.seq_lens_cpu)
+        else:
+            seq_lens_cpu.copy_(batch.seq_lens_cpu.to(torch.int32))
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
@@ -419,9 +421,27 @@ class DFlashWorker:
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
 
+        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
+            return x if x.dtype == weight_dtype else x.to(weight_dtype)
+
+        # Fast path (common): single-rank greedy sampling over the base vocab shard.
+        # Avoids extra max/id bookkeeping that is only needed for TP sync or added vocab.
+        if tp_size == 1 and num_added == 0:
+            for start in range(0, num_tokens, int(chunk_size)):
+                end = min(num_tokens, start + int(chunk_size))
+                hs = _cast_hs(hidden_states[start:end])
+                if num_org > 0:
+                    base_logits = torch.matmul(hs, weight[:num_org].T)
+                    out_token_ids[start:end] = (
+                        torch.argmax(base_logits, dim=-1).to(torch.long) + org_vocab_start
+                    )
+                else:
+                    out_token_ids[start:end] = 0
+            return out_token_ids
+
         for start in range(0, num_tokens, int(chunk_size)):
             end = min(num_tokens, start + int(chunk_size))
-            hs = hidden_states[start:end].to(weight_dtype)
+            hs = _cast_hs(hidden_states[start:end])
             chunk_len = int(hs.shape[0])
 
             # Base vocab logits.
@@ -447,17 +467,17 @@ class DFlashWorker:
                 added_max, added_arg = torch.max(added_logits, dim=-1)
                 use_added = added_max > local_max
                 local_max = torch.where(use_added, added_max, local_max)
-                local_arg = torch.where(
-                    use_added, added_arg.to(local_arg.dtype) + num_org_padded, local_arg
-                )
+                # For base/added conversion below, keep local_arg expressed in the full local
+                # weight index space (base + padding + added), matching `lm_head.weight`.
+                local_arg = torch.where(use_added, added_arg.to(local_arg.dtype) + num_org_padded, local_arg)
 
             # Convert local argmax indices to global token ids.
-            global_ids = torch.empty(
-                (chunk_len,), dtype=torch.int64, device=hs.device
-            )
-            is_base = local_arg < num_org
-            global_ids[is_base] = org_vocab_start + local_arg[is_base]
-            if num_added > 0:
+            if num_added == 0:
+                global_ids = org_vocab_start + local_arg
+            else:
+                global_ids = torch.empty((chunk_len,), dtype=torch.int64, device=hs.device)
+                is_base = local_arg < num_org
+                global_ids[is_base] = org_vocab_start + local_arg[is_base]
                 global_ids[~is_base] = added_vocab_start + (local_arg[~is_base] - num_org_padded)
 
             if tp_size == 1:
