@@ -349,7 +349,7 @@ class TestEdgeCases:
         """Test config file with list values."""
         config_data = {
             "model-path": "microsoft/DialoGPT-medium",
-            "additional-ports": [30001, 30002, 30003],
+            "encoder-urls": ["url1", "url2"],
         }
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
@@ -360,7 +360,7 @@ class TestEdgeCases:
             argv = ["--config", config_file]
             server_args = prepare_server_args(argv)
 
-            assert server_args.additional_ports == [30001, 30002, 30003]
+            assert server_args.encoder_urls == ["url1", "url2"]
         finally:
             os.unlink(config_file)
 
