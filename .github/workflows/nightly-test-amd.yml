@@ -31,6 +31,7 @@ on:
           - 'nightly-perf-8-gpu-deepseek-v3'
           - 'nightly-perf-8-gpu-deepseek-v31'
           # MI35x jobs
+          - 'nightly-test-1-gpu-mi35x'
           - 'nightly-test-2-gpu-mi35x'
           - 'nightly-test-2-gpu-vlm-mi35x'
           - 'nightly-test-8-gpu-mi35x-gpt-oss'
@@ -81,7 +82,7 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-1-gpu --nightly --timeout-per-file 600 || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-1-gpu --nightly --timeout-per-file 600 --continue-on-error || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -311,6 +312,38 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ============================================== MI35x Tests ==============================================
+  # MI35x 1-GPU tests - platform-agnostic tests that may work on CDNA4 (gfx950)
+  nightly-test-1-gpu-mi35x:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-1-gpu-mi35x')
+    runs-on: linux-mi35x-gpu-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd_ci_install_dependency.sh
+          # Install tabulate for run_suite.py (missing in MI35x container)
+          bash scripts/ci/amd_ci_exec.sh pip install tabulate
+
+      - name: Nightly Test MI35x (1-GPU)
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-1-gpu-mi35x --nightly --timeout-per-file 600 --continue-on-error || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
   # MI35x 2-GPU tests (TP=2) - Reuses nightly-amd suite
   nightly-test-2-gpu-mi35x:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-2-gpu-mi35x')
@@ -548,6 +581,7 @@ jobs:
       - nightly-perf-8-gpu-deepseek-v3
       - nightly-perf-8-gpu-deepseek-v31
       # MI35x jobs
+      - nightly-test-1-gpu-mi35x
       - nightly-test-2-gpu-mi35x
       - nightly-test-2-gpu-vlm-mi35x
       - nightly-test-8-gpu-mi35x-gpt-oss
