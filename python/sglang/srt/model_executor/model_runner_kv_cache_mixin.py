@@ -106,6 +106,53 @@ class ModelRunnerKVCacheMixin:
                     * len(self.model_config.swa_attention_layer_ids)
                     * kv_size
                 )
+
+        # Add DFlash hidden state buffer size per token (TARGET worker only)
+        # Hidden states are stored at the same indices as KV cache for prefix caching
+        # Draft worker doesn't need hidden buffer - it uses target model's hidden states
+        if (
+            hasattr(self, "server_args")
+            and self.server_args.speculative_algorithm
+            and self.server_args.speculative_algorithm.upper() == "DFLASH"
+            and not getattr(self, "is_draft_worker", False)  # Only for target worker
+        ):
+            # DFlash stores FC-compressed hidden states for target layers
+            # Default: 5 target layers, hidden_size per layer
+            num_target_layers = (
+                self.server_args.speculative_dflash_num_target_layers or 5
+            )
+            hidden_size = self.model_config.hf_config.hidden_size
+            hidden_state_size = hidden_size * num_target_layers * kv_size
+            cell_size += hidden_state_size
+            logger.info(
+                f"[DFlash] Adding {hidden_state_size} bytes per token for hidden buffer "
+                f"({num_target_layers} layers × {hidden_size} hidden_size)"
+            )
+
+            # Add draft model KV cache size per token
+            # Load draft model config to get layer count automatically
+            from transformers import AutoConfig
+
+            draft_config = AutoConfig.from_pretrained(
+                self.server_args.speculative_draft_model_path,
+                trust_remote_code=True,
+            )
+            num_draft_layers = draft_config.num_hidden_layers
+            num_kv_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
+            # Draft KV cache: num_kv_heads × (head_dim + v_head_dim) × num_draft_layers × kv_size
+            draft_kv_size = (
+                num_kv_heads
+                * (self.model_config.head_dim + self.model_config.v_head_dim)
+                * num_draft_layers
+                * kv_size
+            )
+            cell_size += draft_kv_size
+            logger.info(
+                f"[DFlash] Adding {draft_kv_size} bytes per token for draft KV cache "
+                f"({num_draft_layers} layers × {num_kv_heads} kv_heads × "
+                f"{self.model_config.head_dim + self.model_config.v_head_dim} dim)"
+            )
+
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):
@@ -559,6 +606,20 @@ class ModelRunnerKVCacheMixin:
                         ),
                     )
                 else:
+                    # Compute DFlash hidden buffer params for target worker
+                    dflash_hidden_size = 0
+                    dflash_num_target_layers = 0
+                    if (
+                        hasattr(self, "server_args")
+                        and self.server_args.speculative_algorithm
+                        and self.server_args.speculative_algorithm.upper() == "DFLASH"
+                        and not getattr(self, "is_draft_worker", False)
+                    ):
+                        dflash_num_target_layers = (
+                            self.server_args.speculative_dflash_num_target_layers or 5
+                        )
+                        dflash_hidden_size = self.model_config.hf_config.hidden_size
+
                     self.token_to_kv_pool = MHATokenToKVPool(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
@@ -576,6 +637,8 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        dflash_hidden_size=dflash_hidden_size,
+                        dflash_num_target_layers=dflash_num_target_layers,
                     )
 
         # Initialize token_to_kv_pool_allocator

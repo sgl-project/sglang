@@ -446,6 +446,10 @@ class ServerArgs:
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
 
+    # Speculative decoding (DFlash)
+    speculative_dflash_block_size: int = 16
+    speculative_dflash_num_target_layers: Optional[int] = None
+
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep"] = "none"
@@ -2218,6 +2222,32 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        if self.speculative_algorithm == "DFLASH":
+            # Validate DFlash configuration
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "DFlash requires --speculative-draft-model-path to be set."
+                )
+
+            if self.speculative_dflash_block_size <= 0:
+                raise ValueError(
+                    f"DFlash block size must be positive, got {self.speculative_dflash_block_size}"
+                )
+
+            # Set num_draft_tokens = block_size for DFlash
+            self.speculative_num_draft_tokens = self.speculative_dflash_block_size
+
+            self.speculative_num_steps = 1
+
+            # DFlash V1 only - overlap scheduling not yet supported
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+
+            logger.info(
+                f"DFlash configured with block_size={self.speculative_dflash_block_size}, "
+                f"num_draft_tokens={self.speculative_num_draft_tokens}"
+            )
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -3511,7 +3541,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "DFLASH"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -3651,6 +3681,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-block-size",
+            type=int,
+            default=ServerArgs.speculative_dflash_block_size,
+            help="The block size for DFlash speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-num-target-layers",
+            type=int,
+            default=ServerArgs.speculative_dflash_num_target_layers,
+            help="The number of target model layers to use for feature extraction in DFlash.",
         )
 
         # Multi-layer Eagle speculative decoding

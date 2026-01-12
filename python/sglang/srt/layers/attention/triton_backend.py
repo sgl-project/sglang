@@ -811,9 +811,10 @@ class TritonAttnBackend(AttentionBackend):
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
-        causal = True
-        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
-            causal = False
+        # Determine causal mode from attention type
+        causal = not (
+            layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY
+        )
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:

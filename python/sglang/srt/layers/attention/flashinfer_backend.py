@@ -793,12 +793,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale=layer.v_scale_float,
             )
         else:
-            causal = True
-            if (
+            # Determine causal mode from attention type
+            causal = not (
                 layer.is_cross_attention
                 or layer.attn_type == AttentionType.ENCODER_ONLY
-            ):
-                causal = False
+            )
             if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 

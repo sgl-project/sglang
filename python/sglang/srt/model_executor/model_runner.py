@@ -342,6 +342,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             except:
                 # if there is no aux layer, set to None
                 self.eagle_aux_hidden_state_layer_ids = None
+        elif self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+            # DFlash also needs aux hidden states from multiple target layers
+            # Load draft config to get target_layer_ids
+            from transformers import AutoConfig
+
+            from sglang.srt.models.dflash import build_target_layer_ids
+
+            try:
+                draft_config = AutoConfig.from_pretrained(
+                    server_args.speculative_draft_model_path,
+                    trust_remote_code=True,
+                )
+                # DFlash stores target layer IDs in the config
+                target_layer_ids = getattr(draft_config, "target_layer_ids", None)
+                if target_layer_ids is not None:
+                    self.eagle_use_aux_hidden_state = True
+                    self.eagle_aux_hidden_state_layer_ids = list(target_layer_ids)
+                    logger.info(f"DFlash aux hidden state layers: {target_layer_ids}")
+                else:
+                    # Compute layer IDs using the same algorithm as DFlash model
+                    # Uses build_target_layer_ids(num_target_layers, num_draft_layers)
+                    num_target_layers = self.model_config.num_hidden_layers
+                    num_draft_layers = getattr(draft_config, "num_hidden_layers", 5)
+                    target_layer_ids = build_target_layer_ids(
+                        num_target_layers, num_draft_layers
+                    )
+                    self.eagle_use_aux_hidden_state = True
+                    self.eagle_aux_hidden_state_layer_ids = target_layer_ids
+                    logger.info(
+                        f"DFlash aux hidden state layers (computed): {target_layer_ids}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load DFlash draft config for aux layers: {e}"
+                )
+                self.eagle_aux_hidden_state_layer_ids = None
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -1731,12 +1767,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_dflash()  # FIX: Include DFlash
         ):
             if self.is_draft_worker:
                 raise RuntimeError("This should not happen")
             else:
                 capture_forward_mode = ForwardMode.TARGET_VERIFY
-                num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+                num_tokens_per_bs = (
+                    self.server_args.speculative_dflash_block_size
+                    if self.spec_algorithm.is_dflash()
+                    else self.server_args.speculative_num_draft_tokens
+                )
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
@@ -1749,7 +1790,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             set_torch_compile_config()
 
         if self.eagle_use_aux_hidden_state:
-            self.model.set_eagle3_layers_to_capture()
+            # Pass the configured layer_ids instead of using defaults
+            self.model.set_eagle3_layers_to_capture(
+                self.eagle_aux_hidden_state_layer_ids
+            )
 
         require_mlp_tp_gather_ = require_mlp_tp_gather(self.server_args)
         if require_gathered_buffer(self.server_args):
