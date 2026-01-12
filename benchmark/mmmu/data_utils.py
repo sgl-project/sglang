@@ -186,7 +186,7 @@ def construct_prompt(sample, config):
         empty_prompt_sample_structure = config["multi_choice_example_format"]
         empty_prompt = empty_prompt_sample_structure.format(question, example)
         res_dict = {}
-        res_dict["index2ans"] = index2answer
+        res_dict["index2answer"] = index2answer
         res_dict["correct_choice"] = sample["answer"]
         res_dict["all_choices"] = prediction_range
         res_dict["empty_prompt"] = empty_prompt

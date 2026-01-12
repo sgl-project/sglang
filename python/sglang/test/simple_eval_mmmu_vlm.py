@@ -162,7 +162,7 @@ class MMMUVLMEval(Eval):
                     "image_data": data_uri,
                     "answer": answer,
                     "question_type": question_type,
-                    "index2ans": index2answer,
+                    "index2answer": index2answer,
                     "all_choices": all_choices,
                     "category": subject,
                 }
@@ -227,10 +227,10 @@ class MMMUVLMEval(Eval):
             if (
                 sample["question_type"] == "multiple-choice"
                 and sample["all_choices"]
-                and sample["index2ans"]
+                and sample["index2answer"]
             ):
                 pred = _parse_multi_choice_response(
-                    response_text, sample["all_choices"], sample["index2ans"]
+                    response_text, sample["all_choices"], sample["index2answer"]
                 )
                 score = 1.0 if (gold is not None and pred == gold) else 0.0
                 extracted_answer = pred

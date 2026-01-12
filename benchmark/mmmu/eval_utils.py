@@ -559,7 +559,7 @@ def process_result(response, sample, answer_dict, out_samples):
         return
     if sample["question_type"] == "multiple-choice":
         pred_ans = parse_multi_choice_response(
-            response, sample["all_choices"], sample["index2ans"]
+            response, sample["all_choices"], sample["index2answer"]
         )
     else:  # open question
         pred_ans = response
