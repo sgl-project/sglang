@@ -289,7 +289,7 @@ def add_common_data_to_response(
         response["peak_memory_mb"] = result.peak_memory_mb
 
     # Add inference time if available
-    if result.timings and result.timings.total_duration_ms > 0:
+    if result.timings and result.timings.total_duration_s > 0:
         response["inference_time_s"] = result.timings.total_duration_s
 
     response["id"] = request_id
