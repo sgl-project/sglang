@@ -94,6 +94,10 @@ logger = init_logger(__name__)
 
 _PIPELINE_REGISTRY: Dict[str, Type[ComposedPipelineBase]] = {}
 
+# Registry for pipeline configuration classes (for safetensors files without model_index.json)
+# Maps pipeline_class_name -> (PipelineConfig class, SamplingParams class)
+_PIPELINE_CONFIG_REGISTRY: Dict[str, Tuple[Type[PipelineConfig], Type[Any]]] = {}
+
 
 def _discover_and_register_pipelines():
     """
@@ -126,9 +130,41 @@ def _discover_and_register_pipelines():
                                 f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
                             )
                         _PIPELINE_REGISTRY[cls.pipeline_name] = cls
+
+                        # Auto-register config classes if Pipeline class has them defined
+                        # because comfyui get model from a single weight file, so we need to register the config classes here
+                        if hasattr(cls, "pipeline_config_cls") and hasattr(
+                            cls, "sampling_params_cls"
+                        ):
+                            _PIPELINE_CONFIG_REGISTRY[cls.pipeline_name] = (
+                                cls.pipeline_config_cls,
+                                cls.sampling_params_cls,
+                            )
+                            logger.debug(
+                                f"Auto-registered config classes for pipeline '{cls.pipeline_name}': "
+                                f"PipelineConfig={cls.pipeline_config_cls.__name__}, "
+                                f"SamplingParams={cls.sampling_params_cls.__name__}"
+                            )
     logger.debug(
         f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
     )
+
+
+def get_pipeline_config_classes(
+    pipeline_class_name: str,
+) -> Tuple[Type[PipelineConfig], Type[Any]] | None:
+    """
+    Get the configuration classes for a pipeline.
+
+    Args:
+        pipeline_class_name: The name of the pipeline class
+
+    Returns:
+        A tuple of (PipelineConfig class, SamplingParams class) if found, None otherwise
+    """
+    # Ensure pipelines are discovered first
+    _discover_and_register_pipelines()
+    return _PIPELINE_CONFIG_REGISTRY.get(pipeline_class_name)
 
 
 # --- Part 2: Config Registration ---
