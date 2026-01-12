@@ -233,8 +233,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         if self.server_args.disable_cuda_graph:
             return
-        # todo
-        return
+
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
@@ -435,8 +434,9 @@ class EagleDraftWorker(BaseDraftWorker):
             else ForwardMode.DECODE
         )
         model_worker_batch.input_ids = batch_result.next_draft_input.topk_index
-        model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
-        model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.cpu()
+        # TODO(xjwei): 为社么这个地方注释掉没有影响精度
+        # model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+        # model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.cpu()
 
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
@@ -461,8 +461,8 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
         next_draft_input = batch_result.next_draft_input
-        ret_topk_p_list = [next_draft_input.topk_p] + ret_topk_p_list
-        ret_topk_index_list = [next_draft_input.topk_index] + ret_topk_index_list
+        ret_topk_p_list = [next_draft_input.topk_p] + [ret_topk_p_list]
+        ret_topk_index_list = [next_draft_input.topk_index] + [ret_topk_index_list]
         (
             next_draft_input.topk_p,
             next_draft_input.topk_index,
@@ -518,6 +518,14 @@ class EagleDraftWorker(BaseDraftWorker):
 
             ret_topk_p_list.append(ret_topk_p)
             ret_topk_index_list.append(ret_topk_index)
+
+        if len(ret_topk_p_list) > 1:
+            ret_topk_p_list = torch.cat(ret_topk_p_list, dim=1)
+            ret_topk_index_list = torch.cat(ret_topk_index_list, dim=1)
+        else:
+            batch_size = ret_topk_p_list[0].shape[0]
+            ret_topk_p_list = torch.empty(batch_size, 0, device=ret_topk_p_list[0].device)
+            ret_topk_index_list = torch.empty(batch_size, 0, device=ret_topk_index_list[0].device)
 
         return ret_topk_p_list, ret_topk_index_list
 
