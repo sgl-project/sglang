@@ -201,13 +201,15 @@ jobs:
             const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
 
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
-              const { data: jobs } = await github.rest.actions.listJobsForWorkflowRun({
+              // Use paginate to get ALL jobs (handles workflows with many matrix jobs)
+              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 run_id: context.runId,
+                per_page: 100,
               });
 
-              const stageAJob = jobs.jobs.find(job => job.name === 'stage-a-test-1');
+              const stageAJob = jobs.find(job => job.name === 'stage-a-test-1');
 
               if (stageAJob) {
                 console.log(`stage-a-test-1 status: ${stageAJob.status}, conclusion: ${stageAJob.conclusion}`);
@@ -255,19 +257,21 @@ jobs:
             const pollIntervalSeconds = 30;
             const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
 
-            // Stage-b jobs to wait for
-            const stageBJobs = [
-              'stage-b-test-small-1-gpu',
-              'stage-b-test-large-1-gpu',
-              'stage-b-test-large-2-gpu',
-              'stage-b-test-4-gpu-b200'
+            // Stage-b jobs to wait for (prefix matching handles matrix partitions)
+            const stageBJobPrefixes = [
+              'stage-b-test-small-1-gpu',   // 14 partitions (0-13)
+              'stage-b-test-large-1-gpu',   // 1 job
+              'stage-b-test-large-2-gpu',   // 2 partitions (0-1)
+              'stage-b-test-4-gpu-b200'     // 1 job
             ];
 
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
-              const { data: jobs } = await github.rest.actions.listJobsForWorkflowRun({
+              // Use paginate to get ALL jobs (handles workflows with many matrix jobs)
+              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 run_id: context.runId,
+                per_page: 100,
               });
 
               let allCompleted = true;
@@ -275,9 +279,9 @@ jobs:
               let completedCount = 0;
               let totalCount = 0;
 
-              for (const jobName of stageBJobs) {
-                // Find all jobs that start with this name (handles matrix jobs like "stage-b-test-small-1-gpu (0)")
-                const matchingJobs = jobs.jobs.filter(job => job.name.startsWith(jobName));
+              for (const jobPrefix of stageBJobPrefixes) {
+                // Find all jobs that start with this prefix (handles matrix jobs like "stage-b-test-small-1-gpu (0)")
+                const matchingJobs = jobs.filter(job => job.name.startsWith(jobPrefix));
 
                 for (const job of matchingJobs) {
                   totalCount++;
