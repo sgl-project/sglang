@@ -38,6 +38,7 @@ FAILING_MODELS = {
     "Qwen/Qwen3-30B-A3B-Thinking-2507",  # Not cached locally
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8",  # Not cached locally
     "neuralmagic/Qwen2-72B-Instruct-FP8",  # Not cached locally
+    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",  # Not cached locally
 }
 
 
@@ -51,6 +52,8 @@ MODEL_SCORE_THRESHOLDS = {
     "meta-llama/Llama-3.1-70B-Instruct": 0.95,
     # Mistral series
     "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.61,
+    # Google Gemma (moved from 1-GPU due to AITER kernel compile time)
+    "google/gemma-2-27b-it": 0.91,
     # Qwen2 series
     "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
     # Qwen3 series
@@ -66,6 +69,7 @@ MODEL_SCORE_THRESHOLDS = {
 _TP2_MODELS_ALL = [
     "meta-llama/Llama-3.1-70B-Instruct",
     "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "google/gemma-2-27b-it",  # Moved from 1-GPU (AITER kernel compile faster with TP=2)
     "Qwen/Qwen2-57B-A14B-Instruct",
     "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8",
     "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
