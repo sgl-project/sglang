@@ -10,16 +10,15 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from PIL import Image
-from torchvision.transforms.v2 import functional as F
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import (
+    batch_decode_jpeg_gpu,
     get_bool_env_var,
     is_npu,
     load_audio,
     load_image_tensor,
-    batch_decode_jpeg_gpu,
     load_video,
     logger,
 )
@@ -340,7 +339,7 @@ class BaseMultimodalProcessor(ABC):
         Load a single multimodal data.
 
         If data is precomputed, returns directly.
-        
+
         For images:
           - JPEG: returns (img_tensor_bytes, 'jpeg')
           - Non-JPEG: returns (img_tensor, None)
@@ -350,9 +349,9 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                # load_image_tensor 会自动区分JPEG和非JPEG
-                # JPEG返回: (img_tensor_bytes, 'jpeg')
-                # 非JPEG返回: (img_tensor, None)
+                # load_image_tensor automatically distinguishes between JPEG and non-JPEG
+                # JPEG returns: (img_tensor_bytes, 'jpeg')
+                # Non-JPEG returns: (img_tensor, None)
                 return load_image_tensor(data, discard_alpha_channel)
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
@@ -374,7 +373,7 @@ class BaseMultimodalProcessor(ABC):
         audio_sample_rate: Optional[int] = None,
     ) -> Tuple[List, List]:
         """
-        load multimodal data parallelly using iterators.    
+        Load multimodal data parallelly using iterators.
         For images, will return either:
           - JPEG: (img_tensor_bytes, 'jpeg') for batch decoding
           - Non-JPEG: (img_tensor, None) already decoded
@@ -487,37 +486,43 @@ class BaseMultimodalProcessor(ABC):
             audio_sample_rate=audio_sample_rate,
         )
         final_results = []
-        jpeg_indices = []  # 记录哪些位置是JPEG图像
-        jpeg_bytes_list = []  # 收集JPEG的预处理结果
-        
-        for idx, (future, (modality, raw_data, frame_limit)) in enumerate(zip(futures, task_info)):
+        jpeg_indices = []  # Track which positions are JPEG images
+        jpeg_bytes_list = []  # Collect preprocessed JPEG data
+
+        for idx, (future, (modality, raw_data, frame_limit)) in enumerate(
+            zip(futures, task_info)
+        ):
             result = future.result()
-            
-            # 检查是否是图像的tuple结果
-            if modality == Modality.IMAGE and isinstance(result, tuple) and len(result) == 2:
+
+            # Check if this is an image tuple result
+            if (
+                modality == Modality.IMAGE
+                and isinstance(result, tuple)
+                and len(result) == 2
+            ):
                 img_data, format_type = result
-                
-                if format_type == 'jpeg':
-                    # JPEG图像 - 记录位置和预处理数据
+
+                if format_type == "jpeg":
+                    # JPEG image - record position and preprocessed data
                     jpeg_indices.append(idx)
                     jpeg_bytes_list.append(img_data)
-                    final_results.append(None)  # 占位，后面替换
+                    final_results.append(None)  # Placeholder, will be replaced later
                 else:
-                    # 非JPEG图像 - 已经解码完成，直接移到cuda
+                    # Non-JPEG image - already decoded, move to cuda directly
                     final_results.append(img_data.to("cuda"))
             else:
-                # 非图像数据或预计算数据
+                # Non-image data or precomputed data
                 final_results.append(result)
-        
-        # 批量解码所有JPEG图像
+
+        # Batch decode all JPEG images
         if jpeg_bytes_list:
-            decoded_images = batch_decode_jpeg_gpu(jpeg_bytes_list, device='cuda:1')
-            
-            # 将解码后的图像放回原位置
+            decoded_images = batch_decode_jpeg_gpu(jpeg_bytes_list, device="cuda:1")
+
+            # Put decoded images back to their original positions
             for img_idx, decoded_img in zip(jpeg_indices, decoded_images):
                 final_results[img_idx] = decoded_img.to("cuda")
-        
-        # 创建结果迭代器
+
+        # Create result iterators
         task_info_iter = iter(task_info)
         results_iter = iter(final_results)
 
@@ -529,7 +534,9 @@ class BaseMultimodalProcessor(ABC):
                 if multimodal_tokens_pattern.match(text_part):
                     modality, raw_data, frame_limit = next(task_info_iter)
                     is_precomputed = isinstance(raw_data, dict)
-                    result = next(results_iter)  # 从结果中获取（已经是完整的tensor）
+                    result = next(
+                        results_iter
+                    )  # Get from results (already a complete tensor)
 
                     if modality == Modality.IMAGE:
                         # If data is already processed it will be a

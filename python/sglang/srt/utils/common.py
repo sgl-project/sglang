@@ -874,15 +874,16 @@ def load_image(
 
     return image, image_size
 
+
 def _is_jpeg(data):
     """
-    检测数据是否为 JPEG 格式
-    
+    Detect if data is in JPEG format
+
     Args:
-        data: bytes 或 torch.Tensor
-    
+        data: bytes or torch.Tensor
+
     Returns:
-        bool: 是否为 JPEG 格式
+        bool: Whether the data is in JPEG format
     """
     if isinstance(data, torch.Tensor):
         if len(data) < 3:
@@ -896,55 +897,46 @@ def _is_jpeg(data):
     return False
 
 
-def _decode_jpeg_gpu(img_tensor_bytes, device='cuda:1'):
+def _decode_jpeg_gpu(img_tensor_bytes, device="cuda:1"):
     """
-    使用 GPU 解码 JPEG（只使用 cuda:0）
-    
+    Decode JPEG using GPU (only uses cuda:0)
+
     Args:
-        img_tensor_bytes: 编码的 JPEG 字节数据 (torch.Tensor)
-        device: 目标 GPU 设备（默认为 cuda:0）
-    
+        img_tensor_bytes: Encoded JPEG byte data (torch.Tensor)
+        device: Target GPU device (defaults to cuda:0)
+
     Returns:
-        解码后的图像 tensor [C, H, W]
+        Decoded image tensor [C, H, W]
     """
-    start_time = time.perf_counter()
-    logger.info(f"[GPU JPEG 解码] 调用 GPU 解码 JPEG, 数据大小!!!: {len(img_tensor_bytes)} bytes, 设备: {device}")
-    
+
     from torchvision.io import decode_jpeg
-    # 直接在 GPU 上解码 (nvJPEG/rocJPEG)
+
+    # Decode directly on GPU (nvJPEG/rocJPEG)
     img = decode_jpeg(img_tensor_bytes, mode=ImageReadMode.RGB, device=device)
-    
-    decode_time = (time.perf_counter() - start_time) * 1000  # 转换为毫秒
-    logger.info(f"[GPU JPEG 解码] 解码完成, 图像形状: {img.shape}, 设备: {img.device}, 耗时: {decode_time:.2f}ms")
     return img
 
 
-def batch_decode_jpeg_gpu(img_tensor_bytes_list: list, device='cuda:1'):
+def batch_decode_jpeg_gpu(img_tensor_bytes_list: list, device="cuda:1"):
     """
-    批量解码多个 JPEG 图像
-    
+    Batch decode multiple JPEG images
+
     Args:
-        img_tensor_bytes_list: 编码的 JPEG 字节数据列表（每个元素是torch.Tensor）
-        device: 目标 GPU 设备
-    
+        img_tensor_bytes_list: List of encoded JPEG byte data (each element is a torch.Tensor)
+        device: Target GPU device
+
     Returns:
-        解码后的图像 tensor 列表
+        List of decoded image tensors
     """
     if not img_tensor_bytes_list:
         return []
-    
-    start_time = time.perf_counter()
-    total_bytes = sum(len(b) for b in img_tensor_bytes_list)
-    logger.info(f"[批量 GPU JPEG 解码] 开始批量解码 {len(img_tensor_bytes_list)} 张图像, 总数据大小: {total_bytes} bytes, 设备: {device}")
-    
+
     from torchvision.io import decode_jpeg
-    # 批量解码
-    decoded_images = decode_jpeg(img_tensor_bytes_list, mode=ImageReadMode.RGB, device=device)
-    
-    total_time = (time.perf_counter() - start_time) * 1000
-    avg_time = total_time / len(img_tensor_bytes_list)
-    logger.info(f"[批量 GPU JPEG 解码] 批量解码完成, 总耗时: {total_time:.2f}ms, 平均: {avg_time:.2f}ms/张")
-    
+
+    # Batch decode
+    decoded_images = decode_jpeg(
+        img_tensor_bytes_list, mode=ImageReadMode.RGB, device=device
+    )
+
     return decoded_images
 
 
@@ -953,15 +945,15 @@ def load_image_tensor(
     discard_alpha_channel: bool = True,
 ) -> tuple[Image.Image, tuple[int, int]]:
     """
-    加载图像，对 JPEG 格式返回预处理结果（用于批量解码），非JPEG格式直接解码
-    
+    Load image, return preprocessed result for JPEG format (for batch decoding), decode directly for non-JPEG
+
     Args:
-        image_file: 图像数据
-        discard_alpha_channel: 是否丢弃alpha通道
-    
+        image_file: Image data
+        discard_alpha_channel: Whether to discard alpha channel
+
     Returns:
-        如果是 JPEG: 返回 (img_tensor_bytes, 'jpeg')
-        如果是非JPEG: 返回 (img_tensor, None)
+        If JPEG: returns (img_tensor_bytes, 'jpeg')
+        If non-JPEG: returns (img_tensor, None)
     """
 
     if isinstance(image_file, ImageData):
@@ -970,27 +962,25 @@ def load_image_tensor(
     image = image_size = None
 
     if isinstance(image_file, Image.Image):
-        # 已经是 PIL Image 对象 - 直接返回 tensor（非JPEG）
+        # Already a PIL Image object - return tensor directly (non-JPEG)
         image = image_file
         image_size = (image.width, image.height)
         img_tensor = F.pil_to_tensor(image)
-        return img_tensor, None  # 非JPEG，返回完整tensor
+        return img_tensor, None  # Non-JPEG, return complete tensor
 
     elif isinstance(image_file, bytes):
-        # bytes 格式 - 检测是否为 JPEG
-        img_tensor_bytes = torch.frombuffer(
-            bytearray(image_file), dtype=torch.uint8
-        )
-        
+        # bytes format - detect if JPEG
+        img_tensor_bytes = torch.frombuffer(bytearray(image_file), dtype=torch.uint8)
+
         if _is_jpeg(img_tensor_bytes):
-            # JPEG 格式 - 只返回预处理结果
-            return img_tensor_bytes, 'jpeg'
+            # JPEG format - return preprocessed result only
+            return img_tensor_bytes, "jpeg"
         else:
-            # 非 JPEG 格式 - 直接解码返回完整tensor
+            # Non-JPEG format - decode directly and return complete tensor
             try:
                 img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
             except Exception:
-                # 回退到 PIL
+                # Fallback to PIL
                 image = Image.open(BytesIO(image_file))
                 if discard_alpha_channel and image.mode != "RGB":
                     image = image.convert("RGB")
@@ -1003,21 +993,19 @@ def load_image_tensor(
         response = requests.get(image_file, stream=True, timeout=timeout)
         try:
             response.raise_for_status()
-            # 读取到内存后检测格式
+            # Detect format after reading to memory
             img_bytes = response.content
-            img_tensor_bytes = torch.frombuffer(
-                bytearray(img_bytes), dtype=torch.uint8
-            )
-            
+            img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
+
             if _is_jpeg(img_tensor_bytes):
-                # JPEG 格式 - 只返回预处理结果
-                return img_tensor_bytes, 'jpeg'
+                # JPEG format - return preprocessed result only
+                return img_tensor_bytes, "jpeg"
             else:
-                # 非 JPEG 格式 - 直接解码返回完整tensor
+                # Non-JPEG format - decode directly and return complete tensor
                 try:
                     img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
                 except Exception:
-                    # 回退到 PIL
+                    # Fallback to PIL
                     image = Image.open(BytesIO(img_bytes))
                     if discard_alpha_channel and image.mode != "RGB":
                         image = image.convert("RGB")
@@ -1027,20 +1015,21 @@ def load_image_tensor(
             response.close()
 
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
-        # 本地文件路径 - 根据扩展名判断
+        # Local file path - determine by extension
         is_jpeg = image_file.lower().endswith(("jpg", "jpeg"))
-        
+
         if is_jpeg:
-            # JPEG 文件 - 只返回预处理结果
+            # JPEG file - return preprocessed result only
             from torchvision.io import read_file
+
             img_tensor_bytes = read_file(image_file)
-            return img_tensor_bytes, 'jpeg'
+            return img_tensor_bytes, "jpeg"
         else:
-            # 非 JPEG 文件 - 直接解码返回完整tensor
+            # Non-JPEG file - decode directly and return complete tensor
             try:
                 img_tensor = read_image(image_file, mode=ImageReadMode.RGB)
             except Exception:
-                # 回退到 PIL
+                # Fallback to PIL
                 image = Image.open(image_file)
                 if discard_alpha_channel and image.mode != "RGB":
                     image = image.convert("RGB")
@@ -1048,52 +1037,47 @@ def load_image_tensor(
             return img_tensor, None
 
     elif image_file.startswith("data:"):
-        
-        # data URL 格式: data:image/jpeg;base64,/9j/4AAQ...
-        
-
+        # data URL format: data:image/jpeg;base64,/9j/4AAQ...
         mime_type = image_file.split(";")[0].split(":")[1]
         is_jpeg = "jpeg" in mime_type.lower() or "jpg" in mime_type.lower()
-        
-        # 阶段2: Base64 解码
+
+        # Base64 decode
         base64_str = image_file.split(",")[1]
         img_bytes = pybase64.b64decode(base64_str, validate=True)
-        
-        # 阶段3: 转换为 tensor bytes
+
+        # Convert to tensor bytes
         img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
-        
+
         if is_jpeg:
-            # JPEG 格式 - 只返回预处理结果（不解码）
-            return img_tensor_bytes, 'jpeg'
+            # JPEG format - return preprocessed result only (no decoding)
+            return img_tensor_bytes, "jpeg"
         else:
-            # 阶段4: 非 JPEG 格式 - 直接解码返回完整tensor
+            # Non-JPEG format - decode directly and return complete tensor
             try:
                 img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
-            except Exception as e:
-                # 回退到 PIL
+            except Exception:
+                # Fallback to PIL
                 image = Image.open(BytesIO(img_bytes))
                 if discard_alpha_channel and image.mode != "RGB":
                     image = image.convert("RGB")
                 img_tensor = F.pil_to_tensor(image)
-                decode_elapsed = (time.perf_counter() - stage_start) * 1000
-                timing_data.append(('PIL解码(回退)', decode_elapsed, ''))
-            
+
             return img_tensor, None
-                
+
     elif isinstance(image_file, str):
-        # 纯 base64 字符串 - 解码后检测格式
+        # Pure base64 string - detect format after decoding
         img_bytes = pybase64.b64decode(image_file, validate=True)
         img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
-        
+
         if _is_jpeg(img_tensor_bytes):
-            # JPEG 格式 - 只返回预处理结果
-            return img_tensor_bytes, 'jpeg'
+            # JPEG format - return preprocessed result only
+            return img_tensor_bytes, "jpeg"
         else:
-            # 非 JPEG 格式 - 直接解码返回完整tensor
+            # Non-JPEG format - decode directly and return complete tensor
             try:
                 img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
             except Exception:
-                # 回退到 PIL
+                # Fallback to PIL
                 image = Image.open(BytesIO(img_bytes))
                 if discard_alpha_channel and image.mode != "RGB":
                     image = image.convert("RGB")
