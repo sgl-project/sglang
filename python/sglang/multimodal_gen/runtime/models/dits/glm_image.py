@@ -759,8 +759,8 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         ###
         guidance: torch.Tensor = None,  # TODO: this should probably be removed
     ) -> Tuple[torch.Tensor]:
-
-        kv_caches.set_mode(kv_caches_mode)
+        if kv_caches is not None:
+            kv_caches.set_mode(kv_caches_mode)
 
         batch_size, num_channels, height, width = hidden_states.shape
 
