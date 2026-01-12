@@ -180,7 +180,7 @@ impl BasicWorkerBuilder {
 
         let metadata = WorkerMetadata {
             url: self.url.clone(),
-            metrics_url: metrics_url,
+            metrics_url,
             api_key: self.api_key,
             worker_type: self.worker_type,
             connection_mode: self.connection_mode,
