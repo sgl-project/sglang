@@ -1,9 +1,11 @@
 import torch
 
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.utils.custom_op import register_custom_op
 
 
+@register_split_op()
 @register_custom_op(mutates_args=[])
 def print_tensor_meta(t: torch.Tensor, name: str) -> None:
     """
@@ -63,6 +65,7 @@ def print_tensor_meta(t: torch.Tensor, name: str) -> None:
     print("=" * 80 + "\n", flush=True)
 
 
+@register_split_op()
 @register_custom_op(mutates_args=[])
 def print_tensor_data(t: torch.Tensor, name: str) -> None:
     """
