@@ -610,6 +610,37 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         video_embeds = self.resampler_model(video_feature, video_grid_thw)
         return video_embeds
 
+    def _set_visual_token_mask(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> None:
+        """Set mask for visual tokens (image/video patches and delimiters)."""
+        if self._visual_token_ids_tensor_cache is None:
+            self.visual_token_mask = None
+            return
+        # Create tensor on the correct device
+        visual_token_ids_tensor = self._visual_token_ids_tensor_cache.to(
+            device=input_ids.device,
+            dtype=input_ids.dtype,
+        )
+
+        pad_values = []
+        if hasattr(forward_batch, "mm_inputs") and forward_batch.mm_inputs is not None:
+            for mm_input in forward_batch.mm_inputs:
+                if mm_input is None:
+                    continue
+                for item in mm_input.mm_items:
+                    pad_values.append(item.pad_value)
+        placeholder_tensor = torch.as_tensor(
+            pad_values,
+            device=input_ids.device,
+        )
+        pad_visual_token_ids_tensor = torch.cat(
+            [visual_token_ids_tensor, placeholder_tensor], dim=0
+        )
+        self.visual_token_mask = torch.isin(
+            input_ids, pad_visual_token_ids_tensor
+        ).reshape(-1, 1)
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -674,33 +705,7 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     )
                     positions = torch.cat([positions, pad_pos], dim=0)
 
-        if self._visual_token_ids_tensor_cache is None:
-            visual_token_mask = None
-        else:
-            visual_token_ids_tensor = self._visual_token_ids_tensor_cache.to(
-                device=input_ids.device,
-                dtype=input_ids.dtype,
-            )
-            pad_values = []
-            if (
-                hasattr(forward_batch, "mm_inputs")
-                and forward_batch.mm_inputs is not None
-            ):
-                for mm_input in forward_batch.mm_inputs:
-                    if mm_input is None:
-                        continue
-                    for item in mm_input.mm_items:
-                        pad_values.append(item.pad_value)
-            placeholder_tensor = torch.as_tensor(
-                pad_values,
-                device=input_ids.device,
-            )
-            pad_visual_token_ids_tensor = torch.cat(
-                [visual_token_ids_tensor, placeholder_tensor], dim=0
-            )
-            visual_token_mask = torch.isin(
-                input_ids, pad_visual_token_ids_tensor
-            ).reshape(-1, 1)
+        self._set_visual_token_mask(input_ids, forward_batch)
 
         assert (
             input_ids.numel() == positions.shape[-1]
@@ -712,8 +717,10 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
             language_model=self.model,
             multimodal_model=self,
             positions=positions,
-            visual_token_mask=visual_token_mask,
+            visual_token_mask=self.visual_token_mask,
         )
+
+        self.visual_token_mask = None
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
