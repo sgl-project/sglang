@@ -355,7 +355,8 @@ class CohereForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.logits_processor = LogitsProcessor(config)
+        self.logit_scale = getattr(config, "logit_scale", None)
+        self.logits_processor = LogitsProcessor(config, logit_scale=self.logit_scale)
         self.model = CohereModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
