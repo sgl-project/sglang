@@ -47,7 +47,7 @@ class TestAscendW4A4(CustomTestCase):
                 "--mem-fraction-static",
                 "0.8",
                 "--cuda-graph-bs",
-                "16",
+                "64",
                 "--disable-radix-cache",
             ],
         )
@@ -62,9 +62,9 @@ class TestAscendW4A4(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
-            parallel=16,
+            parallel=64,
             host=f"http://{url.hostname}",
             port=int(url.port),
         )
