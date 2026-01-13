@@ -66,7 +66,9 @@ template <
     template <typename...> typename EpilogueVisitor = cutlass::epilogue::threadblock::Sm80EVT,
     typename ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>
 struct DeviceGemmFp8RowwiseSm89 {
-  static_assert(std::is_same_v<ElementType, cutlass::float_e4m3_t>, "ElementType must be FP8(e4m3)");
+  static_assert(
+      std::is_same_v<ElementType, cutlass::float_e4m3_t> || std::is_same_v<ElementType, cutlass::float_e5m2_t>,
+      "ElementType must be FP8(e4m3 or e5m2)");
 
   using ElementA = ElementType;
   using LayoutA = cutlass::layout::RowMajor;
@@ -266,7 +268,7 @@ void launch_sm89_fp8_scaled_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 
-template <typename OutType, typename CtaShape, typename WarpShape, int Stages>
+template <typename InFp8, typename OutType, typename CtaShape, typename WarpShape, int Stages>
 void sm89_fp8_dispatch_bias(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -274,7 +276,7 @@ void sm89_fp8_dispatch_bias(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias) {
-  using ElementInput = cutlass::float_e4m3_t;
+  using ElementInput = InFp8;
   using ElementOutput = OutType;
   using AccumElementType = float;
   if (bias) {
@@ -300,7 +302,7 @@ void sm89_fp8_dispatch_bias(
   }
 }
 
-template <typename OutType>
+template <typename InFp8, typename OutType>
 void sm89_fp8_dispatch_shape(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -314,12 +316,14 @@ void sm89_fp8_dispatch_shape(
   if (m == 1) {
     if (n <= 8192) {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<16, 64, 128>,
           cutlass::gemm::GemmShape<16, 64, 64>,
           7>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<32, 64, 128>,
           cutlass::gemm::GemmShape<16, 64, 64>,
@@ -329,18 +333,21 @@ void sm89_fp8_dispatch_shape(
     // M in (1, 16]
     if (n <= 8192) {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<16, 64, 128>,
           cutlass::gemm::GemmShape<16, 64, 64>,
           4>(out, a, b, scales_a, scales_b, bias);
     } else if (n <= 16384) {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<32, 64, 128>,
           cutlass::gemm::GemmShape<16, 64, 64>,
           5>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<16, 64, 128>,
           cutlass::gemm::GemmShape<16, 64, 64>,
@@ -350,12 +357,14 @@ void sm89_fp8_dispatch_shape(
     // M in (16, 64]
     if (n <= 16384) {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<32, 64, 128>,
           cutlass::gemm::GemmShape<16, 64, 64>,
           7>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<16, 64, 128>,
           cutlass::gemm::GemmShape<16, 64, 64>,
@@ -365,18 +374,21 @@ void sm89_fp8_dispatch_shape(
     // M in (64, 128]
     if (n <= 8192) {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<64, 64, 128>,
           cutlass::gemm::GemmShape<32, 64, 64>,
           4>(out, a, b, scales_a, scales_b, bias);
     } else if (n <= 16384) {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<64, 64, 128>,
           cutlass::gemm::GemmShape<32, 64, 64>,
           5>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<32, 64, 128>,
           cutlass::gemm::GemmShape<16, 64, 64>,
@@ -386,18 +398,21 @@ void sm89_fp8_dispatch_shape(
     // M in (128, 256]
     if (n <= 8192) {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<128, 64, 64>,
           cutlass::gemm::GemmShape<64, 32, 64>,
           5>(out, a, b, scales_a, scales_b, bias);
     } else if (n <= 16384) {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<64, 128, 64>,
           cutlass::gemm::GemmShape<64, 32, 64>,
           7>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<128, 64, 128>,
           cutlass::gemm::GemmShape<64, 32, 128>,
@@ -407,12 +422,14 @@ void sm89_fp8_dispatch_shape(
     // M in (256, 512)
     if (n <= 16384) {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<128, 128, 64>,
           cutlass::gemm::GemmShape<64, 32, 64>,
           2>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<128, 128, 64>,
           cutlass::gemm::GemmShape<64, 32, 64>,
@@ -422,12 +439,14 @@ void sm89_fp8_dispatch_shape(
     // M in (512, inf)
     if (n <= 8192) {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<128, 128, 64>,
           cutlass::gemm::GemmShape<64, 32, 64>,
           3>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_fp8_dispatch_bias<
+          InFp8,
           OutType,
           cutlass::gemm::GemmShape<128, 128, 64>,
           cutlass::gemm::GemmShape<64, 32, 64>,
@@ -449,7 +468,9 @@ template <
     typename TileSchedulerType = void,
     bool WithBias = false>
 struct DeviceGemmFp8RowwiseSm90 {
-  static_assert(std::is_same_v<ElementType, cutlass::float_e4m3_t>, "ElementType must be FP8(e4m3)");
+  static_assert(
+      std::is_same_v<ElementType, cutlass::float_e4m3_t> || std::is_same_v<ElementType, cutlass::float_e5m2_t>,
+      "ElementType must be FP8(e4m3 or e5m2)");
 
   // A matrix configuration
   using ElementA = ElementType;               // Element type for A matrix operand
@@ -690,6 +711,7 @@ void launch_sm90_fp8_scaled_mm(
 }
 
 template <
+    typename InFp8,
     typename OutType,
     typename CTAShape,
     typename ClusterShape,
@@ -704,7 +726,7 @@ void sm90_fp8_dispatch_bias(
     const c10::optional<torch::Tensor>& bias,
     bool fast_accum = true,
     bool use_persistent = false) {
-  using ElementInput = cutlass::float_e4m3_t;
+  using ElementInput = InFp8;
   using ElementOutput = OutType;
   using AccumElementType = float;
   using EpilogueScheduleType = cutlass::epilogue::TmaWarpSpecialized;
@@ -736,7 +758,7 @@ void sm90_fp8_dispatch_bias(
   }
 }
 
-template <typename OutType>
+template <typename InFp8, typename OutType>
 void sm90_fp8_dispatch_shape(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -751,6 +773,7 @@ void sm90_fp8_dispatch_shape(
   using BasicTileScheduler = void;
   if (m <= 1) {
     return sm90_fp8_dispatch_bias<
+        InFp8,
         OutType,
         Shape<_64, _64, _128>,
         Shape<_1, _8, _1>,
@@ -760,6 +783,7 @@ void sm90_fp8_dispatch_shape(
   if (m <= 64) {
     // m in [1, 64]
     return sm90_fp8_dispatch_bias<
+        InFp8,
         OutType,
         Shape<_64, _64, _128>,
         Shape<_1, _4, _1>,
@@ -768,6 +792,7 @@ void sm90_fp8_dispatch_shape(
   } else if (m <= 256) {
     // m in (64, 256]
     return sm90_fp8_dispatch_bias<
+        InFp8,
         OutType,
         Shape<_64, _64, _128>,
         Shape<_1, _1, _1>,
@@ -776,6 +801,7 @@ void sm90_fp8_dispatch_shape(
   } else if (m <= 1024) {
     // m in (256, 1024]
     return sm90_fp8_dispatch_bias<
+        InFp8,
         OutType,
         Shape<_128, _128, _128>,
         Shape<_1, _1, _1>,
@@ -784,6 +810,7 @@ void sm90_fp8_dispatch_shape(
   } else {
     // m in (1024, inf)
     return sm90_fp8_dispatch_bias<
+        InFp8,
         OutType,
         Shape<_128, _128, _128>,
         Shape<_2, _1, _1>,
@@ -805,7 +832,9 @@ template <
     typename TileSchedulerType = void,
     bool WithBias = false>
 struct DeviceGemmFp8RowwiseSm100 {
-  static_assert(std::is_same_v<ElementType, cutlass::float_e4m3_t>, "ElementType must be FP8(e4m3)");
+  static_assert(
+      std::is_same_v<ElementType, cutlass::float_e4m3_t> || std::is_same_v<ElementType, cutlass::float_e5m2_t>,
+      "ElementType must be FP8(e4m3 or e5m2)");
   using TileShape = CTAShape;
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
 
@@ -1012,7 +1041,7 @@ void launch_sm100_fp8_scaled_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 
-template <typename OutType>
+template <typename InFp8, typename OutType>
 void sm100_fp8_dispatch_bias(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -1036,7 +1065,7 @@ void sm100_fp8_dispatch_bias(
   using EpilogueScheduleType = cutlass::epilogue::collective::EpilogueScheduleAuto;
   using TileSchedulerType = void;
 
-  using ElementInput = cutlass::float_e4m3_t;
+  using ElementInput = InFp8;
   using ElementOutput = OutType;
   using AccumElementType = float;
 
@@ -1158,7 +1187,7 @@ void sm100_fp8_dispatch_bias(
   }
 }
 
-template <typename OutType>
+template <typename InFp8, typename OutType>
 void sm100_fp8_dispatch_shape(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -1166,7 +1195,7 @@ void sm100_fp8_dispatch_shape(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias) {
-  return sm100_fp8_dispatch_bias<OutType>(out, a, b, scales_a, scales_b, bias);
+  return sm100_fp8_dispatch_bias<InFp8, OutType>(out, a, b, scales_a, scales_b, bias);
 }
 
 template <
@@ -1180,7 +1209,9 @@ template <
     typename TileSchedulerType = void,
     bool WithBias = false>
 struct DeviceGemmFp8RowwiseSm120 {
-  static_assert(std::is_same_v<ElementType, cutlass::float_e4m3_t>, "ElementType must be FP8(e4m3)");
+  static_assert(
+      std::is_same_v<ElementType, cutlass::float_e4m3_t> || std::is_same_v<ElementType, cutlass::float_e5m2_t>,
+      "ElementType must be FP8(e4m3 or e5m2)");
   using TileShape = CTAShape;
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
 
@@ -1387,7 +1418,7 @@ void launch_sm120_fp8_scaled_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 
-template <typename OutType>
+template <typename InFp8, typename OutType>
 void sm120_fp8_dispatch_bias(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -1402,7 +1433,7 @@ void sm120_fp8_dispatch_bias(
   using EpilogueScheduleType = cutlass::epilogue::collective::EpilogueScheduleAuto;
   using TileSchedulerType = void;
 
-  using ElementInput = cutlass::float_e4m3_t;
+  using ElementInput = InFp8;
   using ElementOutput = OutType;
   using AccumElementType = float;
 
@@ -1435,7 +1466,7 @@ void sm120_fp8_dispatch_bias(
   }
 }
 
-template <typename OutType>
+template <typename InFp8, typename OutType>
 void sm120_fp8_dispatch_shape(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -1443,7 +1474,7 @@ void sm120_fp8_dispatch_shape(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias) {
-  return sm120_fp8_dispatch_bias<OutType>(out, a, b, scales_a, scales_b, bias);
+  return sm120_fp8_dispatch_bias<InFp8, OutType>(out, a, b, scales_a, scales_b, bias);
 }
 #endif
 
@@ -1466,8 +1497,10 @@ torch::Tensor fp8_scaled_mm(
       (mat_a.size(1) * mat_a.element_size()) % 16 == 0, "mat_a must be multiple of 16 bytes for memory alignment");
   TORCH_CHECK(
       (mat_b.size(0) * mat_b.element_size()) % 16 == 0, "mat_b must be multiple of 16 bytes for memory alignment");
-  TORCH_CHECK(mat_a.scalar_type() == torch::kFloat8_e4m3fn, "mat_a must be Float8_e4m3fn");
-  TORCH_CHECK(mat_b.scalar_type() == torch::kFloat8_e4m3fn, "mat_b must be Float8_e4m3fn");
+  TORCH_CHECK(mat_a.scalar_type() == mat_b.scalar_type(), "mat_a must be the same type as mat_b");
+  TORCH_CHECK(
+      mat_a.scalar_type() == torch::kFloat8_e4m3fn || mat_a.scalar_type() == torch::kFloat8_e5m2,
+      "mat_a must be Float8_e4m3fn or Float8_e5m2");
   TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
 
   TORCH_CHECK(scales_a.numel() == mat_a.size(0), "size of scales_a is not matched");
@@ -1490,17 +1523,30 @@ torch::Tensor fp8_scaled_mm(
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12080
   if (sm_version >= 120) {
-    if (out_dtype == torch::kBFloat16) {
-      sm120_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    if (mat_a.scalar_type() == torch::kFloat8_e4m3fn && out_dtype == torch::kBFloat16) {
+      sm120_fp8_dispatch_shape<cutlass::float_e4m3_t, cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else if (mat_a.scalar_type() == torch::kFloat8_e5m2 && out_dtype == torch::kBFloat16) {
+      sm120_fp8_dispatch_shape<cutlass::float_e5m2_t, cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else if (mat_a.scalar_type() == torch::kFloat8_e4m3fn && out_dtype == torch::kHalf) {
+      sm120_fp8_dispatch_shape<cutlass::float_e4m3_t, cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
-      sm120_fp8_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      sm120_fp8_dispatch_shape<cutlass::float_e5m2_t, cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
     return out;
-  } else if (sm_version >= 100) {
-    if (out_dtype == torch::kBFloat16) {
-      sm100_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+  } else if (
+      sm_version == 100
+#if CUDA_VERSION >= 12090
+      || sm_version == 103
+#endif
+  ) {
+    if (mat_a.scalar_type() == torch::kFloat8_e4m3fn && out_dtype == torch::kBFloat16) {
+      sm100_fp8_dispatch_shape<cutlass::float_e4m3_t, cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else if (mat_a.scalar_type() == torch::kFloat8_e5m2 && out_dtype == torch::kBFloat16) {
+      sm100_fp8_dispatch_shape<cutlass::float_e5m2_t, cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else if (mat_a.scalar_type() == torch::kFloat8_e4m3fn && out_dtype == torch::kHalf) {
+      sm100_fp8_dispatch_shape<cutlass::float_e4m3_t, cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
-      sm100_fp8_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      sm100_fp8_dispatch_shape<cutlass::float_e5m2_t, cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
     return out;
   }
@@ -1508,10 +1554,14 @@ torch::Tensor fp8_scaled_mm(
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12000
   if (sm_version >= 90) {
-    if (out_dtype == torch::kBFloat16) {
-      sm90_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    if (mat_a.scalar_type() == torch::kFloat8_e4m3fn && out_dtype == torch::kBFloat16) {
+      sm90_fp8_dispatch_shape<cutlass::float_e4m3_t, cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else if (mat_a.scalar_type() == torch::kFloat8_e5m2 && out_dtype == torch::kBFloat16) {
+      sm90_fp8_dispatch_shape<cutlass::float_e5m2_t, cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else if (mat_a.scalar_type() == torch::kFloat8_e4m3fn && out_dtype == torch::kHalf) {
+      sm90_fp8_dispatch_shape<cutlass::float_e4m3_t, cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
-      sm90_fp8_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      sm90_fp8_dispatch_shape<cutlass::float_e5m2_t, cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
     return out;
   }
@@ -1519,10 +1569,14 @@ torch::Tensor fp8_scaled_mm(
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12040
   if (sm_version == 89) {
-    if (out_dtype == torch::kBFloat16) {
-      sm89_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    if (mat_a.scalar_type() == torch::kFloat8_e4m3fn && out_dtype == torch::kBFloat16) {
+      sm89_fp8_dispatch_shape<cutlass::float_e4m3_t, cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else if (mat_a.scalar_type() == torch::kFloat8_e5m2 && out_dtype == torch::kBFloat16) {
+      sm89_fp8_dispatch_shape<cutlass::float_e5m2_t, cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+    } else if (mat_a.scalar_type() == torch::kFloat8_e4m3fn && out_dtype == torch::kHalf) {
+      sm89_fp8_dispatch_shape<cutlass::float_e4m3_t, cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
-      sm89_fp8_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      sm89_fp8_dispatch_shape<cutlass::float_e5m2_t, cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
     return out;
   }
