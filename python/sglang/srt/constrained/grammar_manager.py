@@ -96,6 +96,8 @@ class GrammarManager:
                         error_msg = f"Invalid grammar request with cache hit: {key=}"
                         req.set_finish_with_abort(error_msg)
 
+        print(f"[Process Req With Grammar]{id(req)=}, {req.grammar=}")
+
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
 
@@ -105,8 +107,8 @@ class GrammarManager:
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
 
         num_ready_reqs = 0
-        num_timeout_reqs = 0
         sim_timeout_prob = envs.SGLANG_GRAMMAR_SIMULATE_TIMEOUT.get()
+        timeout_ct = GRAMMAR_TIMEOUT / GRAMMAR_POLL_INTERVAL
         if self.is_grammar_sync_entry:
             # Entry rank never simulates timeout
             sim_timeout_prob = -1
@@ -116,6 +118,8 @@ class GrammarManager:
                 if req.finished():  # It is aborted by AbortReq
                     num_ready_reqs += 1
                     continue
+
+                print(f"[Get Ready]{id(req)=}, {req.grammar=}")
 
                 if sim_timeout_prob > 0 and time.time() % 1 < sim_timeout_prob:
                     # Simulate timeout for non-entry ranks in TP sync group for testing
@@ -130,48 +134,37 @@ class GrammarManager:
                     req.set_finish_with_abort(error_msg)
 
                 num_ready_reqs += 1
+                num_timeout_pt = num_ready_reqs
             except futures._base.TimeoutError:
                 req.grammar_wait_ct += 1
                 # NOTE(lianmin): this timeout is the waiting time of the above line. It is
                 # not the waiting time from it enters the grammar queue.
-                if (
-                    sim_timeout_prob > 0
-                    or req.grammar_wait_ct > GRAMMAR_TIMEOUT / GRAMMAR_POLL_INTERVAL
-                ):
-                    num_timeout_reqs = 1
+                if sim_timeout_prob > 0 or req.grammar_wait_ct > timeout_ct:
+                    num_timeout_pt = num_ready_reqs + 1
                 break
 
         if self.grammar_sync_size > 1:
             # Sync across TP ranks to make sure they have the same number of ready requests
-            tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
+            tensor = torch.tensor([num_ready_reqs, -num_timeout_pt], dtype=torch.int32)
             torch.distributed.all_reduce(
-                tensor, op=torch.distributed.ReduceOp.MAX, group=self.grammar_sync_group
+                tensor, op=torch.distributed.ReduceOp.MIN, group=self.grammar_sync_group
             )
-            num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
-
-            for i in range(num_ready_reqs, num_ready_reqs_max):
-                req = self.grammar_queue[i]
-                if req.finished():  # It is aborted by AbortReq
-                    continue
-                req.grammar = req.grammar.result()
-                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-                if req.grammar is INVALID_GRAMMAR_OBJ:
-                    error_msg = f"Invalid grammar request: {req.grammar_key=}"
-                    req.set_finish_with_abort(error_msg)
+            num_ready_reqs_min = tensor[0].item()
+            num_timeout_pt_max = -tensor[1].item()
         else:
-            num_ready_reqs_max = num_ready_reqs
-            num_timeout_reqs_max = num_timeout_reqs
+            num_ready_reqs_min = num_ready_reqs
+            num_timeout_pt_max = num_timeout_pt
 
-        for i in range(num_ready_reqs, num_ready_reqs + num_timeout_reqs_max):
+        # Cancel timed-out requests
+        for i in range(num_ready_reqs_min, num_timeout_pt_max):
             req = self.grammar_queue[i]
-            req.grammar.cancel()
+            if isinstance(req.grammar, futures.Future):
+                req.grammar.cancel()
             self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
             error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
 
-        num_ready_reqs = num_ready_reqs_max + num_timeout_reqs_max
-
-        ready_grammar_reqs = self.grammar_queue[:num_ready_reqs]
-        self.grammar_queue = self.grammar_queue[num_ready_reqs:]
+        ready_grammar_reqs = self.grammar_queue[:num_timeout_pt_max]
+        self.grammar_queue = self.grammar_queue[num_timeout_pt_max:]
 
         return ready_grammar_reqs
