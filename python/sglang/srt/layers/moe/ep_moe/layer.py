@@ -31,6 +31,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -472,13 +473,6 @@ class NpuFuseEPMoE(DeepEPMoE):
             gmm2_weight_scale=self.w2_weight_scale,
         ).hidden_state
 
-    def release_weight_cache(self, weight: torch.Tensor):
-        # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)
-        origin_weight = weight.data.transpose(1, 2)
-        new_weight = origin_weight.contiguous()
-        origin_weight.untyped_storage().resize_(0)
-        return new_weight
-
     def permute_w13_weight_scale(self, w: torch.Tensor, tile_n: int):
         if tile_n % 2 != 0:
             raise ValueError(f"tile_n must be even, got {tile_n}")
@@ -520,14 +514,13 @@ class NpuFuseEPMoE(DeepEPMoE):
         return weight.view(*original_shape[:dim], -1, *original_shape[dim + 1 :])
 
     def _process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        w13 = self.release_weight_cache(layer.w13_weight)
-        torch_npu.npu_format_cast_(w13, 2)
+        w13 = layer.w13_weight
         cpu_w13 = w13.cpu()
         w13 = self.reshape_w13_weight(cpu_w13, -1).npu()
-        torch_npu.npu_format_cast_(w13, 29)
+        w13 = npu_format_cast(w13)
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
 
-        w2 = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
+        w2 = npu_format_cast(w2)
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
 
         w13_scale = layer.w13_weight_scale.data.squeeze(-1).contiguous()
