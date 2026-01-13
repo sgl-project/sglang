@@ -9,7 +9,8 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-4-gpu": [
-        TestFile("models/test_qwen3_next_models.py", 650),
+        TestFile("models/test_qwen3_next_models.py", 350),
+        TestFile("models/test_qwen3_next_models_mtp.py", 350),
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
         TestFile("test_pp_single_node.py", 500),
