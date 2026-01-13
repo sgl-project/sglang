@@ -141,12 +141,12 @@ inline void silu_and_mul(
   };
   Unroll<COLS>{}(load_scale_and_comp);
 
-  auto scalec = [&](auto col, int64_t m) {
+  auto scalec = [&](auto col, int64_t row) {
     // update As
-    vas = _mm512_set1_ps(As[m]);
+    vas = _mm512_set1_ps(As[row]);
     // C = As * (C - Bcomp) * Bs
-    __m512i vc32_0 = _mm512_loadu_si512(C0 + m * BLOCK_N + col * 16);
-    __m512i vc32_1 = _mm512_loadu_si512(C1 + m * BLOCK_N + col * 16);
+    __m512i vc32_0 = _mm512_loadu_si512(C0 + row * BLOCK_N + col * 16);
+    __m512i vc32_1 = _mm512_loadu_si512(C1 + row * BLOCK_N + col * 16);
     vc0[col] = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc32_0, vcomp0[col]));
     vc1[col] = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc32_1, vcomp1[col]));
     vc0[col] = _mm512_mul_ps(_mm512_mul_ps(vc0[col], vas), vbs0[col]);
@@ -163,12 +163,12 @@ inline void silu_and_mul(
     vc0[col] = x * y;
   };
 
-  auto storec = [&](auto col, int64_t m) {
+  auto storec = [&](auto col, int64_t row) {
     if constexpr (col % 2 == 0) {
       fVec x0 = fVec(vc0[col + 0]);
       fVec x1 = fVec(vc0[col + 1]);
       bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-      out_vec.store(C + m * N + col * 16);
+      out_vec.store(C + row * N + col * 16);
     }
   };
 
@@ -205,14 +205,14 @@ inline void scale_C(
   };
   Unroll<COLS>{}(load_scale_and_comp);
 
-  auto scalec = [&](auto col, int64_t m) {
+  auto scalec = [&](auto col, int64_t row) {
     // update As
-    vas = _mm512_set1_ps(As[m]);
+    vas = _mm512_set1_ps(As[row]);
     // C = As * (C - Bcomp) * Bs
-    __m512i vc32 = _mm512_loadu_si512(Ctmp + m * BLOCK_N + col * 16);
+    __m512i vc32 = _mm512_loadu_si512(Ctmp + row * BLOCK_N + col * 16);
     vc[col] = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc32, vcomp[col]));
     vc[col] = _mm512_mul_ps(_mm512_mul_ps(vc[col], vas), vbs[col]);
-    _mm512_storeu_ps(C + m * BLOCK_N + col * 16, vc[col]);
+    _mm512_storeu_ps(C + row * BLOCK_N + col * 16, vc[col]);
   };
 
   for (int64_t m = 0; m < m_size; ++m) {
