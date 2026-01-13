@@ -48,8 +48,9 @@ class DFlashWorker:
         config = AutoConfig.from_pretrained(draft_path, trust_remote_code=True)
 
         # Import and instantiate DFlash model directly
-        from sglang.srt.models.qwen3_dflash import DFlashDraftModel
         from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.models.qwen3_dflash import DFlashDraftModel
+
         self.model = DFlashDraftModel(config)
         self.model_config = ModelConfig.from_server_args(
             server_args,
@@ -76,30 +77,39 @@ class DFlashWorker:
             logger.info(f"DFlash: target_layer_ids={self.target_layer_ids}")
 
         # Get mask token
-        tok = AutoTokenizer.from_pretrained(server_args.model_path, trust_remote_code=True)
+        tok = AutoTokenizer.from_pretrained(
+            server_args.model_path, trust_remote_code=True
+        )
         if tok.mask_token_id is None:
             tok.add_special_tokens({"mask_token": "<|MASK|>"})
         self.mask_token_id = tok.mask_token_id
 
         # Per-request state: {rid: {"hidden": tensor, "verified_id": int, "pos": int}}
         self._state: Dict[str, dict] = {}
-        logger.info(f"DFlashWorker: block_size={self.block_size}, mask_id={self.mask_token_id}")
+        logger.info(
+            f"DFlashWorker: block_size={self.block_size}, mask_id={self.mask_token_id}"
+        )
 
     def _load_weights(self, model_path: str):
         """Load weights from HuggingFace hub or local path."""
-        from huggingface_hub import hf_hub_download, HfFileSystem
-        from safetensors import safe_open
         import os
+
+        from huggingface_hub import HfFileSystem, hf_hub_download
+        from safetensors import safe_open
 
         # Try to find safetensors files
         fs = HfFileSystem()
         try:
             files = fs.ls(model_path, detail=False)
-            safetensor_files = [f for f in files if f.endswith('.safetensors')]
+            safetensor_files = [f for f in files if f.endswith(".safetensors")]
         except Exception:
             # Local path
             if os.path.isdir(model_path):
-                safetensor_files = [os.path.join(model_path, f) for f in os.listdir(model_path) if f.endswith('.safetensors')]
+                safetensor_files = [
+                    os.path.join(model_path, f)
+                    for f in os.listdir(model_path)
+                    if f.endswith(".safetensors")
+                ]
             else:
                 safetensor_files = []
 
@@ -120,7 +130,7 @@ class DFlashWorker:
                     sf_file = hf_hub_download(model_path, os.path.basename(sf_file))
                 except Exception:
                     continue
-            with safe_open(sf_file, framework='pt') as f:
+            with safe_open(sf_file, framework="pt") as f:
                 for key in f.keys():
                     weights.append((key, f.get_tensor(key)))
 
@@ -131,6 +141,7 @@ class DFlashWorker:
     def model_runner(self):
         """Fake model_runner for compatibility - delegates to target's pools."""
         target_runner = self.target_worker.model_runner
+
         class FakeModelRunner:
             def __init__(self, model, target):
                 self.model = model
@@ -138,6 +149,7 @@ class DFlashWorker:
                 self.token_to_kv_pool = target.token_to_kv_pool
                 self.token_to_kv_pool_allocator = target.token_to_kv_pool_allocator
                 self.req_to_token_pool = target.req_to_token_pool
+
         return FakeModelRunner(self.model, target_runner)
 
     def get_memory_pool(self):
@@ -161,15 +173,21 @@ class DFlashWorker:
         # hidden_states is [total_tokens, num_layers * hidden_size]
         h = result.logits_output.hidden_states
         next_ids = result.next_token_ids
-        
+
         if h is None:
             logger.warning("DFlash: hidden_states is None!")
 
         offset = 0
         for i, req in enumerate(batch.reqs):
-            ext_len = batch.extend_lens[i] if hasattr(batch, "extend_lens") else len(req.origin_input_ids)
+            ext_len = (
+                batch.extend_lens[i]
+                if hasattr(batch, "extend_lens")
+                else len(req.origin_input_ids)
+            )
             self._state[req.rid] = {
-                "hidden": h[offset:offset + ext_len].clone() if h is not None else None,
+                "hidden": (
+                    h[offset : offset + ext_len].clone() if h is not None else None
+                ),
                 "verified_id": next_ids[i].item(),
                 "pos": len(req.origin_input_ids),
             }
@@ -196,7 +214,9 @@ class DFlashWorker:
         verify = DFlashVerifyInput(draft, positions, self.block_size)
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = verify
-        verify.prepare_for_verify(batch, batch.page_size if hasattr(batch, 'page_size') else 1)
+        verify.prepare_for_verify(
+            batch, batch.page_size if hasattr(batch, "page_size") else 1
+        )
 
         mwb = batch.get_model_worker_batch()
         mwb.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -253,14 +273,23 @@ class DFlashWorker:
             ctx_len = target_hidden.shape[0]
 
             # Create noise tokens: [verified_id, mask, mask, ...]
-            noise = torch.full((self.block_size,), self.mask_token_id, dtype=torch.long, device=self.device)
+            noise = torch.full(
+                (self.block_size,),
+                self.mask_token_id,
+                dtype=torch.long,
+                device=self.device,
+            )
             noise[0] = verified_id
 
             # Positions for full sequence
-            position_ids = torch.arange(ctx_len + self.block_size, device=self.device).unsqueeze(0)
+            position_ids = torch.arange(
+                ctx_len + self.block_size, device=self.device
+            ).unsqueeze(0)
 
             # Embed and forward
-            noise_emb = self.model.embed_tokens(noise).unsqueeze(0)  # [1, block, hidden]
+            noise_emb = self.model.embed_tokens(noise).unsqueeze(
+                0
+            )  # [1, block, hidden]
             target_hidden_batch = target_hidden.unsqueeze(0)  # [1, ctx, hidden*layers]
 
             with torch.no_grad():
@@ -271,10 +300,14 @@ class DFlashWorker:
             full = torch.cat([noise[0:1], draft_ids])
 
             all_tokens.append(full)
-            all_pos.append(torch.arange(s["pos"], s["pos"] + self.block_size, device=self.device))
+            all_pos.append(
+                torch.arange(s["pos"], s["pos"] + self.block_size, device=self.device)
+            )
 
         if not all_tokens:
-            return torch.tensor([], device=self.device), torch.tensor([], device=self.device)
+            return torch.tensor([], device=self.device), torch.tensor(
+                [], device=self.device
+            )
 
         return torch.cat(all_tokens), torch.cat(all_pos)
 
@@ -289,7 +322,9 @@ class DFlashWorker:
             req.decode_batch_idx += 1
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
-        return self.target_worker.forward_batch_generation(batch.get_model_worker_batch())
+        return self.target_worker.forward_batch_generation(
+            batch.get_model_worker_batch()
+        )
 
     def _cleanup(self, batch: ScheduleBatch):
         active = {req.rid for req in batch.reqs}

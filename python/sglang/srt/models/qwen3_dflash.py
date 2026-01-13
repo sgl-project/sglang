@@ -6,7 +6,7 @@ Minimal Qwen3 DFlash draft model.
 Key pattern: Q from noise, K/V from [context + noise], non-causal attention.
 """
 
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, Tuple
 
 import torch
 from torch import nn
@@ -26,20 +26,44 @@ class DFlashAttention(nn.Module):
 
     def __init__(self, config, layer_idx: int = 0):
         super().__init__()
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.num_kv_groups = self.num_heads // self.num_kv_heads
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+        self.q_proj = nn.Linear(
+            config.hidden_size,
+            self.num_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
+        )
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-    def forward(self, noise: torch.Tensor, ctx: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    def forward(
+        self,
+        noise: torch.Tensor,
+        ctx: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ):
         """
         Args:
             noise: [bsz, q_len, hidden]
@@ -51,15 +75,25 @@ class DFlashAttention(nn.Module):
 
         # Q from noise
         q = self.q_proj(noise).view(bsz, q_len, self.num_heads, self.head_dim)
-        q = self.q_norm(q.reshape(-1, self.head_dim)).view(bsz, q_len, self.num_heads, self.head_dim)
+        q = self.q_norm(q.reshape(-1, self.head_dim)).view(
+            bsz, q_len, self.num_heads, self.head_dim
+        )
         q = q.transpose(1, 2)
 
         # K/V from [ctx, noise]
         kv_input = torch.cat([ctx, noise], dim=1)
-        k = self.k_proj(kv_input).view(bsz, ctx_len + q_len, self.num_kv_heads, self.head_dim)
-        k = self.k_norm(k.reshape(-1, self.head_dim)).view(bsz, ctx_len + q_len, self.num_kv_heads, self.head_dim)
+        k = self.k_proj(kv_input).view(
+            bsz, ctx_len + q_len, self.num_kv_heads, self.head_dim
+        )
+        k = self.k_norm(k.reshape(-1, self.head_dim)).view(
+            bsz, ctx_len + q_len, self.num_kv_heads, self.head_dim
+        )
         k = k.transpose(1, 2)
-        v = self.v_proj(kv_input).view(bsz, ctx_len + q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = (
+            self.v_proj(kv_input)
+            .view(bsz, ctx_len + q_len, self.num_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
 
         # Rotary: Q uses last q_len positions, K uses all
         cos_q, sin_q = cos[:, -q_len:].unsqueeze(1), sin[:, -q_len:].unsqueeze(1)
@@ -91,14 +125,26 @@ class DFlashLayer(nn.Module):
     def __init__(self, config, layer_idx: int = 0):
         super().__init__()
         self.attn = DFlashAttention(config, layer_idx)
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
         self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.act = nn.SiLU()
 
-    def forward(self, noise: torch.Tensor, ctx: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    def forward(
+        self,
+        noise: torch.Tensor,
+        ctx: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ):
         # Attention with residual
         h = norm_3d(self.input_norm, noise)
         noise = noise + self.attn(h, ctx, cos, sin)
@@ -115,7 +161,9 @@ class Qwen3ForCausalLMDFlash(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
 
         # Target layer IDs for hidden state extraction
         self.target_layer_ids = build_target_layer_ids(
@@ -124,16 +172,25 @@ class Qwen3ForCausalLMDFlash(nn.Module):
         )
 
         # Feature compression
-        self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
+        self.fc = nn.Linear(
+            len(self.target_layer_ids) * config.hidden_size,
+            config.hidden_size,
+            bias=False,
+        )
         self.hidden_norm = RMSNorm3D(config.hidden_size, eps=config.rms_norm_eps)
 
         # Layers
-        self.layers = nn.ModuleList([DFlashLayer(config, i) for i in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [DFlashLayer(config, i) for i in range(config.num_hidden_layers)]
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Rotary embedding
         self.rope_theta = getattr(config, "rope_theta", 1000000)
-        inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
+        inv_freq = 1.0 / (
+            self.rope_theta
+            ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Embed/head from target
@@ -158,9 +215,9 @@ class Qwen3ForCausalLMDFlash(nn.Module):
 
     def forward(
         self,
-        noise_emb: torch.Tensor,      # [bsz, block_size, hidden]
+        noise_emb: torch.Tensor,  # [bsz, block_size, hidden]
         target_hidden: torch.Tensor,  # [bsz, ctx_len, num_layers * hidden]
-        position_ids: torch.Tensor,   # [bsz, ctx_len + block_size]
+        position_ids: torch.Tensor,  # [bsz, ctx_len + block_size]
     ) -> torch.Tensor:
         # Project and normalize target hidden
         ctx = self.fc(target_hidden)
@@ -206,6 +263,7 @@ class Qwen3ForCausalLMDFlash(nn.Module):
 # HuggingFace compatibility - must match architectures in config.json
 class DFlashDraftModel(Qwen3ForCausalLMDFlash):
     """DFlashDraftModel - matches HF config architectures field."""
+
     pass
 
 

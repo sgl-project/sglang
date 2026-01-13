@@ -39,7 +39,7 @@ class DFlashDraftInput(SpecInput):
             if new_indices.numel() == 0:
                 self.verified_id = self.verified_id[:0]
             elif has_been_filtered:
-                self.verified_id = self.verified_id[:len(new_indices)]
+                self.verified_id = self.verified_id[: len(new_indices)]
             else:
                 self.verified_id = self.verified_id[new_indices]
 
@@ -103,7 +103,9 @@ class DFlashVerifyInput(SpecInput):
         block = self.draft_token_num
 
         # Target predictions
-        target = torch.argmax(logits_output.next_token_logits, dim=-1).reshape(bs, block)
+        target = torch.argmax(logits_output.next_token_logits, dim=-1).reshape(
+            bs, block
+        )
         draft = self.draft_token.reshape(bs, block)
 
         # DFlash verification: draft[1:] should match target[:-1]
@@ -125,7 +127,7 @@ class DFlashVerifyInput(SpecInput):
             acc = accept_cpu[i]
             actual_acc = 0
             finished_early = False
-            
+
             for j in range(acc + 1):
                 req.output_ids.append(draft_flat[base + j])
                 req.check_finished()
@@ -136,18 +138,20 @@ class DFlashVerifyInput(SpecInput):
                     for k in range(j + 1):
                         accepted_indices.append(base + k)
                     break
-            
+
             if not finished_early:
                 actual_acc = acc
                 for k in range(acc + 1):
                     accepted_indices.append(base + k)
-            
+
             final_accept_lens.append(actual_acc)
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += actual_acc
 
         # Update accept_length to reflect actual acceptance
-        self.accept_length = torch.tensor(final_accept_lens, device=self.device, dtype=torch.int32)
+        self.accept_length = torch.tensor(
+            final_accept_lens, device=self.device, dtype=torch.int32
+        )
 
         accepted = torch.tensor(accepted_indices, device=self.device, dtype=torch.long)
 
