@@ -12,8 +12,6 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
-from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -286,11 +284,10 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
         # Capture extend
-        # Only enable CUDA graphs for draft_extend when there's NO plan stream overlap.
-        # With plan stream overlap, we want init_forward_metadata to run on Plan Stream
-        # (overlapped with verify tail), not in replay() on Main Stream (blocking).
-        enable_overlap = envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
-        if self.draft_extend_attn_backend and (_is_cuda or _is_npu) and not enable_overlap:
+        # Option A: CUDA graphs + Plan Stream overlap are now compatible.
+        # replay_prepare_metadata() runs on Plan Stream (overlapped with verify),
+        # replay_prepare_data() runs on Main Stream after wait_stream().
+        if self.draft_extend_attn_backend and (_is_cuda or _is_npu):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -553,8 +550,14 @@ class EagleDraftWorker(BaseDraftWorker):
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
         if can_cuda_graph:
+            # Option A: Phase 2 - copy data that depends on Verify output
+            # (hidden_states, input_ids, accept_length)
+            # Phase 1 (replay_prepare_metadata) was already run on Plan Stream
+            self.cuda_graph_runner_for_draft_extend.replay_prepare_data(
+                forward_batch, accept_length=batch_result.accept_lens
+            )
             draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
-                forward_batch
+                forward_batch, skip_prepare=True
             )
         else:
             draft_logits_output = self.draft_runner.forward(

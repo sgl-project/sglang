@@ -281,8 +281,13 @@ class EagleDraftInputV2Mixin:
         )
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
-        if not batch.forward_mode.is_idle() and not can_cuda_graph:
-            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        if not batch.forward_mode.is_idle():
+            if can_cuda_graph:
+                # Option A: Run Phase 1 on Plan Stream (FlashInfer plan + metadata)
+                # Phase 2 (data copy) runs on Main Stream after wait_stream()
+                cuda_graph_runner.replay_prepare_metadata(forward_batch)
+            else:
+                draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
 
 

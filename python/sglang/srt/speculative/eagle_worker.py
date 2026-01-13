@@ -39,8 +39,6 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import (
-    _PROFILE_SYNC,
-    _v1_step_stats,
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
@@ -79,6 +77,7 @@ logger = logging.getLogger(__name__)
 
 
 class EAGLEWorker(TpModelWorker):
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -137,10 +136,8 @@ class EAGLEWorker(TpModelWorker):
         else:
             ctx = empty_context()
         with (
-            ctx,
-            speculative_moe_backend_context(),
-            speculative_moe_a2a_backend_context(),
-        ):
+            ctx
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -291,11 +288,9 @@ class EAGLEWorker(TpModelWorker):
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
             )
-            with (
-                self.draft_tp_context(self.draft_model_runner.tp_group),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-            ):
+            with self.draft_tp_context(
+                self.draft_model_runner.tp_group
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
@@ -306,35 +301,17 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         else:
-            if _PROFILE_SYNC:
-                _t_step_start = time.perf_counter_ns()
-
-            if _PROFILE_SYNC:
-                _t_draft_start = time.perf_counter_ns()
-            with (
-                self.draft_tp_context(self.draft_model_runner.tp_group),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-            ):
+            with self.draft_tp_context(
+                self.draft_model_runner.tp_group
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 spec_info = self.draft(batch)
-            if _PROFILE_SYNC:
-                _v1_step_stats["draft_ns"] += time.perf_counter_ns() - _t_draft_start
-
-            if _PROFILE_SYNC:
-                _t_verify_start = time.perf_counter_ns()
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
-            if _PROFILE_SYNC:
-                _v1_step_stats["verify_ns"] += time.perf_counter_ns() - _t_verify_start
 
-            if _PROFILE_SYNC:
-                _t_draft_ext_start = time.perf_counter_ns()
-            with (
-                self.draft_tp_context(self.draft_model_runner.tp_group),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-            ):
+            with self.draft_tp_context(
+                self.draft_model_runner.tp_group
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
@@ -343,23 +320,6 @@ class EAGLEWorker(TpModelWorker):
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
-            if _PROFILE_SYNC:
-                _v1_step_stats["draft_extend_ns"] += (
-                    time.perf_counter_ns() - _t_draft_ext_start
-                )
-                _v1_step_stats["total_ns"] += time.perf_counter_ns() - _t_step_start
-                _v1_step_stats["count"] += 1
-                if _v1_step_stats["count"] % 20 == 0:
-                    n = _v1_step_stats["count"]
-                    draft = _v1_step_stats["draft_ns"] / n / 1e6
-                    verify = _v1_step_stats["verify_ns"] / n / 1e6
-                    draft_ext = _v1_step_stats["draft_extend_ns"] / n / 1e6
-                    total = _v1_step_stats["total_ns"] / n / 1e6
-                    print(
-                        f"[V1 STEP] n={n} draft={draft:.2f}ms verify={verify:.2f}ms "
-                        f"draft_ext={draft_ext:.2f}ms total={total:.2f}ms",
-                        flush=True,
-                    )
 
             return GenerationBatchResult(
                 logits_output=logits_output,
