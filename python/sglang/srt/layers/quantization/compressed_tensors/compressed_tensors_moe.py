@@ -1258,9 +1258,8 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
 
         if self.quant_config.quant_format != CompressionFormat.pack_quantized.value:
             raise ValueError(
-                "For Fused MoE layers, only ",
-                f"{CompressionFormat.pack_quantized.value} ",
-                "is supported for the mxint4",
+                f"For Fused MoE layers, only {CompressionFormat.pack_quantized.value} "
+                "is supported for the mxint4"
             )
         self._cache_permute_indices = {}
 
@@ -1321,7 +1320,6 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
         )
         layer.register_parameter("w2_weight_scale", w2_scale)
         set_weight_attrs(w2_scale, extra_weight_attrs)
-        # set_weight_attrs(w2_scale, {"load_full_w2": False})
 
         w13_weight_shape = torch.nn.Parameter(
             torch.empty(num_experts, 2), requires_grad=False
