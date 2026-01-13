@@ -389,14 +389,6 @@ class ServerManager:
             log_thread.daemon = True
             log_thread.start()
 
-        logger.info(
-            "[server-test] Starting server pid=%s, model=%s, log=%s, wait_deadline=%ss",
-            process.pid,
-            self.model,
-            stdout_path,
-            self.wait_deadline,
-        )
-
         try:
             self._wait_for_ready(process, stdout_path)
         except (TimeoutError, RuntimeError) as e:
@@ -418,8 +410,6 @@ class ServerManager:
                     additional_info += f"\n  Log file size: {full_log_size} bytes"
                 except Exception:
                     pass
-            # Print to stdout so pytest can see it (pytest uses -s flag)
-            print(f"\n{additional_info}\n", flush=True)
             logger.error(additional_info)
             raise
 
@@ -440,15 +430,6 @@ class ServerManager:
         ready_message = "Application startup complete."
         log_period = 30
         prev_log_period_count = 0
-        last_log_check_time = 0
-        log_check_interval = 60  # Check log content every 60 seconds
-
-        logger.info(
-            "[server-test] Waiting for server startup (timeout=%ss, model=%s, port=%s)",
-            self.wait_deadline,
-            self.model,
-            self.port,
-        )
 
         while time.time() - start < self.wait_deadline:
             if process.poll() is not None:
@@ -467,8 +448,6 @@ class ServerManager:
                     f"  Last {min(500, tail_line_count)} lines of log:\n"
                     f"{'=' * 80}\n{tail}\n{'=' * 80}"
                 )
-                # Print to stdout so pytest can see it (pytest uses -s flag)
-                print(f"\n{error_msg}\n", flush=True)
                 logger.error(error_msg)
                 raise RuntimeError(error_msg)
 
@@ -476,40 +455,13 @@ class ServerManager:
                 try:
                     content = stdout_path.read_text(encoding="utf-8", errors="ignore")
                     if ready_message in content:
-                        elapsed = int(time.time() - start)
-                        logger.info(
-                            "[server-test] Server ready after %ss (model=%s, port=%s)",
-                            elapsed,
-                            self.model,
-                            self.port,
-                        )
                         return
-
-                    # Periodically log recent content to help diagnose issues
-                    current_time = time.time()
-                    if current_time - last_log_check_time >= log_check_interval:
-                        last_log_check_time = current_time
-                        elapsed = int(current_time - start)
-                        recent_lines = "\n".join(content.splitlines()[-50:])
-                        logger.info(
-                            "[server-test] Still waiting... elapsed=%ss/%ss. Recent log (last 50 lines):\n%s",
-                            elapsed,
-                            int(self.wait_deadline),
-                            recent_lines,
-                        )
                 except Exception as e:
                     logger.debug("Could not read log yet: %s", e)
 
             elapsed = int(time.time() - start)
             if (elapsed // log_period) > prev_log_period_count:
                 prev_log_period_count = elapsed // log_period
-                logger.info(
-                    "[server-test] Waiting for server... elapsed=%ss/%ss (model=%s, port=%s)",
-                    elapsed,
-                    int(self.wait_deadline),
-                    self.model,
-                    self.port,
-                )
             time.sleep(1)
 
         # Timeout reached
@@ -536,8 +488,6 @@ class ServerManager:
             f"  Last {min(500, tail_line_count)} lines of log:\n"
             f"{'=' * 80}\n{tail}\n{'=' * 80}"
         )
-        # Print to stdout so pytest can see it (pytest uses -s flag)
-        print(f"\n{error_msg}\n", flush=True)
         logger.error(error_msg)
         raise TimeoutError(error_msg)
 

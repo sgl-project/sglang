@@ -93,20 +93,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     # start server
     wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200"))
-    logger.info(
-        "[server-test] Starting server for test case: %s\n"
-        "  Model: %s\n"
-        "  Port: %s\n"
-        "  Wait deadline: %ss\n"
-        "  Extra args: %s\n"
-        "  Num GPUs: %s",
-        case.id,
-        server_args.model_path,
-        port,
-        wait_deadline,
-        extra_args,
-        server_args.num_gpus,
-    )
 
     manager = ServerManager(
         model=server_args.model_path,
@@ -126,8 +112,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             f"  Error type: {type(e).__name__}\n"
             f"  Error message:\n{str(e)}"
         )
-        # Print to stdout so pytest can see it (pytest uses -s flag)
-        print(f"\n{error_info}\n", flush=True)
         logger.error(error_info)
         raise
 
