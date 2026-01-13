@@ -74,6 +74,10 @@ from sgl_kernel.hadamard import (
     hadamard_transform_40n,
 )
 from sgl_kernel.kvcacheio import (
+    sparse_cache_copy,
+    sparse_cache_manager,
+    sparse_cache_manager_batch,
+    sparse_cache_manager_fused,
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
