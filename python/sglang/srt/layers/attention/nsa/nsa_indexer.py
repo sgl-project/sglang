@@ -389,7 +389,7 @@ class Indexer(MultiPlatformOp):
 
             batch_size, next_n, heads, _ = q_fp8.shape
             logits = torch.full(
-                (heads, batch_size * next_n, max_seq_len),
+                (batch_size * next_n, max_seq_len),
                 float("-inf"),
                 device=q_fp8.device,
                 dtype=torch.float32,
@@ -408,7 +408,6 @@ class Indexer(MultiPlatformOp):
                 TotalCuCount=256,
                 WavePerEU=5,
             )
-            logits = logits.sum(dim=0)
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_fp8,
