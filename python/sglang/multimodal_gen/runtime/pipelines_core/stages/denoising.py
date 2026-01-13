@@ -683,6 +683,23 @@ class DenoisingStage(PipelineStage):
             batch, latents, trajectory_tensor
         )
 
+        # Gather noise_pred if using sequence parallelism
+        # noise_pred has the same shape as latents (sharded along sequence dimension)
+        if (
+            get_sp_world_size() > 1
+            and getattr(batch, "did_sp_shard_latents", False)
+            and server_args.comfyui_mode
+            and hasattr(batch, "noise_pred")
+            and batch.noise_pred is not None
+        ):
+            batch.noise_pred = server_args.pipeline_config.gather_latents_for_sp(
+                batch.noise_pred
+            )
+            if hasattr(batch, "raw_latent_shape"):
+                orig_s = batch.raw_latent_shape[1]
+                if batch.noise_pred.shape[1] > orig_s:
+                    batch.noise_pred = batch.noise_pred[:, :orig_s, :]
+
         if trajectory_tensor is not None and trajectory_timesteps_tensor is not None:
             batch.trajectory_timesteps = trajectory_timesteps_tensor.cpu()
             batch.trajectory_latents = trajectory_tensor.cpu()
@@ -1028,6 +1045,10 @@ class DenoisingStage(PipelineStage):
                             guidance=guidance,
                             latents=latents,
                         )
+
+                        # Save noise_pred to batch for external access (e.g., ComfyUI)
+                        if server_args.comfyui_mode:
+                            batch.noise_pred = noise_pred
 
                         # Compute the previous noisy sample
                         latents = self.scheduler.step(
