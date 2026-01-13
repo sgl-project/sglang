@@ -1,7 +1,6 @@
 from typing import Optional
 
 import torch
-
 from flashinfer import (
     scaled_fp4_grouped_quantize,
     silu_and_mul_scaled_nvfp4_experts_quantize,

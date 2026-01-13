@@ -425,6 +425,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         topk_output = dispatch_output.topk_output
 
         from flashinfer import fp4_quantize, trtllm_fp4_block_scale_moe
+
         from sglang.srt.layers.moe.utils import RoutingMethodType
 
         router_logits = topk_output.router_logits
