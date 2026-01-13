@@ -6,7 +6,7 @@ import requests
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMinxin
+from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMixin
 from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
 from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
 from sglang.test.run_eval import run_eval
@@ -27,7 +27,7 @@ register_cuda_ci(est_time=350, suite="stage-c-test-large-4-gpu")
 class TestDPAttentionDP2TP4(
     CustomTestCase,
     TestJSONConstrainedMixin,
-    TestEBNFConstrainedMinxin,
+    TestEBNFConstrainedMixin,
     TestRegexConstrainedMixin,
 ):
     @classmethod
@@ -67,7 +67,7 @@ class TestDPAttentionDP2TP4(
 class TestDPAttentionDP2TP2DeepseekV3MTP(
     CustomTestCase,
     TestJSONConstrainedMixin,
-    TestEBNFConstrainedMinxin,
+    TestEBNFConstrainedMixin,
     TestRegexConstrainedMixin,
 ):
     @classmethod
