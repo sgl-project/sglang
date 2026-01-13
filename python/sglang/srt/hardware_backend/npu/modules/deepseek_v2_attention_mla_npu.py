@@ -76,7 +76,9 @@ def forward_mha_prepare_npu(
         )
         q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
 
-        ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(m.layer_id)
+        ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+            m.layer_id
+        )
         _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
             latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
             m.kv_a_layernorm.weight,
@@ -97,7 +99,7 @@ def forward_mha_prepare_npu(
         k_pe = k_pe.reshape(B, -1, m.qk_rope_head_dim)
     else:
         kv_a = m.kv_a_layernorm(kv_a)
-        k_pe = latent_cache[:, :, m.kv_lora_rank:]
+        k_pe = latent_cache[:, :, m.kv_lora_rank :]
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
