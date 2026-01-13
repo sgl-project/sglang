@@ -238,7 +238,18 @@ class CanonicalStrategy:
     def _parse_partial_analysis(
         self, text: str, tokens: List[Token], start_pos: int
     ) -> Optional[Tuple[Event, str]]:
-        """Try to parse partial analysis content for incremental streaming."""
+        """Try to parse partial analysis content for incremental streaming.
+
+        Bug fix: When analysis block is followed by a new block (marked by <|start|> or <|channel|>),
+        we should stop emitting reasoning content at the new block boundary. Otherwise, the new block's
+        structural markers get included in the reasoning output, causing tool calls to be corrupted.
+
+        The bug scenario:
+        <|channel|>analysis<message|>Thinking...<|start|>assistant<|channel|>commentary to=functions.execute_command ...
+
+        Before fix: reasoning content would be "Thinking...<|start|>assistant<|channel|>commentary..."
+        After fix: reasoning content should be just "Thinking..."
+        """
         pos = start_pos
 
         # Skip <|start|> if present
@@ -275,11 +286,34 @@ class CanonicalStrategy:
         # Extract partial content after <|message|>
         content_start = tokens[message_pos].end
         content = text[content_start:]
-        # Only emit event if there's actual content
-        if not content:
-            return None, text[tokens[start_pos].start : content_start]
 
-        # Return partial reasoning content and preserve the channel structure for next parse
+        # Bug fix: Check if there's a new block starting after message_pos
+        # If we find <|start|>, <|channel|>, or <|constrain|> after current analysis block's message,
+        # it means a new block is starting and current analysis block is implicitly complete.
+        # <|constrain|> marks the start of tool call parameters (tool calls follow),
+        # so it should also be treated as a boundary.
+        new_block_boundary = None
+        for i in range(message_pos + 1, len(tokens)):
+            if tokens[i].type in ("START", "CHANNEL", "CONSTRAIN"):
+                # Found a new block starting - this is the boundary
+                new_block_boundary = i
+                break
+
+        if new_block_boundary is not None:
+            # There's a new block starting - truncate content at this boundary
+            content = text[content_start : tokens[new_block_boundary].start]
+            # Only emit if there's actual content before the new block
+            if not content.strip():
+                return None
+            # Return reasoning content and preserve header for next parse
+            remaining_text = text[tokens[start_pos].start : content_start]
+            return Event("reasoning", content), remaining_text
+
+        # No new block found - emit all content for streaming
+        if not content:
+            return None
+
+        # Return partial reasoning content and preserve channel structure for next parse
         remaining_text = text[tokens[start_pos].start : content_start]
         return Event("reasoning", content), remaining_text
 

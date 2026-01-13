@@ -865,12 +865,12 @@ class TestEdgeCases(unittest.TestCase):
         )  # Should not be mashed together
 
     def test_consecutive_blocks_same_type(self):
-        """Test consecutive blocks of the same type."""
+        """Test consecutive blocks of same type."""
         parser = HarmonyParser()
 
         text = (
-            "<|channel|>analysis<|message|>first reasoning<|end|>"
-            "<|channel|>analysis<|message|>second reasoning<|end|>"
+            "<|channel|>analysis<message|>first reasoning<|end|>"
+            "<|channel|>analysis<message|>second reasoning<|end|>"
         )
         events = parser.parse(text)
 
@@ -879,6 +879,240 @@ class TestEdgeCases(unittest.TestCase):
         self.assertEqual(events[1].event_type, "reasoning")
         self.assertEqual(events[0].content, "first reasoning")
         self.assertEqual(events[1].content, "second reasoning")
+
+    def test_partial_analysis_stops_at_new_block_boundary(self):
+        """
+        Test Bug Fix: _parse_partial_analysis stops at new block boundary.
+
+        When analysis block is missing <|end|> marker and is directly followed by a new block
+        (marked by <|start|>, <|channel|>, or <|constrain|>), _parse_partial_analysis
+        should stop emitting reasoning content at boundary, NOT include new block's
+        structural markers in reasoning output.
+
+        Bug scenario:
+        <|channel|>analysis<message|>Thinking...<|start|>assistant<|channel|>commentary...
+
+        Before fix: reasoning content would be "Thinking...<|start|>assistant<|channel|>commentary..."
+        After fix: reasoning content should be just "Thinking..."
+        """
+        strategy = CanonicalStrategy()
+
+        # Scenario: analysis content followed by new block (<|start|>)
+        text = "<|channel|>analysis<message|>Thinking...<|start|>assistant<|channel|>commentary to=functions.execute_command "
+
+        events, remaining = strategy.parse(text)
+
+        # Verify: reasoning content should NOT contain new block markers
+        self.assertEqual(len(events), 1, "Should emit 1 reasoning event")
+        self.assertEqual(events[0].event_type, "reasoning", "Should be reasoning type")
+
+        reasoning_content = events[0].content
+
+        # Critical fix verification: reasoning content should NOT contain new block markers
+        self.assertNotIn(
+            "<|start|>",
+            reasoning_content,
+            "Bug NOT fixed: reasoning contains <|start|> marker",
+        )
+        self.assertNotIn(
+            "<|channel|>",
+            reasoning_content,
+            "Bug NOT fixed: reasoning contains <|channel|> marker",
+        )
+        self.assertNotIn(
+            "assistant",
+            reasoning_content,
+            "Bug NOT fixed: reasoning contains 'assistant'",
+        )
+        self.assertNotIn(
+            "commentary",
+            reasoning_content,
+            "Bug NOT fixed: reasoning contains 'commentary'",
+        )
+
+        # Verify: reasoning content should be just "Thinking..."
+        self.assertEqual(
+            reasoning_content,
+            "Thinking...",
+            "Reasoning content should be 'Thinking...' only",
+        )
+
+    def test_partial_analysis_stops_at_constrain_boundary(self):
+        """
+        Test Bug Fix: _parse_partial_analysis stops at <|constrain|> boundary.
+
+        <|constrain|> marks the start of tool call parameters (tool calls follow),
+        so it should also be treated as a boundary.
+        """
+        strategy = CanonicalStrategy()
+
+        # Scenario: analysis block followed directly by <|constrain|> (tool call parameters)
+        text = '<|channel|>analysis<message|>Reasoning<|constrain|>json<message|>{"key":"value"}'
+
+        events, remaining = strategy.parse(text)
+
+        if events:
+            # Verify: reasoning content should NOT contain <|constrain|> marker
+            for event in events:
+                if event.event_type == "reasoning":
+                    self.assertNotIn(
+                        "<|constrain|>",
+                        event.content,
+                        "Bug NOT fixed: reasoning contains <|constrain|> marker",
+                    )
+                    self.assertNotIn(
+                        "<|message|>",
+                        event.content,
+                        "Bug NOT fixed: reasoning contains <|message|> marker",
+                    )
+                    # Should be just "Reasoning"
+                    self.assertEqual(
+                        event.content,
+                        "Reasoning",
+                        "Reasoning content should be 'Reasoning' only",
+                    )
+
+    def test_partial_analysis_continues_without_boundary(self):
+        """
+        Test Bug Fix: _parse_partial_analysis continues correctly without boundary.
+
+        This is a control test to verify the fix doesn't break normal streaming
+        when there's NO new block boundary.
+        """
+        strategy = CanonicalStrategy()
+
+        # Scenario: analysis partial content WITHOUT new block boundary
+        text = "<|channel|>analysis<message|>Thinking step 1"
+
+        events, remaining = strategy.parse(text)
+
+        # Verify: should emit reasoning event with complete content
+        self.assertEqual(len(events), 1, "Should emit 1 reasoning event")
+        self.assertEqual(events[0].event_type, "reasoning", "Should be reasoning type")
+
+        # Verify: reasoning content should be complete
+        self.assertEqual(
+            events[0].content,
+            "Thinking step 1",
+            "Reasoning content should be 'Thinking step 1'",
+        )
+
+    def test_partial_analysis_stops_at_new_block_boundary(self):
+        """
+        Test Bug Fix: _parse_partial_analysis stops at new block boundary.
+
+        When analysis block is missing <|end|> marker and is directly followed by a new block
+        (marked by <|start|>, <|channel|>, or <|constrain|>), _parse_partial_analysis
+        should stop emitting reasoning content at the boundary, NOT include the new block's
+        structural markers in the reasoning output.
+
+        Bug scenario:
+        <|channel|>analysis<message|>Thinking...<|start|>assistant<|channel|>commentary...
+
+        Before fix: reasoning content would be "Thinking...<|start|>assistant<|channel|>commentary..."
+        After fix: reasoning content should be just "Thinking..."
+        """
+        strategy = CanonicalStrategy()
+
+        # Scenario: analysis content followed by new block (<|start|>)
+        text = "<|channel|>analysis<message|>Thinking...<|start|>assistant<|channel|>commentary to=functions.execute_command "
+
+        events, remaining = strategy.parse(text)
+
+        # Verify: reasoning content should NOT contain new block markers
+        self.assertEqual(len(events), 1, "Should emit 1 reasoning event")
+        self.assertEqual(events[0].event_type, "reasoning", "Should be reasoning type")
+
+        reasoning_content = events[0].content
+
+        # Critical fix verification: reasoning content should NOT contain new block markers
+        self.assertNotIn(
+            "<|start|>",
+            reasoning_content,
+            "Bug NOT fixed: reasoning contains <|start|> marker",
+        )
+        self.assertNotIn(
+            "<|channel|>",
+            reasoning_content,
+            "Bug NOT fixed: reasoning contains <|channel|> marker",
+        )
+        self.assertNotIn(
+            "assistant",
+            reasoning_content,
+            "Bug NOT fixed: reasoning contains 'assistant'",
+        )
+        self.assertNotIn(
+            "commentary",
+            reasoning_content,
+            "Bug NOT fixed: reasoning contains 'commentary'",
+        )
+
+        # Verify: reasoning content should be just "Thinking..."
+        self.assertEqual(
+            reasoning_content,
+            "Thinking...",
+            "Reasoning content should be 'Thinking...' only",
+        )
+
+    def test_partial_analysis_stops_at_constrain_boundary(self):
+        """
+        Test Bug Fix: _parse_partial_analysis stops at <|constrain|> boundary.
+
+        <|constrain|> marks the start of tool call parameters (tool calls follow),
+        so it should also be treated as a boundary.
+        """
+        strategy = CanonicalStrategy()
+
+        # Scenario: analysis block followed directly by <|constrain|> (tool call parameters)
+        text = '<|channel|>analysis<message|>Reasoning<|constrain|>json<message|>{"key":"value"}'
+
+        events, remaining = strategy.parse(text)
+
+        if events:
+            # Verify: reasoning content should NOT contain <|constrain|> marker
+            for event in events:
+                if event.event_type == "reasoning":
+                    self.assertNotIn(
+                        "<|constrain|>",
+                        event.content,
+                        "Bug NOT fixed: reasoning contains <|constrain|> marker",
+                    )
+                    self.assertNotIn(
+                        "<|message|>",
+                        event.content,
+                        "Bug NOT fixed: reasoning contains <|message|> marker",
+                    )
+                    # Should be just "Reasoning"
+                    self.assertEqual(
+                        event.content,
+                        "Reasoning",
+                        "Reasoning content should be 'Reasoning' only",
+                    )
+
+    def test_partial_analysis_continues_without_boundary(self):
+        """
+        Test Bug Fix: _parse_partial_analysis continues correctly without boundary.
+
+        This is a control test to verify the fix doesn't break normal streaming
+        when there's NO new block boundary.
+        """
+        strategy = CanonicalStrategy()
+
+        # Scenario: analysis partial content WITHOUT new block boundary
+        text = "<|channel|>analysis<message|>Thinking step 1"
+
+        events, remaining = strategy.parse(text)
+
+        # Verify: should emit reasoning event with complete content
+        self.assertEqual(len(events), 1, "Should emit 1 reasoning event")
+        self.assertEqual(events[0].event_type, "reasoning", "Should be reasoning type")
+
+        # Verify: reasoning content should be complete
+        self.assertEqual(
+            events[0].content,
+            "Thinking step 1",
+            "Reasoning content should be 'Thinking step 1'",
+        )
 
 
 class TestStreamingBufferManagement(unittest.TestCase):

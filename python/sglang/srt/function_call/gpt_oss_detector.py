@@ -32,7 +32,8 @@ class GptOssDetector(BaseFormatDetector):
 
         # Pattern to extract function name and JSON from tool_call event content
         self.tool_extract_pattern = re.compile(
-            r"to=([a-zA-Z_][a-zA-Z0-9_.-]*)\s*<\|constrain\|>json<\|message\|>(.*?)(?:<\|call\|>|$)",
+            # Some times model may not include the constrain tag, so we make it optional
+            r"to=([a-zA-Z_][a-zA-Z0-9_.-]*)\s*(?:<\|constrain\|>json)?<\|message\|>(.*?)(?:<\|call\|>|$)",
             re.DOTALL,
         )
 
