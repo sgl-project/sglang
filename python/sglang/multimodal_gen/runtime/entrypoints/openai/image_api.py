@@ -142,6 +142,7 @@ async def generations(
     save_file_path_list, result = await process_generation_batch(
         async_scheduler_client, batch
     )
+    print(f"145 {save_file_path_list=} {result=}")
     save_file_path = save_file_path_list[0]
 
     await IMAGE_STORE.upsert(
@@ -154,6 +155,8 @@ async def generations(
     )
 
     resp_format = (request.response_format or "b64_json").lower()
+
+    print(f"159 {resp_format=}")
     if resp_format == "b64_json":
         with open(save_file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
