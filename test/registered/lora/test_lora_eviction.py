@@ -19,11 +19,12 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=224, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=224, suite="stage-b-test-small-1-gpu-amd")
 
 PROMPTS = [
     "AI is a field of computer science focused on",
