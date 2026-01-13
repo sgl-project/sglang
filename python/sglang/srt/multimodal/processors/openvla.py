@@ -34,14 +34,14 @@ class OpenVLAImageProcessor(BaseMultimodalProcessor):
 
     @staticmethod
     def _process_single_image_task(
-        image_data: Union[str, bytes, ImageData],
+        image_data: Union[str, bytes, ImageData, Image.Image],
         image_size: int = 224,
         processor=None,
     ):
         """Process a single image for OpenVLA.
 
         Args:
-            image_data: Image URL, bytes, or ImageData object.
+            image_data: Image URL, bytes, ImageData object, or PIL Image.
             image_size: Target image size (default 224 for OpenVLA).
             processor: HuggingFace processor with image_processor.
 
@@ -49,28 +49,29 @@ class OpenVLAImageProcessor(BaseMultimodalProcessor):
             Tuple of (pixel_values, image_hash, image_size).
         """
         try:
-            url = image_data.url if isinstance(image_data, ImageData) else image_data
-            image, _ = load_image(url)
-
-            image_hash = hash(url)
-
-            # Use HuggingFace processor if available
-            if processor is not None and hasattr(processor, "image_processor"):
-                pixel_values = processor.image_processor(
-                    image.convert("RGB"), return_tensors="np"
-                )["pixel_values"][0]
+            # Handle PIL Image directly
+            if isinstance(image_data, Image.Image):
+                image = image_data
+                image_hash = id(image)  # Use object id as hash for PIL images
             else:
-                # Fallback: resize and normalize manually
-                image = image.convert("RGB").resize(
-                    (image_size, image_size), Image.BILINEAR
-                )
-                pixel_values = np.array(image, dtype=np.float32) / 255.0
-                # Normalize with ImageNet stats
-                mean = np.array([0.485, 0.456, 0.406])
-                std = np.array([0.229, 0.224, 0.225])
-                pixel_values = (pixel_values - mean) / std
-                # Convert to CHW format
-                pixel_values = pixel_values.transpose(2, 0, 1).astype(np.float16)
+                url = image_data.url if isinstance(image_data, ImageData) else image_data
+                image, _ = load_image(url)
+                image_hash = hash(url)
+
+            # NOTE: Do NOT use HuggingFace processor here.
+            # The HF processor outputs 6 channels (for both DINOv2 and SigLIP),
+            # but SGLang's vision backbone processes each encoder separately
+            # with 3-channel input. Always use manual preprocessing.
+            image = image.convert("RGB").resize(
+                (image_size, image_size), Image.BILINEAR
+            )
+            pixel_values = np.array(image, dtype=np.float32) / 255.0
+            # Normalize with ImageNet stats
+            mean = np.array([0.485, 0.456, 0.406])
+            std = np.array([0.229, 0.224, 0.225])
+            pixel_values = (pixel_values - mean) / std
+            # Convert to CHW format
+            pixel_values = pixel_values.transpose(2, 0, 1).astype(np.float16)
 
             return pixel_values, image_hash, (image_size, image_size)
 
@@ -82,9 +83,18 @@ class OpenVLAImageProcessor(BaseMultimodalProcessor):
 
     async def _process_single_image(
         self,
-        image_data: Union[bytes, str, ImageData],
+        image_data: Union[bytes, str, ImageData, Image.Image],
     ):
         """Async wrapper for image processing."""
+        # PIL Images cannot be pickled properly for ProcessPoolExecutor
+        # Process them directly in the current process
+        if isinstance(image_data, Image.Image):
+            return self._process_single_image_task(
+                image_data,
+                self.image_size,
+                self._processor,
+            )
+
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(

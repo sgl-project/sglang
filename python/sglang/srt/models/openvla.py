@@ -108,18 +108,25 @@ class PrismaticVisionBackbone(nn.Module):
         Returns:
             Patch features of shape (batch, num_patches, embed_dim).
         """
-        # Get features from primary encoder
+        # Expected number of patch tokens: (H/14) * (W/14)
+        num_patches = (pixel_values.shape[-1] // 14) ** 2
+
+        # Get features from primary encoder (DINOv2-reg)
+        # DINOv2 with registers outputs: [CLS, patches..., registers...]
+        # We need to extract just the patch tokens
         features = self.featurizer.forward_features(pixel_values)
 
-        # Remove CLS token if present (keep only patch tokens)
-        if features.shape[1] > (pixel_values.shape[-1] // 14) ** 2:
-            features = features[:, 1:, :]
+        # Extract only the patch tokens (skip CLS, exclude registers)
+        # Position 0 is CLS, positions 1:num_patches+1 are patches
+        if features.shape[1] > num_patches:
+            features = features[:, 1 : num_patches + 1, :]
 
-        # Fuse with secondary encoder
+        # Fuse with secondary encoder (SigLIP)
         if self.use_fused and self.fused_featurizer is not None:
             fused_features = self.fused_featurizer.forward_features(pixel_values)
-            if fused_features.shape[1] > (pixel_values.shape[-1] // 14) ** 2:
-                fused_features = fused_features[:, 1:, :]
+            # SigLIP: [CLS, patches...] - skip CLS, keep patches
+            if fused_features.shape[1] > num_patches:
+                fused_features = fused_features[:, 1 : num_patches + 1, :]
             features = torch.cat([features, fused_features], dim=-1)
 
         return features
@@ -504,6 +511,13 @@ class OpenVLAForActionPrediction(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+        # Move vision backbone and projector to the same device as language model
+        # This is needed because TIMM models are created on CPU
+        device = next(self.language_model.parameters()).device
+        dtype = next(self.language_model.parameters()).dtype
+        self.vision_backbone = self.vision_backbone.to(device=device, dtype=dtype)
+        self.projector = self.projector.to(device=device, dtype=dtype)
 
     def _interpolate_pos_embed(
         self,
