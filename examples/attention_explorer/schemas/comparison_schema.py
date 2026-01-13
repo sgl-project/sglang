@@ -10,7 +10,7 @@ Provides:
 
 import json
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -21,12 +21,10 @@ from scipy import stats
 # Import manifest module for comprehensive experiment tracking
 try:
     from .manifest import (
-        ExperimentManifest,
-        RunType,
         get_git_info,
         get_gpu_info,
-        get_hardware_info,
     )
+
     HAS_MANIFEST = True
 except ImportError:
     HAS_MANIFEST = False
@@ -35,6 +33,7 @@ except ImportError:
 # =============================================================================
 # Enums
 # =============================================================================
+
 
 class QuantizationMethod(str, Enum):
     NONE = "none"
@@ -62,11 +61,11 @@ class ManifoldZone(str, Enum):
 
 
 class QualityTier(str, Enum):
-    EXCELLENT = "excellent"    # Jaccard >= 0.8
-    GOOD = "good"              # Jaccard >= 0.6
+    EXCELLENT = "excellent"  # Jaccard >= 0.8
+    GOOD = "good"  # Jaccard >= 0.6
     ACCEPTABLE = "acceptable"  # Jaccard >= 0.4
-    DEGRADED = "degraded"      # Jaccard >= 0.2
-    FAILED = "failed"          # Jaccard < 0.2
+    DEGRADED = "degraded"  # Jaccard >= 0.2
+    FAILED = "failed"  # Jaccard < 0.2
 
 
 class PromptPack(str, Enum):
@@ -83,6 +82,7 @@ class PromptPack(str, Enum):
 # =============================================================================
 # Metrics Computation
 # =============================================================================
+
 
 def compute_jaccard(set1: set, set2: set) -> float:
     """Compute Jaccard similarity between two sets."""
@@ -150,8 +150,10 @@ def compute_rank_correlation(
     spearman, _ = stats.spearmanr(ranks1, ranks2)
     kendall, _ = stats.kendalltau(ranks1, ranks2)
 
-    return float(spearman) if not np.isnan(spearman) else 0.0, \
-           float(kendall) if not np.isnan(kendall) else 0.0
+    return (
+        float(spearman) if not np.isnan(spearman) else 0.0,
+        float(kendall) if not np.isnan(kendall) else 0.0,
+    )
 
 
 def compute_mass_retained(
@@ -170,7 +172,8 @@ def compute_mass_retained(
     candidate_set = set(candidate_positions)
     total_mass = sum(baseline_scores)
     retained_mass = sum(
-        score for pos, score in zip(baseline_positions, baseline_scores)
+        score
+        for pos, score in zip(baseline_positions, baseline_scores)
         if pos in candidate_set
     )
 
@@ -227,7 +230,7 @@ def compute_bootstrap_ci(
         Tuple of (lower_bound, upper_bound)
     """
     if not values or len(values) < 2:
-        return (float('nan'), float('nan'))
+        return (float("nan"), float("nan"))
 
     values_arr = np.array(values)
     n = len(values_arr)
@@ -276,6 +279,7 @@ def classify_quality_tier(mean_jaccard: float) -> QualityTier:
 # =============================================================================
 # Data Classes
 # =============================================================================
+
 
 @dataclass
 class QuantizationConfig:
@@ -369,7 +373,7 @@ class AttentionCaptureConfig:
             "sink_filter": {
                 "enabled": self.sink_filter_enabled,
                 "indices": self.sink_filter_indices,
-            }
+            },
         }
         if self.layers:
             d["layers"] = self.layers
@@ -510,6 +514,7 @@ class HardwareConfig:
 # Comparison Report Builder
 # =============================================================================
 
+
 class ComparisonReportBuilder:
     """
     Builder for creating Quantization Comparison Schema v1 reports.
@@ -539,6 +544,7 @@ class ComparisonReportBuilder:
             capture_git: If True, capture git SHA/branch info
         """
         import time
+
         self.comparison_id = str(uuid.uuid4())
         self.timestamp = datetime.utcnow().isoformat() + "Z"
         self._start_time = time.time()
@@ -583,7 +589,9 @@ class ComparisonReportBuilder:
         self.decoding = config
         return self
 
-    def set_attention_capture(self, config: AttentionCaptureConfig) -> "ComparisonReportBuilder":
+    def set_attention_capture(
+        self, config: AttentionCaptureConfig
+    ) -> "ComparisonReportBuilder":
         self.attention_capture = config
         return self
 
@@ -652,11 +660,13 @@ class ComparisonReportBuilder:
         if self.attention_capture and self.attention_capture.sink_filter_enabled:
             sink_indices = set(self.attention_capture.sink_filter_indices)
             filtered_baseline = [
-                (p, s) for p, s in zip(baseline_positions, baseline_scores)
+                (p, s)
+                for p, s in zip(baseline_positions, baseline_scores)
                 if p not in sink_indices
             ]
             filtered_candidate = [
-                (p, s) for p, s in zip(candidate_positions, candidate_scores)
+                (p, s)
+                for p, s in zip(candidate_positions, candidate_scores)
                 if p not in sink_indices
             ]
             if filtered_baseline:
@@ -671,10 +681,14 @@ class ComparisonReportBuilder:
         # Compute metrics
         jaccard = compute_jaccard(set(baseline_positions), set(candidate_positions))
         weighted_jaccard = compute_weighted_jaccard(
-            baseline_positions, baseline_scores,
-            candidate_positions, candidate_scores,
+            baseline_positions,
+            baseline_scores,
+            candidate_positions,
+            candidate_scores,
         )
-        spearman, kendall = compute_rank_correlation(baseline_positions, candidate_positions)
+        spearman, kendall = compute_rank_correlation(
+            baseline_positions, candidate_positions
+        )
         mass_retained = compute_mass_retained(
             baseline_positions, baseline_scores, candidate_positions
         )
@@ -721,7 +735,7 @@ class ComparisonReportBuilder:
         jaccards = [r.jaccard for r in self.prompt_results]
 
         # Compute bootstrap 95% confidence interval for mean Jaccard
-        ci_lower, ci_upper = (float('nan'), float('nan'))
+        ci_lower, ci_upper = (float("nan"), float("nan"))
         if compute_ci and len(jaccards) >= 3:
             ci_lower, ci_upper = compute_bootstrap_ci(jaccards, confidence=0.95)
 
@@ -741,7 +755,11 @@ class ComparisonReportBuilder:
         }
 
         # Weighted Jaccard
-        wj = [r.weighted_jaccard for r in self.prompt_results if r.weighted_jaccard is not None]
+        wj = [
+            r.weighted_jaccard
+            for r in self.prompt_results
+            if r.weighted_jaccard is not None
+        ]
         if wj:
             summary["weighted_jaccard"] = {
                 "mean": float(np.mean(wj)),
@@ -759,7 +777,9 @@ class ComparisonReportBuilder:
                 summary["rank_correlation"]["kendall_mean"] = float(np.mean(kendall))
 
         # Mass retained
-        mr = [r.mass_retained for r in self.prompt_results if r.mass_retained is not None]
+        mr = [
+            r.mass_retained for r in self.prompt_results if r.mass_retained is not None
+        ]
         if mr:
             summary["mass_retained"] = {
                 "mean": float(np.mean(mr)),
@@ -767,7 +787,9 @@ class ComparisonReportBuilder:
             }
 
         # KL divergence
-        kl = [r.kl_divergence for r in self.prompt_results if r.kl_divergence is not None]
+        kl = [
+            r.kl_divergence for r in self.prompt_results if r.kl_divergence is not None
+        ]
         if kl:
             summary["kl_divergence"] = {
                 "mean": float(np.mean(kl)),
@@ -775,7 +797,9 @@ class ComparisonReportBuilder:
             }
 
         # Output agreement
-        matches = [r.output_match for r in self.prompt_results if r.output_match is not None]
+        matches = [
+            r.output_match for r in self.prompt_results if r.output_match is not None
+        ]
         if matches:
             summary["output_agreement"] = {
                 "exact_match_rate": sum(matches) / len(matches),
@@ -784,10 +808,14 @@ class ComparisonReportBuilder:
         # Compression ratio
         if self.baseline and self.candidate:
             if self.baseline.memory_mb and self.candidate.memory_mb:
-                summary["compression_ratio"] = self.baseline.memory_mb / self.candidate.memory_mb
+                summary["compression_ratio"] = (
+                    self.baseline.memory_mb / self.candidate.memory_mb
+                )
 
         # Quality tier
-        summary["quality_tier"] = classify_quality_tier(summary["jaccard"]["mean"]).value
+        summary["quality_tier"] = classify_quality_tier(
+            summary["jaccard"]["mean"]
+        ).value
 
         return summary
 
@@ -799,8 +827,7 @@ class ComparisonReportBuilder:
             compute_ci: Whether to compute bootstrap confidence intervals
         """
         results_with_zones = [
-            r for r in self.prompt_results
-            if r.baseline_zone and r.candidate_zone
+            r for r in self.prompt_results if r.baseline_zone and r.candidate_zone
         ]
 
         if not results_with_zones:
@@ -812,9 +839,11 @@ class ComparisonReportBuilder:
         zone_drift_rate = sum(drifts) / len(drifts)
 
         # Compute CI for drift rate (treating as proportion)
-        drift_ci_lower, drift_ci_upper = (float('nan'), float('nan'))
+        drift_ci_lower, drift_ci_upper = (float("nan"), float("nan"))
         if compute_ci and len(drifts) >= 3:
-            drift_ci_lower, drift_ci_upper = compute_bootstrap_ci(drifts, confidence=0.95)
+            drift_ci_lower, drift_ci_upper = compute_bootstrap_ci(
+                drifts, confidence=0.95
+            )
 
         # Zone transition matrix
         transition_matrix: Dict[str, Dict[str, int]] = {}
@@ -830,7 +859,9 @@ class ComparisonReportBuilder:
         for pack in PromptPack:
             pack_results = [r for r in results_with_zones if r.prompt_pack == pack]
             if pack_results:
-                drift_by_pack[pack.value] = sum(float(r.zone_drift) for r in pack_results) / len(pack_results)
+                drift_by_pack[pack.value] = sum(
+                    float(r.zone_drift) for r in pack_results
+                ) / len(pack_results)
 
         return {
             "zone_drift_rate": zone_drift_rate,
@@ -843,10 +874,12 @@ class ComparisonReportBuilder:
 
     def _build_performance_metrics(self) -> Optional[Dict]:
         """Build performance metrics section."""
-        if not any([
-            self.performance_baseline_tps,
-            self.performance_candidate_tps,
-        ]):
+        if not any(
+            [
+                self.performance_baseline_tps,
+                self.performance_candidate_tps,
+            ]
+        ):
             return None
 
         perf = {}
@@ -855,7 +888,9 @@ class ComparisonReportBuilder:
         if self.performance_candidate_tps:
             perf["candidate_throughput_tps"] = self.performance_candidate_tps
         if self.performance_baseline_tps and self.performance_candidate_tps:
-            perf["throughput_ratio"] = self.performance_candidate_tps / self.performance_baseline_tps
+            perf["throughput_ratio"] = (
+                self.performance_candidate_tps / self.performance_baseline_tps
+            )
         if self.performance_baseline_p50:
             perf["baseline_latency_p50_ms"] = self.performance_baseline_p50
         if self.performance_candidate_p50:
@@ -901,7 +936,9 @@ class ComparisonReportBuilder:
                 "packs": [p.value for p in self.harness_packs],
             }
             if self.harness_duration:
-                evaluation["prompts"]["harness_config"]["duration_minutes"] = self.harness_duration
+                evaluation["prompts"]["harness_config"][
+                    "duration_minutes"
+                ] = self.harness_duration
 
         # Build results
         results = {
@@ -953,6 +990,7 @@ class ComparisonReportBuilder:
 # Schema Validation
 # =============================================================================
 
+
 def validate_report(report: Dict) -> Tuple[bool, List[str]]:
     """
     Validate a comparison report against the schema.
@@ -962,7 +1000,15 @@ def validate_report(report: Dict) -> Tuple[bool, List[str]]:
     errors = []
 
     # Required top-level fields
-    required = ["schema_version", "comparison_id", "timestamp", "baseline", "candidate", "evaluation", "results"]
+    required = [
+        "schema_version",
+        "comparison_id",
+        "timestamp",
+        "baseline",
+        "candidate",
+        "evaluation",
+        "results",
+    ]
     for field in required:
         if field not in report:
             errors.append(f"Missing required field: {field}")
@@ -1017,9 +1063,11 @@ def validate_report(report: Dict) -> Tuple[bool, List[str]]:
 # Blessed Config Registry
 # =============================================================================
 
+
 @dataclass
 class BlessedQuantConfig:
     """A quantization configuration that has been validated and approved for routing."""
+
     config_id: str
     model_id: str
     quantization: QuantizationConfig
@@ -1086,7 +1134,8 @@ class BlessedConfigRegistry:
         and is approved for the given pack.
         """
         candidates = [
-            c for c in self.get_for_model(model_id)
+            c
+            for c in self.get_for_model(model_id)
             if pack in c.approved_for_packs
             and pack not in c.excluded_packs
             and self._quality_meets_threshold(c.quality_tier, min_quality)
@@ -1102,9 +1151,16 @@ class BlessedConfigRegistry:
         )
         return candidates[0]
 
-    def _quality_meets_threshold(self, tier: QualityTier, min_tier: QualityTier) -> bool:
-        order = [QualityTier.FAILED, QualityTier.DEGRADED, QualityTier.ACCEPTABLE,
-                 QualityTier.GOOD, QualityTier.EXCELLENT]
+    def _quality_meets_threshold(
+        self, tier: QualityTier, min_tier: QualityTier
+    ) -> bool:
+        order = [
+            QualityTier.FAILED,
+            QualityTier.DEGRADED,
+            QualityTier.ACCEPTABLE,
+            QualityTier.GOOD,
+            QualityTier.EXCELLENT,
+        ]
         return order.index(tier) >= order.index(min_tier)
 
     def save(self, path: Optional[str] = None) -> None:
@@ -1134,75 +1190,89 @@ if __name__ == "__main__":
     builder = ComparisonReportBuilder()
 
     # Set model configs
-    builder.set_baseline(ModelConfig(
-        model_id="Qwen/Qwen3-1.7B",
-        dtype="bf16",
-        memory_mb=3282.0,
-    ))
+    builder.set_baseline(
+        ModelConfig(
+            model_id="Qwen/Qwen3-1.7B",
+            dtype="bf16",
+            memory_mb=3282.0,
+        )
+    )
 
-    builder.set_candidate(ModelConfig(
-        model_id="Qwen/Qwen3-1.7B",
-        dtype="int4",
-        quantization=QuantizationConfig(
-            method=QuantizationMethod.ASINQ,
-            nbits=5,
-            group_size=64,
-            tiling_mode=TilingMode.TWO_D,
-            calibration_dataset="wikitext",
-            calibration_samples=128,
-        ),
-        memory_mb=2100.0,
-    ))
+    builder.set_candidate(
+        ModelConfig(
+            model_id="Qwen/Qwen3-1.7B",
+            dtype="int4",
+            quantization=QuantizationConfig(
+                method=QuantizationMethod.ASINQ,
+                nbits=5,
+                group_size=64,
+                tiling_mode=TilingMode.TWO_D,
+                calibration_dataset="wikitext",
+                calibration_samples=128,
+            ),
+            memory_mb=2100.0,
+        )
+    )
 
     # Set evaluation config
-    builder.set_decoding(DecodingConfig(
-        max_tokens=50,
-        temperature=0.0,
-        seed=42,
-    ))
+    builder.set_decoding(
+        DecodingConfig(
+            max_tokens=50,
+            temperature=0.0,
+            seed=42,
+        )
+    )
 
-    builder.set_attention_capture(AttentionCaptureConfig(
-        top_k=64,
-        sink_filter_enabled=True,
-        sink_filter_indices=[0, 1, 2, 3],
-    ))
+    builder.set_attention_capture(
+        AttentionCaptureConfig(
+            top_k=64,
+            sink_filter_enabled=True,
+            sink_filter_indices=[0, 1, 2, 3],
+        )
+    )
 
-    builder.set_hardware(HardwareConfig(
-        gpu_type="NVIDIA RTX 4090",
-        gpu_count=1,
-        attention_backend="flashinfer",
-    ))
+    builder.set_hardware(
+        HardwareConfig(
+            gpu_type="NVIDIA RTX 4090",
+            gpu_count=1,
+            attention_backend="flashinfer",
+        )
+    )
 
     # Add example prompt results
-    builder.add_prompt_result(PromptResult(
-        prompt_id="test-001",
-        prompt_text="What is the capital of France?",
-        prompt_pack=PromptPack.NATURAL,
-        jaccard=0.75,
-        weighted_jaccard=0.72,
-        spearman=0.68,
-        kendall=0.62,
-        mass_retained=0.81,
-        kl_divergence=0.15,
-        output_match=True,
-        baseline_zone=ManifoldZone.SEMANTIC_BRIDGE,
-        candidate_zone=ManifoldZone.SEMANTIC_BRIDGE,
-    ))
+    builder.add_prompt_result(
+        PromptResult(
+            prompt_id="test-001",
+            prompt_text="What is the capital of France?",
+            prompt_pack=PromptPack.NATURAL,
+            jaccard=0.75,
+            weighted_jaccard=0.72,
+            spearman=0.68,
+            kendall=0.62,
+            mass_retained=0.81,
+            kl_divergence=0.15,
+            output_match=True,
+            baseline_zone=ManifoldZone.SEMANTIC_BRIDGE,
+            candidate_zone=ManifoldZone.SEMANTIC_BRIDGE,
+        )
+    )
 
-    builder.add_prompt_result(PromptResult(
-        prompt_id="test-002",
-        prompt_text="Fix this JSON: {name: 'test'}",
-        prompt_pack=PromptPack.JSON_REPAIR,
-        jaccard=0.82,
-        weighted_jaccard=0.79,
-        spearman=0.75,
-        kendall=0.71,
-        mass_retained=0.88,
-        kl_divergence=0.08,
-        output_match=True,
-        baseline_zone=ManifoldZone.SYNTAX_FLOOR,
-        candidate_zone=ManifoldZone.SYNTAX_FLOOR,
-    ))
+    builder.add_prompt_result(
+        PromptResult(
+            prompt_id="test-002",
+            prompt_text="Fix this JSON: {name: 'test'}",
+            prompt_pack=PromptPack.JSON_REPAIR,
+            jaccard=0.82,
+            weighted_jaccard=0.79,
+            spearman=0.75,
+            kendall=0.71,
+            mass_retained=0.88,
+            kl_divergence=0.08,
+            output_match=True,
+            baseline_zone=ManifoldZone.SYNTAX_FLOOR,
+            candidate_zone=ManifoldZone.SYNTAX_FLOOR,
+        )
+    )
 
     # Build and print
     report = builder.build()

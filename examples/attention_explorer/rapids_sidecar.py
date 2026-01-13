@@ -71,19 +71,23 @@ from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from enum import Enum
 
 # Import manifest for git/hardware info in /version endpoint
 try:
     from schemas.manifest import get_git_sha, get_git_branch
+
     HAS_MANIFEST = True
 except ImportError:
     HAS_MANIFEST = False
+
     def get_git_sha():
         return None
+
     def get_git_branch():
         return None
+
 
 # Sidecar version
 SIDECAR_VERSION = "1.0.0"
@@ -91,6 +95,7 @@ SIDECAR_VERSION = "1.0.0"
 # Try to import discovery classifier
 try:
     from discovery import SidecarClassifier
+
     HAS_DISCOVERY = True
 except ImportError:
     HAS_DISCOVERY = False
@@ -100,11 +105,11 @@ try:
     from discovery import (
         RoPEDerotator,
         RoPEConfig,
-        get_glossary,
         get_term_explanation,
         explain_attention_step,
         ATTENTION_GLOSSARY,
     )
+
     HAS_DEROTATION = True
 except ImportError:
     HAS_DEROTATION = False
@@ -114,11 +119,11 @@ try:
     from discovery import (
         CompassRouter,
         CompassRouterConfig,
-        CompassAnalyzer,
         COMPASS_GLOSSARY,
         create_compass_router,
         analyze_attention_compass,
     )
+
     HAS_COMPASS = True
 except ImportError:
     HAS_COMPASS = False
@@ -128,10 +133,9 @@ try:
     from discovery import (
         ManifoldFirewall,
         ManifoldBatchAnalyzer,
-        FirewallConfig,
         FIREWALL_GLOSSARY,
-        create_firewall,
     )
+
     HAS_FIREWALL = True
     # Global firewall instance for session management
     _GLOBAL_FIREWALL = ManifoldFirewall()
@@ -142,6 +146,7 @@ except ImportError:
 # Try ZMQ for high-performance streaming
 try:
     import zmq
+
     HAS_ZMQ = True
 except ImportError:
     HAS_ZMQ = False
@@ -149,8 +154,8 @@ except ImportError:
 # Try RAPIDS cuML first, fallback to CPU
 try:
     import cudf
-    import cuml
     from cuml.cluster import HDBSCAN as cuHDBSCAN
+
     HAS_RAPIDS = True
 except ImportError:
     HAS_RAPIDS = False
@@ -158,6 +163,7 @@ except ImportError:
 try:
     import hdbscan
     from sklearn.preprocessing import StandardScaler
+
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
@@ -241,21 +247,23 @@ class FingerprintStorage:
             self._ensure_initialized()
 
             # Pack fingerprint as binary blob
-            fp_list = fingerprint.tolist()[:self.FINGERPRINT_DIM]
+            fp_list = fingerprint.tolist()[: self.FINGERPRINT_DIM]
             # Pad if needed
             while len(fp_list) < self.FINGERPRINT_DIM:
                 fp_list.append(0.0)
-            fp_blob = struct.pack(f'<{self.FINGERPRINT_DIM}f', *fp_list)
+            fp_blob = struct.pack(f"<{self.FINGERPRINT_DIM}f", *fp_list)
 
-            self._batch_buffer.append((
-                request_id,
-                self.session_id,
-                step,
-                fp_blob,
-                zone,
-                confidence,
-                cluster_id if cluster_id is not None else -1,
-            ))
+            self._batch_buffer.append(
+                (
+                    request_id,
+                    self.session_id,
+                    step,
+                    fp_blob,
+                    zone,
+                    confidence,
+                    cluster_id if cluster_id is not None else -1,
+                )
+            )
 
             if len(self._batch_buffer) >= self._batch_size:
                 self._flush_batch()
@@ -407,7 +415,7 @@ class DiscoveryIntegration:
     def __init__(self, discovery_dir: str, auto_reload_interval: float = 300.0):
         self.discovery_dir = Path(discovery_dir)
         self.auto_reload_interval = auto_reload_interval
-        self._classifier: Optional['SidecarClassifier'] = None
+        self._classifier: Optional["SidecarClassifier"] = None
         self._last_reload = 0
         self._lock = threading.Lock()
         self._reload_thread: Optional[threading.Thread] = None
@@ -542,16 +550,18 @@ class BlessedConfigStorage:
 
             # Write to temporary file first
             temp_fd, temp_path = tempfile.mkstemp(
-                dir=self.storage_path.parent,
-                prefix=".blessed_configs_",
-                suffix=".tmp"
+                dir=self.storage_path.parent, prefix=".blessed_configs_", suffix=".tmp"
             )
-            with os.fdopen(temp_fd, 'w') as f:
+            with os.fdopen(temp_fd, "w") as f:
                 temp_fd = None  # Prevent double-close
-                json.dump({
-                    "configs": list(self._configs.values()),
-                    "updated_at": time.time(),
-                }, f, indent=2)
+                json.dump(
+                    {
+                        "configs": list(self._configs.values()),
+                        "updated_at": time.time(),
+                    },
+                    f,
+                    indent=2,
+                )
 
             # Atomic rename (on POSIX systems)
             shutil.move(temp_path, self.storage_path)
@@ -661,6 +671,7 @@ class OnlineMicroCluster:
 @dataclass
 class ClusterCentroid:
     """Cluster centroid with metadata."""
+
     cluster_id: int
     centroid: List[float]
     size: int
@@ -671,6 +682,7 @@ class ClusterCentroid:
 @dataclass
 class FingerprintEntry:
     """Stored fingerprint with metadata."""
+
     request_id: str
     vector: np.ndarray
     timestamp: float
@@ -906,7 +918,7 @@ class RAPIDSSidecar:
         """Update online micro-clusters with a new point (called with lock held)."""
         # Find nearest micro-cluster
         best_cluster = None
-        best_dist = float('inf')
+        best_dist = float("inf")
 
         for mc in self._micro_clusters.values():
             dist = mc.distance(point)
@@ -931,7 +943,9 @@ class RAPIDSSidecar:
 
         # Prune stale clusters periodically
         if len(self._micro_clusters) > 0:
-            stale_ids = [cid for cid, mc in self._micro_clusters.items() if mc.is_stale()]
+            stale_ids = [
+                cid for cid, mc in self._micro_clusters.items() if mc.is_stale()
+            ]
             for cid in stale_ids:
                 del self._micro_clusters[cid]
 
@@ -964,11 +978,11 @@ class RAPIDSSidecar:
         Returns (cluster_id, distance). Returns (-1, inf) if no centroids.
         """
         if not self.centroids:
-            return -1, float('inf')
+            return -1, float("inf")
 
         vec = np.array(vector, dtype=np.float32)
         best_cluster = -1
-        best_dist = float('inf')
+        best_dist = float("inf")
 
         for cluster_id, centroid in self.centroids.items():
             cent = np.array(centroid.centroid, dtype=np.float32)
@@ -1038,7 +1052,9 @@ class RAPIDSSidecar:
         self.centroids = new_centroids
         print(f"Found {len(new_centroids)} clusters")
 
-    def _cluster_rapids(self, vectors: np.ndarray) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
+    def _cluster_rapids(
+        self, vectors: np.ndarray
+    ) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
         """RAPIDS cuML clustering."""
         import cupy as cp
 
@@ -1055,7 +1071,7 @@ class RAPIDSSidecar:
         clusterer = cuHDBSCAN(
             min_cluster_size=self.min_cluster_size,
             min_samples=max(1, self.min_cluster_size // 2),
-            cluster_selection_method='leaf',
+            cluster_selection_method="leaf",
             prediction_data=True,
         )
         labels = clusterer.fit_predict(df)
@@ -1069,7 +1085,9 @@ class RAPIDSSidecar:
 
         return labels, centroids
 
-    def _cluster_cpu(self, vectors: np.ndarray) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
+    def _cluster_cpu(
+        self, vectors: np.ndarray
+    ) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
         """CPU fallback clustering."""
         # Scale features
         scaler = StandardScaler()
@@ -1079,7 +1097,7 @@ class RAPIDSSidecar:
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=self.min_cluster_size,
             min_samples=max(1, self.min_cluster_size // 2),
-            cluster_selection_method='leaf',
+            cluster_selection_method="leaf",
         )
         labels = clusterer.fit_predict(vectors_scaled)
 
@@ -1181,7 +1199,9 @@ class RAPIDSSidecar:
 
         return {
             "manifold": {
-                "zone": centroid.traits[0] if centroid and centroid.traits else "unknown",
+                "zone": centroid.traits[0]
+                if centroid and centroid.traits
+                else "unknown",
                 "confidence": max(0, 1 - distance / 5.0),  # Heuristic confidence
                 "cluster_id": cluster_id,
                 "cluster_label": None,
@@ -1312,18 +1332,20 @@ class SidecarHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/version":
             # Version info with git SHA for reproducibility
-            self._send_json({
-                "version": SIDECAR_VERSION,
-                "git_sha": get_git_sha(),
-                "git_branch": get_git_branch(),
-                "backend": self.sidecar.backend.value,
-                "has_discovery": self.sidecar._discovery is not None,
-                "has_storage": self.sidecar._storage is not None,
-                "has_blessed_configs": self.sidecar._blessed_storage is not None,
-                "has_derotation": HAS_DEROTATION,
-                "has_compass": HAS_COMPASS,
-                "has_firewall": HAS_FIREWALL,
-            })
+            self._send_json(
+                {
+                    "version": SIDECAR_VERSION,
+                    "git_sha": get_git_sha(),
+                    "git_branch": get_git_branch(),
+                    "backend": self.sidecar.backend.value,
+                    "has_discovery": self.sidecar._discovery is not None,
+                    "has_storage": self.sidecar._storage is not None,
+                    "has_blessed_configs": self.sidecar._blessed_storage is not None,
+                    "has_derotation": HAS_DEROTATION,
+                    "has_compass": HAS_COMPASS,
+                    "has_firewall": HAS_FIREWALL,
+                }
+            )
 
         elif parsed.path == "/discovery/status":
             # Get discovery integration status
@@ -1335,7 +1357,9 @@ class SidecarHandler(BaseHTTPRequestHandler):
             data = self.sidecar.get_discovery_progress()
             self._send_json(data)
 
-        elif parsed.path == "/discovery/live" or parsed.path.startswith("/discovery/live?"):
+        elif parsed.path == "/discovery/live" or parsed.path.startswith(
+            "/discovery/live?"
+        ):
             # SSE endpoint for live discovery updates
             self._handle_sse_discovery(parsed)
 
@@ -1356,11 +1380,13 @@ class SidecarHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/education/glossary":
             # Get educational glossary for attention concepts
             if HAS_DEROTATION:
-                self._send_json({
-                    "glossary": ATTENTION_GLOSSARY,
-                    "terms": list(ATTENTION_GLOSSARY.keys()),
-                    "version": "1.0.0",
-                })
+                self._send_json(
+                    {
+                        "glossary": ATTENTION_GLOSSARY,
+                        "terms": list(ATTENTION_GLOSSARY.keys()),
+                        "version": "1.0.0",
+                    }
+                )
             else:
                 self._send_json_error(501, "Derotation module not available")
 
@@ -1373,12 +1399,14 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 explanation = get_term_explanation(term, detail_level)
                 if explanation:
                     entry = ATTENTION_GLOSSARY.get(term, {})
-                    self._send_json({
-                        "term": term,
-                        "level": detail_level,
-                        "explanation": explanation,
-                        "full_entry": entry,
-                    })
+                    self._send_json(
+                        {
+                            "term": term,
+                            "level": detail_level,
+                            "explanation": explanation,
+                            "full_entry": entry,
+                        }
+                    )
                 else:
                     self.send_error(404, f"Term not found: {term}")
             else:
@@ -1387,22 +1415,26 @@ class SidecarHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/compass/glossary":
             # Get compass router educational glossary
             if HAS_COMPASS:
-                self._send_json({
-                    "glossary": COMPASS_GLOSSARY,
-                    "terms": list(COMPASS_GLOSSARY.keys()),
-                    "version": "1.0.0",
-                })
+                self._send_json(
+                    {
+                        "glossary": COMPASS_GLOSSARY,
+                        "terms": list(COMPASS_GLOSSARY.keys()),
+                        "version": "1.0.0",
+                    }
+                )
             else:
                 self._send_json_error(501, "Compass router not available")
 
         elif parsed.path == "/firewall/glossary":
             # Get firewall educational glossary
             if HAS_FIREWALL:
-                self._send_json({
-                    "glossary": FIREWALL_GLOSSARY,
-                    "terms": list(FIREWALL_GLOSSARY.keys()),
-                    "version": "1.0.0",
-                })
+                self._send_json(
+                    {
+                        "glossary": FIREWALL_GLOSSARY,
+                        "terms": list(FIREWALL_GLOSSARY.keys()),
+                        "version": "1.0.0",
+                    }
+                )
             else:
                 self._send_json_error(501, "Firewall not available")
 
@@ -1420,7 +1452,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
 
         if parsed.path == "/fingerprint":
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
             data = json.loads(body)
 
@@ -1437,7 +1469,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/classify":
             # Classify fingerprint using discovery artifacts (read-only)
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
             data = json.loads(body)
 
@@ -1445,7 +1477,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(result)
 
         elif parsed.path == "/predict":
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
             data = json.loads(body)
 
@@ -1468,25 +1500,29 @@ class SidecarHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/discovery/reload":
             # Force reload discovery artifacts
             success = self.sidecar.reload_discovery()
-            self._send_json({
-                "status": "reloaded" if success else "failed",
-                "discovery": self.sidecar.get_discovery_status(),
-            })
+            self._send_json(
+                {
+                    "status": "reloaded" if success else "failed",
+                    "discovery": self.sidecar.get_discovery_status(),
+                }
+            )
 
         elif parsed.path == "/storage/flush":
             # Flush storage buffer to SQLite
             if self.sidecar._storage:
                 self.sidecar._storage.flush()
-                self._send_json({
-                    "status": "flushed",
-                    "storage": self.sidecar._storage.get_stats(),
-                })
+                self._send_json(
+                    {
+                        "status": "flushed",
+                        "storage": self.sidecar._storage.get_stats(),
+                    }
+                )
             else:
                 self._send_json({"status": "storage_disabled"})
 
         elif parsed.path == "/discovery/progress":
             # Post discovery progress event for SSE streaming
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
 
             try:
@@ -1500,7 +1536,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/blessed-configs":
             # Add or update a blessed config with schema validation
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
 
             try:
@@ -1517,10 +1553,12 @@ class SidecarHandler(BaseHTTPRequestHandler):
 
             success = self.sidecar.add_blessed_config(data)
             if success:
-                self._send_json({
-                    "status": "saved",
-                    "config_id": data.get("id"),
-                })
+                self._send_json(
+                    {
+                        "status": "saved",
+                        "config_id": data.get("id"),
+                    }
+                )
             else:
                 self._send_json_error(400, "Storage disabled or write failed")
 
@@ -1531,7 +1569,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self._send_json_error(501, "Derotation module not available")
                 return
 
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
 
             try:
@@ -1586,7 +1624,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self._send_json_error(501, "Derotation module not available")
                 return
 
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
 
             try:
@@ -1603,15 +1641,17 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 attention_scores=data.get("attention_scores", []),
             )
 
-            self._send_json({
-                "pattern": result.interpretation.get("pattern", "unknown"),
-                "meaning": result.interpretation.get("meaning", ""),
-                "insight": result.explanations.get("insight", ""),
-                "zone": result.manifold_zone,
-                "zone_description": result.explanations.get("zone", ""),
-                "dominant_mode": result.dominant_mode,
-                "rotational_variance": result.rotational_variance,
-            })
+            self._send_json(
+                {
+                    "pattern": result.interpretation.get("pattern", "unknown"),
+                    "meaning": result.interpretation.get("meaning", ""),
+                    "insight": result.explanations.get("insight", ""),
+                    "zone": result.manifold_zone,
+                    "zone_description": result.explanations.get("zone", ""),
+                    "dominant_mode": result.dominant_mode,
+                    "rotational_variance": result.rotational_variance,
+                }
+            )
 
         elif parsed.path == "/compass/route":
             # Route query using Compass Router (angle-based routing)
@@ -1619,7 +1659,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self._send_json_error(501, "Compass router not available")
                 return
 
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
 
             try:
@@ -1640,8 +1680,12 @@ class SidecarHandler(BaseHTTPRequestHandler):
             if "config" in data:
                 config = CompassRouterConfig(
                     sink_threshold=data["config"].get("sink_threshold", 5),
-                    low_variance_threshold=data["config"].get("low_variance_threshold", 0.3),
-                    high_variance_threshold=data["config"].get("high_variance_threshold", 0.7),
+                    low_variance_threshold=data["config"].get(
+                        "low_variance_threshold", 0.3
+                    ),
+                    high_variance_threshold=data["config"].get(
+                        "high_variance_threshold", 0.7
+                    ),
                     small_model=data["config"].get("small_model", "Qwen/Qwen3-4B"),
                     medium_model=data["config"].get("medium_model", "Qwen/Qwen3-14B"),
                     large_model=data["config"].get("large_model", "Qwen/Qwen3-72B"),
@@ -1664,7 +1708,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self._send_json_error(501, "Compass router not available")
                 return
 
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
 
             try:
@@ -1688,7 +1732,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self._send_json_error(501, "Compass router not available")
                 return
 
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
 
             try:
@@ -1713,7 +1757,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self._send_json_error(501, "Firewall not available")
                 return
 
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
 
             try:
@@ -1725,10 +1769,12 @@ class SidecarHandler(BaseHTTPRequestHandler):
             session_id = data.get("session_id", f"session-{time.time()}")
             _GLOBAL_FIREWALL.start_session(session_id)
 
-            self._send_json({
-                "status": "started",
-                "session_id": session_id,
-            })
+            self._send_json(
+                {
+                    "status": "started",
+                    "session_id": session_id,
+                }
+            )
 
         elif parsed.path == "/firewall/check":
             # Check a fingerprint for drift/hallucination
@@ -1736,7 +1782,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self._send_json_error(501, "Firewall not available")
                 return
 
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
 
             try:
@@ -1746,7 +1792,14 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 return
 
             # Validate required fields
-            required = ["session_id", "fingerprint", "zone", "entropy", "sink_ratio", "token_position"]
+            required = [
+                "session_id",
+                "fingerprint",
+                "zone",
+                "entropy",
+                "sink_ratio",
+                "token_position",
+            ]
             missing = [f for f in required if f not in data]
             if missing:
                 self._send_json_error(400, f"Missing fields: {missing}")
@@ -1771,7 +1824,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self._send_json_error(501, "Firewall not available")
                 return
 
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
 
             try:
@@ -1797,7 +1850,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self._send_json_error(501, "Firewall not available")
                 return
 
-            content_len = int(self.headers.get('Content-Length', 0))
+            content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len)
 
             try:
@@ -1849,14 +1902,14 @@ class SidecarHandler(BaseHTTPRequestHandler):
         """
         # Parse query parameters
         query = urllib.parse.parse_qs(parsed.query)
-        since = float(query.get('since', ['0'])[0])
+        since = float(query.get("since", ["0"])[0])
 
         # Send SSE headers
         self.send_response(200)
-        self.send_header('Content-Type', 'text/event-stream')
-        self.send_header('Cache-Control', 'no-cache')
-        self.send_header('Connection', 'keep-alive')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
         # Subscribe to updates
@@ -1865,12 +1918,12 @@ class SidecarHandler(BaseHTTPRequestHandler):
         try:
             # Send initial status
             status = self.sidecar.get_discovery_progress()
-            self._send_sse_event('status', status)
+            self._send_sse_event("status", status)
 
             # Send any missed events
             events = self.sidecar.get_discovery_events(since)
             for event in events:
-                self._send_sse_event(event['type'], event['data'])
+                self._send_sse_event(event["type"], event["data"])
 
             # Stream updates
             last_check = time.time()
@@ -1881,12 +1934,12 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 # Check for new events
                 events = self.sidecar.get_discovery_events(last_check)
                 for event in events:
-                    self._send_sse_event(event['type'], event['data'])
-                    last_check = event['timestamp']
+                    self._send_sse_event(event["type"], event["data"])
+                    last_check = event["timestamp"]
 
                 # Send heartbeat if no events
                 if not events:
-                    self._send_sse_event('heartbeat', {'timestamp': time.time()})
+                    self._send_sse_event("heartbeat", {"timestamp": time.time()})
 
                 # Reset notification event
                 notify_event.clear()
@@ -1911,8 +1964,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
     def _send_json(self, data):
         response = json.dumps(data).encode()
         self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', len(response))
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(response))
         self.end_headers()
         self.wfile.write(response)
 
@@ -1920,8 +1973,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
         """Send a JSON error response."""
         response = json.dumps({"error": message}).encode()
         self.send_response(status_code)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', len(response))
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(response))
         self.end_headers()
         self.wfile.write(response)
 
@@ -1961,8 +2014,19 @@ class SidecarHandler(BaseHTTPRequestHandler):
             quant = config["quantization"]
             if "method" not in quant:
                 errors.append("quantization missing required field 'method'")
-            elif quant["method"] not in ["none", "sinq", "asinq", "awq", "gptq", "squeezellm", "fp8", "marlin"]:
-                errors.append(f"quantization.method '{quant['method']}' is not a recognized method")
+            elif quant["method"] not in [
+                "none",
+                "sinq",
+                "asinq",
+                "awq",
+                "gptq",
+                "squeezellm",
+                "fp8",
+                "marlin",
+            ]:
+                errors.append(
+                    f"quantization.method '{quant['method']}' is not a recognized method"
+                )
 
             # Validate optional numeric fields
             if "nbits" in quant and not isinstance(quant["nbits"], int):
@@ -1978,37 +2042,84 @@ class SidecarHandler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="RAPIDS clustering sidecar")
-    parser.add_argument("--port", type=int, default=9000,
-                        help="HTTP port for querying centroids (default: 9000)")
-    parser.add_argument("--zmq-bind", type=str, default=None,
-                        help="ZMQ bind address for fingerprint streaming. "
-                             "Example: 'tcp://*:9001'. Must match SGLang's --attention-sidecar-url "
-                             "(but use '*' instead of 'localhost' for binding)")
-    parser.add_argument("--buffer-size", type=int, default=10000,
-                        help="Fingerprint buffer size (default: 10000)")
-    parser.add_argument("--min-cluster-size", type=int, default=10,
-                        help="Minimum cluster size for HDBSCAN (default: 10)")
-    parser.add_argument("--recluster-interval", type=float, default=60.0,
-                        help="Seconds between reclustering (default: 60)")
-    parser.add_argument("--online", action="store_true",
-                        help="Enable online clustering mode (real-time updates, no batching)")
-    parser.add_argument("--online-threshold", type=float, default=2.0,
-                        help="Distance threshold for creating new cluster in online mode (default: 2.0)")
-    parser.add_argument("--online-max-clusters", type=int, default=50,
-                        help="Maximum number of clusters in online mode (default: 50)")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=9000,
+        help="HTTP port for querying centroids (default: 9000)",
+    )
+    parser.add_argument(
+        "--zmq-bind",
+        type=str,
+        default=None,
+        help="ZMQ bind address for fingerprint streaming. "
+        "Example: 'tcp://*:9001'. Must match SGLang's --attention-sidecar-url "
+        "(but use '*' instead of 'localhost' for binding)",
+    )
+    parser.add_argument(
+        "--buffer-size",
+        type=int,
+        default=10000,
+        help="Fingerprint buffer size (default: 10000)",
+    )
+    parser.add_argument(
+        "--min-cluster-size",
+        type=int,
+        default=10,
+        help="Minimum cluster size for HDBSCAN (default: 10)",
+    )
+    parser.add_argument(
+        "--recluster-interval",
+        type=float,
+        default=60.0,
+        help="Seconds between reclustering (default: 60)",
+    )
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help="Enable online clustering mode (real-time updates, no batching)",
+    )
+    parser.add_argument(
+        "--online-threshold",
+        type=float,
+        default=2.0,
+        help="Distance threshold for creating new cluster in online mode (default: 2.0)",
+    )
+    parser.add_argument(
+        "--online-max-clusters",
+        type=int,
+        default=50,
+        help="Maximum number of clusters in online mode (default: 50)",
+    )
 
     # Storage and discovery options
-    parser.add_argument("--db", type=str, default=None,
-                        help="SQLite database path for fingerprint storage. "
-                             "Initialize with: sqlite3 <db> < discovery/schema.sql")
-    parser.add_argument("--discovery-dir", type=str, default=None,
-                        help="Directory containing discovery job artifacts. "
-                             "Should contain a 'latest' symlink to current run.")
-    parser.add_argument("--discovery-reload-interval", type=float, default=300.0,
-                        help="Seconds between discovery artifact reload checks (default: 300)")
-    parser.add_argument("--blessed-configs", type=str, default=None,
-                        help="JSON file path for blessed quantization configs storage. "
-                             "Enables /blessed-configs API endpoints.")
+    parser.add_argument(
+        "--db",
+        type=str,
+        default=None,
+        help="SQLite database path for fingerprint storage. "
+        "Initialize with: sqlite3 <db> < discovery/schema.sql",
+    )
+    parser.add_argument(
+        "--discovery-dir",
+        type=str,
+        default=None,
+        help="Directory containing discovery job artifacts. "
+        "Should contain a 'latest' symlink to current run.",
+    )
+    parser.add_argument(
+        "--discovery-reload-interval",
+        type=float,
+        default=300.0,
+        help="Seconds between discovery artifact reload checks (default: 300)",
+    )
+    parser.add_argument(
+        "--blessed-configs",
+        type=str,
+        default=None,
+        help="JSON file path for blessed quantization configs storage. "
+        "Enables /blessed-configs API endpoints.",
+    )
 
     args = parser.parse_args()
 
@@ -2038,7 +2149,7 @@ def main():
     SidecarHandler.sidecar = sidecar
 
     # Start server
-    server = HTTPServer(('0.0.0.0', args.port), SidecarHandler)
+    server = HTTPServer(("0.0.0.0", args.port), SidecarHandler)
     print(f"\n{'='*60}")
     print(f"RAPIDS Clustering Sidecar")
     print(f"{'='*60}")
@@ -2049,7 +2160,9 @@ def main():
         print(f"ZMQ Receiver:     disabled (use --zmq-bind to enable)")
     print(f"Backend:          {sidecar.backend.value}")
     if args.online:
-        print(f"Online mode:      threshold={args.online_threshold}, max_clusters={args.online_max_clusters}")
+        print(
+            f"Online mode:      threshold={args.online_threshold}, max_clusters={args.online_max_clusters}"
+        )
     else:
         print(f"Buffer size:      {args.buffer_size}")
         print(f"Recluster:        every {args.recluster_interval}s")

@@ -11,12 +11,9 @@ Run with:
     python -m pytest test/srt/test_attention_correctness.py -v
 """
 
-import json
 import os
 import unittest
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
+from typing import Tuple
 
 
 class TestAttentionPositionCorrectness(unittest.TestCase):
@@ -29,14 +26,14 @@ class TestAttentionPositionCorrectness(unittest.TestCase):
 
     def setUp(self):
         """Check if we can import the required modules."""
-        try:
-            from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
-                decode_forward_with_topk,
-            )
+        import importlib.util
 
-            self.decode_available = True
-        except ImportError:
-            self.decode_available = False
+        self.decode_available = (
+            importlib.util.find_spec(
+                "sglang.srt.layers.attention.triton_ops.decode_attention_with_topk"
+            )
+            is not None
+        )
 
     def _create_mock_kv_cache(
         self,
@@ -200,14 +197,14 @@ class TestGQABroadcastCorrectness(unittest.TestCase):
 
     def setUp(self):
         """Check if we can import the required modules."""
-        try:
-            from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
-                compute_topk_attention_chunked,
-            )
+        import importlib.util
 
-            self.gqa_available = True
-        except ImportError:
-            self.gqa_available = False
+        self.gqa_available = (
+            importlib.util.find_spec(
+                "sglang.srt.layers.attention.triton_ops.decode_attention_with_topk"
+            )
+            is not None
+        )
 
     def test_gqa_head_averaging(self):
         """
@@ -328,14 +325,14 @@ class TestPagedAttentionMapping(unittest.TestCase):
 
     def setUp(self):
         """Check if we can import the required modules."""
-        try:
-            from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
-                compute_topk_attention_chunked,
-            )
+        import importlib.util
 
-            self.kernel_available = True
-        except ImportError:
-            self.kernel_available = False
+        self.kernel_available = (
+            importlib.util.find_spec(
+                "sglang.srt.layers.attention.triton_ops.decode_attention_with_topk"
+            )
+            is not None
+        )
 
     def test_physical_vs_logical_position_mapping(self):
         """

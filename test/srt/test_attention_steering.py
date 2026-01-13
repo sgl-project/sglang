@@ -8,16 +8,12 @@ Tests:
 """
 
 import unittest
-import json
-import threading
-import time
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 
 # Test imports
-from sglang.srt.managers.schedule_batch import SemanticMemory, Req, ScheduleBatch, ModelWorkerBatch
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.managers.schedule_batch import SemanticMemory
 
 
 class TestSemanticMemory(unittest.TestCase):
@@ -137,13 +133,17 @@ class TestAttentionBiasesWiring(unittest.TestCase):
         bias_tensor = torch.zeros((batch_size, max_seq_len))
         valid_mask = token_positions < max_seq_len
         if valid_mask.any():
-            bias_tensor[batch_indices[valid_mask], token_positions[valid_mask]] = bias_values[valid_mask]
+            bias_tensor[
+                batch_indices[valid_mask], token_positions[valid_mask]
+            ] = bias_values[valid_mask]
 
         # Verify (use assertAlmostEqual for float comparison)
         self.assertAlmostEqual(bias_tensor[0, 10].item(), 0.5, places=5)
         self.assertAlmostEqual(bias_tensor[0, 20].item(), 0.3, places=5)
         self.assertAlmostEqual(bias_tensor[1, 5].item(), 1.0, places=5)
-        self.assertAlmostEqual(bias_tensor[0, 0].item(), 0.0, places=5)  # Unset position
+        self.assertAlmostEqual(
+            bias_tensor[0, 0].item(), 0.0, places=5
+        )  # Unset position
 
 
 class TestAPIBiasesConversion(unittest.TestCase):
@@ -159,7 +159,9 @@ class TestAPIBiasesConversion(unittest.TestCase):
 
         # Convert to internal format
         internal_biases = {
-            int(layer_id): {int(token_pos): bias for token_pos, bias in token_biases.items()}
+            int(layer_id): {
+                int(token_pos): bias for token_pos, bias in token_biases.items()
+            }
             for layer_id, token_biases in api_biases.items()
         }
 
@@ -172,7 +174,9 @@ class TestAPIBiasesConversion(unittest.TestCase):
         api_biases = None
         internal_biases = (
             {
-                int(layer_id): {int(token_pos): bias for token_pos, bias in token_biases.items()}
+                int(layer_id): {
+                    int(token_pos): bias for token_pos, bias in token_biases.items()
+                }
                 for layer_id, token_biases in api_biases.items()
             }
             if api_biases
@@ -187,20 +191,14 @@ class TestMockSidecar(unittest.TestCase):
 
     def test_sidecar_import(self):
         """Test that the mock sidecar can be imported."""
-        try:
-            import zmq
-            zmq_available = True
-        except ImportError:
-            zmq_available = False
+        import importlib.util
+
+        zmq_available = importlib.util.find_spec("zmq") is not None
 
         if zmq_available:
             # Verify the sidecar script is syntactically correct
-            import sys
-            import importlib.util
-
             spec = importlib.util.spec_from_file_location(
-                "mock_sidecar",
-                "scripts/mock_attention_sidecar.py"
+                "mock_sidecar", "scripts/mock_attention_sidecar.py"
             )
             if spec and spec.loader:
                 module = importlib.util.module_from_spec(spec)

@@ -47,9 +47,6 @@ try:
         FP_ROTATIONAL_VARIANCE,
         RV_THRESHOLD_LOCAL,
         RV_THRESHOLD_LONG_RANGE,
-        ZONE_THRESHOLDS,
-        is_v2,
-        get_rotational_variance,
     )
 except ImportError:
     # Fallback for standalone use
@@ -69,6 +66,7 @@ def _get_plt():
     if _plt is None:
         import matplotlib.pyplot as plt
         import matplotlib.colors as mcolors
+
         _plt = plt
         _colors = mcolors
     return _plt, _colors
@@ -79,20 +77,21 @@ def _get_plt():
 # =============================================================================
 
 ZONE_COLORS = {
-    'syntax_floor': '#3498db',      # Blue - local/syntax
-    'semantic_bridge': '#9b59b6',   # Purple - mid-range
-    'structure_ripple': '#e74c3c',  # Red - long-range
-    'long_range': '#e67e22',        # Orange
-    'diffuse': '#95a5a6',           # Gray
-    'unknown': '#bdc3c7',           # Light gray
+    "syntax_floor": "#3498db",  # Blue - local/syntax
+    "semantic_bridge": "#9b59b6",  # Purple - mid-range
+    "structure_ripple": "#e74c3c",  # Red - long-range
+    "long_range": "#e67e22",  # Orange
+    "diffuse": "#95a5a6",  # Gray
+    "unknown": "#bdc3c7",  # Light gray
 }
 
-RV_CMAP = 'RdYlBu_r'  # Red (high RV) to Blue (low RV)
+RV_CMAP = "RdYlBu_r"  # Red (high RV) to Blue (low RV)
 
 
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
+
 
 def classify_zone_from_fingerprint(fp: np.ndarray) -> str:
     """Classify zone from fingerprint features."""
@@ -105,11 +104,11 @@ def classify_zone_from_fingerprint(fp: np.ndarray) -> str:
 
     if local_mass > 0.5 and entropy < 2.5:
         if rv is None or rv <= RV_THRESHOLD_LOCAL:
-            return 'syntax_floor'
+            return "syntax_floor"
     if long_mass > 0.25:
         if rv is None or rv >= RV_THRESHOLD_LONG_RANGE:
-            return 'structure_ripple'
-    return 'semantic_bridge'
+            return "structure_ripple"
+    return "semantic_bridge"
 
 
 def extract_rv_values(fingerprints: np.ndarray) -> Optional[np.ndarray]:
@@ -126,6 +125,7 @@ def extract_rv_values(fingerprints: np.ndarray) -> Optional[np.ndarray]:
 # =============================================================================
 # PLOT 1: RV TIMELINE
 # =============================================================================
+
 
 def plot_rv_timeline(
     fingerprints: np.ndarray,
@@ -171,13 +171,20 @@ def plot_rv_timeline(
 
         for i, zone in enumerate(zones + [None]):
             if zone != current_zone or i == len(zones):
-                color = ZONE_COLORS.get(current_zone, '#ffffff')
+                color = ZONE_COLORS.get(current_zone, "#ffffff")
                 ax.axvspan(start_pos, i, alpha=0.15, color=color, label=None)
                 current_zone = zone
                 start_pos = i
 
     # Plot RV line
-    ax.plot(positions, rv_values, 'k-', linewidth=1.5, alpha=0.8, label='Rotational Variance')
+    ax.plot(
+        positions,
+        rv_values,
+        "k-",
+        linewidth=1.5,
+        alpha=0.8,
+        label="Rotational Variance",
+    )
 
     # Scatter points colored by zone
     for zone in set(zones):
@@ -186,25 +193,35 @@ def plot_rv_timeline(
             ax.scatter(
                 positions[mask],
                 rv_values[mask],
-                c=ZONE_COLORS.get(zone, '#333333'),
+                c=ZONE_COLORS.get(zone, "#333333"),
                 s=20,
                 alpha=0.6,
-                label=zone.replace('_', ' ').title(),
+                label=zone.replace("_", " ").title(),
             )
 
     # Threshold lines
     if show_thresholds:
-        ax.axhline(y=RV_THRESHOLD_LOCAL, color='blue', linestyle='--',
-                   alpha=0.5, label=f'Local threshold ({RV_THRESHOLD_LOCAL})')
-        ax.axhline(y=RV_THRESHOLD_LONG_RANGE, color='red', linestyle='--',
-                   alpha=0.5, label=f'Long-range threshold ({RV_THRESHOLD_LONG_RANGE})')
+        ax.axhline(
+            y=RV_THRESHOLD_LOCAL,
+            color="blue",
+            linestyle="--",
+            alpha=0.5,
+            label=f"Local threshold ({RV_THRESHOLD_LOCAL})",
+        )
+        ax.axhline(
+            y=RV_THRESHOLD_LONG_RANGE,
+            color="red",
+            linestyle="--",
+            alpha=0.5,
+            label=f"Long-range threshold ({RV_THRESHOLD_LONG_RANGE})",
+        )
 
-    ax.set_xlabel('Token Position', fontsize=12)
-    ax.set_ylabel('Rotational Variance', fontsize=12)
+    ax.set_xlabel("Token Position", fontsize=12)
+    ax.set_ylabel("Rotational Variance", fontsize=12)
     ax.set_title(title, fontsize=14)
     ax.set_ylim(-0.05, 1.05)
     ax.set_xlim(0, n_tokens)
-    ax.legend(loc='upper right', fontsize=9)
+    ax.legend(loc="upper right", fontsize=9)
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -215,13 +232,14 @@ def plot_rv_timeline(
 # PLOT 2: MANIFOLD SCATTER
 # =============================================================================
 
+
 def plot_manifold_scatter(
     fingerprints: np.ndarray,
-    color_by: str = 'rv',  # 'rv', 'zone', 'entropy'
+    color_by: str = "rv",  # 'rv', 'zone', 'entropy'
     zones: Optional[List[str]] = None,
     title: str = "Fingerprint Manifold",
     figsize: Tuple[int, int] = (10, 8),
-    method: str = 'pca',  # 'pca', 'umap'
+    method: str = "pca",  # 'pca', 'umap'
     n_components: int = 2,
 ) -> Any:
     """
@@ -248,14 +266,15 @@ def plot_manifold_scatter(
     fp_scaled = scaler.fit_transform(fingerprints)
 
     # Dimensionality reduction
-    if method == 'pca':
+    if method == "pca":
         reducer = PCA(n_components=n_components, random_state=42)
         coords = reducer.fit_transform(fp_scaled)
         explained_var = reducer.explained_variance_ratio_.sum()
         method_label = f"PCA ({explained_var:.1%} variance)"
-    elif method == 'umap':
+    elif method == "umap":
         try:
             import umap
+
             reducer = umap.UMAP(n_components=n_components, random_state=42)
             coords = reducer.fit_transform(fp_scaled)
             method_label = "UMAP"
@@ -270,24 +289,26 @@ def plot_manifold_scatter(
     fig, ax = plt.subplots(figsize=figsize)
 
     # Color mapping
-    if color_by == 'rv':
+    if color_by == "rv":
         rv_values = extract_rv_values(fingerprints)
         if rv_values is None:
             print("No RV data, falling back to entropy coloring")
-            color_by = 'entropy'
+            color_by = "entropy"
         else:
             scatter = ax.scatter(
-                coords[:, 0], coords[:, 1],
+                coords[:, 0],
+                coords[:, 1],
                 c=rv_values,
                 cmap=RV_CMAP,
                 s=15,
                 alpha=0.6,
-                vmin=0, vmax=1,
+                vmin=0,
+                vmax=1,
             )
             cbar = plt.colorbar(scatter, ax=ax, shrink=0.8)
-            cbar.set_label('Rotational Variance', fontsize=11)
+            cbar.set_label("Rotational Variance", fontsize=11)
 
-    if color_by == 'zone':
+    if color_by == "zone":
         if zones is None:
             zones = [classify_zone_from_fingerprint(fp) for fp in fingerprints]
 
@@ -295,28 +316,30 @@ def plot_manifold_scatter(
             mask = np.array([z == zone for z in zones])
             if mask.any():
                 ax.scatter(
-                    coords[mask, 0], coords[mask, 1],
-                    c=ZONE_COLORS.get(zone, '#333333'),
+                    coords[mask, 0],
+                    coords[mask, 1],
+                    c=ZONE_COLORS.get(zone, "#333333"),
                     s=15,
                     alpha=0.6,
-                    label=zone.replace('_', ' ').title(),
+                    label=zone.replace("_", " ").title(),
                 )
-        ax.legend(loc='upper right', fontsize=10)
+        ax.legend(loc="upper right", fontsize=10)
 
-    if color_by == 'entropy':
+    if color_by == "entropy":
         entropy = fingerprints[:, FP_ENTROPY]
         scatter = ax.scatter(
-            coords[:, 0], coords[:, 1],
+            coords[:, 0],
+            coords[:, 1],
             c=entropy,
-            cmap='viridis',
+            cmap="viridis",
             s=15,
             alpha=0.6,
         )
         cbar = plt.colorbar(scatter, ax=ax, shrink=0.8)
-        cbar.set_label('Entropy', fontsize=11)
+        cbar.set_label("Entropy", fontsize=11)
 
-    ax.set_xlabel(f'{method_label} Dimension 1', fontsize=12)
-    ax.set_ylabel(f'{method_label} Dimension 2', fontsize=12)
+    ax.set_xlabel(f"{method_label} Dimension 1", fontsize=12)
+    ax.set_ylabel(f"{method_label} Dimension 2", fontsize=12)
     ax.set_title(title, fontsize=14)
     ax.grid(True, alpha=0.3)
 
@@ -327,6 +350,7 @@ def plot_manifold_scatter(
 # =============================================================================
 # PLOT 3: SKELETON VIEW
 # =============================================================================
+
 
 def plot_skeleton_view(
     fingerprints: np.ndarray,
@@ -382,32 +406,37 @@ def plot_skeleton_view(
     ax1.scatter(
         coords[evicted_indices, 0],
         coords[evicted_indices, 1],
-        c='#cccccc',
+        c="#cccccc",
         s=10,
         alpha=0.3,
-        label=f'Evicted ({len(evicted_indices)})',
+        label=f"Evicted ({len(evicted_indices)})",
     )
 
     # Plot skeleton tokens (colored by zone, larger)
     for zone in set(zones):
-        mask = np.array([i in skeleton_set and zones[i] == zone for i in range(n_tokens)])
+        mask = np.array(
+            [i in skeleton_set and zones[i] == zone for i in range(n_tokens)]
+        )
         if mask.any():
             ax1.scatter(
                 coords[mask, 0],
                 coords[mask, 1],
-                c=ZONE_COLORS.get(zone, '#333333'),
+                c=ZONE_COLORS.get(zone, "#333333"),
                 s=50,
                 alpha=0.8,
-                edgecolors='black',
+                edgecolors="black",
                 linewidths=0.5,
                 label=f'{zone.replace("_", " ").title()} (kept)',
             )
 
     retention_pct = len(skeleton_indices) / n_tokens * 100
-    ax1.set_title(f'{title}\nRetention: {len(skeleton_indices)}/{n_tokens} ({retention_pct:.1f}%)', fontsize=12)
-    ax1.set_xlabel('PCA Dimension 1')
-    ax1.set_ylabel('PCA Dimension 2')
-    ax1.legend(loc='upper right', fontsize=9)
+    ax1.set_title(
+        f"{title}\nRetention: {len(skeleton_indices)}/{n_tokens} ({retention_pct:.1f}%)",
+        fontsize=12,
+    )
+    ax1.set_xlabel("PCA Dimension 1")
+    ax1.set_ylabel("PCA Dimension 2")
+    ax1.legend(loc="upper right", fontsize=9)
     ax1.grid(True, alpha=0.3)
 
     # --- Bottom plot: Token position view with skeleton markers ---
@@ -415,37 +444,39 @@ def plot_skeleton_view(
         positions = np.arange(n_tokens)
 
         # Plot RV line
-        ax2.plot(positions, rv_values, 'k-', alpha=0.4, linewidth=1)
+        ax2.plot(positions, rv_values, "k-", alpha=0.4, linewidth=1)
 
         # Evicted tokens (small gray)
         ax2.scatter(
             evicted_indices,
             rv_values[evicted_indices],
-            c='#cccccc',
+            c="#cccccc",
             s=8,
             alpha=0.3,
         )
 
         # Skeleton tokens (larger, colored)
         for zone in set(zones):
-            mask = np.array([i in skeleton_set and zones[i] == zone for i in range(n_tokens)])
+            mask = np.array(
+                [i in skeleton_set and zones[i] == zone for i in range(n_tokens)]
+            )
             if mask.any():
                 ax2.scatter(
                     np.where(mask)[0],
                     rv_values[mask],
-                    c=ZONE_COLORS.get(zone, '#333333'),
+                    c=ZONE_COLORS.get(zone, "#333333"),
                     s=30,
                     alpha=0.8,
-                    edgecolors='black',
+                    edgecolors="black",
                     linewidths=0.3,
                 )
 
         # Threshold lines
-        ax2.axhline(y=RV_THRESHOLD_LOCAL, color='blue', linestyle='--', alpha=0.4)
-        ax2.axhline(y=RV_THRESHOLD_LONG_RANGE, color='red', linestyle='--', alpha=0.4)
+        ax2.axhline(y=RV_THRESHOLD_LOCAL, color="blue", linestyle="--", alpha=0.4)
+        ax2.axhline(y=RV_THRESHOLD_LONG_RANGE, color="red", linestyle="--", alpha=0.4)
 
-        ax2.set_xlabel('Token Position')
-        ax2.set_ylabel('Rotational Variance')
+        ax2.set_xlabel("Token Position")
+        ax2.set_ylabel("Rotational Variance")
         ax2.set_ylim(-0.05, 1.05)
         ax2.set_xlim(0, n_tokens)
         ax2.grid(True, alpha=0.3)
@@ -457,6 +488,7 @@ def plot_skeleton_view(
 # =============================================================================
 # PLOT 4: ZONE DISTRIBUTION
 # =============================================================================
+
 
 def plot_zone_distribution(
     zones: List[str],
@@ -484,7 +516,7 @@ def plot_zone_distribution(
 
     zone_names = sorted(zone_counts.keys())
     counts = [zone_counts[z] for z in zone_names]
-    colors = [ZONE_COLORS.get(z, '#333333') for z in zone_names]
+    colors = [ZONE_COLORS.get(z, "#333333") for z in zone_names]
 
     if rv_values is not None:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
@@ -493,10 +525,10 @@ def plot_zone_distribution(
         ax2 = None
 
     # Bar chart
-    bars = ax1.bar(zone_names, counts, color=colors, edgecolor='black', linewidth=0.5)
-    ax1.set_xlabel('Zone')
-    ax1.set_ylabel('Count')
-    ax1.set_title(f'{title}\n(n={len(zones)})')
+    bars = ax1.bar(zone_names, counts, color=colors, edgecolor="black", linewidth=0.5)
+    ax1.set_xlabel("Zone")
+    ax1.set_ylabel("Count")
+    ax1.set_title(f"{title}\n(n={len(zones)})")
 
     # Add percentage labels
     total = sum(counts)
@@ -505,12 +537,12 @@ def plot_zone_distribution(
         ax1.text(
             bar.get_x() + bar.get_width() / 2,
             bar.get_height() + total * 0.01,
-            f'{pct:.1f}%',
-            ha='center',
+            f"{pct:.1f}%",
+            ha="center",
             fontsize=9,
         )
 
-    ax1.set_xticklabels([z.replace('_', '\n') for z in zone_names], fontsize=10)
+    ax1.set_xticklabels([z.replace("_", "\n") for z in zone_names], fontsize=10)
 
     # Box plots of RV by zone
     if ax2 is not None and rv_values is not None:
@@ -522,15 +554,31 @@ def plot_zone_distribution(
                 zone_rv_data.append(rv_values[mask])
                 zone_labels.append(zone)
 
-        bp = ax2.boxplot(zone_rv_data, labels=[z.replace('_', '\n') for z in zone_labels], patch_artist=True)
-        for patch, zone in zip(bp['boxes'], zone_labels):
-            patch.set_facecolor(ZONE_COLORS.get(zone, '#333333'))
+        bp = ax2.boxplot(
+            zone_rv_data,
+            labels=[z.replace("_", "\n") for z in zone_labels],
+            patch_artist=True,
+        )
+        for patch, zone in zip(bp["boxes"], zone_labels):
+            patch.set_facecolor(ZONE_COLORS.get(zone, "#333333"))
             patch.set_alpha(0.6)
 
-        ax2.axhline(y=RV_THRESHOLD_LOCAL, color='blue', linestyle='--', alpha=0.5, label='Local threshold')
-        ax2.axhline(y=RV_THRESHOLD_LONG_RANGE, color='red', linestyle='--', alpha=0.5, label='Long-range threshold')
-        ax2.set_ylabel('Rotational Variance')
-        ax2.set_title('RV Distribution by Zone')
+        ax2.axhline(
+            y=RV_THRESHOLD_LOCAL,
+            color="blue",
+            linestyle="--",
+            alpha=0.5,
+            label="Local threshold",
+        )
+        ax2.axhline(
+            y=RV_THRESHOLD_LONG_RANGE,
+            color="red",
+            linestyle="--",
+            alpha=0.5,
+            label="Long-range threshold",
+        )
+        ax2.set_ylabel("Rotational Variance")
+        ax2.set_title("RV Distribution by Zone")
         ax2.set_ylim(-0.05, 1.05)
         ax2.legend(fontsize=8)
 
@@ -541,6 +589,7 @@ def plot_zone_distribution(
 # =============================================================================
 # FULL REPORT GENERATOR
 # =============================================================================
+
 
 def create_exploration_report(
     fingerprints: np.ndarray,
@@ -579,44 +628,50 @@ def create_exploration_report(
     # 1. Zone distribution
     fig = plot_zone_distribution(zones, rv_values, title="Zone Distribution")
     path = os.path.join(output_dir, f"{prefix}zone_distribution.png")
-    fig.savefig(path, dpi=150, bbox_inches='tight')
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    saved_files['zone_distribution'] = path
+    saved_files["zone_distribution"] = path
     print(f"Saved: {path}")
 
     # 2. Manifold scatter (by zone)
-    fig = plot_manifold_scatter(fingerprints, color_by='zone', zones=zones, title="Manifold by Zone")
+    fig = plot_manifold_scatter(
+        fingerprints, color_by="zone", zones=zones, title="Manifold by Zone"
+    )
     path = os.path.join(output_dir, f"{prefix}manifold_by_zone.png")
-    fig.savefig(path, dpi=150, bbox_inches='tight')
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    saved_files['manifold_by_zone'] = path
+    saved_files["manifold_by_zone"] = path
     print(f"Saved: {path}")
 
     # 3. RV-specific plots (only if RV available)
     if has_rv:
         # RV timeline
-        fig = plot_rv_timeline(fingerprints, zones=zones, title="Rotational Variance Timeline")
+        fig = plot_rv_timeline(
+            fingerprints, zones=zones, title="Rotational Variance Timeline"
+        )
         path = os.path.join(output_dir, f"{prefix}rv_timeline.png")
-        fig.savefig(path, dpi=150, bbox_inches='tight')
+        fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
-        saved_files['rv_timeline'] = path
+        saved_files["rv_timeline"] = path
         print(f"Saved: {path}")
 
         # Manifold by RV
-        fig = plot_manifold_scatter(fingerprints, color_by='rv', title="Manifold by Rotational Variance")
+        fig = plot_manifold_scatter(
+            fingerprints, color_by="rv", title="Manifold by Rotational Variance"
+        )
         path = os.path.join(output_dir, f"{prefix}manifold_by_rv.png")
-        fig.savefig(path, dpi=150, bbox_inches='tight')
+        fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
-        saved_files['manifold_by_rv'] = path
+        saved_files["manifold_by_rv"] = path
         print(f"Saved: {path}")
 
     # 4. Skeleton view (if skeleton provided)
     if skeleton_indices is not None:
         fig = plot_skeleton_view(fingerprints, skeleton_indices, zones=zones)
         path = os.path.join(output_dir, f"{prefix}skeleton_view.png")
-        fig.savefig(path, dpi=150, bbox_inches='tight')
+        fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
-        saved_files['skeleton_view'] = path
+        saved_files["skeleton_view"] = path
         print(f"Saved: {path}")
 
     print(f"\nGenerated {len(saved_files)} plots in {output_dir}")
@@ -627,6 +682,7 @@ def create_exploration_report(
 # CLI
 # =============================================================================
 
+
 def main():
     """Generate visualizations from command line."""
     import argparse
@@ -634,11 +690,17 @@ def main():
     import sqlite3
 
     parser = argparse.ArgumentParser(description="Generate fingerprint visualizations")
-    parser.add_argument("--db", "-d", required=True, help="Path to fingerprints database")
+    parser.add_argument(
+        "--db", "-d", required=True, help="Path to fingerprints database"
+    )
     parser.add_argument("--output", "-o", default="./plots", help="Output directory")
-    parser.add_argument("--limit", "-n", type=int, default=10000, help="Max fingerprints to load")
+    parser.add_argument(
+        "--limit", "-n", type=int, default=10000, help="Max fingerprints to load"
+    )
     parser.add_argument("--prefix", "-p", default="", help="Filename prefix")
-    parser.add_argument("--skeleton-ratio", type=float, default=0.3, help="Skeleton retention ratio")
+    parser.add_argument(
+        "--skeleton-ratio", type=float, default=0.3, help="Skeleton retention ratio"
+    )
 
     args = parser.parse_args()
 
@@ -648,12 +710,14 @@ def main():
     conn = sqlite3.connect(args.db)
     cursor = conn.cursor()
 
-    cursor.execute(f"""
+    cursor.execute(
+        f"""
         SELECT fingerprint, manifold_zone
         FROM fingerprints
         ORDER BY id
         LIMIT {args.limit}
-    """)
+    """
+    )
 
     rows = cursor.fetchall()
     conn.close()
@@ -664,7 +728,7 @@ def main():
     for fp_blob, zone in rows:
         # Detect schema version from blob size
         n_floats = len(fp_blob) // 4
-        fp = np.array(struct.unpack(f'<{n_floats}f', fp_blob))
+        fp = np.array(struct.unpack(f"<{n_floats}f", fp_blob))
         fingerprints.append(fp)
         zones.append(zone if zone else classify_zone_from_fingerprint(fp))
 
@@ -676,6 +740,7 @@ def main():
     if len(fingerprints) >= 50:
         try:
             from .spectral_eviction import SpectralSkeletonComputer
+
             computer = SpectralSkeletonComputer(retention_ratio=args.skeleton_ratio)
             result = computer.compute_skeleton(fingerprints, len(fingerprints))
             skeleton_indices = result.skeleton_indices

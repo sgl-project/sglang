@@ -31,19 +31,20 @@ import struct
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 # Import manifest module for reproducibility layer
 try:
     from schemas.manifest import ExperimentManifest, RunType
+
     HAS_MANIFEST = True
 except ImportError:
     HAS_MANIFEST = False
 
 # Import coordinator for long-running jobs
 try:
-    from .coordinator import DiscoveryJobCoordinator, CoordinatorConfig, run_discovery as run_discovery_coordinated
+    from .coordinator import run_discovery as run_discovery_coordinated
+
     HAS_COORDINATOR = True
 except ImportError:
     HAS_COORDINATOR = False
@@ -57,6 +58,7 @@ import pyarrow.parquet as pq
 # Optional imports with graceful fallback
 try:
     import hdbscan
+
     HAS_HDBSCAN = True
 except ImportError:
     HAS_HDBSCAN = False
@@ -64,6 +66,7 @@ except ImportError:
 
 try:
     import umap
+
     HAS_UMAP = True
 except ImportError:
     HAS_UMAP = False
@@ -76,24 +79,18 @@ from sklearn.preprocessing import StandardScaler
 from .fingerprint_schema import (
     SCHEMA_VERSION,
     V1_DIM as FINGERPRINT_DIM,
-    V2_DIM as FINGERPRINT_DIM_V2,
     FP_LOCAL_MASS,
     FP_MID_MASS,
     FP_LONG_MASS,
     FP_ENTROPY,
     FP_HISTOGRAM_START,
     FP_HISTOGRAM_END,
-    FP_LAYER_STATS_START,
-    FP_LAYER_STATS_END,
     FP_ROTATIONAL_VARIANCE,
     ZONE_THRESHOLDS,
-    is_v2,
-    get_rotational_variance,
 )
 
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -102,9 +99,11 @@ logger = logging.getLogger(__name__)
 # DATA CLASSES
 # =============================================================================
 
+
 @dataclass
 class DiscoveryConfig:
     """Configuration for discovery job."""
+
     db_path: str
     output_dir: str
     time_window_hours: int = 24
@@ -120,6 +119,7 @@ class DiscoveryConfig:
 @dataclass
 class DiscoveryResult:
     """Result of discovery job."""
+
     run_id: str
     fingerprint_count: int
     request_count: int
@@ -133,16 +133,17 @@ class DiscoveryResult:
 # DATABASE OPERATIONS
 # =============================================================================
 
+
 def unpack_fingerprint(blob: bytes) -> np.ndarray:
     """Unpack fingerprint from blob to numpy array."""
     if blob is None:
         return np.zeros(FINGERPRINT_DIM, dtype=np.float32)
-    return np.array(struct.unpack(f'<{FINGERPRINT_DIM}f', blob), dtype=np.float32)
+    return np.array(struct.unpack(f"<{FINGERPRINT_DIM}f", blob), dtype=np.float32)
 
 
 def pack_fingerprint(arr: np.ndarray) -> bytes:
     """Pack numpy array to fingerprint blob."""
-    return struct.pack(f'<{FINGERPRINT_DIM}f', *arr.astype(np.float32))
+    return struct.pack(f"<{FINGERPRINT_DIM}f", *arr.astype(np.float32))
 
 
 def extract_fingerprints(
@@ -199,22 +200,24 @@ def extract_fingerprints(
             break
 
         for row in batch:
-            fp = unpack_fingerprint(row['fingerprint'])
-            rows.append({
-                'id': row['id'],
-                'request_id': row['request_id'],
-                'session_id': row['session_id'],
-                'step': row['step'],
-                'token_id': row['token_id'],
-                'token_text': row['token_text'],
-                'think_phase': row['think_phase'] or 'unknown',
-                'fingerprint': fp,
-                'existing_zone': row['manifold_zone'],
-                'existing_cluster': row['cluster_id'],
-                'router_entropy': row['router_entropy'],
-                'model_id': row['model_id'],
-                'created_at': row['created_at'],
-            })
+            fp = unpack_fingerprint(row["fingerprint"])
+            rows.append(
+                {
+                    "id": row["id"],
+                    "request_id": row["request_id"],
+                    "session_id": row["session_id"],
+                    "step": row["step"],
+                    "token_id": row["token_id"],
+                    "token_text": row["token_text"],
+                    "think_phase": row["think_phase"] or "unknown",
+                    "fingerprint": fp,
+                    "existing_zone": row["manifold_zone"],
+                    "existing_cluster": row["cluster_id"],
+                    "router_entropy": row["router_entropy"],
+                    "model_id": row["model_id"],
+                    "created_at": row["created_at"],
+                }
+            )
 
         logger.info(f"  Loaded {len(rows)} fingerprints...")
 
@@ -222,7 +225,9 @@ def extract_fingerprints(
 
     df = pd.DataFrame(rows)
     if len(df) > 0:
-        logger.info(f"Extracted {len(df)} fingerprints from {df['request_id'].nunique()} requests")
+        logger.info(
+            f"Extracted {len(df)} fingerprints from {df['request_id'].nunique()} requests"
+        )
     else:
         logger.info("No fingerprints found in the specified time window")
     return df
@@ -236,7 +241,7 @@ def extract_request_summaries(db_path: str, request_ids: List[str]) -> Dict[str,
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
-    placeholders = ','.join(['?' for _ in request_ids])
+    placeholders = ",".join(["?" for _ in request_ids])
     query = f"""
         SELECT request_id, prompt_preview, response_preview, model_id
         FROM request_summary
@@ -245,10 +250,10 @@ def extract_request_summaries(db_path: str, request_ids: List[str]) -> Dict[str,
 
     summaries = {}
     for row in conn.execute(query, request_ids):
-        summaries[row['request_id']] = {
-            'prompt_preview': row['prompt_preview'],
-            'response_preview': row['response_preview'],
-            'model_id': row['model_id'],
+        summaries[row["request_id"]] = {
+            "prompt_preview": row["prompt_preview"],
+            "response_preview": row["response_preview"],
+            "model_id": row["model_id"],
         }
 
     conn.close()
@@ -258,6 +263,7 @@ def extract_request_summaries(db_path: str, request_ids: List[str]) -> Dict[str,
 # =============================================================================
 # ZONE ASSIGNMENT
 # =============================================================================
+
 
 def assign_zone_labels(fingerprints: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -295,7 +301,9 @@ def assign_zone_labels(fingerprints: np.ndarray) -> Tuple[np.ndarray, np.ndarray
     has_rotational_variance = fingerprints.shape[1] > FP_ROTATIONAL_VARIANCE
     if has_rotational_variance:
         rotational_variance = fingerprints[:, FP_ROTATIONAL_VARIANCE]
-        logger.info(f"Using rotational variance for zone assignment (mean={rotational_variance.mean():.3f})")
+        logger.info(
+            f"Using rotational variance for zone assignment (mean={rotational_variance.mean():.3f})"
+        )
     else:
         rotational_variance = None
 
@@ -308,57 +316,59 @@ def assign_zone_labels(fingerprints: np.ndarray) -> Tuple[np.ndarray, np.ndarray
     total_mass = np.maximum(total_mass, 1e-6)  # Avoid division by zero
 
     # Get thresholds
-    sf_thresh = ZONE_THRESHOLDS['syntax_floor']
-    sr_thresh = ZONE_THRESHOLDS['structure_ripple']
-    sb_thresh = ZONE_THRESHOLDS.get('semantic_bridge', {})
+    sf_thresh = ZONE_THRESHOLDS["syntax_floor"]
+    sr_thresh = ZONE_THRESHOLDS["structure_ripple"]
+    sb_thresh = ZONE_THRESHOLDS.get("semantic_bridge", {})
 
     # Zone assignment logic
     for i in range(n):
         rv = rotational_variance[i] if rotational_variance is not None else None
 
         # Check syntax_floor first (high local, low entropy, optionally low rotational variance)
-        if local_mass[i] > sf_thresh['local_mass_min']:
-            if entropy[i] < sf_thresh['entropy_max']:
+        if local_mass[i] > sf_thresh["local_mass_min"]:
+            if entropy[i] < sf_thresh["entropy_max"]:
                 # If rotational variance is available, verify it's low (short-range attention)
                 if rv is not None:
-                    rv_max = sf_thresh.get('rotational_variance_max', 1.0)
+                    rv_max = sf_thresh.get("rotational_variance_max", 1.0)
                     if rv <= rv_max:
-                        zones[i] = 'syntax_floor'
+                        zones[i] = "syntax_floor"
                         # High confidence when RV confirms short-range/local attention
-                        confidences[i] = min(1.0, local_mass[i] * (1.0 - entropy[i] / 4.0) * (1.0 - rv))
+                        confidences[i] = min(
+                            1.0, local_mass[i] * (1.0 - entropy[i] / 4.0) * (1.0 - rv)
+                        )
                         continue
                     # High RV with local mass = long-range pattern, not pure syntax
                     # Fall through to check other zones
                 else:
-                    zones[i] = 'syntax_floor'
+                    zones[i] = "syntax_floor"
                     confidences[i] = min(1.0, local_mass[i] * (1.0 - entropy[i] / 4.0))
                     continue
 
         # Check structure_ripple (high long-range, periodic patterns, optionally high rotational variance)
-        if long_mass[i] > sr_thresh['long_mass_min']:
-            if hist_variance[i] > sr_thresh['histogram_variance_min']:
+        if long_mass[i] > sr_thresh["long_mass_min"]:
+            if hist_variance[i] > sr_thresh["histogram_variance_min"]:
                 # If rotational variance is available, verify it's high (long-range attention)
                 if rv is not None:
-                    rv_min = sr_thresh.get('rotational_variance_min', 0.0)
+                    rv_min = sr_thresh.get("rotational_variance_min", 0.0)
                     if rv >= rv_min:
-                        zones[i] = 'structure_ripple'
+                        zones[i] = "structure_ripple"
                         # High confidence when RV confirms long-range attention pattern
                         confidences[i] = min(1.0, (long_mass[i] + rv) / 2)
                         continue
                     # Low RV with high long_mass = unusual pattern, still classify as structure_ripple
-                    zones[i] = 'structure_ripple'
+                    zones[i] = "structure_ripple"
                     confidences[i] = min(1.0, long_mass[i] * 0.8)
                     continue
                 else:
-                    zones[i] = 'structure_ripple'
+                    zones[i] = "structure_ripple"
                     confidences[i] = min(1.0, long_mass[i] + hist_variance[i])
                     continue
 
         # Default: semantic_bridge
-        zones[i] = 'semantic_bridge'
+        zones[i] = "semantic_bridge"
         # Confidence based on mid-mass dominance, boosted by rotational variance if available
         if rv is not None:
-            rv_range = sb_thresh.get('rotational_variance_range', (0.0, 1.0))
+            rv_range = sb_thresh.get("rotational_variance_range", (0.0, 1.0))
             if rv_range[0] <= rv <= rv_range[1]:
                 # Rotational variance in expected range for semantic bridging
                 confidences[i] = min(1.0, mid_mass[i] / total_mass[i] + 0.1)
@@ -367,23 +377,23 @@ def assign_zone_labels(fingerprints: np.ndarray) -> Tuple[np.ndarray, np.ndarray
         else:
             confidences[i] = mid_mass[i] / total_mass[i]
 
-    logger.info(f"Zone distribution: "
-                f"syntax_floor={np.sum(zones == 'syntax_floor')}, "
-                f"semantic_bridge={np.sum(zones == 'semantic_bridge')}, "
-                f"structure_ripple={np.sum(zones == 'structure_ripple')}")
+    logger.info(
+        f"Zone distribution: "
+        f"syntax_floor={np.sum(zones == 'syntax_floor')}, "
+        f"semantic_bridge={np.sum(zones == 'semantic_bridge')}, "
+        f"structure_ripple={np.sum(zones == 'structure_ripple')}"
+    )
 
     return zones, confidences
 
 
 def compute_zone_for_cluster(
-    fingerprints: np.ndarray,
-    labels: np.ndarray,
-    cluster_id: int
+    fingerprints: np.ndarray, labels: np.ndarray, cluster_id: int
 ) -> Tuple[str, float]:
     """Compute dominant zone for a cluster."""
     mask = labels == cluster_id
     if not np.any(mask):
-        return 'unknown', 0.0
+        return "unknown", 0.0
 
     cluster_fps = fingerprints[mask]
     zones, confidences = assign_zone_labels(cluster_fps)
@@ -402,6 +412,7 @@ def compute_zone_for_cluster(
 # =============================================================================
 # EMBEDDING & CLUSTERING
 # =============================================================================
+
 
 def compute_embeddings(
     fingerprints: np.ndarray,
@@ -422,7 +433,9 @@ def compute_embeddings(
         Tuple of (embeddings_2d, pca_model, umap_model)
     """
     if not HAS_UMAP:
-        raise ImportError("umap-learn required for embeddings. Install with: pip install umap-learn")
+        raise ImportError(
+            "umap-learn required for embeddings. Install with: pip install umap-learn"
+        )
 
     logger.info(f"Computing embeddings for {len(fingerprints)} fingerprints...")
 
@@ -438,12 +451,14 @@ def compute_embeddings(
     logger.info(f"  PCA explained variance: {pca.explained_variance_ratio_.sum():.2%}")
 
     # UMAP for 2D embedding
-    logger.info(f"  Running UMAP (neighbors={umap_neighbors}, min_dist={umap_min_dist})...")
+    logger.info(
+        f"  Running UMAP (neighbors={umap_neighbors}, min_dist={umap_min_dist})..."
+    )
     reducer = umap.UMAP(
         n_components=2,
         n_neighbors=umap_neighbors,
         min_dist=umap_min_dist,
-        metric='euclidean',
+        metric="euclidean",
         random_state=42,
         low_memory=len(fingerprints) > 500000,
     )
@@ -453,9 +468,9 @@ def compute_embeddings(
 
     # Bundle models for later use
     models = {
-        'scaler': scaler,
-        'pca': pca,
-        'umap': reducer,
+        "scaler": scaler,
+        "pca": pca,
+        "umap": reducer,
     }
 
     return X_umap, models
@@ -478,14 +493,16 @@ def cluster_embeddings(
         Tuple of (labels, probabilities, clusterer)
     """
     if not HAS_HDBSCAN:
-        raise ImportError("hdbscan required for clustering. Install with: pip install hdbscan")
+        raise ImportError(
+            "hdbscan required for clustering. Install with: pip install hdbscan"
+        )
 
     logger.info(f"Clustering {len(embeddings)} points with HDBSCAN...")
 
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
-        cluster_selection_method='eom',  # Excess of Mass
+        cluster_selection_method="eom",  # Excess of Mass
         prediction_data=True,  # Enable approximate_predict
     )
 
@@ -503,6 +520,7 @@ def cluster_embeddings(
 # =============================================================================
 # PROTOTYPE SELECTION
 # =============================================================================
+
 
 def select_prototypes(
     embeddings: np.ndarray,
@@ -550,16 +568,18 @@ def select_prototypes(
             global_idx = indices[local_idx]
             row = df.iloc[global_idx]
 
-            prototypes.append({
-                'cluster_id': cluster_id,
-                'rank': rank,
-                'fingerprint_id': row['id'],
-                'request_id': row['request_id'],
-                'step': row['step'],
-                'token_text': row['token_text'],
-                'x': embeddings[global_idx, 0],
-                'y': embeddings[global_idx, 1],
-            })
+            prototypes.append(
+                {
+                    "cluster_id": cluster_id,
+                    "rank": rank,
+                    "fingerprint_id": row["id"],
+                    "request_id": row["request_id"],
+                    "step": row["step"],
+                    "token_text": row["token_text"],
+                    "x": embeddings[global_idx, 0],
+                    "y": embeddings[global_idx, 1],
+                }
+            )
 
     proto_df = pd.DataFrame(prototypes)
     logger.info(f"  Selected {len(proto_df)} total prototypes")
@@ -569,6 +589,7 @@ def select_prototypes(
 # =============================================================================
 # CLUSTER METADATA
 # =============================================================================
+
 
 def build_cluster_metadata(
     embeddings: np.ndarray,
@@ -612,23 +633,25 @@ def build_cluster_metadata(
 
         # Get persistence from HDBSCAN (if available)
         persistence = 0.0
-        if hasattr(clusterer, 'cluster_persistence_'):
+        if hasattr(clusterer, "cluster_persistence_"):
             if cluster_id < len(clusterer.cluster_persistence_):
                 persistence = clusterer.cluster_persistence_[cluster_id]
 
-        clusters.append({
-            'cluster_id': cluster_id,
-            'label': f'Cluster {cluster_id}',  # Default label, can be overridden
-            'description': '',
-            'dominant_zone': dominant_zone,
-            'zone_confidence': zone_confidence,
-            'size': int(np.sum(mask)),
-            'persistence': persistence,
-            'centroid_x': centroid_xy[0],
-            'centroid_y': centroid_xy[1],
-            'centroid_fingerprint': centroid_fp,
-            'mean_probability': float(cluster_probs.mean()),
-        })
+        clusters.append(
+            {
+                "cluster_id": cluster_id,
+                "label": f"Cluster {cluster_id}",  # Default label, can be overridden
+                "description": "",
+                "dominant_zone": dominant_zone,
+                "zone_confidence": zone_confidence,
+                "size": int(np.sum(mask)),
+                "persistence": persistence,
+                "centroid_x": centroid_xy[0],
+                "centroid_y": centroid_xy[1],
+                "centroid_fingerprint": centroid_fp,
+                "mean_probability": float(cluster_probs.mean()),
+            }
+        )
 
     cluster_df = pd.DataFrame(clusters)
     logger.info(f"  Built metadata for {len(cluster_df)} clusters")
@@ -638,6 +661,7 @@ def build_cluster_metadata(
 # =============================================================================
 # REQUEST-LEVEL EMBEDDINGS
 # =============================================================================
+
 
 def compute_request_embeddings(
     df: pd.DataFrame,
@@ -666,55 +690,59 @@ def compute_request_embeddings(
 
     # Add embeddings and labels to df for groupby
     df = df.copy()
-    df['x'] = embeddings[:, 0]
-    df['y'] = embeddings[:, 1]
-    df['cluster_id'] = labels
-    df['zone'] = zones
+    df["x"] = embeddings[:, 0]
+    df["y"] = embeddings[:, 1]
+    df["cluster_id"] = labels
+    df["zone"] = zones
 
     request_data = []
 
-    for request_id, group in df.groupby('request_id'):
+    for request_id, group in df.groupby("request_id"):
         # Mean embedding
-        mean_x = group['x'].mean()
-        mean_y = group['y'].mean()
+        mean_x = group["x"].mean()
+        mean_y = group["y"].mean()
 
         # Dominant zone (mode)
-        zone_counts = group['zone'].value_counts()
-        dominant_zone = zone_counts.index[0] if len(zone_counts) > 0 else 'unknown'
+        zone_counts = group["zone"].value_counts()
+        dominant_zone = zone_counts.index[0] if len(zone_counts) > 0 else "unknown"
 
         # Dominant cluster (mode, excluding noise)
-        valid_clusters = group[group['cluster_id'] >= 0]['cluster_id']
-        dominant_cluster = int(valid_clusters.mode().iloc[0]) if len(valid_clusters) > 0 else -1
+        valid_clusters = group[group["cluster_id"] >= 0]["cluster_id"]
+        dominant_cluster = (
+            int(valid_clusters.mode().iloc[0]) if len(valid_clusters) > 0 else -1
+        )
 
         # Think vs output cluster
-        think_group = group[group['think_phase'] == 'think']
-        output_group = group[group['think_phase'] == 'output']
+        think_group = group[group["think_phase"] == "think"]
+        output_group = group[group["think_phase"] == "output"]
 
         think_cluster = -1
         if len(think_group) > 0:
-            think_valid = think_group[think_group['cluster_id'] >= 0]['cluster_id']
+            think_valid = think_group[think_group["cluster_id"] >= 0]["cluster_id"]
             if len(think_valid) > 0:
                 think_cluster = int(think_valid.mode().iloc[0])
 
         output_cluster = -1
         if len(output_group) > 0:
-            output_valid = output_group[output_group['cluster_id'] >= 0]['cluster_id']
+            output_valid = output_group[output_group["cluster_id"] >= 0]["cluster_id"]
             if len(output_valid) > 0:
                 output_cluster = int(output_valid.mode().iloc[0])
 
-        request_data.append({
-            'request_id': request_id,
-            'session_id': group['session_id'].iloc[0],
-            'x': mean_x,
-            'y': mean_y,
-            'dominant_zone': dominant_zone,
-            'dominant_cluster_id': dominant_cluster,
-            'think_cluster_id': think_cluster,
-            'output_cluster_id': output_cluster,
-            'total_steps': len(group),
-            'think_steps': len(think_group),
-            'output_steps': len(output_group),
-        })
+        request_data.append(
+            {
+                "request_id": request_id,
+                "session_id": group["session_id"].iloc[0],
+                "x": mean_x,
+                "y": mean_y,
+                "dominant_zone": dominant_zone,
+                "dominant_cluster_id": dominant_cluster,
+                "think_cluster_id": think_cluster,
+                "output_cluster_id": output_cluster,
+                "total_steps": len(group),
+                "think_steps": len(think_group),
+                "output_steps": len(output_group),
+            }
+        )
 
     request_df = pd.DataFrame(request_data)
     logger.info(f"  Computed embeddings for {len(request_df)} requests")
@@ -724,6 +752,7 @@ def compute_request_embeddings(
 # =============================================================================
 # OUTPUT WRITERS
 # =============================================================================
+
 
 def write_parquet(path: str, df: pd.DataFrame, special_columns: Dict[str, str] = None):
     """
@@ -741,27 +770,27 @@ def write_parquet(path: str, df: pd.DataFrame, special_columns: Dict[str, str] =
     if special_columns:
         df = df.copy()
         for col, handling in special_columns.items():
-            if col in df.columns and handling == 'fingerprint':
+            if col in df.columns and handling == "fingerprint":
                 df[col] = df[col].apply(
                     lambda x: pack_fingerprint(x) if isinstance(x, np.ndarray) else x
                 )
 
     table = pa.Table.from_pandas(df)
-    pq.write_table(table, path, compression='snappy')
+    pq.write_table(table, path, compression="snappy")
     logger.info(f"  Wrote {path} ({len(df)} rows)")
 
 
 def write_manifest(path: str, manifest: dict):
     """Write manifest JSON file."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
+    with open(path, "w") as f:
         json.dump(manifest, f, indent=2, default=str)
     logger.info(f"  Wrote {path}")
 
 
 def update_latest_symlink(output_dir: str, run_id: str):
     """Update 'latest' symlink to point to newest run."""
-    latest_path = os.path.join(output_dir, 'latest')
+    latest_path = os.path.join(output_dir, "latest")
     run_path = os.path.join(output_dir, run_id)
 
     # Remove existing symlink
@@ -790,80 +819,92 @@ def update_database(
     cursor = conn.cursor()
 
     # Insert discovery run
-    cursor.execute("""
+    cursor.execute(
+        """
         INSERT INTO discovery_runs (
             run_id, time_window_start, time_window_end,
             fingerprint_count, request_count, cluster_count, noise_count,
             embedding_method, clustering_method, min_cluster_size,
             output_dir, status, completed_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP)
-    """, (
-        run_id,
-        (datetime.utcnow() - timedelta(hours=config.time_window_hours)).isoformat(),
-        datetime.utcnow().isoformat(),
-        result.fingerprint_count,
-        result.request_count,
-        result.cluster_count,
-        result.noise_count,
-        f'pca_{config.pca_components}_umap_2',
-        f'hdbscan_min{config.min_cluster_size}',
-        config.min_cluster_size,
-        result.output_dir,
-    ))
+    """,
+        (
+            run_id,
+            (datetime.utcnow() - timedelta(hours=config.time_window_hours)).isoformat(),
+            datetime.utcnow().isoformat(),
+            result.fingerprint_count,
+            result.request_count,
+            result.cluster_count,
+            result.noise_count,
+            f"pca_{config.pca_components}_umap_2",
+            f"hdbscan_min{config.min_cluster_size}",
+            config.min_cluster_size,
+            result.output_dir,
+        ),
+    )
 
     # Update clusters table
     cursor.execute("DELETE FROM clusters WHERE run_id != 'initial'")
 
     for _, row in cluster_df.iterrows():
-        cursor.execute("""
+        cursor.execute(
+            """
             INSERT INTO clusters (
                 cluster_id, run_id, label, description,
                 dominant_zone, zone_confidence, size, persistence,
                 centroid_x, centroid_y, centroid_fingerprint
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            int(row['cluster_id']),
-            run_id,
-            row['label'],
-            row['description'],
-            row['dominant_zone'],
-            float(row['zone_confidence']),
-            int(row['size']),
-            float(row['persistence']),
-            float(row['centroid_x']),
-            float(row['centroid_y']),
-            pack_fingerprint(row['centroid_fingerprint']),
-        ))
+        """,
+            (
+                int(row["cluster_id"]),
+                run_id,
+                row["label"],
+                row["description"],
+                row["dominant_zone"],
+                float(row["zone_confidence"]),
+                int(row["size"]),
+                float(row["persistence"]),
+                float(row["centroid_x"]),
+                float(row["centroid_y"]),
+                pack_fingerprint(row["centroid_fingerprint"]),
+            ),
+        )
 
     # Update prototypes table
     cursor.execute("DELETE FROM prototypes")
 
     for _, row in proto_df.iterrows():
-        cursor.execute("""
+        cursor.execute(
+            """
             INSERT INTO prototypes (
                 cluster_id, run_id, rank, fingerprint_id,
                 request_id, step, token_text, x, y
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            int(row['cluster_id']),
-            run_id,
-            int(row['rank']),
-            int(row['fingerprint_id']) if pd.notna(row['fingerprint_id']) else None,
-            row['request_id'],
-            int(row['step']) if pd.notna(row['step']) else None,
-            row['token_text'],
-            float(row['x']),
-            float(row['y']),
-        ))
+        """,
+            (
+                int(row["cluster_id"]),
+                run_id,
+                int(row["rank"]),
+                int(row["fingerprint_id"]) if pd.notna(row["fingerprint_id"]) else None,
+                row["request_id"],
+                int(row["step"]) if pd.notna(row["step"]) else None,
+                row["token_text"],
+                float(row["x"]),
+                float(row["y"]),
+            ),
+        )
 
     conn.commit()
     conn.close()
-    logger.info(f"  Updated database with {len(cluster_df)} clusters, {len(proto_df)} prototypes")
+    logger.info(
+        f"  Updated database with {len(cluster_df)} clusters, {len(proto_df)} prototypes"
+    )
 
 
 # =============================================================================
 # MAIN DISCOVERY JOB
 # =============================================================================
+
 
 def run_discovery(config: DiscoveryConfig) -> DiscoveryResult:
     """
@@ -876,7 +917,7 @@ def run_discovery(config: DiscoveryConfig) -> DiscoveryResult:
         DiscoveryResult with job summary
     """
     start_time = datetime.utcnow()
-    run_id = start_time.strftime('%Y-%m-%dT%H-%M-%S')
+    run_id = start_time.strftime("%Y-%m-%dT%H-%M-%S")
 
     logger.info(f"Starting discovery job: {run_id}")
     logger.info(f"  Database: {config.db_path}")
@@ -907,7 +948,7 @@ def run_discovery(config: DiscoveryConfig) -> DiscoveryResult:
         )
 
     # Stack fingerprints into array
-    fingerprints = np.vstack(df['fingerprint'].values)
+    fingerprints = np.vstack(df["fingerprint"].values)
     logger.info(f"Fingerprint matrix: {fingerprints.shape}")
 
     # 2. Compute embeddings
@@ -940,17 +981,19 @@ def run_discovery(config: DiscoveryConfig) -> DiscoveryResult:
     request_df = compute_request_embeddings(df, embeddings, labels, zones)
 
     # 8. Build embeddings dataframe
-    embeddings_df = pd.DataFrame({
-        'fingerprint_id': df['id'],
-        'request_id': df['request_id'],
-        'step': df['step'],
-        'x': embeddings[:, 0],
-        'y': embeddings[:, 1],
-        'cluster_id': labels,
-        'cluster_prob': probabilities,
-        'zone_label': zones,
-        'zone_confidence': zone_confidences,
-    })
+    embeddings_df = pd.DataFrame(
+        {
+            "fingerprint_id": df["id"],
+            "request_id": df["request_id"],
+            "step": df["step"],
+            "x": embeddings[:, 0],
+            "y": embeddings[:, 1],
+            "cluster_id": labels,
+            "cluster_prob": probabilities,
+            "zone_label": zones,
+            "zone_confidence": zone_confidences,
+        }
+    )
 
     # 9. Write outputs
     logger.info(f"Writing outputs to {run_dir}...")
@@ -959,7 +1002,7 @@ def run_discovery(config: DiscoveryConfig) -> DiscoveryResult:
     write_parquet(
         f"{run_dir}/clusters.parquet",
         cluster_df,
-        special_columns={'centroid_fingerprint': 'fingerprint'}
+        special_columns={"centroid_fingerprint": "fingerprint"},
     )
     write_parquet(f"{run_dir}/prototypes.parquet", proto_df)
     write_parquet(f"{run_dir}/request_embeddings.parquet", request_df)
@@ -987,45 +1030,55 @@ def run_discovery(config: DiscoveryConfig) -> DiscoveryResult:
             database_path=config.db_path,
             time_window_hours=config.time_window_hours,
             fingerprint_count=len(df),
-            request_count=df['request_id'].nunique(),
+            request_count=df["request_id"].nunique(),
         )
 
         # Set discovery parameters
-        manifest_obj.set_parameters({
-            'time_window_hours': config.time_window_hours,
-            'min_cluster_size': config.min_cluster_size,
-            'min_samples': config.min_samples,
-            'umap_neighbors': config.umap_neighbors,
-            'umap_min_dist': config.umap_min_dist,
-            'pca_components': config.pca_components,
-            'prototype_count': config.prototype_count,
-            'embedding_method': f'pca_{config.pca_components}_umap_2',
-            'clustering_method': 'hdbscan',
-        })
+        manifest_obj.set_parameters(
+            {
+                "time_window_hours": config.time_window_hours,
+                "min_cluster_size": config.min_cluster_size,
+                "min_samples": config.min_samples,
+                "umap_neighbors": config.umap_neighbors,
+                "umap_min_dist": config.umap_min_dist,
+                "pca_components": config.pca_components,
+                "prototype_count": config.prototype_count,
+                "embedding_method": f"pca_{config.pca_components}_umap_2",
+                "clustering_method": "hdbscan",
+            }
+        )
 
         # Set statistics
-        manifest_obj.set_statistics({
-            'fingerprint_count': len(df),
-            'request_count': df['request_id'].nunique(),
-            'cluster_count': n_clusters,
-            'noise_count': n_noise,
-            'zone_distribution': {
-                'syntax_floor': int(np.sum(zones == 'syntax_floor')),
-                'semantic_bridge': int(np.sum(zones == 'semantic_bridge')),
-                'structure_ripple': int(np.sum(zones == 'structure_ripple')),
-            },
-            'time_range': {
-                'start': (datetime.utcnow() - timedelta(hours=config.time_window_hours)).isoformat(),
-                'end': datetime.utcnow().isoformat(),
-            },
-        })
+        manifest_obj.set_statistics(
+            {
+                "fingerprint_count": len(df),
+                "request_count": df["request_id"].nunique(),
+                "cluster_count": n_clusters,
+                "noise_count": n_noise,
+                "zone_distribution": {
+                    "syntax_floor": int(np.sum(zones == "syntax_floor")),
+                    "semantic_bridge": int(np.sum(zones == "semantic_bridge")),
+                    "structure_ripple": int(np.sum(zones == "structure_ripple")),
+                },
+                "time_range": {
+                    "start": (
+                        datetime.utcnow() - timedelta(hours=config.time_window_hours)
+                    ).isoformat(),
+                    "end": datetime.utcnow().isoformat(),
+                },
+            }
+        )
 
         # Add artifact references
         manifest_obj.add_artifact("embeddings", f"{run_dir}/embeddings.parquet")
         manifest_obj.add_artifact("clusters", f"{run_dir}/clusters.parquet")
         manifest_obj.add_artifact("prototypes", f"{run_dir}/prototypes.parquet")
-        manifest_obj.add_artifact("request_embeddings", f"{run_dir}/request_embeddings.parquet")
-        manifest_obj.add_artifact("embedding_models", f"{run_dir}/embedding_models.joblib")
+        manifest_obj.add_artifact(
+            "request_embeddings", f"{run_dir}/request_embeddings.parquet"
+        )
+        manifest_obj.add_artifact(
+            "embedding_models", f"{run_dir}/embedding_models.joblib"
+        )
         manifest_obj.add_artifact("clusterer", f"{run_dir}/clusterer.joblib")
 
         # Finalize and save
@@ -1034,31 +1087,33 @@ def run_discovery(config: DiscoveryConfig) -> DiscoveryResult:
     else:
         # Fallback to simple dict manifest
         manifest = {
-            'schema_version': SCHEMA_VERSION,
-            'run_id': run_id,
-            'created_at': datetime.utcnow().isoformat(),
-            'fingerprint_count': len(df),
-            'request_count': df['request_id'].nunique(),
-            'cluster_count': n_clusters,
-            'noise_count': n_noise,
-            'embedding_method': f'pca_{config.pca_components}_umap_2',
-            'clustering_method': 'hdbscan',
-            'parameters': {
-                'time_window_hours': config.time_window_hours,
-                'min_cluster_size': config.min_cluster_size,
-                'min_samples': config.min_samples,
-                'umap_neighbors': config.umap_neighbors,
-                'umap_min_dist': config.umap_min_dist,
-                'pca_components': config.pca_components,
+            "schema_version": SCHEMA_VERSION,
+            "run_id": run_id,
+            "created_at": datetime.utcnow().isoformat(),
+            "fingerprint_count": len(df),
+            "request_count": df["request_id"].nunique(),
+            "cluster_count": n_clusters,
+            "noise_count": n_noise,
+            "embedding_method": f"pca_{config.pca_components}_umap_2",
+            "clustering_method": "hdbscan",
+            "parameters": {
+                "time_window_hours": config.time_window_hours,
+                "min_cluster_size": config.min_cluster_size,
+                "min_samples": config.min_samples,
+                "umap_neighbors": config.umap_neighbors,
+                "umap_min_dist": config.umap_min_dist,
+                "pca_components": config.pca_components,
             },
-            'zone_distribution': {
-                'syntax_floor': int(np.sum(zones == 'syntax_floor')),
-                'semantic_bridge': int(np.sum(zones == 'semantic_bridge')),
-                'structure_ripple': int(np.sum(zones == 'structure_ripple')),
+            "zone_distribution": {
+                "syntax_floor": int(np.sum(zones == "syntax_floor")),
+                "semantic_bridge": int(np.sum(zones == "semantic_bridge")),
+                "structure_ripple": int(np.sum(zones == "structure_ripple")),
             },
-            'time_range': {
-                'start': (datetime.utcnow() - timedelta(hours=config.time_window_hours)).isoformat(),
-                'end': datetime.utcnow().isoformat(),
+            "time_range": {
+                "start": (
+                    datetime.utcnow() - timedelta(hours=config.time_window_hours)
+                ).isoformat(),
+                "end": datetime.utcnow().isoformat(),
             },
         }
         write_manifest(f"{run_dir}/manifest.json", manifest)
@@ -1070,7 +1125,7 @@ def run_discovery(config: DiscoveryConfig) -> DiscoveryResult:
     result = DiscoveryResult(
         run_id=run_id,
         fingerprint_count=len(df),
-        request_count=df['request_id'].nunique(),
+        request_count=df["request_id"].nunique(),
         cluster_count=n_clusters,
         noise_count=n_noise,
         output_dir=run_dir,
@@ -1092,114 +1147,118 @@ def run_discovery(config: DiscoveryConfig) -> DiscoveryResult:
 # CLI
 # =============================================================================
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Run attention fingerprint discovery job',
+        description="Run attention fingerprint discovery job",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     parser.add_argument(
-        '--db', '-d',
+        "--db",
+        "-d",
         required=True,
-        help='Path to SQLite database',
+        help="Path to SQLite database",
     )
     parser.add_argument(
-        '--output', '-o',
+        "--output",
+        "-o",
         required=True,
-        help='Output directory for discovery artifacts',
+        help="Output directory for discovery artifacts",
     )
     parser.add_argument(
-        '--hours', '-H',
+        "--hours",
+        "-H",
         type=int,
         default=24,
-        help='Time window in hours (process fingerprints from last N hours)',
+        help="Time window in hours (process fingerprints from last N hours)",
     )
     parser.add_argument(
-        '--min-cluster-size',
+        "--min-cluster-size",
         type=int,
         default=50,
-        help='HDBSCAN min_cluster_size parameter',
+        help="HDBSCAN min_cluster_size parameter",
     )
     parser.add_argument(
-        '--min-samples',
+        "--min-samples",
         type=int,
         default=10,
-        help='HDBSCAN min_samples parameter',
+        help="HDBSCAN min_samples parameter",
     )
     parser.add_argument(
-        '--umap-neighbors',
+        "--umap-neighbors",
         type=int,
         default=15,
-        help='UMAP n_neighbors parameter',
+        help="UMAP n_neighbors parameter",
     )
     parser.add_argument(
-        '--umap-min-dist',
+        "--umap-min-dist",
         type=float,
         default=0.1,
-        help='UMAP min_dist parameter',
+        help="UMAP min_dist parameter",
     )
     parser.add_argument(
-        '--pca-components',
+        "--pca-components",
         type=int,
         default=50,
-        help='Number of PCA components (intermediate step)',
+        help="Number of PCA components (intermediate step)",
     )
     parser.add_argument(
-        '--prototypes',
+        "--prototypes",
         type=int,
         default=5,
-        help='Number of prototypes per cluster',
+        help="Number of prototypes per cluster",
     )
     parser.add_argument(
-        '--batch-size',
+        "--batch-size",
         type=int,
         default=100000,
-        help='Batch size for loading fingerprints',
+        help="Batch size for loading fingerprints",
     )
 
     # Long-running mode arguments
     parser.add_argument(
-        '--long-running',
-        action='store_true',
-        help='Enable long-running mode with checkpointing and live updates',
+        "--long-running",
+        action="store_true",
+        help="Enable long-running mode with checkpointing and live updates",
     )
     parser.add_argument(
-        '--resume',
+        "--resume",
         type=str,
-        help='Run ID to resume from (long-running mode only)',
+        help="Run ID to resume from (long-running mode only)",
     )
     parser.add_argument(
-        '--websocket-port',
+        "--websocket-port",
         type=int,
         default=9010,
-        help='WebSocket port for live updates (0 to disable)',
+        help="WebSocket port for live updates (0 to disable)",
     )
     parser.add_argument(
-        '--max-memory-gb',
+        "--max-memory-gb",
         type=float,
         default=8.0,
-        help='Maximum memory usage in GB',
+        help="Maximum memory usage in GB",
     )
     parser.add_argument(
-        '--max-hours',
+        "--max-hours",
         type=float,
-        help='Maximum runtime in hours (for time-limited runs)',
+        help="Maximum runtime in hours (for time-limited runs)",
     )
     parser.add_argument(
-        '--checkpoint-db',
+        "--checkpoint-db",
         type=str,
-        help='Separate database for checkpoints (defaults to --db)',
+        help="Separate database for checkpoints (defaults to --db)",
     )
     parser.add_argument(
-        '--zone-thresholds',
+        "--zone-thresholds",
         type=str,
-        help='Path to zone thresholds JSON file',
+        help="Path to zone thresholds JSON file",
     )
     parser.add_argument(
-        '--umap-sample-size',
+        "--umap-sample-size",
         type=int,
         default=50000,
-        help='Sample size for UMAP fitting (long-running mode)',
+        help="Sample size for UMAP fitting (long-running mode)",
     )
 
     args = parser.parse_args()
@@ -1223,17 +1282,19 @@ def main():
         # Run with coordinator
         logger.info("Running in long-running mode with coordinator")
 
-        result = asyncio.run(run_discovery_coordinated(
-            db_path=args.db,
-            output_dir=args.output,
-            resume_from=args.resume,
-            websocket_port=args.websocket_port,
-            max_memory_gb=args.max_memory_gb,
-            chunk_size=args.batch_size,
-            umap_sample_size=args.umap_sample_size,
-            zone_thresholds_path=args.zone_thresholds,
-            max_runtime_hours=args.max_hours,
-        ))
+        result = asyncio.run(
+            run_discovery_coordinated(
+                db_path=args.db,
+                output_dir=args.output,
+                resume_from=args.resume,
+                websocket_port=args.websocket_port,
+                max_memory_gb=args.max_memory_gb,
+                chunk_size=args.batch_size,
+                umap_sample_size=args.umap_sample_size,
+                zone_thresholds_path=args.zone_thresholds,
+                max_runtime_hours=args.max_hours,
+            )
+        )
 
         if result.success:
             print(f"\nDiscovery completed successfully!")
@@ -1274,5 +1335,5 @@ def main():
             sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

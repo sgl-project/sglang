@@ -16,27 +16,23 @@ Benefits:
 """
 
 import pytest
-import numpy as np
-from typing import List
 
 # Try to import torch and triton - skip tests if not available
 try:
     import torch
+
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
 
-try:
-    import triton
-    HAS_TRITON = True
-except ImportError:
-    HAS_TRITON = False
+import importlib.util
+
+HAS_TRITON = importlib.util.find_spec("triton") is not None
 
 
 # Skip all tests if torch/triton not available
 pytestmark = pytest.mark.skipif(
-    not HAS_TORCH or not HAS_TRITON,
-    reason="torch and triton required for kernel tests"
+    not HAS_TORCH or not HAS_TRITON, reason="torch and triton required for kernel tests"
 )
 
 
@@ -59,10 +55,22 @@ class TestSinqKernelOptimization:
         head_dim = 128
         seq_len = 100
 
-        q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=torch.float16)
-        k_buffer = torch.randn(seq_len * batch_size, num_kv_heads, head_dim, device=device, dtype=torch.float16)
-        kv_indptr = torch.tensor([0, seq_len, seq_len * 2], dtype=torch.int32, device=device)
-        kv_indices = torch.arange(seq_len * batch_size, dtype=torch.int32, device=device)
+        q = torch.randn(
+            batch_size, num_heads, head_dim, device=device, dtype=torch.float16
+        )
+        k_buffer = torch.randn(
+            seq_len * batch_size,
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=torch.float16,
+        )
+        kv_indptr = torch.tensor(
+            [0, seq_len, seq_len * 2], dtype=torch.int32, device=device
+        )
+        kv_indices = torch.arange(
+            seq_len * batch_size, dtype=torch.int32, device=device
+        )
         sm_scale = 1.0 / (head_dim ** 0.5)
 
         return {
@@ -122,7 +130,9 @@ class TestSinqKernelOptimization:
         for b in range(indices.shape[0]):
             for k in range(indices.shape[1]):
                 pos = indices_cpu[b, k].item()
-                assert pos >= 5 or pos == 0, f"Found sink position {pos} in batch {b}, top-k {k}"
+                assert (
+                    pos >= 5 or pos == 0
+                ), f"Found sink position {pos} in batch {b}, top-k {k}"
 
     def test_topk_capture_class_sink_threshold(self, test_data, device):
         """Test TopKAttentionCapture class with sink_threshold."""
@@ -159,7 +169,7 @@ class TestSinqKernelOptimization:
         current_pos = torch.tensor(
             [test_data["seq_len"], test_data["seq_len"]],
             dtype=torch.int64,
-            device=device
+            device=device,
         )
 
         capture = TopKAttentionCapture(
@@ -208,9 +218,9 @@ class TestSinqKernelOptimization:
                 valid_indices = indices_cpu[valid_mask]
                 if valid_indices.numel() > 0:
                     min_pos = valid_indices.min().item()
-                    assert min_pos >= threshold, (
-                        f"With sink_threshold={threshold}, found position {min_pos}"
-                    )
+                    assert (
+                        min_pos >= threshold
+                    ), f"With sink_threshold={threshold}, found position {min_pos}"
 
 
 class TestSinqEdgeCases:
@@ -236,14 +246,22 @@ class TestSinqEdgeCases:
         seq_len = 5  # All positions 0-4
         top_k = 5
 
-        q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=torch.float16)
-        k_buffer = torch.randn(seq_len, num_kv_heads, head_dim, device=device, dtype=torch.float16)
+        q = torch.randn(
+            batch_size, num_heads, head_dim, device=device, dtype=torch.float16
+        )
+        k_buffer = torch.randn(
+            seq_len, num_kv_heads, head_dim, device=device, dtype=torch.float16
+        )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
         sm_scale = 1.0 / (head_dim ** 0.5)
 
         scores, indices, logits, logsumexp = compute_topk_attention_chunked(
-            q, k_buffer, kv_indptr, kv_indices, sm_scale,
+            q,
+            k_buffer,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
             top_k=top_k,
             sink_threshold=5,  # Filter all positions
         )
@@ -266,15 +284,23 @@ class TestSinqEdgeCases:
         seq_len = 10
         top_k = 5
 
-        q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=torch.float16)
-        k_buffer = torch.randn(seq_len, num_kv_heads, head_dim, device=device, dtype=torch.float16)
+        q = torch.randn(
+            batch_size, num_heads, head_dim, device=device, dtype=torch.float16
+        )
+        k_buffer = torch.randn(
+            seq_len, num_kv_heads, head_dim, device=device, dtype=torch.float16
+        )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
         sm_scale = 1.0 / (head_dim ** 0.5)
 
         # Sink threshold larger than sequence
         scores, indices, logits, logsumexp = compute_topk_attention_chunked(
-            q, k_buffer, kv_indptr, kv_indices, sm_scale,
+            q,
+            k_buffer,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
             top_k=top_k,
             sink_threshold=20,  # Larger than seq_len
         )
@@ -306,14 +332,24 @@ class TestSinqPerformanceCharacteristics:
             head_dim = 128
             seq_len = 500
 
-            q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=torch.float16)
-            k_buffer = torch.randn(seq_len * batch_size, num_kv_heads, head_dim, device=device, dtype=torch.float16)
+            q = torch.randn(
+                batch_size, num_heads, head_dim, device=device, dtype=torch.float16
+            )
+            k_buffer = torch.randn(
+                seq_len * batch_size,
+                num_kv_heads,
+                head_dim,
+                device=device,
+                dtype=torch.float16,
+            )
             kv_indptr = torch.tensor(
                 [i * seq_len for i in range(batch_size + 1)],
                 dtype=torch.int32,
-                device=device
+                device=device,
             )
-            kv_indices = torch.arange(seq_len * batch_size, dtype=torch.int32, device=device)
+            kv_indices = torch.arange(
+                seq_len * batch_size, dtype=torch.int32, device=device
+            )
             sm_scale = 1.0 / (head_dim ** 0.5)
 
             capture = TopKAttentionCapture(top_k=20, sink_threshold=5)
@@ -350,8 +386,12 @@ def demo_sinq_optimization():
     seq_len = 1000
 
     q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=torch.float16)
-    k_buffer = torch.randn(seq_len * batch_size, num_kv_heads, head_dim, device=device, dtype=torch.float16)
-    kv_indptr = torch.tensor([0, seq_len, seq_len * 2], dtype=torch.int32, device=device)
+    k_buffer = torch.randn(
+        seq_len * batch_size, num_kv_heads, head_dim, device=device, dtype=torch.float16
+    )
+    kv_indptr = torch.tensor(
+        [0, seq_len, seq_len * 2], dtype=torch.int32, device=device
+    )
     kv_indices = torch.arange(seq_len * batch_size, dtype=torch.int32, device=device)
     sm_scale = 1.0 / (head_dim ** 0.5)
 
@@ -361,7 +401,9 @@ def demo_sinq_optimization():
 
     print("\n1. Without Sinq filtering (sink_threshold=0):")
     capture_no_filter = TopKAttentionCapture(top_k=10, sink_threshold=0)
-    result_no_filter = capture_no_filter.extract(q, k_buffer, kv_indptr, kv_indices, sm_scale)
+    result_no_filter = capture_no_filter.extract(
+        q, k_buffer, kv_indptr, kv_indices, sm_scale
+    )
     indices = result_no_filter["indices"][0].cpu().tolist()
     print(f"   Top-10 positions: {indices}")
     has_sinks = any(i < 5 for i in indices)

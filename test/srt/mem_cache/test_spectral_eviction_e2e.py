@@ -12,8 +12,8 @@ For live server testing, use: scripts/test_spectral_eviction_live.py
 
 import time
 import unittest
-from unittest.mock import MagicMock, patch
-from typing import Dict, List, Any, Optional
+from unittest.mock import MagicMock
+from typing import Dict, List
 
 import numpy as np
 
@@ -26,6 +26,7 @@ class TestSpectralEvictionE2E(unittest.TestCase):
         # Check if radix_cache is available
         try:
             from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+
             self.RadixCache = RadixCache
             self.TreeNode = TreeNode
             self.radix_available = True
@@ -39,6 +40,7 @@ class TestSpectralEvictionE2E(unittest.TestCase):
                 SpectralSkeletonComputer,
                 ZONE_IMPORTANCE,
             )
+
             self.SpectralEvictionStrategy = SpectralEvictionStrategy
             self.SpectralSkeletonComputer = SpectralSkeletonComputer
             self.ZONE_IMPORTANCE = ZONE_IMPORTANCE
@@ -53,7 +55,7 @@ class TestSpectralEvictionE2E(unittest.TestCase):
         This simulates the data format produced by scheduler_output_processor_mixin.py
         """
         attention_tokens = []
-        zones = ['syntax_floor', 'semantic_bridge', 'structure_ripple']
+        zones = ["syntax_floor", "semantic_bridge", "structure_ripple"]
 
         for i in range(n_tokens):
             # Create a 20D fingerprint vector
@@ -64,14 +66,16 @@ class TestSpectralEvictionE2E(unittest.TestCase):
             fingerprint[2] = 0.4 if i % 3 == 2 else 0.1  # long_mass
             fingerprint[3] = 1.5 + (i % 4) * 0.5  # entropy
 
-            attention_tokens.append({
-                'schema_version': 1,
-                'mode': 'fingerprint',
-                'fingerprint': fingerprint,
-                'manifold': zones[i % 3],
-                'step': i,
-                'think_phase': 'output',
-            })
+            attention_tokens.append(
+                {
+                    "schema_version": 1,
+                    "mode": "fingerprint",
+                    "fingerprint": fingerprint,
+                    "manifold": zones[i % 3],
+                    "step": i,
+                    "think_phase": "output",
+                }
+            )
 
         return attention_tokens
 
@@ -92,8 +96,8 @@ class TestSpectralEvictionE2E(unittest.TestCase):
 
         for token_info in attention_tokens:
             if isinstance(token_info, dict):
-                fp = token_info.get('fingerprint')
-                zone = token_info.get('manifold')
+                fp = token_info.get("fingerprint")
+                zone = token_info.get("manifold")
                 if fp is not None:
                     fingerprints.append(fp)
                 if zone is not None:
@@ -102,7 +106,9 @@ class TestSpectralEvictionE2E(unittest.TestCase):
         self.assertEqual(len(fingerprints), 5)
         self.assertEqual(len(manifold_zones), 5)
         self.assertEqual(len(fingerprints[0]), 20)  # 20D fingerprint
-        self.assertIn(manifold_zones[0], ['syntax_floor', 'semantic_bridge', 'structure_ripple'])
+        self.assertIn(
+            manifold_zones[0], ["syntax_floor", "semantic_bridge", "structure_ripple"]
+        )
 
     def test_attach_metadata_to_mock_node(self):
         """Test attaching spectral metadata to a mock TreeNode."""
@@ -122,12 +128,12 @@ class TestSpectralEvictionE2E(unittest.TestCase):
 
         # Attach metadata
         node.spectral_fingerprint = fingerprint
-        node.manifold_zone = 'semantic_bridge'
+        node.manifold_zone = "semantic_bridge"
         node.spectral_coherence = 0.85
 
         # Verify
         self.assertIsNotNone(node.spectral_fingerprint)
-        self.assertEqual(node.manifold_zone, 'semantic_bridge')
+        self.assertEqual(node.manifold_zone, "semantic_bridge")
         self.assertEqual(node.spectral_coherence, 0.85)
 
         # Test eviction priority
@@ -154,8 +160,8 @@ class TestSpectralEvictionE2E(unittest.TestCase):
         strategy = self.SpectralEvictionStrategy()
 
         # semantic_bridge should have highest importance
-        bridge_node = MockNode('semantic_bridge')
-        syntax_node = MockNode('syntax_floor')
+        bridge_node = MockNode("semantic_bridge")
+        syntax_node = MockNode("syntax_floor")
 
         bridge_priority = strategy.get_priority(bridge_node)
         syntax_priority = strategy.get_priority(syntax_node)
@@ -180,8 +186,8 @@ class TestSpectralEvictionE2E(unittest.TestCase):
         manifold_zones = []
         for token_info in attention_tokens:
             if isinstance(token_info, dict):
-                fp = token_info.get('fingerprint')
-                zone = token_info.get('manifold')
+                fp = token_info.get("fingerprint")
+                zone = token_info.get("manifold")
                 if fp is not None:
                     fingerprints.append(np.array(fp))
                 if zone is not None:
@@ -208,18 +214,31 @@ class TestSpectralEvictionE2E(unittest.TestCase):
         # Verify all nodes got valid priorities
         for i, priority in enumerate(priorities):
             self.assertIsInstance(priority, tuple, f"Node {i} priority should be tuple")
-            self.assertEqual(len(priority), 2, f"Node {i} priority should have 2 elements")
+            self.assertEqual(
+                len(priority), 2, f"Node {i} priority should have 2 elements"
+            )
             self.assertGreater(priority[0], 0, f"Node {i} spectral score should be > 0")
 
         # Verify zone-based ordering (semantic_bridge > syntax_floor)
-        bridge_priorities = [p[0] for i, p in enumerate(priorities) if manifold_zones[i] == 'semantic_bridge']
-        syntax_priorities = [p[0] for i, p in enumerate(priorities) if manifold_zones[i] == 'syntax_floor']
+        bridge_priorities = [
+            p[0]
+            for i, p in enumerate(priorities)
+            if manifold_zones[i] == "semantic_bridge"
+        ]
+        syntax_priorities = [
+            p[0]
+            for i, p in enumerate(priorities)
+            if manifold_zones[i] == "syntax_floor"
+        ]
 
         if bridge_priorities and syntax_priorities:
             avg_bridge = sum(bridge_priorities) / len(bridge_priorities)
             avg_syntax = sum(syntax_priorities) / len(syntax_priorities)
-            self.assertGreater(avg_bridge, avg_syntax,
-                "semantic_bridge nodes should have higher avg priority than syntax_floor")
+            self.assertGreater(
+                avg_bridge,
+                avg_syntax,
+                "semantic_bridge nodes should have higher avg priority than syntax_floor",
+            )
 
     def test_skeleton_computation_e2e(self):
         """Test skeleton computation with realistic fingerprints."""
@@ -286,19 +305,16 @@ class TestFingerprintSchemaIntegration(unittest.TestCase):
             from examples.attention_explorer.discovery.fingerprint_schema import (
                 V1_DIM,
                 V2_DIM,
-                FP_LOCAL_MASS,
-                FP_ENTROPY,
                 FP_ROTATIONAL_VARIANCE,
                 ZONE_THRESHOLDS,
-                is_v2,
             )
 
             self.assertEqual(V1_DIM, 20)
             self.assertEqual(V2_DIM, 21)
             self.assertEqual(FP_ROTATIONAL_VARIANCE, 20)
-            self.assertIn('syntax_floor', ZONE_THRESHOLDS)
-            self.assertIn('semantic_bridge', ZONE_THRESHOLDS)
-            self.assertIn('structure_ripple', ZONE_THRESHOLDS)
+            self.assertIn("syntax_floor", ZONE_THRESHOLDS)
+            self.assertIn("semantic_bridge", ZONE_THRESHOLDS)
+            self.assertIn("structure_ripple", ZONE_THRESHOLDS)
 
         except ImportError:
             self.skipTest("fingerprint_schema not available")
