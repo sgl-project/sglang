@@ -2,19 +2,15 @@
 //!
 //! This module defines stages specific to regular tokenizer-based models.
 
-pub mod chat;
-pub mod classify;
-pub mod embedding;
-pub mod generate;
-mod preparation;
-mod request_building;
-mod response_processing;
+pub(crate) mod chat;
+pub(crate) mod classify;
+pub(crate) mod embedding;
+pub(crate) mod generate;
+pub(crate) mod preparation;
+pub(crate) mod request_building;
+pub(crate) mod response_processing;
 
-pub use chat::{ChatPreparationStage, ChatRequestBuildingStage, ChatResponseProcessingStage};
-pub use classify::ClassifyResponseProcessingStage;
-pub use generate::{
-    GeneratePreparationStage, GenerateRequestBuildingStage, GenerateResponseProcessingStage,
-};
-pub use preparation::PreparationStage;
-pub use request_building::RequestBuildingStage;
-pub use response_processing::ResponseProcessingStage;
+// Re-export main stages used by pipeline
+pub(crate) use preparation::PreparationStage;
+pub(crate) use request_building::RequestBuildingStage;
+pub(crate) use response_processing::ResponseProcessingStage;

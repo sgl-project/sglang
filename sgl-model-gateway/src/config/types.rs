@@ -58,6 +58,9 @@ pub struct RouterConfig {
     /// Required when history_backend = "postgres"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postgres: Option<PostgresConfig>,
+    /// Required when history_backend = "redis"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redis: Option<RedisConfig>,
     /// For reasoning models (e.g., deepseek-r1, qwen3)
     pub reasoning_parser: Option<String>,
     /// For tool-call interactions
@@ -138,6 +141,7 @@ pub enum HistoryBackend {
     None,
     Oracle,
     Postgres,
+    Redis,
 }
 
 /// Oracle history backend configuration
@@ -245,6 +249,53 @@ impl PostgresConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RedisConfig {
+    // Redis connection URL
+    // redis://[:password@]host[:port][/db]
+    pub url: String,
+    // Connection pool max size
+    #[serde(default = "default_redis_pool_max")]
+    pub pool_max: usize,
+    // Data retention in days. If None, data persists indefinitely.
+    #[serde(default = "default_redis_retention_days")]
+    pub retention_days: Option<u64>,
+}
+
+fn default_redis_pool_max() -> usize {
+    16
+}
+
+fn default_redis_retention_days() -> Option<u64> {
+    Some(30)
+}
+
+impl RedisConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let s = self.url.trim();
+        if s.is_empty() {
+            return Err("redis url should not be empty".to_string());
+        }
+
+        let url = Url::parse(s).map_err(|e| format!("invalid redis url: {}", e))?;
+
+        let scheme = url.scheme();
+        if scheme != "redis" && scheme != "rediss" {
+            return Err(format!("unsupported URL scheme: {}", scheme));
+        }
+
+        if url.host().is_none() {
+            return Err("redis url must have a host".to_string());
+        }
+
+        if self.pool_max == 0 {
+            return Err("pool_max must be greater than 0".to_string());
+        }
+
+        Ok(())
+    }
+}
+
 /// Routing mode configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -305,6 +356,19 @@ impl RoutingMode {
     }
 }
 
+/// Assignment mode for manual policy when encountering a new routing key
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualAssignmentMode {
+    /// Random selection (default)
+    #[default]
+    Random,
+    /// Select worker with minimum running requests
+    MinLoad,
+    /// Select worker with minimum active routing keys
+    MinGroup,
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -341,8 +405,19 @@ pub enum PolicyConfig {
     /// - X-SMG-Routing-Key: Routes to a cached worker or assigns a new one
     /// - Provides true sticky sessions with zero key redistribution on worker add
     /// - Falls back to random selection if no routing key is provided
+    /// - Supports LRU eviction when cache size exceeds max_entries
     #[serde(rename = "manual")]
-    Manual,
+    Manual {
+        /// Interval between TTL eviction cycles (seconds, default: 60)
+        #[serde(default = "default_manual_eviction_interval_secs")]
+        eviction_interval_secs: u64,
+        /// Maximum idle time before eviction (seconds, default: 14400 = 4 hours)
+        #[serde(default = "default_manual_max_idle_secs")]
+        max_idle_secs: u64,
+        /// Assignment mode for new routing keys (default: random)
+        #[serde(default)]
+        assignment_mode: ManualAssignmentMode,
+    },
 
     /// Consistent hashing policy using hash ring for session affinity:
     /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
@@ -376,6 +451,14 @@ fn default_load_factor() -> f64 {
     1.25
 }
 
+fn default_manual_eviction_interval_secs() -> u64 {
+    60
+}
+
+fn default_manual_max_idle_secs() -> u64 {
+    4 * 3600
+}
+
 impl PolicyConfig {
     pub fn name(&self) -> &'static str {
         match self {
@@ -384,7 +467,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::Bucket { .. } => "bucket",
-            PolicyConfig::Manual => "manual",
+            PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
         }
@@ -563,6 +646,7 @@ impl Default for RouterConfig {
             history_backend: default_history_backend(),
             oracle: None,
             postgres: None,
+            redis: None,
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),
