@@ -603,7 +603,7 @@ class SchedulerDisaggregationPrefillMixin:
         """
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.tp_worker.get_attention_tp_cpu_group(),
+            self.attn_tp_cpu_group,
         )
 
         transferred_rids: List[str] = []

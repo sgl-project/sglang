@@ -11,6 +11,10 @@ from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
 from sglang.srt.environ import envs
+from sglang.srt.metrics.collector import (
+    ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
+    compute_routing_key_stats,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -144,9 +148,27 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:e2e_request_latency_seconds",
             "sglang:http_requests_active",
             "sglang:routing_keys_active",
+            "sglang:num_unique_running_routing_keys",
+            "sglang:routing_key_running_req_count",
+            "sglang:routing_key_all_req_count",
         ]
         for metric in essential_metrics:
             self.assertIn(metric, metrics_text, f"Missing metric: {metric}")
+
+        # Verify routing key GaugeHistogram buckets
+        expected_buckets = len(ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS) + 1
+        for metric_name in [
+            "sglang:routing_key_running_req_count",
+            "sglang:routing_key_all_req_count",
+        ]:
+            gt_le_pairs = set()
+            for sample in metrics.get(metric_name, []):
+                gt_le_pairs.add((sample.labels.get("gt"), sample.labels.get("le")))
+            self.assertEqual(
+                len(gt_le_pairs),
+                expected_buckets,
+                f"{metric_name}: Expected {expected_buckets} buckets, got {len(gt_le_pairs)}",
+            )
 
         self.assertIn(f'model_name="{_MODEL_NAME}"', metrics_text)
         self.assertIn("_sum{", metrics_text)
@@ -158,6 +180,7 @@ class TestEnableMetrics(CustomTestCase):
             ("sglang:realtime_tokens_total", {"mode": "decode"}),
             ("sglang:gpu_execution_seconds_total", {"category": "forward_extend"}),
             ("sglang:gpu_execution_seconds_total", {"category": "forward_decode"}),
+            ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
 
@@ -183,6 +206,34 @@ def _check_metrics_positive(test_case, metrics, metrics_to_check):
     for metric_name, labels in metrics_to_check:
         value = _get_sample_value_by_labels(metrics[metric_name], labels)
         test_case.assertGreater(value, 0, f"{metric_name} {labels}")
+
+
+class TestComputeRoutingKeyStats(unittest.TestCase):
+    def test_empty(self):
+        num_unique, req_counts = compute_routing_key_stats([])
+        self.assertEqual(num_unique, 0)
+        self.assertEqual(req_counts, [])
+
+    def test_all_none(self):
+        num_unique, req_counts = compute_routing_key_stats([None, None, None])
+        self.assertEqual(num_unique, 0)
+        self.assertEqual(req_counts, [])
+
+    def test_with_none(self):
+        num_unique, req_counts = compute_routing_key_stats([None, "key1", None])
+        self.assertEqual(num_unique, 1)
+        self.assertEqual(req_counts, [1])
+
+    def test_single_key_multiple_reqs(self):
+        num_unique, req_counts = compute_routing_key_stats(["key1"] * 5)
+        self.assertEqual(num_unique, 1)
+        self.assertEqual(req_counts, [5])
+
+    def test_distribution(self):
+        routing_keys = ["key1"] * 5 + ["key2"] * 1 + ["key3"] * 15 + ["key4"] * 250
+        num_unique, req_counts = compute_routing_key_stats(routing_keys)
+        self.assertEqual(num_unique, 4)
+        self.assertEqual(sorted(req_counts), [1, 5, 15, 250])
 
 
 if __name__ == "__main__":

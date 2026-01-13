@@ -265,6 +265,11 @@ class ServerArgs:
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
+    # Pipeline override
+    pipeline_class_name: str | None = (
+        None  # Override pipeline class from model_index.json
+    )
+
     # LoRA parameters
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
@@ -284,6 +289,9 @@ class ServerArgs:
     vae_cpu_offload: bool | None = None
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
+
+    # ComfyUI integration
+    comfyui_mode: bool = False
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -935,7 +943,10 @@ class ServerArgs:
 
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             # TODO: need a better way to tell this
-            if "wan" in self.pipeline_config.__class__.__name__.lower():
+            if (
+                "wan" in self.pipeline_config.__class__.__name__.lower()
+                and self.dit_layerwise_offload is None
+            ):
                 logger.info(
                     "Automatically enable dit_layerwise_offload for Wan for best performance"
                 )
