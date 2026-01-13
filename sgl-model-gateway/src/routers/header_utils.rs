@@ -3,7 +3,13 @@ use axum::{
     extract::Request,
     http::{HeaderMap, HeaderValue},
 };
-use http::header::HeaderName;
+use http::{
+    header,
+    header::HeaderName,
+};
+
+// `http::header` intentionally avoids defining constants for every legacy header name.
+static HEADER_KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 
 static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
@@ -59,16 +65,16 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
 fn should_forward_header_no_alloc(name: &str) -> bool {
     // List of headers that should NOT be forwarded (hop-by-hop headers)
     // Use eq_ignore_ascii_case to avoid to_lowercase() allocation
-    !(name.eq_ignore_ascii_case("connection")
-        || name.eq_ignore_ascii_case("keep-alive")
-        || name.eq_ignore_ascii_case("proxy-authenticate")
-        || name.eq_ignore_ascii_case("proxy-authorization")
-        || name.eq_ignore_ascii_case("te")
-        || name.eq_ignore_ascii_case("trailer")
-        || name.eq_ignore_ascii_case("transfer-encoding")
-        || name.eq_ignore_ascii_case("upgrade")
-        || name.eq_ignore_ascii_case("content-encoding")
-        || name.eq_ignore_ascii_case("host"))
+    !(name.eq_ignore_ascii_case(header::CONNECTION.as_str())
+        || name.eq_ignore_ascii_case(HEADER_KEEP_ALIVE.as_str())
+        || name.eq_ignore_ascii_case(header::PROXY_AUTHENTICATE.as_str())
+        || name.eq_ignore_ascii_case(header::PROXY_AUTHORIZATION.as_str())
+        || name.eq_ignore_ascii_case(header::TE.as_str())
+        || name.eq_ignore_ascii_case(header::TRAILER.as_str())
+        || name.eq_ignore_ascii_case(header::TRANSFER_ENCODING.as_str())
+        || name.eq_ignore_ascii_case(header::UPGRADE.as_str())
+        || name.eq_ignore_ascii_case(header::CONTENT_ENCODING.as_str())
+        || name.eq_ignore_ascii_case(header::HOST.as_str()))
 }
 
 /// Apply headers to a reqwest request builder, filtering out headers that shouldn't be forwarded
@@ -80,7 +86,7 @@ pub fn apply_request_headers(
 ) -> reqwest::RequestBuilder {
     // Always forward Authorization header first if present
     if let Some(auth) = headers
-        .get("authorization")
+        .get(header::AUTHORIZATION.as_str())
         .or_else(|| headers.get("Authorization"))
     {
         request_builder = request_builder.header("Authorization", auth.clone());
@@ -96,18 +102,18 @@ pub fn apply_request_headers(
         // - We already handled (authorization)
         // - Are hop-by-hop headers (connection, transfer-encoding)
         // - Should not be forwarded (host)
-        let should_skip = key_str.eq_ignore_ascii_case("authorization") // Already handled above
-            || key_str.eq_ignore_ascii_case("host")
-            || key_str.eq_ignore_ascii_case("connection")
-            || key_str.eq_ignore_ascii_case("transfer-encoding")
-            || key_str.eq_ignore_ascii_case("keep-alive")
-            || key_str.eq_ignore_ascii_case("te")
-            || key_str.eq_ignore_ascii_case("trailer")
-            || key_str.eq_ignore_ascii_case("accept-encoding")
-            || key_str.eq_ignore_ascii_case("upgrade")
+        let should_skip = key_str.eq_ignore_ascii_case(header::AUTHORIZATION.as_str()) // Already handled above
+            || key_str.eq_ignore_ascii_case(header::HOST.as_str())
+            || key_str.eq_ignore_ascii_case(header::CONNECTION.as_str())
+            || key_str.eq_ignore_ascii_case(header::TRANSFER_ENCODING.as_str())
+            || key_str.eq_ignore_ascii_case(HEADER_KEEP_ALIVE.as_str())
+            || key_str.eq_ignore_ascii_case(header::TE.as_str())
+            || key_str.eq_ignore_ascii_case(header::TRAILER.as_str())
+            || key_str.eq_ignore_ascii_case(header::ACCEPT_ENCODING.as_str())
+            || key_str.eq_ignore_ascii_case(header::UPGRADE.as_str())
             || (skip_content_headers
-                && (key_str.eq_ignore_ascii_case("content-type")
-                    || key_str.eq_ignore_ascii_case("content-length")));
+                && (key_str.eq_ignore_ascii_case(header::CONTENT_TYPE.as_str())
+                    || key_str.eq_ignore_ascii_case(header::CONTENT_LENGTH.as_str())));
 
         if !should_skip {
             request_builder = request_builder.header(key.clone(), value.clone());
