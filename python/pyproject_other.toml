@@ -81,7 +81,7 @@ srt_hip = [
   "sglang[runtime_common]",
   "torch",
   "petit_kernel==0.0.2",
-  "wave-lang==3.8.2",
+  "wave-lang==3.9.1",
 ]
 
 # https://docs.sglang.io/platforms/ascend_npu.html
