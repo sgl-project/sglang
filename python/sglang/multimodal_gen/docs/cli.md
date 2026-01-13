@@ -188,3 +188,57 @@ Once the generation task has finished, the server will shut down automatically.
 
 > [!NOTE]
 > The HTTP server-related arguments are ignored in this subcommand.
+
+## Diffusers Backend
+
+SGLang diffusion supports a **diffusers backend** that allows you to run any diffusers-compatible model through SGLang's infrastructure using vanilla diffusers pipelines. This is useful for running models without native SGLang implementations or models with custom pipeline classes.
+
+### Arguments
+
+| Argument | Values | Description |
+|----------|--------|-------------|
+| `--backend` | `auto` (default), `sglang`, `diffusers` | `auto`: prefer native SGLang, fallback to diffusers. `sglang`: force native (fails if unavailable). `diffusers`: force vanilla diffusers pipeline. |
+| `--diffusers-attention-backend` | `flash`, `_flash_3_hub`, `sage`, `xformers`, `native` | Attention backend for diffusers pipelines. See [diffusers attention backends](https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends). |
+| `--trust-remote-code` | flag | Required for models with custom pipeline classes (e.g., Ovis). |
+| `--vae-tiling` | flag | Enable VAE tiling for large image support (decodes tile-by-tile). |
+| `--vae-slicing` | flag | Enable VAE slicing for lower memory usage (decodes slice-by-slice). |
+| `--dit-precision` | `fp16`, `bf16`, `fp32` | Precision for the diffusion transformer. |
+| `--vae-precision` | `fp16`, `bf16`, `fp32` | Precision for the VAE. |
+
+### Example: Running Ovis-Image-7B
+
+[Ovis-Image-7B](https://huggingface.co/AIDC-AI/Ovis-Image-7B) is a 7B text-to-image model optimized for high-quality text rendering.
+
+```bash
+sglang generate \
+  --model-path AIDC-AI/Ovis-Image-7B \
+  --backend diffusers \
+  --trust-remote-code \
+  --diffusers-attention-backend flash \
+  --prompt "A serene Japanese garden with cherry blossoms" \
+  --height 1024 \
+  --width 1024 \
+  --num-inference-steps 30 \
+  --save-output \
+  --output-path outputs \
+  --output-file-name ovis_garden.png
+```
+
+### Extra Diffusers Arguments
+
+For pipeline-specific parameters not exposed via CLI, use `diffusers_kwargs` in a config file:
+
+```json
+{
+    "model_path": "AIDC-AI/Ovis-Image-7B",
+    "backend": "diffusers",
+    "prompt": "A beautiful landscape",
+    "diffusers_kwargs": {
+        "cross_attention_kwargs": {"scale": 0.5}
+    }
+}
+```
+
+```bash
+sglang generate --config config.json
+```
