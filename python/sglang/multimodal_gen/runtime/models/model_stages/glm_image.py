@@ -672,9 +672,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
             width = width or ar_condition_images[0].width
-        print(f"689 {height=}, {width=}")
-        height = 1152
-        width = 768
         time_start = time.time()
         prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
             prompt=prompt,
@@ -827,5 +824,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         batch.crop_coords = crops_coords_top_left
 
         batch.kv_caches = kv_caches
+
+        batch.height = height
+        batch.width = width
 
         return batch
