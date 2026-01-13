@@ -1402,6 +1402,7 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 @dataclass
 class CheckWeightsReqInput(BaseReq):
     action: str
+    checksums: Optional[list | dict] = None
 
 
 @dataclass

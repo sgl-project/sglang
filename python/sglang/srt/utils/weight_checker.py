@@ -1,3 +1,4 @@
+import hashlib
 import logging
 from typing import Dict, Iterable, Tuple
 
@@ -16,7 +17,7 @@ class WeightChecker:
         self._model_runner = model_runner
         self._snapshot_tensors = None
 
-    def handle(self, action: str):
+    def handle(self, action: str, checksums=None):
         logger.info(f"[WeightChecker] handle action={action}")
         if action == "snapshot":
             self._snapshot()
@@ -24,8 +25,95 @@ class WeightChecker:
             self._reset_tensors()
         elif action == "compare":
             self._compare()
+        elif action == "compare_checksum":
+            self._compare_checksum(checksums)
         else:
             raise Exception(f"Unsupported {action=}")
+
+    def _compare_checksum(self, expected_checksums):
+        if expected_checksums is None:
+            return
+
+        # 1. Get raw model state (BF16 for Qwen2.5-3B)
+        actual_state = dict(self._model_state())
+
+        import sglang.srt.distributed.parallel_state as ps
+
+        tp_group = ps.get_tp_group()
+        tp_rank = ps.get_tensor_model_parallel_rank()
+
+        errors = []
+        matched_count = 0
+
+        for name in sorted(actual_state.keys()):
+            if name in expected_checksums:
+                param = actual_state[name]
+                expected_hash = expected_checksums[name]
+
+                data = param.data.to(torch.bfloat16)
+
+                # STAGE A: Direct Match (Handles Replicated layers like Norms/Embeds)
+                t_cpu = data.detach().cpu().contiguous()
+                actual_hash = hashlib.sha256(
+                    t_cpu.view(torch.uint8).numpy()
+                ).hexdigest()
+                if actual_hash == expected_hash:
+                    matched_count += 1
+                    continue
+
+                # STAGE B: Shard Reconstruction (Handles TP layers)
+                if tp_group.world_size > 1:
+                    # Gather shards from all TP ranks
+                    all_shards = [
+                        torch.empty_like(data) for _ in range(tp_group.world_size)
+                    ]
+                    torch.distributed.all_gather(
+                        all_shards, data, group=tp_group.device_group
+                    )
+
+                    # Try Dim 0 (ColumnParallel: Gate, Up, QKV)
+                    full_p0 = torch.cat(all_shards, dim=0)
+                    if (
+                        hashlib.sha256(
+                            full_p0.detach()
+                            .cpu()
+                            .contiguous()
+                            .view(torch.uint8)
+                            .numpy()
+                        ).hexdigest()
+                        == expected_hash
+                    ):
+                        matched_count += 1
+                        continue
+
+                    # Try Dim 1 (RowParallel: O_proj, Down_proj) - only for 2D weights
+                    if data.ndim > 1:
+                        full_p1 = torch.cat(all_shards, dim=1)
+                        if (
+                            hashlib.sha256(
+                                full_p1.detach()
+                                .cpu()
+                                .contiguous()
+                                .view(torch.uint8)
+                                .numpy()
+                            ).hexdigest()
+                            == expected_hash
+                        ):
+                            matched_count += 1
+                            continue
+
+                # record mismatch if all reconstruction attempts fail
+                errors.append(
+                    f"name={name} TP_rank={tp_rank} mismatch! expected={expected_hash}, actual_shard={actual_hash}"
+                )
+
+        logger.info(
+            f"[WeightChecker] verified {matched_count} parameters on TP_rank {tp_rank}"
+        )
+        if errors:
+            raise Exception(
+                "Weight checksum verification failed:\n" + "\n".join(errors[:5])
+            )
 
     def _snapshot(self):
         named_tensors = [
