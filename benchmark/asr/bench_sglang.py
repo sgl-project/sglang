@@ -12,7 +12,7 @@ import numpy as np
 from datasets import load_dataset
 from evaluate import load
 from transformers import AutoTokenizer
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, OpenAI
 
 def to_bytes(y, sr):
     buffer = io.BytesIO()
@@ -20,15 +20,13 @@ def to_bytes(y, sr):
     buffer.seek(0)
     return buffer
 
-async def run_asr_sglang(client, model_name, y, sr):
-    # Convert audio to base64 for sGLang multimodal chat completion
+async def run_asr_chat(client, model_name, y, sr):
+    """Use chat completions API with audio_url for ASR."""
     with to_bytes(y, sr) as f:
         audio_bytes = f.read()
         audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
     
     start_time = time.perf_counter()
-    # sGLang uses chat completions for audio/ASR models
-    # We use the data URL format for audio
     response = await client.chat.completions.create(
         model=model_name,
         messages=[{
@@ -48,10 +46,39 @@ async def run_asr_sglang(client, model_name, y, sr):
     latency = end_time - start_time
     return latency, asr_text
 
-async def bound_asr(sem, client, model_name, tokenizer, audio, reference):
+def run_asr_transcription_sync(client, model_name, y, sr, language=None):
+    """Use audio transcriptions API for ASR (sync version)."""
+    audio_buffer = to_bytes(y, sr)
+    audio_buffer.name = "audio.wav"  # OpenAI client needs a name attribute
+    
+    start_time = time.perf_counter()
+    kwargs = {
+        "model": model_name,
+        "file": audio_buffer,
+    }
+    if language:
+        kwargs["language"] = language
+    
+    transcription = client.audio.transcriptions.create(**kwargs)
+    end_time = time.perf_counter()
+    
+    latency = end_time - start_time
+    return latency, transcription.text
+
+async def run_asr_transcription(client, model_name, y, sr, language=None):
+    """Async wrapper for transcription API (runs sync call in executor)."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, run_asr_transcription_sync, client, model_name, y, sr, language
+    )
+
+async def bound_asr(sem, client, model_name, tokenizer, audio, reference, api_type="chat", language=None):
     async with sem:
         try:
-            latency, text = await run_asr_sglang(client, model_name, *audio)
+            if api_type == "transcription":
+                latency, text = await run_asr_transcription(client, model_name, *audio, language=language)
+            else:
+                latency, text = await run_asr_chat(client, model_name, *audio)
             
             # Calculate tokens for throughput metrics
             num_output_tokens = len(tokenizer(text, add_special_tokens=False).input_ids)
@@ -70,30 +97,35 @@ async def bound_asr(sem, client, model_name, tokenizer, audio, reference):
             print(f"Error during ASR: {e}")
             return None
 
-async def process_dataset(model_name, client, data, concurrent_request):
+async def process_dataset(model_name, client, data, concurrent_request, api_type="chat", language=None):
     sem = asyncio.Semaphore(concurrent_request)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # Warmup
     print("Performing warmup...")
     audio_warmup, sr_warmup = data[0]["audio"]["array"], data[0]["audio"]["sampling_rate"]
-    await bound_asr(sem, client, model_name, tokenizer, (audio_warmup, sr_warmup), "")
+    await bound_asr(sem, client, model_name, tokenizer, (audio_warmup, sr_warmup), "", api_type=api_type, language=language)
 
     tasks = []
     print(f"Processing {len(data)} samples...")
     for sample in data:
         audio, sr = sample["audio"]["array"], sample["audio"]["sampling_rate"]
         tasks.append(asyncio.create_task(
-            bound_asr(sem, client, model_name, tokenizer, (audio, sr), sample["text"])
+            bound_asr(sem, client, model_name, tokenizer, (audio, sr), sample["text"], api_type=api_type, language=language)
         ))
     
     results = await asyncio.gather(*tasks)
     return [r for r in results if r is not None]
 
 def run_evaluation(args):
-    client = AsyncOpenAI(base_url=f"{args.base_url}/v1", api_key="None")
+    # Use sync client for transcription API, async for chat API
+    if args.api_type == "transcription":
+        client = OpenAI(base_url=f"{args.base_url}/v1", api_key="None")
+    else:
+        client = AsyncOpenAI(base_url=f"{args.base_url}/v1", api_key="None")
     
     print(f"Loading dataset: {args.dataset}...")
+    print(f"Using API type: {args.api_type}")
     dataset = load_dataset(args.dataset, split=args.split)
     
     # Filter by duration if needed (Whisper max is 30s)
@@ -111,7 +143,7 @@ def run_evaluation(args):
         dataset = dataset.select(range(min(args.n_examples, len(dataset))))
 
     start = time.perf_counter()
-    results = asyncio.run(process_dataset(args.model, client, dataset, args.concurrency))
+    results = asyncio.run(process_dataset(args.model, client, dataset, args.concurrency, api_type=args.api_type, language=args.language))
     total_test_time = time.perf_counter() - start
 
     if not results:
@@ -172,6 +204,9 @@ if __name__ == "__main__":
     parser.add_argument("--output", help="Path to save results in JSON")
     parser.add_argument("--show-predictions", action="store_true", help="Print sample predictions and references")
     parser.add_argument("--print-n", type=int, default=5, help="Number of sample predictions to print")
+    parser.add_argument("--api-type", choices=["chat", "transcription"], default="chat",
+                        help="API type to use: 'chat' for chat completions with audio_url, 'transcription' for audio.transcriptions API")
+    parser.add_argument("--language", default=None, help="Language code for transcription API (e.g., 'en')")
     args = parser.parse_args()
 
     run_evaluation(args)
