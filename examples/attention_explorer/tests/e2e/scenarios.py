@@ -69,7 +69,7 @@ SYNTAX_SCENARIOS = [
         messages=[
             {
                 "role": "user",
-                "content": "Fix the grammar: Him went to the store yesterday and buyed milk.",
+                "content": "Fix the grammar: Him went to the store yesterday and goed shopping.",
             }
         ],
         expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
