@@ -98,11 +98,12 @@ def chunk_gated_delta_rule_cpu(
     g,
     beta,
     initial_state,
-    output_final_state,
     cu_seqlens,
     head_first,
     use_qk_l2norm_in_kernel,
+    initial_state_indices,
 ):
+    recurrent_state = initial_state[initial_state_indices]
     core_attn_out, last_recurrent_state = (
         torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu(
             q,
@@ -110,12 +111,12 @@ def chunk_gated_delta_rule_cpu(
             v,
             g,
             beta,
-            initial_state,
-            output_final_state,
+            recurrent_state,
+            True,  # output_final_state
             cu_seqlens,
             head_first,
             use_qk_l2norm_in_kernel,
         )
     )
-    h = None  # todo: add return h support
+    h = None  # Todo: add return h support
     return core_attn_out, last_recurrent_state, h
