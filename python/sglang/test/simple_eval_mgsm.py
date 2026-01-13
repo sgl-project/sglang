@@ -9,6 +9,7 @@ https://arxiv.org/abs/2210.03057 reference: https://github.com/google-research/u
 
 import re
 import urllib
+from enum import StrEnum
 from typing import Optional
 
 from sglang.test import simple_eval_common as common
@@ -20,64 +21,82 @@ from sglang.test.simple_eval_common import (
     SingleEvalResult,
 )
 
+
+class Language:
+    class LatinScript(StrEnum):
+        ENGLISH = "en"
+        SPANISH = "es"
+        FRENCH = "fr"
+        GERMAN = "de"
+        SWAHILI = "sw"
+
+    class NonLatinScript(StrEnum):
+        RUSSIAN = "ru"
+        BENGALI = "bn"
+        TELUGU = "te"
+        THAI = "th"
+        JAPANESE = "ja"
+        CHINESE = "zh"
+
+
 LATIN_SCRIPT_LANGUAGES = [
-    "en",
-    "es",
-    "fr",
-    "de",
-    "sw",
+    Language.LatinScript.ENGLISH.value,
+    Language.LatinScript.SPANISH.value,
+    Language.LatinScript.FRENCH.value,
+    Language.LatinScript.GERMAN.value,
+    Language.LatinScript.SWAHILI.value,
 ]
 
 NON_LATIN_SCRIPT_LANGUAGES = [
-    "ru",
-    "bn",
-    "te",
-    "th",
-    "ja",
-    "zh",
+    Language.NonLatinScript.RUSSIAN.value,
+    Language.NonLatinScript.BENGALI.value,
+    Language.NonLatinScript.TELUGU.value,
+    Language.NonLatinScript.THAI.value,
+    Language.NonLatinScript.JAPANESE.value,
+    Language.NonLatinScript.CHINESE.value,
 ]
 
 ALL_LANGUAGES = LATIN_SCRIPT_LANGUAGES + NON_LATIN_SCRIPT_LANGUAGES
 
 LANG_TO_FPATH = {
-    "en": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_en.tsv",
-    "es": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_es.tsv",
-    "fr": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_fr.tsv",
-    "de": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_de.tsv",
-    "sw": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_sw.tsv",
-    "ru": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_ru.tsv",
-    "bn": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_bn.tsv",
-    "te": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_te.tsv",
-    "th": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_th.tsv",
-    "ja": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_ja.tsv",
-    "zh": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_zh.tsv",
+    Language.LatinScript.ENGLISH.value: "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_en.tsv",
+    Language.LatinScript.SPANISH.value: "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_es.tsv",
+    Language.LatinScript.FRENCH.value: "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_fr.tsv",
+    Language.LatinScript.GERMAN.value: "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_de.tsv",
+    Language.LatinScript.SWAHILI.value: "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_sw.tsv",
+    Language.NonLatinScript.RUSSIAN.value: "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_ru.tsv",
+    Language.NonLatinScript.BENGALI.value: "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_bn.tsv",
+    Language.NonLatinScript.TELUGU.value: "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_te.tsv",
+    Language.NonLatinScript.THAI.value: "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_th.tsv",
+    Language.NonLatinScript.JAPANESE.value: "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_ja.tsv",
+    Language.NonLatinScript.CHINESE.value: "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_zh.tsv",
 }
 LANG_TO_INSTRUCTIONS = {
-    "en": """Solve this math problem. Give the reasoning steps before giving the final answer on the last line by itself in the format of "Answer:". Do not add anything other than the integer answer after "Answer:".\n\n{input}""",
-    "es": """Resuelve este problema matemático. Proporciona los pasos de razonamiento antes de dar la respuesta final en la última línea por sí misma en el formato de "Respuesta:". No añadas nada más que la respuesta entera después de "Respuesta:".\n\n{input}""",
-    "fr": """Résolvez ce problème de mathématiques. Donnez les étapes de raisonnement avant de fournir la réponse finale sur la dernière ligne elle-même dans le format de "Réponse:". N'ajoutez rien d'autre que la réponse entière après "Réponse:".\n\n{input}""",
-    "de": """Löse dieses Mathematikproblem. Gib die Schritte zur Begründung an, bevor du die endgültige Antwort in der letzten Zeile alleine im Format "Antwort:" gibst. Füge nichts anderes als die ganzzahlige Antwort nach "Antwort:" hinzu.\n\n{input}""",
-    "sw": """Suluhisha tatizo hili la hesabu. Toa hatua za mantiki kabla ya kutoa jibu la mwisho kwenye mstari wa mwisho peke yake katika muundo wa "Jibu:". Usiongeze chochote kingine isipokuwa jibu la integer baada ya "Jibu:".\n\n{input}""",
-    "ru": """Решите эту математическую задачу. Объясните шаги рассуждения перед тем, как дать окончательный ответ в последней строке сам по себе в формате "Ответ:". Не добавляйте ничего, кроме целочисленного ответа после "Ответ:".\n\n{input}""",
-    "bn": """এই গণিতের সমস্যাটি সমাধান করুন। চূড়ান্ত উত্তর দেওয়ার আগে যুক্তিসম্পন্ন পদক্ষেপ প্রদান করুন। চূড়ান্ত উত্তরটি একক সংখ্যা হিসাবে "উত্তর:" এর পরে শেষ লাইনে দিন। "উত্তর:" এর পরে অন্য কিছু যুক্ত করবেন না।.\n\n{input}""",
-    "te": """ఈ గణిత సమస్యను పరిష్కరించండి. చివరి సమాధానాన్ని ఇవ్వదానికి ముందు తర్కాత్మక అదుగులను ఇవ్వండి. చివరి పంక్తిలో మాత్రమే 'సమాధానం:' అనే ఆకారంలో చివరి సమాధానాద్ని ఇవ్వండి సమాధానం: తర్వాత పూర్ణాంక సమాధానానికి తప్పించి ఎదేనా చేర్చవద్దు.\n\n{input}""",
-    "th": """แก้ปัญหาคณิตศาสตร์นี้ ให้ให้ขั้นตอนการใช้เหตุผลก่อนที่จะให้คำตอบสุดท้ายในบรรทัดสุดท้ายโดยอยู่ในรูปแบบ "คำตอบ:" ไม่ควรเพิ่มอะไรนอกจากคำตอบที่เป็นจำนวนเต็มหลังจาก "คำตอบ:"\n\n{input}""",
-    "ja": """の数学の問題を解いてください。最終的な答えを出す前に、解答の推論過程を記述してください。そして最後の行には "答え:" の形式で答えを記述し、その後には整数の答え以外何も追加しないでください。\n\n{input}""",
-    "zh": """解决这个数学问题。在最后一行给出答案前，请提供推理步骤。最后一行应该以 "答案: " 的形式独立给出答案。在 "答案：" 后不要添加除整数答案之外的任何内容。\n\n{input}""",
+    Language.LatinScript.ENGLISH.value: """Solve this math problem. Give the reasoning steps before giving the final answer on the last line by itself in the format of "Answer:". Do not add anything other than the integer answer after "Answer:".\n\n{input}""",
+    Language.LatinScript.SPANISH.value: """Resuelve este problema matemático. Proporciona los pasos de razonamiento antes de dar la respuesta final en la última línea por sí misma en el formato de "Respuesta:". No añadas nada más que la respuesta entera después de "Respuesta:".\n\n{input}""",
+    Language.LatinScript.FRENCH.value: """Résolvez ce problème de mathématiques. Donnez les étapes de raisonnement avant de fournir la réponse finale sur la dernière ligne elle-même dans le format de "Réponse:". N'ajoutez rien d'autre que la réponse entière après "Réponse:".\n\n{input}""",
+    Language.LatinScript.GERMAN.value: """Löse dieses Mathematikproblem. Gib die Schritte zur Begründung an, bevor du die endgültige Antwort in der letzten Zeile alleine im Format "Antwort:" gibst. Füge nichts anderes als die ganzzahlige Antwort nach "Antwort:" hinzu.\n\n{input}""",
+    Language.LatinScript.SWAHILI.value: """Suluhisha tatizo hili la hesabu. Toa hatua za mantiki kabla ya kutoa jibu la mwisho kwenye mstari wa mwisho peke yake katika muundo wa "Jibu:". Usiongeze chochote kingine isipokuwa jibu la integer baada ya "Jibu:".\n\n{input}""",
+    Language.NonLatinScript.RUSSIAN.value: """Решите эту математическую задачу. Объясните шаги рассуждения перед тем, как дать окончательный ответ в последней строке сам по себе в формате "Ответ:". Не добавляйте ничего, кроме целочисленного ответа после "Ответ:".\n\n{input}""",
+    Language.NonLatinScript.BENGALI.value: """এই গণিতের সমস্যাটি সমাধান করুন। চূড়ান্ত উত্তর দেওয়ার আগে যুক্তিসম্পন্ন পদক্ষেপ প্রদান করুন। চূড়ান্ত উত্তরটি একক সংখ্যা হিসাবে "উত্তর:" এর পরে শেষ লাইনে দিন। "উত্তর:" এর পরে অন্য কিছু যুক্ত করবেন না।.\n\n{input}""",
+    Language.NonLatinScript.TELUGU.value: """ఈ గణిత సమస్యను పరిష్కరించండి. చివరి సమాధానాన్ని ఇవ్వదానికి ముందు తర్కాత్మక అదుగులను ఇవ్వండి. చివరి పంక్తిలో మాత్రమే 'సమాధానం:' అనే ఆకారంలో చివరి సమాధానాద్ని ఇవ్వండి సమాధానం: తర్వాత పూర్ణాంక సమాధానానికి తప్పించి ఎదేనా చేర్చవద్దు.\n\n{input}""",
+    Language.NonLatinScript.THAI.value: """แก้ปัญหาคณิตศาสตร์นี้ ให้ให้ขั้นตอนการใช้เหตุผลก่อนที่จะให้คำตอบสุดท้ายในบรรทัดสุดท้ายโดยอยู่ในรูปแบบ "คำตอบ:" ไม่ควรเพิ่มอะไรนอกจากคำตอบที่เป็นจำนวนเต็มหลังจาก "คำตอบ:"\n\n{input}""",
+    Language.NonLatinScript.JAPANESE.value: """の数学の問題を解いてください。最終的な答えを出す前に、解答の推論過程を記述してください。そして最後の行には "答え:" の形式で答えを記述し、その後には整数の答え以外何も追加しないでください。\n\n{input}""",
+    Language.NonLatinScript.CHINESE.value: """解决这个数学问题。在最后一行给出答案前，请提供推理步骤。最后一行应该以 "答案: " 的形式独立给出答案。在 "答案：" 后不要添加除整数答案之外的任何内容。\n\n{input}""",
 }
 
 LANG_TO_ANSWER_PREFIX = {
-    "en": "Answer",
-    "es": "Respuesta",
-    "fr": "Réponse",
-    "de": "Antwort",
-    "sw": "Jibu",
-    "ru": "Ответ",
-    "bn": "উত্তর",
-    "te": "సమాధానం",
-    "th": "คำตอบ",
-    "ja": "答え",
-    "zh": "答案",
+    Language.LatinScript.ENGLISH.value: "Answer",
+    Language.LatinScript.SPANISH.value: "Respuesta",
+    Language.LatinScript.FRENCH.value: "Réponse",
+    Language.LatinScript.GERMAN.value: "Antwort",
+    Language.LatinScript.SWAHILI.value: "Jibu",
+    Language.NonLatinScript.RUSSIAN.value: "Ответ",
+    Language.NonLatinScript.BENGALI.value: "উত্তর",
+    Language.NonLatinScript.TELUGU.value: "సమాధానం",
+    Language.NonLatinScript.THAI.value: "คำตอบ",
+    Language.NonLatinScript.JAPANESE.value: "答え",
+    Language.NonLatinScript.CHINESE.value: "答案",
 }
 
 
