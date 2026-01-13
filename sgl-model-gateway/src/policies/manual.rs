@@ -928,4 +928,48 @@ mod tests {
             "Random mode should sometimes select worker 0 despite higher load"
         );
     }
+
+    fn assert_no_routing_key_uses_random(
+        assignment_mode: ManualAssignmentMode,
+        setup_load: impl Fn(&[Arc<dyn Worker>]),
+    ) {
+        let config = ManualConfig {
+            assignment_mode,
+            ..Default::default()
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        setup_load(&workers);
+
+        let mut selected_worker_0 = false;
+        for _ in 0..50 {
+            let info = SelectWorkerInfo::default();
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(branch, ExecutionBranch::NoRoutingId);
+            if result == Some(0) {
+                selected_worker_0 = true;
+                break;
+            }
+        }
+        assert!(
+            selected_worker_0,
+            "Should randomly select worker 0 despite higher load"
+        );
+    }
+
+    #[test]
+    fn test_no_routing_key_uses_random_even_with_min_load_mode() {
+        assert_no_routing_key_uses_random(ManualAssignmentMode::MinLoad, |workers| {
+            workers[0].increment_load();
+            workers[0].increment_load();
+        });
+    }
+
+    #[test]
+    fn test_no_routing_key_uses_random_even_with_min_group_mode() {
+        assert_no_routing_key_uses_random(ManualAssignmentMode::MinGroup, |workers| {
+            workers[0].worker_routing_key_load().increment("k1");
+            workers[0].worker_routing_key_load().increment("k2");
+        });
+    }
 }
