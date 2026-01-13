@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel", "grpcio-tools==1.75.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -22,7 +22,7 @@ dependencies = [
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
-  "cuda-python",
+  "cuda-python==12.9",
   "decord2",
   "datasets",
   "einops",
@@ -38,7 +38,7 @@ dependencies = [
   "msgspec",
   "ninja",
   "numpy",
-  "nvidia-cutlass-dsl==4.2.1",
+  "nvidia-cutlass-dsl==4.3.1",
   "nvidia-ml-py",
   "openai-harmony==0.0.4",
   "openai==2.6.1",
@@ -172,6 +172,8 @@ exclude = [
 root = ".."
 version_file = "sglang/_version.py"
 git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+# Allow editable installs even when .git metadata is not available.
+fallback_version = "0.0.0.dev0"
 
 [tool.codespell]
 ignore-words-list = "ans, als, hel, boostrap, childs, te, vas, hsa, ment"

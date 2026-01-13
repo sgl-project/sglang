@@ -20,10 +20,11 @@ type EvictionCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Cached MCP connection with metadata
 #[derive(Clone)]
-pub struct CachedConnection {
+pub(crate) struct CachedConnection {
     /// The MCP client instance
     pub client: Arc<McpClient>,
     /// Server configuration used to create this connection
+    #[allow(dead_code)]
     pub config: McpServerConfig,
 }
 
@@ -220,7 +221,7 @@ pub struct PoolStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::McpTransport;
+    use crate::mcp::config::McpTransport;
 
     // Helper to create test server config
     fn create_test_config(url: &str) -> McpServerConfig {
@@ -277,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_pool_with_global_proxy() {
-        use crate::mcp::McpProxyConfig;
+        use crate::mcp::config::McpProxyConfig;
 
         // Create proxy config
         let proxy = McpProxyConfig {
