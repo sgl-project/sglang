@@ -95,7 +95,7 @@ diffusion_hip = [
   "cloudpickle",
   "remote-pdb",
   "torchcodec==0.5.0",
-  "st_attn==0.0.7",
+  "fastvideo_kernel",
   "vsa==0.0.4",
   "runai_model_streamer",
 ]
@@ -126,7 +126,7 @@ diffusion_musa = [
   "moviepy>=2.0.0",
   "opencv-python-headless==4.10.0.84",
   "remote-pdb",
-  "st_attn==0.0.7",
+  "fastvideo_kernel",
   "vsa==0.0.4",
   "runai_model_streamer",
   "cache-dit==1.1.8"
