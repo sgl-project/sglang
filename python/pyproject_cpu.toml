@@ -1,6 +1,6 @@
 # https://docs.sglang.io/platforms/cpu_server.html
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel", "grpcio-tools==1.75.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -132,6 +132,7 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
+git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
 
 [tool.codespell]
 ignore-words-list = "ans, als, hel, boostrap, childs, te, vas, hsa, ment"

@@ -11,15 +11,17 @@ diffusion models.
 import multiprocessing as mp
 import os
 import time
-from typing import Any
+from typing import Any, List, Union
 
 import numpy as np
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
+    format_lora_message,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
@@ -31,6 +33,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    GREEN,
+    RESET,
     init_logger,
     log_batch_completion,
     log_generation_timer,
@@ -77,16 +81,11 @@ class DiffGenerator:
     @classmethod
     def from_pretrained(
         cls,
+        local_mode: bool = True,
         **kwargs,
     ) -> "DiffGenerator":
         """
         Create a DiffGenerator from a pretrained model.
-
-        Args:
-            **kwargs: Additional arguments to customize model loading, set any ServerArgs or PipelineConfig attributes here.
-
-        Returns:
-            The created DiffGenerator
 
         Priority level: Default pipeline config < User's pipeline config < User's kwargs
         """
@@ -100,10 +99,12 @@ class DiffGenerator:
         else:
             server_args = ServerArgs.from_kwargs(**kwargs)
 
-        return cls.from_server_args(server_args)
+        return cls.from_server_args(server_args, local_mode=local_mode)
 
     @classmethod
-    def from_server_args(cls, server_args: ServerArgs) -> "DiffGenerator":
+    def from_server_args(
+        cls, server_args: ServerArgs, local_mode: bool = True
+    ) -> "DiffGenerator":
         """
         Create a DiffGenerator with the specified arguments.
 
@@ -116,9 +117,8 @@ class DiffGenerator:
         instance = cls(
             server_args=server_args,
         )
-        is_local_mode = server_args.is_local_mode
-        logger.info(f"Local mode: {is_local_mode}")
-        if is_local_mode:
+        logger.info(f"Local mode: {local_mode}")
+        if local_mode:
             instance.local_scheduler_process = instance._start_local_server_if_needed()
         else:
             # In remote mode, we just need to connect and check.
@@ -145,12 +145,12 @@ class DiffGenerator:
         if not sync_scheduler_client.ping():
             raise ConnectionError(
                 f"Could not connect to remote scheduler at "
-                f"{self.server_args.scheduler_endpoint()} with `local mode` as False. "
+                f"{self.server_args.scheduler_endpoint} with `local mode` as False. "
                 "Please ensure the server is running."
             )
         logger.info(
             f"Successfully connected to remote scheduler at "
-            f"{self.server_args.scheduler_endpoint()}."
+            f"{self.server_args.scheduler_endpoint}."
         )
 
     def generate(
@@ -196,15 +196,20 @@ class DiffGenerator:
             **sampling_params_kwargs,
         )
 
+        # Extract diffusers_kwargs if passed
+        diffusers_kwargs = sampling_params_kwargs.pop("diffusers_kwargs", None)
+
         requests: list[Req] = []
         for output_idx, p in enumerate(prompts):
             sampling_params.prompt = p
-            requests.append(
-                prepare_request(
-                    server_args=self.server_args,
-                    sampling_params=sampling_params,
-                )
+            req = prepare_request(
+                server_args=self.server_args,
+                sampling_params=sampling_params,
             )
+            # Add diffusers_kwargs to request's extra dict
+            if diffusers_kwargs:
+                req.extra["diffusers_kwargs"] = diffusers_kwargs
+            requests.append(req)
 
         results = []
         total_start_time = time.perf_counter()
@@ -264,6 +269,13 @@ class DiffGenerator:
         log_batch_completion(logger, len(results), total_gen_time)
 
         if results:
+            if self.server_args.warmup:
+                total_duration_ms = results[0]["timings"]["total_duration_ms"]
+                logger.info(
+                    f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
+                    total_duration_ms / 1000.0,
+                )
+
             peak_memories = [r.get("peak_memory_mb", 0) for r in results]
             if peak_memories:
                 max_peak_memory = max(peak_memories)
@@ -291,35 +303,34 @@ class DiffGenerator:
     # LoRA
     def _send_lora_request(self, req: Any, success_msg: str, failure_msg: str):
         response = sync_scheduler_client.forward(req)
-        if isinstance(response, dict) and response.get("status") == "ok":
+        if response.error is None:
             logger.info(success_msg)
+            return response
         else:
-            error_msg = (
-                response.get("message", "Unknown error")
-                if isinstance(response, dict)
-                else "Unknown response format"
-            )
+            error_msg = response.error
             raise RuntimeError(f"{failure_msg}: {error_msg}")
 
     def set_lora(
         self,
-        lora_nickname: str,
-        lora_path: str | None = None,
-        target: str = "all",
-        strength: float = 1.0,
+        lora_nickname: Union[str, List[str]],
+        lora_path: Union[str, None, List[Union[str, None]]] = None,
+        target: Union[str, List[str]] = "all",
+        strength: Union[float, List[float]] = 1.0,
     ) -> None:
         """
-        Set a LoRA adapter for the specified transformer(s).
+        Set LoRA adapter(s) for the specified transformer(s).
+        Supports both single LoRA (backward compatible) and multiple LoRA adapters.
 
         Args:
-            lora_nickname: The nickname of the adapter.
-            lora_path: Path to the LoRA adapter.
-            target: Which transformer(s) to apply the LoRA to. One of:
+            lora_nickname: The nickname(s) of the adapter(s). Can be a string or a list of strings.
+            lora_path: Path(s) to the LoRA adapter(s). Can be a string, None, or a list of strings/None.
+            target: Which transformer(s) to apply the LoRA to. Can be a string or a list of strings.
+                Valid values:
                 - "all": Apply to all transformers (default)
                 - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model
-            strength: LoRA strength for merge, default 1.0.
+            strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
         """
         req = SetLoraReq(
             lora_nickname=lora_nickname,
@@ -327,9 +338,13 @@ class DiffGenerator:
             target=target,
             strength=strength,
         )
+        nickname_str, target_str, strength_str = format_lora_message(
+            lora_nickname, target, strength
+        )
+
         self._send_lora_request(
             req,
-            f"Successfully set LoRA adapter: {lora_nickname} (target: {target}, strength: {strength})",
+            f"Successfully set LoRA adapter(s): {nickname_str} (target: {target_str}, strength: {strength_str})",
             "Failed to set LoRA adapter",
         )
 
@@ -361,6 +376,21 @@ class DiffGenerator:
             f"Successfully merged LoRA weights (target: {target}, strength: {strength})",
             "Failed to merge LoRA weights",
         )
+
+    def list_loras(self) -> OutputBatch:
+        """
+        List loaded LoRA adapters and current application status per module.
+        """
+
+        output = self._send_lora_request(
+            req=ListLorasReq(),
+            success_msg="Successfully listed LoRA adapters",
+            failure_msg="Failed to list LoRA adapters",
+        )
+        if output.error is None:
+            return output.output or {}
+        else:
+            raise RuntimeError(f"Failed to list LoRA adapters: {output.error}")
 
     def _ensure_lora_state(
         self,

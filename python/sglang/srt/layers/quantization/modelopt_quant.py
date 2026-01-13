@@ -53,6 +53,7 @@ from sglang.srt.utils.common import (
     is_sm120_supported,
     next_power_of_2,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -73,15 +74,13 @@ except ImportError:
     fp4_quantize = None
 
 try:
-    from flashinfer import mm_fp4 as fp4_gemm
+    from flashinfer import mm_fp4 as flashinfer_fp4_gemm
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
 
     enable_flashinfer_fp4_gemm = True
 except ImportError:
     if is_cuda():
-        from sgl_kernel import cutlass_scaled_fp4_mm as fp4_gemm
-    else:
-        fp4_gemm = None
+        from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
     enable_flashinfer_fp4_gemm = False
     reorder_rows_for_gated_act_gemm = None
     shuffle_matrix_a = None
@@ -103,8 +102,22 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-@torch.library.custom_op("sglang::fp4_gemm", mutates_args=())
-def _sglang_fp4_gemm(
+def _sglang_fp4_gemm_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> torch.Tensor:
+    M = input.shape[-2]
+    N = int(out_features)
+    return input.new_empty((M, N), dtype=out_dtype)
+
+
+@register_custom_op(fake_impl=_sglang_fp4_gemm_fake)
+def fp4_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
     input_sf: torch.Tensor,
@@ -115,26 +128,11 @@ def _sglang_fp4_gemm(
 ) -> torch.Tensor:
     backend = FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
     if enable_flashinfer_fp4_gemm:
-        return fp4_gemm(
+        return flashinfer_fp4_gemm(
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
         )
     else:
-        return fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
-
-
-@torch.library.register_fake("sglang::fp4_gemm")
-def _sglang_fp4_gemm_fake(
-    input,
-    weight,
-    input_sf,
-    weight_sf,
-    alpha,
-    out_dtype,
-    out_features: int,
-):
-    M = input.shape[-2]
-    N = int(out_features)
-    return input.new_empty((M, N), dtype=out_dtype)
+        return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
 
 
 if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
@@ -1229,7 +1227,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         backend = (
             FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
         )
-        out = torch.ops.sglang.fp4_gemm(
+        out = fp4_gemm(
             x_fp4,
             w,
             x_scale_interleaved,
