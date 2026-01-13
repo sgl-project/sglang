@@ -99,12 +99,6 @@ class SparseLinearAttentionImpl(AttentionImpl):
     ) -> None:
         nn.Module.__init__(self)
 
-        self.num_heads = num_heads
-        self.head_size = head_size
-        self.softmax_scale = softmax_scale if softmax_scale else head_size**-0.5
-        self.causal = causal
-        self.prefix = prefix
-
         # SLA-specific config
         self.topk_ratio = topk_ratio
         self.BLKQ = BLKQ
