@@ -12,7 +12,7 @@ Key MoE characteristics:
 - Post-hoc normalization of top-k weights
 """
 
-from typing import Iterable, List, Optional, Set, Tuple
+from typing import Iterable, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -32,6 +32,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -80,13 +82,13 @@ class Lfm2MoeMLP(nn.Module):
 
 class Lfm2MoeSparseMoeBlock(nn.Module):
     """
-    Sparse MoE block with sigmoid routing - naive PyTorch implementation.
+    Sparse MoE block with sigmoid routing using optimized FusedMoE.
 
-    This implementation exactly matches HuggingFace for numerical correctness.
     Key features:
-    - Sigmoid scoring (not softmax)
+    - Sigmoid scoring (not softmax) - auxiliary-loss-free style
     - Expert bias (fp32) for load balancing
     - Bias affects selection only, not weighting
+    - Uses FusedMoE for efficient batched expert computation
     """
 
     def __init__(
@@ -130,90 +132,40 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         else:
             self.register_parameter("expert_bias", None)
 
-        # Expert weights stored as 3D tensors (like HF Qwen2MoeExperts)
-        # gate_up_proj: [num_experts, 2 * intermediate_size, hidden_size]
-        # down_proj: [num_experts, hidden_size, intermediate_size]
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, 2 * self.intermediate_size, self.hidden_size)
+        # TopK selector with sigmoid scoring
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok,
+            layer_id=layer_idx,
+            renormalize=config.norm_topk_prob,
+            scoring_func="sigmoid",
+            correction_bias=self.expert_bias if self.use_expert_bias else None,
         )
-        self.down_proj = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_size, self.intermediate_size)
+
+        # FusedMoE for efficient batched expert computation
+        self.experts = FusedMoE(
+            num_experts=config.num_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            layer_id=layer_idx,
+            reduce_results=True,
+            quant_config=quant_config,
+            prefix=add_prefix("experts", prefix),
         )
-
-    def route_tokens_to_experts(self, router_logits: torch.Tensor):
-        """Route tokens using sigmoid scoring with optional expert bias."""
-        routing_weights = router_logits.sigmoid()
-
-        if self.use_expert_bias and self.expert_bias is not None:
-            # Bias affects selection only, not the final weights
-            scores_for_routing = routing_weights + self.expert_bias
-            _, selected_experts = torch.topk(scores_for_routing, k=self.top_k, dim=-1)
-            # Gather original weights (without bias) for selected experts
-            routing_weights = torch.gather(
-                routing_weights, dim=1, index=selected_experts
-            ).type_as(router_logits)
-        else:
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, k=self.top_k, dim=-1
-            )
-
-        if self.norm_topk_prob:
-            routing_weights = routing_weights / (
-                routing_weights.sum(dim=-1, keepdim=True) + 1e-6
-            )
-        routing_weights = routing_weights * self.routed_scaling_factor
-
-        return selected_experts, routing_weights
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Naive expert forward pass matching HuggingFace exactly.
-
-        This implementation avoids nonzero()/where()/data-dependent control flow
-        to be CUDA graph compatible. It processes ALL experts unconditionally
-        and uses masking to zero out contributions from non-selected experts.
-        """
+        """Optimized expert forward pass using FusedMoE."""
         # Get router logits
         router_logits, _ = self.gate(hidden_states)
 
-        # Route tokens to experts
-        # selected_experts: [num_tokens, top_k] - expert indices
-        # routing_weights: [num_tokens, top_k] - weights for each selected expert
-        selected_experts, routing_weights = self.route_tokens_to_experts(router_logits)
+        # Select top-k experts with sigmoid scoring
+        topk_output = self.topk(hidden_states, router_logits)
 
-        # Initialize output
-        final_hidden_states = torch.zeros_like(hidden_states)
+        # Run fused expert computation
+        final_hidden_states = self.experts(hidden_states, topk_output)
 
-        # Process each expert unconditionally (CUDA graph compatible)
-        for expert_idx in range(self.num_experts):
-            # Create mask for tokens assigned to this expert at each top-k position
-            # expert_mask: [num_tokens, top_k] - True where selected_experts == expert_idx
-            expert_mask = selected_experts == expert_idx  # [num_tokens, top_k]
-
-            # Sum across top_k to get per-token weights for this expert
-            # A token might be assigned to the same expert at multiple top-k positions
-            # (rare but possible), so we sum the weights
-            # token_weights will be 0 for tokens not assigned to this expert
-            token_weights = (routing_weights * expert_mask).sum(dim=1)  # [num_tokens]
-
-            # Compute expert output for ALL tokens
-            # Tokens not assigned to this expert will have weight=0, so their
-            # contribution will be zeroed out when we multiply by token_weights
-            gate_up = torch.nn.functional.linear(
-                hidden_states, self.gate_up_proj[expert_idx]
-            )
-            gate, up = gate_up.chunk(2, dim=-1)
-            expert_out = torch.nn.functional.silu(gate) * up
-            expert_out = torch.nn.functional.linear(
-                expert_out, self.down_proj[expert_idx]
-            )
-
-            # Apply routing weights (0 for non-selected tokens)
-            weighted_out = expert_out * token_weights.unsqueeze(-1)
-
-            # Accumulate
-            final_hidden_states = final_hidden_states + weighted_out
-
-        return final_hidden_states
+        # Apply routed scaling factor
+        return final_hidden_states * self.routed_scaling_factor
 
 
 class Lfm2MoeAttention(nn.Module):
@@ -591,35 +543,10 @@ class Lfm2MoeForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    @staticmethod
-    def _make_expert_params_mapping(
-        num_experts: int,
-    ) -> List[Tuple[str, str, int, str]]:
-        """Generate mapping for MoE expert weights.
-
-        Returns list of (param_name, weight_name, expert_id, shard_id) tuples.
-        HF checkpoint format: experts.{expert_id}.w{1,2,3}.weight
-        Our naive format: gate_up_proj[expert_id] and down_proj[expert_id]
-        """
-        return [
-            (
-                "gate_up_proj" if shard_id in ("w1", "w3") else "down_proj",
-                f"experts.{expert_id}.{weight_name}.weight",
-                expert_id,
-                shard_id,
-            )
-            for expert_id in range(num_experts)
-            for shard_id, weight_name in [
-                ("w1", "w1"),  # gate projection -> first half of gate_up_proj
-                ("w2", "w2"),  # down projection -> down_proj
-                ("w3", "w3"),  # up projection -> second half of gate_up_proj
-            ]
-        ]
-
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
-        """Load weights with naive MoE expert format."""
+        """Load weights with FusedMoE expert format."""
         stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -630,10 +557,15 @@ class Lfm2MoeForCausalLM(nn.Module):
             ("gate_up_proj", "w3", 1),
         ]
 
-        expert_params_mapping = self._make_expert_params_mapping(
-            num_experts=self.config.num_experts
+        # FusedMoE expert params mapping
+        # HF format: experts.{expert_id}.w{1,2,3}.weight
+        # FusedMoE format: experts.w13_weight, experts.w2_weight
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+            num_experts=self.config.num_experts,
         )
-        intermediate_size = self.config.moe_intermediate_size
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
@@ -677,30 +609,31 @@ class Lfm2MoeForCausalLM(nn.Module):
                 loaded_params.add(name)
                 break
             else:
-                # Handle MoE expert weights
+                # Handle MoE expert weights using FusedMoE format
                 # HF format: model.layers.X.feed_forward.experts.Y.wZ.weight
-                # Our format: model.layers.X.feed_forward.{gate_up_proj,down_proj}
+                # FusedMoE format: model.layers.X.feed_forward.experts.w13_weight/w2_weight
                 for (
                     param_name,
-                    weight_pattern,
+                    weight_name,
                     expert_id,
                     shard_id,
                 ) in expert_params_mapping:
-                    if weight_pattern not in name:
+                    if weight_name not in name:
                         continue
-                    # Build our parameter name by replacing the experts.X.wY.weight pattern
-                    param_full_name = name.replace(weight_pattern, param_name)
-                    if param_full_name not in params_dict:
+                    # Build our parameter name
+                    name = name.replace(weight_name, param_name)
+                    if name not in params_dict:
                         continue
-                    param = params_dict[param_full_name]
-                    # Load into the correct slice of our 3D tensor
-                    if shard_id == "w1":
-                        param.data[expert_id, :intermediate_size, :] = loaded_weight
-                    elif shard_id == "w3":
-                        param.data[expert_id, intermediate_size:, :] = loaded_weight
-                    else:  # w2
-                        param.data[expert_id] = loaded_weight
-                    loaded_params.add(param_full_name)
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+                    loaded_params.add(name)
                     break
                 else:
                     # Handle regular weights
