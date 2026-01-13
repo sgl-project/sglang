@@ -218,7 +218,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
                             continue
                         p_idx = p_match.index(">")
                         p_name = p_match[:p_idx]
-                        p_val = p_match[p_idx + 1 :].strip()  # Remove \n
+                        p_val = p_match[p_idx + 1 :]
+                        # Remove prefixing and trailing \n
+                        if p_val.startswith("\n"):
+                            p_val = p_val[1:]
+                        if p_val.endswith("\n"):
+                            p_val = p_val[:-1]
 
                         parsed_params[p_name] = self._convert_param_value(
                             p_val, p_name, param_config, func_name
