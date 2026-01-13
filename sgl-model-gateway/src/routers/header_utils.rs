@@ -5,7 +5,10 @@ use axum::{
 };
 use http::{
     header,
-    header::HeaderName,
+    header::{
+        HeaderName,
+        TE as header__TE, // codespell:ignore te
+    },
 };
 
 // `http::header` intentionally avoids defining constants for every legacy header name.
@@ -69,7 +72,7 @@ fn should_forward_header_no_alloc(name: &str) -> bool {
         || name.eq_ignore_ascii_case(HEADER_KEEP_ALIVE.as_str())
         || name.eq_ignore_ascii_case(header::PROXY_AUTHENTICATE.as_str())
         || name.eq_ignore_ascii_case(header::PROXY_AUTHORIZATION.as_str())
-        || name.eq_ignore_ascii_case(header::TE.as_str())
+        || name.eq_ignore_ascii_case(header__TE.as_str())
         || name.eq_ignore_ascii_case(header::TRAILER.as_str())
         || name.eq_ignore_ascii_case(header::TRANSFER_ENCODING.as_str())
         || name.eq_ignore_ascii_case(header::UPGRADE.as_str())
@@ -107,7 +110,7 @@ pub fn apply_request_headers(
             || key_str.eq_ignore_ascii_case(header::CONNECTION.as_str())
             || key_str.eq_ignore_ascii_case(header::TRANSFER_ENCODING.as_str())
             || key_str.eq_ignore_ascii_case(HEADER_KEEP_ALIVE.as_str())
-            || key_str.eq_ignore_ascii_case(header::TE.as_str())
+            || key_str.eq_ignore_ascii_case(header__TE.as_str())
             || key_str.eq_ignore_ascii_case(header::TRAILER.as_str())
             || key_str.eq_ignore_ascii_case(header::ACCEPT_ENCODING.as_str())
             || key_str.eq_ignore_ascii_case(header::UPGRADE.as_str())

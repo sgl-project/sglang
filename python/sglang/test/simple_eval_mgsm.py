@@ -33,7 +33,7 @@ class Language:
     class NonLatinScript(StrEnum):
         RUSSIAN = "ru"
         BENGALI = "bn"
-        TELUGU = "te"
+        TELUGU = "te"  # codespell:ignore te
         THAI = "th"
         JAPANESE = "ja"
         CHINESE = "zh"
