@@ -793,19 +793,20 @@ class VisionLanguageEncoderLoader(ComponentLoader):
         transformers_or_diffusers: str = "vision_language_encoder",
     ) -> Any:
         if transformers_or_diffusers == "vision_language_encoder":
-            from transformers import AutoModelForImageTextToText
+            from transformers import GlmImageForConditionalGeneration
 
             config = get_hf_config(
                 component_model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
-            return AutoModelForImageTextToText.from_pretrained(
+            model = GlmImageForConditionalGeneration.from_pretrained(
                 component_model_path,
                 config=config,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             ).to(get_local_torch_device())
+            return model
         else:
             raise ValueError(
                 f"Unsupported library for VisionLanguageEncoder: {transformers_or_diffusers}"
