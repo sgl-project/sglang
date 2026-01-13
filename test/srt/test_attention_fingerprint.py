@@ -39,8 +39,12 @@ class TestFingerprintComputation(CustomTestCase):
         # Create sample data matching actual function signature:
         # compute_fingerprint_gpu(topk_indices, topk_weights, current_pos, n_bins)
         topk_indices = torch.randint(0, seq_len, (batch_size, top_k), device=device)
-        topk_weights = torch.softmax(torch.randn(batch_size, top_k, device=device), dim=-1)
-        current_pos = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+        topk_weights = torch.softmax(
+            torch.randn(batch_size, top_k, device=device), dim=-1
+        )
+        current_pos = torch.full(
+            (batch_size,), seq_len, dtype=torch.int32, device=device
+        )
 
         fingerprint = compute_fingerprint_gpu(topk_indices, topk_weights, current_pos)
 
@@ -56,8 +60,8 @@ class TestFingerprintComputation(CustomTestCase):
         """Test that fingerprint features align with expected zones."""
         try:
             from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
-                compute_fingerprint_gpu,
                 add_mass_and_entropy_features,
+                compute_fingerprint_gpu,
             )
         except ImportError:
             self.skipTest("compute_fingerprint_gpu not available")
@@ -72,29 +76,43 @@ class TestFingerprintComputation(CustomTestCase):
 
         # Test case 1: Highly local attention (syntax_floor zone)
         # All attention on recent positions (close to current_pos)
-        local_positions = torch.arange(seq_len - top_k, seq_len, device=device).unsqueeze(0)
-        local_scores = torch.softmax(torch.randn(batch_size, top_k, device=device), dim=-1)
-        current_pos = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+        local_positions = torch.arange(
+            seq_len - top_k, seq_len, device=device
+        ).unsqueeze(0)
+        local_scores = torch.softmax(
+            torch.randn(batch_size, top_k, device=device), dim=-1
+        )
+        current_pos = torch.full(
+            (batch_size,), seq_len, dtype=torch.int32, device=device
+        )
 
-        local_fp_raw = compute_fingerprint_gpu(local_positions, local_scores, current_pos)
+        local_fp_raw = compute_fingerprint_gpu(
+            local_positions, local_scores, current_pos
+        )
         local_features = add_mass_and_entropy_features(local_fp_raw)
 
         # Local mass (index 0) should be high for local attention
         # The raw histogram bins 0-2 map to local_mass (offset < 8)
         local_mass = local_features[0, 0].item()
-        self.assertGreater(local_mass, 0.3, "Local attention should have some local_mass")
+        self.assertGreater(
+            local_mass, 0.3, "Local attention should have some local_mass"
+        )
 
         # Test case 2: Long-range attention
         # All attention on distant positions (far from current_pos)
         long_positions = torch.arange(0, top_k, device=device).unsqueeze(0)
-        long_scores = torch.softmax(torch.randn(batch_size, top_k, device=device), dim=-1)
+        long_scores = torch.softmax(
+            torch.randn(batch_size, top_k, device=device), dim=-1
+        )
 
         long_fp_raw = compute_fingerprint_gpu(long_positions, long_scores, current_pos)
         long_features = add_mass_and_entropy_features(long_fp_raw)
 
         # Long-range mass (index 2) should be high for distant attention
         long_mass = long_features[0, 2].item()
-        self.assertGreater(long_mass, 0.3, "Distant attention should have some long_mass")
+        self.assertGreater(
+            long_mass, 0.3, "Distant attention should have some long_mass"
+        )
 
     def test_fingerprint_deterministic(self):
         """Test that fingerprint computation is deterministic."""
@@ -117,7 +135,9 @@ class TestFingerprintComputation(CustomTestCase):
         torch.manual_seed(42)
         positions = torch.randint(0, seq_len, (batch_size, top_k), device=device)
         scores = torch.softmax(torch.randn(batch_size, top_k, device=device), dim=-1)
-        current_pos = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+        current_pos = torch.full(
+            (batch_size,), seq_len, dtype=torch.int32, device=device
+        )
 
         # Compute twice
         fp1 = compute_fingerprint_gpu(positions, scores, current_pos)
@@ -179,8 +199,8 @@ class TestFingerprintIntegration(CustomTestCase):
         """Test full pipeline from attention data to zone classification."""
         try:
             from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
-                compute_fingerprint_gpu,
                 classify_manifold_zone,
+                compute_fingerprint_gpu,
             )
         except ImportError:
             self.skipTest("Pipeline functions not available")
@@ -197,7 +217,9 @@ class TestFingerprintIntegration(CustomTestCase):
         # Simulate semantic_bridge pattern: mid-range retrieval
         positions = torch.randint(100, 500, (batch_size, top_k), device=device)
         scores = torch.softmax(torch.randn(batch_size, top_k, device=device), dim=-1)
-        current_pos = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+        current_pos = torch.full(
+            (batch_size,), seq_len, dtype=torch.int32, device=device
+        )
 
         # Compute fingerprint
         fingerprint = compute_fingerprint_gpu(positions, scores, current_pos)
@@ -209,8 +231,15 @@ class TestFingerprintIntegration(CustomTestCase):
         zone, confidence = classify_manifold_zone(fp_np)
 
         # Should get a valid zone
-        valid_zones = ["syntax_floor", "semantic_bridge", "structure_ripple",
-                       "long_range", "diffuse", "exploration", "steering"]
+        valid_zones = [
+            "syntax_floor",
+            "semantic_bridge",
+            "structure_ripple",
+            "long_range",
+            "diffuse",
+            "exploration",
+            "steering",
+        ]
         self.assertIn(zone, valid_zones)
         self.assertGreaterEqual(confidence, 0.0)
         self.assertLessEqual(confidence, 1.0)
@@ -235,10 +264,13 @@ class TestFingerprintIntegration(CustomTestCase):
 
         positions = torch.randint(0, seq_len, (batch_size, top_k), device=device)
         scores = torch.softmax(torch.randn(batch_size, top_k, device=device), dim=-1)
-        current_pos = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+        current_pos = torch.full(
+            (batch_size,), seq_len, dtype=torch.int32, device=device
+        )
 
         # Should not OOM and should be fast
         import time
+
         start = time.time()
         fingerprints = compute_fingerprint_gpu(positions, scores, current_pos)
         elapsed = time.time() - start
@@ -269,7 +301,9 @@ class TestRotationalVariance(CustomTestCase):
 
         positions = torch.randint(0, seq_len, (batch_size, top_k), device=device)
         scores = torch.softmax(torch.randn(batch_size, top_k, device=device), dim=-1)
-        current_pos = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+        current_pos = torch.full(
+            (batch_size,), seq_len, dtype=torch.int32, device=device
+        )
 
         fingerprint = compute_fingerprint_gpu(positions, scores, current_pos)
 
@@ -286,9 +320,7 @@ class TestSpectralEvictionIntegration(CustomTestCase):
     def test_spectral_importance_from_fingerprint(self):
         """Test computing spectral importance score from fingerprint."""
         try:
-            from sglang.srt.mem_cache.spectral_eviction import (
-                SpectralEvictionStrategy,
-            )
+            from sglang.srt.mem_cache.spectral_eviction import SpectralEvictionStrategy
         except ImportError:
             self.skipTest("SpectralEvictionStrategy not available")
 
@@ -302,8 +334,13 @@ class TestSpectralEvictionIntegration(CustomTestCase):
         # which takes (node) but we'll test the zone scoring directly
 
         # Verify zone scores are correctly ordered in the strategy
-        expected_zone_order = ["semantic_bridge", "long_range", "structure_ripple",
-                               "syntax_floor", "diffuse"]
+        expected_zone_order = [
+            "semantic_bridge",
+            "long_range",
+            "structure_ripple",
+            "syntax_floor",
+            "diffuse",
+        ]
 
         # Check that the strategy was created successfully
         self.assertIsNotNone(strategy)

@@ -576,8 +576,8 @@ def is_pin_memory_available() -> bool:
 
 
 class LayerFn(Protocol):
-
-    def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
+    def __call__(self, idx: int, prefix: str) -> torch.nn.Module:
+        ...
 
 
 def make_layers(
@@ -1409,10 +1409,10 @@ def get_zmq_socket_on_host(
 
 def config_socket(socket, socket_type: zmq.SocketType):
     mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
+    total_mem = mem.total / 1024 ** 3
+    available_mem = mem.available / 1024 ** 3
     if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
+        buf_size = int(0.5 * 1024 ** 3)
     else:
         buf_size = -1
 
@@ -2473,9 +2473,9 @@ def set_cuda_arch():
     if is_flashinfer_available():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
-        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = (
-            f"{arch}{'a' if capability[0] >= 9 else ''}"
-        )
+        os.environ[
+            "FLASHINFER_CUDA_ARCH_LIST"
+        ] = f"{arch}{'a' if capability[0] >= 9 else ''}"
 
 
 def cdiv(a: int, b: int) -> int:
@@ -2567,7 +2567,7 @@ def retry(
             if not should_retry(e):
                 raise Exception(f"retry() observe errors that should not be retried.")
 
-            delay = min(initial_delay * (2**try_index), max_delay) * (
+            delay = min(initial_delay * (2 ** try_index), max_delay) * (
                 0.75 + 0.25 * random.random()
             )
 

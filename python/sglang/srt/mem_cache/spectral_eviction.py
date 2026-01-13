@@ -44,6 +44,7 @@ try:
     from sklearn.cluster import KMeans
     from sklearn.manifold import SpectralEmbedding
     from sklearn.preprocessing import StandardScaler
+
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
@@ -63,12 +64,12 @@ except ImportError:
 #   - structure_ripple: long-range structural patterns → moderately important
 #   - semantic_bridge: mid-range retrieval anchors → most important (bridging)
 ZONE_IMPORTANCE = {
-    "semantic_bridge": 0.95,    # Retrieval anchors - critical
-    "long_range": 0.85,         # Long-range dependencies
-    "structure_ripple": 0.70,   # Structural patterns
-    "syntax_floor": 0.30,       # Local syntax - can be reconstructed
-    "diffuse": 0.20,            # Uniform attention - least important
-    "unknown": 0.50,            # Default
+    "semantic_bridge": 0.95,  # Retrieval anchors - critical
+    "long_range": 0.85,  # Long-range dependencies
+    "structure_ripple": 0.70,  # Structural patterns
+    "syntax_floor": 0.30,  # Local syntax - can be reconstructed
+    "diffuse": 0.20,  # Uniform attention - least important
+    "unknown": 0.50,  # Default
 }
 
 # Fingerprint feature indices
@@ -86,14 +87,16 @@ FP_ROTATIONAL_VARIANCE = 20  # Schema v2 extension (if dim >= 21)
 # SPECTRAL SKELETON COMPUTER
 # =============================================================================
 
+
 @dataclass
 class SkeletonResult:
     """Result of skeleton computation."""
-    skeleton_indices: List[int]     # Token indices to KEEP
-    computation_time_ms: float      # Time to compute
-    n_spectral_dims: int            # Spectral dimensions used
-    n_clusters: int                 # K-means clusters used
-    cache_key: str                  # For invalidation
+
+    skeleton_indices: List[int]  # Token indices to KEEP
+    computation_time_ms: float  # Time to compute
+    n_spectral_dims: int  # Spectral dimensions used
+    n_clusters: int  # K-means clusters used
+    cache_key: str  # For invalidation
 
 
 class SpectralSkeletonComputer:
@@ -233,7 +236,7 @@ class SpectralSkeletonComputer:
 
             embedding = SpectralEmbedding(
                 n_components=n_comp,
-                affinity='nearest_neighbors',
+                affinity="nearest_neighbors",
                 n_neighbors=min(15, n_tokens - 1),
                 random_state=self.random_state,
             )
@@ -298,6 +301,7 @@ class SpectralSkeletonComputer:
 # SPECTRAL EVICTION STRATEGY
 # =============================================================================
 
+
 class SpectralEvictionStrategy(EvictionStrategy):
     """
     Eviction strategy based on spectral importance of tokens.
@@ -358,9 +362,9 @@ class SpectralEvictionStrategy(EvictionStrategy):
         Returns a tuple (spectral_score, lru_score) for proper ordering.
         """
         # Check if node has spectral metadata
-        spectral_fp = getattr(node, 'spectral_fingerprint', None)
-        manifold_zone = getattr(node, 'manifold_zone', None)
-        spectral_coherence = getattr(node, 'spectral_coherence', None)
+        spectral_fp = getattr(node, "spectral_fingerprint", None)
+        manifold_zone = getattr(node, "manifold_zone", None)
+        spectral_coherence = getattr(node, "spectral_coherence", None)
 
         if spectral_fp is None:
             # No spectral data - use pure LRU
@@ -376,10 +380,9 @@ class SpectralEvictionStrategy(EvictionStrategy):
 
         # Combine scores
         # Higher combined = more important = evicted later
-        combined_score = (
-            self.spectral_weight * spectral_score +
-            (1 - self.spectral_weight) * self._normalize_time(lru_score)
-        )
+        combined_score = self.spectral_weight * spectral_score + (
+            1 - self.spectral_weight
+        ) * self._normalize_time(lru_score)
 
         return (combined_score, lru_score)
 
@@ -459,6 +462,7 @@ class SpectralEvictionStrategy(EvictionStrategy):
 # HELPER FUNCTIONS
 # =============================================================================
 
+
 def compute_sequence_skeleton(
     fingerprints: List[np.ndarray],
     retention_ratio: float = 0.3,
@@ -506,6 +510,7 @@ def score_token_importance(
 # TESTING
 # =============================================================================
 
+
 def _test_spectral_eviction():
     """Quick test of spectral eviction components."""
     print("=" * 60)
@@ -518,11 +523,16 @@ def _test_spectral_eviction():
     feature_dim = 20
 
     # Create fingerprints with cluster structure
-    fingerprints = np.vstack([
-        np.random.randn(30, feature_dim) + np.array([1, 0, 0] + [0] * 17),  # Cluster 1
-        np.random.randn(40, feature_dim) + np.array([0, 1, 0] + [0] * 17),  # Cluster 2
-        np.random.randn(30, feature_dim) + np.array([0, 0, 1] + [0] * 17),  # Cluster 3
-    ])
+    fingerprints = np.vstack(
+        [
+            np.random.randn(30, feature_dim)
+            + np.array([1, 0, 0] + [0] * 17),  # Cluster 1
+            np.random.randn(40, feature_dim)
+            + np.array([0, 1, 0] + [0] * 17),  # Cluster 2
+            np.random.randn(30, feature_dim)
+            + np.array([0, 0, 1] + [0] * 17),  # Cluster 3
+        ]
+    )
 
     computer = SpectralSkeletonComputer(retention_ratio=0.3)
     result = computer.compute_skeleton(fingerprints, n_tokens)
@@ -568,7 +578,9 @@ def _test_spectral_eviction():
     print("Node priorities (higher = keep longer):")
     for i, node in enumerate(nodes):
         priority = strategy.get_priority(node)
-        print(f"  Node {i}: zone={node.manifold_zone}, coherence={node.spectral_coherence}, priority={priority}")
+        print(
+            f"  Node {i}: zone={node.manifold_zone}, coherence={node.spectral_coherence}, priority={priority}"
+        )
 
     print("\n✓ All tests passed!")
 

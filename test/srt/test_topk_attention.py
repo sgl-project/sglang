@@ -80,9 +80,7 @@ def topk_attention_reference(
         # Pad if needed
         if actual_k < top_k:
             padding = top_k - actual_k
-            topk_probs = torch.cat(
-                [topk_probs, torch.zeros(padding, device=device)]
-            )
+            topk_probs = torch.cat([topk_probs, torch.zeros(padding, device=device)])
             topk_idx = torch.cat(
                 [topk_idx, torch.zeros(padding, dtype=torch.int64, device=device)]
             )
@@ -94,7 +92,6 @@ def topk_attention_reference(
 
 
 class TestTopkAttention(CustomTestCase):
-
     def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""
         random.seed(seed)
@@ -119,9 +116,7 @@ class TestTopkAttention(CustomTestCase):
         dtype = torch.bfloat16
 
         # Create random query
-        q = torch.randn(
-            batch_size, num_heads, head_dim, dtype=dtype, device=device
-        )
+        q = torch.randn(batch_size, num_heads, head_dim, dtype=dtype, device=device)
 
         # Create KV cache with variable sequence lengths per batch
         seq_lens = torch.randint(
@@ -139,10 +134,15 @@ class TestTopkAttention(CustomTestCase):
 
         kv_indices = torch.arange(total_tokens, dtype=torch.int32, device=device)
 
-        sm_scale = 1.0 / (head_dim**0.5)
+        sm_scale = 1.0 / (head_dim ** 0.5)
 
         # Run the chunked kernel (returns 4-tuple: scores, indices, logits, logsumexp)
-        topk_scores, topk_indices, topk_logits, logsumexp_all = compute_topk_attention_chunked(
+        (
+            topk_scores,
+            topk_indices,
+            topk_logits,
+            logsumexp_all,
+        ) = compute_topk_attention_chunked(
             q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k
         )
 
@@ -195,13 +195,23 @@ class TestTopkAttention(CustomTestCase):
     def test_gqa_topk(self):
         """Test top-k with grouped query attention (GQA)."""
         self._test_topk_attention_once(
-            batch_size=4, seq_len=64, num_heads=32, num_kv_heads=8, head_dim=128, top_k=10
+            batch_size=4,
+            seq_len=64,
+            num_heads=32,
+            num_kv_heads=8,
+            head_dim=128,
+            top_k=10,
         )
 
     def test_mqa_topk(self):
         """Test top-k with multi-query attention (MQA)."""
         self._test_topk_attention_once(
-            batch_size=2, seq_len=128, num_heads=16, num_kv_heads=1, head_dim=64, top_k=5
+            batch_size=2,
+            seq_len=128,
+            num_heads=16,
+            num_kv_heads=1,
+            head_dim=64,
+            top_k=5,
         )
 
     def test_topk_larger_than_seq(self):
@@ -219,7 +229,12 @@ class TestTopkAttention(CustomTestCase):
     def test_large_batch(self):
         """Test with larger batch size."""
         self._test_topk_attention_once(
-            batch_size=32, seq_len=256, num_heads=16, num_kv_heads=4, head_dim=128, top_k=10
+            batch_size=32,
+            seq_len=256,
+            num_heads=16,
+            num_kv_heads=4,
+            head_dim=128,
+            top_k=10,
         )
 
     def test_various_head_dims(self):
@@ -251,9 +266,14 @@ class TestTopkAttention(CustomTestCase):
         k_buffer = torch.randn(0, num_heads, head_dim, device=device)
         kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
         kv_indices = torch.zeros(0, dtype=torch.int32, device=device)
-        sm_scale = 1.0 / (head_dim**0.5)
+        sm_scale = 1.0 / (head_dim ** 0.5)
 
-        topk_scores, topk_indices, topk_logits, logsumexp_all = compute_topk_attention_chunked(
+        (
+            topk_scores,
+            topk_indices,
+            topk_logits,
+            logsumexp_all,
+        ) = compute_topk_attention_chunked(
             q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k
         )
 
@@ -288,25 +308,23 @@ class TestTopkAttention(CustomTestCase):
         top_k = 10
 
         q = torch.randn(
-            batch_size, num_heads, head_dim,
-            dtype=torch.float16, device=device
+            batch_size, num_heads, head_dim, dtype=torch.float16, device=device
         )
         k_buffer = torch.randn(
-            seq_len, num_kv_heads, head_dim,
-            dtype=torch.float16, device=device
+            seq_len, num_kv_heads, head_dim, dtype=torch.float16, device=device
         )
-        kv_indptr = torch.tensor(
-            [0, seq_len], dtype=torch.int32, device=device
-        )
-        kv_indices = torch.arange(
-            seq_len, dtype=torch.int32, device=device
-        )
+        kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+        kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
         sm_scale = 1.0 / (head_dim ** 0.5)
 
         # This should not OOM due to chunked approach
-        topk_scores, topk_indices, topk_logits, logsumexp_all = compute_topk_attention_chunked(
-            q, k_buffer, kv_indptr, kv_indices, sm_scale,
-            top_k=top_k, chunk_size=2048
+        (
+            topk_scores,
+            topk_indices,
+            topk_logits,
+            logsumexp_all,
+        ) = compute_topk_attention_chunked(
+            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k=top_k, chunk_size=2048
         )
 
         # Verify results
@@ -338,12 +356,14 @@ class TestTopkAttention(CustomTestCase):
         top_k = 5
 
         q = torch.randn(
-            batch_size, num_heads, head_dim,
-            dtype=torch.float16, device=device
+            batch_size, num_heads, head_dim, dtype=torch.float16, device=device
         )
         k_buffer = torch.randn(
-            seq_len * batch_size, num_kv_heads, head_dim,
-            dtype=torch.float16, device=device
+            seq_len * batch_size,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float16,
+            device=device,
         )
         kv_indptr = torch.tensor(
             [0, seq_len, seq_len * 2], dtype=torch.int32, device=device
@@ -421,22 +441,36 @@ class TestHeadSelectionFiltering(CustomTestCase):
         top_k = 5
 
         # Create query and keys
-        q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device=device)
-        k_buffer = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.float16, device=device)
+        q = torch.randn(
+            batch_size, num_heads, head_dim, dtype=torch.float16, device=device
+        )
+        k_buffer = torch.randn(
+            seq_len, num_kv_heads, head_dim, dtype=torch.float16, device=device
+        )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
         sm_scale = 1.0 / (head_dim ** 0.5)
 
         # Run without head filtering
         scores_all, indices_all, _, _ = compute_topk_attention_chunked(
-            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            q,
+            k_buffer,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            top_k,
             head_ids=None,
         )
 
         # Run with subset of heads
         head_ids = [0, 1, 2]  # Only use first 3 heads
         scores_filtered, indices_filtered, _, _ = compute_topk_attention_chunked(
-            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            q,
+            k_buffer,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            top_k,
             head_ids=head_ids,
         )
 
@@ -466,20 +500,34 @@ class TestHeadSelectionFiltering(CustomTestCase):
         seq_len = 32
         top_k = 3
 
-        q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device=device)
-        k_buffer = torch.randn(seq_len, num_heads, head_dim, dtype=torch.float16, device=device)
+        q = torch.randn(
+            batch_size, num_heads, head_dim, dtype=torch.float16, device=device
+        )
+        k_buffer = torch.randn(
+            seq_len, num_heads, head_dim, dtype=torch.float16, device=device
+        )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
         sm_scale = 1.0 / (head_dim ** 0.5)
 
         # Empty head_ids should behave like None (all heads)
         scores_empty, indices_empty, _, _ = compute_topk_attention_chunked(
-            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            q,
+            k_buffer,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            top_k,
             head_ids=[],
         )
 
         scores_none, indices_none, _, _ = compute_topk_attention_chunked(
-            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            q,
+            k_buffer,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            top_k,
             head_ids=None,
         )
 
@@ -500,8 +548,12 @@ class TestHeadSelectionFiltering(CustomTestCase):
         seq_len = 32
         top_k = 3
 
-        q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device=device)
-        k_buffer = torch.randn(seq_len, num_heads, head_dim, dtype=torch.float16, device=device)
+        q = torch.randn(
+            batch_size, num_heads, head_dim, dtype=torch.float16, device=device
+        )
+        k_buffer = torch.randn(
+            seq_len, num_heads, head_dim, dtype=torch.float16, device=device
+        )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
         sm_scale = 1.0 / (head_dim ** 0.5)
@@ -511,7 +563,12 @@ class TestHeadSelectionFiltering(CustomTestCase):
 
         # Should not crash and should produce valid results
         scores, indices, _, _ = compute_topk_attention_chunked(
-            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            q,
+            k_buffer,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            top_k,
             head_ids=head_ids,
         )
 
@@ -535,15 +592,24 @@ class TestHeadSelectionFiltering(CustomTestCase):
         seq_len = 64
         top_k = 5
 
-        q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device=device)
-        k_buffer = torch.randn(seq_len, num_heads, head_dim, dtype=torch.float16, device=device)
+        q = torch.randn(
+            batch_size, num_heads, head_dim, dtype=torch.float16, device=device
+        )
+        k_buffer = torch.randn(
+            seq_len, num_heads, head_dim, dtype=torch.float16, device=device
+        )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
         sm_scale = 1.0 / (head_dim ** 0.5)
 
         # Use only head 0
         scores, indices, logits, lse = compute_topk_attention_chunked(
-            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            q,
+            k_buffer,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            top_k,
             head_ids=[0],
         )
 
@@ -572,8 +638,12 @@ class TestHeadSelectionFiltering(CustomTestCase):
         seq_len = 10000  # Large enough to trigger chunked path
         top_k = 10
 
-        q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device=device)
-        k_buffer = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.float16, device=device)
+        q = torch.randn(
+            batch_size, num_heads, head_dim, dtype=torch.float16, device=device
+        )
+        k_buffer = torch.randn(
+            seq_len, num_kv_heads, head_dim, dtype=torch.float16, device=device
+        )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
         sm_scale = 1.0 / (head_dim ** 0.5)
@@ -582,7 +652,12 @@ class TestHeadSelectionFiltering(CustomTestCase):
         head_ids = [0, 4, 8, 12]
 
         scores, indices, logits, lse = compute_topk_attention_chunked(
-            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            q,
+            k_buffer,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            top_k,
             chunk_size=2048,
             head_ids=head_ids,
         )

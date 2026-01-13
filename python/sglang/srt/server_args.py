@@ -612,13 +612,21 @@ class ServerArgs:
     attention_tokens_max: int = 4096  # Max tokens to record (0 = unlimited)
     attention_tokens_stride: int = 1  # Record every Nth token (1 = all)
     attention_tokens_window: int = 0  # Context window for capture (0 = all tokens)
-    attention_capture_layers: str = "last"  # "last", "auto", or comma-separated layer indices
-    attention_capture_layer_id: Optional[int] = None  # Specific layer ID to capture (overrides attention_capture_layers)
+    attention_capture_layers: str = (
+        "last"  # "last", "auto", or comma-separated layer indices
+    )
+    attention_capture_layer_id: Optional[
+        int
+    ] = None  # Specific layer ID to capture (overrides attention_capture_layers)
     # Fingerprint mode: compute in-kernel histogram instead of exporting raw indices
     # Production mode - 64 bytes vs ~200KB per step, for high-throughput routing
     attention_fingerprint_mode: bool = False
-    attention_fingerprint_max_steps: int = 256  # Early exit: only capture first N decode steps (manifold stabilizes early)
-    attention_sidecar_url: str = ""  # ZMQ URL for fingerprint streaming (e.g., "tcp://localhost:9001")
+    attention_fingerprint_max_steps: int = (
+        256  # Early exit: only capture first N decode steps (manifold stabilizes early)
+    )
+    attention_sidecar_url: str = (
+        ""  # ZMQ URL for fingerprint streaming (e.g., "tcp://localhost:9001")
+    )
     # Sketch mode: compute per-layer summary sketches (top_hubs, dist_hist, entropy)
     # Bandwidth-efficient for very long outputs (86k+) - ~500 bytes per layer vs raw edges
     attention_sketch_mode: bool = False
@@ -628,25 +636,41 @@ class ServerArgs:
 
     # Privacy: mask attention to system prompt tokens
     # Prevents leaking system prompt structure/length through attention patterns
-    attention_mask_system_prompt: bool = False  # Auto-detect and mask system prompt tokens
+    attention_mask_system_prompt: bool = (
+        False  # Auto-detect and mask system prompt tokens
+    )
     attention_mask_prefix: int = 0  # Manual: mask first N tokens (0 = disabled)
 
     # Attention steering bias caps (prevent OOM from unbounded bias payloads)
     attention_bias_max_layers: int = 8  # Max layers that can have biases
     attention_bias_max_entries_per_layer: int = 1024  # Max bias entries per layer
-    attention_bias_max_seq_len: int = 32768  # Max seq_len for dense fallback (beyond uses sparse)
+    attention_bias_max_seq_len: int = (
+        32768  # Max seq_len for dense fallback (beyond uses sparse)
+    )
 
     # MoE routing capture caps (prevent unbounded buffer growth for long outputs)
-    moe_routing_max_steps: int = 2048  # Max decode steps to capture routing (0 = unlimited)
+    moe_routing_max_steps: int = (
+        2048  # Max decode steps to capture routing (0 = unlimited)
+    )
     moe_routing_stride: int = 1  # Capture every Nth token (1 = all, 8 = every 8th)
-    moe_routing_max_bytes: int = 0  # Hard limit on routing buffer size in bytes (0 = unlimited)
+    moe_routing_max_bytes: int = (
+        0  # Hard limit on routing buffer size in bytes (0 = unlimited)
+    )
 
     # Multi-tenant guardrails for attention capture
     # Restricts who can use attention capture in shared/production environments
-    attention_capture_api_key: Optional[str] = None  # If set, only requests with this key can use attention capture
-    attention_capture_allowed_origins: Optional[str] = None  # Comma-separated origins allowed for attention capture (CORS)
-    attention_capture_max_concurrent: int = 0  # Max concurrent requests with attention capture (0 = unlimited)
-    attention_capture_disable_in_production: bool = False  # Auto-disable if server_args indicate production mode
+    attention_capture_api_key: Optional[
+        str
+    ] = None  # If set, only requests with this key can use attention capture
+    attention_capture_allowed_origins: Optional[
+        str
+    ] = None  # Comma-separated origins allowed for attention capture (CORS)
+    attention_capture_max_concurrent: int = (
+        0  # Max concurrent requests with attention capture (0 = unlimited)
+    )
+    attention_capture_disable_in_production: bool = (
+        False  # Auto-disable if server_args indicate production mode
+    )
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
@@ -1837,9 +1861,10 @@ class ServerArgs:
 
         use_mla_backend = self.use_mla_backend()
         # self.attention_backend didn't overwrite self.prefill/decode_attention_backend yet
-        self.prefill_attention_backend_str, self.decode_attention_backend_str = (
-            self.get_attention_backends()
-        )
+        (
+            self.prefill_attention_backend_str,
+            self.decode_attention_backend_str,
+        ) = self.get_attention_backends()
 
         if is_cuda():
             if (
@@ -4503,9 +4528,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.attention_capture_layers,
             help="Which layers to capture attention from. Options: 'last' (last layer only, syntax patterns), "
-                 "'mid' or 'mid_full' (mid-depth layer ~70%%, recommended for semantic discovery), "
-                 "'auto' (4 layers spread across depth), or comma-separated layer indices like '0,10,20,30'. "
-                 "For hybrid models (Qwen3-Next), 'mid' auto-selects mid-depth full-attention layer. (default: last)",
+            "'mid' or 'mid_full' (mid-depth layer ~70%%, recommended for semantic discovery), "
+            "'auto' (4 layers spread across depth), or comma-separated layer indices like '0,10,20,30'. "
+            "For hybrid models (Qwen3-Next), 'mid' auto-selects mid-depth full-attention layer. (default: last)",
         )
         parser.add_argument(
             "--attention-capture-layer-id",
@@ -4518,52 +4543,52 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.attention_fingerprint_mode,
             help="Enable fingerprint mode for attention capture. Computes in-kernel log-binned histogram "
-                 "instead of exporting raw indices. Production mode - 64 bytes vs ~200KB per step. (default: False)",
+            "instead of exporting raw indices. Production mode - 64 bytes vs ~200KB per step. (default: False)",
         )
         parser.add_argument(
             "--attention-fingerprint-max-steps",
             type=int,
             default=ServerArgs.attention_fingerprint_max_steps,
             help="Early exit for fingerprint mode: only capture first N decode steps. "
-                 "The attention manifold typically stabilizes early, so stopping after 256 steps "
-                 "saves ~90%% of compute overhead. Use 0 for unlimited. (default: 256)",
+            "The attention manifold typically stabilizes early, so stopping after 256 steps "
+            "saves ~90%% of compute overhead. Use 0 for unlimited. (default: 256)",
         )
         parser.add_argument(
             "--attention-sidecar-url",
             type=str,
             default=ServerArgs.attention_sidecar_url,
             help="ZMQ URL for streaming attention fingerprints to sidecar process for clustering. "
-                 "Example: 'tcp://localhost:9001'. Empty string disables streaming. (default: '')",
+            "Example: 'tcp://localhost:9001'. Empty string disables streaming. (default: '')",
         )
         parser.add_argument(
             "--attention-sketch-mode",
             action="store_true",
             default=ServerArgs.attention_sketch_mode,
             help="Enable sketch mode for attention capture. Returns per-layer summary sketches "
-                 "(top_hubs, dist_hist, entropy) instead of raw edges. Bandwidth-efficient for "
-                 "very long outputs (86k+). ~500 bytes per layer. (default: False)",
+            "(top_hubs, dist_hist, entropy) instead of raw edges. Bandwidth-efficient for "
+            "very long outputs (86k+). ~500 bytes per layer. (default: False)",
         )
         parser.add_argument(
             "--attention-chunk-size",
             type=int,
             default=ServerArgs.attention_chunk_size,
             help="Chunk size for attention extraction kernel. Larger chunks use more memory "
-                 "but have fewer kernel launches. Tune based on GPU memory and context length. "
-                 "(default: 2048)",
+            "but have fewer kernel launches. Tune based on GPU memory and context length. "
+            "(default: 2048)",
         )
         parser.add_argument(
             "--attention-mask-system-prompt",
             action="store_true",
             default=ServerArgs.attention_mask_system_prompt,
             help="Privacy: automatically mask attention to system prompt tokens. "
-                 "Prevents leaking system prompt structure/length through attention patterns. (default: False)",
+            "Prevents leaking system prompt structure/length through attention patterns. (default: False)",
         )
         parser.add_argument(
             "--attention-mask-prefix",
             type=int,
             default=ServerArgs.attention_mask_prefix,
             help="Privacy: manually mask attention to first N tokens. "
-                 "Set to number of system prompt tokens to hide. 0 disables. (default: 0)",
+            "Set to number of system prompt tokens to hide. 0 disables. (default: 0)",
         )
         parser.add_argument(
             "--attention-bias-max-layers",
@@ -4608,14 +4633,14 @@ class ServerArgs:
             type=str,
             default=ServerArgs.attention_capture_api_key,
             help="If set, only requests with this API key in X-Attention-Key header can use attention capture. "
-                 "Useful for restricting attention capture in shared environments.",
+            "Useful for restricting attention capture in shared environments.",
         )
         parser.add_argument(
             "--attention-capture-allowed-origins",
             type=str,
             default=ServerArgs.attention_capture_allowed_origins,
             help="Comma-separated list of origins allowed to use attention capture. "
-                 "Example: 'http://localhost:3000,https://dashboard.example.com'",
+            "Example: 'http://localhost:3000,https://dashboard.example.com'",
         )
         parser.add_argument(
             "--attention-capture-max-concurrent",
@@ -4628,7 +4653,7 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.attention_capture_disable_in_production,
             help="Auto-disable attention capture when running in production mode "
-                 "(detected via SGLANG_PRODUCTION env var or explicit flag).",
+            "(detected via SGLANG_PRODUCTION env var or explicit flag).",
         )
 
         # PD disaggregation
@@ -5286,8 +5311,10 @@ class ServerArgs:
         baseline_vit_hidden_size = 1024
 
         # weight params count
-        current_complexity_score = vit_num_layers * (vit_hidden_size**2)
-        baseline_complexity_score = baseline_vit_layers * (baseline_vit_hidden_size**2)
+        current_complexity_score = vit_num_layers * (vit_hidden_size ** 2)
+        baseline_complexity_score = baseline_vit_layers * (
+            baseline_vit_hidden_size ** 2
+        )
         complexity_ratio = (
             current_complexity_score / baseline_complexity_score
             if baseline_complexity_score > 0

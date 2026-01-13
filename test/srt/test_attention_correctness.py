@@ -33,6 +33,7 @@ class TestAttentionPositionCorrectness(unittest.TestCase):
             from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
                 decode_forward_with_topk,
             )
+
             self.decode_available = True
         except ImportError:
             self.decode_available = False
@@ -47,17 +48,16 @@ class TestAttentionPositionCorrectness(unittest.TestCase):
     ) -> Tuple:
         """Create mock KV cache tensors."""
         import torch
+
         dtype = dtype or torch.float16
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # Create KV cache with known patterns
         k_cache = torch.randn(
-            batch_size, num_heads, seq_len, head_dim,
-            dtype=dtype, device=device
+            batch_size, num_heads, seq_len, head_dim, dtype=dtype, device=device
         )
         v_cache = torch.randn(
-            batch_size, num_heads, seq_len, head_dim,
-            dtype=dtype, device=device
+            batch_size, num_heads, seq_len, head_dim, dtype=dtype, device=device
         )
 
         return k_cache, v_cache
@@ -85,13 +85,17 @@ class TestAttentionPositionCorrectness(unittest.TestCase):
         top_k = 10
 
         # Create query and KV cache
-        q = torch.randn(batch_size, num_heads, 1, head_dim, dtype=torch.float16, device="cuda")
+        q = torch.randn(
+            batch_size, num_heads, 1, head_dim, dtype=torch.float16, device="cuda"
+        )
         k_cache, v_cache = self._create_mock_kv_cache(
             batch_size, num_heads, head_dim, seq_len, torch.float16
         )
 
         # Create seq_lens
-        seq_lens = torch.tensor([seq_len] * batch_size, dtype=torch.int32, device="cuda")
+        seq_lens = torch.tensor(
+            [seq_len] * batch_size, dtype=torch.int32, device="cuda"
+        )
 
         # Run attention with top-k extraction
         from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
@@ -115,7 +119,7 @@ class TestAttentionPositionCorrectness(unittest.TestCase):
 
                 self.assertTrue(
                     all(0 <= idx < seq_len for idx in valid_indices),
-                    f"Batch {b}, Head {h}: indices {list(valid_indices)} not in [0, {seq_len})"
+                    f"Batch {b}, Head {h}: indices {list(valid_indices)} not in [0, {seq_len})",
                 )
 
     def test_needle_token_position(self):
@@ -142,12 +146,18 @@ class TestAttentionPositionCorrectness(unittest.TestCase):
         top_k = 5
 
         # Create KV cache with a "needle" - a key that will have high attention
-        k_cache = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
-        v_cache = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+        k_cache = torch.randn(
+            batch_size, num_heads, seq_len, head_dim, dtype=torch.float16, device="cuda"
+        )
+        v_cache = torch.randn(
+            batch_size, num_heads, seq_len, head_dim, dtype=torch.float16, device="cuda"
+        )
 
         # Create a query that matches the needle
-        needle_key = torch.randn(1, num_heads, 1, head_dim, dtype=torch.float16, device="cuda")
-        k_cache[:, :, needle_position:needle_position+1, :] = needle_key
+        needle_key = torch.randn(
+            1, num_heads, 1, head_dim, dtype=torch.float16, device="cuda"
+        )
+        k_cache[:, :, needle_position : needle_position + 1, :] = needle_key
 
         # Query is the same as the needle key (will have high attention to position 25)
         q = needle_key.squeeze(2)  # [B, H, D]
@@ -175,7 +185,7 @@ class TestAttentionPositionCorrectness(unittest.TestCase):
             self.assertIn(
                 needle_position,
                 head_topk,
-                f"Head {h}: needle position {needle_position} not in top-{top_k}: {head_topk}"
+                f"Head {h}: needle position {needle_position} not in top-{top_k}: {head_topk}",
             )
 
 
@@ -194,6 +204,7 @@ class TestGQABroadcastCorrectness(unittest.TestCase):
             from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
                 compute_topk_attention_chunked,
             )
+
             self.gqa_available = True
         except ImportError:
             self.gqa_available = False
@@ -227,11 +238,15 @@ class TestGQABroadcastCorrectness(unittest.TestCase):
         top_k = 5
 
         # Create query [B, num_q_heads, D]
-        q = torch.randn(batch_size, num_q_heads, head_dim, dtype=torch.float16, device="cuda")
+        q = torch.randn(
+            batch_size, num_q_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
 
         # Create KV buffer in paged format: [total_kv, num_kv_heads, D]
         # For single sequence, total_kv = seq_len
-        k_buffer = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        k_buffer = torch.randn(
+            seq_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
 
         # Put a strong signal at position 15 that should be detected after averaging
         needle_pos = 15
@@ -239,7 +254,7 @@ class TestGQABroadcastCorrectness(unittest.TestCase):
         for kv_h in range(num_kv_heads):
             # Average of 4 query heads per KV head
             q_start = kv_h * 4
-            avg_query = q[0, q_start:q_start+4, :].mean(dim=0)
+            avg_query = q[0, q_start : q_start + 4, :].mean(dim=0)
             k_buffer[needle_pos, kv_h, :] = avg_query * 2  # Strong match
 
         # Create indptr and indices for paged attention
@@ -249,7 +264,12 @@ class TestGQABroadcastCorrectness(unittest.TestCase):
         sm_scale = 1.0 / (head_dim ** 0.5)
 
         # Run chunked attention extraction
-        topk_scores, topk_indices, topk_logits, logsumexp = compute_topk_attention_chunked(
+        (
+            topk_scores,
+            topk_indices,
+            topk_logits,
+            logsumexp,
+        ) = compute_topk_attention_chunked(
             q,  # [B, num_q_heads, D]
             k_buffer,  # [total_kv, num_kv_heads, D]
             kv_indptr,
@@ -272,17 +292,17 @@ class TestGQABroadcastCorrectness(unittest.TestCase):
         self.assertIn(
             needle_pos,
             valid_indices,
-            f"Needle position {needle_pos} should be in top-k after averaging: {valid_indices}"
+            f"Needle position {needle_pos} should be in top-k after averaging: {valid_indices}",
         )
 
     def test_gqa_ratio_computation(self):
         """Test that GQA ratio is correctly computed."""
         # Common GQA configurations
         test_cases = [
-            (32, 8, 4),   # Llama-3: 32 Q heads, 8 KV heads, ratio 4
-            (32, 4, 8),   # Some models: 32 Q heads, 4 KV heads, ratio 8
-            (8, 8, 1),    # MHA: equal Q and KV heads, ratio 1
-            (8, 1, 8),    # MQA: 1 KV head, ratio 8
+            (32, 8, 4),  # Llama-3: 32 Q heads, 8 KV heads, ratio 4
+            (32, 4, 8),  # Some models: 32 Q heads, 4 KV heads, ratio 8
+            (8, 8, 1),  # MHA: equal Q and KV heads, ratio 1
+            (8, 1, 8),  # MQA: 1 KV head, ratio 8
         ]
 
         for num_q_heads, num_kv_heads, expected_ratio in test_cases:
@@ -290,7 +310,7 @@ class TestGQABroadcastCorrectness(unittest.TestCase):
             self.assertEqual(
                 actual_ratio,
                 expected_ratio,
-                f"GQA ratio mismatch: {num_q_heads} Q / {num_kv_heads} KV = {actual_ratio}, expected {expected_ratio}"
+                f"GQA ratio mismatch: {num_q_heads} Q / {num_kv_heads} KV = {actual_ratio}, expected {expected_ratio}",
             )
 
 
@@ -312,6 +332,7 @@ class TestPagedAttentionMapping(unittest.TestCase):
             from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
                 compute_topk_attention_chunked,
             )
+
             self.kernel_available = True
         except ImportError:
             self.kernel_available = False
@@ -349,10 +370,14 @@ class TestPagedAttentionMapping(unittest.TestCase):
         seq_len = 10
         top_k = 3
         needle_logical_pos = 5
-        needle_physical_addr = seq_len - 1 - needle_logical_pos  # Reversed: physical = 4
+        needle_physical_addr = (
+            seq_len - 1 - needle_logical_pos
+        )  # Reversed: physical = 4
 
         # Create KV buffer in paged format: [total_kv, num_kv_heads, head_dim]
-        k_buffer = torch.randn(seq_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        k_buffer = torch.randn(
+            seq_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
 
         # Create a REVERSED mapping: kv_indices[physical] = logical
         # Physical addr 0 -> logical pos 9
@@ -362,7 +387,9 @@ class TestPagedAttentionMapping(unittest.TestCase):
         kv_indices = torch.arange(seq_len - 1, -1, -1, dtype=torch.int32, device="cuda")
 
         # Create query that matches the needle (at physical address 4)
-        needle_key = torch.randn(1, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        needle_key = torch.randn(
+            1, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
         k_buffer[needle_physical_addr] = needle_key  # Physical addr 4 = logical pos 5
 
         # Query matches the needle
@@ -374,7 +401,12 @@ class TestPagedAttentionMapping(unittest.TestCase):
         sm_scale = 1.0 / (head_dim ** 0.5)
 
         # Run attention extraction
-        topk_scores, topk_indices, topk_logits, logsumexp = compute_topk_attention_chunked(
+        (
+            topk_scores,
+            topk_indices,
+            topk_logits,
+            logsumexp,
+        ) = compute_topk_attention_chunked(
             q,
             k_buffer,
             kv_indptr,
@@ -393,7 +425,7 @@ class TestPagedAttentionMapping(unittest.TestCase):
             needle_logical_pos,
             valid_indices,
             f"Expected logical position {needle_logical_pos} in top-k, got {valid_indices}. "
-            f"(Physical address was {needle_physical_addr} - if this appeared, mapping is broken)"
+            f"(Physical address was {needle_physical_addr} - if this appeared, mapping is broken)",
         )
 
         # The physical address (4) should NOT appear unless it happens to be a valid logical position
@@ -429,7 +461,9 @@ class TestPagedAttentionMapping(unittest.TestCase):
         top_k = 3
 
         # Physical KV buffer
-        k_buffer = torch.randn(total_kv, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        k_buffer = torch.randn(
+            total_kv, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
 
         # Non-contiguous layout:
         # Seq 0: stored at physical [10,11,12,13,14]
@@ -439,14 +473,20 @@ class TestPagedAttentionMapping(unittest.TestCase):
         # kv_indices maps: the kernel reads from these physical locations
         # For seq 0: indices 0-4 point to physical [10,11,12,13,14]
         # For seq 1: indices 5-9 point to physical [0,1,2,3,4]
-        kv_indices = torch.cat([
-            torch.arange(10, 15, dtype=torch.int32, device="cuda"),  # Seq 0: phys 10-14
-            torch.arange(0, 5, dtype=torch.int32, device="cuda"),    # Seq 1: phys 0-4
-        ])
+        kv_indices = torch.cat(
+            [
+                torch.arange(
+                    10, 15, dtype=torch.int32, device="cuda"
+                ),  # Seq 0: phys 10-14
+                torch.arange(0, 5, dtype=torch.int32, device="cuda"),  # Seq 1: phys 0-4
+            ]
+        )
 
         # Put needle at logical position 2 for both sequences
         needle_logical = 2
-        needle_key = torch.randn(1, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        needle_key = torch.randn(
+            1, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
 
         # Seq 0: logical 2 -> kv_indices index 2 -> physical 12
         k_buffer[12] = needle_key
@@ -458,7 +498,12 @@ class TestPagedAttentionMapping(unittest.TestCase):
 
         sm_scale = 1.0 / (head_dim ** 0.5)
 
-        topk_scores, topk_indices, topk_logits, logsumexp = compute_topk_attention_chunked(
+        (
+            topk_scores,
+            topk_indices,
+            topk_logits,
+            logsumexp,
+        ) = compute_topk_attention_chunked(
             q,
             k_buffer,
             kv_indptr,
@@ -475,13 +520,13 @@ class TestPagedAttentionMapping(unittest.TestCase):
             self.assertIn(
                 needle_logical,
                 valid_indices,
-                f"Batch {b}: Expected logical position {needle_logical} in top-k, got {valid_indices}"
+                f"Batch {b}: Expected logical position {needle_logical} in top-k, got {valid_indices}",
             )
 
             # Verify indices are in valid range [0, seq_len)
             self.assertTrue(
                 all(0 <= idx < seq_len_per_batch for idx in valid_indices),
-                f"Batch {b}: Indices {valid_indices} out of range [0, {seq_len_per_batch})"
+                f"Batch {b}: Indices {valid_indices} out of range [0, {seq_len_per_batch})",
             )
 
 
@@ -533,29 +578,27 @@ class TestAttentionSchemaValidation(unittest.TestCase):
         """Verify attention tokens follow the expected schema."""
         # Expected schema for fingerprint mode
         expected_fields = {
-            'schema_version': int,
-            'mode': str,
-            'fingerprint': list,
-            'manifold': str,
-            'step': int,
+            "schema_version": int,
+            "mode": str,
+            "fingerprint": list,
+            "manifold": str,
+            "step": int,
         }
 
         # Mock attention token (as would be returned from API)
         sample_token = {
-            'schema_version': 1,
-            'mode': 'fingerprint',
-            'fingerprint': [0.1] * 20,
-            'manifold': 'semantic_bridge',
-            'step': 0,
-            'think_phase': 'output',
+            "schema_version": 1,
+            "mode": "fingerprint",
+            "fingerprint": [0.1] * 20,
+            "manifold": "semantic_bridge",
+            "step": 0,
+            "think_phase": "output",
         }
 
         for field, expected_type in expected_fields.items():
             self.assertIn(field, sample_token, f"Missing field: {field}")
             self.assertIsInstance(
-                sample_token[field],
-                expected_type,
-                f"Field {field} has wrong type"
+                sample_token[field], expected_type, f"Field {field} has wrong type"
             )
 
     def test_fingerprint_dimension(self):
@@ -573,10 +616,10 @@ class TestAttentionSchemaValidation(unittest.TestCase):
     def test_manifold_zone_values(self):
         """Verify manifold zone takes expected values."""
         valid_zones = {
-            'syntax_floor',
-            'semantic_bridge',
-            'structure_ripple',
-            'unknown',
+            "syntax_floor",
+            "semantic_bridge",
+            "structure_ripple",
+            "unknown",
         }
 
         for zone in valid_zones:
@@ -594,6 +637,7 @@ class TestLiveServerCorrectness(unittest.TestCase):
         self.base_url = os.environ.get("SGLANG_TEST_URL", "http://localhost:30000")
         try:
             import requests
+
             response = requests.get(f"{self.base_url}/health", timeout=2)
             self.server_available = response.status_code == 200
         except Exception:
@@ -653,8 +697,8 @@ What is the secret code?"""
 
             # Check first record has valid structure
             first = attention_tokens[0]
-            self.assertIn('fingerprint', first)
-            self.assertIn('manifold', first)
+            self.assertIn("fingerprint", first)
+            self.assertIn("manifold", first)
 
 
 if __name__ == "__main__":

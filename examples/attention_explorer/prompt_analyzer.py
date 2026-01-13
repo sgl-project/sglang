@@ -132,8 +132,16 @@ class PromptAnalyzer:
 
         # Domain keywords for entity extraction
         self.technical_domains = {
-            "quantum", "neural", "machine learning", "ai", "algorithm",
-            "blockchain", "cryptocurrency", "physics", "chemistry", "biology",
+            "quantum",
+            "neural",
+            "machine learning",
+            "ai",
+            "algorithm",
+            "blockchain",
+            "cryptocurrency",
+            "physics",
+            "chemistry",
+            "biology",
         }
 
         # Safety patterns
@@ -202,9 +210,13 @@ class PromptAnalyzer:
         scores = {
             QueryType.CODE: self._pattern_score(prompt_lower, self.code_patterns),
             QueryType.MATH: self._pattern_score(prompt_lower, self.math_patterns),
-            QueryType.REASONING: self._pattern_score(prompt_lower, self.reasoning_patterns),
+            QueryType.REASONING: self._pattern_score(
+                prompt_lower, self.reasoning_patterns
+            ),
             QueryType.FACTUAL: self._pattern_score(prompt_lower, self.factual_patterns),
-            QueryType.CREATIVE: self._pattern_score(prompt_lower, self.creative_patterns),
+            QueryType.CREATIVE: self._pattern_score(
+                prompt_lower, self.creative_patterns
+            ),
         }
 
         # Default to conversational if no strong signals
@@ -308,7 +320,8 @@ class PromptAnalyzer:
         # Extract technical terms
         technical = re.findall(
             r"\b(API|JSON|HTTP|SQL|Python|JavaScript|algorithm|function|class)\b",
-            prompt, re.IGNORECASE
+            prompt,
+            re.IGNORECASE,
         )
         entities.extend(technical[:3])
 
@@ -461,10 +474,14 @@ if __name__ == "__main__":
 
         analysis = analyzer.analyze(prompt)
 
-        print(f"Complexity: {analysis.complexity.value} ({analysis.complexity_score:.2f})")
+        print(
+            f"Complexity: {analysis.complexity.value} ({analysis.complexity_score:.2f})"
+        )
         print(f"Query Type: {analysis.query_type.value}")
         print(f"Predicted Zones: {analysis.predicted_zones}")
-        print(f"Expected Entropy: {analysis.expected_entropy[0]:.2f} - {analysis.expected_entropy[1]:.2f}")
+        print(
+            f"Expected Entropy: {analysis.expected_entropy[0]:.2f} - {analysis.expected_entropy[1]:.2f}"
+        )
         print(f"Key Entities: {analysis.key_entities}")
         print(f"Recommended Model: {analysis.recommended_model}")
         print(f"Recommended Max Tokens: {analysis.recommended_max_tokens}")

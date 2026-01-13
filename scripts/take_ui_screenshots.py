@@ -6,12 +6,14 @@ Take comprehensive screenshots of the Attention Explorer UI for documentation.
 import time
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright, Page
+from playwright.sync_api import Page, sync_playwright
 
 
 def setup_output_dir():
     """Create output directory for screenshots."""
-    output_dir = Path("/media/thread/pyth/agentic/attentio/sglang/results/ui_screenshots")
+    output_dir = Path(
+        "/media/thread/pyth/agentic/attentio/sglang/results/ui_screenshots"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
@@ -50,14 +52,14 @@ def main():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080}
-        )
+        context = browser.new_context(viewport={"width": 1920, "height": 1080})
         page = context.new_page()
 
         # Capture console messages
         console_messages = []
-        page.on("console", lambda msg: console_messages.append(f"[{msg.type}] {msg.text}"))
+        page.on(
+            "console", lambda msg: console_messages.append(f"[{msg.type}] {msg.text}")
+        )
 
         print("Loading UI...")
         page.goto(base_url)
@@ -87,7 +89,11 @@ def main():
 
         # Run analysis 2: Code generation
         print("\n=== Analysis 2: Code Generation ===")
-        run_analysis(page, "Write a Python function to check if a number is prime", max_tokens=150)
+        run_analysis(
+            page,
+            "Write a Python function to check if a number is prime",
+            max_tokens=150,
+        )
         take_screenshot(page, "05_code_overview", output_dir)
 
         # Click on a code token
@@ -99,7 +105,11 @@ def main():
 
         # Run analysis 3: Reasoning question
         print("\n=== Analysis 3: Reasoning Question ===")
-        run_analysis(page, "If Alice is taller than Bob, and Bob is taller than Carol, who is the shortest?", max_tokens=80)
+        run_analysis(
+            page,
+            "If Alice is taller than Bob, and Bob is taller than Carol, who is the shortest?",
+            max_tokens=80,
+        )
         take_screenshot(page, "07_reasoning_overview", output_dir)
 
         # Select a reasoning token

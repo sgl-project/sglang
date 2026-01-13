@@ -447,11 +447,15 @@ class ForwardBatch:
     # For attention steering (semantic routing loop)
     # Sparse representation: (layer_id, batch_idx, token_pos, bias_value) tensors
     # Applied as additive bias to attention logits before softmax
-    attention_bias_indices: Optional[torch.Tensor] = None  # [num_biases, 3] (layer_id, batch_idx, token_pos)
-    attention_bias_values: Optional[torch.Tensor] = None   # [num_biases] bias values
-    attention_bias_layers: Optional[List[int]] = None      # Which layers have biases
+    attention_bias_indices: Optional[
+        torch.Tensor
+    ] = None  # [num_biases, 3] (layer_id, batch_idx, token_pos)
+    attention_bias_values: Optional[torch.Tensor] = None  # [num_biases] bias values
+    attention_bias_layers: Optional[List[int]] = None  # Which layers have biases
     # CSR-style per-layer indexing for efficient lookup
-    attention_bias_layer_indptr: Optional[torch.Tensor] = None  # [num_layers+1] CSR indptr
+    attention_bias_layer_indptr: Optional[
+        torch.Tensor
+    ] = None  # [num_layers+1] CSR indptr
 
     # For MoE routing capture (interpretability/semantic telemetry)
     # Captures which experts were selected and with what weights
@@ -470,7 +474,9 @@ class ForwardBatch:
     # For logit lens (interpretability) - project intermediate layers to vocab
     capture_logit_lens: bool = False
     logit_lens_top_k: int = 5  # Number of top token candidates per layer
-    logit_lens_layer_ids: Optional[List[int]] = None  # Which layers to probe (None = auto-select ~4)
+    logit_lens_layer_ids: Optional[
+        List[int]
+    ] = None  # Which layers to probe (None = auto-select ~4)
     # Captured logit lens output (populated after forward pass)
     logit_lens_output: Optional["LogitLensOutput"] = None
 
@@ -539,9 +545,10 @@ class ForwardBatch:
             # process global_num_tokens and global_num_tokens_for_logprob
             if batch.spec_info is not None:
                 spec_info: SpecInput = batch.spec_info
-                global_num_tokens, global_num_tokens_for_logprob = (
-                    spec_info.get_spec_adjusted_global_num_tokens(batch)
-                )
+                (
+                    global_num_tokens,
+                    global_num_tokens_for_logprob,
+                ) = spec_info.get_spec_adjusted_global_num_tokens(batch)
             else:
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
@@ -633,10 +640,10 @@ class ForwardBatch:
         _is_decode = ret.forward_mode.is_decode()
 
         # Determine decode backend
-        decode_backend = getattr(model_runner, 'decode_attention_backend_str', None)
+        decode_backend = getattr(model_runner, "decode_attention_backend_str", None)
         if decode_backend is None:
             decode_backend = model_runner.server_args.attention_backend
-        _is_triton = (decode_backend == "triton")
+        _is_triton = decode_backend == "triton"
 
         # Single linear predicate: all conditions must hold
         _should_capture_attention = _capture_requested and _is_decode and _is_triton
@@ -659,14 +666,16 @@ class ForwardBatch:
 
             # Check if fingerprint mode is enabled (production path)
             ret.attention_fingerprint_mode = getattr(
-                model_runner.server_args, 'attention_fingerprint_mode', False
+                model_runner.server_args, "attention_fingerprint_mode", False
             )
 
             # Determine which layers to capture
             # Priority: 1) per-request override, 2) server arg layer ID, 3) server arg layers config
             num_layers = model_runner.model_config.num_hidden_layers
             layers_config = model_runner.server_args.attention_capture_layers
-            server_layer_id = getattr(model_runner.server_args, 'attention_capture_layer_id', None)
+            server_layer_id = getattr(
+                model_runner.server_args, "attention_capture_layer_id", None
+            )
 
             # Per-request layer override takes highest precedence
             if batch.attention_capture_layer_id is not None:
@@ -674,7 +683,9 @@ class ForwardBatch:
                 # Handle both int and List[int] formats
                 if isinstance(layer_override, list):
                     # Handle -1 as "last layer" for each element
-                    layer_ids = [l if l >= 0 else num_layers + l for l in layer_override]
+                    layer_ids = [
+                        l if l >= 0 else num_layers + l for l in layer_override
+                    ]
                 else:
                     # Single int
                     layer_id = layer_override
@@ -690,7 +701,10 @@ class ForwardBatch:
                 layer_ids = [layer_id]
             elif layers_config == "last":
                 # Just the last layer (mostly syntax/format repair patterns)
-                if hasattr(model_runner, 'attention_layers') and model_runner.attention_layers:
+                if (
+                    hasattr(model_runner, "attention_layers")
+                    and model_runner.attention_layers
+                ):
                     layer_ids = [model_runner.attention_layers[-1].layer_id]
                 else:
                     layer_ids = [num_layers - 1]
@@ -698,7 +712,9 @@ class ForwardBatch:
                 # Mid-depth layer for semantic discovery (~60-80% depth)
                 # This is better for semantic manifold discovery than last layer
                 # For hybrid models, selects mid-depth full attention layer
-                full_attn_layers = getattr(model_runner.model_config, 'full_attention_layer_ids', None)
+                full_attn_layers = getattr(
+                    model_runner.model_config, "full_attention_layer_ids", None
+                )
 
                 if full_attn_layers and len(full_attn_layers) > 0:
                     # HYBRID MODEL: Select mid-depth full attention layer
@@ -713,7 +729,9 @@ class ForwardBatch:
                 # Automatically select ~4 layers spread across depth for semantic manifold coverage
                 # For hybrid models (Qwen3-Next, Llama4, etc.), only use full attention layers
                 # since sliding window layers don't provide the same semantic information
-                full_attn_layers = getattr(model_runner.model_config, 'full_attention_layer_ids', None)
+                full_attn_layers = getattr(
+                    model_runner.model_config, "full_attention_layer_ids", None
+                )
 
                 if full_attn_layers and len(full_attn_layers) > 0:
                     # HYBRID MODEL: Select ~4 layers spread across full attention layers
@@ -785,7 +803,10 @@ class ForwardBatch:
 
             if bias_values:
                 ret.attention_bias_indices = torch.tensor(
-                    [[l, b, t] for l, b, t in zip(layer_ids, batch_indices, token_positions)],
+                    [
+                        [l, b, t]
+                        for l, b, t in zip(layer_ids, batch_indices, token_positions)
+                    ],
                     dtype=torch.int64,
                     device=model_runner.device,
                 )
@@ -805,10 +826,16 @@ class ForwardBatch:
         if batch.capture_moe_routing:
             ret.capture_moe_routing = True
             ret.moe_routing_top_k = batch.moe_routing_top_k
-            ret.moe_routing_buffer = []  # Initialize empty list to accumulate routing data
+            ret.moe_routing_buffer = (
+                []
+            )  # Initialize empty list to accumulate routing data
             # Get limits from server_args
-            ret.moe_routing_stride = getattr(model_runner.server_args, 'moe_routing_stride', 1)
-            ret.moe_routing_max_steps = getattr(model_runner.server_args, 'moe_routing_max_steps', 0)
+            ret.moe_routing_stride = getattr(
+                model_runner.server_args, "moe_routing_stride", 1
+            )
+            ret.moe_routing_max_steps = getattr(
+                model_runner.server_args, "moe_routing_max_steps", 0
+            )
             ret.moe_routing_current_step = 0
 
             # Validate moe_capture_layer_ids against model configuration
@@ -816,8 +843,7 @@ class ForwardBatch:
             if batch.moe_capture_layer_ids is not None:
                 # Filter out invalid layer IDs (out of range or negative)
                 valid_layer_ids = [
-                    lid for lid in batch.moe_capture_layer_ids
-                    if 0 <= lid < num_layers
+                    lid for lid in batch.moe_capture_layer_ids if 0 <= lid < num_layers
                 ]
                 if valid_layer_ids:
                     ret.moe_capture_layer_ids = valid_layer_ids
@@ -838,7 +864,9 @@ class ForwardBatch:
                     lid if lid >= 0 else num_layers + lid
                     for lid in batch.logit_lens_layer_ids
                 ]
-                valid_layer_ids = [lid for lid in valid_layer_ids if 0 <= lid < num_layers]
+                valid_layer_ids = [
+                    lid for lid in valid_layer_ids if 0 <= lid < num_layers
+                ]
                 ret.logit_lens_layer_ids = valid_layer_ids if valid_layer_ids else None
             else:
                 ret.logit_lens_layer_ids = None  # Auto-select layers
@@ -1453,12 +1481,13 @@ class ForwardBatch:
         ) // self.prefix_chunk_len
 
         # Here we compute chunk lens twice to avoid stream sync, once on gpu and once on cpu.
-        prefix_chunk_starts_cuda, prefix_chunk_seq_lens_cuda = (
-            self.get_prefix_chunk_seq_lens(
-                self.extend_prefix_lens,
-                self.num_prefix_chunks,
-                self.prefix_chunk_len,
-            )
+        (
+            prefix_chunk_starts_cuda,
+            prefix_chunk_seq_lens_cuda,
+        ) = self.get_prefix_chunk_seq_lens(
+            self.extend_prefix_lens,
+            self.num_prefix_chunks,
+            self.prefix_chunk_len,
         )
         _, prefix_chunk_seq_lens_cpu = self.get_prefix_chunk_seq_lens(
             torch.tensor(self.extend_prefix_lens_cpu),
