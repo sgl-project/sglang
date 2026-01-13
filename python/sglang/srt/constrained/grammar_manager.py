@@ -101,6 +101,12 @@ class GrammarManager:
 
         return add_to_grammar_queue
 
+    def finalize_grammar(self, req: Req):
+        self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+        if req.grammar is INVALID_GRAMMAR_OBJ:
+            error_msg = f"Invalid grammar request: {req.grammar_key=}"
+            req.set_finish_with_abort(error_msg)
+
     def get_ready_grammar_requests(self) -> List[Req]:
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
         num_ready_reqs = 0
@@ -126,11 +132,7 @@ class GrammarManager:
                     raise futures._base.TimeoutError()
 
                 req.grammar = req.grammar.result(timeout=GRAMMAR_POLL_INTERVAL)
-                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-                if req.grammar is INVALID_GRAMMAR_OBJ:
-                    error_msg = f"Invalid grammar request: {req.grammar_key=}"
-                    req.set_finish_with_abort(error_msg)
-
+                self.finalize_grammar(req)
                 num_ready_reqs += 1
                 num_timeout_pt = num_ready_reqs
             except futures._base.TimeoutError:
@@ -166,10 +168,7 @@ class GrammarManager:
                     continue
                 if isinstance(req.grammar, futures.Future):
                     req.grammar = req.grammar.result()
-                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-                    if req.grammar is INVALID_GRAMMAR_OBJ:
-                        error_msg = f"Invalid grammar request: {req.grammar_key=}"
-                        req.set_finish_with_abort(error_msg)
+                    self.finalize_grammar(req)
 
             num_ready_reqs_min = num_ready_reqs_max
 
@@ -177,11 +176,12 @@ class GrammarManager:
         # TP ranks because timeouts can diverge across ranks.
         for i in range(num_ready_reqs_min, num_timeout_pt_max):
             req = self.grammar_queue[i]
+            if req.finished():
+                continue
             if isinstance(req.grammar, futures.Future):
                 req.grammar.cancel()
-            self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
-            error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
-            req.set_finish_with_abort(error_msg)
+            req.grammar = INVALID_GRAMMAR_OBJ
+            self.finalize_grammar(req)
 
         ready_grammar_reqs = self.grammar_queue[:num_timeout_pt_max]
         self.grammar_queue = self.grammar_queue[num_timeout_pt_max:]
