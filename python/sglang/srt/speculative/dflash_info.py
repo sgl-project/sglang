@@ -108,31 +108,49 @@ class DFlashVerifyInput(SpecInput):
         cumprod = matches.cumprod(dim=1)
         self.accept_length = cumprod.sum(dim=1).to(torch.int32)
 
-        # Get verified tokens
+        # Get verified tokens (before we potentially modify accept_length)
         verified_id = target[torch.arange(bs, device=self.device), self.accept_length]
 
-        # Update requests
+        # Update requests and track accepted indices
         draft_flat = draft.flatten().tolist()
         accept_cpu = self.accept_length.cpu().tolist()
         accepted_indices = []
+        final_accept_lens = []
 
         for i, req in enumerate(batch.reqs):
             base = i * block
             acc = accept_cpu[i]
+            actual_acc = 0
+            finished_early = False
+            
             for j in range(acc + 1):
-                accepted_indices.append(base + j)
                 req.output_ids.append(draft_flat[base + j])
                 req.check_finished()
                 if req.finished():
-                    self.accept_length[i] = j
+                    actual_acc = j
+                    finished_early = True
+                    # Include up to and including the finishing token
+                    for k in range(j + 1):
+                        accepted_indices.append(base + k)
                     break
+            
+            if not finished_early:
+                actual_acc = acc
+                for k in range(acc + 1):
+                    accepted_indices.append(base + k)
+            
+            final_accept_lens.append(actual_acc)
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += acc
+            req.spec_accepted_tokens += actual_acc
+
+        # Update accept_length to reflect actual acceptance
+        self.accept_length = torch.tensor(final_accept_lens, device=self.device, dtype=torch.int32)
 
         accepted = torch.tensor(accepted_indices, device=self.device, dtype=torch.long)
 
         # Free rejected cache
-        evict = torch.ones(bs * block, dtype=torch.bool, device=self.device)
+        num_allocated = len(batch.out_cache_loc)
+        evict = torch.ones(num_allocated, dtype=torch.bool, device=self.device)
         evict[accepted] = False
         batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict])
         batch.out_cache_loc = batch.out_cache_loc[accepted]

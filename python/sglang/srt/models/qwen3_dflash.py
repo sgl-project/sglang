@@ -179,12 +179,28 @@ class Qwen3ForCausalLMDFlash(nn.Module):
         return torch.matmul(h, self._head.t())
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """Load weights with name mapping from checkpoint to our model."""
         params = dict(self.named_parameters())
+        loaded = set()
+
         for name, w in weights:
-            if not name.startswith("model."):
-                name = "model." + name
-            if name in params:
-                default_weight_loader(params[name], w)
+            # Map checkpoint names to our model names
+            mapped = name
+            mapped = mapped.replace("self_attn.", "attn.")
+            mapped = mapped.replace("mlp.gate_proj", "gate_proj")
+            mapped = mapped.replace("mlp.up_proj", "up_proj")
+            mapped = mapped.replace("mlp.down_proj", "down_proj")
+            mapped = mapped.replace("input_layernorm", "input_norm")
+            mapped = mapped.replace("post_attention_layernorm", "post_norm")
+
+            if mapped in params:
+                default_weight_loader(params[mapped], w)
+                loaded.add(mapped)
+
+        # Report missing
+        missing = set(params.keys()) - loaded
+        if missing:
+            print(f"DFlash: {len(missing)} params not loaded: {list(missing)[:5]}")
 
 
 # HuggingFace compatibility - must match architectures in config.json
