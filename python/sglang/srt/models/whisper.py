@@ -526,7 +526,7 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: List[int], _mm_inputs: MultimodalInputs):
         # For Whisper, we manage encoder outputs at the model level (_encoder_cache)
         # rather than using the attention backend's encoder cache mechanism.
         # Therefore, we don't need to prepend placeholder tokens or set num_image_tokens.
@@ -539,22 +539,13 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ) -> LogitsProcessorOutput:
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
         dtype = self.encoder.conv1.weight.dtype
-        device = input_ids.device
 
         # Check if we're in decode mode - use forward_mode instead of mm_inputs
         # because mm_inputs can persist across prefill and decode
         is_decode = forward_batch.forward_mode.is_decode()
 
-        if get_is_capture_mode():
-            # During CUDA graph capture, create dummy encoder outputs
-            total_encoder_len = forward_batch.batch_size
-            encoder_outputs = torch.zeros(
-                total_encoder_len, self.config.d_model, dtype=dtype, device=device
-            )
-        elif is_decode:
+        if is_decode:
             # Decode phase: retrieve cached encoder outputs for all requests in batch
             # Each request needs its own encoder outputs for cross-attention
             encoder_outputs = None
@@ -576,7 +567,7 @@ class WhisperForConditionalGeneration(torch.nn.Module):
             req_indices = forward_batch.req_pool_indices.tolist() if forward_batch.req_pool_indices is not None else []
 
             # Process each request's audio separately and cache
-            for i, (req_idx, mm_input) in enumerate(zip(req_indices, mm_inputs_list)):
+            for req_idx, mm_input in zip(req_indices, mm_inputs_list):
                 if mm_input is None or not mm_input.mm_items:
                     continue
 

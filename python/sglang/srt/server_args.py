@@ -1660,6 +1660,13 @@ class ServerArgs:
                 self.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
 
+        # Encoder-decoder models (e.g., Whisper)
+        if model_config.is_encoder_decoder:
+            logger.warning(
+                "Cuda graph is disabled for encoder-decoder models (e.g., Whisper)"
+            )
+            self.disable_cuda_graph = True
+
         # Major NVIDIA platforms backends
         if (
             self.attention_backend == "flashmla"
