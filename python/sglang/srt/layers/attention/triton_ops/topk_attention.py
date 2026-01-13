@@ -19,7 +19,6 @@ decode phase. It's designed for interpretability/visualization without
 materializing the full attention matrix.
 """
 
-import math
 from typing import Tuple
 
 import torch

@@ -1,6 +1,5 @@
 prompt = "The capital of france is "
 
-import json
 
 import requests
 

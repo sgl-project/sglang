@@ -23,10 +23,7 @@ Usage:
 """
 
 import argparse
-import json
 import sys
-import time
-from typing import Dict, List, Any, Optional
 
 try:
     import requests

@@ -17,8 +17,8 @@ import json
 import time
 import threading
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List
 import numpy as np
 
 try:

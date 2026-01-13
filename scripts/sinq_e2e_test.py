@@ -15,8 +15,7 @@ import json
 import gc
 import argparse
 import time
-from pathlib import Path
-from typing import List, Set, Dict, Tuple, Optional
+from typing import List, Set, Dict, Tuple
 from dataclasses import dataclass, asdict
 
 # Add SINQ to path

@@ -26,7 +26,6 @@ Usage:
 import argparse
 import gc
 import json
-import os
 import sys
 import time
 import uuid

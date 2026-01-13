@@ -9,8 +9,6 @@ import json
 import time
 import subprocess
 import requests
-import os
-import signal
 
 def get_gpu_memory():
     """Get current GPU memory usage in GB."""
