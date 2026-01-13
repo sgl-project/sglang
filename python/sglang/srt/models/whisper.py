@@ -195,30 +195,17 @@ class WhisperAttention(torch.nn.Module):
                 num_heads = self.attn.tp_q_head_num
                 head_dim = self.attn.head_dim
 
-                has_batch_dim = hidden_states.ndim == 3
-                if has_batch_dim:
-                    batch_size, seq_len, _ = hidden_states.shape
-                    # Reshape: [batch, seq_len, embed_dim] -> [batch, seq_len, num_heads, head_dim]
-                    q = q.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)  # [batch, num_heads, seq_len, head_dim]
-                    k = k.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
-                    v = v.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
+                batch_size, seq_len, _ = hidden_states.shape
+                # Reshape: [batch, seq_len, embed_dim] -> [batch, seq_len, num_heads, head_dim]
+                q = q.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)  # [batch, num_heads, seq_len, head_dim]
+                k = k.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
+                v = v.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
 
-                    # Use PyTorch's scaled_dot_product_attention for efficiency
-                    attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=1.0)  # scaling already applied to q
+                # Use PyTorch's scaled_dot_product_attention for efficiency
+                attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=1.0)  # scaling already applied to q
 
-                    # [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, embed_dim]
-                    attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_heads * head_dim)
-                else:
-                    seq_len = hidden_states.shape[0]
-                    q = q.view(seq_len, num_heads, head_dim).transpose(0, 1)  # [num_heads, seq_len, head_dim]
-                    k = k.view(seq_len, num_heads, head_dim).transpose(0, 1)
-                    v = v.view(seq_len, num_heads, head_dim).transpose(0, 1)
-
-                    attn_weights = torch.bmm(q, k.transpose(1, 2))
-                    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
-                    attn_output = torch.bmm(attn_weights, v)
-
-                    attn_output = attn_output.transpose(0, 1).reshape(seq_len, num_heads * head_dim)
+                # [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, embed_dim]
+                attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_heads * head_dim)
             else:
                 # For decoder self-attention: use RadixAttention with KV cache
                 attn_output = self.attn(
@@ -579,12 +566,7 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                         encoder_list.append(self._encoder_cache[req_idx])
 
                 if encoder_list:
-                    if len(encoder_list) == 1:
-                        encoder_outputs = encoder_list[0]
-                    else:
-                        # Concatenate encoder outputs for batched decode
-                        # This aligns with how decoder hidden states are concatenated
-                        encoder_outputs = torch.cat(encoder_list, dim=0)
+                    encoder_outputs = torch.cat(encoder_list, dim=0)
         else:
             # Prefill (extend) phase: process each request's audio separately
             encoder_list = []
@@ -615,9 +597,8 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                     features.to(dtype), encoder_position_ids, forward_batch
                 )
 
-                # Squeeze batch dimension if present
-                if req_encoder_outputs.ndim == 3 and req_encoder_outputs.shape[0] == 1:
-                    req_encoder_outputs = req_encoder_outputs.squeeze(0)
+                # Squeeze batch dimension (encoder always produces [1, seq_len, embed_dim])
+                req_encoder_outputs = req_encoder_outputs.squeeze(0)
 
                 # Cache this request's encoder outputs
                 self._encoder_cache[req_idx] = req_encoder_outputs
@@ -625,10 +606,7 @@ class WhisperForConditionalGeneration(torch.nn.Module):
 
             # Concatenate encoder outputs for all requests in batch
             if encoder_list:
-                if len(encoder_list) == 1:
-                    encoder_outputs = encoder_list[0]
-                else:
-                    encoder_outputs = torch.cat(encoder_list, dim=0)
+                encoder_outputs = torch.cat(encoder_list, dim=0)
             else:
                 encoder_outputs = None
 
