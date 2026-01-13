@@ -5,6 +5,7 @@ from typing import Any, Iterable, Optional, Set, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import get_pp_group
@@ -1060,6 +1061,7 @@ EntryClass = Qwen3NextForCausalLM
 
 
 @register_custom_op(mutates_args=["output"])
+@register_split_op()
 def gdn_with_output(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
