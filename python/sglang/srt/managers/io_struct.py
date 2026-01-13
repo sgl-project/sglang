@@ -223,7 +223,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Only average over these attention heads (None = all heads)
     attention_capture_head_ids: Optional[Union[List[List[int]], List[int]]] = None
     # Attention biases for steering: Dict[layer_id -> Dict[token_pos -> bias]]
-    attention_biases: Optional[Union[List[Dict[int, Dict[int, float]]], Dict[int, Dict[int, float]]]] = None
+    attention_biases: Optional[
+        Union[List[Dict[int, Dict[int, float]]], Dict[int, Dict[int, float]]]
+    ] = None
     # MoE routing capture: which experts were selected for each token
     return_moe_routing: Union[List[bool], bool] = False
     moe_routing_top_k: Union[List[int], int] = 2

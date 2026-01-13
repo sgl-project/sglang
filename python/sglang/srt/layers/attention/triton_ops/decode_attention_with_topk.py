@@ -49,11 +49,11 @@ logger = logging.getLogger(__name__)
 
 @triton.jit
 def _compute_chunk_max_kernel(
-    Q,                    # [batch, num_heads, head_dim]
-    K_Buffer,             # [total_kv, num_kv_heads, head_dim]
-    kv_indptr,           # [batch + 1]
-    kv_indices,          # [total_kv]
-    Chunk_Max_Scores,    # [batch, num_heads, num_chunks]
+    Q,  # [batch, num_heads, head_dim]
+    K_Buffer,  # [total_kv, num_kv_heads, head_dim]
+    kv_indptr,  # [batch + 1]
+    kv_indices,  # [total_kv]
+    Chunk_Max_Scores,  # [batch, num_heads, num_chunks]
     sm_scale,
     stride_qb,
     stride_qh,
@@ -107,7 +107,7 @@ def _compute_chunk_max_kernel(
     q = tl.load(
         Q + cur_batch * stride_qb + cur_head * stride_qh + offs_d,
         mask=mask_d,
-        other=0.0
+        other=0.0,
     )
 
     # Accumulate all scores for this chunk, then take max at the end
@@ -123,17 +123,16 @@ def _compute_chunk_max_kernel(
     mask_n = mask_n & sink_mask
 
     # Get KV cache locations
-    kv_loc = tl.load(
-        kv_indices + kv_start + chunk_start + offs_n,
-        mask=mask_n,
-        other=0
-    )
+    kv_loc = tl.load(kv_indices + kv_start + chunk_start + offs_n, mask=mask_n, other=0)
 
     # Load keys
     k = tl.load(
-        K_Buffer + kv_loc[:, None] * stride_kb + cur_kv_head * stride_kh + offs_d[None, :],
+        K_Buffer
+        + kv_loc[:, None] * stride_kb
+        + cur_kv_head * stride_kh
+        + offs_d[None, :],
         mask=mask_n[:, None] & mask_d[None, :],
-        other=0.0
+        other=0.0,
     )
 
     # Compute attention scores: q @ k^T
@@ -148,10 +147,10 @@ def _compute_chunk_max_kernel(
 
 
 def compute_topk_attention_chunked(
-    q: torch.Tensor,              # [batch, num_heads, head_dim]
-    k_buffer: torch.Tensor,       # [total_kv, num_kv_heads, head_dim]
-    kv_indptr: torch.Tensor,      # [batch + 1]
-    kv_indices: torch.Tensor,     # [total_kv]
+    q: torch.Tensor,  # [batch, num_heads, head_dim]
+    k_buffer: torch.Tensor,  # [total_kv, num_kv_heads, head_dim]
+    kv_indptr: torch.Tensor,  # [batch + 1]
+    kv_indices: torch.Tensor,  # [total_kv]
     sm_scale: float,
     top_k: int = 10,
     chunk_size: int = 1024,
@@ -197,7 +196,9 @@ def compute_topk_attention_chunked(
     if batch_size == 0:
         return (
             torch.zeros((0, top_k), dtype=torch.float32, device=device),
-            torch.full((0, top_k), -1, dtype=torch.int64, device=device),  # -1 = invalid position
+            torch.full(
+                (0, top_k), -1, dtype=torch.int64, device=device
+            ),  # -1 = invalid position
             torch.zeros((0, top_k), dtype=torch.float32, device=device),
             torch.zeros((0,), dtype=torch.float32, device=device),
         )
@@ -210,7 +211,9 @@ def compute_topk_attention_chunked(
         )
         return (
             torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
-            torch.full((batch_size, top_k), -1, dtype=torch.int64, device=device),  # -1 = invalid
+            torch.full(
+                (batch_size, top_k), -1, dtype=torch.int64, device=device
+            ),  # -1 = invalid
             torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
             torch.zeros((batch_size,), dtype=torch.float32, device=device),
         )
@@ -225,7 +228,9 @@ def compute_topk_attention_chunked(
     if max_seq_len == 0:
         return (
             torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
-            torch.full((batch_size, top_k), -1, dtype=torch.int64, device=device),  # -1 = invalid
+            torch.full(
+                (batch_size, top_k), -1, dtype=torch.int64, device=device
+            ),  # -1 = invalid
             torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
             torch.zeros((batch_size,), dtype=torch.float32, device=device),
         )
@@ -240,7 +245,9 @@ def compute_topk_attention_chunked(
             )
             return (
                 torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
-                torch.full((batch_size, top_k), -1, dtype=torch.int64, device=device),  # -1 = invalid
+                torch.full(
+                    (batch_size, top_k), -1, dtype=torch.int64, device=device
+                ),  # -1 = invalid
                 torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
                 torch.zeros((batch_size,), dtype=torch.float32, device=device),
             )
@@ -255,7 +262,9 @@ def compute_topk_attention_chunked(
             )
             return (
                 torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
-                torch.full((batch_size, top_k), -1, dtype=torch.int64, device=device),  # -1 = invalid
+                torch.full(
+                    (batch_size, top_k), -1, dtype=torch.int64, device=device
+                ),  # -1 = invalid
                 torch.zeros((batch_size, top_k), dtype=torch.float32, device=device),
                 torch.zeros((batch_size,), dtype=torch.float32, device=device),
             )
@@ -263,7 +272,12 @@ def compute_topk_attention_chunked(
     # For small sequences, use direct PyTorch (simpler, no kernel overhead)
     if max_seq_len <= chunk_size * 2:
         return _compute_topk_pytorch(
-            q, k_buffer, kv_indptr, kv_indices, sm_scale, top_k,
+            q,
+            k_buffer,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            top_k,
             sink_threshold=sink_threshold,
         )
 
@@ -272,9 +286,7 @@ def compute_topk_attention_chunked(
 
     # Phase 1: Use Triton kernel to compute max score per chunk
     chunk_max_scores = torch.empty(
-        (batch_size, num_heads, num_chunks),
-        dtype=torch.float32,
-        device=device
+        (batch_size, num_heads, num_chunks), dtype=torch.float32, device=device
     )
 
     Lk = head_dim
@@ -317,7 +329,7 @@ def compute_topk_attention_chunked(
                 # First valid chunk: (seq_len - window) // chunk_size
                 first_valid_chunk = (seq_len - window) // chunk_size
                 if first_valid_chunk > 0:
-                    avg_chunk_scores[b, :first_valid_chunk] = float('-inf')
+                    avg_chunk_scores[b, :first_valid_chunk] = float("-inf")
 
     # Get top-k chunks (get extra in case we need to deduplicate)
     k_chunks = min(top_k * 2, num_chunks)
@@ -325,8 +337,14 @@ def compute_topk_attention_chunked(
 
     # Rescan top chunks in PyTorch to get exact positions and scores
     return _rescan_top_chunks(
-        q, k_buffer, kv_indptr, kv_indices,
-        sm_scale, topk_chunk_idx, chunk_size, top_k,
+        q,
+        k_buffer,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        topk_chunk_idx,
+        chunk_size,
+        top_k,
         exact_logsumexp=exact_logsumexp,
         head_ids=head_ids,
         sink_threshold=sink_threshold,
@@ -364,7 +382,7 @@ def _compute_exact_logsumexp_all_chunks(
         seq_len = kv_end - kv_start
 
         if seq_len == 0:
-            logsumexp_list.append(torch.tensor(float('-inf'), device=device))
+            logsumexp_list.append(torch.tensor(float("-inf"), device=device))
             continue
 
         # Online logsumexp accumulation
@@ -377,7 +395,7 @@ def _compute_exact_logsumexp_all_chunks(
             chunk_end = min(chunk_start + chunk_size, seq_len)
 
             # Get positions in this chunk
-            kv_pos = kv_indices[kv_start + chunk_start:kv_start + chunk_end]
+            kv_pos = kv_indices[kv_start + chunk_start : kv_start + chunk_end]
 
             # Validate indices before indexing (prevent CUDA assert)
             if kv_pos.numel() > 0:
@@ -479,7 +497,9 @@ def _rescan_top_chunks(
 
         if seq_len == 0:
             topk_scores_list.append(torch.zeros(top_k, device=device))
-            topk_indices_list.append(torch.full((top_k,), -1, dtype=torch.int64, device=device))  # -1 = invalid
+            topk_indices_list.append(
+                torch.full((top_k,), -1, dtype=torch.int64, device=device)
+            )  # -1 = invalid
             topk_logits_list.append(torch.zeros(top_k, device=device))
             logsumexp_list.append(torch.tensor(0.0, device=device))
             continue
@@ -510,7 +530,7 @@ def _rescan_top_chunks(
                 local_indices = positions - chunk_start
                 kv_pos = kv_indices[kv_start + positions]
             else:
-                kv_pos = kv_indices[kv_start + chunk_start:kv_start + chunk_end]
+                kv_pos = kv_indices[kv_start + chunk_start : kv_start + chunk_end]
 
             # Validate indices before indexing (prevent CUDA assert)
             if kv_pos.numel() > 0:
@@ -552,7 +572,9 @@ def _rescan_top_chunks(
 
         if len(all_scores) == 0:
             topk_scores_list.append(torch.zeros(top_k, device=device))
-            topk_indices_list.append(torch.full((top_k,), -1, dtype=torch.int64, device=device))  # -1 = invalid
+            topk_indices_list.append(
+                torch.full((top_k,), -1, dtype=torch.int64, device=device)
+            )  # -1 = invalid
             topk_logits_list.append(torch.zeros(top_k, device=device))
             logsumexp_list.append(torch.tensor(0.0, device=device))
             continue
@@ -580,8 +602,15 @@ def _rescan_top_chunks(
         if actual_k < top_k:
             padding = top_k - actual_k
             topk_probs = torch.cat([topk_probs, torch.zeros(padding, device=device)])
-            topk_positions = torch.cat([topk_positions, torch.full((padding,), -1, dtype=torch.int64, device=device)])
-            topk_vals = torch.cat([topk_vals, torch.full((padding,), float('-inf'), device=device)])
+            topk_positions = torch.cat(
+                [
+                    topk_positions,
+                    torch.full((padding,), -1, dtype=torch.int64, device=device),
+                ]
+            )
+            topk_vals = torch.cat(
+                [topk_vals, torch.full((padding,), float("-inf"), device=device)]
+            )
 
         topk_scores_list.append(topk_probs)
         topk_indices_list.append(topk_positions)
@@ -637,7 +666,9 @@ def _compute_topk_pytorch(
 
         if seq_len == 0:
             topk_scores_list.append(torch.zeros(top_k, device=device))
-            topk_indices_list.append(torch.full((top_k,), -1, dtype=torch.int64, device=device))  # -1 = invalid
+            topk_indices_list.append(
+                torch.full((top_k,), -1, dtype=torch.int64, device=device)
+            )  # -1 = invalid
             topk_logits_list.append(torch.zeros(top_k, device=device))
             logsumexp_list.append(torch.tensor(0.0, device=device))
             continue
@@ -655,7 +686,9 @@ def _compute_topk_pytorch(
                     f"k_buffer_size={k_buffer_size}). Skipping."
                 )
                 topk_scores_list.append(torch.zeros(top_k, device=device))
-                topk_indices_list.append(torch.full((top_k,), -1, dtype=torch.int64, device=device))  # -1 = invalid
+                topk_indices_list.append(
+                    torch.full((top_k,), -1, dtype=torch.int64, device=device)
+                )  # -1 = invalid
                 topk_logits_list.append(torch.zeros(top_k, device=device))
                 logsumexp_list.append(torch.tensor(0.0, device=device))
                 continue
@@ -682,7 +715,7 @@ def _compute_topk_pytorch(
             positions = torch.arange(seq_len, device=device)
             sink_mask = positions < sink_threshold
             # Set sink scores to -inf so they're never selected
-            scores_avg = scores_avg.masked_fill(sink_mask, float('-inf'))
+            scores_avg = scores_avg.masked_fill(sink_mask, float("-inf"))
             # Adjust effective sequence length for top-k
             effective_seq_len = max(0, seq_len - sink_threshold)
         else:
@@ -698,7 +731,7 @@ def _compute_topk_pytorch(
             topk_vals, topk_idx = torch.topk(scores_avg, actual_k)
         else:
             # All positions are sink tokens - use -1 as invalid position sentinel
-            topk_vals = torch.full((top_k,), float('-inf'), device=device)
+            topk_vals = torch.full((top_k,), float("-inf"), device=device)
             topk_idx = torch.full((top_k,), -1, dtype=torch.int64, device=device)
 
         # Softmax normalize (over top-k only, for display)
@@ -709,8 +742,12 @@ def _compute_topk_pytorch(
         if actual_k > 0 and actual_k < top_k:
             padding = top_k - actual_k
             topk_probs = torch.cat([topk_probs, torch.zeros(padding, device=device)])
-            topk_idx = torch.cat([topk_idx, torch.full((padding,), -1, dtype=torch.int64, device=device)])
-            topk_vals = torch.cat([topk_vals, torch.full((padding,), float('-inf'), device=device)])
+            topk_idx = torch.cat(
+                [topk_idx, torch.full((padding,), -1, dtype=torch.int64, device=device)]
+            )
+            topk_vals = torch.cat(
+                [topk_vals, torch.full((padding,), float("-inf"), device=device)]
+            )
 
         topk_scores_list.append(topk_probs)
         topk_indices_list.append(topk_idx)
@@ -735,13 +772,13 @@ N_FINGERPRINT_BINS = 16
 
 @triton.jit
 def _compute_fingerprint_kernel(
-    TopK_Indices,       # [batch, top_k] - positions attended to
-    TopK_Weights,       # [batch, top_k] - attention weights (normalized)
-    Current_Pos,        # [batch] - current decode position
-    Fingerprint_Out,    # [batch, N_BINS] - output histogram
-    stride_ib,          # stride for indices batch dim
-    stride_wb,          # stride for weights batch dim
-    stride_fb,          # stride for fingerprint batch dim
+    TopK_Indices,  # [batch, top_k] - positions attended to
+    TopK_Weights,  # [batch, top_k] - attention weights (normalized)
+    Current_Pos,  # [batch] - current decode position
+    Fingerprint_Out,  # [batch, N_BINS] - output histogram
+    stride_ib,  # stride for indices batch dim
+    stride_wb,  # stride for weights batch dim
+    stride_fb,  # stride for fingerprint batch dim
     N_BINS: tl.constexpr,
     TOP_K: tl.constexpr,
 ):
@@ -788,7 +825,9 @@ def _compute_fingerprint_kernel(
     # Since we're in a single program, we can use atomic adds to shared memory
     # But simpler: iterate and accumulate (TOP_K is small, typically 10)
     for i in range(TOP_K):
-        bin_idx = tl.load(bins + i)  # This doesn't work in Triton - need different approach
+        bin_idx = tl.load(
+            bins + i
+        )  # This doesn't work in Triton - need different approach
         weight = tl.load(weights + i)
         # Accumulate - we'll use a different approach below
 
@@ -798,9 +837,9 @@ def _compute_fingerprint_kernel(
 
 
 def compute_fingerprint_gpu(
-    topk_indices: torch.Tensor,    # [batch, top_k]
-    topk_weights: torch.Tensor,    # [batch, top_k]
-    current_pos: torch.Tensor,     # [batch]
+    topk_indices: torch.Tensor,  # [batch, top_k]
+    topk_weights: torch.Tensor,  # [batch, top_k]
+    current_pos: torch.Tensor,  # [batch]
     n_bins: int = N_FINGERPRINT_BINS,
 ) -> torch.Tensor:
     """
@@ -860,9 +899,9 @@ def compute_fingerprint_features(
     hist_norm = fingerprint / hist_sum
 
     # Extract mass by region
-    local_mass = hist_norm[:, :3].sum(dim=1)   # Bins 0-2: offset < 8
-    mid_mass = hist_norm[:, 3:8].sum(dim=1)    # Bins 3-7: offset 8-255
-    long_mass = hist_norm[:, 8:].sum(dim=1)    # Bins 8+: offset 256+
+    local_mass = hist_norm[:, :3].sum(dim=1)  # Bins 0-2: offset < 8
+    mid_mass = hist_norm[:, 3:8].sum(dim=1)  # Bins 3-7: offset 8-255
+    long_mass = hist_norm[:, 8:].sum(dim=1)  # Bins 8+: offset 256+
 
     # Entropy (concentration measure)
     # High entropy = diffuse attention, Low entropy = focused attention
@@ -883,10 +922,11 @@ def compute_fingerprint_features(
 
 class ManifoldZone:
     """Attention manifold classification."""
-    SYNTAX_FLOOR = "syntax_floor"       # Local jitter (offset < 8)
-    SEMANTIC_BRIDGE = "semantic_bridge" # Mid-range retrieval (offset 8-255)
-    LONG_RANGE = "long_range"           # Long-range attention (offset 256+)
-    DIFFUSE = "diffuse"                 # No clear pattern (high entropy)
+
+    SYNTAX_FLOOR = "syntax_floor"  # Local jitter (offset < 8)
+    SEMANTIC_BRIDGE = "semantic_bridge"  # Mid-range retrieval (offset 8-255)
+    LONG_RANGE = "long_range"  # Long-range attention (offset 256+)
+    DIFFUSE = "diffuse"  # No clear pattern (high entropy)
     UNKNOWN = "unknown"
 
 
@@ -941,6 +981,7 @@ def classify_manifold_gpu(
 # =============================================================================
 # HIGH-LEVEL API FOR INTEGRATION
 # =============================================================================
+
 
 class TopKAttentionCapture:
     """
@@ -1006,8 +1047,13 @@ class TopKAttentionCapture:
             - manifold: List[str] manifold classification (if fingerprint_mode)
         """
         scores, indices, logits, logsumexp = compute_topk_attention_chunked(
-            q, k_buffer, kv_indptr, kv_indices,
-            sm_scale, self.top_k, self.chunk_size,
+            q,
+            k_buffer,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            self.top_k,
+            self.chunk_size,
             sink_threshold=self.sink_threshold,  # Sinq kernel optimization
         )
 
@@ -1026,9 +1072,9 @@ class TopKAttentionCapture:
             features = compute_fingerprint_features(fingerprint)
             manifolds, confidences = classify_manifold_gpu(fingerprint)
 
-            result["fingerprint"] = fingerprint       # [batch, 16] - stays on GPU
-            result["features"] = features             # [batch, 20] - stays on GPU
-            result["manifold"] = manifolds            # List[str]
+            result["fingerprint"] = fingerprint  # [batch, 16] - stays on GPU
+            result["features"] = features  # [batch, 20] - stays on GPU
+            result["manifold"] = manifolds  # List[str]
             result["manifold_confidence"] = confidences
 
         return result
@@ -1056,15 +1102,18 @@ class TopKAttentionCapture:
         # Get top-k (we still need this for the histogram)
         # Sink tokens are filtered in-kernel if sink_threshold > 0
         scores, indices, _, _ = compute_topk_attention_chunked(
-            q, k_buffer, kv_indptr, kv_indices,
-            sm_scale, self.top_k, self.chunk_size,
+            q,
+            k_buffer,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            self.top_k,
+            self.chunk_size,
             sink_threshold=self.sink_threshold,  # Sinq kernel optimization
         )
 
         # Compute fingerprint ON GPU - this is the key optimization
-        fingerprint = compute_fingerprint_gpu(
-            indices, scores, current_pos, self.n_bins
-        )
+        fingerprint = compute_fingerprint_gpu(indices, scores, current_pos, self.n_bins)
         features = compute_fingerprint_features(fingerprint)
         manifolds, _ = classify_manifold_gpu(fingerprint)
 
@@ -1096,7 +1145,9 @@ class TopKAttentionCapture:
             if "manifold" in topk_info:
                 entry["manifold"] = topk_info["manifold"][b]
             if "manifold_confidence" in topk_info:
-                entry["manifold_confidence"] = topk_info["manifold_confidence"][b].item()
+                entry["manifold_confidence"] = topk_info["manifold_confidence"][
+                    b
+                ].item()
             result.append(entry)
         return result
 
@@ -1124,17 +1175,22 @@ class TopKAttentionCapture:
 
         result = []
         for b in range(batch_size):
-            result.append({
-                "request_id": request_ids[b] if b < len(request_ids) else f"batch-{b}",
-                "vector": features_cpu[b].tolist(),
-                "manifold": manifolds[b],
-            })
+            result.append(
+                {
+                    "request_id": (
+                        request_ids[b] if b < len(request_ids) else f"batch-{b}"
+                    ),
+                    "vector": features_cpu[b].tolist(),
+                    "manifold": manifolds[b],
+                }
+            )
         return result
 
 
 # =============================================================================
 # TESTING
 # =============================================================================
+
 
 def test_topk_attention():
     """Quick test of the top-k extraction."""
@@ -1148,10 +1204,14 @@ def test_topk_attention():
 
     # Create test data
     q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=torch.float16)
-    k_buffer = torch.randn(seq_len * batch_size, num_kv_heads, head_dim, device=device, dtype=torch.float16)
-    kv_indptr = torch.tensor([0, seq_len, seq_len * 2], dtype=torch.int32, device=device)
+    k_buffer = torch.randn(
+        seq_len * batch_size, num_kv_heads, head_dim, device=device, dtype=torch.float16
+    )
+    kv_indptr = torch.tensor(
+        [0, seq_len, seq_len * 2], dtype=torch.int32, device=device
+    )
     kv_indices = torch.arange(seq_len * batch_size, dtype=torch.int32, device=device)
-    sm_scale = 1.0 / (head_dim ** 0.5)
+    sm_scale = 1.0 / (head_dim**0.5)
 
     print("=" * 60)
     print("TEST 1: Basic Top-K Extraction (Debug Mode)")
@@ -1166,8 +1226,8 @@ def test_topk_attention():
     print(f"Sample indices: {result['indices'][0]}")
 
     # Verify true probability calculation
-    logits = result['logits'][0]
-    logsumexp = result['logsumexp'][0]
+    logits = result["logits"][0]
+    logsumexp = result["logsumexp"][0]
     true_probs = torch.exp(logits - logsumexp)
     print(f"Sum of true probs (should be <= 1): {true_probs.sum().item():.6f}")
 
@@ -1178,7 +1238,9 @@ def test_topk_attention():
     # Test fingerprint mode
     current_pos = torch.tensor([seq_len, seq_len], dtype=torch.int64, device=device)
     capture_fp = TopKAttentionCapture(top_k=10, fingerprint_mode=True)
-    result_fp = capture_fp.extract(q, k_buffer, kv_indptr, kv_indices, sm_scale, current_pos)
+    result_fp = capture_fp.extract(
+        q, k_buffer, kv_indptr, kv_indices, sm_scale, current_pos
+    )
 
     print(f"Fingerprint shape: {result_fp['fingerprint'].shape}")
     print(f"Features shape: {result_fp['features'].shape}")
@@ -1187,14 +1249,14 @@ def test_topk_attention():
 
     # Show histogram
     print(f"\nFingerprint histogram (batch 0):")
-    fp = result_fp['fingerprint'][0]
+    fp = result_fp["fingerprint"][0]
     for i in range(N_FINGERPRINT_BINS):
         bar = "█" * int(fp[i].item() * 50)
         offset_range = f"[{2**i}-{2**(i+1)-1}]" if i > 0 else "[1]"
         print(f"  Bin {i:2d} {offset_range:12s}: {fp[i].item():.3f} {bar}")
 
     # Show features
-    features = result_fp['features'][0]
+    features = result_fp["features"][0]
     print(f"\nFeature vector (batch 0):")
     print(f"  local_mass:  {features[0].item():.3f} (bins 0-2, offset < 8)")
     print(f"  mid_mass:    {features[1].item():.3f} (bins 3-7, offset 8-255)")
@@ -1226,7 +1288,7 @@ def test_topk_attention():
 
     # Compare bandwidth
     raw_size = batch_size * 10 * 4 * 2  # indices + scores, float32
-    fp_size = batch_size * 20 * 4       # 20 features, float32
+    fp_size = batch_size * 20 * 4  # 20 features, float32
 
     print(f"Raw mode:         {raw_size:,} bytes per step")
     print(f"Fingerprint mode: {fp_size:,} bytes per step")
@@ -1252,14 +1314,16 @@ def test_topk_attention():
     print(f"  Top-k indices: {result_sinq['indices'][0]}")
 
     # Verify no sink positions (0-4) in results
-    indices_batch0 = result_sinq['indices'][0].cpu()
+    indices_batch0 = result_sinq["indices"][0].cpu()
     has_sink = (indices_batch0 < 5).any().item()
     print(f"  Contains sink positions (0-4): {has_sink}")
 
     # Compare with no filtering
     capture_no_filter = TopKAttentionCapture(top_k=10, sink_threshold=0)
-    result_no_filter = capture_no_filter.extract(q, k_buffer, kv_indptr, kv_indices, sm_scale)
-    indices_no_filter = result_no_filter['indices'][0].cpu()
+    result_no_filter = capture_no_filter.extract(
+        q, k_buffer, kv_indptr, kv_indices, sm_scale
+    )
+    indices_no_filter = result_no_filter["indices"][0].cpu()
     has_sink_unfiltered = (indices_no_filter < 5).any().item()
     print(f"  Without filter, contains sink: {has_sink_unfiltered}")
 
@@ -1293,9 +1357,12 @@ def test_fingerprint_manifolds():
     # Create synthetic fingerprints for each manifold type
     test_cases = [
         ("Syntax Floor (local)", [0.5, 0.3, 0.15, 0.05] + [0.0] * 12),
-        ("Semantic Bridge (mid)", [0.05, 0.05, 0.1, 0.2, 0.25, 0.2, 0.1, 0.05] + [0.0] * 8),
+        (
+            "Semantic Bridge (mid)",
+            [0.05, 0.05, 0.1, 0.2, 0.25, 0.2, 0.1, 0.05] + [0.0] * 8,
+        ),
         ("Long Range", [0.05] * 8 + [0.15, 0.2, 0.25, 0.2, 0.1, 0.05, 0.0, 0.0]),
-        ("Diffuse (uniform)", [1/16] * 16),
+        ("Diffuse (uniform)", [1 / 16] * 16),
     ]
 
     for name, hist in test_cases:
@@ -1306,8 +1373,10 @@ def test_fingerprint_manifolds():
         print(f"\n{name}:")
         print(f"  Manifold: {manifolds[0]}")
         print(f"  Confidence: {confidences[0].item():.3f}")
-        print(f"  Features: local={features[0,0].item():.2f}, mid={features[0,1].item():.2f}, "
-              f"long={features[0,2].item():.2f}, entropy={features[0,3].item():.2f}")
+        print(
+            f"  Features: local={features[0,0].item():.2f}, mid={features[0,1].item():.2f}, "
+            f"long={features[0,2].item():.2f}, entropy={features[0,3].item():.2f}"
+        )
 
 
 if __name__ == "__main__":

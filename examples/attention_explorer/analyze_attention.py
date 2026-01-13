@@ -27,6 +27,7 @@ import requests
 # Try to use local tokenizer for efficiency
 try:
     from transformers import AutoTokenizer
+
     HAS_TRANSFORMERS = True
 except ImportError:
     HAS_TRANSFORMERS = False
@@ -93,9 +94,7 @@ class AttentionAnalyzer:
         if self.local_tokenizer is not None:
             # Fast path: local tokenizer
             token_ids = self.local_tokenizer.encode(text, add_special_tokens=False)
-            token_strings = [
-                self.local_tokenizer.decode([tid]) for tid in token_ids
-            ]
+            token_strings = [self.local_tokenizer.decode([tid]) for tid in token_ids]
             return token_ids, token_strings
 
         # Fallback: server API (batch, not per-token)
@@ -266,7 +265,11 @@ class AttentionAnalyzer:
                     position_max_score[pos] = max(position_max_score[pos], score)
 
                     # Track true probability if available
-                    if i < len(logits) and logsumexp is not None and logits[i] is not None:
+                    if (
+                        i < len(logits)
+                        and logsumexp is not None
+                        and logits[i] is not None
+                    ):
                         true_prob = self.compute_true_probability(logits[i], logsumexp)
                         if true_prob is not None:
                             position_true_prob_sum[pos] += true_prob
@@ -279,15 +282,17 @@ class AttentionAnalyzer:
         for pos in position_total_score.keys():
             tok_text = all_tokens[pos] if pos < len(all_tokens) else f"[{pos}]"
             true_prob = position_true_prob_sum.get(pos, 0)
-            influence_ranking.append({
-                "position": pos,
-                "token": tok_text,
-                "total_score": position_total_score[pos],
-                "count": position_count[pos],
-                "max_score": position_max_score[pos],
-                "true_prob_sum": true_prob,
-                "is_prompt": pos < prompt_len,
-            })
+            influence_ranking.append(
+                {
+                    "position": pos,
+                    "token": tok_text,
+                    "total_score": position_total_score[pos],
+                    "count": position_count[pos],
+                    "max_score": position_max_score[pos],
+                    "true_prob_sum": true_prob,
+                    "is_prompt": pos < prompt_len,
+                }
+            )
 
         # Sort by true_prob_sum if available, otherwise by total_score
         if has_true_probs:
@@ -320,22 +325,28 @@ class AttentionAnalyzer:
                 if j < len(logits) and logsumexp is not None and logits[j] is not None:
                     true_prob = self.compute_true_probability(logits[j], logsumexp)
 
-                top_attended.append({
-                    "position": pos,
-                    "token": tok_text,
-                    "score": score,
-                    "true_prob": true_prob,
-                    "is_prompt": pos < prompt_len,
-                })
+                top_attended.append(
+                    {
+                        "position": pos,
+                        "token": tok_text,
+                        "score": score,
+                        "true_prob": true_prob,
+                        "is_prompt": pos < prompt_len,
+                    }
+                )
 
-            output_breakdown.append({
-                "step": i,
-                "prompt_attention": prompt_attn,
-                "output_attention": output_attn,
-                "top_attended": top_attended,
-            })
+            output_breakdown.append(
+                {
+                    "step": i,
+                    "prompt_attention": prompt_attn,
+                    "output_attention": output_attn,
+                    "top_attended": top_attended,
+                }
+            )
 
-        avg_captured_mass = total_captured_mass / mass_samples if mass_samples > 0 else None
+        avg_captured_mass = (
+            total_captured_mass / mass_samples if mass_samples > 0 else None
+        )
 
         # Get layer info from first attention entry if available
         captured_layer_id = None
@@ -360,25 +371,31 @@ class AttentionAnalyzer:
     def print_analysis(self, analysis: Dict):
         """Pretty print analysis results."""
         print(f"Prompt: \"{analysis['prompt']}\"")
-        print(f"Output: \"{analysis['output_text'][:100]}{'...' if len(analysis['output_text']) > 100 else ''}\"")
-        print(f"Prompt tokens: {analysis['prompt_len']}, Output tokens: {analysis.get('output_len', '?')}")
-        print(f"Recorded attention steps: {analysis['attention_steps']} (stride/max limits may apply)")
-        if analysis.get('layer_id') is not None:
+        print(
+            f"Output: \"{analysis['output_text'][:100]}{'...' if len(analysis['output_text']) > 100 else ''}\""
+        )
+        print(
+            f"Prompt tokens: {analysis['prompt_len']}, Output tokens: {analysis.get('output_len', '?')}"
+        )
+        print(
+            f"Recorded attention steps: {analysis['attention_steps']} (stride/max limits may apply)"
+        )
+        if analysis.get("layer_id") is not None:
             print(f"Captured from layer: {analysis['layer_id']}")
-        if analysis['avg_captured_mass'] is not None:
+        if analysis["avg_captured_mass"] is not None:
             print(f"Avg captured mass (top-k): {analysis['avg_captured_mass']:.1%}")
         print(f"Ranking method: {analysis.get('ranked_by', 'attention_score')}")
         print()
 
         # Print prompt tokens
         print(f"Prompt tokens ({analysis['prompt_len']}):")
-        for i, tok in enumerate(analysis['prompt_tokens'][:20]):
+        for i, tok in enumerate(analysis["prompt_tokens"][:20]):
             print(f"  {i:3d}: {repr(tok)}")
-        if len(analysis['prompt_tokens']) > 20:
+        if len(analysis["prompt_tokens"]) > 20:
             print(f"  ... ({len(analysis['prompt_tokens']) - 20} more)")
 
         # Print output tokens if available
-        output_tokens = analysis.get('output_tokens', [])
+        output_tokens = analysis.get("output_tokens", [])
         if output_tokens:
             print(f"\nOutput tokens ({len(output_tokens)}):")
             for i, tok in enumerate(output_tokens[:10]):
@@ -389,18 +406,24 @@ class AttentionAnalyzer:
 
         # Print influence ranking
         print("=" * 70)
-        ranked_by = analysis.get('ranked_by', 'attention_score')
-        if ranked_by == 'true_prob':
+        ranked_by = analysis.get("ranked_by", "attention_score")
+        if ranked_by == "true_prob":
             print("TOKEN INFLUENCE (ranked by TRUE PROBABILITY - stable across k)")
         else:
-            print("TOKEN INFLUENCE (ranked by attention score - renormalized over top-k)")
+            print(
+                "TOKEN INFLUENCE (ranked by attention score - renormalized over top-k)"
+            )
         print("=" * 70)
-        print(f"{'Pos':>4} {'Type':<6} {'Token':<20} {'Score':>8} {'Count':>6} {'TrueProb':>10}")
+        print(
+            f"{'Pos':>4} {'Type':<6} {'Token':<20} {'Score':>8} {'Count':>6} {'TrueProb':>10}"
+        )
         print("-" * 70)
 
-        for item in analysis['influence_ranking'][:15]:
-            true_prob_str = f"{item['true_prob_sum']:.4f}" if item['true_prob_sum'] > 0 else "-"
-            pos_type = "prompt" if item.get('is_prompt', True) else "output"
+        for item in analysis["influence_ranking"][:15]:
+            true_prob_str = (
+                f"{item['true_prob_sum']:.4f}" if item["true_prob_sum"] > 0 else "-"
+            )
+            pos_type = "prompt" if item.get("is_prompt", True) else "output"
             print(
                 f"{item['position']:4d} {pos_type:<6} {repr(item['token']):<20} "
                 f"{item['total_score']:8.3f} {item['count']:6d} "
@@ -412,13 +435,13 @@ class AttentionAnalyzer:
         print("OUTPUT TOKEN ATTENTION BREAKDOWN")
         print("=" * 70)
 
-        for breakdown in analysis['output_breakdown']:
+        for breakdown in analysis["output_breakdown"]:
             print(f"\nOutput token {breakdown['step'] + 1}:")
             print(f"  Prompt attention: {breakdown['prompt_attention']:.1%}")
             print(f"  Output attention: {breakdown['output_attention']:.1%}")
             print(f"  Top attended:")
-            for att in breakdown['top_attended']:
-                if att['true_prob'] is not None:
+            for att in breakdown["top_attended"]:
+                if att["true_prob"] is not None:
                     print(
                         f"    {att['position']:3d} {repr(att['token']):<15} "
                         f"score={att['score']:.3f} true_prob={att['true_prob']:.4f}"
@@ -436,15 +459,31 @@ def main():
     )
     parser.add_argument("prompt", help="The prompt to analyze")
     parser.add_argument("--max-tokens", type=int, default=20, help="Max output tokens")
-    parser.add_argument("--top-k-attention", type=int, default=10,
-                        help="Number of top attention positions to capture")
-    parser.add_argument("--max-output-breakdown", type=int, default=5,
-                        help="Number of output tokens to show detailed breakdown")
-    parser.add_argument("--layer-id", type=int, default=None,
-                        help="Layer to capture attention from (-1 for last layer, default: server default)")
+    parser.add_argument(
+        "--top-k-attention",
+        type=int,
+        default=10,
+        help="Number of top attention positions to capture",
+    )
+    parser.add_argument(
+        "--max-output-breakdown",
+        type=int,
+        default=5,
+        help="Number of output tokens to show detailed breakdown",
+    )
+    parser.add_argument(
+        "--layer-id",
+        type=int,
+        default=None,
+        help="Layer to capture attention from (-1 for last layer, default: server default)",
+    )
     parser.add_argument("--model", default="default", help="Model name for API calls")
-    parser.add_argument("--api-base", default="http://localhost:8000", help="API base URL")
-    parser.add_argument("--timeout", type=int, default=60, help="Request timeout in seconds")
+    parser.add_argument(
+        "--api-base", default="http://localhost:8000", help="API base URL"
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=60, help="Request timeout in seconds"
+    )
     parser.add_argument("--json", action="store_true", help="Output as JSON")
 
     args = parser.parse_args()

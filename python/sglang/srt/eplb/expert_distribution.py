@@ -160,15 +160,24 @@ class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
             layer_idx = self._current_layer_idx.value
 
             # Check max_steps limit (0 = unlimited)
-            if fb.moe_routing_max_steps > 0 and fb.moe_routing_current_step >= fb.moe_routing_max_steps:
+            if (
+                fb.moe_routing_max_steps > 0
+                and fb.moe_routing_current_step >= fb.moe_routing_max_steps
+            ):
                 return  # Exceeded max steps, skip capture
 
             # Check stride (only capture every Nth step)
-            if fb.moe_routing_stride > 1 and (fb.moe_routing_current_step % fb.moe_routing_stride) != 0:
+            if (
+                fb.moe_routing_stride > 1
+                and (fb.moe_routing_current_step % fb.moe_routing_stride) != 0
+            ):
                 return  # Not on stride boundary, skip capture
 
             # Check if this layer should be captured
-            if fb.moe_capture_layer_ids is None or layer_idx in fb.moe_capture_layer_ids:
+            if (
+                fb.moe_capture_layer_ids is None
+                or layer_idx in fb.moe_capture_layer_ids
+            ):
                 # Limit to top-k experts as requested
                 top_k = min(fb.moe_routing_top_k, topk_ids.shape[-1])
                 captured_ids = topk_ids[:, :top_k].clone().cpu()
@@ -177,7 +186,9 @@ class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
                     if topk_weights is not None
                     else None
                 )
-                fb.moe_routing_buffer.append((layer_idx, captured_ids, captured_weights))
+                fb.moe_routing_buffer.append(
+                    (layer_idx, captured_ids, captured_weights)
+                )
 
 
 class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
@@ -267,13 +278,22 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             layer_idx = self._current_layer_idx.value
 
             # Check max_steps limit (0 = unlimited)
-            if fb.moe_routing_max_steps > 0 and fb.moe_routing_current_step >= fb.moe_routing_max_steps:
+            if (
+                fb.moe_routing_max_steps > 0
+                and fb.moe_routing_current_step >= fb.moe_routing_max_steps
+            ):
                 pass  # Exceeded max steps, skip capture but continue to hook
             # Check stride (only capture every Nth step)
-            elif fb.moe_routing_stride > 1 and (fb.moe_routing_current_step % fb.moe_routing_stride) != 0:
+            elif (
+                fb.moe_routing_stride > 1
+                and (fb.moe_routing_current_step % fb.moe_routing_stride) != 0
+            ):
                 pass  # Not on stride boundary, skip capture but continue to hook
             # Check if this layer should be captured
-            elif fb.moe_capture_layer_ids is None or layer_idx in fb.moe_capture_layer_ids:
+            elif (
+                fb.moe_capture_layer_ids is None
+                or layer_idx in fb.moe_capture_layer_ids
+            ):
                 # Limit to top-k experts as requested
                 top_k = min(fb.moe_routing_top_k, topk_ids.shape[-1])
                 captured_ids = topk_ids[:, :top_k].clone().cpu()
@@ -282,7 +302,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                     if topk_weights is not None
                     else None
                 )
-                fb.moe_routing_buffer.append((layer_idx, captured_ids, captured_weights))
+                fb.moe_routing_buffer.append(
+                    (layer_idx, captured_ids, captured_weights)
+                )
 
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 

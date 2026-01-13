@@ -931,14 +931,20 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 attention_capture_layer_id=obj.attention_capture_layer_id,
                 attention_capture_layer_ids=obj.attention_capture_layer_ids,
                 attention_sketch_mode=obj.attention_sketch_mode,
-                attention_fingerprint_mode=getattr(obj, 'attention_fingerprint_mode', None),
-                attention_fingerprint_only=getattr(obj, 'attention_fingerprint_only', None),
-                attention_mask_prefix=getattr(obj, 'attention_mask_prefix', None),
-                include_prompt_attention=getattr(obj, 'include_prompt_attention', True),
-                attention_capture_head_ids=getattr(obj, 'attention_capture_head_ids', None),
-                return_logit_lens=getattr(obj, 'return_logit_lens', False),
-                logit_lens_top_k=getattr(obj, 'logit_lens_top_k', 5),
-                logit_lens_layer_ids=getattr(obj, 'logit_lens_layer_ids', None),
+                attention_fingerprint_mode=getattr(
+                    obj, "attention_fingerprint_mode", None
+                ),
+                attention_fingerprint_only=getattr(
+                    obj, "attention_fingerprint_only", None
+                ),
+                attention_mask_prefix=getattr(obj, "attention_mask_prefix", None),
+                include_prompt_attention=getattr(obj, "include_prompt_attention", True),
+                attention_capture_head_ids=getattr(
+                    obj, "attention_capture_head_ids", None
+                ),
+                return_logit_lens=getattr(obj, "return_logit_lens", False),
+                logit_lens_top_k=getattr(obj, "logit_lens_top_k", 5),
+                logit_lens_layer_ids=getattr(obj, "logit_lens_layer_ids", None),
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,

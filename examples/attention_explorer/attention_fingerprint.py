@@ -30,19 +30,23 @@ Usage:
 
 import argparse
 import json
-import numpy as np
-from collections import Counter
-from typing import List, Dict, Tuple, Optional, Union
 import sys
+from collections import Counter
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
 
 try:
     import scipy.fft
+
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
 
 
-def normalize_attention_data(attention_tokens: Union[List[Dict], Dict]) -> Tuple[List[Dict], Dict[int, List[Dict]]]:
+def normalize_attention_data(
+    attention_tokens: Union[List[Dict], Dict]
+) -> Tuple[List[Dict], Dict[int, List[Dict]]]:
     """
     Normalize attention data to both flat list and per-layer dict.
 
@@ -136,8 +140,11 @@ class AttentionFingerprint:
         gini = (2 * np.sum(indices * weights)) / (n * np.sum(weights)) - (n + 1) / n
         return float(np.clip(gini, 0, 1))
 
-    def compute_consensus(self, attention_tokens: List[Dict],
-                          per_layer: Optional[Dict[int, List[Dict]]] = None) -> float:
+    def compute_consensus(
+        self,
+        attention_tokens: List[Dict],
+        per_layer: Optional[Dict[int, List[Dict]]] = None,
+    ) -> float:
         """
         Axis Y: Consensus - Weighted pairwise Jaccard across layers.
 
@@ -155,13 +162,15 @@ class AttentionFingerprint:
 
         if len(layer_ids) < 2:
             # Single layer: use temporal consistency
-            all_positions = [set(e.get("token_positions", [])) for e in attention_tokens]
+            all_positions = [
+                set(e.get("token_positions", [])) for e in attention_tokens
+            ]
             if len(all_positions) < 2:
                 return 0.5
             similarities = []
             for i in range(1, len(all_positions)):
-                intersection = len(all_positions[i-1] & all_positions[i])
-                union = len(all_positions[i-1] | all_positions[i])
+                intersection = len(all_positions[i - 1] & all_positions[i])
+                union = len(all_positions[i - 1] | all_positions[i])
                 if union > 0:
                     similarities.append(intersection / union)
             return float(np.mean(similarities)) if similarities else 0.5
@@ -180,7 +189,7 @@ class AttentionFingerprint:
         # Weighted pairwise Jaccard
         pairwise_scores = []
         for i, layer_i in enumerate(layer_ids):
-            for layer_j in layer_ids[i+1:]:
+            for layer_j in layer_ids[i + 1 :]:
                 w_i = layer_weights[layer_i]
                 w_j = layer_weights[layer_j]
                 all_positions = set(w_i.keys()) | set(w_j.keys())
@@ -226,7 +235,7 @@ class AttentionFingerprint:
         log_offsets = np.floor(np.log2(offsets)).astype(int)
 
         hist = np.bincount(log_offsets, minlength=self.num_offset_bins)
-        hist = hist[:self.num_offset_bins].astype(np.float32)
+        hist = hist[: self.num_offset_bins].astype(np.float32)
 
         if hist.sum() < 1:
             return 0.5
@@ -325,14 +334,16 @@ class AttentionFingerprint:
             "entropy": entropy,
             "offset_histogram": histogram.tolist(),
             "vector": [hubness, consensus, spectral],  # 3D for visualization
-            "full_vector": [hubness, consensus, spectral, entropy] + histogram.tolist(),  # Full for clustering
+            "full_vector": [hubness, consensus, spectral, entropy]
+            + histogram.tolist(),  # Full for clustering
             "n_tokens": len(flat_list),
             "n_layers": len(per_layer),
             "layer_ids": sorted(per_layer.keys()),
         }
 
-    def fingerprint_vector(self, attention_tokens: Union[List[Dict], Dict],
-                           include_histogram: bool = True) -> np.ndarray:
+    def fingerprint_vector(
+        self, attention_tokens: Union[List[Dict], Dict], include_histogram: bool = True
+    ) -> np.ndarray:
         """
         Compute fingerprint as a feature vector for clustering.
 
@@ -347,7 +358,10 @@ class AttentionFingerprint:
         if include_histogram:
             return np.array(fp["full_vector"], dtype=np.float32)
         else:
-            return np.array([fp["hubness"], fp["consensus"], fp["spectral"], fp["entropy"]], dtype=np.float32)
+            return np.array(
+                [fp["hubness"], fp["consensus"], fp["spectral"], fp["entropy"]],
+                dtype=np.float32,
+            )
 
 
 def test_fingerprint():
@@ -362,13 +376,15 @@ def test_fingerprint():
         if t < 5:
             positions = [0, 1, 2, 3, 4]
         else:
-            positions = [0, 1, t-1, t-2, t-3]
+            positions = [0, 1, t - 1, t - 2, t - 3]
         scores = [0.4, 0.3, 0.15, 0.1, 0.05]
-        attention_tokens.append({
-            "token_positions": positions,
-            "attention_scores": scores,
-            "layer_id": 23,
-        })
+        attention_tokens.append(
+            {
+                "token_positions": positions,
+                "attention_scores": scores,
+                "layer_id": 23,
+            }
+        )
 
     fp = AttentionFingerprint()
     result = fp.fingerprint(attention_tokens)
@@ -417,7 +433,9 @@ def test_fingerprint():
 
     print("\n2. Multi-layer format (4 layers: 6, 12, 18, 23):")
     print(f"   Hubness:   {result_multi['hubness']:.3f}")
-    print(f"   Consensus: {result_multi['consensus']:.3f} (weighted cross-layer Jaccard)")
+    print(
+        f"   Consensus: {result_multi['consensus']:.3f} (weighted cross-layer Jaccard)"
+    )
     print(f"   Spectral:  {result_multi['spectral']:.3f}")
     print(f"   Entropy:   {result_multi['entropy']:.3f}")
     print(f"   N_layers:  {result_multi['n_layers']}")
@@ -428,8 +446,14 @@ def test_fingerprint():
     for t in range(10):
         entry = {
             "layers": {
-                "6": {"token_positions": [0, max(0, t-1)], "attention_scores": [0.6, 0.4]},
-                "23": {"token_positions": [0, max(0, t-2)], "attention_scores": [0.5, 0.5]},
+                "6": {
+                    "token_positions": [0, max(0, t - 1)],
+                    "attention_scores": [0.6, 0.4],
+                },
+                "23": {
+                    "token_positions": [0, max(0, t - 2)],
+                    "attention_scores": [0.5, 0.5],
+                },
             }
         }
         stream_entries.append(entry)
@@ -454,10 +478,13 @@ def test_fingerprint():
 def main():
     parser = argparse.ArgumentParser(description="Compute attention fingerprints")
     parser.add_argument("--input", "-i", help="JSON file with attention trace")
-    parser.add_argument("--server", "-s", default="http://localhost:8000",
-                        help="SGLang server URL")
+    parser.add_argument(
+        "--server", "-s", default="http://localhost:8000", help="SGLang server URL"
+    )
     parser.add_argument("--prompt", "-p", help="Prompt to test with server")
-    parser.add_argument("--test", action="store_true", help="Run test with synthetic data")
+    parser.add_argument(
+        "--test", action="store_true", help="Run test with synthetic data"
+    )
 
     args = parser.parse_args()
 
@@ -471,6 +498,7 @@ def main():
         attention_tokens = data.get("attention_tokens", data)
     elif args.prompt:
         import requests
+
         resp = requests.post(
             f"{args.server}/v1/completions",
             json={
@@ -479,7 +507,7 @@ def main():
                 "max_tokens": 50,
                 "return_attention_tokens": True,
                 "top_k_attention": 10,
-            }
+            },
         )
         resp.raise_for_status()
         data = resp.json()

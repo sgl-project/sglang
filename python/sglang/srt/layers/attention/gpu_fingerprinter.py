@@ -34,8 +34,9 @@ from enum import Enum
 
 class ManifoldZone(Enum):
     """Attention manifold classification."""
-    SYNTAX_FLOOR = "syntax_floor"       # Local jitter (early/final layers)
-    SEMANTIC_BRIDGE = "semantic_bridge" # Retrieval to anchors (mid layers)
+
+    SYNTAX_FLOOR = "syntax_floor"  # Local jitter (early/final layers)
+    SEMANTIC_BRIDGE = "semantic_bridge"  # Retrieval to anchors (mid layers)
     STRUCTURE_RIPPLE = "structure_ripple"  # Periodic patterns
     UNKNOWN = "unknown"
 
@@ -43,9 +44,10 @@ class ManifoldZone(Enum):
 @dataclass
 class FingerprintConfig:
     """Configuration for GPU fingerprinting."""
-    n_bins: int = 16              # Log2 bins (covers 2^16 = 64K tokens)
+
+    n_bins: int = 16  # Log2 bins (covers 2^16 = 64K tokens)
     enable_early_exit: bool = True  # Stop fingerprinting after classification
-    early_exit_steps: int = 256    # Steps to run before early exit
+    early_exit_steps: int = 256  # Steps to run before early exit
     classify_threshold: float = 0.7  # Confidence threshold for classification
 
 
@@ -82,17 +84,37 @@ class GPUFingerprinter:
         # These represent the expected bin mass distribution for each manifold
         self._syntax_bins = torch.tensor(
             [0.4, 0.3, 0.15, 0.1, 0.05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            device=device, dtype=dtype
+            device=device,
+            dtype=dtype,
         )  # 95% mass in bins 0-2 (offset < 4)
 
         self._semantic_bins = torch.tensor(
-            [0.05, 0.05, 0.05, 0.05, 0.1, 0.15, 0.2, 0.15, 0.1, 0.05, 0.03, 0.02, 0, 0, 0, 0],
-            device=device, dtype=dtype
+            [
+                0.05,
+                0.05,
+                0.05,
+                0.05,
+                0.1,
+                0.15,
+                0.2,
+                0.15,
+                0.1,
+                0.05,
+                0.03,
+                0.02,
+                0,
+                0,
+                0,
+                0,
+            ],
+            device=device,
+            dtype=dtype,
         )  # High mass in bins 5-9 (offset 32-512)
 
         self._structure_bins = torch.tensor(
             [0.1, 0.05, 0.25, 0.05, 0.25, 0.05, 0.15, 0.05, 0.05, 0, 0, 0, 0, 0, 0, 0],
-            device=device, dtype=dtype
+            device=device,
+            dtype=dtype,
         )  # Comb-like pattern at bins 2, 4, 6 (periodic 4, 16, 64)
 
     def process_step(
@@ -135,9 +157,7 @@ class GPUFingerprinter:
         flat_weights = topk_weights.view(batch_size, -1)  # [Batch, Layers*K]
 
         histogram = torch.zeros(
-            (batch_size, self.n_bins),
-            device=self.device,
-            dtype=self.dtype
+            (batch_size, self.n_bins), device=self.device, dtype=self.dtype
         )
         histogram.scatter_add_(1, flat_bins, flat_weights)
 
@@ -235,8 +255,8 @@ class GPUFingerprinter:
 
         # Feature extraction
         local_mass = hist[:3].sum().item()  # Bins 0-2: offset < 8
-        mid_mass = hist[3:8].sum().item()   # Bins 3-7: offset 8-255
-        long_mass = hist[8:].sum().item()   # Bins 8+: offset > 256
+        mid_mass = hist[3:8].sum().item()  # Bins 3-7: offset 8-255
+        long_mass = hist[8:].sum().item()  # Bins 8+: offset > 256
 
         # Entropy (concentration measure)
         entropy = -(hist * torch.log(hist + 1e-9)).sum().item()
@@ -246,19 +266,19 @@ class GPUFingerprinter:
         # Peak detection for periodicity
         peaks = []
         for i in range(1, self.n_bins - 1):
-            if hist[i] > hist[i-1] and hist[i] > hist[i+1]:
+            if hist[i] > hist[i - 1] and hist[i] > hist[i + 1]:
                 peaks.append(i)
 
         # Periodicity score (how comb-like is the pattern?)
         periodicity = len(peaks) / (self.n_bins / 2) if peaks else 0
 
         return {
-            "local_mass": local_mass,      # Syntax floor signal
-            "mid_mass": mid_mass,          # Semantic bridge signal
-            "long_mass": long_mass,        # Long-range retrieval
-            "entropy": normalized_entropy, # Concentration (low = focused)
-            "periodicity": periodicity,    # Structure ripple signal
-            "peak_bins": peaks,            # Which bins have peaks
+            "local_mass": local_mass,  # Syntax floor signal
+            "mid_mass": mid_mass,  # Semantic bridge signal
+            "long_mass": long_mass,  # Long-range retrieval
+            "entropy": normalized_entropy,  # Concentration (low = focused)
+            "periodicity": periodicity,  # Structure ripple signal
+            "peak_bins": peaks,  # Which bins have peaks
         }
 
     def to_vector(self, histogram: torch.Tensor) -> torch.Tensor:
@@ -277,12 +297,16 @@ class GPUFingerprinter:
         # Normalize histogram
         hist = hist / (hist.sum() + 1e-9)
 
-        prefix = torch.tensor([
-            features["local_mass"],
-            features["mid_mass"],
-            features["long_mass"],
-            features["entropy"],
-        ], device=self.device, dtype=self.dtype)
+        prefix = torch.tensor(
+            [
+                features["local_mass"],
+                features["mid_mass"],
+                features["long_mass"],
+                features["entropy"],
+            ],
+            device=self.device,
+            dtype=self.dtype,
+        )
 
         return torch.cat([prefix, hist])
 
@@ -346,8 +370,10 @@ class StreamingFingerprinter:
             )
 
         # Try classification after early_exit_steps
-        if (self.config.enable_early_exit and
-            self._step_count >= self.config.early_exit_steps):
+        if (
+            self.config.enable_early_exit
+            and self._step_count >= self.config.early_exit_steps
+        ):
 
             manifold, confidence = self.fingerprinter.classify_manifold(
                 self._running_histogram,

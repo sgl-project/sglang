@@ -86,7 +86,10 @@ def _topk_attention_scores_kernel(
 
     # Load K vectors
     k = tl.load(
-        K_Buffer + kv_loc[:, None] * stride_kb + cur_kv_head * stride_kh + offs_d[None, :],
+        K_Buffer
+        + kv_loc[:, None] * stride_kb
+        + cur_kv_head * stride_kh
+        + offs_d[None, :],
         mask=mask_n[:, None] & mask_d[None, :],
         other=0.0,
     )
@@ -188,7 +191,9 @@ def _compute_topk_pytorch(
 
         if seq_len == 0:
             topk_scores_list.append(torch.zeros(top_k, device=device))
-            topk_indices_list.append(torch.zeros(top_k, dtype=torch.int64, device=device))
+            topk_indices_list.append(
+                torch.zeros(top_k, dtype=torch.int64, device=device)
+            )
             continue
 
         # Get KV cache positions for this sequence
@@ -222,10 +227,14 @@ def _compute_topk_pytorch(
         if actual_k < top_k:
             padding = top_k - actual_k
             topk_probs = torch.cat([topk_probs, torch.zeros(padding, device=device)])
-            topk_idx = torch.cat([topk_idx, torch.zeros(padding, dtype=torch.int64, device=device)])
+            topk_idx = torch.cat(
+                [topk_idx, torch.zeros(padding, dtype=torch.int64, device=device)]
+            )
 
         # Convert local indices to sequence positions
-        topk_positions = topk_idx  # These are already 0-indexed positions in the sequence
+        topk_positions = (
+            topk_idx  # These are already 0-indexed positions in the sequence
+        )
 
         topk_scores_list.append(topk_probs)
         topk_indices_list.append(topk_positions)
@@ -306,13 +315,15 @@ def _compute_topk_triton(
     # Pad if needed
     if topk_idx.shape[-1] < top_k:
         padding = top_k - topk_idx.shape[-1]
-        topk_probs = torch.cat([
-            topk_probs,
-            torch.zeros((batch_size, padding), device=device)
-        ], dim=-1)
-        topk_idx = torch.cat([
-            topk_idx,
-            torch.zeros((batch_size, padding), dtype=torch.int64, device=device)
-        ], dim=-1)
+        topk_probs = torch.cat(
+            [topk_probs, torch.zeros((batch_size, padding), device=device)], dim=-1
+        )
+        topk_idx = torch.cat(
+            [
+                topk_idx,
+                torch.zeros((batch_size, padding), dtype=torch.int64, device=device),
+            ],
+            dim=-1,
+        )
 
     return topk_probs, topk_idx

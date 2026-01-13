@@ -1141,8 +1141,10 @@ class TritonAttnBackend(AttentionBackend):
         # We need to reduce to [batch, num_heads]
         max_splits = attn_lse.shape[2]
         final_lse = torch.full(
-            (batch_size, num_heads), float('-inf'),
-            dtype=attn_lse.dtype, device=attn_lse.device
+            (batch_size, num_heads),
+            float("-inf"),
+            dtype=attn_lse.dtype,
+            device=attn_lse.device,
         )
         for b in range(batch_size):
             n_splits = num_kv_splits[b].item()
@@ -1189,7 +1191,9 @@ class TritonAttnBackend(AttentionBackend):
 
             # Gather K, V for biased positions only
             k_biased = k_buffer[biased_kv_locs]  # [num_biased, num_kv_heads, head_dim]
-            v_biased = v_buffer[biased_kv_locs]  # [num_biased, num_kv_heads, v_head_dim]
+            v_biased = v_buffer[
+                biased_kv_locs
+            ]  # [num_biased, num_kv_heads, v_head_dim]
 
             # Get query for this batch
             q_b = q[b]  # [num_heads, head_dim]
@@ -1358,11 +1362,13 @@ class TritonAttnBackend(AttentionBackend):
 
             # Synchronize to catch any pending CUDA errors before we start
             import torch
+
             torch.cuda.synchronize()
 
             # Check kv_indptr has correct size
             if kv_indptr.shape[0] != batch_size + 1:
                 import logging
+
                 logging.getLogger(__name__).warning(
                     f"Skipping attention capture: kv_indptr size mismatch "
                     f"(expected {batch_size + 1}, got {kv_indptr.shape[0]})"
@@ -1374,6 +1380,7 @@ class TritonAttnBackend(AttentionBackend):
             if max_kv_idx > 0 and kv_indices.shape[0] > 0:
                 if max_kv_idx > kv_indices.shape[0]:
                     import logging
+
                     logging.getLogger(__name__).warning(
                         f"Skipping attention capture: kv_indptr max ({max_kv_idx}) > "
                         f"kv_indices size ({kv_indices.shape[0]})"
@@ -1386,27 +1393,30 @@ class TritonAttnBackend(AttentionBackend):
                 min_idx = indices_to_check.min().item()
                 if max_idx >= k_buffer.shape[0] or min_idx < 0:
                     import logging
+
                     logging.getLogger(__name__).warning(
                         f"Skipping attention capture: kv_indices out of bounds "
                         f"(min={min_idx}, max={max_idx}, k_buffer_size={k_buffer.shape[0]})"
                     )
                     return
 
-            topk_scores, topk_indices, topk_logits, logsumexp_candidates = compute_topk_attention_chunked(
-                q,
-                k_buffer,
-                kv_indptr,
-                kv_indices,
-                sm_scale,
-                top_k=forward_batch.attention_top_k,
-                chunk_size=forward_batch.attention_chunk_size,
-                window=forward_batch.attention_window,
-                head_ids=forward_batch.attention_capture_head_ids,
+            topk_scores, topk_indices, topk_logits, logsumexp_candidates = (
+                compute_topk_attention_chunked(
+                    q,
+                    k_buffer,
+                    kv_indptr,
+                    kv_indices,
+                    sm_scale,
+                    top_k=forward_batch.attention_top_k,
+                    chunk_size=forward_batch.attention_chunk_size,
+                    window=forward_batch.attention_window,
+                    head_ids=forward_batch.attention_capture_head_ids,
+                )
             )
 
             # Compute fingerprint if fingerprint mode is enabled (production path)
             # This computes the 20D feature vector ON GPU, avoiding CPU export bottleneck
-            if getattr(forward_batch, 'attention_fingerprint_mode', False):
+            if getattr(forward_batch, "attention_fingerprint_mode", False):
                 # Get current positions for fingerprint computation
                 # Use seq_lens as current positions (decode position)
                 current_pos = forward_batch.seq_lens.clone()
@@ -1449,6 +1459,7 @@ class TritonAttnBackend(AttentionBackend):
         except (RuntimeError, torch.cuda.CudaError) as e:
             # Catch CUDA errors specifically - they can be fatal
             import logging
+
             logging.getLogger(__name__).error(
                 f"CUDA error during attention capture (disabling for this request): {e}"
             )
@@ -1461,6 +1472,7 @@ class TritonAttnBackend(AttentionBackend):
             # Don't let attention capture errors break inference
             import logging
             import traceback
+
             logging.getLogger(__name__).warning(
                 f"Failed to compute attention tokens: {e}\n{traceback.format_exc()}"
             )

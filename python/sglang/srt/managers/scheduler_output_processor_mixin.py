@@ -40,13 +40,13 @@ DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 # Sketch configuration
 SKETCH_TOP_HUBS_K = 32  # Number of top positions to track by attention mass
-SKETCH_DIST_BINS = 16   # Number of bins for distance histogram (log scale)
-SKETCH_DIST_MAX = 20    # Max log2 distance for binning (covers 1M+ tokens)
+SKETCH_DIST_BINS = 16  # Number of bins for distance histogram (log scale)
+SKETCH_DIST_MAX = 20  # Max log2 distance for binning (covers 1M+ tokens)
 
 # Fingerprint configuration (matches client-side types.ts)
 FINGERPRINT_HISTOGRAM_BINS = 16
-FINGERPRINT_LOCAL_THRESHOLD = 16   # Tokens within 16 = local
-FINGERPRINT_MID_THRESHOLD = 256    # Tokens within 256 = mid-range
+FINGERPRINT_LOCAL_THRESHOLD = 16  # Tokens within 16 = local
+FINGERPRINT_MID_THRESHOLD = 256  # Tokens within 256 = mid-range
 
 
 def compute_fingerprint_from_raw(
@@ -133,8 +133,7 @@ def compute_fingerprint_from_raw(
     consensus = 0.0
     if layers_data and len(layers_data) > 1:
         layer_topk = [
-            set(layer.get("token_positions", [])[:5])
-            for layer in layers_data.values()
+            set(layer.get("token_positions", [])[:5]) for layer in layers_data.values()
         ]
         if len(layer_topk) >= 2:
             overlaps = 0
@@ -214,7 +213,9 @@ def apply_attention_privacy_mask(
         if pos >= mask_prefix:
             # Offset position so system prompt region is hidden
             masked_positions.append(pos - mask_prefix)
-            masked_scores.append(attention_scores[i] if i < len(attention_scores) else 0.0)
+            masked_scores.append(
+                attention_scores[i] if i < len(attention_scores) else 0.0
+            )
             if masked_logits is not None and topk_logits is not None:
                 masked_logits.append(topk_logits[i] if i < len(topk_logits) else 0.0)
 
@@ -739,12 +740,18 @@ class SchedulerOutputProcessorMixin:
 
             # Track think phase transitions for attention segmentation
             # Detects <think> and </think> tokens to segment attention data
-            if req.return_attention_tokens and hasattr(self, 'tokenizer') and self.tokenizer:
-                think_start_id = getattr(self.tokenizer, 'think_start_id', None)
-                think_end_id = getattr(self.tokenizer, 'think_end_id', None)
+            if (
+                req.return_attention_tokens
+                and hasattr(self, "tokenizer")
+                and self.tokenizer
+            ):
+                think_start_id = getattr(self.tokenizer, "think_start_id", None)
+                think_end_id = getattr(self.tokenizer, "think_end_id", None)
 
                 # Handle single token or list of tokens (speculative decoding)
-                tokens_to_check = [next_token_id] if isinstance(next_token_id, int) else next_token_id
+                tokens_to_check = (
+                    [next_token_id] if isinstance(next_token_id, int) else next_token_id
+                )
                 for tok in tokens_to_check:
                     if think_start_id is not None and tok == think_start_id:
                         req.attention_think_phase = "think"
@@ -801,7 +808,9 @@ class SchedulerOutputProcessorMixin:
             # COMPUTE-GATED STRIDE: The stride/max check is done BEFORE GPU compute
             # in schedule_batch.py. If we have results here, we should always store them.
             # The step counter is always incremented to track decode progress.
-            fingerprint_mode = getattr(self.server_args, "attention_fingerprint_mode", False)
+            fingerprint_mode = getattr(
+                self.server_args, "attention_fingerprint_mode", False
+            )
             sketch_mode = getattr(self.server_args, "attention_sketch_mode", False)
 
             # Always increment step counter for attention-enabled requests
@@ -819,7 +828,11 @@ class SchedulerOutputProcessorMixin:
                         "schema_version": 1,  # Version for UI compatibility
                         "mode": "fingerprint",
                         "fingerprint": fingerprints_cpu[i].tolist(),
-                        "manifold": logits_output.attention_manifold[i] if logits_output.attention_manifold else "unknown",
+                        "manifold": (
+                            logits_output.attention_manifold[i]
+                            if logits_output.attention_manifold
+                            else "unknown"
+                        ),
                         "step": req.attention_tokens_decode_step,
                         "think_phase": req.attention_think_phase,
                     }
@@ -867,16 +880,29 @@ class SchedulerOutputProcessorMixin:
                 if logits_output.attention_multi_layer:
                     # Multi-layer: compute sketch for each layer
                     layer_sketches = {}
-                    for layer_id, (positions, scores, logits, logsumexp) in logits_output.attention_multi_layer.items():
+                    for layer_id, (
+                        positions,
+                        scores,
+                        logits,
+                        logsumexp,
+                    ) in logits_output.attention_multi_layer.items():
                         pos_list = positions[i].cpu().tolist()[:req_top_k]
                         score_list = scores[i].cpu().tolist()[:req_top_k]
-                        logit_list = logits[i].cpu().tolist()[:req_top_k] if logits is not None else None
-                        lse_val = logsumexp[i].cpu().item() if logsumexp is not None else None
+                        logit_list = (
+                            logits[i].cpu().tolist()[:req_top_k]
+                            if logits is not None
+                            else None
+                        )
+                        lse_val = (
+                            logsumexp[i].cpu().item() if logsumexp is not None else None
+                        )
 
                         # Apply privacy mask
                         if sketch_mask_prefix > 0:
-                            pos_list, score_list, logit_list = apply_attention_privacy_mask(
-                                pos_list, score_list, sketch_mask_prefix, logit_list
+                            pos_list, score_list, logit_list = (
+                                apply_attention_privacy_mask(
+                                    pos_list, score_list, sketch_mask_prefix, logit_list
+                                )
                             )
                             # Adjust current_pos for distance calculations
                             adjusted_current_pos = current_pos - sketch_mask_prefix
@@ -884,7 +910,11 @@ class SchedulerOutputProcessorMixin:
                             adjusted_current_pos = current_pos
 
                         layer_sketches[layer_id] = compute_attention_sketch(
-                            pos_list, score_list, logit_list, lse_val, adjusted_current_pos
+                            pos_list,
+                            score_list,
+                            logit_list,
+                            lse_val,
+                            adjusted_current_pos,
                         )
 
                     attention_info = {
@@ -896,15 +926,27 @@ class SchedulerOutputProcessorMixin:
                     }
                 else:
                     # Single layer: compute one sketch
-                    pos_list = logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
-                    score_list = logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
+                    pos_list = (
+                        logits_output.attention_token_positions[i]
+                        .cpu()
+                        .tolist()[:req_top_k]
+                    )
+                    score_list = (
+                        logits_output.attention_token_scores[i]
+                        .cpu()
+                        .tolist()[:req_top_k]
+                    )
                     logit_list = (
-                        logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
-                        if logits_output.attention_topk_logits is not None else None
+                        logits_output.attention_topk_logits[i]
+                        .cpu()
+                        .tolist()[:req_top_k]
+                        if logits_output.attention_topk_logits is not None
+                        else None
                     )
                     lse_val = (
                         logits_output.attention_logsumexp_candidates[i].cpu().item()
-                        if logits_output.attention_logsumexp_candidates is not None else None
+                        if logits_output.attention_logsumexp_candidates is not None
+                        else None
                     )
 
                     # Apply privacy mask
@@ -969,7 +1011,12 @@ class SchedulerOutputProcessorMixin:
                     # First pass: extract UNMASKED data for fingerprint computation
                     # This ensures fingerprints are computed from complete data before privacy masking
                     unmasked_layers_data = {}
-                    for layer_id, (positions, scores, logits, logsumexp) in logits_output.attention_multi_layer.items():
+                    for layer_id, (
+                        positions,
+                        scores,
+                        logits,
+                        logsumexp,
+                    ) in logits_output.attention_multi_layer.items():
                         unmasked_pos = positions[i].cpu().tolist()[:req_top_k]
                         unmasked_scores = scores[i].cpu().tolist()[:req_top_k]
                         unmasked_layers_data[layer_id] = {
@@ -990,15 +1037,26 @@ class SchedulerOutputProcessorMixin:
                     manifold_zone = classify_manifold_zone(server_fingerprint)
 
                     # Second pass: apply privacy mask and build response
-                    for layer_id, (positions, scores, logits, logsumexp) in logits_output.attention_multi_layer.items():
+                    for layer_id, (
+                        positions,
+                        scores,
+                        logits,
+                        logsumexp,
+                    ) in logits_output.attention_multi_layer.items():
                         pos_list = positions[i].cpu().tolist()[:req_top_k]
                         score_list = scores[i].cpu().tolist()[:req_top_k]
-                        logit_list = logits[i].cpu().tolist()[:req_top_k] if logits is not None else None
+                        logit_list = (
+                            logits[i].cpu().tolist()[:req_top_k]
+                            if logits is not None
+                            else None
+                        )
 
                         # Apply privacy mask
                         if mask_prefix > 0:
-                            pos_list, score_list, logit_list = apply_attention_privacy_mask(
-                                pos_list, score_list, mask_prefix, logit_list
+                            pos_list, score_list, logit_list = (
+                                apply_attention_privacy_mask(
+                                    pos_list, score_list, mask_prefix, logit_list
+                                )
                             )
 
                         layer_entry = {
@@ -1015,7 +1073,12 @@ class SchedulerOutputProcessorMixin:
                             # Vectorized computation for efficiency
                             if logits is not None:
                                 logits_tensor = logits[i][:req_top_k]
-                                topk_mass = torch.exp(logits_tensor - lse_val).sum().clamp(max=1.0).item()
+                                topk_mass = (
+                                    torch.exp(logits_tensor - lse_val)
+                                    .sum()
+                                    .clamp(max=1.0)
+                                    .item()
+                                )
                                 layer_entry["topk_mass"] = topk_mass
                         layers_data[layer_id] = layer_entry
 
@@ -1024,7 +1087,9 @@ class SchedulerOutputProcessorMixin:
                         attention_info = {
                             "schema_version": 1,
                             "mode": "fingerprint_only",
-                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                            "layer_id": getattr(
+                                logits_output, "attention_layer_id", -1
+                            ),
                             # Server-side fingerprint (computed from unmasked data)
                             "fingerprint": server_fingerprint,
                             "manifold_zone": manifold_zone,
@@ -1035,42 +1100,76 @@ class SchedulerOutputProcessorMixin:
                             "mode": "raw",
                             "layers": layers_data,
                             # Also include last layer at top level for backward compatibility
-                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                            "layer_id": getattr(
+                                logits_output, "attention_layer_id", -1
+                            ),
                             # Server-side fingerprint (computed from unmasked data)
                             "fingerprint": server_fingerprint,
                             "manifold_zone": manifold_zone,
                         }
                         # Copy last layer data to top level for backward compatibility
                         if logits_output.attention_token_positions is not None:
-                            top_pos = logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
-                            top_scores = logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
+                            top_pos = (
+                                logits_output.attention_token_positions[i]
+                                .cpu()
+                                .tolist()[:req_top_k]
+                            )
+                            top_scores = (
+                                logits_output.attention_token_scores[i]
+                                .cpu()
+                                .tolist()[:req_top_k]
+                            )
                             top_logits = (
-                                logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
-                                if logits_output.attention_topk_logits is not None else None
+                                logits_output.attention_topk_logits[i]
+                                .cpu()
+                                .tolist()[:req_top_k]
+                                if logits_output.attention_topk_logits is not None
+                                else None
                             )
                             # Apply privacy mask to top-level data
                             if mask_prefix > 0:
-                                top_pos, top_scores, top_logits = apply_attention_privacy_mask(
-                                    top_pos, top_scores, mask_prefix, top_logits
+                                top_pos, top_scores, top_logits = (
+                                    apply_attention_privacy_mask(
+                                        top_pos, top_scores, mask_prefix, top_logits
+                                    )
                                 )
                             attention_info["token_positions"] = top_pos
                             attention_info["attention_scores"] = top_scores
                             if top_logits is not None:
                                 attention_info["topk_logits"] = top_logits
                         if logits_output.attention_logsumexp_candidates is not None:
-                            lse_val = logits_output.attention_logsumexp_candidates[i].cpu().item()
+                            lse_val = (
+                                logits_output.attention_logsumexp_candidates[i]
+                                .cpu()
+                                .item()
+                            )
                             attention_info["logsumexp_candidates"] = lse_val
                             # Compute topk_mass for top-level (backward compat)
                             # Use vectorized torch ops (not Python loop)
                             if logits_output.attention_topk_logits is not None:
-                                logits_tensor = logits_output.attention_topk_logits[i][:req_top_k]
-                                topk_mass = torch.exp(logits_tensor - lse_val).sum().clamp(max=1.0).item()
+                                logits_tensor = logits_output.attention_topk_logits[i][
+                                    :req_top_k
+                                ]
+                                topk_mass = (
+                                    torch.exp(logits_tensor - lse_val)
+                                    .sum()
+                                    .clamp(max=1.0)
+                                    .item()
+                                )
                                 attention_info["topk_mass"] = topk_mass
                 else:
                     # Single-layer capture (backward compatible format)
                     # First extract UNMASKED data for fingerprint computation
-                    unmasked_pos = logits_output.attention_token_positions[i].cpu().tolist()[:req_top_k]
-                    unmasked_scores = logits_output.attention_token_scores[i].cpu().tolist()[:req_top_k]
+                    unmasked_pos = (
+                        logits_output.attention_token_positions[i]
+                        .cpu()
+                        .tolist()[:req_top_k]
+                    )
+                    unmasked_scores = (
+                        logits_output.attention_token_scores[i]
+                        .cpu()
+                        .tolist()[:req_top_k]
+                    )
 
                     # Compute fingerprint from UNMASKED data (security fix)
                     server_fingerprint = compute_fingerprint_from_raw(
@@ -1086,7 +1185,9 @@ class SchedulerOutputProcessorMixin:
                         attention_info = {
                             "schema_version": 1,
                             "mode": "fingerprint_only",
-                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                            "layer_id": getattr(
+                                logits_output, "attention_layer_id", -1
+                            ),
                             # Server-side fingerprint (computed from unmasked data)
                             "fingerprint": server_fingerprint,
                             "manifold_zone": manifold_zone,
@@ -1096,14 +1197,22 @@ class SchedulerOutputProcessorMixin:
                         single_pos = unmasked_pos
                         single_scores = unmasked_scores
                         single_logits = (
-                            logits_output.attention_topk_logits[i].cpu().tolist()[:req_top_k]
-                            if logits_output.attention_topk_logits is not None else None
+                            logits_output.attention_topk_logits[i]
+                            .cpu()
+                            .tolist()[:req_top_k]
+                            if logits_output.attention_topk_logits is not None
+                            else None
                         )
 
                         # Apply privacy mask
                         if mask_prefix > 0:
-                            single_pos, single_scores, single_logits = apply_attention_privacy_mask(
-                                single_pos, single_scores, mask_prefix, single_logits
+                            single_pos, single_scores, single_logits = (
+                                apply_attention_privacy_mask(
+                                    single_pos,
+                                    single_scores,
+                                    mask_prefix,
+                                    single_logits,
+                                )
                             )
 
                         attention_info = {
@@ -1111,7 +1220,9 @@ class SchedulerOutputProcessorMixin:
                             "mode": "raw",
                             "token_positions": single_pos,
                             "attention_scores": single_scores,
-                            "layer_id": getattr(logits_output, "attention_layer_id", -1),
+                            "layer_id": getattr(
+                                logits_output, "attention_layer_id", -1
+                            ),
                             # Server-side fingerprint (computed from unmasked data)
                             "fingerprint": server_fingerprint,
                             "manifold_zone": manifold_zone,
@@ -1120,13 +1231,24 @@ class SchedulerOutputProcessorMixin:
                         if single_logits is not None:
                             attention_info["topk_logits"] = single_logits
                         if logits_output.attention_logsumexp_candidates is not None:
-                            lse_val = logits_output.attention_logsumexp_candidates[i].cpu().item()
+                            lse_val = (
+                                logits_output.attention_logsumexp_candidates[i]
+                                .cpu()
+                                .item()
+                            )
                             attention_info["logsumexp_candidates"] = lse_val
                             # Compute topk_mass: fraction of attention captured by top-k
                             # Vectorized computation for efficiency
                             if logits_output.attention_topk_logits is not None:
-                                logits_tensor = logits_output.attention_topk_logits[i][:req_top_k]
-                                topk_mass = torch.exp(logits_tensor - lse_val).sum().clamp(max=1.0).item()
+                                logits_tensor = logits_output.attention_topk_logits[i][
+                                    :req_top_k
+                                ]
+                                topk_mass = (
+                                    torch.exp(logits_tensor - lse_val)
+                                    .sum()
+                                    .clamp(max=1.0)
+                                    .item()
+                                )
                                 attention_info["topk_mass"] = topk_mass
 
                 # Add decode_step and think phase to the attention info
@@ -1135,13 +1257,14 @@ class SchedulerOutputProcessorMixin:
                 req.attention_tokens.append(attention_info)
 
             # Process MoE routing capture
-            if (
-                req.return_moe_routing
-                and logits_output.moe_routing_buffer
-            ):
+            if req.return_moe_routing and logits_output.moe_routing_buffer:
                 # Extract routing info for this request (token index i in decode mode)
                 moe_routing_info = {}
-                for layer_id, topk_ids, topk_weights in logits_output.moe_routing_buffer:
+                for (
+                    layer_id,
+                    topk_ids,
+                    topk_weights,
+                ) in logits_output.moe_routing_buffer:
                     # In decode mode, each token corresponds to one request
                     # topk_ids: [batch, top_k], topk_weights: [batch, top_k]
                     if i < topk_ids.shape[0]:
@@ -1153,10 +1276,12 @@ class SchedulerOutputProcessorMixin:
                         moe_routing_info[layer_id] = layer_routing
 
                 if moe_routing_info:
-                    req.moe_routing.append({
-                        "decode_step": len(req.output_ids),
-                        "layers": moe_routing_info,
-                    })
+                    req.moe_routing.append(
+                        {
+                            "decode_step": len(req.output_ids),
+                            "layers": moe_routing_info,
+                        }
+                    )
 
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -1783,10 +1908,10 @@ class SchedulerOutputProcessorMixin:
                         output_moe_routing = []
                     output_moe_routing.append(req.moe_routing)
 
-                if getattr(req, 'return_logit_lens', False):
+                if getattr(req, "return_logit_lens", False):
                     if output_logit_lens is None:
                         output_logit_lens = []
-                    output_logit_lens.append(getattr(req, 'logit_lens', None))
+                    output_logit_lens.append(getattr(req, "logit_lens", None))
 
             if (
                 req.finished()
@@ -1917,11 +2042,14 @@ class SchedulerOutputProcessorMixin:
 
         try:
             import zmq
+
             self._zmq_context = zmq.Context()
             self._fingerprint_publisher = self._zmq_context.socket(zmq.PUSH)
             self._fingerprint_publisher.connect(sidecar_url)
             self._fingerprint_publisher.setsockopt(zmq.SNDHWM, 1000)  # High water mark
-            self._fingerprint_publisher.setsockopt(zmq.LINGER, 0)  # Don't hang on shutdown
+            self._fingerprint_publisher.setsockopt(
+                zmq.LINGER, 0
+            )  # Don't hang on shutdown
             logger.info(f"Connected fingerprint publisher to {sidecar_url}")
         except ImportError:
             logger.warning("ZMQ not available, fingerprint streaming disabled")
@@ -2054,7 +2182,7 @@ class SchedulerOutputProcessorMixin:
 
         This is non-blocking - fingerprints are dropped if sidecar is slow.
         """
-        if not hasattr(self, '_fingerprint_publisher'):
+        if not hasattr(self, "_fingerprint_publisher"):
             self._init_fingerprint_publisher()
 
         if self._fingerprint_publisher is None:
@@ -2062,6 +2190,7 @@ class SchedulerOutputProcessorMixin:
 
         try:
             import json
+
             payload = {
                 "request_id": request_id,
                 "vector": fingerprint,
@@ -2104,8 +2233,8 @@ class SchedulerOutputProcessorMixin:
         if "]:" in sidecar_url:
             # IPv6 with port
             bracket_pos = sidecar_url.rfind("]:")
-            base = sidecar_url[:bracket_pos + 1]
-            port_str = sidecar_url[bracket_pos + 2:]
+            base = sidecar_url[: bracket_pos + 1]
+            port_str = sidecar_url[bracket_pos + 2 :]
             try:
                 port = int(port_str)
                 return f"{base}:{port + 1}"
@@ -2119,7 +2248,7 @@ class SchedulerOutputProcessorMixin:
 
         # Make sure we're not splitting the scheme (tcp:)
         base = sidecar_url[:last_colon]
-        port_str = sidecar_url[last_colon + 1:]
+        port_str = sidecar_url[last_colon + 1 :]
 
         # Validate it looks like a port number
         if not port_str.isdigit():
@@ -2160,13 +2289,17 @@ class SchedulerOutputProcessorMixin:
                     return
 
             # Reuse existing ZMQ context or create new one
-            if not hasattr(self, '_zmq_context') or self._zmq_context is None:
+            if not hasattr(self, "_zmq_context") or self._zmq_context is None:
                 self._zmq_context = zmq.Context()
 
             self._feedback_subscriber = self._zmq_context.socket(zmq.PULL)
-            self._feedback_subscriber.connect(feedback_url)  # Connect to sidecar's PUSH socket
+            self._feedback_subscriber.connect(
+                feedback_url
+            )  # Connect to sidecar's PUSH socket
             self._feedback_subscriber.setsockopt(zmq.RCVHWM, 1000)  # High water mark
-            self._feedback_subscriber.setsockopt(zmq.LINGER, 0)  # Don't hang on shutdown
+            self._feedback_subscriber.setsockopt(
+                zmq.LINGER, 0
+            )  # Don't hang on shutdown
             self._feedback_subscriber.setsockopt(zmq.RCVTIMEO, 0)  # Non-blocking
             logger.info(f"Connected to sidecar feedback on {feedback_url}")
 
@@ -2211,7 +2344,7 @@ class SchedulerOutputProcessorMixin:
 
         Legacy format (no schema_version) is also accepted for backwards compatibility.
         """
-        if not hasattr(self, '_feedback_subscriber'):
+        if not hasattr(self, "_feedback_subscriber"):
             self._init_feedback_subscriber()
 
         if self._feedback_subscriber is None:
@@ -2221,7 +2354,7 @@ class SchedulerOutputProcessorMixin:
         import zmq
 
         # Initialize sequence tracking if needed
-        if not hasattr(self, '_feedback_last_seq'):
+        if not hasattr(self, "_feedback_last_seq"):
             self._feedback_last_seq = {}
 
         # Process all available feedback messages (non-blocking)
@@ -2299,20 +2432,20 @@ class SchedulerOutputProcessorMixin:
         Returns the Req object if found, None otherwise.
         """
         # Check running batch
-        if hasattr(self, 'running_batch') and self.running_batch is not None:
+        if hasattr(self, "running_batch") and self.running_batch is not None:
             for req in self.running_batch.reqs:
                 if req.rid == request_id:
                     return req
 
         # Check current batch if different
-        if hasattr(self, 'cur_batch') and self.cur_batch is not None:
+        if hasattr(self, "cur_batch") and self.cur_batch is not None:
             if self.cur_batch is not self.running_batch:
                 for req in self.cur_batch.reqs:
                     if req.rid == request_id:
                         return req
 
         # Check waiting queue
-        if hasattr(self, 'waiting_queue'):
+        if hasattr(self, "waiting_queue"):
             for req in self.waiting_queue:
                 if req.rid == request_id:
                     return req

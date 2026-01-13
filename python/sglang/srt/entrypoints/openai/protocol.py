@@ -274,15 +274,33 @@ class CompletionRequest(BaseModel):
 
     # For attention token capture (interpretability)
     return_attention_tokens: bool = False
-    top_k_attention: int = 10  # Number of top attended tokens to return per output token
-    attention_capture_layer_id: Optional[int] = None  # Layer to capture attention from (-1 = last, None = default)
-    attention_capture_layer_ids: Optional[List[int]] = None  # Specific layers to capture (overrides attention_capture_layer_id)
-    attention_sketch_mode: bool = False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
-    attention_fingerprint_mode: Optional[bool] = None  # Override server fingerprint mode (None = use server default)
-    attention_mask_prefix: Optional[int] = None  # Mask attention to first N tokens (privacy: hide system prompt structure)
-    attention_fingerprint_only: Optional[bool] = None  # SECURE MODE: Only return fingerprint, never raw positions/scores (auto-enabled when mask_prefix > 0)
-    include_prompt_attention: bool = True  # Capture first decode step (prompt attention) regardless of stride
-    attention_capture_head_ids: Optional[List[int]] = None  # Only average over these heads (None = all heads)
+    top_k_attention: int = (
+        10  # Number of top attended tokens to return per output token
+    )
+    attention_capture_layer_id: Optional[int] = (
+        None  # Layer to capture attention from (-1 = last, None = default)
+    )
+    attention_capture_layer_ids: Optional[List[int]] = (
+        None  # Specific layers to capture (overrides attention_capture_layer_id)
+    )
+    attention_sketch_mode: bool = (
+        False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
+    )
+    attention_fingerprint_mode: Optional[bool] = (
+        None  # Override server fingerprint mode (None = use server default)
+    )
+    attention_mask_prefix: Optional[int] = (
+        None  # Mask attention to first N tokens (privacy: hide system prompt structure)
+    )
+    attention_fingerprint_only: Optional[bool] = (
+        None  # SECURE MODE: Only return fingerprint, never raw positions/scores (auto-enabled when mask_prefix > 0)
+    )
+    include_prompt_attention: bool = (
+        True  # Capture first decode step (prompt attention) regardless of stride
+    )
+    attention_capture_head_ids: Optional[List[int]] = (
+        None  # Only average over these heads (None = all heads)
+    )
 
     # For attention steering (semantic routing loop)
     # Format: {"layer_id": {"token_pos": bias_value, ...}, ...}
@@ -293,13 +311,17 @@ class CompletionRequest(BaseModel):
     # Returns which experts were selected for each token
     return_moe_routing: bool = False
     moe_routing_top_k: int = 2  # How many top experts to capture per token
-    moe_capture_layer_ids: Optional[List[int]] = None  # Which layers to capture (None = all MoE layers)
+    moe_capture_layer_ids: Optional[List[int]] = (
+        None  # Which layers to capture (None = all MoE layers)
+    )
 
     # For logit lens (interpretability) - project intermediate layers to vocab
     # Shows how token predictions evolve through the model
     return_logit_lens: bool = False  # Enable logit lens capture (experimental)
     logit_lens_top_k: int = 5  # Number of top token candidates per layer
-    logit_lens_layer_ids: Optional[List[int]] = None  # Which layers to probe (None = auto-select ~4 layers)
+    logit_lens_layer_ids: Optional[List[int]] = (
+        None  # Which layers to probe (None = auto-select ~4 layers)
+    )
 
     @field_validator("max_tokens")
     @classmethod
@@ -530,15 +552,33 @@ class ChatCompletionRequest(BaseModel):
     return_hidden_states: bool = False
     # For attention token capture (interpretability)
     return_attention_tokens: bool = False
-    top_k_attention: int = 10  # Number of top attended tokens to return per output token
-    attention_capture_layer_id: Optional[int] = None  # Layer to capture attention from (-1 = last, None = default)
-    attention_capture_layer_ids: Optional[List[int]] = None  # Specific layers to capture (overrides attention_capture_layer_id)
-    attention_sketch_mode: bool = False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
-    attention_fingerprint_mode: Optional[bool] = None  # Override server fingerprint mode (None = use server default)
-    attention_mask_prefix: Optional[int] = None  # Mask attention to first N tokens (privacy: hide system prompt structure)
-    attention_fingerprint_only: Optional[bool] = None  # SECURE MODE: Only return fingerprint, never raw positions/scores (auto-enabled when mask_prefix > 0)
-    include_prompt_attention: bool = True  # Capture first decode step (prompt attention) regardless of stride
-    attention_capture_head_ids: Optional[List[int]] = None  # Only average over these heads (None = all heads)
+    top_k_attention: int = (
+        10  # Number of top attended tokens to return per output token
+    )
+    attention_capture_layer_id: Optional[int] = (
+        None  # Layer to capture attention from (-1 = last, None = default)
+    )
+    attention_capture_layer_ids: Optional[List[int]] = (
+        None  # Specific layers to capture (overrides attention_capture_layer_id)
+    )
+    attention_sketch_mode: bool = (
+        False  # Return per-layer sketches instead of raw edges (bandwidth efficient)
+    )
+    attention_fingerprint_mode: Optional[bool] = (
+        None  # Override server fingerprint mode (None = use server default)
+    )
+    attention_mask_prefix: Optional[int] = (
+        None  # Mask attention to first N tokens (privacy: hide system prompt structure)
+    )
+    attention_fingerprint_only: Optional[bool] = (
+        None  # SECURE MODE: Only return fingerprint, never raw positions/scores (auto-enabled when mask_prefix > 0)
+    )
+    include_prompt_attention: bool = (
+        True  # Capture first decode step (prompt attention) regardless of stride
+    )
+    attention_capture_head_ids: Optional[List[int]] = (
+        None  # Only average over these heads (None = all heads)
+    )
 
     # For attention steering (semantic routing loop)
     # Format: {"layer_id": {"token_pos": bias_value, ...}, ...}
@@ -549,13 +589,17 @@ class ChatCompletionRequest(BaseModel):
     # Returns which experts were selected for each token
     return_moe_routing: bool = False
     moe_routing_top_k: int = 2  # How many top experts to capture per token
-    moe_capture_layer_ids: Optional[List[int]] = None  # Which layers to capture (None = all MoE layers)
+    moe_capture_layer_ids: Optional[List[int]] = (
+        None  # Which layers to capture (None = all MoE layers)
+    )
 
     # For logit lens (interpretability) - project intermediate layers to vocab
     # Shows how token predictions evolve through the model
     return_logit_lens: bool = False  # Enable logit lens capture (experimental)
     logit_lens_top_k: int = 5  # Number of top token candidates per layer
-    logit_lens_layer_ids: Optional[List[int]] = None  # Which layers to probe (None = auto-select ~4 layers)
+    logit_lens_layer_ids: Optional[List[int]] = (
+        None  # Which layers to probe (None = auto-select ~4 layers)
+    )
 
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",

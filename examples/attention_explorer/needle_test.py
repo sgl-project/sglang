@@ -23,8 +23,9 @@ Usage:
 
 import argparse
 import json
+from typing import Any, Dict, List
+
 import requests
-from typing import List, Dict, Any, Optional
 
 
 def tokenize(text: str, base_url: str) -> List[Dict]:
@@ -33,7 +34,7 @@ def tokenize(text: str, base_url: str) -> List[Dict]:
         resp = requests.post(
             f"{base_url}/tokenize",
             json={"text": text, "add_special_tokens": True},
-            timeout=10
+            timeout=10,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -42,7 +43,9 @@ def tokenize(text: str, base_url: str) -> List[Dict]:
             # Also try to get text
             token_texts = data.get("token_texts", [])
             if token_texts:
-                return [{"id": tid, "text": txt} for tid, txt in zip(token_ids, token_texts)]
+                return [
+                    {"id": tid, "text": txt} for tid, txt in zip(token_ids, token_texts)
+                ]
             return [{"id": tid, "text": f"[{tid}]"} for tid in token_ids]
     except Exception as e:
         print(f"Tokenize failed: {e}")
@@ -78,25 +81,23 @@ def run_needle_test(base_url: str, verbose: bool = False) -> Dict[str, Any]:
 
     try:
         resp = requests.post(
-            f"{base_url}/v1/chat/completions",
-            json=payload,
-            timeout=120
+            f"{base_url}/v1/chat/completions", json=payload, timeout=120
         )
 
         if resp.status_code != 200:
             return {"status": "FAIL", "error": f"HTTP {resp.status_code}: {resp.text}"}
 
         data = resp.json()
-        choices = data.get('choices', [])
+        choices = data.get("choices", [])
         if not choices:
             return {"status": "FAIL", "error": "No choices in response"}
 
         # Extract content
-        message = choices[0].get('message', {})
-        generated_text = message.get('content', '')
+        message = choices[0].get("message", {})
+        generated_text = message.get("content", "")
 
         # Extract attention data
-        attention_data = choices[0].get('attention_tokens', [])
+        attention_data = choices[0].get("attention_tokens", [])
 
         # Tokenize generated text (approximate by splitting)
         generated_tokens = list(generated_text)  # Character-level fallback
@@ -108,7 +109,7 @@ def run_needle_test(base_url: str, verbose: bool = False) -> Dict[str, Any]:
             return {
                 "status": "FAIL",
                 "error": "No attention data received. Check --return-attention-tokens flag.",
-                "generated": generated_text
+                "generated": generated_text,
             }
 
         # Tokenize the prompt to find "4" position
@@ -119,7 +120,7 @@ def run_needle_test(base_url: str, verbose: bool = False) -> Dict[str, Any]:
         # Find the position of "4" in "4829" (should be around position 6-8)
         needle_positions = []
         for i, tok in enumerate(prompt_tokens):
-            if '4' in str(tok):
+            if "4" in str(tok):
                 needle_positions.append(i)
 
         print(f"\nNeedle '4' found at prompt positions: {needle_positions}")
@@ -127,7 +128,7 @@ def run_needle_test(base_url: str, verbose: bool = False) -> Dict[str, Any]:
         # Check first generated "4" attention
         first_four_idx = None
         for i, tok in enumerate(generated_tokens):
-            if '4' in tok:
+            if "4" in tok:
                 first_four_idx = i
                 break
 
@@ -135,7 +136,7 @@ def run_needle_test(base_url: str, verbose: bool = False) -> Dict[str, Any]:
             return {
                 "status": "INCONCLUSIVE",
                 "error": f"Model didn't generate '4'. Output: {generated_text}",
-                "generated": generated_text
+                "generated": generated_text,
             }
 
         print(f"\nFirst '4' generated at output position: {first_four_idx}")
@@ -146,27 +147,32 @@ def run_needle_test(base_url: str, verbose: bool = False) -> Dict[str, Any]:
 
             # Parse top-k positions
             top_k = []
-            if 'layers' in attn:
+            if "layers" in attn:
                 # Multi-layer format
-                for layer_id, layer_data in attn['layers'].items():
-                    positions = layer_data.get('positions', [])
-                    scores = layer_data.get('scores', [])
+                for layer_id, layer_data in attn["layers"].items():
+                    positions = layer_data.get("positions", [])
+                    scores = layer_data.get("scores", [])
                     for pos, score in zip(positions, scores):
-                        top_k.append({'position': pos, 'score': score, 'layer': layer_id})
-            elif 'positions' in attn:
+                        top_k.append(
+                            {"position": pos, "score": score, "layer": layer_id}
+                        )
+            elif "positions" in attn:
                 # Single layer format
-                positions = attn.get('positions', [])
-                scores = attn.get('scores', [])
+                positions = attn.get("positions", [])
+                scores = attn.get("scores", [])
                 for pos, score in zip(positions, scores):
-                    top_k.append({'position': pos, 'score': score})
+                    top_k.append({"position": pos, "score": score})
 
             if verbose:
                 print(f"\nTop-K attention for first '4':")
-                for item in sorted(top_k, key=lambda x: -x['score'])[:10]:
+                for item in sorted(top_k, key=lambda x: -x["score"])[:10]:
                     print(f"  Position {item['position']}: {item['score']:.4f}")
 
             # Check if any top-k position matches needle position
-            top_positions = [item['position'] for item in sorted(top_k, key=lambda x: -x['score'])[:5]]
+            top_positions = [
+                item["position"]
+                for item in sorted(top_k, key=lambda x: -x["score"])[:5]
+            ]
 
             # Check overlap with needle positions
             hits = set(top_positions) & set(needle_positions)
@@ -184,7 +190,7 @@ def run_needle_test(base_url: str, verbose: bool = False) -> Dict[str, Any]:
                     "generated": generated_text,
                     "needle_positions": needle_positions,
                     "top_attended": top_positions,
-                    "overlap": list(hits)
+                    "overlap": list(hits),
                 }
             else:
                 print("\n" + "=" * 60)
@@ -196,13 +202,13 @@ def run_needle_test(base_url: str, verbose: bool = False) -> Dict[str, Any]:
                     "error": "Attention misaligned - doesn't point to needle",
                     "generated": generated_text,
                     "needle_positions": needle_positions,
-                    "top_attended": top_positions
+                    "top_attended": top_positions,
                 }
         else:
             return {
                 "status": "FAIL",
                 "error": f"No attention for token {first_four_idx}",
-                "generated": generated_text
+                "generated": generated_text,
             }
 
     except requests.exceptions.ConnectionError:

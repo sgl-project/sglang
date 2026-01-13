@@ -32,16 +32,19 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 
 try:
     import requests
+
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
 
 try:
     import torch
+
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
@@ -50,6 +53,7 @@ except ImportError:
 @dataclass
 class CachedCentroid:
     """Cached cluster centroid for fast lookup."""
+
     cluster_id: int
     centroid: np.ndarray
     traits: List[str]
@@ -186,7 +190,7 @@ class ProxyClassifier:
         with self._centroids_lock:
             if not self._centroids:
                 self._miss_count += 1
-                return None, float('inf'), [], {}
+                return None, float("inf"), [], {}
 
             centroids = list(self._centroids.values())
 
@@ -197,7 +201,7 @@ class ProxyClassifier:
 
         # Find nearest centroid (O(k))
         best_match: Optional[CachedCentroid] = None
-        best_dist = float('inf')
+        best_dist = float("inf")
 
         for centroid in centroids:
             dist = np.linalg.norm(fingerprint - centroid.centroid)
@@ -233,7 +237,7 @@ class ProxyClassifier:
         with self._centroids_lock:
             if not self._centroids:
                 self._miss_count += 1
-                return None, float('inf'), [], {}
+                return None, float("inf"), [], {}
 
             # Stack centroids into tensor
             centroid_list = list(self._centroids.values())
@@ -257,7 +261,9 @@ class ProxyClassifier:
 
     def get_stats(self) -> Dict:
         """Get classifier statistics."""
-        hit_rate = self._hit_count / self._classify_count if self._classify_count > 0 else 0
+        hit_rate = (
+            self._hit_count / self._classify_count if self._classify_count > 0 else 0
+        )
         return {
             "n_centroids": len(self._centroids),
             "classify_count": self._classify_count,
@@ -346,23 +352,25 @@ def test_classifier():
     classifier = ProxyClassifier(max_distance=2.0)
 
     # Set up test centroids
-    classifier.set_centroids({
-        0: {
-            "centroid": [0.8, 0.1, 0.1, 0.3] + [0.0] * 16,
-            "traits": ["syntax_floor", "local_attention"],
-            "sampling_hint": {"temperature": 0.2},
-        },
-        1: {
-            "centroid": [0.2, 0.6, 0.2, 0.5] + [0.0] * 16,
-            "traits": ["semantic_bridge", "retrieval_heavy"],
-            "sampling_hint": {"temperature": 0.5},
-        },
-        2: {
-            "centroid": [0.2, 0.2, 0.6, 0.6] + [0.0] * 16,
-            "traits": ["long_range", "context_aware"],
-            "sampling_hint": {"temperature": 0.6},
-        },
-    })
+    classifier.set_centroids(
+        {
+            0: {
+                "centroid": [0.8, 0.1, 0.1, 0.3] + [0.0] * 16,
+                "traits": ["syntax_floor", "local_attention"],
+                "sampling_hint": {"temperature": 0.2},
+            },
+            1: {
+                "centroid": [0.2, 0.6, 0.2, 0.5] + [0.0] * 16,
+                "traits": ["semantic_bridge", "retrieval_heavy"],
+                "sampling_hint": {"temperature": 0.5},
+            },
+            2: {
+                "centroid": [0.2, 0.2, 0.6, 0.6] + [0.0] * 16,
+                "traits": ["long_range", "context_aware"],
+                "sampling_hint": {"temperature": 0.6},
+            },
+        }
+    )
 
     # Test classifications
     test_cases = [
@@ -405,15 +413,22 @@ def test_classifier():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Proxy classifier for attention routing")
-    parser.add_argument("--sidecar", default="http://localhost:9000",
-                        help="RAPIDS sidecar URL")
-    parser.add_argument("--sync-interval", type=float, default=30.0,
-                        help="Seconds between centroid sync")
-    parser.add_argument("--test", action="store_true",
-                        help="Run test with synthetic data")
-    parser.add_argument("--interactive", action="store_true",
-                        help="Interactive mode")
+    parser = argparse.ArgumentParser(
+        description="Proxy classifier for attention routing"
+    )
+    parser.add_argument(
+        "--sidecar", default="http://localhost:9000", help="RAPIDS sidecar URL"
+    )
+    parser.add_argument(
+        "--sync-interval",
+        type=float,
+        default=30.0,
+        help="Seconds between centroid sync",
+    )
+    parser.add_argument(
+        "--test", action="store_true", help="Run test with synthetic data"
+    )
+    parser.add_argument("--interactive", action="store_true", help="Interactive mode")
 
     args = parser.parse_args()
 

@@ -578,7 +578,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
-                attention_tokens[index] = content["meta_info"].get("attention_tokens", None)
+                attention_tokens[index] = content["meta_info"].get(
+                    "attention_tokens", None
+                )
                 logit_lens_data[index] = content["meta_info"].get("logit_lens", None)
 
                 # Handle logprobs
@@ -791,9 +793,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[
                                 ChatCompletionResponseStreamChoice(
                                     index=index,
-                                    delta=DeltaMessage(
-                                        logit_lens=choice_logit_lens
-                                    ),
+                                    delta=DeltaMessage(logit_lens=choice_logit_lens),
                                     finish_reason=None,
                                 )
                             ],
@@ -1173,7 +1173,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if biases is None:
             return None
         return {
-            int(layer_id): {int(token_pos): bias for token_pos, bias in token_biases.items()}
+            int(layer_id): {
+                int(token_pos): bias for token_pos, bias in token_biases.items()
+            }
             for layer_id, token_biases in biases.items()
         }
 

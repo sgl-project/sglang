@@ -10,18 +10,19 @@ Usage:
 """
 
 import argparse
-import json
 import math
-import requests
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
+
+import requests
 
 
 @dataclass
 class LayerAnalysis:
     """Analysis results for a single layer."""
+
     layer_id: int
     # Which input tokens get the most attention
     top_attended_positions: List[int]
@@ -30,12 +31,15 @@ class LayerAnalysis:
     # Attention distribution metrics
     entropy: float  # Higher = more distributed attention
     max_score: float  # Highest single attention score
-    prompt_vs_output_ratio: float  # How much attention goes to prompt vs generated tokens
+    prompt_vs_output_ratio: (
+        float  # How much attention goes to prompt vs generated tokens
+    )
 
 
 @dataclass
 class SemanticTest:
     """A test case for semantic attention discovery."""
+
     name: str
     prompt: str
     expected_semantic_tokens: List[str]  # Tokens we expect to be semantically important
@@ -48,31 +52,31 @@ SEMANTIC_TESTS = [
         name="capital_city",
         prompt="The capital of France is",
         expected_semantic_tokens=["France", "capital"],
-        description="Test if layers attend to 'France' when generating 'Paris'"
+        description="Test if layers attend to 'France' when generating 'Paris'",
     ),
     SemanticTest(
         name="arithmetic",
         prompt="5 + 3 =",
         expected_semantic_tokens=["5", "3", "+"],
-        description="Test if layers attend to operands and operator for math"
+        description="Test if layers attend to operands and operator for math",
     ),
     SemanticTest(
         name="synonym",
         prompt="Happy is the opposite of",
         expected_semantic_tokens=["Happy", "opposite"],
-        description="Test if layers attend to 'Happy' when generating 'sad'"
+        description="Test if layers attend to 'Happy' when generating 'sad'",
     ),
     SemanticTest(
         name="continuation",
         prompt="Once upon a time, there was a",
         expected_semantic_tokens=["Once", "upon", "time"],
-        description="Test attention patterns in story continuation"
+        description="Test attention patterns in story continuation",
     ),
     SemanticTest(
         name="translation_context",
         prompt="In French, 'hello' is",
         expected_semantic_tokens=["French", "hello"],
-        description="Test if layers attend to language and word to translate"
+        description="Test if layers attend to language and word to translate",
     ),
 ]
 
@@ -89,8 +93,7 @@ def get_model_info(api_base: str) -> dict:
 def tokenize_prompt(prompt: str, api_base: str) -> Tuple[List[int], List[str]]:
     """Tokenize prompt and return token IDs and texts."""
     tok_response = requests.post(
-        f"{api_base}/v1/tokenize",
-        json={"model": "default", "prompt": prompt}
+        f"{api_base}/v1/tokenize", json={"model": "default", "prompt": prompt}
     )
     token_ids = tok_response.json().get("tokens", [])
 
@@ -98,8 +101,7 @@ def tokenize_prompt(prompt: str, api_base: str) -> Tuple[List[int], List[str]]:
     token_texts = []
     for tid in token_ids:
         detok = requests.post(
-            f"{api_base}/v1/detokenize",
-            json={"model": "default", "tokens": [tid]}
+            f"{api_base}/v1/detokenize", json={"model": "default", "tokens": [tid]}
         )
         token_texts.append(detok.json().get("text", f"[{tid}]"))
 
@@ -112,7 +114,7 @@ def analyze_layer(
     prompt_tokens: List[str],
     api_base: str,
     max_tokens: int = 5,
-    top_k: int = 15
+    top_k: int = 15,
 ) -> Optional[LayerAnalysis]:
     """Analyze attention patterns for a specific layer."""
 
@@ -128,7 +130,7 @@ def analyze_layer(
                 "top_k_attention": top_k,
                 "attention_capture_layer_id": layer_id,
             },
-            timeout=30
+            timeout=30,
         )
 
         if response.status_code != 200:
@@ -178,11 +180,16 @@ def analyze_layer(
             max_score = 0.0
 
         # Get top attended positions (only prompt tokens)
-        prompt_positions = [(pos, score) for pos, score in position_scores.items() if pos < prompt_len]
+        prompt_positions = [
+            (pos, score) for pos, score in position_scores.items() if pos < prompt_len
+        ]
         prompt_positions.sort(key=lambda x: -x[1])
 
         top_positions = [pos for pos, _ in prompt_positions[:5]]
-        top_tokens = [prompt_tokens[pos] if pos < len(prompt_tokens) else f"[{pos}]" for pos in top_positions]
+        top_tokens = [
+            prompt_tokens[pos] if pos < len(prompt_tokens) else f"[{pos}]"
+            for pos in top_positions
+        ]
         top_scores = [position_scores[pos] for pos in top_positions]
 
         # Calculate prompt vs output ratio
@@ -210,14 +217,14 @@ def run_layer_discovery(
     api_base: str,
     expected_tokens: Optional[List[str]] = None,
     max_tokens: int = 5,
-    layer_step: int = 1
+    layer_step: int = 1,
 ) -> List[LayerAnalysis]:
     """Run attention analysis across all layers."""
 
     print(f"\n{'='*70}")
     print(f"LAYER DISCOVERY ANALYSIS")
     print(f"{'='*70}")
-    print(f"Prompt: \"{prompt}\"")
+    print(f'Prompt: "{prompt}"')
     if expected_tokens:
         print(f"Expected semantic tokens: {expected_tokens}")
     print()
@@ -242,15 +249,16 @@ def run_layer_discovery(
         if analysis:
             results.append(analysis)
             # Progress indicator
-            print(f"  Layer {layer_id:3d}: top tokens = {analysis.top_attended_tokens[:3]}, "
-                  f"entropy={analysis.entropy:.2f}, prompt_ratio={analysis.prompt_vs_output_ratio:.1%}")
+            print(
+                f"  Layer {layer_id:3d}: top tokens = {analysis.top_attended_tokens[:3]}, "
+                f"entropy={analysis.entropy:.2f}, prompt_ratio={analysis.prompt_vs_output_ratio:.1%}"
+            )
 
     return results
 
 
 def find_semantic_layers(
-    results: List[LayerAnalysis],
-    expected_tokens: List[str]
+    results: List[LayerAnalysis], expected_tokens: List[str]
 ) -> Tuple[List[int], List[int]]:
     """Find layers that attend to semantic tokens vs structural tokens."""
 
@@ -262,21 +270,39 @@ def find_semantic_layers(
         top_tokens_lower = [t.lower().strip() for t in analysis.top_attended_tokens]
         expected_lower = [t.lower() for t in expected_tokens]
 
-        semantic_matches = sum(1 for t in expected_lower if any(t in tt for tt in top_tokens_lower))
+        semantic_matches = sum(
+            1 for t in expected_lower if any(t in tt for tt in top_tokens_lower)
+        )
 
         if semantic_matches > 0:
             semantic_layers.append(analysis.layer_id)
         else:
             # Check for structural patterns (common tokens like punctuation, articles)
-            structural_tokens = {',', '.', ':', ';', 'the', 'a', 'an', 'is', 'are', 'was', 'were'}
-            structural_matches = sum(1 for t in top_tokens_lower if t.strip() in structural_tokens)
+            structural_tokens = {
+                ",",
+                ".",
+                ":",
+                ";",
+                "the",
+                "a",
+                "an",
+                "is",
+                "are",
+                "was",
+                "were",
+            }
+            structural_matches = sum(
+                1 for t in top_tokens_lower if t.strip() in structural_tokens
+            )
             if structural_matches > 0:
                 structural_layers.append(analysis.layer_id)
 
     return semantic_layers, structural_layers
 
 
-def print_layer_summary(results: List[LayerAnalysis], expected_tokens: Optional[List[str]] = None):
+def print_layer_summary(
+    results: List[LayerAnalysis], expected_tokens: Optional[List[str]] = None
+):
     """Print a summary of layer analysis results."""
 
     if not results:
@@ -291,21 +317,31 @@ def print_layer_summary(results: List[LayerAnalysis], expected_tokens: Optional[
     by_entropy = sorted(results, key=lambda x: x.entropy)
     print("\nLowest entropy (most focused attention):")
     for a in by_entropy[:3]:
-        print(f"  Layer {a.layer_id:3d}: entropy={a.entropy:.3f}, top={a.top_attended_tokens[:2]}")
+        print(
+            f"  Layer {a.layer_id:3d}: entropy={a.entropy:.3f}, top={a.top_attended_tokens[:2]}"
+        )
 
     print("\nHighest entropy (most distributed attention):")
     for a in by_entropy[-3:]:
-        print(f"  Layer {a.layer_id:3d}: entropy={a.entropy:.3f}, top={a.top_attended_tokens[:2]}")
+        print(
+            f"  Layer {a.layer_id:3d}: entropy={a.entropy:.3f}, top={a.top_attended_tokens[:2]}"
+        )
 
     # Find layers with highest prompt attention ratio
-    by_prompt_ratio = sorted(results, key=lambda x: x.prompt_vs_output_ratio, reverse=True)
+    by_prompt_ratio = sorted(
+        results, key=lambda x: x.prompt_vs_output_ratio, reverse=True
+    )
     print("\nMost prompt-focused layers:")
     for a in by_prompt_ratio[:3]:
-        print(f"  Layer {a.layer_id:3d}: {a.prompt_vs_output_ratio:.1%} prompt attention")
+        print(
+            f"  Layer {a.layer_id:3d}: {a.prompt_vs_output_ratio:.1%} prompt attention"
+        )
 
     # Semantic analysis if expected tokens provided
     if expected_tokens:
-        semantic_layers, structural_layers = find_semantic_layers(results, expected_tokens)
+        semantic_layers, structural_layers = find_semantic_layers(
+            results, expected_tokens
+        )
 
         print(f"\n{'='*70}")
         print("SEMANTIC VS STRUCTURAL LAYERS")
@@ -328,7 +364,9 @@ def print_layer_summary(results: List[LayerAnalysis], expected_tokens: Optional[
     print(f"{'='*70}")
 
     early_layers = [a for a in results if a.layer_id < len(results) // 3]
-    mid_layers = [a for a in results if len(results) // 3 <= a.layer_id < 2 * len(results) // 3]
+    mid_layers = [
+        a for a in results if len(results) // 3 <= a.layer_id < 2 * len(results) // 3
+    ]
     late_layers = [a for a in results if a.layer_id >= 2 * len(results) // 3]
 
     def avg_metrics(layer_list):
@@ -336,7 +374,7 @@ def print_layer_summary(results: List[LayerAnalysis], expected_tokens: Optional[
             return 0, 0
         return (
             sum(a.entropy for a in layer_list) / len(layer_list),
-            sum(a.prompt_vs_output_ratio for a in layer_list) / len(layer_list)
+            sum(a.prompt_vs_output_ratio for a in layer_list) / len(layer_list),
         )
 
     early_entropy, early_ratio = avg_metrics(early_layers)
@@ -353,9 +391,9 @@ def print_layer_summary(results: List[LayerAnalysis], expected_tokens: Optional[
 def run_all_semantic_tests(num_layers: int, api_base: str, layer_step: int = 4):
     """Run all pre-defined semantic tests."""
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("RUNNING ALL SEMANTIC TESTS")
-    print("="*70)
+    print("=" * 70)
 
     all_results = {}
 
@@ -370,7 +408,7 @@ def run_all_semantic_tests(num_layers: int, api_base: str, layer_step: int = 4):
             num_layers=num_layers,
             api_base=api_base,
             expected_tokens=test.expected_semantic_tokens,
-            layer_step=layer_step
+            layer_step=layer_step,
         )
 
         print_layer_summary(results, test.expected_semantic_tokens)
@@ -380,32 +418,49 @@ def run_all_semantic_tests(num_layers: int, api_base: str, layer_step: int = 4):
         time.sleep(0.5)
 
     # Cross-test analysis
-    print("\n\n" + "="*70)
+    print("\n\n" + "=" * 70)
     print("CROSS-TEST ANALYSIS")
-    print("="*70)
+    print("=" * 70)
 
     # Find layers that consistently attend to semantic tokens across tests
     layer_semantic_count = defaultdict(int)
     for test_name, results in all_results.items():
         test = next(t for t in SEMANTIC_TESTS if t.name == test_name)
-        semantic_layers, _ = find_semantic_layers(results, test.expected_semantic_tokens)
+        semantic_layers, _ = find_semantic_layers(
+            results, test.expected_semantic_tokens
+        )
         for layer_id in semantic_layers:
             layer_semantic_count[layer_id] += 1
 
     print("\nLayers with semantic attention across multiple tests:")
     for layer_id, count in sorted(layer_semantic_count.items(), key=lambda x: -x[1]):
         if count > 1:
-            print(f"  Layer {layer_id}: semantic in {count}/{len(SEMANTIC_TESTS)} tests")
+            print(
+                f"  Layer {layer_id}: semantic in {count}/{len(SEMANTIC_TESTS)} tests"
+            )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Layer Discovery Analysis")
     parser.add_argument("--prompt", type=str, help="Custom prompt to analyze")
-    parser.add_argument("--num-layers", type=int, default=28, help="Number of model layers")
-    parser.add_argument("--api-base", default="http://localhost:8000", help="API base URL")
-    parser.add_argument("--max-tokens", type=int, default=5, help="Max tokens to generate")
-    parser.add_argument("--layer-step", type=int, default=1, help="Step between layers (for faster testing)")
-    parser.add_argument("--run-all-tests", action="store_true", help="Run all semantic tests")
+    parser.add_argument(
+        "--num-layers", type=int, default=28, help="Number of model layers"
+    )
+    parser.add_argument(
+        "--api-base", default="http://localhost:8000", help="API base URL"
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=5, help="Max tokens to generate"
+    )
+    parser.add_argument(
+        "--layer-step",
+        type=int,
+        default=1,
+        help="Step between layers (for faster testing)",
+    )
+    parser.add_argument(
+        "--run-all-tests", action="store_true", help="Run all semantic tests"
+    )
     parser.add_argument("--expected-tokens", nargs="+", help="Expected semantic tokens")
 
     args = parser.parse_args()
@@ -419,7 +474,7 @@ def main():
             api_base=args.api_base,
             expected_tokens=args.expected_tokens,
             max_tokens=args.max_tokens,
-            layer_step=args.layer_step
+            layer_step=args.layer_step,
         )
         print_layer_summary(results, args.expected_tokens)
     else:
@@ -430,7 +485,7 @@ def main():
             api_base=args.api_base,
             expected_tokens=["France", "capital"],
             max_tokens=args.max_tokens,
-            layer_step=args.layer_step
+            layer_step=args.layer_step,
         )
         print_layer_summary(results, ["France", "capital"])
 

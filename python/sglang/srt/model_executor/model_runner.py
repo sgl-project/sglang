@@ -966,12 +966,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Initialize logit lens extractor for interpretability (experimental)
         self.logit_lens_extractor: Optional[LogitLensExtractor] = None
-        if hasattr(self.model, 'lm_head'):
+        if hasattr(self.model, "lm_head"):
             # Get final layer norm if available (for proper projection)
             norm_module = None
-            if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
+            if hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
                 norm_module = self.model.model.norm
-            elif hasattr(self.model, 'norm'):
+            elif hasattr(self.model, "norm"):
                 norm_module = self.model.norm
 
             self.logit_lens_extractor = create_logit_lens_extractor(
@@ -2249,7 +2249,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
-        output.expert_distribution_metrics = recorder_outputs.get("metrics") if recorder_outputs else None
+        output.expert_distribution_metrics = (
+            recorder_outputs.get("metrics") if recorder_outputs else None
+        )
 
         # Copy cached routing experts' buffers back to CPU cache
         get_global_experts_capturer().on_forward_end(
@@ -2295,7 +2297,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if (
             forward_batch.capture_logit_lens
             and self.logit_lens_extractor is not None
-            and hasattr(self.model, 'lm_head')
+            and hasattr(self.model, "lm_head")
         ):
             self.logit_lens_extractor.register_hooks(forward_batch.logit_lens_layer_ids)
             logit_lens_active = True

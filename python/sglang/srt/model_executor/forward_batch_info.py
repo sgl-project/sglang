@@ -447,15 +447,15 @@ class ForwardBatch:
     # For attention steering (semantic routing loop)
     # Sparse representation: (layer_id, batch_idx, token_pos, bias_value) tensors
     # Applied as additive bias to attention logits before softmax
-    attention_bias_indices: Optional[
-        torch.Tensor
-    ] = None  # [num_biases, 3] (layer_id, batch_idx, token_pos)
+    attention_bias_indices: Optional[torch.Tensor] = (
+        None  # [num_biases, 3] (layer_id, batch_idx, token_pos)
+    )
     attention_bias_values: Optional[torch.Tensor] = None  # [num_biases] bias values
     attention_bias_layers: Optional[List[int]] = None  # Which layers have biases
     # CSR-style per-layer indexing for efficient lookup
-    attention_bias_layer_indptr: Optional[
-        torch.Tensor
-    ] = None  # [num_layers+1] CSR indptr
+    attention_bias_layer_indptr: Optional[torch.Tensor] = (
+        None  # [num_layers+1] CSR indptr
+    )
 
     # For MoE routing capture (interpretability/semantic telemetry)
     # Captures which experts were selected and with what weights
@@ -474,9 +474,9 @@ class ForwardBatch:
     # For logit lens (interpretability) - project intermediate layers to vocab
     capture_logit_lens: bool = False
     logit_lens_top_k: int = 5  # Number of top token candidates per layer
-    logit_lens_layer_ids: Optional[
-        List[int]
-    ] = None  # Which layers to probe (None = auto-select ~4)
+    logit_lens_layer_ids: Optional[List[int]] = (
+        None  # Which layers to probe (None = auto-select ~4)
+    )
     # Captured logit lens output (populated after forward pass)
     logit_lens_output: Optional["LogitLensOutput"] = None
 
@@ -923,9 +923,9 @@ class ForwardBatch:
         # Mask for valid positions (within max_seq_len)
         valid_mask = token_positions < max_seq_len
         if valid_mask.any():
-            bias_tensor[
-                batch_indices[valid_mask], token_positions[valid_mask]
-            ] = layer_values[valid_mask]
+            bias_tensor[batch_indices[valid_mask], token_positions[valid_mask]] = (
+                layer_values[valid_mask]
+            )
 
         return bias_tensor
 

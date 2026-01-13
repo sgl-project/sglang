@@ -1443,14 +1443,20 @@ class Scheduler(
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
                 return_attention_tokens=recv_req.return_attention_tokens,
-                top_k_attention=getattr(recv_req, 'top_k_attention', 10),
-                attention_capture_layer_id=getattr(recv_req, 'attention_capture_layer_id', None),
-                attention_capture_layer_ids=getattr(recv_req, 'attention_capture_layer_ids', None),
-                attention_sketch_mode=getattr(recv_req, 'attention_sketch_mode', False),
-                attention_fingerprint_mode=getattr(recv_req, 'attention_fingerprint_mode', None),
-                return_moe_routing=getattr(recv_req, 'return_moe_routing', False),
-                moe_routing_top_k=getattr(recv_req, 'moe_routing_top_k', 2),
-                moe_capture_layer_ids=getattr(recv_req, 'moe_capture_layer_ids', None),
+                top_k_attention=getattr(recv_req, "top_k_attention", 10),
+                attention_capture_layer_id=getattr(
+                    recv_req, "attention_capture_layer_id", None
+                ),
+                attention_capture_layer_ids=getattr(
+                    recv_req, "attention_capture_layer_ids", None
+                ),
+                attention_sketch_mode=getattr(recv_req, "attention_sketch_mode", False),
+                attention_fingerprint_mode=getattr(
+                    recv_req, "attention_fingerprint_mode", None
+                ),
+                return_moe_routing=getattr(recv_req, "return_moe_routing", False),
+                moe_routing_top_k=getattr(recv_req, "moe_routing_top_k", 2),
+                moe_capture_layer_ids=getattr(recv_req, "moe_capture_layer_ids", None),
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -1469,8 +1475,8 @@ class Scheduler(
             req.tokenizer = self.tokenizer
 
             # Populate semantic_memory with API-provided attention biases
-            api_biases = getattr(recv_req, 'attention_biases', None)
-            if api_biases and hasattr(req, 'semantic_memory') and req.semantic_memory:
+            api_biases = getattr(recv_req, "attention_biases", None)
+            if api_biases and hasattr(req, "semantic_memory") and req.semantic_memory:
                 req.semantic_memory.attention_biases = api_biases
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
@@ -1826,10 +1832,18 @@ class Scheduler(
                 self.running_batch = self.update_running_batch(self.running_batch)
                 if not self.running_batch.is_empty():
                     # Ensure stride/max are set for compute-gated stride
-                    self.running_batch.attention_tokens_stride = self.server_args.attention_tokens_stride
-                    self.running_batch.attention_tokens_max = self.server_args.attention_tokens_max
-                    self.running_batch.attention_fingerprint_mode = self.server_args.attention_fingerprint_mode
-                    self.running_batch.attention_fingerprint_max_steps = self.server_args.attention_fingerprint_max_steps
+                    self.running_batch.attention_tokens_stride = (
+                        self.server_args.attention_tokens_stride
+                    )
+                    self.running_batch.attention_tokens_max = (
+                        self.server_args.attention_tokens_max
+                    )
+                    self.running_batch.attention_fingerprint_mode = (
+                        self.server_args.attention_fingerprint_mode
+                    )
+                    self.running_batch.attention_fingerprint_max_steps = (
+                        self.server_args.attention_fingerprint_max_steps
+                    )
                     ret = self.running_batch
                 else:
                     ret = None
@@ -2056,8 +2070,12 @@ class Scheduler(
         # Set attention token capture gating parameters (compute-gated stride)
         new_batch.attention_tokens_stride = self.server_args.attention_tokens_stride
         new_batch.attention_tokens_max = self.server_args.attention_tokens_max
-        new_batch.attention_fingerprint_mode = self.server_args.attention_fingerprint_mode
-        new_batch.attention_fingerprint_max_steps = self.server_args.attention_fingerprint_max_steps
+        new_batch.attention_fingerprint_mode = (
+            self.server_args.attention_fingerprint_mode
+        )
+        new_batch.attention_fingerprint_max_steps = (
+            self.server_args.attention_fingerprint_max_steps
+        )
 
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered

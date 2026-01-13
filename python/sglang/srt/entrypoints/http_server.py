@@ -1386,7 +1386,8 @@ async def attention_capabilities():
         "features": {
             "include_prompt_attention": True,
             "privacy_mask": {
-                "enabled": server_args.attention_mask_prefix > 0 or server_args.attention_mask_system_prompt,
+                "enabled": server_args.attention_mask_prefix > 0
+                or server_args.attention_mask_system_prompt,
                 "mask_system_prompt": server_args.attention_mask_system_prompt,
                 "mask_prefix": server_args.attention_mask_prefix,
             },
@@ -1410,14 +1411,18 @@ async def attention_capabilities():
         },
         "guardrails": {
             "api_key_required": server_args.attention_capture_api_key is not None,
-            "allowed_origins": server_args.attention_capture_allowed_origins.split(",") if server_args.attention_capture_allowed_origins else None,
+            "allowed_origins": (
+                server_args.attention_capture_allowed_origins.split(",")
+                if server_args.attention_capture_allowed_origins
+                else None
+            ),
             "max_concurrent": server_args.attention_capture_max_concurrent,
             "disabled_in_production": server_args.attention_capture_disable_in_production,
         },
         "model": {
             "name": _global_state.tokenizer_manager.served_model_name,
             "context_length": model_config.context_len,
-            "num_heads": getattr(model_config, 'num_attention_heads', None),
+            "num_heads": getattr(model_config, "num_attention_heads", None),
         },
     }
 

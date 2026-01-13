@@ -18,34 +18,38 @@ Usage:
 
 import argparse
 import json
-import numpy as np
-from typing import List, Dict, Optional, Tuple, Any
-from pathlib import Path
 import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 # Optional imports with graceful fallback
 try:
     import hdbscan
+
     HAS_HDBSCAN = True
 except ImportError:
     HAS_HDBSCAN = False
 
 try:
     import umap
+
     HAS_UMAP = True
 except ImportError:
     HAS_UMAP = False
 
 try:
-    from sklearn.preprocessing import StandardScaler
     from sklearn.metrics import silhouette_score
+    from sklearn.preprocessing import StandardScaler
+
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
 
 # Local import
 sys.path.insert(0, str(Path(__file__).parent))
-from attention_fingerprint import AttentionFingerprint, normalize_attention_data
+from attention_fingerprint import AttentionFingerprint
 
 
 class AttentionClusterer:
@@ -194,7 +198,9 @@ class AttentionClusterer:
             mask = self.labels != -1
             if mask.sum() > n_clusters:
                 try:
-                    silhouette = float(silhouette_score(X_cluster[mask], self.labels[mask]))
+                    silhouette = float(
+                        silhouette_score(X_cluster[mask], self.labels[mask])
+                    )
                 except:
                     pass
 
@@ -321,8 +327,12 @@ class AttentionClusterer:
             "fingerprints": [fp.tolist() for fp in self.fingerprints],
             "metadata": self.metadata,
             "labels": self.labels.tolist() if self.labels is not None else None,
-            "probabilities": self.probabilities.tolist() if self.probabilities is not None else None,
-            "embedding": self.embedding.tolist() if self.embedding is not None else None,
+            "probabilities": (
+                self.probabilities.tolist() if self.probabilities is not None else None
+            ),
+            "embedding": (
+                self.embedding.tolist() if self.embedding is not None else None
+            ),
             "config": {
                 "min_cluster_size": self.min_cluster_size,
                 "min_samples": self.min_samples,
@@ -339,11 +349,14 @@ class AttentionClusterer:
         # Save sklearn/hdbscan models separately
         model_path = path.replace(".json", "_models.pkl")
         with open(model_path, "wb") as f:
-            pickle.dump({
-                "scaler": self.scaler,
-                "umap_reducer": self.umap_reducer,
-                "clusterer": self.clusterer,
-            }, f)
+            pickle.dump(
+                {
+                    "scaler": self.scaler,
+                    "umap_reducer": self.umap_reducer,
+                    "clusterer": self.clusterer,
+                },
+                f,
+            )
 
     def load(self, path: str):
         """Load clusterer state from file."""
@@ -352,10 +365,14 @@ class AttentionClusterer:
         with open(path) as f:
             state = json.load(f)
 
-        self.fingerprints = [np.array(fp, dtype=np.float32) for fp in state["fingerprints"]]
+        self.fingerprints = [
+            np.array(fp, dtype=np.float32) for fp in state["fingerprints"]
+        ]
         self.metadata = state["metadata"]
         self.labels = np.array(state["labels"]) if state["labels"] else None
-        self.probabilities = np.array(state["probabilities"]) if state["probabilities"] else None
+        self.probabilities = (
+            np.array(state["probabilities"]) if state["probabilities"] else None
+        )
         self.embedding = np.array(state["embedding"]) if state["embedding"] else None
 
         # Load models
@@ -373,22 +390,24 @@ class AttentionClusterer:
             return {"error": "Not fitted yet"}
 
         points = []
-        for i, (emb, label, prob) in enumerate(zip(
-            self.embedding, self.labels, self.probabilities
-        )):
+        for i, (emb, label, prob) in enumerate(
+            zip(self.embedding, self.labels, self.probabilities)
+        ):
             fp = self.fingerprints[i]
-            points.append({
-                "x": float(emb[0]),
-                "y": float(emb[1]),
-                "z": float(emb[2]) if len(emb) > 2 else 0.0,
-                "cluster": int(label),
-                "probability": float(prob),
-                "hubness": float(fp[0]),
-                "consensus": float(fp[1]),
-                "spectral": float(fp[2]),
-                "entropy": float(fp[3]),
-                "metadata": self.metadata[i],
-            })
+            points.append(
+                {
+                    "x": float(emb[0]),
+                    "y": float(emb[1]),
+                    "z": float(emb[2]) if len(emb) > 2 else 0.0,
+                    "cluster": int(label),
+                    "probability": float(prob),
+                    "hubness": float(fp[0]),
+                    "consensus": float(fp[1]),
+                    "spectral": float(fp[2]),
+                    "entropy": float(fp[3]),
+                    "metadata": self.metadata[i],
+                }
+            )
 
         return {
             "points": points,
@@ -485,7 +504,7 @@ def demo_clustering():
 
     # Combine
     all_vectors = np.vstack([cluster0, cluster1, cluster2])
-    true_labels = [0]*20 + [1]*20 + [2]*15
+    true_labels = [0] * 20 + [1] * 20 + [2] * 15
 
     # Create clusterer
     clusterer = AttentionClusterer(
@@ -506,14 +525,16 @@ def demo_clustering():
     print(f"  Samples: {results['n_samples']}")
     print(f"  Clusters found: {results['n_clusters']}")
     print(f"  Noise points: {results['n_noise']}")
-    if results.get('silhouette'):
+    if results.get("silhouette"):
         print(f"  Silhouette score: {results['silhouette']:.3f}")
 
     print("\nCluster Statistics:")
     for label, stats in results.get("cluster_stats", {}).items():
-        print(f"  Cluster {label}: size={stats['size']}, "
-              f"hubness={stats['hubness']:.2f}, "
-              f"consensus={stats['consensus']:.2f}")
+        print(
+            f"  Cluster {label}: size={stats['size']}, "
+            f"hubness={stats['hubness']:.2f}, "
+            f"consensus={stats['consensus']:.2f}"
+        )
 
     print("\nCluster Summaries:")
     summaries = clusterer.get_cluster_summary()
@@ -525,36 +546,45 @@ def demo_clustering():
     new_vec = np.zeros(20)
     new_vec[0] = 0.85  # High hubness
     new_vec[1] = 0.75  # High consensus
-    new_vec[3] = 1.0   # Low entropy
+    new_vec[3] = 1.0  # Low entropy
 
     # Create fake attention data for prediction
-    fake_attn = [{
-        "token_positions": [0, 1, 2],
-        "attention_scores": [0.6, 0.3, 0.1],
-        "layer_id": 23,
-    }]
+    fake_attn = [
+        {
+            "token_positions": [0, 1, 2],
+            "attention_scores": [0.6, 0.3, 0.1],
+            "layer_id": 23,
+        }
+    ]
 
     pred = clusterer.predict(fake_attn)
-    print(f"  Predicted cluster: {pred['cluster']} (probability: {pred['probability']:.3f})")
+    print(
+        f"  Predicted cluster: {pred['cluster']} (probability: {pred['probability']:.3f})"
+    )
 
     print("\n" + "=" * 60)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HDBSCAN clustering for attention fingerprints")
+    parser = argparse.ArgumentParser(
+        description="HDBSCAN clustering for attention fingerprints"
+    )
     parser.add_argument("--input", "-i", help="JSONL file with fingerprints")
     parser.add_argument("--output", "-o", help="Output file for clustering results")
-    parser.add_argument("--server", "-s", default="http://localhost:8000",
-                        help="SGLang server URL")
+    parser.add_argument(
+        "--server", "-s", default="http://localhost:8000", help="SGLang server URL"
+    )
     parser.add_argument("--prompts", "-p", help="File with prompts (one per line)")
-    parser.add_argument("--interactive", action="store_true",
-                        help="Interactive mode")
-    parser.add_argument("--demo", action="store_true",
-                        help="Run demo with synthetic data")
-    parser.add_argument("--min-cluster-size", type=int, default=5,
-                        help="Minimum cluster size")
-    parser.add_argument("--no-umap", action="store_true",
-                        help="Disable UMAP dimensionality reduction")
+    parser.add_argument("--interactive", action="store_true", help="Interactive mode")
+    parser.add_argument(
+        "--demo", action="store_true", help="Run demo with synthetic data"
+    )
+    parser.add_argument(
+        "--min-cluster-size", type=int, default=5, help="Minimum cluster size"
+    )
+    parser.add_argument(
+        "--no-umap", action="store_true", help="Disable UMAP dimensionality reduction"
+    )
 
     args = parser.parse_args()
 
@@ -599,7 +629,9 @@ def main():
     elif args.interactive:
         import requests
 
-        print("Interactive clustering mode. Type prompts to add, 'fit' to cluster, 'quit' to exit.")
+        print(
+            "Interactive clustering mode. Type prompts to add, 'fit' to cluster, 'quit' to exit."
+        )
 
         while True:
             try:
@@ -611,7 +643,9 @@ def main():
                 break
             elif cmd.lower() == "fit":
                 if len(clusterer.fingerprints) < 10:
-                    print(f"Need at least 10 samples, have {len(clusterer.fingerprints)}")
+                    print(
+                        f"Need at least 10 samples, have {len(clusterer.fingerprints)}"
+                    )
                     continue
                 results = clusterer.fit()
                 print(json.dumps(results, indent=2))
@@ -642,16 +676,22 @@ def main():
                     attn = data["choices"][0].get("attention_tokens", [])
                     text = data["choices"][0].get("text", "")
 
-                    fp = clusterer.add_fingerprint(attn, {"prompt": cmd, "response": text})
+                    fp = clusterer.add_fingerprint(
+                        attn, {"prompt": cmd, "response": text}
+                    )
                     print(f"Response: {text[:100]}...")
-                    print(f"Fingerprint: H={fp['hubness']:.2f} C={fp['consensus']:.2f} "
-                          f"S={fp['spectral']:.2f} E={fp['entropy']:.2f}")
+                    print(
+                        f"Fingerprint: H={fp['hubness']:.2f} C={fp['consensus']:.2f} "
+                        f"S={fp['spectral']:.2f} E={fp['entropy']:.2f}"
+                    )
                     print(f"Total samples: {len(clusterer.fingerprints)}")
 
                     # Predict if fitted
                     if clusterer.clusterer is not None:
                         pred = clusterer.predict(attn)
-                        print(f"Predicted cluster: {pred['cluster']} (p={pred['probability']:.2f})")
+                        print(
+                            f"Predicted cluster: {pred['cluster']} (p={pred['probability']:.2f})"
+                        )
                 except Exception as e:
                     print(f"Error: {e}")
 
@@ -665,7 +705,9 @@ def main():
     if len(clusterer.fingerprints) >= 10:
         print("\nFitting HDBSCAN...")
         results = clusterer.fit()
-        print(f"Found {results['n_clusters']} clusters, {results['n_noise']} noise points")
+        print(
+            f"Found {results['n_clusters']} clusters, {results['n_noise']} noise points"
+        )
 
         summaries = clusterer.get_cluster_summary()
         print("\nCluster Summaries:")
@@ -683,7 +725,9 @@ def main():
             clusterer.save(model_path)
             print(f"Saved model to {model_path}")
     else:
-        print(f"Need at least 10 samples for clustering, have {len(clusterer.fingerprints)}")
+        print(
+            f"Need at least 10 samples for clustering, have {len(clusterer.fingerprints)}"
+        )
 
 
 if __name__ == "__main__":
