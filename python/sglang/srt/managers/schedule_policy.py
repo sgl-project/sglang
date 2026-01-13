@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp_in_seq_split
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -78,6 +78,7 @@ class CacheAgnosticPolicy(Enum):
     LOF = "lof"  # longest output first
     RANDOM = "random"
     SEL = "sel"  # shortest extend length first
+    ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
 
 
 class SchedulePolicy:
@@ -105,7 +106,9 @@ class SchedulePolicy:
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
-    def calc_priority(self, waiting_queue: List[Req]) -> bool:
+    def calc_priority(
+        self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
+    ) -> bool:
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
@@ -140,6 +143,9 @@ class SchedulePolicy:
                 )
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
+            elif policy == CacheAgnosticPolicy.ROUTING_KEY:
+                if running_batch is not None:
+                    SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
             elif policy == CacheAgnosticPolicy.SEL:
                 SchedulePolicy._sort_by_shortest_extend_length(
                     waiting_queue, self.sel_length_ratio, self.sel_waiting_time_ratio
@@ -396,7 +402,7 @@ class PrefillAdder:
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp_in_seq_split()
         self.prefill_max_requests = prefill_max_requests
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
