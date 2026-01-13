@@ -12,10 +12,8 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -35,9 +33,15 @@ class WhisperAttention(torch.nn.Module):
         is_encoder=False,
     ):
         super().__init__()
+        self.total_num_heads = num_heads
         head_dim = embed_dim // num_heads
         self.is_cross_attention = is_cross_attention
         self.is_encoder = is_encoder
+
+        # Get tensor parallel size for head partitioning
+        tp_size = get_tensor_model_parallel_world_size()
+        assert num_heads % tp_size == 0, f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
+        self.num_heads = num_heads // tp_size  # TP-divided num_heads for RadixAttention
 
         if (head_dim * num_heads) != embed_dim:
             raise ValueError(
@@ -46,12 +50,24 @@ class WhisperAttention(torch.nn.Module):
             )
         self.scaling = head_dim**-0.5
 
+        # Store head_dim and kv_size for cross-attention forward pass
+        self.head_dim = head_dim
+        self.kv_size = self.num_heads * head_dim  # TP-divided kv_size
+        
         if is_cross_attention:
+            # For cross-attention: Q comes from decoder, K/V come from encoder
             self.q_proj = ColumnParallelLinear(
                 embed_dim, embed_dim, quant_config=quant_config
             )
-            self.kv_proj = ColumnParallelLinear(
-                embed_dim, 2 * embed_dim, quant_config=quant_config
+            # Use QKVParallelLinear for KV with total_num_heads=0 (no Q)
+            # This allows proper weight loading with shard_id
+            self.kv_proj = QKVParallelLinear(
+                hidden_size=embed_dim,
+                head_size=head_dim,
+                total_num_heads=0,  # No Q heads in this projection
+                total_num_kv_heads=num_heads,  # K and V heads
+                bias=bias,
+                quant_config=quant_config,
             )
         else:
             self.qkv_proj = QKVParallelLinear(
@@ -60,11 +76,12 @@ class WhisperAttention(torch.nn.Module):
         self.out_proj = RowParallelLinear(
             embed_dim, embed_dim, bias=bias, quant_config=quant_config
         )
+        # Pass TP-divided num_heads to RadixAttention
         self.attn = RadixAttention(
-            num_heads,
+            self.num_heads,
             head_dim,
             scaling=1.0,
-            num_kv_heads=num_heads,
+            num_kv_heads=self.num_heads,
             layer_id=layer_id,
             quant_config=quant_config,
             is_cross_attention=is_cross_attention,
@@ -87,7 +104,8 @@ class WhisperAttention(torch.nn.Module):
             # cross_hidden_states should always be provided (from encoder cache)
             if cross_hidden_states is not None:
                 kv, _ = self.kv_proj(cross_hidden_states)
-                k, v = kv.chunk(chunks=2, dim=-1)
+                # Split KV into K and V using kv_size (TP-aware)
+                k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
             else:
                 # Fallback for warmup or missing encoder outputs
                 k = torch.zeros_like(q)
@@ -162,9 +180,9 @@ class WhisperAttention(torch.nn.Module):
             # Compute output: (num_heads, q_len, kv_len) @ (num_heads, kv_len, head_dim)
             attn_output = torch.bmm(attn_weights, v)  # (num_heads, q_len, head_dim)
 
-            # Transpose back: (num_heads, q_len, head_dim) -> (q_len, num_heads, head_dim)
+            # Transpose back: [num_heads, q_len, head_dim] -> [q_len, num_heads, head_dim]
             attn_output = attn_output.transpose(0, 1)
-            attn_output = attn_output.reshape(-1, num_heads * head_dim)
+            attn_output = attn_output.reshape(q_len, num_heads * head_dim)
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.chunk(chunks=3, dim=-1)
@@ -224,7 +242,7 @@ class WhisperEncoderLayer(torch.nn.Module):
 
         self.self_attn = WhisperAttention(
             embed_dim=self.embed_dim,
-            num_heads=config.decoder_attention_heads,
+            num_heads=config.encoder_attention_heads,
             layer_id=layer_id,
             quant_config=quant_config,
             is_encoder=True,
@@ -368,7 +386,8 @@ class WhisperEncoder(torch.nn.Module):
             embed_dim, embed_dim, kernel_size=3, stride=2, padding=1
         )
 
-        self.embed_positions = VocabParallelEmbedding(
+        # Use regular nn.Embedding for positional embeddings (not sharded across TP)
+        self.embed_positions = torch.nn.Embedding(
             config.max_source_positions, embed_dim
         )
 
@@ -410,8 +429,12 @@ class WhisperDecoder(torch.nn.Module):
         self.max_source_positions = config.max_source_positions
         self.embed_scale = config.d_model**-0.5 if config.scale_embedding else 1.0
 
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.d_model)
-        self.embed_positions = VocabParallelEmbedding(
+        # Use regular nn.Embedding for token and position embeddings (not sharded across TP)
+        # This matches vLLM's approach where embeddings are replicated across TP ranks
+        self.embed_tokens = torch.nn.Embedding(
+            config.vocab_size, config.d_model, padding_idx=config.pad_token_id
+        )
+        self.embed_positions = torch.nn.Embedding(
             self.max_target_positions, config.d_model
         )
 
@@ -431,7 +454,6 @@ class WhisperDecoder(torch.nn.Module):
         forward_batch: ForwardBatch,
         position_ids=None,
     ):
-
         inputs_embeds = self.embed_tokens(input_ids)
 
         # embed positions
@@ -472,47 +494,47 @@ class WhisperForConditionalGeneration(torch.nn.Module):
             (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
             (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
             (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
+            # Cross-attention K/V projections
+            (".encoder_attn.kv_proj", ".encoder_attn.k_proj", "k"),
+            (".encoder_attn.kv_proj", ".encoder_attn.v_proj", "v"),
         ]
 
         params_dict = dict(self.named_parameters())
 
         weights_dict = dict(weights)
+        
+        # Create fake zeros bias for k_proj in cross-attention (Whisper has no k_proj bias)
         for layer_idx in range(self.config.decoder_layers):
             layer_prefix = f"model.decoder.layers.{layer_idx}.encoder_attn."
-
-            v_proj_weight = weights_dict[layer_prefix + "v_proj.weight"]
-            v_proj_bias = weights_dict[layer_prefix + "v_proj.bias"]
-
-            k_proj_weight = weights_dict[layer_prefix + "k_proj.weight"]
-
-            del (
-                weights_dict[layer_prefix + "v_proj.weight"],
-                weights_dict[layer_prefix + "v_proj.bias"],
-                weights_dict[layer_prefix + "k_proj.weight"],
-            )
-            k_proj_bias = torch.zeros_like(v_proj_bias)
-
-            weights_dict[f"decoder.layers.{layer_idx}.encoder_attn.kv_proj.weight"] = (
-                torch.cat([k_proj_weight, v_proj_weight], dim=0)
-            )
-            weights_dict[f"decoder.layers.{layer_idx}.encoder_attn.kv_proj.bias"] = (
-                torch.cat([k_proj_bias, v_proj_bias], dim=0)
-            )
+            k_proj_key = layer_prefix + "k_proj.weight"
+            if k_proj_key in weights_dict:
+                k_proj_weight = weights_dict[k_proj_key]
+                bias_key = layer_prefix + "k_proj.bias"
+                if bias_key not in weights_dict:
+                    weights_dict[bias_key] = torch.zeros(k_proj_weight.size(0))
+        
+        # Tie proj_out weights to embed_tokens
         weights_dict["proj_out.weight"] = weights_dict[
             "model.decoder.embed_tokens.weight"
         ]
 
         for name, loaded_weight in weights_dict.items():
             name = name.replace("model.", "")
+            
+            # Handle stacked params (qkv_proj and kv_proj)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                if name not in params_dict:
+                    break
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -583,6 +605,7 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                     features = features.unsqueeze(0)
 
                 # Compute encoder output length from features
+                # After conv1 (stride 1) and conv2 (stride 2), the length is halved
                 encoder_len = features.shape[-1] // 2
                 encoder_position_ids = torch.arange(encoder_len).to(
                     features.device, non_blocking=True
