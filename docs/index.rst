@@ -100,6 +100,7 @@ Its core features include:
    developer_guide/development_guide_using_docker.md
    developer_guide/benchmark_and_profiling.md
    developer_guide/bench_serving.md
+   developer_guide/post_training_integration.md
 
 .. toctree::
    :maxdepth: 1
