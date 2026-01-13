@@ -8,19 +8,19 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
+**/build/
+**/develop-eggs/
+**/dist/
+**/downloads/
+**/eggs/
 .eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
+**/lib/
+**/lib64/
+**/parts/
+**/sdist/
+**/var/
+**/wheels/
+**/share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -261,3 +261,8 @@ outputs/
 
 # setuptools-scm generated version file
 python/sglang/_version.py
+
+# Generated protobuf files (regenerate during wheel build or with compile_proto.py)
+python/sglang/srt/grpc/*_pb2.py
+python/sglang/srt/grpc/*_pb2_grpc.py
+python/sglang/srt/grpc/*_pb2.pyi

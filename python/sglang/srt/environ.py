@@ -163,6 +163,8 @@ class Envs:
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
+    SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
+    SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
 
     # SGLang CI
     SGLANG_IS_IN_CI = EnvBool(False)
@@ -173,6 +175,7 @@ class Envs:
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
     SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
+    SGLANG_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     IS_BLACKWELL = EnvBool(False)
@@ -224,6 +227,7 @@ class Envs:
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(30)
+    SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
 
     # Test: pd-disaggregation
@@ -323,6 +327,10 @@ class Envs:
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
 
+    # NSA Backend
+    SGLANG_NSA_FUSE_TOPK = EnvBool(True)
+    SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
@@ -373,6 +381,8 @@ class Envs:
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
+    SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
@@ -415,6 +425,12 @@ class Envs:
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+
+    # Tokenizer
+    SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
+
+    # TokenizerManager
+    SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
     # fmt: on
 
@@ -475,6 +491,18 @@ _warn_deprecated_env_to_cli_flag(
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
     "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
+    "Please use '--enable-prefill-delayer' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES",
+    "Please use '--prefill-delayer-max-delay-passes' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK",
+    "Please use '--prefill-delayer-token-usage-low-watermark' instead.",
 )
 
 

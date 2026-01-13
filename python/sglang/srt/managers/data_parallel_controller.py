@@ -16,17 +16,14 @@
 import faulthandler
 import logging
 import multiprocessing as mp
-import pickle
 import signal
 import threading
 import time
-from collections import deque
 from enum import Enum, auto
 from typing import Callable, List, Optional
 
 import psutil
 import setproctitle
-import torch
 import zmq
 
 from sglang.srt.environ import envs
@@ -39,6 +36,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, RequestStage
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
@@ -73,8 +71,8 @@ class LoadBalanceMethod(Enum):
 
     ROUND_ROBIN = auto()
     FOLLOW_BOOTSTRAP_ROOM = auto()
-    SHORTEST_QUEUE = auto()
-    MINIMUM_TOKENS = auto()
+    TOTAL_REQUESTS = auto()
+    TOTAL_TOKENS = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -87,63 +85,31 @@ class LoadBalanceMethod(Enum):
 
 class DPBudget:
     def __init__(self, dp_size: int):
-        # TODO: support minimum tokens method
-        self.budget_queue = deque()
         self.dp_size = dp_size
-        self.ts_tic = 0.0
-        self.pending_loads = {}
-        # Set time window to 2ms
-        self.tic_window = 0.002
-        self.update_budget_count = 0
-        self.update_interval = envs.SGLANG_DATA_PARALLEL_BUDGET_INTERVAL.get()
+        self.total_requests = [0] * dp_size
+        self.total_tokens = [0] * dp_size
 
     def update_budget(self, load_update: WatchLoadUpdateReq):
-        """Update the budget queue."""
-        # Update budget queue together for load updating from the same round.
+        """Update the budget."""
         for load in load_update.loads:
-            if abs(load.ts_tic - self.ts_tic) > self.tic_window:
-                logger.debug(f"Proceed to next round: {self.ts_tic=} {load.ts_tic=}")
-                self.pending_loads.clear()
-                self.ts_tic = load.ts_tic
-            self.pending_loads[load.dp_rank] = load
+            self.total_requests[load.dp_rank] = load.num_reqs
+            self.total_tokens[load.dp_rank] = load.num_tokens
 
-        if len(self.pending_loads) < self.dp_size:
-            logger.debug(f"Waiting for all DP ranks: {len(self.pending_loads)=}")
-            return
-
-        self.update_budget_count = (self.update_budget_count + 1) % self.update_interval
-        if self.update_budget_count:
-            return
-
-        # Ready to update budget_queue.
-        self.budget_queue.clear()
-        num_reqs = [0] * self.dp_size
-        for dp_rank, load in self.pending_loads.items():
-            num_reqs[dp_rank] = load.num_reqs
-        if not num_reqs:
-            return
-
-        max_num_reqs = max(num_reqs)
-        if all(x == max_num_reqs for x in num_reqs):
-            return
-
-        while any(x != num_reqs[0] for x in num_reqs):
-            min_load = min(num_reqs)
-            min_indices = [
-                dp_rank for dp_rank, x in enumerate(num_reqs) if x == min_load
-            ]
-            second_min_load = min(x for x in num_reqs if x > min_load)
-            self.budget_queue.extend(
-                [dp_rank for dp_rank in min_indices] * (second_min_load - min_load)
+    def dispatch(self, method: LoadBalanceMethod):
+        if method == LoadBalanceMethod.TOTAL_REQUESTS:
+            target_rank = self.total_requests.index(min(self.total_requests))
+        elif method == LoadBalanceMethod.TOTAL_TOKENS:
+            # Use total_requests as a tie-breaker when total_tokens are equal
+            target_rank = min(
+                range(self.dp_size),
+                key=lambda i: (self.total_tokens[i], self.total_requests[i]),
             )
-            for idx in min_indices:
-                num_reqs[idx] = second_min_load
+        else:
+            return None
 
-    def dispatch(self):
-        if not self.budget_queue:
-            self.budget_queue.extend(range(self.dp_size))
-
-        return self.budget_queue.popleft()
+        # Increment the load of that worker by one as a heuristic
+        self.total_requests[target_rank] += 1
+        return target_rank
 
 
 class DataParallelController:
@@ -178,8 +144,8 @@ class DataParallelController:
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
-            LoadBalanceMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
-            LoadBalanceMethod.MINIMUM_TOKENS: self.minimum_tokens_scheduler,
+            LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
+            LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
 
@@ -209,16 +175,17 @@ class DataParallelController:
             test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
         )
 
+        if server_args.enable_metrics:
+            start_cpu_monitor_thread("data_parallel_controller")
+
     def send_to_all_workers(self, obj):
-        msg = [b"NORM", pickle.dumps(obj)]
         for worker in self.workers:
-            worker.send_multipart(msg, copy=False)
+            worker.send_pyobj(obj)
 
     def send_control_message(self, obj):
-        msg = [b"NORM", pickle.dumps(obj)]
         # Send control messages to first worker of tp group
         for worker in self.workers[:: self.control_message_step]:
-            worker.send_multipart(msg, copy=False)
+            worker.send_pyobj(obj)
 
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
@@ -503,9 +470,8 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.data_parallel_rank is not None:
-            msg = [b"NORM", pickle.dumps(req)]
             logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
-            self.workers[req.data_parallel_rank].send_multipart(msg, copy=False)
+            self.workers[req.data_parallel_rank].send_pyobj(req)
             return True
         return False
 
@@ -513,8 +479,7 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        msg = [b"NORM", pickle.dumps(req)]
-        self.workers[self.round_robin_counter].send_multipart(msg, copy=False)
+        self.workers[self.round_robin_counter].send_pyobj(req)
         self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
 
     def follow_bootstrap_room_scheduler(self, req: Req):
@@ -536,116 +501,26 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        msg = [b"NORM", pickle.dumps(req)]
-        self.workers[target_rank].send_multipart(msg, copy=False)
+        self.workers[target_rank].send_pyobj(req)
 
-    def shortest_queue_scheduler(self, req):
+    def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch()
-        if target_worker is None:
-            if self.server_args.disaggregation_mode == "null":
-                self.round_robin_scheduler(req)
-            else:
-                self.follow_bootstrap_room_scheduler(req)
-        else:
-            msg = [b"NORM", pickle.dumps(req)]
-            self.workers[target_worker].send_multipart(msg, copy=False)
+        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        self.workers[target_worker].send_pyobj(req)
 
-    def minimum_tokens_scheduler(self, req):
+    def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-
-        logger.warning(
-            "The 'minimum_tokens' load balancing method is deprecated for now and will introduced later."
-            "Fall back to 'round_robin_scheduler'"
-        )
-        if self.server_args.disaggregation_mode == "null":
-            self.round_robin_scheduler(req)
-        else:
-            self.follow_bootstrap_room_scheduler(req)
-
-    def _parse_multipart_message(self, parts):
-        # Check message type
-        msg_type = bytes(parts[0])
-
-        if msg_type == b"NORM":
-            # Normal message
-            recv_req = pickle.loads(parts[1])
-
-        elif msg_type == b"FEAT":
-            # Message with optimized feature tensors
-            recv_req = pickle.loads(parts[1])
-            feature_infos = pickle.loads(parts[2])
-
-            # Reconstruct tensors
-            for i, feature_info in enumerate(feature_infos):
-                buffer_idx = 3 + i
-                buffer = (
-                    parts[buffer_idx].buffer
-                    if hasattr(parts[buffer_idx], "buffer")
-                    else parts[buffer_idx]
-                )
-
-                dtype = feature_info["dtype"]
-                shape = feature_info["shape"]
-                tensor = torch.frombuffer(buffer, dtype=dtype).reshape(shape)
-
-                idx = feature_info["idx"]
-                if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
-                    mm_items = recv_req.mm_inputs.get("mm_items", [])
-                    if idx < len(mm_items):
-                        mm_items[idx].feature = tensor
-        else:
-            logger.warning(f"Unknown message type: {msg_type}")
-        return recv_req
-
-    def _parse_multipart_message(self, parts):
-        # Check message type
-        msg_type = bytes(parts[0])
-
-        if msg_type == b"NORM":
-            # Normal message
-            recv_req = pickle.loads(parts[1])
-
-        elif msg_type == b"FEAT":
-            # Message with optimized feature tensors
-            recv_req = pickle.loads(parts[1])
-            feature_infos = pickle.loads(parts[2])
-
-            # Reconstruct tensors
-            for i, feature_info in enumerate(feature_infos):
-                buffer_idx = 3 + i
-                buffer = (
-                    parts[buffer_idx].buffer
-                    if hasattr(parts[buffer_idx], "buffer")
-                    else parts[buffer_idx]
-                )
-
-                dtype = feature_info["dtype"]
-                shape = feature_info["shape"]
-                tensor = torch.frombuffer(buffer, dtype=dtype).reshape(shape)
-
-                idx = feature_info["idx"]
-                if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
-                    mm_items = recv_req.mm_inputs.get("mm_items", [])
-                    if idx < len(mm_items):
-                        mm_items[idx].feature = tensor
-        else:
-            logger.warning(f"Unknown message type: {msg_type}")
-        return recv_req
+        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS)
+        self.workers[target_worker].send_pyobj(req)
 
     def event_loop(self):
         while True:
             while True:
                 self.soft_watchdog.feed()
                 try:
-                    parts = self.recv_from_tokenizer.recv_multipart(
-                        flags=zmq.NOBLOCK, copy=False
-                    )
-                    if not parts:
-                        break
-                    recv_req = self._parse_multipart_message(parts)
+                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
