@@ -47,5 +47,5 @@ It learns from [Copybara](https://github.com/google/copybara), a tool used at Go
                 default=ServerArgs.private_flag,
             )
     ```
-- Similarly, you can inherit `Engine` and override `launch_subprocesses_func`, `server_args_class`.
-- You can pass your own subprocesses launch functions to `launch_server.py::launch_server`
+- Similarly, you can inherit `Engine` and override its fields. You can override `server_args_class` to use your own ServerArgs,
+  override `init_tokenizer_manager_func` to use your own TokenizerManager, override `run_scheduler_process_func` to use your own scheduler.
