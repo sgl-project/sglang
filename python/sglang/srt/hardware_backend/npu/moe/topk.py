@@ -5,6 +5,7 @@ from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.layers.moe.topk import StandardTopKOutput, select_experts
 
 if TYPE_CHECKING:
@@ -18,6 +19,7 @@ def fused_topk_npu(
     topk_config: "TopKConfig",
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
+    layer_id: Optional[int] = None,
 ) -> "TopKOutput":
 
     use_grouped_topk = topk_config.use_grouped_topk
@@ -53,6 +55,10 @@ def fused_topk_npu(
                 1 if renormalize else topk_config.routed_scaling_factor
             ),
             eps=float(1e-20),
+        )
+        get_global_experts_capturer().capture(
+            layer_id=layer_id,
+            topk_ids=topk_ids,
         )
 
     else:
