@@ -478,10 +478,6 @@ class DenoisingStage(PipelineStage):
         """
         Prepare all necessary invariant variables for the denoising loop.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
         Returns:
             A dictionary containing all the prepared variables for the denoising loop.
         """
@@ -940,13 +936,6 @@ class DenoisingStage(PipelineStage):
     ) -> Req:
         """
         Run the denoising loop.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with denoised latents.
         """
         # Prepare variables for the denoising loop
 
@@ -1127,13 +1116,6 @@ class DenoisingStage(PipelineStage):
     ) -> tqdm:
         """
         Create a progress bar for the denoising process.
-
-        Args:
-            iterable: The iterable to iterate over.
-            total: The total number of items.
-
-        Returns:
-            A tqdm progress bar.
         """
         local_rank = get_world_group().local_rank
         disable = local_rank != 0
@@ -1176,11 +1158,6 @@ class DenoisingStage(PipelineStage):
 
         Args:
             i: The current timestep index.
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The attention metadata, or None if not applicable.
         """
         attn_metadata = None
         self.attn_metadata_builder = None
@@ -1375,10 +1352,6 @@ class DenoisingStage(PipelineStage):
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """
         Prepare Sliding Tile Attention (STA) parameters and settings.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
         """
         # TODO(kevin): STA mask search, currently only support Wan2.1 with 69x768x1280
         STA_mode = server_args.STA_mode
