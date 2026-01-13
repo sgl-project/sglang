@@ -6,7 +6,7 @@ Handles merging of YAML configuration files with command-line arguments.
 import argparse
 import logging
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 import yaml
 
@@ -53,28 +53,38 @@ class ConfigArgumentMerger:
                 msg = f"Unsupported config option '{key_norm}' with action '{action.__class__.__name__}'"
                 raise ValueError(msg)
 
-            if key_norm in dest_map:
-                action = dest_map[key_norm]
-                if action.choices and value not in action.choices:
-                    raise ValueError(
-                        f"Invalid value for '{key}': {value}. Allowed choices: {action.choices}"
-                    )
+            if key_norm not in dest_map:
+                logger.warning(
+                    f"Unknown config option '{key}' will be ignored. "
+                    f"Check if the option name is correct."
+                )
+                continue
 
-                # Validate store_true actions accept only boolean values
-                if key_norm in self.store_true_actions and not isinstance(value, bool):
-                    raise ValueError(
-                        f"Invalid value for '{key}': {value}. Expected boolean (true/false), got {type(value).__name__}"
-                    )
-                # Apply type conversion if action.type is defined
-                elif action.type is not None and callable(action.type):
-                    try:
-                        value = action.type(value)
-                    except (ValueError, TypeError, argparse.ArgumentTypeError) as e:
-                        raise ValueError(
-                            f"Invalid value for '{key}': {value}. Type conversion failed: {e}"
-                        ) from e
+            action = dest_map[key_norm]
 
-                parsed_config[action.dest] = value
+            if action.choices and value not in action.choices:
+                raise ValueError(
+                    f"Invalid value for '{key}': {value}. Allowed choices: {action.choices}"
+                )
+            # Validate store_true actions accept only boolean values
+            if key_norm in self.store_true_actions and not isinstance(value, bool):
+                raise ValueError(
+                    f"Invalid value for '{key}': {value}. Expected boolean (true/false), got {type(value).__name__}"
+                )
+            # Apply type conversion if action.type is defined
+            elif action.type is not None and callable(action.type):
+                try:
+                    # Handle nargs: apply type conversion to each list element
+                    if action.nargs is not None and isinstance(value, list):
+                        value = [self._convert_value(v, action.type) for v in value]
+                    else:
+                        value = self._convert_value(value, action.type)
+                except (ValueError, TypeError, argparse.ArgumentTypeError) as e:
+                    raise ValueError(
+                        f"Invalid value for '{key}': {value}. Type conversion failed: {e}"
+                    ) from e
+
+            parsed_config[action.dest] = value
 
         return parsed_config
 
@@ -146,3 +156,31 @@ class ConfigArgumentMerger:
 
         if not path.exists():
             raise ValueError(f"Config file not found: {file_path}")
+
+    def _convert_value(self, value: Any, type_func: Callable) -> Any:
+        """
+        Convert a value using the specified type function.
+
+        Handles special cases:
+        - None: pass through without conversion
+        - Already correct type: skip redundant conversion for basic types
+        - JSON type functions: skip if value is already dict/list from YAML
+        """
+        # Skip conversion for None values (YAML null)
+        if value is None:
+            return None
+
+        # Skip conversion if value already has the expected type (for basic types)
+        if type_func in (int, float, str) and isinstance(value, type_func):
+            return value
+
+        # Handle JSON type functions (json.loads, json_list_type, etc.)
+        # YAML already parses the value to dict/list, no need to re-parse
+        type_func_name = getattr(type_func, "__name__", "")
+        if type_func_name in ("loads", "json_list_type") and isinstance(
+            value, (dict, list)
+        ):
+            return value
+
+        # Apply type conversion
+        return type_func(value)

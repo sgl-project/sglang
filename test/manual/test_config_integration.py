@@ -349,7 +349,8 @@ class TestEdgeCases:
         """Test config file with list values."""
         config_data = {
             "model-path": "microsoft/DialoGPT-medium",
-            "encoder-urls": ["url1", "url2"],
+            "log-requests": True,
+            "log-requests-target": ["path1", "path2"],
         }
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
@@ -360,7 +361,7 @@ class TestEdgeCases:
             argv = ["--config", config_file]
             server_args = prepare_server_args(argv)
 
-            assert server_args.encoder_urls == ["url1", "url2"]
+            assert server_args.log_requests_target == ["path1", "path2"]
         finally:
             os.unlink(config_file)
 
@@ -507,6 +508,65 @@ class TestTypeValidation:
         try:
             cli_args = ["--config", config_file]
             parsed_config = merger.parse_config(cli_args)
+            assert parsed_config["mem_fraction_static"] == 0.85
+            assert isinstance(parsed_config["mem_fraction_static"], float)
+        finally:
+            os.unlink(config_file)
+
+    def test_null_value_passthrough(self, merger):
+        """Test that null/None values pass through without conversion."""
+        config_data = {
+            "model-path": "test-model",
+            "quantization-param-path": None,  # null in YAML
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            cli_args = ["--config", config_file]
+            parsed_config = merger.parse_config(cli_args)
+            assert parsed_config["quantization_param_path"] is None
+        finally:
+            os.unlink(config_file)
+
+    def test_dict_value_skips_json_conversion(self, merger):
+        """Test that dict values from YAML skip json.loads conversion."""
+        config_data = {
+            "model-path": "test-model",
+            "mm-process-config": {"image": {"resize": 224}},  # Already parsed dict
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            cli_args = ["--config", config_file]
+            parsed_config = merger.parse_config(cli_args)
+            assert parsed_config["mm_process_config"] == {"image": {"resize": 224}}
+            assert isinstance(parsed_config["mm_process_config"], dict)
+        finally:
+            os.unlink(config_file)
+
+    def test_type_already_matched_skips_conversion(self, merger):
+        """Test that values already matching the target type skip conversion."""
+        config_data = {
+            "model-path": "test-model",
+            "port": 30000,  # Already int from YAML
+            "mem-fraction-static": 0.85,  # Already float from YAML
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config_data, f)
+            config_file = f.name
+
+        try:
+            cli_args = ["--config", config_file]
+            parsed_config = merger.parse_config(cli_args)
+            assert parsed_config["port"] == 30000
+            assert isinstance(parsed_config["port"], int)
             assert parsed_config["mem_fraction_static"] == 0.85
             assert isinstance(parsed_config["mem_fraction_static"], float)
         finally:
