@@ -6,6 +6,8 @@ from typing import Any, Dict
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -15,9 +17,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
-# Import from turbo_layer
-from ..turbo_layer import _attention, get_block_map
-
 
 class SparseLinearAttentionBackend(AttentionBackend):
     """Sparse Linear Attention Backend for efficient attention computation."""
@@ -26,7 +25,7 @@ class SparseLinearAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        return [64, 128]
+        return [32, 64, 96, 128, 160, 192, 224, 256]
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
@@ -188,41 +187,33 @@ class SparseLinearAttentionImpl(AttentionImpl):
     def _get_feature_map(self, feature_map_type: str):
         """Get feature map function based on type."""
         if feature_map_type == "elu":
-
-            def elu_feature_map(x):
-                return F.elu(x) + 1
-
-            return elu_feature_map
+            return self._elu_feature_map
         elif feature_map_type == "relu":
             return torch.nn.ReLU()
         elif feature_map_type == "softmax":
-
-            def softmax_feature_map(x):
-                return F.softmax(x, dim=-1)
-
-            return softmax_feature_map
+            return self._softmax_feature_map
         else:
             raise NotImplementedError(f"Not supported feature map {feature_map_type}.")
 
     def forward(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
         attn_metadata: SparseLinearAttentionMetadata,
     ) -> torch.Tensor:
         """Forward pass for sparse linear attention.
 
         Args:
-            query: query tensor of shape (B, H, L, D)
-            key: key tensor of shape (B, H, L, D)
-            value: value tensor of shape (B, H, L, D)
+            q: query tensor of shape (B, H, L, D)
+            k: key tensor of shape (B, H, L, D)
+            v: value tensor of shape (B, H, L, D)
             attn_metadata: attention metadata containing configuration
 
         Returns:
             output tensor of shape (B, H, L, D)
         """
-        dtype = query.dtype
+        dtype = q.dtype
 
         # Get configuration from metadata
         topk_ratio = attn_metadata.topk
@@ -236,9 +227,9 @@ class SparseLinearAttentionImpl(AttentionImpl):
         compute_dtype = torch.bfloat16 if use_bf16 else torch.float16
 
         # Transpose for computation
-        q = query.transpose(1, 2).contiguous()
-        k = key.transpose(1, 2).contiguous()
-        v = value.transpose(1, 2).contiguous()
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
 
         # Get sparse attention map
         sparse_map, lut, real_topk = get_block_map(
@@ -262,18 +253,10 @@ class SparseLinearAttentionImpl(AttentionImpl):
         )
 
         # Apply feature maps
-        q_feat = feature_map_q(q).contiguous().to(compute_dtype)
-        k_feat = feature_map_k(k).contiguous().to(compute_dtype)
-
+        q = feature_map_q(q).contiguous().to(compute_dtype)  # c_q
+        k = feature_map_k(k).contiguous().to(compute_dtype)  # c_k
         # Linear attention computation
-        def calc_linear(q_linear, k_linear, v_linear):
-            kvsum = k_linear.transpose(-1, -2) @ v_linear
-            ksum = torch.sum(k_linear, dim=-2, keepdim=True)
-            return (q_linear @ kvsum) / (
-                1e-5 + (q_linear * ksum).sum(dim=-1, keepdim=True)
-            )
-
-        o_l = calc_linear(q_feat, k_feat, v)
+        o_l = self._torch_calc_linear(q, k, v)
 
         # Apply projection and combine results
         with torch.amp.autocast("cuda", dtype=compute_dtype):
@@ -283,3 +266,182 @@ class SparseLinearAttentionImpl(AttentionImpl):
         output = (o_s + o_l).to(dtype).transpose(1, 2)
 
         return output
+
+    def _torch_calc_linear(self, q, k, v):
+        kv = torch.matmul(k.transpose(-1, -2), v)
+        k_sum = torch.sum(k, dim=-2, keepdim=True)
+        return torch.matmul(q, kv) / (1e-5 + torch.matmul(q, k_sum.transpose(-1, -2)))
+
+    def _softmax_feature_map(self, x):
+        return F.softmax(x, dim=-1)
+
+    def _elu_feature_map(self, x):
+        return F.elu(x) + 1
+
+
+class _attention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, k_block_id, lut, topk, BLOCK_M, BLOCK_N, qk_scale=None):
+        assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+        assert k_block_id.is_contiguous() and lut.is_contiguous()
+
+        # We recommend the following two settings
+        assert BLOCK_M == 64 or BLOCK_M == 128
+        assert BLOCK_N == 64
+
+        B, H, L, D = q.shape
+        if qk_scale is None:
+            qk_scale = D**-0.5
+
+        M_BLOCKS = triton.cdiv(L, BLOCK_M)
+
+        o_s = torch.empty_like(v)
+        lse = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
+
+        grid = (M_BLOCKS, B * H)
+        _attn_fwd[grid](
+            q,
+            k,
+            v,
+            qk_scale,
+            topk,
+            lut,
+            lse,
+            o_s,
+            L,
+            M_BLOCKS,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            num_warps=4 if q.shape[-1] == 64 else 8,
+            num_stages=3,
+        )
+
+        ctx.save_for_backward(q, k, v, k_block_id, lut, lse, o_s)
+        ctx.qk_scale = qk_scale
+        ctx.topk = topk
+        ctx.BLOCK_M = BLOCK_M
+        ctx.BLOCK_N = BLOCK_N
+        return o_s
+
+
+def get_block_map(q, k, topk_ratio, BLKQ=64, BLKK=64):
+    arg_k = k - torch.mean(
+        k, dim=-2, keepdim=True
+    )  # smooth-k technique in SageAttention
+    pooled_qblocks = mean_pool(q, BLKQ)
+    pooled_kblocks = mean_pool(arg_k, BLKK)
+    pooled_score = pooled_qblocks @ pooled_kblocks.transpose(-1, -2)
+
+    K = pooled_score.shape[-1]
+    topk = min(K, int(topk_ratio * K))
+    lut = torch.topk(pooled_score, topk, dim=-1, sorted=False).indices
+
+    sparse_map = torch.zeros_like(pooled_score, dtype=torch.int8)
+    sparse_map.scatter_(-1, lut, 1)
+    return sparse_map, lut, topk
+
+
+def mean_pool(x, BLK):
+    assert x.is_contiguous()
+
+    B, H, L, D = x.shape
+    L_BLOCKS = (L + BLK - 1) // BLK
+    x_mean = torch.empty((B, H, L_BLOCKS, D), device=x.device, dtype=x.dtype)
+
+    grid = (L_BLOCKS, B * H)
+    compress_kernel[grid](x, x_mean, L, D, BLK)
+    return x_mean
+
+
+@triton.jit
+def compress_kernel(
+    X,
+    XM,
+    L: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+):
+    idx_l = tl.program_id(0)
+    idx_bh = tl.program_id(1)
+
+    offs_l = idx_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    offs_d = tl.arange(0, D)
+
+    x_offset = idx_bh * L * D
+    xm_offset = idx_bh * ((L + BLOCK_L - 1) // BLOCK_L) * D
+    x = tl.load(
+        X + x_offset + offs_l[:, None] * D + offs_d[None, :], mask=offs_l[:, None] < L
+    )
+
+    nx = min(BLOCK_L, L - idx_l * BLOCK_L)
+    x_mean = tl.sum(x, axis=0, dtype=tl.float32) / nx
+    tl.store(XM + xm_offset + idx_l * D + offs_d, x_mean.to(XM.dtype.element_ty))
+
+
+@triton.jit
+def _attn_fwd(
+    Q,
+    K,
+    V,
+    qk_scale: tl.constexpr,
+    topk: tl.constexpr,
+    LUT,
+    LSE,
+    OS,
+    L: tl.constexpr,
+    M_BLOCKS: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    idx_m = tl.program_id(0).to(tl.int64)
+    idx_bh = tl.program_id(1).to(tl.int64)
+
+    qkv_offset = idx_bh * L * D
+    lut_offset = (idx_bh * M_BLOCKS + idx_m) * topk
+    lse_offset = idx_bh * L
+    offs_m = idx_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+
+    Q_ptrs = Q + qkv_offset + offs_m[:, None] * D + offs_d[None, :]
+    K_ptrs = K + qkv_offset + offs_n[None, :] * D + offs_d[:, None]
+    V_ptrs = V + qkv_offset + offs_n[:, None] * D + offs_d[None, :]
+    OS_ptrs = OS + qkv_offset + offs_m[:, None] * D + offs_d[None, :]
+    LUT_ptr = LUT + lut_offset
+    LSE_ptrs = LSE + lse_offset + offs_m
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    o_s = tl.zeros([BLOCK_M, D], dtype=tl.float32)
+
+    q = tl.load(Q_ptrs, mask=offs_m[:, None] < L)
+    for block_idx in tl.range(topk):
+        idx_n = tl.load(LUT_ptr + block_idx)
+        n_mask = offs_n < L - idx_n * BLOCK_N
+
+        k = tl.load(K_ptrs + idx_n * BLOCK_N * D, mask=n_mask[None, :])
+        qk = tl.dot(q, k) * (qk_scale * 1.4426950408889634)  # = 1 / ln(2)
+        if L - idx_n * BLOCK_N < BLOCK_N:
+            qk = tl.where(n_mask[None, :], qk, float("-inf"))
+
+        v = tl.load(V_ptrs + idx_n * BLOCK_N * D, mask=n_mask[:, None])
+        local_m = tl.max(qk, 1)
+        new_m = tl.maximum(m_i, local_m)
+        qk = qk - new_m[:, None]
+
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+        alpha = tl.math.exp2(m_i - new_m)
+        o_s = o_s * alpha[:, None]
+        o_s += tl.dot(p.to(v.dtype), v)
+
+        l_i = l_i * alpha + l_ij
+        m_i = new_m
+
+    o_s = o_s / l_i[:, None]
+    tl.store(OS_ptrs, o_s.to(OS.type.element_ty), mask=offs_m[:, None] < L)
+
+    m_i += tl.math.log2(l_i)
+    tl.store(LSE_ptrs, m_i, mask=offs_m < L)
