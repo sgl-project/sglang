@@ -387,7 +387,7 @@ def get_quant_config(
         raise ValueError(f"Cannot find the config file for {model_config['quantization_config']['quant_method']}")
     if len(quant_config_files) > 1:
         raise ValueError(
-            f"Found multiple config files for {model_config.quantization}: "
+            f"Found multiple config files for {model_config['quantization_config']['quant_method']}: "
             f"{quant_config_files}"
         )
 
