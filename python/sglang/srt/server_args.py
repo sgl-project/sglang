@@ -328,7 +328,7 @@ class ServerArgs:
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
-    watchdog_timeout: float = 300
+    watchdog_timeout: float = 300000000
     soft_watchdog_timeout: Optional[float] = None
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
@@ -2217,6 +2217,13 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
+            
+        if self.speculative_algorithm == "LLGUIDANCE":
+            # llguidance must be used as grammar backend
+            assert self.grammar_backend == "llguidance", (
+                "When using LLGuidance fast-forward tokens decoding, "
+                "please set grammar_backend to 'llguidance'."
+            )
 
     def _handle_load_format(self):
         if (
