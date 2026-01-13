@@ -212,20 +212,7 @@ class NPUW8A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight_offset", w2_weight_offset)
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
 
-    def release_weight_cache(self, weight: torch.Tensor):
-        # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)
-        origin_weight = weight.data.transpose(1, 2)
-        new_weight = origin_weight.contiguous()
-        origin_weight.untyped_storage().resize_(0)
-        return new_weight
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        weight_data = self.release_weight_cache(layer.w13_weight.data)
-        layer.w13_weight = torch.nn.Parameter(weight_data, requires_grad=False)
-
-        weight_data = self.release_weight_cache(layer.w2_weight.data)
-        layer.w2_weight = torch.nn.Parameter(weight_data, requires_grad=False)
-
         layer.w13_weight_scale = torch.nn.Parameter(
             layer.w13_weight_scale.data.squeeze(-1).contiguous().to(torch.float32),
             requires_grad=False,
