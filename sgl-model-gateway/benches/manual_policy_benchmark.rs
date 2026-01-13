@@ -7,6 +7,10 @@ use smg::{
 };
 use tokio::runtime::Runtime;
 
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
 fn create_workers(count: usize) -> Vec<Arc<dyn Worker>> {
     (0..count)
         .map(|i| {
@@ -43,6 +47,10 @@ fn warmup_keys(rt: &Runtime, policy: &ManualPolicy, workers: &[Arc<dyn Worker>],
 fn gen_keys(count: usize, prefix: &str) -> Vec<String> {
     (0..count).map(|i| format!("{}{}", prefix, i)).collect()
 }
+
+// ============================================================================
+// Benchmarks
+// ============================================================================
 
 fn bench_fast_path_hit(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
@@ -224,6 +232,7 @@ fn bench_comparison_baseline(c: &mut Criterion) {
     let mut group = c.benchmark_group("manual_policy/vs_baseline");
     let workers = create_workers(16);
 
+    // Baseline: raw random selection without any policy overhead
     group.bench_function("raw_random", |b| {
         let mut rng = rand::rng();
         b.iter(|| black_box(rng.random_range(0..workers.len())));
