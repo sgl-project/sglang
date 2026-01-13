@@ -36,7 +36,7 @@ class RouterArgs:
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
     max_idle_secs: int = 4 * 3600
-    assignment_mode: str = "random"
+    assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
@@ -315,8 +315,8 @@ class RouterArgs:
             f"--{prefix}assignment-mode",
             type=str,
             default=RouterArgs.assignment_mode,
-            choices=["random", "min_load"],
-            help="Mode for assigning new routing keys in manual policy: random (default), min_load (worker with fewest requests)",
+            choices=["random", "min_load", "min_group"],
+            help="Mode for assigning new routing keys in manual policy: random (default), min_load (worker with fewest requests), min_group (worker with fewest routing keys)",
         )
         routing_group.add_argument(
             f"--{prefix}max-payload-size",
