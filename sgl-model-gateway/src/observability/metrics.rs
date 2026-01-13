@@ -916,6 +916,16 @@ impl Metrics {
         .set(count as f64);
     }
 
+    /// Set active routing keys per worker
+    pub fn set_worker_routing_keys_active(worker: &str, count: usize) {
+        let worker_interned = intern_string(worker);
+        gauge!(
+            "smg_worker_routing_keys_active",
+            "worker" => worker_interned
+        )
+        .set(count as f64);
+    }
+
     /// Set worker health status
     pub fn set_worker_health(worker_url: &str, healthy: bool) {
         let worker_interned = intern_string(worker_url);

@@ -35,6 +35,9 @@ struct StepTracker {
     failed: HashSet<StepId>,
     skipped: HashSet<StepId>,
     running: HashSet<StepId>,
+    /// Steps waiting for delay/scheduled_at: maps step INDEX to ready time
+    /// Using index instead of StepId for O(w) iteration in the main loop
+    waiting_until: HashMap<usize, std::time::Instant>,
 }
 
 impl StepTracker {
@@ -42,21 +45,58 @@ impl StepTracker {
         self.completed.len() + self.failed.len() + self.skipped.len()
     }
 
-    fn is_step_processable(&self, step_id: &StepId) -> bool {
+    fn is_step_processable(&self, step_id: &StepId, step_idx: usize) -> bool {
         !self.completed.contains(step_id)
             && !self.failed.contains(step_id)
             && !self.skipped.contains(step_id)
             && !self.running.contains(step_id)
+            && !self.waiting_until.contains_key(&step_idx)
     }
 
+    /// Get indices of waiting steps that are now ready to run - O(w) where w = waiting count
+    fn get_ready_waiting_indices(&self) -> Vec<usize> {
+        let now = std::time::Instant::now();
+        self.waiting_until
+            .iter()
+            .filter(|(_, &ready_at)| now >= ready_at)
+            .map(|(&idx, _)| idx)
+            .collect()
+    }
+
+    /// Mark a step as waiting until a specific time (by index)
+    fn set_waiting(&mut self, step_idx: usize, ready_at: std::time::Instant) {
+        self.waiting_until.insert(step_idx, ready_at);
+    }
+
+    /// Clear waiting status for a step (it's now ready to run)
+    fn clear_waiting(&mut self, step_idx: usize) {
+        self.waiting_until.remove(&step_idx);
+    }
+
+    /// Check if ALL dependencies are satisfied (completed or skipped)
     fn are_dependencies_satisfied(&self, depends_on: &[StepId]) -> bool {
         depends_on
             .iter()
             .all(|dep| self.completed.contains(dep) || self.skipped.contains(dep))
     }
 
+    /// Check if ANY dependency is satisfied (completed or skipped)
+    /// Returns true if the list is empty (no "any" dependencies)
+    fn is_any_dependency_satisfied(&self, depends_on_any: &[StepId]) -> bool {
+        depends_on_any.is_empty()
+            || depends_on_any
+                .iter()
+                .any(|dep| self.completed.contains(dep) || self.skipped.contains(dep))
+    }
+
+    /// Check if ANY dependency has failed (for depends_on - blocks if any fail)
     fn has_failed_dependency(&self, depends_on: &[StepId]) -> bool {
         depends_on.iter().any(|dep| self.failed.contains(dep))
+    }
+
+    /// Check if ALL dependencies have failed (for depends_on_any - blocks only if all fail)
+    fn have_all_any_deps_failed(&self, depends_on_any: &[StepId]) -> bool {
+        !depends_on_any.is_empty() && depends_on_any.iter().all(|dep| self.failed.contains(dep))
     }
 }
 
@@ -97,6 +137,23 @@ impl Backoff for LinearBackoff {
         let next = self.current;
         self.current = (self.current + self.increment).min(self.max);
         Some(next)
+    }
+}
+
+/// Enum-based backoff implementation to avoid heap allocation
+enum BackoffImpl {
+    Fixed(FixedBackoff),
+    Exponential(backoff::ExponentialBackoff),
+    Linear(LinearBackoff),
+}
+
+impl BackoffImpl {
+    fn next_backoff(&mut self) -> Option<Duration> {
+        match self {
+            BackoffImpl::Fixed(b) => b.next_backoff(),
+            BackoffImpl::Exponential(b) => b.next_backoff(),
+            BackoffImpl::Linear(b) => b.next_backoff(),
+        }
     }
 }
 
@@ -212,7 +269,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     /// to ensure all workflows are stopped. Note that this cancels workflows
     /// at the state level; running steps may still complete.
     pub async fn force_cancel_all(&self) -> usize {
-        let active_states = match self.state_store.list_active() {
+        let active_states = match self.state_store.list_active().await {
             Ok(states) => states,
             Err(e) => {
                 tracing::error!(error = ?e, "Failed to list active workflows for force cancel");
@@ -245,6 +302,35 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     /// Decrement active workflow count
     fn workflow_finished(&self) {
         self.active_workflows.fetch_sub(1, Ordering::Release);
+    }
+
+    /// Calculate how long a step needs to wait based on delay and/or scheduled_at.
+    /// Returns None if no waiting is needed.
+    fn calculate_wait_duration(step: &StepDefinition<D>) -> Option<Duration> {
+        let now = Utc::now();
+
+        // Calculate wait time for scheduled_at
+        let schedule_wait = step.scheduled_at.and_then(|scheduled_time| {
+            if now < scheduled_time {
+                (scheduled_time - now).to_std().ok()
+            } else {
+                // Scheduled time is in the past
+                tracing::debug!(
+                    step_id = %step.id,
+                    scheduled_time = %scheduled_time,
+                    "Step scheduled_at is in the past, proceeding immediately"
+                );
+                None
+            }
+        });
+
+        // Combine delay and schedule_wait (both apply if both are set)
+        match (step.delay, schedule_wait) {
+            (Some(delay), Some(schedule)) => Some(delay + schedule),
+            (Some(delay), None) => Some(delay),
+            (None, Some(schedule)) => Some(schedule),
+            (None, None) => None,
+        }
     }
 
     /// Create a guard that decrements active_workflows on drop.
@@ -287,7 +373,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        state_store.cleanup_old_workflows(ttl);
+                        state_store.cleanup_old_workflows(ttl).await;
                     }
                     _ = shutdown_rx.changed() => {
                         tracing::info!("Cleanup task stopping due to shutdown");
@@ -299,7 +385,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     }
 
     /// Register a workflow definition
-    pub fn register_workflow(&self, mut definition: WorkflowDefinition<D>) -> Result<(), String> {
+    #[must_use = "registration result should be checked"]
+    pub fn register_workflow(
+        &self,
+        mut definition: WorkflowDefinition<D>,
+    ) -> Result<(), super::definition::ValidationError> {
         // Validate DAG and build dependency graph once at registration
         definition.validate()?;
 
@@ -321,6 +411,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     /// Start a new workflow instance
     ///
     /// Returns `Err(WorkflowError::ShuttingDown)` if the engine is shutting down.
+    #[must_use = "workflow instance ID should be stored or awaited"]
     pub async fn start_workflow(
         &self,
         definition_id: WorkflowId,
@@ -351,7 +442,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 .insert(step.id.clone(), StepState::default());
         }
 
-        self.state_store.save(state)?;
+        self.state_store.save(state).await?;
 
         self.event_bus
             .publish(WorkflowEvent::WorkflowStarted {
@@ -399,29 +490,102 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             .collect();
 
         loop {
-            if self.state_store.is_cancelled(instance_id)? {
+            if self.state_store.is_cancelled(instance_id).await? {
                 self.event_bus
                     .publish(WorkflowEvent::WorkflowCancelled { instance_id })
                     .await;
                 return Ok(());
             }
 
-            // Find ready steps from pending_check (not all steps)
-            let (ready_step_indices, total_processed, running_count) = {
+            // Phase 0: Drain any pending completion signals to ensure dependents are added
+            // This prevents race conditions where tasks finish but their signals aren't processed
+            while let Ok((step_id, result)) = rx.try_recv() {
+                tracing::debug!(
+                    step_id = %step_id,
+                    result = ?result,
+                    "Step completed (startup drain)"
+                );
+                if matches!(result, StepResult::Success | StepResult::Skip) {
+                    for &dep_idx in definition.get_dependent_indices(&step_id) {
+                        pending_check.push_back(dep_idx);
+                    }
+                }
+            }
+
+            // Phase 1: Check waiting steps + deps-ready steps + blocked detection
+            // Single lock acquisition for all read operations
+            let (
+                newly_ready_from_wait,
+                deps_ready_indices,
+                total_processed,
+                current_running,
+                current_waiting,
+            ) = {
                 let t = tracker.read();
 
-                // Only check steps in pending_check, not all steps
-                let ready: Vec<usize> = pending_check
+                // O(w) iteration over waiting_until keys instead of O(n) over all steps
+                let wait_ready: Vec<usize> = t.get_ready_waiting_indices();
+
+                // Check pending_check for dependency-satisfied steps
+                let deps_ready: Vec<usize> = pending_check
                     .drain(..)
                     .filter(|&idx| {
                         let step = &definition.steps[idx];
-                        t.is_step_processable(&step.id)
+                        t.is_step_processable(&step.id, idx)
                             && t.are_dependencies_satisfied(&step.depends_on)
+                            && t.is_any_dependency_satisfied(&step.depends_on_any)
                             && !t.has_failed_dependency(&step.depends_on)
+                            && !t.have_all_any_deps_failed(&step.depends_on_any)
                     })
                     .collect();
 
-                (ready, t.total_processed(), t.running.len())
+                (
+                    wait_ready,
+                    deps_ready,
+                    t.total_processed(),
+                    t.running.len(),
+                    t.waiting_until.len(),
+                )
+            };
+
+            // Phase 2: Process waiting and deps-ready steps, update waiting_until
+            // Single write lock for all mutations
+            // Returns (ready_to_launch, steps_added_to_waiting)
+            let (ready_to_launch, steps_added_to_waiting) = {
+                let now = std::time::Instant::now();
+                let mut t = tracker.write();
+                let mut added_to_waiting = 0usize;
+
+                // Clear waiting status for ready steps
+                for &idx in &newly_ready_from_wait {
+                    t.clear_waiting(idx);
+                }
+
+                // Collect steps ready to launch
+                let mut ready = newly_ready_from_wait;
+
+                for idx in deps_ready_indices {
+                    let step = &definition.steps[idx];
+                    let wait_duration = Self::calculate_wait_duration(step);
+
+                    if let Some(duration) = wait_duration {
+                        if duration > Duration::ZERO {
+                            // Step needs to wait - add to waiting_until
+                            let ready_at = now + duration;
+                            tracing::debug!(
+                                step_id = %step.id,
+                                wait_ms = duration.as_millis(),
+                                "Step waiting for delay/schedule"
+                            );
+                            t.set_waiting(idx, ready_at);
+                            added_to_waiting += 1;
+                            continue;
+                        }
+                    }
+                    ready.push(idx);
+                }
+
+                (ready, added_to_waiting)
             };
 
             // Check if we're done
@@ -429,36 +593,52 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 break;
             }
 
-            // Handle blocked workflow (no ready steps, none running, but work remains)
-            if ready_step_indices.is_empty() && running_count == 0 && pending_check.is_empty() {
+            // Handle blocked workflow (no ready steps, none running/waiting, but work remains)
+            // Use current_running/current_waiting from Phase 1, adjusted for Phase 2 changes.
+            // current_running may be stale-high (tasks completed since), but that's safe -
+            // we'd just do an extra loop iteration. current_waiting needs adjustment for
+            // steps we just added to waiting in Phase 2.
+            let effective_waiting = current_waiting + steps_added_to_waiting;
+            if ready_to_launch.is_empty()
+                && current_running == 0
+                && effective_waiting == 0
+                && pending_check.is_empty()
+            {
                 let failed_step = tracker.read().failed.iter().next().cloned();
-                let error_message = if failed_step.is_some() {
-                    "Workflow failed due to step dependency failure".to_string()
+                // Use &'static str to avoid allocation in common error paths
+                let error_message: &'static str = if failed_step.is_some() {
+                    "Workflow failed due to step dependency failure"
                 } else {
-                    "Workflow deadlocked: no steps ready and none running. This may indicate a scheduler bug.".to_string()
+                    "Workflow deadlocked: no steps ready and none running"
                 };
 
-                self.state_store.update(instance_id, |s| {
-                    s.status = WorkflowStatus::Failed;
-                })?;
+                self.state_store
+                    .update(instance_id, |s| {
+                        s.status = WorkflowStatus::Failed;
+                    })
+                    .await?;
                 self.event_bus
                     .publish(WorkflowEvent::WorkflowFailed {
                         instance_id,
                         failed_step: failed_step
                             .unwrap_or_else(|| StepId::new("internal_scheduler")),
-                        error: error_message,
+                        error: error_message.to_string(),
                     })
                     .await;
                 return Ok(());
             }
 
             // Launch ready steps in parallel
-            let mut tasks_launched = 0;
-            for step_idx in ready_step_indices {
-                let step = &definition.steps[step_idx];
-                tracker.write().running.insert(step.id.clone());
-                tasks_launched += 1;
+            let tasks_launched = ready_to_launch.len();
+            if tasks_launched > 0 {
+                let mut t = tracker.write();
+                for &idx in &ready_to_launch {
+                    t.running.insert(definition.steps[idx].id.clone());
+                }
+            }
 
+            for step_idx in ready_to_launch {
+                let step = &definition.steps[step_idx];
                 let engine = self.clone_for_execution();
                 let def = Arc::clone(&definition);
                 let step_id = step.id.clone();
@@ -467,6 +647,76 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
                 tokio::spawn(async move {
                     let step = &def.steps[step_idx];
+
+                    // Evaluate run_if condition if present
+                    if let Some(ref condition) = step.run_if {
+                        match engine.state_store.get_context(instance_id).await {
+                            Ok(ctx) => {
+                                if !condition(&ctx) {
+                                    // Condition is false - skip this step
+                                    tracing::debug!(
+                                        step_id = %step_id,
+                                        "Step skipped due to run_if condition"
+                                    );
+
+                                    // Update tracker and send skip signal
+                                    {
+                                        let mut t = tracker.write();
+                                        t.running.remove(&step_id);
+                                        t.skipped.insert(step_id.clone());
+                                    }
+
+                                    // Update state store
+                                    let _ = engine
+                                        .state_store
+                                        .update(instance_id, |s| {
+                                            if let Some(step_state) =
+                                                s.step_states.get_mut(&step_id)
+                                            {
+                                                step_state.status = StepStatus::Skipped;
+                                            }
+                                        })
+                                        .await;
+
+                                    // Send skip signal
+                                    let _ = tx.try_send((step_id, StepResult::Skip));
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                // Failed to get context - fail the step rather than proceeding blindly
+                                tracing::error!(
+                                    step_id = %step_id,
+                                    error = ?e,
+                                    "Failed to get context for run_if evaluation, failing step"
+                                );
+
+                                // Update tracker
+                                {
+                                    let mut t = tracker.write();
+                                    t.running.remove(&step_id);
+                                    t.failed.insert(step_id.clone());
+                                }
+
+                                // Update state store
+                                let _ = engine
+                                    .state_store
+                                    .update(instance_id, |s| {
+                                        if let Some(step_state) = s.step_states.get_mut(&step_id) {
+                                            step_state.status = StepStatus::Failed;
+                                            step_state.last_error =
+                                                Some(format!("run_if context error: {e}"));
+                                        }
+                                    })
+                                    .await;
+
+                                // Send failure signal
+                                let _ = tx.try_send((step_id, StepResult::Failure));
+                                return;
+                            }
+                        }
+                    }
+
                     let result = engine
                         .execute_step_with_retry(instance_id, step, &def)
                         .await;
@@ -476,37 +726,31 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                         Err(_) => StepResult::Failure,
                     };
 
-                    {
+                    // Track whether we need to update state to Skipped after releasing lock
+                    let needs_skip_update = {
                         let mut t = tracker.write();
                         t.running.remove(&step_id);
 
-                        match result {
+                        let needs_update = match result {
                             Ok(StepResult::Success) => {
                                 t.completed.insert(step_id.clone());
+                                false
                             }
                             Ok(StepResult::Skip) => {
                                 t.skipped.insert(step_id.clone());
+                                false
                             }
                             Ok(StepResult::Failure) | Err(_) => match step.on_failure {
                                 FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => {
                                     t.failed.insert(step_id.clone());
+                                    false
                                 }
                                 FailureAction::ContinueNextStep => {
-                                    if let Err(e) = engine.state_store.update(instance_id, |s| {
-                                        if let Some(step_state) = s.step_states.get_mut(&step_id) {
-                                            step_state.status = StepStatus::Skipped;
-                                        }
-                                    }) {
-                                        tracing::warn!(
-                                            step_id = %step_id,
-                                            error = ?e,
-                                            "Failed to update step state to Skipped"
-                                        );
-                                    }
                                     t.skipped.insert(step_id.clone());
+                                    true // Need to update state store after releasing lock
                                 }
                             },
-                        }
+                        };
 
                         if let Err(e) = tx.try_send((step_id.clone(), signal)) {
                             use mpsc::error::TrySendError;
@@ -525,12 +769,42 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                                 }
                             }
                         }
+
+                        needs_update
+                    };
+
+                    // Perform async state update after releasing the tracker lock
+                    if needs_skip_update {
+                        if let Err(e) = engine
+                            .state_store
+                            .update(instance_id, |s| {
+                                if let Some(step_state) = s.step_states.get_mut(&step_id) {
+                                    step_state.status = StepStatus::Skipped;
+                                }
+                            })
+                            .await
+                        {
+                            tracing::warn!(
+                                step_id = %step_id,
+                                error = ?e,
+                                "Failed to update step state to Skipped"
+                            );
+                        }
                     }
                 });
             }
 
-            let should_wait = tasks_launched > 0 || !tracker.read().running.is_empty();
-            if should_wait {
+            // Single lock read for both checks
+            let (has_running, has_waiting) = {
+                let t = tracker.read();
+                (
+                    tasks_launched > 0 || !t.running.is_empty(),
+                    !t.waiting_until.is_empty(),
+                )
+            };
+
+            if has_running {
+                // Wait for a step to complete; Phase 0 will drain any others
                 if let Some((completed_step_id, result)) = rx.recv().await {
                     tracing::debug!(
                         step_id = %completed_step_id,
@@ -546,6 +820,28 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                         }
                     }
                 }
+            } else if has_waiting {
+                // No running tasks, but some steps are waiting for their delay/schedule
+                // Calculate how long to sleep based on the soonest waiting step
+                let sleep_duration = {
+                    let t = tracker.read();
+                    let now = std::time::Instant::now();
+                    t.waiting_until
+                        .values()
+                        .filter_map(|&ready_at| {
+                            if ready_at > now {
+                                Some(ready_at - now)
+                            } else {
+                                None
+                            }
+                        })
+                        .min()
+                        .unwrap_or(Duration::from_millis(10))
+                };
+
+                // Sleep until the next step is ready (with a cap to allow cancellation checks)
+                let capped_sleep = sleep_duration.min(Duration::from_millis(100));
+                tokio::time::sleep(capped_sleep).await;
             }
         }
 
@@ -555,20 +851,24 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         };
 
         if let Some(ref step) = failed_step {
-            self.state_store.update(instance_id, |s| {
-                s.status = WorkflowStatus::Failed;
-            })?;
+            self.state_store
+                .update(instance_id, |s| {
+                    s.status = WorkflowStatus::Failed;
+                })
+                .await?;
             self.event_bus
                 .publish(WorkflowEvent::WorkflowFailed {
                     instance_id,
                     failed_step: step.clone(),
-                    error: "One or more steps failed".to_string(),
+                    error: "One or more steps failed".into(),
                 })
                 .await;
         } else {
-            self.state_store.update(instance_id, |s| {
-                s.status = WorkflowStatus::Completed;
-            })?;
+            self.state_store
+                .update(instance_id, |s| {
+                    s.status = WorkflowStatus::Completed;
+                })
+                .await?;
 
             let duration = start_time.elapsed();
             self.event_bus
@@ -602,23 +902,25 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let mut backoff = Self::create_backoff(&retry_policy.backoff);
 
         loop {
-            if self.state_store.is_cancelled(instance_id)? {
+            if self.state_store.is_cancelled(instance_id).await? {
                 return Err(WorkflowError::Cancelled(instance_id));
             }
 
             // Update step state
-            self.state_store.update(instance_id, |s| {
-                s.current_step = Some(step.id.clone());
-                if let Some(step_state) = s.step_states.get_mut(&step.id) {
-                    step_state.status = if attempt == 1 {
-                        StepStatus::Running
-                    } else {
-                        StepStatus::Retrying
-                    };
-                    step_state.attempt = attempt;
-                    step_state.started_at = Some(Utc::now());
-                }
-            })?;
+            self.state_store
+                .update(instance_id, |s| {
+                    s.current_step = Some(step.id.clone());
+                    if let Some(step_state) = s.step_states.get_mut(&step.id) {
+                        step_state.status = if attempt == 1 {
+                            StepStatus::Running
+                        } else {
+                            StepStatus::Retrying
+                        };
+                        step_state.attempt = attempt;
+                        step_state.started_at = Some(Utc::now());
+                    }
+                })
+                .await?;
 
             // Emit step started event
             self.event_bus
@@ -629,7 +931,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 })
                 .await;
 
-            let mut context = self.state_store.get_context(instance_id)?;
+            let mut context = self.state_store.get_context(instance_id).await?;
 
             // Execute step with timeout
             let step_start = std::time::Instant::now();
@@ -637,19 +939,23 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
             let step_duration = step_start.elapsed();
 
-            self.state_store.update(instance_id, |s| {
-                s.context = context.clone();
-            })?;
+            self.state_store
+                .update(instance_id, |s| {
+                    s.context = context.clone();
+                })
+                .await?;
 
             match result {
                 Ok(Ok(StepResult::Success)) => {
                     // Step succeeded
-                    self.state_store.update(instance_id, |s| {
-                        if let Some(step_state) = s.step_states.get_mut(&step.id) {
-                            step_state.status = StepStatus::Succeeded;
-                            step_state.completed_at = Some(Utc::now());
-                        }
-                    })?;
+                    self.state_store
+                        .update(instance_id, |s| {
+                            if let Some(step_state) = s.step_states.get_mut(&step.id) {
+                                step_state.status = StepStatus::Succeeded;
+                                step_state.completed_at = Some(Utc::now());
+                            }
+                        })
+                        .await?;
 
                     self.event_bus
                         .publish(WorkflowEvent::StepSucceeded {
@@ -686,19 +992,21 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     let will_retry = should_retry && attempt < max_attempts;
 
                     // Update step state
-                    self.state_store.update(instance_id, |s| {
-                        if let Some(step_state) = s.step_states.get_mut(&step.id) {
-                            step_state.status = if will_retry {
-                                StepStatus::Retrying
-                            } else {
-                                StepStatus::Failed
-                            };
-                            step_state.last_error = Some(error_msg.clone());
-                            if !will_retry {
-                                step_state.completed_at = Some(Utc::now());
+                    self.state_store
+                        .update(instance_id, |s| {
+                            if let Some(step_state) = s.step_states.get_mut(&step.id) {
+                                step_state.status = if will_retry {
+                                    StepStatus::Retrying
+                                } else {
+                                    StepStatus::Failed
+                                };
+                                step_state.last_error = Some(error_msg.clone());
+                                if !will_retry {
+                                    step_state.completed_at = Some(Utc::now());
+                                }
                             }
-                        }
-                    })?;
+                        })
+                        .await?;
 
                     // Emit step failed event
                     self.event_bus
@@ -746,28 +1054,30 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         }
     }
 
-    fn create_backoff(strategy: &BackoffStrategy) -> Box<dyn Backoff + Send> {
+    fn create_backoff(strategy: &BackoffStrategy) -> BackoffImpl {
         match strategy {
-            BackoffStrategy::Fixed(duration) => Box::new(FixedBackoff(*duration)),
+            BackoffStrategy::Fixed(duration) => BackoffImpl::Fixed(FixedBackoff(*duration)),
             BackoffStrategy::Exponential { base, max } => {
                 let backoff = ExponentialBackoffBuilder::new()
                     .with_initial_interval(*base)
                     .with_max_interval(*max)
                     .with_max_elapsed_time(None)
                     .build();
-                Box::new(backoff)
+                BackoffImpl::Exponential(backoff)
             }
             BackoffStrategy::Linear { increment, max } => {
-                Box::new(LinearBackoff::new(*increment, *max))
+                BackoffImpl::Linear(LinearBackoff::new(*increment, *max))
             }
         }
     }
 
     /// Cancel a running workflow
     pub async fn cancel_workflow(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<()> {
-        self.state_store.update(instance_id, |s| {
-            s.status = WorkflowStatus::Cancelled;
-        })?;
+        self.state_store
+            .update(instance_id, |s| {
+                s.status = WorkflowStatus::Cancelled;
+            })
+            .await?;
 
         self.event_bus
             .publish(WorkflowEvent::WorkflowCancelled { instance_id })
@@ -777,8 +1087,11 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
     }
 
     /// Get workflow status
-    pub fn get_status(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<WorkflowState<D>> {
-        self.state_store.load(instance_id)
+    pub async fn get_status(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> WorkflowResult<WorkflowState<D>> {
+        self.state_store.load(instance_id).await
     }
 
     /// Wait for a workflow to complete with adaptive polling
@@ -807,6 +1120,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
 
             let state = self
                 .get_status(instance_id)
+                .await
                 .map_err(|e| format!("Failed to get workflow status: {:?}", e))?;
 
             let result = match state.status {
@@ -835,7 +1149,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 }
             };
 
-            self.state_store.cleanup_if_terminal(instance_id);
+            self.state_store.cleanup_if_terminal(instance_id).await;
             return result;
         }
     }

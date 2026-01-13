@@ -264,7 +264,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     schema=key_string, any_whitespace=self.any_whitespace
                 )
 
-        except (RuntimeError, json.decoder.JSONDecodeError) as e:
+        except (RuntimeError, json.decoder.JSONDecodeError, UnicodeDecodeError) as e:
             logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))
