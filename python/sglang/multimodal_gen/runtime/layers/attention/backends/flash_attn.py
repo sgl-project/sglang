@@ -3,12 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import Any, List, Optional, Tuple
 
 import torch
 
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.srt.utils.custom_op import register_custom_op
 
 try:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -18,6 +19,135 @@ try:
     flash_attn_func = flash_attn_varlen_func
 except ImportError as e:
     raise e
+
+
+def maybe_contiguous(x):
+    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def flash_attn_varlen_func_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    qv: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    window_size: Optional[List[int]] = None,
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    sm_margin: int = 0,
+    return_softmax_lse: bool = False,
+    sinks: Optional[torch.Tensor] = None,
+    ver: int = 4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert ver == 4, "only support flash attention v4"
+    q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+    num_head, head_dim = q.shape[-2:]
+    if cu_seqlens_q is None:
+        batch_size, seqlen_q = q.shape[:2]
+        total_q = batch_size * seqlen_q
+    else:
+        batch_size = cu_seqlens_q.shape[0] - 1
+        seqlen_q = None
+        total_q = q.shape[0]
+    head_dim_v = v.shape[-1]
+    if cu_seqlens_q is not None:
+        assert cu_seqlens_q.shape == (
+            batch_size + 1,
+        ), "cu_seqlens_q must have shape (batch_size + 1,)"
+        assert cu_seqlens_q.dtype == torch.int32, "cu_seqlens_q must be int32"
+        assert cu_seqlens_q.stride(0) == 1, "cu_seqlens_q must be contiguous"
+    assert q.dtype in [
+        torch.float16,
+        torch.bfloat16,
+    ], "inputs must be float16 or bfloat16"
+    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    assert head_dim <= 256, "head_dim must be less than or equal to 256"
+    alignment = 16 // q.element_size()
+    assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
+
+    q_batch_seqlen_shape = (
+        (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
+    )
+    lse_shape = (
+        (batch_size, num_head, seqlen_q)
+        if cu_seqlens_q is None
+        else (num_head, total_q)
+    )
+    out = q.new_empty(*q_batch_seqlen_shape, num_head, head_dim_v)
+    lse = q.new_empty(lse_shape, dtype=torch.float32) if return_softmax_lse else None
+    return (out, lse) if return_softmax_lse else out
+
+
+@register_custom_op(fake_impl=flash_attn_varlen_func_fake)
+def flash_attn_varlen_func_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    qv: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    window_size: Optional[List[int]] = None,
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    sm_margin: int = 0,
+    return_softmax_lse: bool = False,
+    sinks: Optional[torch.Tensor] = None,
+    ver: int = 4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if window_size is None:
+        window_size = [-1, -1]
+    return flash_attn_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        page_table=page_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        qv=qv,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        window_size=tuple(window_size),
+        attention_chunk=attention_chunk,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        sm_margin=sm_margin,
+        return_softmax_lse=return_softmax_lse,
+        sinks=sinks,
+        ver=ver,
+    )
 
 
 try:
@@ -221,7 +351,14 @@ class FlashAttentionImpl(AttentionImpl):
                 return out.reshape(bsz, seqlen, nheads_q, -1), softmax_lse
             return out.reshape(bsz, seqlen, nheads_q, d)
 
-        output = flash_attn_func(
+        if fa_ver == 3:
+            flash_attn_op = flash_attn_func
+        elif fa_ver == 4:
+            flash_attn_op = flash_attn_varlen_func_op
+        else:
+            raise ValueError(f"flash attention version {fa_ver} is not supported.")
+
+        output = flash_attn_op(
             q=query,  # type: ignore[no-untyped-call]
             k=key,
             v=value,
