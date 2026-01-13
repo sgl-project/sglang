@@ -20,9 +20,9 @@ from sglang.test.simple_eval_common import (
     SingleEvalResult,
 )
 
-ALL_LANGUAGES = ["bn", "de", "en", "es", "fr", "ja", "ru", "sw", "te", "th", "zh"]
 LATIN_LANGUAGES = ["de", "en", "es", "fr", "sw"]
 NON_LATIN_LANGUAGES = ["bn", "ja", "ru", "te", "th", "zh"]
+ALL_LANGUAGES = ["bn", "de", "en", "es", "fr", "ja", "ru", "sw", "te", "th", "zh"]
 
 LANG_TO_FPATH = {
     "bn": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_bn.tsv",
