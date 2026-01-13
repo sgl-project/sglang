@@ -2,6 +2,7 @@
 # Adapted from vllm-ascend: https://github.com/vllm-project/vllm-ascend/blob/main/vllm_ascend/platform.py
 
 import os
+from typing import Any
 
 import torch
 
@@ -74,6 +75,28 @@ class NPUPlatformBase(Platform):
             " not found. Assuming no NVLink available."
         )
         return False
+
+    @classmethod
+    def get_available_gpu_memory(
+        cls,
+        device_id: int = 0,
+        distributed: bool = False,
+        empty_cache: bool = True,
+        cpu_group: Any = None,
+    ) -> float:
+        if empty_cache:
+            torch.npu.empty_cache()
+
+        free_gpu_memory, _ = torch.npu.mem_get_info(device_id)
+
+        if distributed:
+            import torch.distributed as dist
+
+            tensor = torch.tensor(free_gpu_memory, dtype=torch.float32, device="npu")
+            dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=cpu_group)
+            free_gpu_memory = float(tensor.item())
+
+        return free_gpu_memory / (1 << 30)
 
     @classmethod
     def log_warnings(cls) -> None:
