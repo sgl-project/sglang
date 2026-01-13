@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
 import numpy
 import torch
 
-from python.sglang.srt.utils.common import round_up_to_multiple
+from sglang.srt.utils.common import round_up_to_multiple
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 
 if TYPE_CHECKING:
