@@ -387,9 +387,11 @@ class ModelRunnerKVCacheMixin:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
 
-        # Initialize token_to_kv_pool
+        # Initialize token_to_kv_pool (skip if already provided, e.g., shared from target worker)
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        if self.server_args.attention_backend == "ascend":
+        if self.token_to_kv_pool is not None:
+            pass  # Use pre-existing token_to_kv_pool (shared from target worker)
+        elif self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,
