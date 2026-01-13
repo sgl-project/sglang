@@ -8,15 +8,7 @@ import numpy as np
 import PIL
 import torch
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.models import AutoencoderKL, GlmImageTransformer2DModel
-from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
-from transformers import (
-    ByT5Tokenizer,
-    GlmImageForConditionalGeneration,
-    GlmImageProcessor,
-    T5EncoderModel,
-)
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -137,13 +129,13 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
     def __init__(
         self,
-        tokenizer: ByT5Tokenizer,
-        processor: GlmImageProcessor,
-        text_encoder: T5EncoderModel,
-        vision_language_encoder: GlmImageForConditionalGeneration,
-        vae: AutoencoderKL,
-        transformer: GlmImageTransformer2DModel,
-        scheduler: FlowMatchEulerDiscreteScheduler,
+        tokenizer,
+        processor,
+        text_encoder,
+        vision_language_encoder,
+        vae,
+        transformer,
+        scheduler,
     ):
         super().__init__()
 
