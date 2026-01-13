@@ -8,25 +8,6 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
-    "per-commit-1-gpu": [
-        TestFile("test_evs.py", 20),
-        TestFile("test_external_models.py", 30),
-        TestFile("test_modelopt_loader.py", 11),
-        TestFile("test_utils_update_weights.py", 29),
-        TestFile("test_video_utils.py", 5),
-        TestFile("test_modelopt_export.py", 9),
-    ],
-    "per-commit-2-gpu": [
-        TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
-        TestFile("hicache/test_hicache_storage_file_backend.py", 200),
-        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
-        TestFile("models/test_kimi_linear_models.py", 90),
-        TestFile("models/test_nvidia_nemotron_nano_v2.py", 132),
-        TestFile("test_data_parallelism.py", 73),
-        TestFile("test_disaggregation_basic.py", 400),
-        TestFile("test_dp_attention.py", 350),
-        TestFile("test_load_weights_from_remote_instance.py", 72),
-    ],
     "per-commit-4-gpu": [
         TestFile("models/test_qwen3_next_models.py", 650),
         TestFile("test_gpt_oss_4gpu.py", 300),
@@ -60,11 +41,11 @@ suites = {
     # ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_deepseek_v3_cutedsl_4gpu.py", 1800),
+        TestFile("test_disaggregation_aarch64.py", 300),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
-        # TODO: Add it back after mooncake supports torch 2.9
-        # TestFile("ep/test_mooncake_ep_small.py", 450),
+        TestFile("ep/test_mooncake_ep_small.py", 660),
     ],
     "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 563),
@@ -88,6 +69,7 @@ suites = {
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
         TestFile("test_prefill_delayer.py"),
+        TestFile("test_fla_layernorm_guard.py"),
     ],
 }
 
@@ -103,11 +85,9 @@ suite_amd = {
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_bench_typebaseddispatcher.py", 10),
-        TestFile("test_external_models.py", 45),
         TestFile("test_rope_rocm.py", 3),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         TestFile("test_type_based_dispatcher.py", 10),
-        TestFile("test_video_utils.py", 8),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
         # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
@@ -115,11 +95,6 @@ suite_amd = {
         # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
-    ],
-    "per-commit-amd-mi35x": [],
-    "per-commit-2-gpu-amd": [
-        TestFile("test_data_parallelism.py", 73),
-        TestFile("test_load_weights_from_remote_instance.py", 72),
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
@@ -129,19 +104,11 @@ suite_amd = {
         TestFile("test_deepseek_v3_mtp.py", 275),
     ],
     "per-commit-8-gpu-amd-mi35x": [
-        TestFile("test_deepseek_r1_mxfp4_8gpu.py", 1800),
+        TestFile("test_deepseek_r1_mxfp4_8gpu.py", 3600),
     ],
-    "nightly-amd": [
-        TestFile("nightly/test_gsm8k_eval_amd.py"),
-    ],
-    # AMD VLM tests using MMMU benchmark (2-GPU runner)
-    "nightly-amd-vlm": [
-        TestFile("nightly/test_vlms_mmmu_eval_amd.py"),
-    ],
-    # AMD 8-GPU tests for base models using gsm8k completion benchmark
-    "nightly-amd-8-gpu": [
-        TestFile("nightly/test_gsm8k_completion_eval_amd.py"),
-    ],
+    # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
+    # have been migrated to test/registered/amd/nightly/ and are now managed
+    # by test/run_suite.py using the registry system.
 }
 
 # Add Intel Xeon tests
