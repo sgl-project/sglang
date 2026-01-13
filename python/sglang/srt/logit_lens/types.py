@@ -85,7 +85,11 @@ class LogitLensOutput:
         if self.final_top_token_ids is not None:
             result["final"] = {
                 "top_token_ids": self.final_top_token_ids.tolist(),
-                "top_probs": self.final_top_probs.tolist() if self.final_top_probs is not None else None,
+                "top_probs": (
+                    self.final_top_probs.tolist()
+                    if self.final_top_probs is not None
+                    else None
+                ),
             }
             if tokenizer is not None:
                 batch_tokens = []

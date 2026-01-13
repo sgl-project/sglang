@@ -19,4 +19,9 @@ from sglang.srt.logit_lens.extractor import (
 )
 from sglang.srt.logit_lens.types import LogitLensLayerResult, LogitLensOutput
 
-__all__ = ["LogitLensExtractor", "create_logit_lens_extractor", "LogitLensOutput", "LogitLensLayerResult"]
+__all__ = [
+    "LogitLensExtractor",
+    "create_logit_lens_extractor",
+    "LogitLensOutput",
+    "LogitLensLayerResult",
+]

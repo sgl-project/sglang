@@ -299,10 +299,11 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = PriorityStrategy()
         elif self.eviction_policy == "spectral":
             from sglang.srt.mem_cache.evict_policy import get_spectral_strategy_class
+
             SpectralEvictionStrategy = get_spectral_strategy_class()
             # Get spectral eviction parameters from params
-            retention_ratio = getattr(params, 'spectral_retention_ratio', 0.3)
-            spectral_weight = getattr(params, 'spectral_weight', 0.7)
+            retention_ratio = getattr(params, "spectral_retention_ratio", 0.3)
+            spectral_weight = getattr(params, "spectral_weight", 0.7)
             self.eviction_strategy: EvictionStrategy = SpectralEvictionStrategy(
                 retention_ratio=retention_ratio,
                 spectral_weight=spectral_weight,
@@ -480,7 +481,7 @@ class RadixCache(BasePrefixCache):
             )
 
             # Attach spectral metadata for spectral eviction
-            if self.eviction_policy == "spectral" and hasattr(req, 'attention_tokens'):
+            if self.eviction_policy == "spectral" and hasattr(req, "attention_tokens"):
                 self._attach_spectral_from_request(req)
         else:
             self.token_to_kv_pool_allocator.free(
@@ -697,7 +698,11 @@ class RadixCache(BasePrefixCache):
                 continue
 
             # Use the last token's fingerprint for this node
-            fp_idx = min(token_offset + node_len - 1, len(fingerprints) - 1) if fingerprints else -1
+            fp_idx = (
+                min(token_offset + node_len - 1, len(fingerprints) - 1)
+                if fingerprints
+                else -1
+            )
 
             if fingerprints and fp_idx >= 0 and fp_idx < len(fingerprints):
                 node.spectral_fingerprint = fingerprints[fp_idx]
@@ -715,7 +720,7 @@ class RadixCache(BasePrefixCache):
         This is called after cache_finished_req inserts the request into the tree.
         The attention_tokens contain fingerprint data collected during generation.
         """
-        attention_tokens = getattr(req, 'attention_tokens', [])
+        attention_tokens = getattr(req, "attention_tokens", [])
         if not attention_tokens:
             return
 
@@ -726,8 +731,8 @@ class RadixCache(BasePrefixCache):
         for token_info in attention_tokens:
             if isinstance(token_info, dict):
                 # Fingerprint mode returns dict with fingerprint and manifold
-                fp = token_info.get('fingerprint')
-                zone = token_info.get('manifold')
+                fp = token_info.get("fingerprint")
+                zone = token_info.get("manifold")
                 if fp is not None:
                     fingerprints.append(fp)
                 if zone is not None:
@@ -737,7 +742,7 @@ class RadixCache(BasePrefixCache):
             return
 
         # Attach to the request's last_node path
-        last_node = getattr(req, 'last_node', None)
+        last_node = getattr(req, "last_node", None)
         if last_node is not None:
             self.attach_spectral_metadata_to_path(
                 last_node,

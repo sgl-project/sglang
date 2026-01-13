@@ -486,12 +486,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_index, dtype=torch.int32, device=self.device
         )
         if self.enable_mamba_extra_buffer:
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                select_index
-            ] = torch.tensor(
-                mamba_ping_pong_track_buffer_list,
-                dtype=torch.int32,
-                device=self.device,
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+                torch.tensor(
+                    mamba_ping_pong_track_buffer_list,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             )
         return select_index
 
@@ -685,9 +685,7 @@ class MHATokenToKVPool(KVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim
-            if v_head_dim is not None
-            else head_dim
+            else v_head_dim if v_head_dim is not None else head_dim
         )
 
         self._create_buffers()
@@ -1623,9 +1621,9 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
                 self.store_dtype
             )
-            self.kv_scale_buffer[layer_id - self.start_layer][
-                loc
-            ] = cache_k_fp4_sf.view(self.store_dtype)
+            self.kv_scale_buffer[layer_id - self.start_layer][loc] = (
+                cache_k_fp4_sf.view(self.store_dtype)
+            )
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 

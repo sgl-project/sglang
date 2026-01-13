@@ -243,7 +243,9 @@ class LogitLensExtractor:
             probs = F.softmax(logits.float(), dim=-1)
 
             # Get top-k predictions
-            top_probs, top_ids = torch.topk(probs, k=min(top_k, probs.shape[-1]), dim=-1)
+            top_probs, top_ids = torch.topk(
+                probs, k=min(top_k, probs.shape[-1]), dim=-1
+            )
 
             # Compute entropy
             log_probs = F.log_softmax(logits.float(), dim=-1)

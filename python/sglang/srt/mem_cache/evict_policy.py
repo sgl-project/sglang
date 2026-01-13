@@ -56,5 +56,6 @@ def get_spectral_strategy_class():
     global _spectral_strategy_class
     if _spectral_strategy_class is None:
         from sglang.srt.mem_cache.spectral_eviction import SpectralEvictionStrategy
+
         _spectral_strategy_class = SpectralEvictionStrategy
     return _spectral_strategy_class

@@ -615,9 +615,9 @@ class ServerArgs:
     attention_capture_layers: str = (
         "last"  # "last", "auto", or comma-separated layer indices
     )
-    attention_capture_layer_id: Optional[
-        int
-    ] = None  # Specific layer ID to capture (overrides attention_capture_layers)
+    attention_capture_layer_id: Optional[int] = (
+        None  # Specific layer ID to capture (overrides attention_capture_layers)
+    )
     # Fingerprint mode: compute in-kernel histogram instead of exporting raw indices
     # Production mode - 64 bytes vs ~200KB per step, for high-throughput routing
     attention_fingerprint_mode: bool = False
@@ -659,12 +659,12 @@ class ServerArgs:
 
     # Multi-tenant guardrails for attention capture
     # Restricts who can use attention capture in shared/production environments
-    attention_capture_api_key: Optional[
-        str
-    ] = None  # If set, only requests with this key can use attention capture
-    attention_capture_allowed_origins: Optional[
-        str
-    ] = None  # Comma-separated origins allowed for attention capture (CORS)
+    attention_capture_api_key: Optional[str] = (
+        None  # If set, only requests with this key can use attention capture
+    )
+    attention_capture_allowed_origins: Optional[str] = (
+        None  # Comma-separated origins allowed for attention capture (CORS)
+    )
     attention_capture_max_concurrent: int = (
         0  # Max concurrent requests with attention capture (0 = unlimited)
     )
@@ -5311,10 +5311,8 @@ class ServerArgs:
         baseline_vit_hidden_size = 1024
 
         # weight params count
-        current_complexity_score = vit_num_layers * (vit_hidden_size ** 2)
-        baseline_complexity_score = baseline_vit_layers * (
-            baseline_vit_hidden_size ** 2
-        )
+        current_complexity_score = vit_num_layers * (vit_hidden_size**2)
+        baseline_complexity_score = baseline_vit_layers * (baseline_vit_hidden_size**2)
         complexity_ratio = (
             current_complexity_score / baseline_complexity_score
             if baseline_complexity_score > 0

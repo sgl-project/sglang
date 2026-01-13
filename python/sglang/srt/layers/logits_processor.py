@@ -77,10 +77,14 @@ class LogitsProcessorOutput:
     # Top-k attention token info for interpretability [batch, top_k] positions and scores
     attention_token_positions: Optional[torch.Tensor] = None
     attention_token_scores: Optional[torch.Tensor] = None
-    attention_layer_id: int = -1  # Which layer the attention came from (-1 = aggregated)
+    attention_layer_id: int = (
+        -1
+    )  # Which layer the attention came from (-1 = aggregated)
     # Raw attention logits and logsumexp for approximate probability calculation
     attention_topk_logits: Optional[torch.Tensor] = None  # [batch, top_k]
-    attention_logsumexp_candidates: Optional[torch.Tensor] = None  # [batch] (approx, from top chunks)
+    attention_logsumexp_candidates: Optional[torch.Tensor] = (
+        None  # [batch] (approx, from top chunks)
+    )
     # Multi-layer attention capture: dict of layer_id -> (positions, scores, logits, logsumexp)
     attention_multi_layer: Optional[Dict[int, tuple]] = None
     # In-kernel fingerprint: compressed attention pattern (20D feature vector)
@@ -446,13 +450,22 @@ class LogitsProcessor(nn.Module):
                     )
 
                 # Extract fingerprint if available (production mode)
-                if hasattr(logits_metadata, 'attention_fingerprint') and logits_metadata.attention_fingerprint is not None:
+                if (
+                    hasattr(logits_metadata, "attention_fingerprint")
+                    and logits_metadata.attention_fingerprint is not None
+                ):
                     attention_fingerprint = logits_metadata.attention_fingerprint
-                if hasattr(logits_metadata, 'attention_manifold') and logits_metadata.attention_manifold is not None:
+                if (
+                    hasattr(logits_metadata, "attention_manifold")
+                    and logits_metadata.attention_manifold is not None
+                ):
                     attention_manifold = logits_metadata.attention_manifold
 
             # Extract MoE routing buffer if captured
-            if logits_metadata.capture_moe_routing and logits_metadata.moe_routing_buffer:
+            if (
+                logits_metadata.capture_moe_routing
+                and logits_metadata.moe_routing_buffer
+            ):
                 moe_routing_buffer = logits_metadata.moe_routing_buffer
 
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)

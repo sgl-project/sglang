@@ -254,7 +254,11 @@ def _dispatch_auto_backend() -> Callable:
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
-    elif is_blackwell_supported() and not is_sm120_supported() and is_flashinfer_available():
+    elif (
+        is_blackwell_supported()
+        and not is_sm120_supported()
+        and is_flashinfer_available()
+    ):
         # Only use flashinfer for SM100, not SM120 (trtllm backend doesn't support SM120)
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
     elif _check_cutlass_block_fp8_hardware_support():
