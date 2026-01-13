@@ -106,6 +106,8 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if x.numel() == 0:
+            return x
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, **kwargs)
         if is_batch_invariant_mode_enabled():
