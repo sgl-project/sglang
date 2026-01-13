@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.utils import get_compute_dtype
 
 
@@ -221,10 +222,13 @@ class MinimalA2AAttnOp(DistributedAttention):
         self,
         num_heads: int,
         head_size: int,
+        attention_type: str,
         topk: float,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ):
         dtype = get_compute_dtype()
+        if attention_type == "sla":
+            get_global_server_args().attention_backend = "SLA_ATTN"
         attn_backend = get_attn_backend(
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
