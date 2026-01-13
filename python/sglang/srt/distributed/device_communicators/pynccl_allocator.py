@@ -39,7 +39,7 @@ const char*  ncclGetErrorString(ncclResult_t result);
 #define NCCLCHECK(cmd) do {                                               \
   ncclResult_t res = cmd;                                                 \
   if (res != ncclSuccess) {                                               \
-    printf("ERROR: NCCL symmetric memory allocation failed. Most likely out of device memory. '%s'\\n", \
+    fprintf(stderr, "ERROR: NCCL symmetric memory allocation failed. Most likely out of device memory. '%s'\\n", \
            ncclGetErrorString(res));                       \
     return NULL;                                                        \
   }                                                                       \
