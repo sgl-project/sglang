@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_MC: int = 3
     SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
+    SGLANG_CACHE_DIT_WARMUP_RESOLUTIONS_INIT_STEPS: int = 0
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
 
@@ -268,6 +269,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_CACHE_DIT_SCM_CACHE_BINS": _lazy_str("SGLANG_CACHE_DIT_SCM_CACHE_BINS"),
     # SCM policy: dynamic or static
     "SGLANG_CACHE_DIT_SCM_POLICY": _lazy_str("SGLANG_CACHE_DIT_SCM_POLICY", "dynamic"),
+    # warmup_resolutions init inference for cache dit
+    "SGLANG_CACHE_DIT_WARMUP_RESOLUTIONS_INIT_STEPS": _lazy_int(
+        "SGLANG_CACHE_DIT_WARMUP_RESOLUTIONS_INIT_STEPS", 0
+    ),
     # model loading
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"

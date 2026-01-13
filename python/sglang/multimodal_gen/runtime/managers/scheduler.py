@@ -10,7 +10,9 @@ from typing import Any, List
 
 import zmq
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -202,7 +204,21 @@ class Scheduler:
                         prompt="",
                         is_warmup=True,
                     )
-                req.extra["cache_dit_num_inference_steps"] = 4  # min step for cache dit
+                if envs.SGLANG_CACHE_DIT_ENABLED:
+                    sampling_params = self._get_sampling_params()
+                    cache_steps = (
+                        envs.SGLANG_CACHE_DIT_WARMUP_RESOLUTIONS_INIT_STEPS
+                        if envs.SGLANG_CACHE_DIT_WARMUP_RESOLUTIONS_INIT_STEPS > 0
+                        else sampling_params.num_inference_steps
+                    )
+                    if cache_steps is None or (
+                        cache_steps < 8 and cache_steps not in [4, 6]
+                    ):
+                        cache_steps = 4
+                        logger.warning(
+                            "cache_dit_num_inference_steps is not legal, automatically set to 4. please set the SGLANG_CACHE_DIT_WARMUP_RESOLUTIONS_INIT_STEPS additionally"
+                        )
+                    req.extra["cache_dit_num_inference_steps"] = cache_steps
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
@@ -403,3 +419,9 @@ class Scheduler:
         for pipe in self.result_pipes_from_slaves:
             results.append(pipe.recv())
         return results
+
+    def _get_sampling_params(self):
+        return SamplingParams.from_pretrained(self.server_args.model_path)
+
+    def _get_env_int(self, key: str):
+        os.getenv(key)
