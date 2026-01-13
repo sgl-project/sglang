@@ -220,21 +220,33 @@ def print_result(result: BenchmarkResult, baseline: Optional[BenchmarkResult] = 
     print(f"  Throughput: {result.tokens_per_sec:.1f} tok/s", end="")
 
     if baseline and baseline.tokens_per_sec > 0:
-        delta = (result.tokens_per_sec - baseline.tokens_per_sec) / baseline.tokens_per_sec * 100
+        delta = (
+            (result.tokens_per_sec - baseline.tokens_per_sec)
+            / baseline.tokens_per_sec
+            * 100
+        )
         print(f" ({delta:+.1f}% vs baseline)")
     else:
         print()
 
     print(f"  Latency p50: {result.p50_latency_ms:.1f} ms", end="")
     if baseline and baseline.p50_latency_ms > 0:
-        delta = (result.p50_latency_ms - baseline.p50_latency_ms) / baseline.p50_latency_ms * 100
+        delta = (
+            (result.p50_latency_ms - baseline.p50_latency_ms)
+            / baseline.p50_latency_ms
+            * 100
+        )
         print(f" ({delta:+.1f}%)")
     else:
         print()
 
     print(f"  Latency p99: {result.p99_latency_ms:.1f} ms", end="")
     if baseline and baseline.p99_latency_ms > 0:
-        delta = (result.p99_latency_ms - baseline.p99_latency_ms) / baseline.p99_latency_ms * 100
+        delta = (
+            (result.p99_latency_ms - baseline.p99_latency_ms)
+            / baseline.p99_latency_ms
+            * 100
+        )
         print(f" ({delta:+.1f}%)")
     else:
         print()
@@ -264,7 +276,15 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["baseline", "disabled", "fingerprint", "sketch", "raw", "all", "compare"],
+        choices=[
+            "baseline",
+            "disabled",
+            "fingerprint",
+            "sketch",
+            "raw",
+            "all",
+            "compare",
+        ],
         default="all",
         help="Benchmark mode(s) to run",
     )
@@ -382,8 +402,14 @@ def main():
             if mode in ("baseline", "disabled"):
                 continue
             if baseline.tokens_per_sec > 0:
-                overhead = (baseline.tokens_per_sec - result.tokens_per_sec) / baseline.tokens_per_sec * 100
-                print(f"{mode}: {result.tokens_per_sec:.1f} tok/s ({overhead:+.1f}% overhead)")
+                overhead = (
+                    (baseline.tokens_per_sec - result.tokens_per_sec)
+                    / baseline.tokens_per_sec
+                    * 100
+                )
+                print(
+                    f"{mode}: {result.tokens_per_sec:.1f} tok/s ({overhead:+.1f}% overhead)"
+                )
 
     # Regression check
     if "baseline" in results and "disabled" in results:
@@ -391,13 +417,21 @@ def main():
         disabled = results["disabled"]
 
         if baseline.tokens_per_sec > 0:
-            regression = (baseline.tokens_per_sec - disabled.tokens_per_sec) / baseline.tokens_per_sec * 100
+            regression = (
+                (baseline.tokens_per_sec - disabled.tokens_per_sec)
+                / baseline.tokens_per_sec
+                * 100
+            )
 
             print(f"\n*** REGRESSION CHECK ***")
             if abs(regression) < 2.0:
-                print(f"PASS: Disabled mode has {regression:+.1f}% throughput delta (< 2% threshold)")
+                print(
+                    f"PASS: Disabled mode has {regression:+.1f}% throughput delta (< 2% threshold)"
+                )
             else:
-                print(f"WARN: Disabled mode has {regression:+.1f}% throughput delta (>= 2% threshold)")
+                print(
+                    f"WARN: Disabled mode has {regression:+.1f}% throughput delta (>= 2% threshold)"
+                )
 
     # Save results
     if args.output:

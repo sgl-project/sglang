@@ -83,7 +83,9 @@ def main():
         sys.exit(1)
 
     print(f"{Colors.GREEN}Connected! Waiting for fingerprints...{Colors.RESET}")
-    print(f"{Colors.GRAY}(Send a request with return_attention_tokens: true){Colors.RESET}\n")
+    print(
+        f"{Colors.GRAY}(Send a request with return_attention_tokens: true){Colors.RESET}\n"
+    )
 
     # Stats
     total = 0
@@ -117,35 +119,43 @@ def main():
                 requests[request_id] += 1
 
                 # Add to history
-                history.append({
-                    "rid": request_id,
-                    "step": step,
-                    "manifold": manifold,
-                    "vector": vector,
-                    "phase": think_phase,
-                })
+                history.append(
+                    {
+                        "rid": request_id,
+                        "step": step,
+                        "manifold": manifold,
+                        "vector": vector,
+                        "phase": think_phase,
+                    }
+                )
 
                 # Display
                 color = manifold_colors.get(manifold, Colors.GRAY)
                 sparkline = format_vector(vector)
 
-                print(f"{Colors.BOLD}[{total:04d}]{Colors.RESET} "
-                      f"rid={Colors.BLUE}{request_id}{Colors.RESET} "
-                      f"step={step:3d} "
-                      f"zone={color}{manifold:16s}{Colors.RESET} "
-                      f"phase={think_phase:8s} "
-                      f"{Colors.GRAY}{sparkline}{Colors.RESET}")
+                print(
+                    f"{Colors.BOLD}[{total:04d}]{Colors.RESET} "
+                    f"rid={Colors.BLUE}{request_id}{Colors.RESET} "
+                    f"step={step:3d} "
+                    f"zone={color}{manifold:16s}{Colors.RESET} "
+                    f"phase={think_phase:8s} "
+                    f"{Colors.GRAY}{sparkline}{Colors.RESET}"
+                )
 
                 # Every 10 fingerprints, show summary
                 if total % 10 == 0:
-                    print(f"\n{Colors.GRAY}--- Stats: {total} total, {len(requests)} requests ---{Colors.RESET}\n")
+                    print(
+                        f"\n{Colors.GRAY}--- Stats: {total} total, {len(requests)} requests ---{Colors.RESET}\n"
+                    )
 
             except zmq.Again:
                 print(f"{Colors.GRAY}... waiting for fingerprints ...{Colors.RESET}")
                 continue
 
     except KeyboardInterrupt:
-        print(f"\n\n{Colors.YELLOW}Stopped. Received {total} fingerprints from {len(requests)} requests.{Colors.RESET}")
+        print(
+            f"\n\n{Colors.YELLOW}Stopped. Received {total} fingerprints from {len(requests)} requests.{Colors.RESET}"
+        )
 
     finally:
         socket.close()

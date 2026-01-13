@@ -122,11 +122,11 @@ def test_fingerprint_capture(base_url: str, verbose: bool = False) -> bool:
         if verbose:
             print(f"First record keys: {list(first_record.keys())}")
 
-        if 'fingerprint' not in first_record:
+        if "fingerprint" not in first_record:
             print("FAILED: No 'fingerprint' in attention record")
             return False
 
-        fingerprint = first_record['fingerprint']
+        fingerprint = first_record["fingerprint"]
         if not isinstance(fingerprint, list):
             print(f"FAILED: Fingerprint is not a list: {type(fingerprint)}")
             return False
@@ -141,7 +141,9 @@ def test_fingerprint_capture(base_url: str, verbose: bool = False) -> bool:
 
         if verbose:
             fp_arr = np.array(fingerprint)
-            print(f"Fingerprint stats: min={fp_arr.min():.3f}, max={fp_arr.max():.3f}, mean={fp_arr.mean():.3f}")
+            print(
+                f"Fingerprint stats: min={fp_arr.min():.3f}, max={fp_arr.max():.3f}, mean={fp_arr.mean():.3f}"
+            )
 
         print("PASSED")
         return True
@@ -157,7 +159,7 @@ def test_fingerprint_zone_distribution(base_url: str, verbose: bool = False) -> 
 
     prompts = [
         # Syntax-heavy (should get syntax_floor)
-        "Fix this JSON: {\"name\": \"test\"",
+        'Fix this JSON: {"name": "test"',
         # Reasoning (should get semantic_bridge or structure_ripple)
         "Explain step by step how photosynthesis works in plants.",
         # Counting/structure (should get structure_ripple)
@@ -181,14 +183,18 @@ def test_fingerprint_zone_distribution(base_url: str, verbose: bool = False) -> 
             )
 
             if response.status_code != 200:
-                print(f"FAILED: Status {response.status_code} for prompt: {prompt[:30]}...")
+                print(
+                    f"FAILED: Status {response.status_code} for prompt: {prompt[:30]}..."
+                )
                 continue
 
             data = response.json()
-            attention_tokens = data["choices"][0].get("meta_info", {}).get("attention_tokens", [])
+            attention_tokens = (
+                data["choices"][0].get("meta_info", {}).get("attention_tokens", [])
+            )
 
             for record in attention_tokens:
-                zone = record.get('manifold', 'unknown')
+                zone = record.get("manifold", "unknown")
                 zone_counts[zone] = zone_counts.get(zone, 0) + 1
 
         if not zone_counts:
@@ -237,10 +243,12 @@ def test_fingerprint_consistency(base_url: str, verbose: bool = False) -> bool:
                 return False
 
             data = response.json()
-            attention_tokens = data["choices"][0].get("meta_info", {}).get("attention_tokens", [])
+            attention_tokens = (
+                data["choices"][0].get("meta_info", {}).get("attention_tokens", [])
+            )
 
             if attention_tokens:
-                fingerprints.append(np.array(attention_tokens[0]['fingerprint']))
+                fingerprints.append(np.array(attention_tokens[0]["fingerprint"]))
 
         if len(fingerprints) < 2:
             print("FAILED: Not enough fingerprints captured")
@@ -303,10 +311,24 @@ def main():
 
     # Run tests
     results = []
-    results.append(("Basic Completion", test_basic_completion(args.base_url, args.verbose)))
-    results.append(("Fingerprint Capture", test_fingerprint_capture(args.base_url, args.verbose)))
-    results.append(("Zone Distribution", test_fingerprint_zone_distribution(args.base_url, args.verbose)))
-    results.append(("Fingerprint Consistency", test_fingerprint_consistency(args.base_url, args.verbose)))
+    results.append(
+        ("Basic Completion", test_basic_completion(args.base_url, args.verbose))
+    )
+    results.append(
+        ("Fingerprint Capture", test_fingerprint_capture(args.base_url, args.verbose))
+    )
+    results.append(
+        (
+            "Zone Distribution",
+            test_fingerprint_zone_distribution(args.base_url, args.verbose),
+        )
+    )
+    results.append(
+        (
+            "Fingerprint Consistency",
+            test_fingerprint_consistency(args.base_url, args.verbose),
+        )
+    )
 
     # Summary
     print("\n" + "=" * 60)

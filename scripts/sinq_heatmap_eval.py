@@ -28,21 +28,21 @@ import gc
 import json
 import sys
 import time
+import traceback
 import uuid
-from dataclasses import dataclass, field, asdict
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from collections import defaultdict
-import traceback
-
-import torch
-import numpy as np
-from scipy import stats
 
 # Visualization
 import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend
+import numpy as np
+import torch
+from scipy import stats
+
+matplotlib.use("Agg")  # Non-interactive backend
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -52,8 +52,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Import manifest module for reproducibility layer
 try:
     # Try to import from attention_explorer schemas
-    sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "attention_explorer"))
+    sys.path.insert(
+        0, str(Path(__file__).parent.parent / "examples" / "attention_explorer")
+    )
     from schemas.manifest import ExperimentManifest, RunType
+
     HAS_MANIFEST = True
 except ImportError:
     HAS_MANIFEST = False
@@ -63,9 +66,11 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
+
 @dataclass
 class QuantConfig:
     """Quantization configuration."""
+
     nbits: int
     tiling_mode: str
     group_size: int
@@ -110,16 +115,24 @@ QUICK_PROMPTS = [
 # Manifold zones based on attention distance distribution
 ManifoldZone = str  # Type alias: 'syntax_floor' | 'semantic_bridge' | 'long_range' | 'structure_ripple' | 'diffuse' | 'unknown'
 
-MANIFOLD_ZONES = ['syntax_floor', 'semantic_bridge', 'long_range', 'structure_ripple', 'diffuse', 'unknown']
+MANIFOLD_ZONES = [
+    "syntax_floor",
+    "semantic_bridge",
+    "long_range",
+    "structure_ripple",
+    "diffuse",
+    "unknown",
+]
 
 
 @dataclass
 class AttentionFingerprint:
     """Fingerprint computed from attention positions and scores."""
-    local_mass: float    # Attention on nearby tokens (distance 0-32)
-    mid_mass: float      # Attention on mid-range tokens (distance 33-256)
-    long_mass: float     # Attention on distant tokens (distance 257+)
-    entropy: float       # Distribution entropy
+
+    local_mass: float  # Attention on nearby tokens (distance 0-32)
+    mid_mass: float  # Attention on mid-range tokens (distance 33-256)
+    long_mass: float  # Attention on distant tokens (distance 257+)
+    entropy: float  # Distribution entropy
     histogram: List[float] = field(default_factory=list)  # Distance histogram
 
 
@@ -210,16 +223,16 @@ def classify_manifold_zone(fp: AttentionFingerprint) -> ManifoldZone:
     - diffuse: Distributed attention (creative, exploratory)
     """
     if fp.local_mass > 0.5:
-        return 'syntax_floor'
+        return "syntax_floor"
     if fp.mid_mass > 0.4:
-        return 'semantic_bridge'
+        return "semantic_bridge"
     if fp.long_mass > 0.35:
-        return 'long_range'
+        return "long_range"
     if fp.entropy < 2.0 and fp.local_mass > 0.3:
-        return 'structure_ripple'
+        return "structure_ripple"
     if fp.entropy > 3.5:
-        return 'diffuse'
-    return 'diffuse'  # Default
+        return "diffuse"
+    return "diffuse"  # Default
 
 
 def compute_zone_from_topk(
@@ -236,9 +249,11 @@ def compute_zone_from_topk(
 # METRICS COMPUTATION
 # ============================================================================
 
+
 @dataclass
 class StepMetrics:
     """Metrics for a single generation step."""
+
     jaccard: float
     weighted_jaccard: float
     spearman: float
@@ -250,6 +265,7 @@ class StepMetrics:
 @dataclass
 class PromptMetrics:
     """Aggregated metrics for a single prompt."""
+
     prompt_id: str
     prompt_text: str
     jaccard: float
@@ -260,8 +276,8 @@ class PromptMetrics:
     kl_divergence: float
     output_match: bool
     # Manifold zone tracking
-    baseline_zone: ManifoldZone = 'unknown'
-    candidate_zone: ManifoldZone = 'unknown'
+    baseline_zone: ManifoldZone = "unknown"
+    candidate_zone: ManifoldZone = "unknown"
     zone_drift: bool = False
     per_step_jaccard: List[float] = field(default_factory=list)
 
@@ -269,6 +285,7 @@ class PromptMetrics:
 @dataclass
 class ConfigResult:
     """Result for a single configuration."""
+
     config: QuantConfig
     mean_jaccard: float
     std_jaccard: float
@@ -387,7 +404,8 @@ def compute_mass_retained(
     candidate_set = set(candidate_positions)
     total_mass = sum(baseline_scores)
     retained_mass = sum(
-        score for pos, score in zip(baseline_positions, baseline_scores)
+        score
+        for pos, score in zip(baseline_positions, baseline_scores)
         if pos in candidate_set
     )
 
@@ -434,10 +452,14 @@ def compute_step_metrics(
         set(baseline_positions), set(candidate_positions)
     )
     weighted_jaccard = compute_weighted_jaccard(
-        baseline_positions, baseline_scores,
-        candidate_positions, candidate_scores,
+        baseline_positions,
+        baseline_scores,
+        candidate_positions,
+        candidate_scores,
     )
-    spearman, kendall = compute_rank_correlation(baseline_positions, candidate_positions)
+    spearman, kendall = compute_rank_correlation(
+        baseline_positions, candidate_positions
+    )
     mass_retained = compute_mass_retained(
         baseline_positions, baseline_scores, candidate_positions
     )
@@ -453,7 +475,9 @@ def compute_step_metrics(
     )
 
 
-def get_top_tokens_with_scores(logits: torch.Tensor, k: int = 10) -> Tuple[List[int], List[float]]:
+def get_top_tokens_with_scores(
+    logits: torch.Tensor, k: int = 10
+) -> Tuple[List[int], List[float]]:
     """Get top-k token indices and their probability scores from logits."""
     probs = torch.softmax(logits, dim=-1)
     top_probs, top_indices = torch.topk(probs, k)
@@ -546,8 +570,7 @@ class SINQEvaluator:
 
             # Decode response
             response = self.tokenizer.decode(
-                outputs.sequences[0][input_len:],
-                skip_special_tokens=True
+                outputs.sequences[0][input_len:], skip_special_tokens=True
             )
 
             # Collect top-k tokens WITH SCORES for each generated position
@@ -571,8 +594,10 @@ class SINQEvaluator:
         """Evaluate a single quantization configuration with full metrics."""
         print(f"\n{'-'*60}")
         print(f"Testing: {config.name}")
-        print(f"  nbits={config.nbits}, group_size={config.group_size}, "
-              f"tiling={config.tiling_mode}, method={config.method}")
+        print(
+            f"  nbits={config.nbits}, group_size={config.group_size}, "
+            f"tiling={config.tiling_mode}, method={config.method}"
+        )
         print(f"{'-'*60}")
 
         start_time = time.time()
@@ -613,8 +638,12 @@ class SINQEvaluator:
             model_to_quant.eval()
 
             quant_memory = get_memory_mb()
-            compression_ratio = self.bf16_memory / quant_memory if quant_memory > 0 else 0
-            print(f"  Quantized memory: {quant_memory:.1f} MB (compression: {compression_ratio:.2f}x)")
+            compression_ratio = (
+                self.bf16_memory / quant_memory if quant_memory > 0 else 0
+            )
+            print(
+                f"  Quantized memory: {quant_memory:.1f} MB (compression: {compression_ratio:.2f}x)"
+            )
 
             # Evaluate on prompts - collect ALL metrics
             prompt_metrics_list = []
@@ -638,8 +667,7 @@ class SINQEvaluator:
 
                 # Decode quantized response
                 quant_response = self.tokenizer.decode(
-                    outputs.sequences[0][input_len:],
-                    skip_special_tokens=True
+                    outputs.sequences[0][input_len:], skip_special_tokens=True
                 )
 
                 # Collect top-k tokens WITH SCORES
@@ -658,15 +686,17 @@ class SINQEvaluator:
                         quant_positions, quant_scores = quant_topk_steps[i]
 
                         step_m = compute_step_metrics(
-                            bf16_positions, bf16_scores,
-                            quant_positions, quant_scores,
+                            bf16_positions,
+                            bf16_scores,
+                            quant_positions,
+                            quant_scores,
                         )
                         step_metrics.append(step_m)
 
                 # Compute manifold zones from aggregated attention
                 # We use the middle step as representative (or all steps averaged)
-                baseline_zone = 'unknown'
-                candidate_zone = 'unknown'
+                baseline_zone = "unknown"
+                candidate_zone = "unknown"
 
                 if min_len > 0:
                     # Aggregate all positions/scores across steps for zone classification
@@ -678,8 +708,12 @@ class SINQEvaluator:
                     # Current position is approximately input_len + step
                     current_pos = input_len + mid_step
 
-                    baseline_zone = compute_zone_from_topk(bf16_positions, bf16_scores, current_pos)
-                    candidate_zone = compute_zone_from_topk(quant_positions, quant_scores, current_pos)
+                    baseline_zone = compute_zone_from_topk(
+                        bf16_positions, bf16_scores, current_pos
+                    )
+                    candidate_zone = compute_zone_from_topk(
+                        quant_positions, quant_scores, current_pos
+                    )
 
                 zone_drift = baseline_zone != candidate_zone
 
@@ -725,8 +759,10 @@ class SINQEvaluator:
 
                 prompt_metrics_list.append(pm)
                 drift_marker = " [DRIFT]" if zone_drift else ""
-                print(f"  Prompt '{prompt[:30]}...': J={pm.jaccard:.3f} wJ={pm.weighted_jaccard:.3f} "
-                      f"ρ={pm.spearman:.3f} zone={baseline_zone}->{candidate_zone}{drift_marker}")
+                print(
+                    f"  Prompt '{prompt[:30]}...': J={pm.jaccard:.3f} wJ={pm.weighted_jaccard:.3f} "
+                    f"ρ={pm.spearman:.3f} zone={baseline_zone}->{candidate_zone}{drift_marker}"
+                )
 
             # Cleanup
             del model_to_quant
@@ -745,14 +781,20 @@ class SINQEvaluator:
 
             # Compute zone drift rate and transition matrix
             drift_count = sum(1 for pm in prompt_metrics_list if pm.zone_drift)
-            zone_drift_rate = drift_count / len(prompt_metrics_list) if prompt_metrics_list else 0.0
+            zone_drift_rate = (
+                drift_count / len(prompt_metrics_list) if prompt_metrics_list else 0.0
+            )
 
             # Build zone transition matrix
-            zone_transition_matrix: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+            zone_transition_matrix: Dict[str, Dict[str, int]] = defaultdict(
+                lambda: defaultdict(int)
+            )
             for pm in prompt_metrics_list:
                 zone_transition_matrix[pm.baseline_zone][pm.candidate_zone] += 1
             # Convert to regular dict for serialization
-            zone_transition_dict = {k: dict(v) for k, v in zone_transition_matrix.items()}
+            zone_transition_dict = {
+                k: dict(v) for k, v in zone_transition_matrix.items()
+            }
 
             return ConfigResult(
                 config=config,
@@ -765,7 +807,9 @@ class SINQEvaluator:
                 mean_kendall=float(np.mean(all_kendall)),
                 mean_mass_retained=float(np.mean(all_mass)),
                 mean_kl_divergence=float(np.mean(all_kl)),
-                output_match_rate=sum(all_matches) / len(all_matches) if all_matches else 0.0,
+                output_match_rate=(
+                    sum(all_matches) / len(all_matches) if all_matches else 0.0
+                ),
                 zone_drift_rate=zone_drift_rate,
                 zone_transition_matrix=zone_transition_dict,
                 compression_ratio=compression_ratio,
@@ -799,18 +843,23 @@ class SINQEvaluator:
 # VISUALIZATION
 # ============================================================================
 
+
 def create_heatmaps(results: List[ConfigResult], output_dir: Path):
     """Create heatmap visualizations of the results."""
 
     # Organize data by method
     for method in METHOD_OPTIONS:
-        method_results = [r for r in results if r.config.method == method and r.error is None]
+        method_results = [
+            r for r in results if r.config.method == method and r.error is None
+        ]
         if not method_results:
             continue
 
         # Create heatmap data for each tiling mode
         for tiling in TILING_OPTIONS:
-            tiling_results = [r for r in method_results if r.config.tiling_mode == tiling]
+            tiling_results = [
+                r for r in method_results if r.config.tiling_mode == tiling
+            ]
             if not tiling_results:
                 continue
 
@@ -837,15 +886,17 @@ def create_heatmaps(results: List[ConfigResult], output_dir: Path):
                 xticklabels=[f"g{g}" for g in group_list],
                 yticklabels=[f"{n}b" for n in nbits_list],
                 annot=True,
-                fmt='.2f',
-                cmap='RdYlGn',
+                fmt=".2f",
+                cmap="RdYlGn",
                 vmin=0,
                 vmax=1,
-                cbar_kws={'label': 'Jaccard Similarity'}
+                cbar_kws={"label": "Jaccard Similarity"},
             )
-            axes[0].set_xlabel('Group Size')
-            axes[0].set_ylabel('Bits')
-            axes[0].set_title(f'{method.upper()} {tiling} - Jaccard Similarity\n(Higher = Better Quality)')
+            axes[0].set_xlabel("Group Size")
+            axes[0].set_ylabel("Bits")
+            axes[0].set_title(
+                f"{method.upper()} {tiling} - Jaccard Similarity\n(Higher = Better Quality)"
+            )
 
             # Compression heatmap
             sns.heatmap(
@@ -854,18 +905,20 @@ def create_heatmaps(results: List[ConfigResult], output_dir: Path):
                 xticklabels=[f"g{g}" for g in group_list],
                 yticklabels=[f"{n}b" for n in nbits_list],
                 annot=True,
-                fmt='.2f',
-                cmap='Blues',
-                cbar_kws={'label': 'Compression Ratio'}
+                fmt=".2f",
+                cmap="Blues",
+                cbar_kws={"label": "Compression Ratio"},
             )
-            axes[1].set_xlabel('Group Size')
-            axes[1].set_ylabel('Bits')
-            axes[1].set_title(f'{method.upper()} {tiling} - Compression Ratio\n(Higher = Smaller Model)')
+            axes[1].set_xlabel("Group Size")
+            axes[1].set_ylabel("Bits")
+            axes[1].set_title(
+                f"{method.upper()} {tiling} - Compression Ratio\n(Higher = Smaller Model)"
+            )
 
             plt.tight_layout()
 
             filename = output_dir / f"heatmap_{method}_{tiling}.png"
-            plt.savefig(filename, dpi=150, bbox_inches='tight')
+            plt.savefig(filename, dpi=150, bbox_inches="tight")
             plt.close()
             print(f"Saved: {filename}")
 
@@ -887,7 +940,9 @@ def create_summary_heatmap(results: List[ConfigResult], output_dir: Path):
     jaccards = []
     compressions = []
 
-    for r in sorted(valid_results, key=lambda x: (-x.config.nbits, x.config.group_size)):
+    for r in sorted(
+        valid_results, key=lambda x: (-x.config.nbits, x.config.group_size)
+    ):
         label = f"{r.config.method[:1].upper()}-{r.config.nbits}b-g{r.config.group_size}-{r.config.tiling_mode}"
         configs.append(label)
         jaccards.append(r.mean_jaccard)
@@ -899,32 +954,48 @@ def create_summary_heatmap(results: List[ConfigResult], output_dir: Path):
     x = np.arange(len(configs))
     width = 0.35
 
-    bars1 = ax.bar(x - width/2, jaccards, width, label='Jaccard Similarity', color='green', alpha=0.7)
+    bars1 = ax.bar(
+        x - width / 2,
+        jaccards,
+        width,
+        label="Jaccard Similarity",
+        color="green",
+        alpha=0.7,
+    )
 
     # Secondary axis for compression
     ax2 = ax.twinx()
-    bars2 = ax2.bar(x + width/2, compressions, width, label='Compression Ratio', color='blue', alpha=0.7)
+    bars2 = ax2.bar(
+        x + width / 2,
+        compressions,
+        width,
+        label="Compression Ratio",
+        color="blue",
+        alpha=0.7,
+    )
 
-    ax.set_xlabel('Configuration')
-    ax.set_ylabel('Jaccard Similarity', color='green')
-    ax2.set_ylabel('Compression Ratio', color='blue')
+    ax.set_xlabel("Configuration")
+    ax.set_ylabel("Jaccard Similarity", color="green")
+    ax2.set_ylabel("Compression Ratio", color="blue")
     ax.set_xticks(x)
-    ax.set_xticklabels(configs, rotation=45, ha='right')
+    ax.set_xticklabels(configs, rotation=45, ha="right")
     ax.set_ylim(0, 1)
     ax2.set_ylim(0, max(compressions) * 1.2)
 
     # Add quality threshold lines
-    ax.axhline(y=0.8, color='green', linestyle='--', alpha=0.5, label='Good (0.8)')
-    ax.axhline(y=0.6, color='orange', linestyle='--', alpha=0.5, label='Acceptable (0.6)')
+    ax.axhline(y=0.8, color="green", linestyle="--", alpha=0.5, label="Good (0.8)")
+    ax.axhline(
+        y=0.6, color="orange", linestyle="--", alpha=0.5, label="Acceptable (0.6)"
+    )
 
-    ax.legend(loc='upper left')
-    ax2.legend(loc='upper right')
+    ax.legend(loc="upper left")
+    ax2.legend(loc="upper right")
 
-    plt.title('SINQ Quantization: Quality vs Compression Trade-off')
+    plt.title("SINQ Quantization: Quality vs Compression Trade-off")
     plt.tight_layout()
 
     filename = output_dir / "summary_comparison.png"
-    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    plt.savefig(filename, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved: {filename}")
 
@@ -939,8 +1010,8 @@ def create_pareto_plot(results: List[ConfigResult], output_dir: Path):
     fig, ax = plt.subplots(figsize=(12, 8))
 
     # Color by method
-    colors = {'sinq': 'blue', 'asinq': 'red'}
-    markers = {'1D': 'o', '2D': 's'}
+    colors = {"sinq": "blue", "asinq": "red"}
+    markers = {"1D": "o", "2D": "s"}
 
     for r in valid_results:
         color = colors[r.config.method]
@@ -954,7 +1025,12 @@ def create_pareto_plot(results: List[ConfigResult], output_dir: Path):
             marker=marker,
             s=100 + r.config.nbits * 20,  # Size by nbits
             alpha=0.7,
-            label=label if label not in [t.get_text() for t in ax.get_legend_handles_labels()[1]] else "",
+            label=(
+                label
+                if label
+                not in [t.get_text() for t in ax.get_legend_handles_labels()[1]]
+                else ""
+            ),
         )
 
         # Annotate with config
@@ -966,14 +1042,14 @@ def create_pareto_plot(results: List[ConfigResult], output_dir: Path):
             fontsize=8,
         )
 
-    ax.set_xlabel('Compression Ratio (higher = smaller model)')
-    ax.set_ylabel('Jaccard Similarity (higher = better quality)')
-    ax.set_title('SINQ Quantization Pareto Frontier')
+    ax.set_xlabel("Compression Ratio (higher = smaller model)")
+    ax.set_ylabel("Jaccard Similarity (higher = better quality)")
+    ax.set_title("SINQ Quantization Pareto Frontier")
 
     # Add quality threshold lines
-    ax.axhline(y=0.8, color='green', linestyle='--', alpha=0.3, label='Good Quality')
-    ax.axhline(y=0.6, color='orange', linestyle='--', alpha=0.3, label='Acceptable')
-    ax.axhline(y=0.5, color='red', linestyle='--', alpha=0.3, label='Poor')
+    ax.axhline(y=0.8, color="green", linestyle="--", alpha=0.3, label="Good Quality")
+    ax.axhline(y=0.6, color="orange", linestyle="--", alpha=0.3, label="Acceptable")
+    ax.axhline(y=0.5, color="red", linestyle="--", alpha=0.3, label="Poor")
 
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -981,7 +1057,7 @@ def create_pareto_plot(results: List[ConfigResult], output_dir: Path):
     plt.tight_layout()
 
     filename = output_dir / "pareto_frontier.png"
-    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    plt.savefig(filename, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved: {filename}")
 
@@ -990,16 +1066,33 @@ def create_pareto_plot(results: List[ConfigResult], output_dir: Path):
 # MAIN
 # ============================================================================
 
+
 def main():
     parser = argparse.ArgumentParser(description="SINQ Comprehensive Evaluation")
-    parser.add_argument("--model", "-m", default="Qwen/Qwen3-1.7B", help="Model to evaluate")
-    parser.add_argument("--output", "-o", default="sinq_eval_results", help="Output directory")
-    parser.add_argument("--quick", action="store_true", help="Quick mode with fewer prompts")
+    parser.add_argument(
+        "--model", "-m", default="Qwen/Qwen3-1.7B", help="Model to evaluate"
+    )
+    parser.add_argument(
+        "--output", "-o", default="sinq_eval_results", help="Output directory"
+    )
+    parser.add_argument(
+        "--quick", action="store_true", help="Quick mode with fewer prompts"
+    )
     parser.add_argument("--nbits", type=int, nargs="+", help="Specific nbits to test")
-    parser.add_argument("--methods", nargs="+", choices=["sinq", "asinq"], help="Specific methods")
-    parser.add_argument("--max-tokens", type=int, default=64, help="Max tokens to generate")
-    parser.add_argument("--schema-v1", action="store_true", help="Export in Quantization Comparison Schema v1 format")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument(
+        "--methods", nargs="+", choices=["sinq", "asinq"], help="Specific methods"
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=64, help="Max tokens to generate"
+    )
+    parser.add_argument(
+        "--schema-v1",
+        action="store_true",
+        help="Export in Quantization Comparison Schema v1 format",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None, help="Random seed for reproducibility"
+    )
 
     args = parser.parse_args()
 
@@ -1024,16 +1117,18 @@ def main():
         for tiling in TILING_OPTIONS:
             for group_size in GROUP_SIZE_OPTIONS:
                 for method in methods_to_test:
-                    configs.append(QuantConfig(
-                        nbits=nbits,
-                        tiling_mode=tiling,
-                        group_size=group_size,
-                        method=method,
-                    ))
+                    configs.append(
+                        QuantConfig(
+                            nbits=nbits,
+                            tiling_mode=tiling,
+                            group_size=group_size,
+                            method=method,
+                        )
+                    )
 
     # Create experiment manifest for reproducibility
     manifest = None
-    run_id = datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
+    run_id = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     if HAS_MANIFEST:
         manifest = ExperimentManifest.create(
             run_type=RunType.EVALUATION,
@@ -1047,15 +1142,17 @@ def main():
             temperature=0.0,  # Greedy for reproducibility
             seed=args.seed,
         )
-        manifest.set_parameters({
-            "quick_mode": args.quick,
-            "prompt_count": len(prompts),
-            "config_count": len(configs),
-            "nbits_tested": nbits_to_test,
-            "methods_tested": methods_to_test,
-            "tiling_modes": TILING_OPTIONS,
-            "group_sizes": GROUP_SIZE_OPTIONS,
-        })
+        manifest.set_parameters(
+            {
+                "quick_mode": args.quick,
+                "prompt_count": len(prompts),
+                "config_count": len(configs),
+                "nbits_tested": nbits_to_test,
+                "methods_tested": methods_to_test,
+                "tiling_modes": TILING_OPTIONS,
+                "group_sizes": GROUP_SIZE_OPTIONS,
+            }
+        )
         print(f"Manifest created for run: {run_id}")
 
     print(f"\n{'='*60}")
@@ -1081,7 +1178,9 @@ def main():
 
     for i, config in enumerate(configs):
         print(f"\n[{i+1}/{len(configs)}] ", end="")
-        result = evaluator.evaluate_config(config, prompts, bf16_outputs, args.max_tokens)
+        result = evaluator.evaluate_config(
+            config, prompts, bf16_outputs, args.max_tokens
+        )
         results.append(result)
 
         # Save intermediate results
@@ -1094,9 +1193,9 @@ def main():
     save_results(results, output_dir)
 
     # Generate visualizations
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Generating visualizations...")
-    print("="*60)
+    print("=" * 60)
 
     create_heatmaps(results, output_dir)
     create_pareto_plot(results, output_dir)
@@ -1112,27 +1211,45 @@ def main():
     if HAS_MANIFEST and manifest:
         # Compute aggregate statistics across all configs
         mean_jaccards = [r.mean_jaccard for r in results if r.mean_jaccard is not None]
-        best_config = max(results, key=lambda r: r.mean_jaccard if r.mean_jaccard else 0)
+        best_config = max(
+            results, key=lambda r: r.mean_jaccard if r.mean_jaccard else 0
+        )
 
-        manifest.set_statistics({
-            "total_configs_tested": len(configs),
-            "successful_configs": len([r for r in results if r.mean_jaccard is not None]),
-            "total_duration_seconds": total_time,
-            "overall_mean_jaccard": np.mean(mean_jaccards) if mean_jaccards else None,
-            "overall_std_jaccard": np.std(mean_jaccards) if mean_jaccards else None,
-            "best_config": {
-                "name": best_config.config.name,
-                "mean_jaccard": best_config.mean_jaccard,
-                "zone_drift_rate": best_config.zone_drift_rate,
-                "compression_ratio": best_config.compression_ratio,
-            } if best_config.mean_jaccard else None,
-        })
+        manifest.set_statistics(
+            {
+                "total_configs_tested": len(configs),
+                "successful_configs": len(
+                    [r for r in results if r.mean_jaccard is not None]
+                ),
+                "total_duration_seconds": total_time,
+                "overall_mean_jaccard": (
+                    np.mean(mean_jaccards) if mean_jaccards else None
+                ),
+                "overall_std_jaccard": np.std(mean_jaccards) if mean_jaccards else None,
+                "best_config": (
+                    {
+                        "name": best_config.config.name,
+                        "mean_jaccard": best_config.mean_jaccard,
+                        "zone_drift_rate": best_config.zone_drift_rate,
+                        "compression_ratio": best_config.compression_ratio,
+                    }
+                    if best_config.mean_jaccard
+                    else None
+                ),
+            }
+        )
 
         # Add artifact references
         manifest.add_artifact("results_json", str(output_dir / "results.json"))
-        manifest.add_artifact("heatmap_jaccard", str(output_dir / "heatmap_jaccard.png"))
-        manifest.add_artifact("heatmap_zone_drift", str(output_dir / "heatmap_zone_drift.png"))
-        manifest.add_artifact("pareto_plot", str(output_dir / "pareto_compression_vs_quality.png"))
+        manifest.add_artifact(
+            "heatmap_jaccard", str(output_dir / "heatmap_jaccard.png")
+        )
+        manifest.add_artifact(
+            "heatmap_zone_drift", str(output_dir / "heatmap_zone_drift.png")
+        )
+        manifest.add_artifact(
+            "pareto_plot", str(output_dir / "pareto_compression_vs_quality.png")
+        )
 
         # Finalize and save
         manifest.finalize()
@@ -1194,7 +1311,7 @@ def save_results(results: List[ConfigResult], output_dir: Path):
                 ],
             }
             for r in results
-        ]
+        ],
     }
 
     filename = output_dir / "results.json"
@@ -1204,9 +1321,9 @@ def save_results(results: List[ConfigResult], output_dir: Path):
 
 def print_summary(results: List[ConfigResult], total_time: float):
     """Print evaluation summary with all metrics."""
-    print("\n" + "="*90)
+    print("\n" + "=" * 90)
     print("EVALUATION SUMMARY")
-    print("="*90)
+    print("=" * 90)
 
     valid = [r for r in results if r.error is None]
     errors = [r for r in results if r.error is not None]
@@ -1225,29 +1342,33 @@ def print_summary(results: List[ConfigResult], total_time: float):
         # Sort by Jaccard
         sorted_by_quality = sorted(valid, key=lambda x: -x.mean_jaccard)
 
-        print("\n" + "-"*90)
+        print("\n" + "-" * 90)
         print("TOP 10 BY QUALITY (Jaccard Similarity)")
-        print("-"*90)
+        print("-" * 90)
         header = f"{'Config':<30} {'Jaccard':>8} {'wJacc':>7} {'Spear':>7} {'Mass':>6} {'KL':>7} {'Match':>6} {'Compr':>7}"
         print(header)
-        print("-"*90)
+        print("-" * 90)
         for r in sorted_by_quality[:10]:
-            print(f"{r.config.name:<30} {r.mean_jaccard:>8.3f} {r.mean_weighted_jaccard:>7.3f} "
-                  f"{r.mean_spearman:>7.3f} {r.mean_mass_retained:>6.3f} {r.mean_kl_divergence:>7.3f} "
-                  f"{r.output_match_rate:>6.1%} {r.compression_ratio:>6.2f}x")
+            print(
+                f"{r.config.name:<30} {r.mean_jaccard:>8.3f} {r.mean_weighted_jaccard:>7.3f} "
+                f"{r.mean_spearman:>7.3f} {r.mean_mass_retained:>6.3f} {r.mean_kl_divergence:>7.3f} "
+                f"{r.output_match_rate:>6.1%} {r.compression_ratio:>6.2f}x"
+            )
 
         # Sort by compression
         sorted_by_compression = sorted(valid, key=lambda x: -x.compression_ratio)
 
-        print("\n" + "-"*90)
+        print("\n" + "-" * 90)
         print("TOP 10 BY COMPRESSION")
-        print("-"*90)
+        print("-" * 90)
         print(header)
-        print("-"*90)
+        print("-" * 90)
         for r in sorted_by_compression[:10]:
-            print(f"{r.config.name:<30} {r.mean_jaccard:>8.3f} {r.mean_weighted_jaccard:>7.3f} "
-                  f"{r.mean_spearman:>7.3f} {r.mean_mass_retained:>6.3f} {r.mean_kl_divergence:>7.3f} "
-                  f"{r.output_match_rate:>6.1%} {r.compression_ratio:>6.2f}x")
+            print(
+                f"{r.config.name:<30} {r.mean_jaccard:>8.3f} {r.mean_weighted_jaccard:>7.3f} "
+                f"{r.mean_spearman:>7.3f} {r.mean_mass_retained:>6.3f} {r.mean_kl_divergence:>7.3f} "
+                f"{r.output_match_rate:>6.1%} {r.compression_ratio:>6.2f}x"
+            )
 
         # Quality tier distribution
         excellent = [r for r in valid if r.mean_jaccard >= 0.8]
@@ -1256,9 +1377,9 @@ def print_summary(results: List[ConfigResult], total_time: float):
         degraded = [r for r in valid if 0.2 <= r.mean_jaccard < 0.4]
         failed = [r for r in valid if r.mean_jaccard < 0.2]
 
-        print("\n" + "-"*90)
+        print("\n" + "-" * 90)
         print("QUALITY TIER DISTRIBUTION")
-        print("-"*90)
+        print("-" * 90)
         print(f"  Excellent (≥80%): {len(excellent):>3} configs")
         print(f"  Good (≥60%):      {len(good):>3} configs")
         print(f"  Acceptable (≥40%): {len(acceptable):>3} configs")
@@ -1266,9 +1387,9 @@ def print_summary(results: List[ConfigResult], total_time: float):
         print(f"  Failed (<20%):    {len(failed):>3} configs")
 
         # Manifold zone drift analysis
-        print("\n" + "-"*90)
+        print("\n" + "-" * 90)
         print("MANIFOLD ZONE DRIFT ANALYSIS")
-        print("-"*90)
+        print("-" * 90)
         drift_rates = [r.zone_drift_rate for r in valid]
         avg_drift = np.mean(drift_rates) if drift_rates else 0.0
         min_drift = np.min(drift_rates) if drift_rates else 0.0
@@ -1287,7 +1408,9 @@ def print_summary(results: List[ConfigResult], total_time: float):
         if sorted_by_drift:
             print("\n  Top 5 most stable (lowest zone drift):")
             for r in sorted_by_drift[:5]:
-                print(f"    {r.config.name:<30} drift={r.zone_drift_rate:.1%} jaccard={r.mean_jaccard:.3f}")
+                print(
+                    f"    {r.config.name:<30} drift={r.zone_drift_rate:.1%} jaccard={r.mean_jaccard:.3f}"
+                )
 
         # Best trade-off (highest Jaccard with compression > 2x)
         good_compression = [r for r in valid if r.compression_ratio >= 2.0]
@@ -1336,7 +1459,11 @@ def export_schema_v1(
     timestamp = datetime.now().isoformat()
 
     # Compute summary statistics
-    jaccards = result.per_prompt_jaccard if result.per_prompt_jaccard else [result.mean_jaccard]
+    jaccards = (
+        result.per_prompt_jaccard
+        if result.per_prompt_jaccard
+        else [result.mean_jaccard]
+    )
     jaccards_sorted = sorted(jaccards)
 
     def percentile(arr, p):
@@ -1347,26 +1474,28 @@ def export_schema_v1(
     # Build per-prompt results
     per_prompt_results = []
     for pm in result.per_prompt_metrics:
-        per_prompt_results.append({
-            "prompt_id": pm.prompt_id,
-            "prompt_text": pm.prompt_text,
-            "prompt_pack": "custom",
-            "jaccard": pm.jaccard,
-            "weighted_jaccard": pm.weighted_jaccard,
-            "rank_correlation": {
-                "spearman": pm.spearman,
-                "kendall": pm.kendall,
-            },
-            "mass_retained": pm.mass_retained,
-            "kl_divergence": pm.kl_divergence,
-            "output_match": pm.output_match,
-            "manifold_zone": {
-                "baseline": pm.baseline_zone,
-                "candidate": pm.candidate_zone,
-                "drift": pm.zone_drift,
-            },
-            "per_step_jaccard": pm.per_step_jaccard,
-        })
+        per_prompt_results.append(
+            {
+                "prompt_id": pm.prompt_id,
+                "prompt_text": pm.prompt_text,
+                "prompt_pack": "custom",
+                "jaccard": pm.jaccard,
+                "weighted_jaccard": pm.weighted_jaccard,
+                "rank_correlation": {
+                    "spearman": pm.spearman,
+                    "kendall": pm.kendall,
+                },
+                "mass_retained": pm.mass_retained,
+                "kl_divergence": pm.kl_divergence,
+                "output_match": pm.output_match,
+                "manifold_zone": {
+                    "baseline": pm.baseline_zone,
+                    "candidate": pm.candidate_zone,
+                    "drift": pm.zone_drift,
+                },
+                "per_step_jaccard": pm.per_step_jaccard,
+            }
+        )
 
     report = {
         "schema_version": "1.0.0",
@@ -1461,9 +1590,9 @@ def export_all_schema_v1(
     output_dir: Path,
 ):
     """Export all results in Schema v1 format."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Exporting Schema v1 reports...")
-    print("="*60)
+    print("=" * 60)
 
     schema_dir = output_dir / "schema_v1"
     schema_dir.mkdir(exist_ok=True)

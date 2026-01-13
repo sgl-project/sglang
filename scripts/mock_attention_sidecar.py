@@ -22,10 +22,10 @@ Example with SGLang server:
 
 import argparse
 import json
-import time
 import signal
 import sys
-from typing import Dict, Any, Optional
+import time
+from typing import Any, Dict, Optional
 
 try:
     import zmq
@@ -97,7 +97,9 @@ class MockAttentionSidecar:
         self.fingerprint_socket.close()
         self.feedback_socket.close()
         self.context.term()
-        print(f"[Sidecar] Stats: {self.fingerprints_received} fingerprints, {self.feedbacks_sent} feedbacks")
+        print(
+            f"[Sidecar] Stats: {self.fingerprints_received} fingerprints, {self.feedbacks_sent} feedbacks"
+        )
 
     def _run_loop(self):
         """Main processing loop."""
@@ -133,7 +135,9 @@ class MockAttentionSidecar:
             self.request_history[request_id].append(data)
 
             if self.verbose:
-                print(f"[Fingerprint] rid={request_id[:8]}... manifold={manifold} vector_len={len(vector)}")
+                print(
+                    f"[Fingerprint] rid={request_id[:8]}... manifold={manifold} vector_len={len(vector)}"
+                )
 
             # Decide if we should send feedback
             feedback = self._compute_feedback(request_id, data)
@@ -151,7 +155,9 @@ class MockAttentionSidecar:
         self.request_seq[request_id] = seq
         return seq
 
-    def _compute_feedback(self, request_id: str, fingerprint: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _compute_feedback(
+        self, request_id: str, fingerprint: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
         """
         Compute feedback based on fingerprint analysis.
 
@@ -205,7 +211,9 @@ class MockAttentionSidecar:
                 "control": {
                     "attention_biases": {
                         str(self.steering_rules["bias_layer"]): {
-                            str(self.steering_rules["bias_token"]): self.steering_rules["bias_value"]
+                            str(self.steering_rules["bias_token"]): self.steering_rules[
+                                "bias_value"
+                            ]
                         }
                     },
                     "hub_tokens": [0, 1, 2],  # Mark first few tokens as hubs
@@ -241,11 +249,7 @@ class MockAttentionSidecar:
             "request_id": request_id,
             "seq": self._get_next_seq(request_id),
             "ts_ms": int(time.time() * 1000),
-            "control": {
-                "attention_biases": {
-                    str(layer_id): {str(token_pos): bias}
-                }
-            },
+            "control": {"attention_biases": {str(layer_id): {str(token_pos): bias}}},
         }
         self._send_feedback(feedback)
         print(f"[Manual] Injected bias: layer={layer_id} token={token_pos} bias={bias}")
@@ -253,12 +257,19 @@ class MockAttentionSidecar:
 
 def main():
     parser = argparse.ArgumentParser(description="Mock Attention Sidecar")
-    parser.add_argument("--fingerprint-port", type=int, default=9001,
-                        help="Port to receive fingerprints (default: 9001)")
-    parser.add_argument("--feedback-port", type=int, default=9002,
-                        help="Port to send feedback (default: 9002)")
-    parser.add_argument("--quiet", action="store_true",
-                        help="Reduce output verbosity")
+    parser.add_argument(
+        "--fingerprint-port",
+        type=int,
+        default=9001,
+        help="Port to receive fingerprints (default: 9001)",
+    )
+    parser.add_argument(
+        "--feedback-port",
+        type=int,
+        default=9002,
+        help="Port to send feedback (default: 9002)",
+    )
+    parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")
     args = parser.parse_args()
 
     sidecar = MockAttentionSidecar(

@@ -14,17 +14,18 @@ The dashboard connects to:
 """
 
 import json
-import time
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List
+
 import numpy as np
 
 try:
-    import streamlit as st
     import plotly.express as px
     import plotly.graph_objects as go
+    import streamlit as st
     from plotly.subplots import make_subplots
 except ImportError:
     print("Please install: pip install streamlit plotly")
@@ -40,6 +41,7 @@ except ImportError:
 # ============================================================================
 # Data Store (shared across Streamlit reruns)
 # ============================================================================
+
 
 @dataclass
 class FingerprintData:
@@ -84,8 +86,9 @@ class DataStore:
             # Update stats
             self.stats["total_received"] += 1
             self.stats["requests_seen"].add(fp.request_id)
-            self.stats["manifold_counts"][fp.manifold] = \
+            self.stats["manifold_counts"][fp.manifold] = (
                 self.stats["manifold_counts"].get(fp.manifold, 0) + 1
+            )
 
     def get_recent(self, n: int = 50) -> List[FingerprintData]:
         with self.lock:
@@ -123,6 +126,7 @@ if "receiver_thread" not in st.session_state:
 # ZMQ Receiver Thread
 # ============================================================================
 
+
 def zmq_receiver_thread(data_store: DataStore, stop_event: threading.Event):
     """Background thread to receive fingerprints via ZMQ."""
     context = zmq.Context()
@@ -154,13 +158,16 @@ def zmq_receiver_thread(data_store: DataStore, stop_event: threading.Event):
 
 def start_receiver():
     """Start the ZMQ receiver thread."""
-    if st.session_state.receiver_thread is None or not st.session_state.receiver_thread.is_alive():
+    if (
+        st.session_state.receiver_thread is None
+        or not st.session_state.receiver_thread.is_alive()
+    ):
         stop_event = threading.Event()
         st.session_state.stop_event = stop_event
         thread = threading.Thread(
             target=zmq_receiver_thread,
             args=(st.session_state.data_store, stop_event),
-            daemon=True
+            daemon=True,
         )
         thread.start()
         st.session_state.receiver_thread = thread
@@ -169,7 +176,7 @@ def start_receiver():
 
 def stop_receiver():
     """Stop the ZMQ receiver thread."""
-    if hasattr(st.session_state, 'stop_event'):
+    if hasattr(st.session_state, "stop_event"):
         st.session_state.stop_event.set()
         st.session_state.zmq_connected = False
 
@@ -177,6 +184,7 @@ def stop_receiver():
 # ============================================================================
 # Visualization Components
 # ============================================================================
+
 
 def create_fingerprint_heatmap(fingerprints: List[FingerprintData]) -> go.Figure:
     """Create a heatmap of recent fingerprints."""
@@ -190,11 +198,13 @@ def create_fingerprint_heatmap(fingerprints: List[FingerprintData]) -> go.Figure
 
     matrix = np.array(vectors)
 
-    fig = go.Figure(data=go.Heatmap(
-        z=matrix,
-        colorscale="Viridis",
-        showscale=True,
-    ))
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=matrix,
+            colorscale="Viridis",
+            showscale=True,
+        )
+    )
 
     fig.update_layout(
         title="Fingerprint Heatmap (recent → oldest)",
@@ -225,29 +235,42 @@ def create_manifold_trajectory(fingerprints: List[FingerprintData]) -> go.Figure
     fig = go.Figure()
 
     # Add trajectory line
-    fig.add_trace(go.Scatter(
-        x=x, y=y,
-        mode='lines+markers',
-        marker=dict(size=8, color=list(range(len(x))), colorscale='Blues'),
-        line=dict(width=1, color='lightgray'),
-        text=[f"Step {fp.step}: {fp.manifold}" for fp in fingerprints if len(fp.vector) >= 2],
-        hoverinfo='text',
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=y,
+            mode="lines+markers",
+            marker=dict(size=8, color=list(range(len(x))), colorscale="Blues"),
+            line=dict(width=1, color="lightgray"),
+            text=[
+                f"Step {fp.step}: {fp.manifold}"
+                for fp in fingerprints
+                if len(fp.vector) >= 2
+            ],
+            hoverinfo="text",
+        )
+    )
 
     # Mark start and end
     if len(x) > 0:
-        fig.add_trace(go.Scatter(
-            x=[x[0]], y=[y[0]],
-            mode='markers',
-            marker=dict(size=15, color='green', symbol='star'),
-            name='Start',
-        ))
-        fig.add_trace(go.Scatter(
-            x=[x[-1]], y=[y[-1]],
-            mode='markers',
-            marker=dict(size=15, color='red', symbol='star'),
-            name='End',
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=[x[0]],
+                y=[y[0]],
+                mode="markers",
+                marker=dict(size=15, color="green", symbol="star"),
+                name="Start",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[x[-1]],
+                y=[y[-1]],
+                mode="markers",
+                marker=dict(size=15, color="red", symbol="star"),
+                name="End",
+            )
+        )
 
     fig.update_layout(
         title="Semantic Manifold Trajectory",
@@ -260,7 +283,9 @@ def create_manifold_trajectory(fingerprints: List[FingerprintData]) -> go.Figure
     return fig
 
 
-def create_dimension_timeseries(fingerprints: List[FingerprintData], dims: List[int] = [0, 1, 2, 3]) -> go.Figure:
+def create_dimension_timeseries(
+    fingerprints: List[FingerprintData], dims: List[int] = [0, 1, 2, 3]
+) -> go.Figure:
     """Create time series of specific dimensions."""
     if not fingerprints:
         return go.Figure()
@@ -271,12 +296,14 @@ def create_dimension_timeseries(fingerprints: List[FingerprintData], dims: List[
         values = [fp.vector[dim] if len(fp.vector) > dim else 0 for fp in fingerprints]
         steps = list(range(len(values)))
 
-        fig.add_trace(go.Scatter(
-            x=steps,
-            y=values,
-            mode='lines',
-            name=f'Dim {dim}',
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=steps,
+                y=values,
+                mode="lines",
+                name=f"Dim {dim}",
+            )
+        )
 
     fig.update_layout(
         title="Fingerprint Dimensions Over Time",
@@ -294,11 +321,15 @@ def create_manifold_pie(stats: dict) -> go.Figure:
     if not counts:
         return go.Figure()
 
-    fig = go.Figure(data=[go.Pie(
-        labels=list(counts.keys()),
-        values=list(counts.values()),
-        hole=0.4,
-    )])
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=list(counts.keys()),
+                values=list(counts.values()),
+                hole=0.4,
+            )
+        ]
+    )
 
     fig.update_layout(
         title="Manifold Zone Distribution",
@@ -311,6 +342,7 @@ def create_manifold_pie(stats: dict) -> go.Figure:
 # ============================================================================
 # Steering Controls
 # ============================================================================
+
 
 def send_steering_command(request_id: str, command: dict):
     """Send a steering command to the scheduler via ZMQ."""
@@ -325,7 +357,7 @@ def send_steering_command(request_id: str, command: dict):
             "request_id": request_id,
             "seq": int(time.time() * 1000),
             "ts_ms": int(time.time() * 1000),
-            **command
+            **command,
         }
 
         socket.send(json.dumps(message).encode(), zmq.NOBLOCK)
@@ -340,6 +372,7 @@ def send_steering_command(request_id: str, command: dict):
 # ============================================================================
 # Main Dashboard
 # ============================================================================
+
 
 def main():
     st.set_page_config(
@@ -425,13 +458,18 @@ def main():
     fingerprints = data_store.get_recent(100)
 
     if not fingerprints:
-        st.info("👆 Click 'Connect to Stream' and send a request with `return_attention_tokens: true`")
+        st.info(
+            "👆 Click 'Connect to Stream' and send a request with `return_attention_tokens: true`"
+        )
 
-        st.code('''
+        st.code(
+            """
 curl http://localhost:8000/v1/chat/completions \\
   -H "Content-Type: application/json" \\
   -d '{"model": "...", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 50, "return_attention_tokens": true}'
-        ''', language="bash")
+        """,
+            language="bash",
+        )
     else:
         # Row 1: Heatmap and Trajectory
         col1, col2 = st.columns(2)

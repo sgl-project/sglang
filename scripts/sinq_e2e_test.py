@@ -9,25 +9,26 @@ Usage:
     python scripts/sinq_e2e_test.py --model Qwen/Qwen3-1.7B --nbits 2 --group-size 128 --tiling-mode 2D
 """
 
-import sys
-import os
-import json
-import gc
 import argparse
+import gc
+import json
+import os
+import sys
 import time
-from typing import List, Set, Dict, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
+from typing import Dict, List, Set, Tuple
 
 # Add SINQ to path
 sys.path.insert(0, "/media/thread/pyth/agentic/attentio/SINQ")
 
-import torch
 import numpy as np
+import torch
 
 
 @dataclass
 class PromptResult:
     """Result for a single prompt comparison."""
+
     prompt: str
     bf16_response: str
     quant_response: str
@@ -46,6 +47,7 @@ class PromptResult:
 @dataclass
 class E2ETestResult:
     """Full E2E test result."""
+
     model: str
     quantization: str
     nbits: int
@@ -148,11 +150,10 @@ class SINQTester:
 
         print(f"\n{'='*60}")
         print(f"Loading BF16 model: {self.model_name}")
-        print("="*60)
+        print("=" * 60)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name,
-            trust_remote_code=True
+            self.model_name, trust_remote_code=True
         )
 
         self.bf16_model = AutoModelForCausalLM.from_pretrained(
@@ -172,13 +173,17 @@ class SINQTester:
         from transformers import AutoModelForCausalLM
 
         print(f"\n{'='*60}")
-        print(f"Quantizing with A-SINQ: {self.nbits}-bit, group_size={self.group_size}, tiling={self.tiling_mode}")
-        print("="*60)
+        print(
+            f"Quantizing with A-SINQ: {self.nbits}-bit, group_size={self.group_size}, tiling={self.tiling_mode}"
+        )
+        print("=" * 60)
 
         # Create temp path for quantized model
         self.quant_path = f"/tmp/sinq-{self.model_name.split('/')[-1]}-{self.nbits}bit-g{self.group_size}-{self.tiling_mode}"
 
-        if os.path.exists(self.quant_path) and os.path.exists(os.path.join(self.quant_path, "model.safetensors.index.json")):
+        if os.path.exists(self.quant_path) and os.path.exists(
+            os.path.join(self.quant_path, "model.safetensors.index.json")
+        ):
             print(f"Using cached quantized model at: {self.quant_path}")
             return self.quant_path
 
@@ -203,7 +208,9 @@ class SINQTester:
 
         # Quantize using AutoSINQHFModel.quantize_model class method
         print(f"Applying A-SINQ quantization...")
-        print(f"  nbits={self.nbits}, group_size={self.group_size}, tiling={self.tiling_mode}")
+        print(
+            f"  nbits={self.nbits}, group_size={self.group_size}, tiling={self.tiling_mode}"
+        )
         AutoSINQHFModel.quantize_model(
             model_to_quant,
             self.tokenizer,
@@ -234,7 +241,7 @@ class SINQTester:
 
         print(f"\n{'='*60}")
         print(f"Loading quantized model from: {self.quant_path}")
-        print("="*60)
+        print("=" * 60)
 
         self.quant_model = AutoSINQHFModel.from_quantized_safetensors(
             self.quant_path,
@@ -245,10 +252,7 @@ class SINQTester:
         return get_gpu_memory_mb()
 
     def _generate_with_attention(
-        self,
-        model,
-        prompt: str,
-        capture_attention: bool = True
+        self, model, prompt: str, capture_attention: bool = True
     ) -> Tuple[str, List[List[int]]]:
         """Generate text and capture TopK attention positions."""
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
@@ -276,7 +280,7 @@ class SINQTester:
 
         # Extract TopK attention positions
         topk_positions = []
-        if capture_attention and hasattr(outputs, 'attentions') and outputs.attentions:
+        if capture_attention and hasattr(outputs, "attentions") and outputs.attentions:
             for step_attns in outputs.attentions:
                 if step_attns:
                     last_layer = step_attns[-1]  # (batch, heads, seq, seq)
@@ -287,9 +291,7 @@ class SINQTester:
         return generated_text, topk_positions
 
     def _compare_attention(
-        self,
-        bf16_positions: List[List[int]],
-        quant_positions: List[List[int]]
+        self, bf16_positions: List[List[int]], quant_positions: List[List[int]]
     ) -> Dict:
         """Compare attention patterns between models."""
         min_len = min(len(bf16_positions), len(quant_positions))
@@ -331,7 +333,7 @@ class SINQTester:
         # Phase 2: Run BF16 inference
         print(f"\n{'='*60}")
         print("Running BF16 inference...")
-        print("="*60)
+        print("=" * 60)
 
         bf16_results = []
         for prompt in prompts:
@@ -355,7 +357,7 @@ class SINQTester:
         # Phase 5: Run quantized inference
         print(f"\n{'='*60}")
         print("Running quantized inference...")
-        print("="*60)
+        print("=" * 60)
 
         quant_results = []
         for prompt in prompts:
@@ -364,7 +366,7 @@ class SINQTester:
             text, positions = self._generate_with_attention(
                 self.quant_model,
                 prompt,
-                capture_attention=False  # SINQ doesn't support attention output
+                capture_attention=False,  # SINQ doesn't support attention output
             )
             quant_results.append({"text": text, "positions": positions})
             print(f"  Response: {text[:60]}...")
@@ -372,7 +374,7 @@ class SINQTester:
         # Phase 6: Compare results
         print(f"\n{'='*60}")
         print("Comparing attention patterns...")
-        print("="*60)
+        print("=" * 60)
 
         prompt_results = []
         for i, prompt in enumerate(prompts):
@@ -381,8 +383,7 @@ class SINQTester:
 
             # Compare attention
             attn_comparison = self._compare_attention(
-                bf16["positions"],
-                quant["positions"]
+                bf16["positions"], quant["positions"]
             )
 
             # Compute response match
@@ -426,7 +427,9 @@ class SINQTester:
 
         # Compute overall metrics
         overall_jaccard = np.mean([r.mean_jaccard for r in prompt_results])
-        pass_rate = sum(1 for r in prompt_results if r.status == "PASS") / len(prompt_results)
+        pass_rate = sum(1 for r in prompt_results if r.status == "PASS") / len(
+            prompt_results
+        )
 
         # Cleanup
         del self.quant_model
@@ -460,11 +463,13 @@ def print_summary(result: E2ETestResult):
     """Print test summary."""
     print(f"\n{'='*70}")
     print("E2E TEST SUMMARY")
-    print("="*70)
+    print("=" * 70)
 
     print(f"\nModel: {result.model}")
     print(f"Quantization: {result.quantization}")
-    print(f"Config: {result.nbits}-bit, group_size={result.group_size}, tiling={result.tiling_mode}")
+    print(
+        f"Config: {result.nbits}-bit, group_size={result.group_size}, tiling={result.tiling_mode}"
+    )
     print(f"\nMemory:")
     print(f"  BF16: {result.bf16_memory_mb:.1f} MB")
     print(f"  Quantized: {result.quant_memory_mb:.1f} MB")
@@ -478,7 +483,7 @@ def print_summary(result: E2ETestResult):
     tier_colors = {
         "EXCELLENT": "\033[92m",  # Green
         "ACCEPTABLE": "\033[93m",  # Yellow
-        "POOR": "\033[91m",       # Red
+        "POOR": "\033[91m",  # Red
     }
     reset = "\033[0m"
     color = tier_colors.get(result.quality_tier, "")
@@ -486,30 +491,41 @@ def print_summary(result: E2ETestResult):
 
     print(f"\nPer-Prompt Results:")
     for r in result.results:
-        status_color = "\033[92m" if r["status"] == "PASS" else "\033[93m" if r["status"] == "WARN" else "\033[91m"
-        print(f"  {r['prompt'][:40]:40} | {r['mean_jaccard']:.1%} | {status_color}[{r['status']}]{reset}")
+        status_color = (
+            "\033[92m"
+            if r["status"] == "PASS"
+            else "\033[93m" if r["status"] == "WARN" else "\033[91m"
+        )
+        print(
+            f"  {r['prompt'][:40]:40} | {r['mean_jaccard']:.1%} | {status_color}[{r['status']}]{reset}"
+        )
         print(f"    Response match: {r['response_match']:.1%}")
 
     print(f"\nTest duration: {result.test_duration_seconds:.1f}s")
-    print("="*70)
+    print("=" * 70)
 
 
 def main():
     parser = argparse.ArgumentParser(description="SINQ E2E Quantization Test")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B",
-                       help="Model to test")
-    parser.add_argument("--nbits", type=int, default=2,
-                       help="Quantization bits (1, 2, 3, 4, 5, 6, 8)")
-    parser.add_argument("--group-size", type=int, default=128,
-                       help="Group size (32, 64, 128, 256)")
-    parser.add_argument("--tiling-mode", type=str, default="2D",
-                       help="Tiling mode (1D, 2D)")
-    parser.add_argument("--device", type=str, default="cuda:0",
-                       help="Device to use")
-    parser.add_argument("--output", type=str, default=None,
-                       help="Output JSON file path")
-    parser.add_argument("--prompts", type=str, nargs="+", default=None,
-                       help="Custom prompts to test")
+    parser.add_argument(
+        "--model", type=str, default="Qwen/Qwen3-1.7B", help="Model to test"
+    )
+    parser.add_argument(
+        "--nbits", type=int, default=2, help="Quantization bits (1, 2, 3, 4, 5, 6, 8)"
+    )
+    parser.add_argument(
+        "--group-size", type=int, default=128, help="Group size (32, 64, 128, 256)"
+    )
+    parser.add_argument(
+        "--tiling-mode", type=str, default="2D", help="Tiling mode (1D, 2D)"
+    )
+    parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
+    parser.add_argument(
+        "--output", type=str, default=None, help="Output JSON file path"
+    )
+    parser.add_argument(
+        "--prompts", type=str, nargs="+", default=None, help="Custom prompts to test"
+    )
 
     args = parser.parse_args()
 
@@ -550,7 +566,10 @@ def main():
     print_summary(result)
 
     # Save results
-    output_path = args.output or f"/tmp/sinq_e2e_{args.nbits}bit_g{args.group_size}_{args.tiling_mode}.json"
+    output_path = (
+        args.output
+        or f"/tmp/sinq_e2e_{args.nbits}bit_g{args.group_size}_{args.tiling_mode}.json"
+    )
 
     # Convert to UI-compatible format
     ui_result = {
@@ -563,7 +582,9 @@ def main():
             {
                 "prompt": r["prompt"],
                 "bf16Response": r["bf16_response"],
-                "int4Response": r["quant_response"],  # Using int4Response for compatibility
+                "int4Response": r[
+                    "quant_response"
+                ],  # Using int4Response for compatibility
                 "mean_jaccard": r["mean_jaccard"],
                 "min_jaccard": r["min_jaccard"],
                 "max_jaccard": r["max_jaccard"],
@@ -585,7 +606,7 @@ def main():
             "quant_memory_mb": result.quant_memory_mb,
             "compression_ratio": result.compression_ratio,
             "test_duration_seconds": result.test_duration_seconds,
-        }
+        },
     }
 
     with open(output_path, "w") as f:
