@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include "pytorch_extension_utils.h"
+#include "utils.cuh"
 
 constexpr int NUM_LOCAL_HEADS = 128;
 constexpr int QK_NOPE_HEAD_DIM = 128;
@@ -12,67 +13,64 @@ constexpr int K_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM;
 constexpr int HEAD_CHUNK_SIZE = 16;
 constexpr int NUM_HEAD_CHUNKS = NUM_LOCAL_HEADS / HEAD_CHUNK_SIZE;
 
-__forceinline__ __device__ int get_lane_id() {
-  int lane_id;
-  asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
-  return lane_id;
-}
-
-int ceil_div(int a, int b) {
-  return (a + b - 1) / b;
-}
-
 __global__ void concat_mla_k_kernel(
-    nv_bfloat16* k,
-    nv_bfloat16* k_nope,
-    nv_bfloat16* k_rope,
+    nv_bfloat16* __restrict__ k,
+    const nv_bfloat16* __restrict__ k_nope,
+    const nv_bfloat16* __restrict__ k_rope,
     const int num_tokens,
-    const int k_stride_0,
+    const int64_t k_stride_0,
     const int k_stride_1,
-    const int k_nope_stride_0,
+    const int64_t k_nope_stride_0,
     const int k_nope_stride_1,
-    const int k_rope_stride_0) {
+    const int64_t k_rope_stride_0) {
   const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
   const int token_id = flat_warp_id / NUM_HEAD_CHUNKS;
   const int head_chunk_id = flat_warp_id % NUM_HEAD_CHUNKS;
   const int lane_id = get_lane_id();
+  if (token_id >= num_tokens) return;
 
-  if (token_id >= num_tokens) {
-    return;
-  }
+  using NopeVec = int2;  // 8B/thread，32 thread = 256B/row
+  using RopeVec = int;   // 4B/thread，32 thread = 128B/row
+  static_assert(sizeof(NopeVec) * 32 == QK_NOPE_HEAD_DIM * sizeof(nv_bfloat16), "nope vec mismatch");
+  static_assert(sizeof(RopeVec) * 32 == QK_ROPE_HEAD_DIM * sizeof(nv_bfloat16), "rope vec mismatch");
 
-  using KNopeBufType = int2;
-  static_assert(sizeof(KNopeBufType) == QK_NOPE_HEAD_DIM * sizeof(k[0]) / 32);
-  KNopeBufType k_nope_buf[HEAD_CHUNK_SIZE];
+  const int head_row0 = head_chunk_id * HEAD_CHUNK_SIZE;
 
-  using KRopeBufType = int;
-  static_assert(sizeof(KRopeBufType) == QK_ROPE_HEAD_DIM * sizeof(k[0]) / 32);
-  KRopeBufType k_rope_buf;
+  const int2* __restrict__ nope_src =
+      reinterpret_cast<const int2*>(k_nope + token_id * k_nope_stride_0 + head_row0 * k_nope_stride_1) + lane_id;
 
-  {
-    const int* base_addr = reinterpret_cast<int*>(k_rope + token_id * k_rope_stride_0);
-    k_rope_buf = *(base_addr + lane_id);
-  }
+  int2* __restrict__ nope_dst = reinterpret_cast<int2*>(k + token_id * k_stride_0 + head_row0 * k_stride_1) + lane_id;
+
+  int* __restrict__ rope_dst =
+      reinterpret_cast<int*>(k + token_id * k_stride_0 + head_row0 * k_stride_1 + QK_NOPE_HEAD_DIM) + lane_id;
+
+  const int nope_src_stride_v = (k_nope_stride_1 >> 2);  // int2 covers 4 bf16
+  const int nope_dst_stride_v = (k_stride_1 >> 2);
+  const int rope_dst_stride_v = (k_stride_1 >> 1);  // int covers 2 bf16
+
+  const int* rope_base = reinterpret_cast<const int*>(k_rope + token_id * k_rope_stride_0);
+  const RopeVec rope_val = ld_na_global_v1(rope_base + lane_id);
+
+  prefetch_L2(nope_src);
+  NopeVec cur = ld_na_global_v2(nope_src);
 
 #pragma unroll
   for (int i = 0; i < HEAD_CHUNK_SIZE; ++i) {
-    const int head_id = head_chunk_id * HEAD_CHUNK_SIZE + i;
-    const int2* base_addr = reinterpret_cast<int2*>(k_nope + token_id * k_nope_stride_0 + head_id * k_nope_stride_1);
-    k_nope_buf[i] = *(base_addr + lane_id);
-  }
-
-#pragma unroll
-  for (int i = 0; i < HEAD_CHUNK_SIZE; ++i) {
-    const int head_id = head_chunk_id * HEAD_CHUNK_SIZE + i;
-
-    {
-      int2* base_addr = reinterpret_cast<int2*>(k + token_id * k_stride_0 + head_id * k_stride_1);
-      *(base_addr + lane_id) = k_nope_buf[i];
+    NopeVec next;
+    if (i + 1 < HEAD_CHUNK_SIZE) {
+      const int2* next_src = nope_src + nope_src_stride_v;
+      prefetch_L2(next_src);
+      next = ld_na_global_v2(next_src);
     }
-    {
-      int* base_addr = reinterpret_cast<int*>(k + token_id * k_stride_0 + head_id * k_stride_1 + QK_NOPE_HEAD_DIM);
-      *(base_addr + lane_id) = k_rope_buf;
-    }
+
+    st_na_global_v2(nope_dst, cur);
+    st_na_global_v1(rope_dst, rope_val);
+
+    nope_src += nope_src_stride_v;
+    nope_dst += nope_dst_stride_v;
+    rope_dst += rope_dst_stride_v;
+
+    cur = next;
   }
 }
 
@@ -128,11 +126,11 @@ __global__ void concat_mla_absorb_q_kernel(
     nv_bfloat16* out,
     const int num_items,
     const int dim_1,
-    const int a_stride_0,
+    const int64_t a_stride_0,
     const int a_stride_1,
-    const int b_stride_0,
+    const int64_t b_stride_0,
     const int b_stride_1,
-    const int out_stride_0,
+    const int64_t out_stride_0,
     const int out_stride_1) {
   const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
   const int lane_id = get_lane_id();

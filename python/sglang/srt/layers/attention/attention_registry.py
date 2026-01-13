@@ -1,3 +1,14 @@
+import logging
+from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
+
+
+if TYPE_CHECKING:
+    # evade circular imports
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
 ATTENTION_BACKENDS = {}
 
 
@@ -23,7 +34,9 @@ def create_flashinfer_backend(runner):
                 or not runner.plan_stream_for_flashinfer
             ):
                 runner.plan_stream_for_flashinfer = torch.cuda.Stream()
-        return FlashInferAttnBackend(runner)
+        return FlashInferAttnBackend(
+            runner, init_new_workspace=runner.init_new_workspace
+        )
     else:
         from sglang.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,
@@ -57,9 +70,18 @@ def create_wave_backend(runner):
 
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
-    from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
+    from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+        AscendAttnBackend,
+    )
 
     return AscendAttnBackend(runner)
+
+
+@register_attention_backend("nsa")
+def create_nsa_backend(runner):
+    from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+
+    return NativeSparseAttnBackend(runner)
 
 
 @register_attention_backend("triton")
@@ -118,9 +140,6 @@ def create_flashattention_v3_backend(runner):
 
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
-    assert (
-        runner.use_mla_backend
-    ), "FlashAttention v4 Support is at an early stage, only MLA model supported now"
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 
     return FlashAttentionBackend(runner, fa_impl_ver=4)
@@ -158,35 +177,56 @@ def create_dual_chunk_flash_attn_backend(runner):
     return DualChunkFlashAttentionBackend(runner)
 
 
-@register_attention_backend("hybrid_linear_attn")
-def create_hybrid_linear_attn_backend(runner):
-    assert (
-        runner.is_hybrid_gdn
-    ), "hybrid_linear_attn backend can only be used with hybrid GDN models."
-    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-        HybridLinearAttnBackend,
-        MambaAttnBackend,
-    )
-    from sglang.srt.utils import is_blackwell, is_npu
+def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
+    """
+    Wrapper for special models like hybrid GDN, so we don't
+    need to change the code of the original attention backend.
+    """
+    assert not (
+        runner.hybrid_gdn_config is not None and runner.use_mla_backend
+    ), "hybrid_gdn can only be used with non-MLA models."
 
-    if is_npu():
-        from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
+    if cfg := runner.mambaish_config:
+        from sglang.srt.layers.attention.fla.utils import check_environments
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            GDNAttnBackend,
+            HybridLinearAttnBackend,
+            KimiLinearAttnBackend,
+            Mamba2AttnBackend,
+        )
+        from sglang.srt.utils import is_blackwell, is_npu
 
-        full_attn_backend = AscendAttnBackend(runner)
-    elif is_blackwell():
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-
-        full_attn_backend = TritonAttnBackend(runner)
-    else:
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionBackend,
+        check_environments()
+        if runner.hybrid_gdn_config is not None:
+            if is_blackwell():
+                assert (
+                    runner.server_args.attention_backend == "triton"
+                    or runner.server_args.attention_backend == "trtllm_mha"
+                ), "triton or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend."
+            if is_npu():
+                assert (
+                    runner.server_args.attention_backend == "ascend"
+                ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
+            logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
+            linear_attn_backend = GDNAttnBackend(runner)
+        elif runner.mamba2_config is not None:
+            linear_attn_backend = Mamba2AttnBackend(runner)
+        elif runner.kimi_linear_config is not None:
+            linear_attn_backend = KimiLinearAttnBackend(runner)
+        else:
+            raise ValueError(
+                "Expected hybrid GDN or NemotronH models, but got unknown model."
+            )
+        full_attn_layers = cfg.full_attention_layer_ids
+        return HybridLinearAttnBackend(
+            full_attn_backend, linear_attn_backend, full_attn_layers
         )
 
-        full_attn_backend = FlashAttentionBackend(runner)
+    return full_attn_backend
 
-    linear_attn_backend = MambaAttnBackend(runner)
-    full_attn_layers = runner.model_config.hf_config.full_attention_layer_ids
 
-    return HybridLinearAttnBackend(
-        full_attn_backend, linear_attn_backend, full_attn_layers
-    )
+@register_attention_backend("intel_xpu")
+def create_intel_xpu_backend(runner):
+    from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+    return XPUAttentionBackend(runner)

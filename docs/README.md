@@ -1,5 +1,7 @@
 # SGLang Documentation
 
+This is the documentation website for the SGLang project (https://github.com/sgl-project/sglang).
+
 We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase.
 Most documentation files are located under the `docs/` folder.
 
@@ -51,5 +53,5 @@ pre-commit run --all-files
 - Keep in mind the documentation execution time when writing interactive Jupyter notebooks. Each interactive notebook will be run and compiled against every commit to ensure they are runnable, so it is important to apply some tips to reduce the documentation compilation time:
   - Use small models (e.g., `qwen/qwen2.5-0.5b-instruct`) for most cases to reduce server launch time.
   - Reuse the launched server as much as possible to reduce server launch time.
-- Do not use absolute links (e.g., `https://docs.sglang.ai/get_started/install.html`). Always prefer relative links (e.g., `../get_started/install.md`).
+- Do not use absolute links (e.g., `https://docs.sglang.io/get_started/install.html`). Always prefer relative links (e.g., `../get_started/install.md`).
 - Follow the existing examples to learn how to launch a server, send a query and other common styles.
