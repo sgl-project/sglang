@@ -1,37 +1,21 @@
 import logging
-from typing import List, Optional
+from typing import Optional
 
-import numpy as np
 import torch
 import triton
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
-from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.common import alloc_token_slots
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.constrained.llguidance_backend import GuidanceBackend
-
-from sglang.srt.mem_cache.common import (
-    alloc_for_decode,
-    alloc_for_extend,
-    evict_from_tree_cache,
-    release_kv_cache,
-    alloc_token_slots
-)
-from sglang.srt.speculative.spec_utils import (
-    TREE_SPEC_KERNEL_AVAILABLE,
-    assign_req_to_token_pool,
-    get_src_tgt_cache_loc,
-    get_target_cache_loc,
-)
+from sglang.srt.speculative.spec_utils import assign_req_to_token_pool
 
 logger = logging.getLogger(__name__)
 
 USE_FULL_MASK = True
+
 
 class LlguidanceWorker:
     def __init__(
@@ -49,22 +33,22 @@ class LlguidanceWorker:
     def clear_cache_pool(self):
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch, **kwargs) -> GenerationBatchResult:
+    def forward_batch_generation(
+        self, batch: ScheduleBatch, **kwargs
+    ) -> GenerationBatchResult:
         # Update fields
         to_process_output_ids = not batch.forward_mode.is_extend()
         self._prepare_for_decode(batch)
 
         model_worker_batch = batch.get_model_worker_batch()
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch
-        )               
+        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
 
         if to_process_output_ids:
             logits_output, next_token_ids, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
                 batch_result.can_run_cuda_graph,
-            ) 
+            )
             next_token_ids_cpu = next_token_ids.cpu()
             for i, req in enumerate(batch.reqs):
                 if req.grammar:
@@ -76,7 +60,7 @@ class LlguidanceWorker:
             batch.forward_mode = ForwardMode.DECODE
 
         return batch_result
-    
+
     def _prepare_for_decode(self, batch: ScheduleBatch):
         if not batch.forward_mode.is_extend():
             ff_tokens_list = []
@@ -111,7 +95,7 @@ class LlguidanceWorker:
                     req.kv_committed_len += len(ff_tokens) + 1
                     req.kv_allocated_len = req.kv_committed_len
 
-                    # batch.seq_lens[i] += len(ff_tokens)                    
+                    # batch.seq_lens[i] += len(ff_tokens)
                     batch.prefix_lens[i] = batch.seq_lens_cpu[i].item()
                     batch.extend_lens[i] = len(ff_tokens) + 1
                     batch.extend_num_tokens += len(ff_tokens) + 1
@@ -121,7 +105,9 @@ class LlguidanceWorker:
 
                     end_seq_lens[i] += len(ff_tokens) + 1
 
-                batch.out_cache_loc = alloc_token_slots(batch.tree_cache, len(new_input_ids))
+                batch.out_cache_loc = alloc_token_slots(
+                    batch.tree_cache, len(new_input_ids)
+                )
                 assign_req_to_token_pool[(bs,)](
                     batch.req_pool_indices,
                     batch.req_to_token_pool.req_to_token,
@@ -134,11 +120,17 @@ class LlguidanceWorker:
 
                 batch.seq_lens = end_seq_lens
                 batch.seq_lens_sum += len(new_input_ids)
-                batch.input_ids = torch.asarray(new_input_ids, dtype=batch.input_ids.dtype, device=batch.input_ids.device)
+                batch.input_ids = torch.asarray(
+                    new_input_ids,
+                    dtype=batch.input_ids.dtype,
+                    device=batch.input_ids.device,
+                )
                 batch.forward_mode = ForwardMode.EXTEND
             else:
                 # batch.out_cache_loc = alloc_for_decode(batch, token_per_req=1)
-                batch.out_cache_loc = alloc_token_slots(batch.tree_cache, len(batch.input_ids))
+                batch.out_cache_loc = alloc_token_slots(
+                    batch.tree_cache, len(batch.input_ids)
+                )
                 assign_req_to_token_pool[(bs,)](
                     batch.req_pool_indices,
                     batch.req_to_token_pool.req_to_token,
@@ -151,7 +143,7 @@ class LlguidanceWorker:
 
                 for req in batch.reqs:
                     req.kv_committed_len += 1
-                    req.kv_allocated_len += 1            
+                    req.kv_allocated_len += 1
 
                 # Update seq_lens after allocation
                 if batch.enable_overlap:

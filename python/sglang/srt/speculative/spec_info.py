@@ -46,7 +46,7 @@ class SpeculativeAlgorithm(Enum):
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
-    
+
     def is_llguidance(self) -> bool:
         return self == SpeculativeAlgorithm.LLGUIDANCE
 
