@@ -20,7 +20,6 @@ Author: SGLang Team
 """
 
 import argparse
-import json
 import sys
 from typing import List, Optional
 
@@ -39,7 +38,6 @@ from sglang.srt.mem_cache.token_importance import (
     ImportanceResult,
     SmartTruncator,
     TokenImportanceScorer,
-    compute_importance_from_attention,
 )
 
 

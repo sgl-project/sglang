@@ -271,7 +271,7 @@ class FingerprintMonitor:
     def _start_prometheus_server(self):
         """Start HTTP server for Prometheus metrics."""
         try:
-            from http.server import HTTPServer, BaseHTTPRequestHandler
+            from http.server import BaseHTTPRequestHandler, HTTPServer
         except ImportError:
             print("[Monitor] http.server not available for Prometheus mode")
             return
