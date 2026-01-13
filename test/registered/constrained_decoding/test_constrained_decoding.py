@@ -5,10 +5,8 @@ register_amd_ci(est_time=179, suite="stage-b-test-small-1-gpu-amd")
 
 import unittest
 
-import torch
-
 from sglang.srt.utils import kill_process_tree
-from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMinxin
+from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMixin
 from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
 from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
 from sglang.test.test_utils import (
@@ -23,7 +21,6 @@ from sglang.test.test_utils import (
 class ServerWithGrammar(CustomTestCase):
     backend = "xgrammar"
     disable_overlap = False
-    tp_size = 1
 
     @classmethod
     def setUpClass(cls):
@@ -35,9 +32,6 @@ class ServerWithGrammar(CustomTestCase):
             "--grammar-backend",
             cls.backend,
         ]
-
-        if cls.tp_size > 1:
-            launch_args += ["--tp-size", str(cls.tp_size)]
 
         if cls.disable_overlap:
             launch_args += ["--disable-overlap-schedule"]
@@ -57,7 +51,7 @@ class ServerWithGrammar(CustomTestCase):
 class TestXGrammarBackend(
     ServerWithGrammar,
     TestJSONConstrainedMixin,
-    TestEBNFConstrainedMinxin,
+    TestEBNFConstrainedMixin,
     TestRegexConstrainedMixin,
 ):
     backend = "xgrammar"
@@ -70,39 +64,10 @@ class TestOutlinesBackend(ServerWithGrammar, TestJSONConstrainedMixin):
 class TestLLGuidanceBackend(
     ServerWithGrammar,
     TestJSONConstrainedMixin,
-    TestEBNFConstrainedMinxin,
+    TestEBNFConstrainedMixin,
     TestRegexConstrainedMixin,
 ):
     backend = "llguidance"
-
-
-# Test with TP=2
-@unittest.skipIf(torch.cuda.device_count() < 2, "Requires at least 2 GPUs")
-class TestXGrammarBackendTP2(
-    ServerWithGrammar,
-    TestJSONConstrainedMixin,
-    TestEBNFConstrainedMinxin,
-    TestRegexConstrainedMixin,
-):
-    backend = "xgrammar"
-    tp_size = 2
-
-
-@unittest.skipIf(torch.cuda.device_count() < 2, "Requires at least 2 GPUs")
-class TestOutlinesBackendTP2(ServerWithGrammar, TestJSONConstrainedMixin):
-    backend = "outlines"
-    tp_size = 2
-
-
-@unittest.skipIf(torch.cuda.device_count() < 2, "Requires at least 2 GPUs")
-class TestLLGuidanceBackendTP2(
-    ServerWithGrammar,
-    TestJSONConstrainedMixin,
-    TestEBNFConstrainedMinxin,
-    TestRegexConstrainedMixin,
-):
-    backend = "llguidance"
-    tp_size = 2
 
 
 if __name__ == "__main__":

@@ -418,7 +418,7 @@ def initialize_model_parallel(
 
         PROCESS_GROUP = _DummyProcessGroup()
     else:
-        # Build yunchang SP sub-groups based on the true SP groups. This is
+        # Build SGLang Diffusion SP sub-groups based on the true SP groups. This is
         # critical when TP>1, because SP groups may be strided in global ranks
         # (e.g., tp-sp order).
         sp_groups = rank_generator.get_ranks("sp")
@@ -633,8 +633,6 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     This method is for draft workers of speculative decoding to run draft model
     with different tp degree from that of target model workers.
 
-    Args:
-        tp_group (GroupCoordinator): the tp group coordinator
     """
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
