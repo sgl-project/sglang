@@ -360,9 +360,13 @@ impl RoutingMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ManualAssignmentMode {
+    /// Random selection (default)
     #[default]
     Random,
+    /// Select worker with minimum running requests
     MinLoad,
+    /// Select worker with minimum active routing keys
+    MinGroup,
 }
 
 /// Policy configuration for routing
