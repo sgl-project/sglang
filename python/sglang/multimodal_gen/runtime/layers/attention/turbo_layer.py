@@ -13,6 +13,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    ForwardContext,
+    get_forward_context,
+)
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.utils import get_compute_dtype
@@ -183,7 +187,7 @@ class DistributedAttention(torch.nn.Module):
         self.stream = None
 
     def forward(
-        self, query: Tensor, key: Tensor, value: Tensor, *args: Any, **kwargs
+        self, query: Tensor, key: Tensor, value: Tensor, ctx_attn_metadata
     ) -> Tensor:
         """forward
 
@@ -191,22 +195,21 @@ class DistributedAttention(torch.nn.Module):
             query (Tensor): query input to the layer
             key (Tensor): key input to the layer
             value (Tensor): value input to the layer
-            args: other args
 
         Returns:
             * output (Tensor): context output
         """
         if self.pg is None:
-            return self.local_attn(query, key, value, *args, **kwargs)
+            return self.local_attn(query, key, value, ctx_attn_metadata)
         pg_size = dist.get_world_size(self.pg)
         if pg_size < 2:
-            return self.local_attn(query, key, value, *args, **kwargs)
+            return self.local_attn(query, key, value, ctx_attn_metadata)
 
         query_layer, key_layer, value_layer = _SeqAllToAllQKV.apply(
             self.pg, query, key, value, pg_size, self.stream, True
         )
         context_layer = self.local_attn(
-            query_layer, key_layer, value_layer, *args, **kwargs
+            query_layer, key_layer, value_layer, ctx_attn_metadata
         )
 
         output = _SeqAllToAll.apply(self.pg, context_layer, False)
@@ -247,5 +250,7 @@ class MinimalA2AAttnOp(DistributedAttention):
     def forward(
         self, query: Tensor, key: Tensor, value: Tensor, *args: Any, **kwargs
     ) -> Tensor:
-        results = super().forward(query, key, value, *args, **kwargs)
+        forward_context: ForwardContext = get_forward_context()
+        ctx_attn_metadata = forward_context.attn_metadata
+        results = super().forward(query, key, value, ctx_attn_metadata)
         return rearrange(results, "b ... h l -> b ... (h l)")

@@ -312,6 +312,7 @@ class WanTransformerBlock(nn.Module):
             self.attn1 = MinimalA2AAttnOp(
                 num_heads=divide(num_heads, get_tensor_model_parallel_world_size()),
                 head_size=dim // num_heads,
+                attention_type=attention_type,
                 topk=sla_topk,
                 supported_attention_backends={AttentionBackendEnum.SLA_ATTN},
             )

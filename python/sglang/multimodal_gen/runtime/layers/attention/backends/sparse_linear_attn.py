@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 class SparseLinearAttentionBackend(AttentionBackend):
@@ -78,7 +81,7 @@ class SparseLinearAttentionMetadataBuilder(AttentionMetadataBuilder):
         )
 
 
-class SparseLinearAttentionImpl(AttentionImpl):
+class SparseLinearAttentionImpl(AttentionImpl, nn.Module):
     """Implementation of sparse linear attention for the backend."""
 
     def __init__(
@@ -150,53 +153,51 @@ class SparseLinearAttentionImpl(AttentionImpl):
 
     def forward(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: SparseLinearAttentionMetadata = None,
     ) -> torch.Tensor:
         """Forward pass for sparse linear attention.
 
         Args:
-            q: query tensor of shape (B, H, L, D)
-            k: key tensor of shape (B, H, L, D)
-            v: value tensor of shape (B, H, L, D)
-
+            query: query tensor of shape (B, H, L, D)
+            key: key tensor of shape (B, H, L, D)
+            value: value tensor of shape (B, H, L, D)
+            attn_metadata: attention metadata containing configuration
         Returns:
             output tensor of shape (B, H, L, D)
         """
-        dtype = q.dtype
-
-        # Determine computation dtype
-        compute_dtype = torch.bfloat16 if self.use_bf16 else torch.float16
+        dtype = query.dtype
 
         # Transpose for computation
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
+        query = query.transpose(1, 2).contiguous()
+        key = key.transpose(1, 2).contiguous()
+        value = value.transpose(1, 2).contiguous()
 
         # Get sparse attention map
         sparse_map, lut, real_topk = get_block_map(
-            q, k, topk_ratio=self.topk_ratio, BLKQ=self.BLKQ, BLKK=self.BLKK
+            query, key, topk_ratio=self.topk_ratio, BLKQ=self.BLKQ, BLKK=self.BLKK
         )
 
         # Convert to computation dtype
-        q = q.to(compute_dtype)
-        k = k.to(compute_dtype)
-        v = v.to(compute_dtype)
+        query = query.to(self.dtype)
+        key = key.to(self.dtype)
+        value = value.to(self.dtype)
 
         # Sparse attention computation
         o_s = _attention.apply(
-            q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK
+            query, key, value, sparse_map, lut, real_topk, self.BLKQ, self.BLKK
         )
 
         # Apply feature maps
-        q = self.feature_map_q(q).contiguous().to(compute_dtype)  # c_q
-        k = self.feature_map_k(k).contiguous().to(compute_dtype)  # c_k
+        query = self.feature_map_q(query).contiguous().to(self.dtype)  # c_q
+        key = self.feature_map_k(key).contiguous().to(self.dtype)  # c_k
         # Linear attention computation
-        o_l = self._torch_calc_linear(q, k, v)
+        o_l = self._calc_linear_attention_with_torch(query, key, value)
 
         # Apply projection and combine results
-        with torch.amp.autocast("cuda", dtype=compute_dtype):
+        with torch.amp.autocast("cuda", dtype=self.dtype):
             o_l = self.proj_l(o_l)
 
         # Combine sparse and linear attention
