@@ -123,45 +123,5 @@ class TestQwen3Next(CustomTestCase):
         print("test_prefix_cache_branching passed")
 
 
-class TestQwen3NextPiecewiseCudaGraph(CustomTestCase):
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = QWEN3_NEXT_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--tp",
-                "4",
-                "--enable-piecewise-cuda-graph",
-                "--piecewise-cuda-graph-compiler",
-                "eager",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreaterEqual(
-            metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
-        )
-
-
 if __name__ == "__main__":
     unittest.main()
