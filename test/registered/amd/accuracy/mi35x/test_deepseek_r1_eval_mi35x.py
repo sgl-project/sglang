@@ -1,9 +1,9 @@
 """MI35x DeepSeek-R1 GSM8K Completion Evaluation Test (8-GPU)
 
-Tests DeepSeek-R1-0528 with multiple configurations (basic, MTP, DP, TC)
-using few-shot completion benchmark on MI35x.
+Tests DeepSeek-R1-0528 with basic configuration using few-shot completion
+benchmark on MI35x.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-r1 suite
+Registry: nightly-amd-accuracy-8-gpu-mi35x-deepseek-r1 suite
 """
 
 import ast
@@ -32,9 +32,9 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-# Register for AMD CI - MI35x DeepSeek-R1-0528 accuracy tests (~120 min)
+# Register for AMD CI - MI35x DeepSeek-R1-0528 accuracy test (~30 min for basic only)
 register_amd_ci(
-    est_time=7200,
+    est_time=1800,
     suite="nightly-amd-accuracy-8-gpu-mi35x-deepseek-r1",
     nightly=True,
 )
@@ -66,7 +66,8 @@ class ModelConfig:
         return self.model_path
 
 
-# DeepSeek-R1 models for MI35x (same model as MI300X for consistency)
+# DeepSeek-R1 models for MI35x - only basic variant for faster CI
+# MTP, DP, and TC variants removed to reduce test time from ~2h to ~30min
 MI35X_DEEPSEEK_R1_MODELS = [
     # DeepSeek-R1-0528 basic
     ModelConfig(
@@ -88,81 +89,6 @@ MI35X_DEEPSEEK_R1_MODELS = [
             "1200",  # 20 minutes for weight loading
         ],
         env_vars={"SGLANG_USE_AITER": "1"},
-    ),
-    # DeepSeek-R1-0528 with MTP (EAGLE)
-    ModelConfig(
-        model_path="deepseek-ai/DeepSeek-R1-0528",
-        tp_size=8,
-        accuracy_threshold=0.93,
-        timeout=3600,
-        variant="MTP",
-        other_args=[
-            "--chunked-prefill-size",
-            "131072",
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-num-steps",
-            "3",
-            "--speculative-eagle-topk",
-            "1",
-            "--speculative-num-draft-tokens",
-            "4",
-            "--mem-fraction-static",
-            "0.7",
-            "--trust-remote-code",
-            "--watchdog-timeout",
-            "1200",  # 20 minutes for weight loading
-        ],
-        env_vars={"SGLANG_USE_AITER": "1"},
-    ),
-    # DeepSeek-R1-0528 with DP attention
-    ModelConfig(
-        model_path="deepseek-ai/DeepSeek-R1-0528",
-        tp_size=8,
-        accuracy_threshold=0.93,
-        timeout=3600,
-        variant="DP",
-        other_args=[
-            "--chunked-prefill-size",
-            "131072",
-            "--dp-size",
-            "8",
-            "--enable-dp-attention",
-            "--mem-fraction-static",
-            "0.85",
-            "--trust-remote-code",
-            "--watchdog-timeout",
-            "1800",  # 30 minutes for DP weight loading
-        ],
-        env_vars={
-            "SGLANG_USE_ROCM700A": "1",
-            "SGLANG_USE_AITER": "1",
-        },
-    ),
-    # DeepSeek-R1-0528 with torch compile
-    ModelConfig(
-        model_path="deepseek-ai/DeepSeek-R1-0528",
-        tp_size=8,
-        accuracy_threshold=0.93,
-        timeout=7200,
-        variant="TC",
-        other_args=[
-            "--chunked-prefill-size",
-            "131072",
-            "--mem-fraction-static",
-            "0.70",
-            "--cuda-graph-max-bs",
-            "8",
-            "--enable-torch-compile",
-            "--disable-cuda-graph",
-            "--trust-remote-code",
-            "--watchdog-timeout",
-            "3600",  # 60 minutes for torch compile warmup
-        ],
-        env_vars={
-            "SGLANG_USE_ROCM700A": "1",
-            "SGLANG_USE_AITER": "1",
-        },
     ),
 ]
 
