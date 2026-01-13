@@ -537,6 +537,8 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
+        // For non-streaming: use guard for automatic load management
+        // For streaming: load will be managed in create_streaming_response
         let _prefill_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
         let _decode_guard =
