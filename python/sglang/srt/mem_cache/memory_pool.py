@@ -169,17 +169,24 @@ class MambaPool:
         conv: List[torch.Tensor]
         temporal: torch.Tensor
 
-        def at_layer_idx(self, layer: int):
+        def at_layer_idx(self, layer: int, device: str):
             kwargs = {}
-            # Use fields instead of vars to avoid torch.compile graph break
-            for f in fields(self):
-                name = f.name
-                v = getattr(self, name)
-                if name in ("conv", "intermediate_conv_window"):
-                    kwargs[name] = [conv[layer] for conv in v]
-                else:
-                    # temporal or intermediate_ssm
-                    kwargs[name] = v[layer]
+            if device != "cpu":
+                for k, v in vars(self).items():
+                    if k == "conv" or k == "intermediate_conv_window":
+                        kwargs[k] = [conv[layer] for conv in v]
+                    else:
+                        kwargs[k] = v[layer]
+            else:
+                # Use fields instead of vars to avoid torch.compile graph break
+                for f in fields(self):
+                    name = f.name
+                    v = getattr(self, name)
+                    if name in ("conv", "intermediate_conv_window"):
+                        kwargs[name] = [conv[layer] for conv in v]
+                    else:
+                        kwargs[name] = v[layer]
+
             return type(self)(**kwargs)
 
         def mem_usage_bytes(self):
@@ -302,7 +309,7 @@ class MambaPool:
         return self.mamba_cache
 
     def mamba2_layer_cache(self, layer_id: int):
-        return self.mamba_cache.at_layer_idx(layer_id)
+        return self.mamba_cache.at_layer_idx(layer_id, self.device)
 
     def available_size(self):
         return len(self.free_slots)
