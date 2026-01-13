@@ -48,7 +48,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
@@ -58,6 +57,7 @@ from sglang.srt.mem_cache.utils import (
 from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
 

@@ -21,6 +21,7 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.mem_cache.sparsity import get_sparse_coordinator
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -120,7 +121,10 @@ class RadixAttention(nn.Module):
             )
             return output
         else:
-            return forward_batch.attn_backend.forward(
+            attention_begin_hook(q, k, v, self, forward_batch)
+            
+            # Call backend attention
+            output = forward_batch.attn_backend.forward(
                 q,
                 k,
                 v,
@@ -129,6 +133,30 @@ class RadixAttention(nn.Module):
                 save_kv_cache,
                 **kwargs,
             )
+            
+            attention_end_hook(output, self, forward_batch)
+            return output
+
+def attention_begin_hook(q, k, v, layer, forward_batch):
+    sparse_coordinator = get_sparse_coordinator()
+    if sparse_coordinator is not None:
+        sparse_coordinator.attention_begin(
+            query=q,
+            key=k,
+            value=v,
+            layer=layer,
+            forward_batch=forward_batch,
+            attn_metadata=getattr(forward_batch.attn_backend, 'forward_metadata', None),
+        )
+
+def attention_end_hook(output, layer, forward_batch):
+    sparse_coordinator = get_sparse_coordinator()
+    if sparse_coordinator is not None:
+        sparse_coordinator.attention_end(
+            output=output,
+            layer=layer,
+            forward_batch=forward_batch,
+        )
 
 
 @register_custom_op(mutates_args=["output"])

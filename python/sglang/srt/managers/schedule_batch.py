@@ -763,6 +763,10 @@ class Req:
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
+        # Hierarchical sparse attention: indicates if this request has entered sparse mode
+        # (prompt KV cache offloaded and device slots truncated to LRU buffer size)
+        self.hierarchical_sparse_enabled = False
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1908,8 +1912,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Update req-level memory management fields
         for req in self.reqs:
             req.decode_batch_idx += 1
-            req.kv_committed_len += 1
-            req.kv_allocated_len += 1
+            if not req.hierarchical_sparse_enabled:
+                req.kv_committed_len += 1
+                req.kv_allocated_len += 1
 
         # Update seq_lens after allocation
         if self.enable_overlap:

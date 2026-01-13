@@ -8,10 +8,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
-from sglang.srt.mem_cache.sparsity.factory import (
-    get_sparse_coordinator,
-    is_hierarchical_sparse_attention_enabled,
-)
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 
 if TYPE_CHECKING:
@@ -53,38 +49,12 @@ class ChunkCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         kv_committed_len = req.pop_committed_kv_cache()
-
-        if is_hierarchical_sparse_attention_enabled():
-            self._free_hierarchical_sparse_req(req)
-            return
-
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
-
-    def _free_hierarchical_sparse_req(self, req: Req):
-        sparse_coordinator = get_sparse_coordinator()
-        req_truncated_mask = sparse_coordinator.get_reqs_offloaded_and_truncated_mask(
-            torch.tensor([req.req_pool_idx])
-        ).item()
-        if req_truncated_mask:
-            kv_committed_len = (
-                sparse_coordinator.get_hierarchical_sparse_truncated_len()
-            )
-        else:
-            kv_committed_len = req.kv_committed_len
-
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
-        ]
-        self.req_to_token_pool.free(req.req_pool_idx)
-        self.token_to_kv_pool_allocator.free(kv_indices)
-        logger.info(
-            f"Cache finished request {req.req_pool_idx} free {len(kv_indices)} tokens, truncated:{req_truncated_mask}"
-        )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[

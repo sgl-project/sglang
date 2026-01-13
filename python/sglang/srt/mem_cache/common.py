@@ -495,6 +495,9 @@ def alloc_for_hierarchical_sparse_decode(
     """
     Allocate KV cache for hierarchical sparse decode batch and write to req_to_token_pool.
     """
+    if isinstance(batch.tree_cache, SWAChunkCache):
+        raise RuntimeError("SWAChunkCache is not supported for hierarchical sparse decode")
+    
     bs = batch.seq_lens.shape[0]
     seq_lens_next = batch.seq_lens + token_per_req
     page_size = batch.tree_cache.page_size
@@ -508,15 +511,14 @@ def alloc_for_hierarchical_sparse_decode(
 
     # Find truncated and non-truncated requests
     kv_truncated_len = sparse_coordinator.get_hierarchical_sparse_truncated_len()
-    truncated_mask = sparse_coordinator.get_reqs_offloaded_and_truncated_mask(
+    hierarchical_sparse_masks = sparse_coordinator.get_hierarchical_sparse_req_masks(
         req_pool_indices
     )
     out_cache_loc = torch.empty(bs, dtype=torch.int32, device=batch.device)
 
-    num_truncated = truncated_mask.sum().item()
     # Handle truncated requests: reuse a pre-allocated rolling page per request
-    if truncated_mask.any():
-        truncated_indices = truncated_mask.nonzero(as_tuple=True)[0]
+    if hierarchical_sparse_masks.any():
+        truncated_indices = hierarchical_sparse_masks.nonzero(as_tuple=True)[0]
         # Map logical decode positions onto the reserved rolling page in a round-robin way
         decode_offsets = locs[truncated_indices]
         rolling_positions = (kv_truncated_len - page_size) + (
@@ -526,13 +528,10 @@ def alloc_for_hierarchical_sparse_decode(
             batch.req_pool_indices[truncated_indices],
             rolling_positions,
         ]
-        # logger.info(
-        #     f"Allocated {num_truncated} truncated sparse decode, rolling positions:{rolling_positions.tolist()}, out_cache_loc:{out_cache_loc[truncated_indices].tolist()}"
-        # )
 
     # Handle non-truncated requests: allocate normally
-    if (~truncated_mask).any():
-        non_truncated_indices = (~truncated_mask).nonzero(as_tuple=True)[0]
+    if (~hierarchical_sparse_masks).any():
+        non_truncated_indices = (~hierarchical_sparse_masks).nonzero(as_tuple=True)[0]
         if batch.tree_cache.page_size == 1:
             non_truncated_out = alloc_token_slots(
                 batch.tree_cache, len(non_truncated_indices) * token_per_req

@@ -66,6 +66,7 @@ def page_wise_diff_triton_kernel(
             page_table + page_table_s * req_idx + top_k_vals, mask=mask
         )
         tl.store(page_ids_base + offset_page, loaded_page_start / page_size, mask=mask)
+        return
 
     last_top_k = tl.load(last_top_k_base + offset_lru)
     top_k_origin = tl.load(top_k_base + offset_page)
@@ -213,6 +214,108 @@ def invoke_sparse_diff_kernel(
     )
 
 
+def test_mixed_sparse_mask():
+    """Test with mixed sparse_mask: one truncated (True), one non-truncated (False)"""
+    print("\n=== Testing Mixed Sparse Mask (Truncated + Non-Truncated) ===")
+    page_size = 64
+    top_k = 1024  # 16 pages
+    hot_buffer_len = 2048  # 32 pages
+    
+    # 2 requests: one truncated (sparse_mask=1), one non-truncated (sparse_mask=0)
+    last_top_k_idx = torch.full((2, 1, 32), -1, dtype=torch.int64, device="cuda")
+    last_page_ids = torch.full((2, 1, 32), -1, dtype=torch.int64, device="cuda")
+    
+    # Request 0: Truncated, has previous device indices [0-31]
+    last_page_ids[0, 0, :] = torch.arange(0, 32, dtype=torch.int64, device="cuda") + 41  # [41-72]
+    last_top_k_idx[0, 0, :] = torch.arange(0, 32, dtype=torch.int64, device="cuda")
+    
+    # Request 1: Non-truncated, no previous device indices (all -1)
+    # last_page_ids[1, 0, :] stays as -1
+    # last_top_k_idx[1, 0, :] stays as -1
+    
+    # TopK results
+    top_k_idx = torch.full((2, 16), -1, dtype=torch.int64, device="cuda")
+    # Request 0: Selected 16 pages
+    top_k_idx[0, :] = torch.tensor([0, 2, 9, 10, 12, 13, 21, 23, 24, 28, 32, 35, 36, 37, 38, 39], dtype=torch.int64, device="cuda")
+    # Request 1: All -1 (non-truncated, doesn't need topk)
+    
+    # Initialize outputs
+    page_ids = torch.full((2, 16), -1, dtype=torch.int32, device="cuda")
+    diff_map = torch.full((2, 2500), -1, dtype=torch.int32, device="cuda")
+    load_tokens = torch.full((2, 1024), -1, dtype=torch.int64, device="cuda")
+    load_tokens_host = torch.full((2, 1024), -1, dtype=torch.int64, device="cuda")
+    
+    # Other inputs
+    req_to_tokens_host = torch.arange(2500, dtype=torch.int64, device="cuda").unsqueeze(0).expand(2, -1).contiguous()
+    seq_lens = torch.tensor([2400, 2300], dtype=torch.int64, device="cuda")
+    sparse_mask = torch.tensor([1, 0], dtype=torch.int32, device="cuda")  # Request 0: sparse, Request 1: non-sparse
+    req_pool_indices = torch.tensor([0, 1], dtype=torch.int64, device="cuda")
+    
+    # page_table: mapping from logical token to physical token
+    page_table = torch.arange(2500, dtype=torch.int64, device="cuda").unsqueeze(0).expand(2, -1).contiguous()
+    
+    print("=== Input ===")
+    print(f"sparse_mask: {sparse_mask.tolist()}")
+    print(f"Request 0 (sparse=True) topk_result: {top_k_idx[0].tolist()}")
+    print(f"Request 0 prev_device_indices: {last_page_ids[0, 0, :].tolist()}")
+    print(f"Request 1 (sparse=False) topk_result: {top_k_idx[1].tolist()}")
+    print(f"Request 1 prev_device_indices: {last_page_ids[1, 0, :].tolist()}")
+    
+    invoke_sparse_diff_kernel(
+        last_top_k_idx,
+        top_k_idx,
+        last_page_ids,
+        page_ids,
+        diff_map,
+        req_to_tokens_host,
+        load_tokens,
+        load_tokens_host,
+        seq_lens,
+        req_pool_indices,
+        sparse_mask,
+        page_table,
+        layer_id=0,
+        top_k=top_k,
+        hot_buffer_len=hot_buffer_len,
+        page_size=page_size,
+    )
+    
+    print("\n=== Output ===")
+    print(f"Request 0 load_tokens (device) [first 64]: {load_tokens[0, :64].tolist()}")
+    print(f"Request 0 load_tokens_host (host) [first 64]: {load_tokens_host[0, :64].tolist()}")
+    print(f"Request 1 load_tokens (device) [first 64]: {load_tokens[1, :64].tolist()}")
+    print(f"Request 1 load_tokens_host (host) [first 64]: {load_tokens_host[1, :64].tolist()}")
+    
+    # Check for mismatch (simulate the original buggy code)
+    print("\n=== Checking for mismatch ===")
+    swap_target_device_slots = load_tokens[:2, :top_k]
+    swap_source_host_slots = load_tokens_host[:2, :top_k]
+    
+    device_valid_separate = swap_target_device_slots[swap_target_device_slots != -1]
+    host_valid_separate = swap_source_host_slots[swap_source_host_slots != -1]
+    
+    print(f"Device slots (separate filter): count = {device_valid_separate.numel()}")
+    print(f"Host slots (separate filter): count = {host_valid_separate.numel()}")
+    print(f"⚠️  Mismatch with separate filters: {device_valid_separate.numel() != host_valid_separate.numel()}")
+    
+    # Use joint mask
+    valid_mask = (swap_target_device_slots != -1) & (swap_source_host_slots != -1)
+    device_valid_joint = swap_target_device_slots[valid_mask]
+    host_valid_joint = swap_source_host_slots[valid_mask]
+    
+    print(f"Device slots (joint filter): count = {device_valid_joint.numel()}")
+    print(f"Host slots (joint filter): count = {host_valid_joint.numel()}")
+    print(f"✓ Match with joint filter: {device_valid_joint.numel() == host_valid_joint.numel()}")
+    
+    if device_valid_separate.numel() != host_valid_separate.numel():
+        print("\n✓ SUCCESSFULLY REPRODUCED THE BUG!")
+        print("This confirms the issue with mixed sparse_mask in batch.")
+        return True
+    else:
+        print("\nFailed to reproduce the bug.")
+        return False
+
+
 def test_real_scenario():
     """Test with real scenario: topk=1024, lru_buffer=2048, page_size=64"""
     page_size = 64
@@ -289,6 +392,10 @@ def test_real_scenario():
 
 
 if __name__ == "__main__":
+    print("Running mixed sparse mask test...")
+    test_mixed_sparse_mask()
+    print("\n" + "=" * 50 + "\n")
+    
     print("Running real scenario test...")
     test_real_scenario()
     print("\n" + "=" * 50 + "\n")
