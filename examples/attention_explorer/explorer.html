@@ -783,8 +783,53 @@
         // Configuration - UPDATE THIS TO YOUR ENDPOINT
         const CONFIG = {
             apiBase: 'http://localhost:8000',
-            modelId: 'Qwen/Qwen3-Next-80B-A3B-Thinking-FP8'
+            modelId: 'default',  // Will be auto-detected from server
+            chatTemplate: 'auto' // 'auto', 'qwen3', 'llama3', 'chatml', 'raw'
         };
+
+        // Chat template formats for different model families
+        const CHAT_TEMPLATES = {
+            qwen3: {
+                userStart: '<|im_start|>user\n',
+                userEnd: '<|im_end|>\n',
+                assistantStart: '<|im_start|>assistant\n',
+                assistantEnd: '<|im_end|>',
+            },
+            llama3: {
+                userStart: '<|start_header_id|>user<|end_header_id|>\n\n',
+                userEnd: '<|eot_id|>',
+                assistantStart: '<|start_header_id|>assistant<|end_header_id|>\n\n',
+                assistantEnd: '<|eot_id|>',
+            },
+            chatml: {
+                userStart: '<|im_start|>user\n',
+                userEnd: '<|im_end|>\n',
+                assistantStart: '<|im_start|>assistant\n',
+                assistantEnd: '<|im_end|>',
+            },
+            raw: {
+                userStart: 'User: ',
+                userEnd: '\n',
+                assistantStart: 'Assistant: ',
+                assistantEnd: '',
+            }
+        };
+
+        // Detect chat template from model name
+        function detectChatTemplate(modelName) {
+            const lower = modelName.toLowerCase();
+            if (lower.includes('qwen')) return 'qwen3';
+            if (lower.includes('llama-3') || lower.includes('llama3')) return 'llama3';
+            if (lower.includes('mistral') || lower.includes('mixtral')) return 'chatml';
+            if (lower.includes('phi')) return 'chatml';
+            if (lower.includes('gemma')) return 'raw';
+            return 'chatml'; // Default fallback
+        }
+
+        function buildChatPrompt(text, templateName) {
+            const tmpl = CHAT_TEMPLATES[templateName] || CHAT_TEMPLATES.chatml;
+            return `${tmpl.userStart}${text}${tmpl.userEnd}${tmpl.assistantStart}`;
+        }
 
         // State
         const state = {
@@ -815,7 +860,18 @@
                 const res = await fetch(`${CONFIG.apiBase}/v1/models`);
                 const data = await res.json();
                 dot.classList.remove('error', 'loading');
-                text.textContent = data.data[0]?.id?.split('/')[1] || 'Connected';
+
+                // Auto-detect model ID and chat template
+                const modelData = data.data[0];
+                if (modelData) {
+                    CONFIG.modelId = modelData.id;
+                    if (CONFIG.chatTemplate === 'auto') {
+                        CONFIG.chatTemplate = detectChatTemplate(modelData.id);
+                    }
+                    console.log(`Detected model: ${CONFIG.modelId}, template: ${CONFIG.chatTemplate}`);
+                }
+
+                text.textContent = modelData?.id?.split('/').pop() || 'Connected';
             } catch (e) {
                 dot.classList.add('error');
                 text.textContent = 'Connection failed';
@@ -832,8 +888,9 @@
         // Get prompt token texts by tokenizing the chat-formatted prompt
         async function getPromptTokenTexts(text) {
             try {
-                // Build the chat template (Qwen3 format)
-                const chatPrompt = `<|im_start|>user\n${text}<|im_end|>\n<|im_start|>assistant\n`;
+                // Build chat template using detected template type
+                const chatPrompt = buildChatPrompt(text, CONFIG.chatTemplate);
+                console.log(`Using chat template: ${CONFIG.chatTemplate}`);
 
                 // First tokenize the full prompt with chat template
                 const tokenizeRes = await fetch(`${CONFIG.apiBase}/v1/tokenize`, {
@@ -844,21 +901,33 @@
                 if (!tokenizeRes.ok) return null;
                 const tokenData = await tokenizeRes.json();
 
-                // Detokenize each token individually to get text
+                // Batch detokenize: send all tokens at once, then split by individual decoding
+                // This is much more efficient than per-token API calls
                 const tokenTexts = [];
-                for (const tokenId of tokenData.tokens) {
-                    const detokRes = await fetch(`${CONFIG.apiBase}/v1/detokenize`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ model: CONFIG.modelId, tokens: [tokenId] })
+                const batchSize = 50; // Process in batches to avoid URL length limits
+
+                for (let i = 0; i < tokenData.tokens.length; i += batchSize) {
+                    const batch = tokenData.tokens.slice(i, i + batchSize);
+
+                    // Detokenize each token in this batch concurrently
+                    const batchPromises = batch.map(tokenId =>
+                        fetch(`${CONFIG.apiBase}/v1/detokenize`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ model: CONFIG.modelId, tokens: [tokenId] })
+                        }).then(res => res.ok ? res.json() : null)
+                    );
+
+                    const batchResults = await Promise.all(batchPromises);
+                    batchResults.forEach((result, idx) => {
+                        if (result) {
+                            tokenTexts.push(result.text);
+                        } else {
+                            tokenTexts.push(`[${batch[idx]}]`);
+                        }
                     });
-                    if (detokRes.ok) {
-                        const detokData = await detokRes.json();
-                        tokenTexts.push(detokData.text);
-                    } else {
-                        tokenTexts.push(`[${tokenId}]`);
-                    }
                 }
+
                 return tokenTexts;
             } catch (e) {
                 console.warn('Could not get prompt token texts:', e);
@@ -1087,10 +1156,13 @@
             const container = document.getElementById('tokenSegments');
             container.innerHTML = '';
 
+            // Apply word aggregation if enabled
+            const displayTokens = aggregateToWords(state.tokens);
+
             const segments = {
-                prompt: state.tokens.filter(t => t.segment === 'prompt'),
-                think: state.tokens.filter(t => t.segment === 'think'),
-                output: state.tokens.filter(t => t.segment === 'output')
+                prompt: displayTokens.filter(t => t.segment === 'prompt'),
+                think: displayTokens.filter(t => t.segment === 'think'),
+                output: displayTokens.filter(t => t.segment === 'output')
             };
 
             const segmentNames = {
@@ -1099,6 +1171,8 @@
                 output: 'Response (Output)'
             };
 
+            const unitLabel = state.wordMode ? 'words' : 'tokens';
+
             ['prompt', 'think', 'output'].forEach(seg => {
                 if (segments[seg].length === 0) return;
 
@@ -1106,7 +1180,7 @@
                 segEl.className = 'segment';
                 segEl.innerHTML = `
                     <div class="segment-header ${seg}">
-                        <span>${segmentNames[seg]} (${segments[seg].length} tokens)</span>
+                        <span>${segmentNames[seg]} (${segments[seg].length} ${unitLabel})</span>
                         <button class="segment-toggle" onclick="toggleSegment(this)">-</button>
                     </div>
                     <div class="segment-body">
@@ -1120,13 +1194,23 @@
                     const tokenEl = document.createElement('span');
                     tokenEl.className = 'token';
                     tokenEl.dataset.idx = token.idx;
+
+                    // For word mode, store all token indices
+                    if (token.tokenIndices) {
+                        tokenEl.dataset.tokenIndices = token.tokenIndices.join(',');
+                    }
+
                     tokenEl.textContent = token.text;
-                    tokenEl.onclick = () => selectToken(token.idx);
+                    tokenEl.onclick = () => selectToken(token.idx, token.tokenIndices);
 
                     // Apply manifold color if in fingerprint mode
                     if (token.manifold) {
                         tokenEl.classList.add(`manifold-${token.manifold.replace(/_/g, '-')}`);
-                        tokenEl.title = `Manifold: ${token.manifold}`;
+                        tokenEl.title = state.wordMode
+                            ? `Word: "${token.text}" | Tokens: ${token.tokenIndices?.length || 1} | Zone: ${token.manifold}`
+                            : `Manifold: ${token.manifold}`;
+                    } else if (state.wordMode && token.tokenIndices) {
+                        tokenEl.title = `Word: "${token.text}" | Tokens: ${token.tokenIndices.length}`;
                     }
 
                     flowEl.appendChild(tokenEl);
@@ -1200,33 +1284,56 @@
             });
         }
 
-        function selectToken(idx) {
+        function selectToken(idx, tokenIndices = null) {
             document.querySelectorAll('.token').forEach(el => {
                 el.classList.remove('selected', 'attended-to', 'attends-from');
             });
 
             state.selectedToken = idx;
-            const token = state.tokens.find(t => t.idx === idx);
+            state.selectedTokenIndices = tokenIndices || [idx]; // For word mode
+
+            // Find the display token (may be aggregated word)
+            const displayTokens = aggregateToWords(state.tokens);
+            const displayToken = displayTokens.find(t => t.idx === idx);
+            const rawToken = state.tokens.find(t => t.idx === idx);
 
             const selectedEl = document.querySelector(`.token[data-idx="${idx}"]`);
             if (selectedEl) selectedEl.classList.add('selected');
 
-            const outEdges = state.adjacencyOut[idx] || [];
+            // Aggregate edges for all tokens in the word (if in word mode)
+            let outEdges = [];
+            let inEdges = [];
+            state.selectedTokenIndices.forEach(tokenIdx => {
+                outEdges = outEdges.concat(state.adjacencyOut[tokenIdx] || []);
+                inEdges = inEdges.concat(state.adjacencyIn[tokenIdx] || []);
+            });
+
+            // Deduplicate and aggregate by destination/source
+            if (state.wordMode && outEdges.length > 0) {
+                outEdges = aggregateEdges(outEdges, 'dst');
+            }
+            if (state.wordMode && inEdges.length > 0) {
+                inEdges = aggregateEdges(inEdges, 'src');
+            }
+
             outEdges.forEach(edge => {
                 const el = document.querySelector(`.token[data-idx="${edge.dst}"]`);
                 if (el) el.classList.add('attended-to');
             });
 
-            const inEdges = state.adjacencyIn[idx] || [];
             inEdges.forEach(edge => {
                 const el = document.querySelector(`.token[data-idx="${edge.src}"]`);
                 if (el) el.classList.add('attends-from');
             });
 
+            const token = displayToken || rawToken;
             document.getElementById('selectedTokenText').textContent = token ? token.text : '';
 
             // Build meta text - include manifold info if available
-            let metaText = `Position: ${idx} | Segment: ${token?.segment || ''}`;
+            let metaText = state.wordMode && state.selectedTokenIndices.length > 1
+                ? `Tokens: ${state.selectedTokenIndices.join(', ')} | Segment: ${token?.segment || ''}`
+                : `Position: ${idx} | Segment: ${token?.segment || ''}`;
+
             if (token?.manifold) {
                 metaText += ` | Zone: ${token.manifold}`;
             }
@@ -1237,6 +1344,24 @@
 
             renderDetailList();
             renderEdges();
+        }
+
+        // Aggregate edges by target field, summing weights
+        function aggregateEdges(edges, targetField) {
+            const aggregated = {};
+            edges.forEach(edge => {
+                const key = edge[targetField];
+                if (!aggregated[key]) {
+                    aggregated[key] = { ...edge, weight: 0 };
+                }
+                aggregated[key].weight += edge.weight;
+            });
+            // Normalize weights if they exceed 1
+            const maxWeight = Math.max(...Object.values(aggregated).map(e => e.weight));
+            if (maxWeight > 1) {
+                Object.values(aggregated).forEach(e => e.weight /= maxWeight);
+            }
+            return Object.values(aggregated);
         }
 
         function renderDetailList() {
@@ -1474,6 +1599,59 @@
         function toggleWordMode() {
             state.wordMode = !state.wordMode;
             document.getElementById('wordModeToggle').classList.toggle('active', state.wordMode);
+
+            // Re-render with word aggregation if we have tokens
+            if (state.tokens.length > 0) {
+                render();
+                updateStats();
+            }
+        }
+
+        // Aggregate tokens into words based on whitespace boundaries
+        function aggregateToWords(tokens) {
+            if (!state.wordMode || tokens.length === 0) return tokens;
+
+            const words = [];
+            let currentWord = null;
+
+            tokens.forEach(token => {
+                const text = token.text || '';
+                // Check if this token starts a new word (starts with space, newline, or is after special token)
+                const startsNewWord = text.startsWith(' ') ||
+                                      text.startsWith('Ġ') ||  // GPT-2/RoBERTa style
+                                      text === '⏎' ||
+                                      text.includes('⟨') ||
+                                      currentWord === null;
+
+                if (startsNewWord && currentWord !== null) {
+                    words.push(currentWord);
+                    currentWord = null;
+                }
+
+                if (currentWord === null) {
+                    currentWord = {
+                        idx: token.idx,
+                        text: text.replace(/^[Ġ\s]/, ''), // Remove leading space/Ġ
+                        segment: token.segment,
+                        tokenIndices: [token.idx],
+                        manifold: token.manifold,
+                        fingerprint: token.fingerprint,
+                    };
+                } else {
+                    currentWord.text += text;
+                    currentWord.tokenIndices.push(token.idx);
+                    // Keep the most significant manifold
+                    if (token.manifold && !currentWord.manifold) {
+                        currentWord.manifold = token.manifold;
+                    }
+                }
+            });
+
+            if (currentWord !== null) {
+                words.push(currentWord);
+            }
+
+            return words;
         }
 
         // UI Helpers
