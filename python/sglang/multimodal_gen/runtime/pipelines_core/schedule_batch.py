@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import pprint
-from dataclasses import asdict, dataclass, field
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Optional
 
 import PIL.Image
@@ -31,8 +31,10 @@ from sglang.multimodal_gen.utils import align_to
 
 logger = init_logger(__name__)
 
+SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
 
-@dataclass
+
+@dataclass(init=False)
 class Req:
     """
     Complete state passed through the pipeline execution.
@@ -137,6 +139,22 @@ class Req:
     # results
     output: torch.Tensor | None = None
 
+    def __init__(self, **kwargs):
+        # Initialize dataclass fields
+        for name, field in self.__class__.__dataclass_fields__.items():
+            if name in kwargs:
+                object.__setattr__(self, name, kwargs.pop(name))
+            elif field.default is not MISSING:
+                object.__setattr__(self, name, field.default)
+            elif field.default_factory is not MISSING:
+                object.__setattr__(self, name, field.default_factory())
+
+        for name, value in kwargs.items():
+            setattr(self, name, value)
+
+        if hasattr(self, "__post_init__"):
+            self.__post_init__()
+
     def __getattr__(self, name: str) -> Any:
         """
         Delegate attribute access to sampling_params if not found in Req.
@@ -172,13 +190,18 @@ class Req:
 
         try:
             sampling_params = object.__getattribute__(self, "sampling_params")
-            if sampling_params is not None and hasattr(sampling_params, name):
-                setattr(sampling_params, name, value)
-                return
         except AttributeError:
-            # This can happen if `sampling_params` is not set yet. We'll fall through
-            # to setting the attribute on `self`.
-            pass
+            sampling_params = None
+
+        if sampling_params is not None and hasattr(sampling_params, name):
+            setattr(sampling_params, name, value)
+            return
+
+        if sampling_params is None and name in SAMPLING_PARAMS_FIELDS:
+            new_sp = SamplingParams()
+            object.__setattr__(self, "sampling_params", new_sp)
+            setattr(new_sp, name, value)
+            return
 
         object.__setattr__(self, name, value)
 
@@ -277,4 +300,7 @@ class OutputBatch:
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None
+
+    # For ComfyUI integration: noise prediction from denoising stage
+    noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
