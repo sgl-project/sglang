@@ -173,6 +173,7 @@ class ReqState:
     input_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
     output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
 
+
 class InputFormat(Enum):
     """Input format types for tokenization handling."""
 
@@ -229,9 +230,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Init request dispatcher
         self.init_request_dispatcher()
-
-        self.start_time = None
-        self.iter_count = 0
 
     def init_model_config(self):
         server_args = self.server_args
@@ -1480,12 +1478,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             BatchTokenIDOutput,
         ],
     ):
-        self.iter_count += 1
-        curr_readable_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        if self.start_time is None:
-            self.start_time = time.time()
-        print(f"[{curr_readable_time}] [{self.iter_count}] time: {time.time() - self.start_time} seconds")
-        self.start_time = time.time()
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1771,7 +1763,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
             )
 
-        # tic = time.time()
         self.add_logprob_to_meta_info(
             meta_info,
             state,
@@ -1779,8 +1770,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             state.obj.token_ids_logprob,
             return_text_in_logprobs,
         )
-        # toc = time.time()
-        # print(f"add_logprob_to_meta_info time: {toc - tic} seconds")
 
     def detokenize_logprob_tokens(
         self,
