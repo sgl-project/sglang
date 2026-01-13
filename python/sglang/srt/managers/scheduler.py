@@ -1933,8 +1933,8 @@ class Scheduler(
             running_bs = len(self.running_batch.reqs)
             if self.enable_priority_scheduling:
                 num_running_reqs_by_priority.clear()
-                for req in self.running_batch.reqs:
-                    num_running_reqs_by_priority[req.priority] += 1
+                for running_req in self.running_batch.reqs:
+                    num_running_reqs_by_priority[running_req.priority] += 1
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
