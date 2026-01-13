@@ -694,7 +694,7 @@ jobs:
       IS_BLACKWELL: "1"
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 8
       matrix:
         partition: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
