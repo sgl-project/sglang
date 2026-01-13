@@ -20,9 +20,9 @@ from sglang.test.simple_eval_common import (
     SingleEvalResult,
 )
 
-LATIN_LANGUAGES = ["de", "en", "es", "fr", "sw"]
-NON_LATIN_LANGUAGES = ["bn", "ja", "ru", "te", "th", "zh"]
-ALL_LANGUAGES = LATIN_LANGUAGES + NON_LATIN_LANGUAGES
+LATIN_SCRIPT_LANGUAGES = ["de", "en", "es", "fr", "sw"]
+NON_LATIN_SCRIPT_LANGUAGES = ["bn", "ja", "ru", "te", "th", "zh"]
+ALL_LANGUAGES = LATIN_SCRIPT_LANGUAGES + NON_LATIN_SCRIPT_LANGUAGES
 
 LANG_TO_FPATH = {
     "bn": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_bn.tsv",
@@ -142,7 +142,9 @@ class MGSMEval(Eval):
         def fn(example: dict[str, str]):
             language = example["lang"]
             latin_language = (
-                "group_latin" if language in LATIN_LANGUAGES else "group_non_latin"
+                "group_latin"
+                if language in LATIN_SCRIPT_LANGUAGES
+                else "group_non_latin"
             )
             correct_answer = example["targets"]
             instructoin = LANG_TO_INSTRUCTIONS[language]
