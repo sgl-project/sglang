@@ -422,6 +422,3 @@ class Scheduler:
 
     def _get_sampling_params(self):
         return SamplingParams.from_pretrained(self.server_args.model_path)
-
-    def _get_env_int(self, key: str):
-        os.getenv(key)
