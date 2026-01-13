@@ -84,7 +84,7 @@ def _define_kernels():
     cpasync = _cpasync
 
     @cute.kernel
-    def cpasync_verify_kernel(
+    def sglang_gdn_verify_kernel(
         tiled_copy_load: cute.TiledCopy,     # TiledCopy for G2S load (passed from JIT launcher)
         h0_source: cute.Tensor,              # [pool_size * HV, V, K] - initial state pool (K-last)
         intermediate_states: cute.Tensor,    # [pool_size * T * HV, V, K] - intermediate state cache
@@ -176,77 +176,83 @@ def _define_kernels():
         cache_idx = h0_indices[i_n]
 
         # ===================================================================
-        # Pre-compute q, k, v, g, beta for all time steps (outside v_tiles loop)
+        # Early exit optimization: skip pre-computation for padding slots
+        # This saves significant overhead for CUDA Graph padding entries
         # ===================================================================
-        for i_t in range(T):
-            # Load q, k into register arrays
-            for i in range(vec_size):
-                r_q[i] = cutlass.Float32(q[i_n, i_t, i_h, i * 32 + lane_id])
-                r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, i * 32 + lane_id])
-                # Load v for all V elements
-                sV[(i_t, i * 32 + lane_id)] = cutlass.Float32(v[i_n, i_t, i_hv, i * 32 + lane_id])
-
-            # Compute g and beta
-            r_a = cutlass.Float32(a[i_n, i_t, i_hv])
-            r_b = cutlass.Float32(b[i_n, i_t, i_hv])
-            r_g = 0.0
-            r_beta = 0.0
-            if lane_id == 0:
-                x = r_a + r_dt_bias
-                beta_x = softplus_beta * x
-                softplus_x = 0.0
-
-                if beta_x <= softplus_threshold:
-                    exp_beta_x = cute.exp(beta_x)
-                    log_input = cutlass.Float32(1.0 + exp_beta_x)
-                    log_result = cutlass.Float32(cute.log(log_input))
-                    softplus_x = cutlass.Float32((cutlass.Float32(1.0) / softplus_beta) * log_result)
-                else:
-                    softplus_x = x
-
-                r_g_value = -cute.exp(r_A_log) * softplus_x
-                r_beta = 1.0 / (1.0 + cute.exp(-r_b))
-                r_g = cute.exp(r_g_value)
-
-            r_g = cute.arch.shuffle_sync(r_g, 0)
-            r_beta = cute.arch.shuffle_sync(r_beta, 0)
-
-            # Apply L2 normalization
-            if use_qk_l2norm:
-                sum_q = 0.0
-                sum_k = 0.0
+        if cache_idx >= 0:
+            # ===================================================================
+            # Pre-compute q, k, v, g, beta for all time steps (outside v_tiles loop)
+            # ===================================================================
+            for i_t in range(T):
+                # Load q, k into register arrays
                 for i in range(vec_size):
-                    sum_q += r_q[i] * r_q[i]
-                    sum_k += r_k[i] * r_k[i]
-                
-                for offset in [16, 8, 4, 2, 1]:
-                    sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=offset, mask=-1, mask_and_clamp=31)
-                    sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=offset, mask=-1, mask_and_clamp=31)
+                    r_q[i] = cutlass.Float32(q[i_n, i_t, i_h, i * 32 + lane_id])
+                    r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, i * 32 + lane_id])
+                    # Load v for all V elements
+                    sV[(i_t, i * 32 + lane_id)] = cutlass.Float32(v[i_n, i_t, i_hv, i * 32 + lane_id])
 
-                inv_norm_q = cute.rsqrt(sum_q + 1e-6)
-                inv_norm_k = cute.rsqrt(sum_k + 1e-6)
-                
+                # Compute g and beta
+                r_a = cutlass.Float32(a[i_n, i_t, i_hv])
+                r_b = cutlass.Float32(b[i_n, i_t, i_hv])
+                r_g = 0.0
+                r_beta = 0.0
+                if lane_id == 0:
+                    x = r_a + r_dt_bias
+                    beta_x = softplus_beta * x
+                    softplus_x = 0.0
+
+                    if beta_x <= softplus_threshold:
+                        exp_beta_x = cute.exp(beta_x)
+                        log_input = cutlass.Float32(1.0 + exp_beta_x)
+                        log_result = cutlass.Float32(cute.log(log_input))
+                        softplus_x = cutlass.Float32((cutlass.Float32(1.0) / softplus_beta) * log_result)
+                    else:
+                        softplus_x = x
+
+                    r_g_value = -cute.exp(r_A_log) * softplus_x
+                    r_beta = 1.0 / (1.0 + cute.exp(-r_b))
+                    r_g = cute.exp(r_g_value)
+
+                r_g = cute.arch.shuffle_sync(r_g, 0)
+                r_beta = cute.arch.shuffle_sync(r_beta, 0)
+
+                # Apply L2 normalization
+                if use_qk_l2norm:
+                    sum_q = 0.0
+                    sum_k = 0.0
+                    for i in range(vec_size):
+                        sum_q += r_q[i] * r_q[i]
+                        sum_k += r_k[i] * r_k[i]
+                    
+                    for offset in [16, 8, 4, 2, 1]:
+                        sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=offset, mask=-1, mask_and_clamp=31)
+                        sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=offset, mask=-1, mask_and_clamp=31)
+
+                    inv_norm_q = cute.rsqrt(sum_q + 1e-6)
+                    inv_norm_k = cute.rsqrt(sum_k + 1e-6)
+                    
+                    for i in range(vec_size):
+                        r_q[i] = r_q[i] * inv_norm_q
+                        r_k[i] = r_k[i] * inv_norm_k
+
+                # Apply scaling to q
                 for i in range(vec_size):
-                    r_q[i] = r_q[i] * inv_norm_q
-                    r_k[i] = r_k[i] * inv_norm_k
+                    r_q[i] = r_q[i] * scale
 
-            # Apply scaling to q
-            for i in range(vec_size):
-                r_q[i] = r_q[i] * scale
+                # Store pre-computed values to shared memory
+                for i in range(vec_size):
+                    sQ[(i_t, i * 32 + lane_id)] = r_q[i]
+                    sK[(i_t, i * 32 + lane_id)] = r_k[i]
+                
+                # Store g and beta (only one thread needs to do this)
+                if tidx == 0:
+                    sG[i_t] = r_g
+                    sBeta[i_t] = r_beta
 
-            # Store pre-computed values to shared memory
-            for i in range(vec_size):
-                sQ[(i_t, i * 32 + lane_id)] = r_q[i]
-                sK[(i_t, i * 32 + lane_id)] = r_k[i]
-            
-            # Store g and beta (only one thread needs to do this)
-            if tidx == 0:
-                sG[i_t] = r_g
-                sBeta[i_t] = r_beta
-
+        # All threads must participate in barrier (CUDA requirement)
         cute.arch.barrier()
 
-        # Skip all computation for invalid batch entries (CUDA Graph padding slots where cache_idx < 0)
+        # Main computation only for valid batch entries
         if cache_idx >= 0:
             # Setup source tensor for initial state loading
             gSrc_batch = h0_source[(cache_idx * HV + i_hv, None, None)]
@@ -359,8 +365,10 @@ def _define_kernels():
             
             for i_t in range(T):
                 o[(i_n, i_t, i_hv, tidx)] = cutlass.BFloat16(sOutput[(i_t, tidx)])
+        # Note: padding slots (cache_idx < 0) skip all computation and output writeback
+        # Their output values are unused since they're CUDA Graph padding
 
-    return cpasync_verify_kernel
+    return sglang_gdn_verify_kernel
 
 
 def _create_jit_function():
@@ -370,7 +378,7 @@ def _create_jit_function():
     cpasync = _cpasync
     cuda = _cuda
 
-    cpasync_verify_kernel = _define_kernels()
+    sglang_gdn_verify_kernel = _define_kernels()
 
     @cute.jit
     def run_verify_kernel(
@@ -445,7 +453,7 @@ def _create_jit_function():
         # sQ/sK padding: +8 per row, sV padding: +8 per row
         smem_bytes = 4 * TILE_V * TILE_K * NUM_STAGES + 4 * T * v_dim + 4 * T * (k_dim + 8) + 4 * T * (k_dim + 8) + 4 * T * (v_dim + 8) + 4 * T + 4 * T + 128
 
-        cpasync_verify_kernel(
+        sglang_gdn_verify_kernel(
             tiled_copy_load,
             h0_source, intermediate_states, smem_layout_staged,
             vec_size, num_v_tiles,
@@ -623,7 +631,8 @@ def cutedsl_gdn_verify_k_last(
     else:
         intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device=initial_state_source.device)
     
-    o = torch.empty(B, T, HV, V_dim, dtype=v.dtype, device=v.device)
+    # Output tensor must be bfloat16 to match kernel's output dtype
+    o = torch.empty(B, T, HV, V_dim, dtype=torch.bfloat16, device=v.device)
 
     # cu_seqlens caching
     global _cu_seqlens_cache

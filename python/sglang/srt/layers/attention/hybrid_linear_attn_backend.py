@@ -1,6 +1,9 @@
+import logging
 from typing import Optional, Union
 
 import torch
+
+logger = logging.getLogger(__name__)
 import triton
 import triton.language as tl
 from einops import rearrange
@@ -911,6 +914,8 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend using Mamba kernel."""
 
+    _k_last_decode_warning_shown = False  # Class-level flag to show warning only once
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.conv_states_shape = (
@@ -922,6 +927,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # Check if SSM states use K-last layout (HV, V, K) for MTP kernel optimization
         # Priority: server_args > model config
         self.ssm_k_last = get_global_server_args().mamba_ssm_k_last
+        
+        # Warn if K-last is enabled without speculative decoding
+        if self.ssm_k_last and not GDNAttnBackend._k_last_decode_warning_shown:
+            server_args = get_global_server_args()
+            if server_args.speculative_algorithm is None:
+                logger.warning(
+                    "K-last SSM layout (--mamba-ssm-k-last) is enabled without speculative decoding. "
+                    "This is NOT recommended as there is no K-last decode kernel yet - "
+                    "the V-last Triton kernel will be used with extra transpose overhead, "
+                    "resulting in ~28%% slower decode performance. "
+                    "K-last layout is optimized for speculative decoding (MTP) verify kernel only."
+                )
+                GDNAttnBackend._k_last_decode_warning_shown = True
 
     def forward_decode(
         self,
