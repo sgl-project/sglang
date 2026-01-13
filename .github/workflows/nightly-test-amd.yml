@@ -603,7 +603,7 @@ jobs:
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 registered/amd/test_deepseek_r1_mxfp4_perf.py || TEST_EXIT_CODE=$?
+            python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 

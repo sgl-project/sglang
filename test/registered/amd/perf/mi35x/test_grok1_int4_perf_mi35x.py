@@ -53,51 +53,73 @@ class TestGrok1INT4PerfMI35x(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.model = GROK1_MODEL_PATH
-        cls.tokenizer = GROK1_TOKENIZER_PATH
+        cls.batch_sizes = [1, 1, 8, 16, 64]
+        cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "1024"))
+        cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
+
+        cls.model_config = {
+            "name": "grok1-int4-mi35x",
+            "model_path": GROK1_MODEL_PATH,
+            "other_args": [
+                "--trust-remote-code",
+                "--tp",
+                "8",
+                "--quantization",
+                "fp8",
+                "--mem-fraction-static",
+                "0.85",
+                "--tokenizer-path",
+                GROK1_TOKENIZER_PATH,
+                "--attention-backend",
+                "aiter",
+            ],
+            "env_vars": {
+                "RCCL_MSCCL_ENABLE": "0",
+                "SGLANG_USE_AITER": "1",
+                "SGLANG_INT4_WEIGHT": "1",
+            },
+        }
+
+        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_profile_directory()
+        cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_grok1_int4_perf(self):
         """Run Grok-1 INT4 performance benchmark on MI35x."""
-        batch_sizes = _parse_int_list_env("BATCH_SIZES", "1,8,16,32")
-        input_lens = _parse_int_list_env("INPUT_LENS", "1024,4096")
-        output_len = int(os.getenv("OUTPUT_LEN", "256"))
+        # Set environment variables
+        old_env = {}
+        for key, value in self.model_config.get("env_vars", {}).items():
+            old_env[key] = os.environ.get(key)
+            os.environ[key] = value
+            print(f"Setting env: {key}={value}")
 
-        env = os.environ.copy()
-        env["RCCL_MSCCL_ENABLE"] = "0"
-        env["SGLANG_USE_AITER"] = "1"
-        env["SGLANG_INT4_WEIGHT"] = "1"
+        try:
+            result_tuple = self.runner.run_benchmark_for_model(
+                model_path=self.model_config["model_path"],
+                batch_sizes=self.batch_sizes,
+                input_lens=self.input_lens,
+                output_lens=self.output_lens,
+                other_args=self.model_config["other_args"],
+                variant=self.model_config["name"],
+                extra_bench_args=["--trust-remote-code"],
+            )
+            results = result_tuple[0]
+            success = result_tuple[1]
 
-        other_args = [
-            "--tp",
-            "8",
-            "--quantization",
-            "fp8",
-            "--attention-backend",
-            "aiter",
-            "--mem-fraction-static",
-            "0.85",
-            "--tokenizer-path",
-            self.tokenizer,
-            "--trust-remote-code",
-        ]
+            if results:
+                self.runner.full_report += (
+                    generate_simple_markdown_report(results) + "\n"
+                )
 
-        runner = NightlyBenchmarkRunner(
-            base_url=self.base_url,
-            model=self.model,
-            batch_sizes=batch_sizes,
-            input_lens=input_lens,
-            output_len=output_len,
-            other_args=other_args,
-            env=env,
-            profile_dir=PROFILE_DIR,
-            timeout=3600,
-        )
-
-        results = runner.run_benchmarks()
-        self.assertGreater(len(results), 0, "No benchmark results")
-
-        summary = generate_simple_markdown_report(results)
-        runner.write_github_summary(summary)
+            self.assertTrue(success, "Benchmark failed for Grok-1 INT4 on MI35x")
+        finally:
+            # Restore original environment
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            self.runner.write_final_report()
 
 
 if __name__ == "__main__":
