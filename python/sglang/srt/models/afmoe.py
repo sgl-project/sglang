@@ -11,9 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
-# Adapted from vLLM implementation:
-# https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/afmoe.py
 """Inference-only AfMoE model compatible with HuggingFace weights.
 
 AfMoE is a Mixture-of-Experts model with:
@@ -312,9 +309,7 @@ class AfmoeAttention(nn.Module):
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
 
-        self.head_dim = getattr(
-            config, "head_dim", hidden_size // self.total_num_heads
-        )
+        self.head_dim = getattr(config, "head_dim", hidden_size // self.total_num_heads)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5

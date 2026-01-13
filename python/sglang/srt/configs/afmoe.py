@@ -1,6 +1,3 @@
-# Adapted from transformers
-# https://huggingface.co/docs/transformers/main/en/model_doc/afmoe
-
 from typing import List, Optional
 
 from transformers import PretrainedConfig
@@ -63,7 +60,9 @@ class AfmoeConfig(PretrainedConfig):
             num_key_value_heads = num_attention_heads
 
         self.num_key_value_heads = num_key_value_heads
-        self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
+        self.head_dim = (
+            head_dim if head_dim is not None else hidden_size // num_attention_heads
+        )
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
