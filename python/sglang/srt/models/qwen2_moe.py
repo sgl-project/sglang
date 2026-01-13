@@ -256,13 +256,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return shared_output
 
-    def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch, enable_dual_stream: bool):
+    def _forward_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        enable_dual_stream: bool,
+    ):
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
             if enable_dual_stream:
-                shared_output = shared_expert_on_independent_stream(hidden_states, self._forward_shared_experts)
+                shared_output = shared_expert_on_independent_stream(
+                    hidden_states, self._forward_shared_experts
+                )
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
@@ -277,12 +284,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         if enable_dual_stream:
-            final_hidden_states = routed_expert_on_independent_stream(hidden_states, topk_output, self.experts)
+            final_hidden_states = routed_expert_on_independent_stream(
+                hidden_states, topk_output, self.experts
+            )
         else:
             final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
 
         if enable_dual_stream:
             wait_routed_stream()
@@ -323,9 +332,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        enable_dual_stream = is_npu() and envs.SGLANG_MOE_USE_DUAL_STREAM.get() and forward_batch.forward_mode.is_decode()
+        enable_dual_stream = (
+            is_npu()
+            and envs.SGLANG_MOE_USE_DUAL_STREAM.get()
+            and forward_batch.forward_mode.is_decode()
+        )
         if get_moe_a2a_backend().is_deepep():
-            return self._forward_deepep(hidden_states, forward_batch, enable_dual_stream)
+            return self._forward_deepep(
+                hidden_states, forward_batch, enable_dual_stream
+            )
 
         if (
             self.alt_stream is not None
@@ -338,9 +353,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             if enable_dual_stream:
                 router_logits, _ = self.gate(hidden_states)
-                shared_output = shared_expert_on_independent_stream(hidden_states, self._forward_shared_experts)
+                shared_output = shared_expert_on_independent_stream(
+                    hidden_states, self._forward_shared_experts
+                )
                 topk_output = self.topk(hidden_states, router_logits)
-                final_hidden_states = routed_expert_on_independent_stream(hidden_states, topk_output, self.experts)
+                final_hidden_states = routed_expert_on_independent_stream(
+                    hidden_states, topk_output, self.experts
+                )
                 wait_routed_stream()
                 wait_share_stream()
             else:

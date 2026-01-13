@@ -7,6 +7,7 @@ import torch
 import torch_npu
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
@@ -14,11 +15,9 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -1124,7 +1123,9 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     sparse_mode=0,
                 )
-                return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
+                return attn_output.view(
+                    num_tokens, layer.tp_q_head_num * layer.v_head_dim
+                )
         else:
             c_kv, k_rope = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             if is_fia_nz():

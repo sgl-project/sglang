@@ -23,7 +23,6 @@ import numpy as np
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (

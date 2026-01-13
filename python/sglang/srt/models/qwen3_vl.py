@@ -19,7 +19,6 @@ import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -64,7 +63,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_bool_env_var, get_int_env_var, is_npu
+from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)

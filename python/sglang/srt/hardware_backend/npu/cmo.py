@@ -89,7 +89,7 @@ def set_share_stream(stream):
 
 def get_routed_stream():
     global routed_stream
-    return routed_stream 
+    return routed_stream
 
 
 def set_routed_stream(stream):
@@ -103,15 +103,15 @@ def wait_share_stream():
     if stream is not None:
         cur_stream = torch.npu.current_stream()
         cur_stream.wait_stream(stream)
- 
- 
+
+
 def wait_routed_stream():
     stream = get_routed_stream()
     if stream is not None:
         cur_stream = torch.npu.current_stream()
         cur_stream.wait_stream(stream)
- 
- 
+
+
 def shared_expert_on_independent_stream(hidden_states, forward_func):
     stream = get_share_stream()
     if stream is None:
@@ -121,8 +121,8 @@ def shared_expert_on_independent_stream(hidden_states, forward_func):
     with torch.npu.stream(stream):
         shared_output = forward_func(hidden_states)
         return shared_output
- 
- 
+
+
 def routed_expert_on_independent_stream(hidden_states, topk_output, forward_func):
     stream = get_routed_stream()
     if stream is None:

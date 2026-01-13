@@ -47,18 +47,19 @@ if is_cuda():
     causal_conv1d_fn = causal_conv1d_fn_cuda
 elif is_npu():
     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
-    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update_npu
     from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
+    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
+        fused_sigmoid_gating_delta_rule_update_npu,
+    )
     from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_fn_npu
 
-
     from sglang.srt.hardware_backend.npu.cmo import (
-        get_or_create_conv1d_stream,
         get_or_create_cache_update_stream,
+        get_or_create_conv1d_stream,
     )
 
     def causal_conv1d_update_dual_stream(
-        hidden_state: torch.Tensor,    
+        hidden_state: torch.Tensor,
         conv_state: torch.Tensor,
         weight: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
@@ -68,7 +69,9 @@ elif is_npu():
         conv_state_tmp = conv_state[conv_state_indices]
         state_len = conv_state_tmp.shape[-1]
         hidden_state = hidden_state.unsqueeze(-1)
-        hidden_states_new = torch.cat([conv_state_tmp, hidden_state], dim=-1).to(weight.dtype)
+        hidden_states_new = torch.cat([conv_state_tmp, hidden_state], dim=-1).to(
+            weight.dtype
+        )
 
         current_stream = torch.npu.current_stream()
         conv1d_stream = get_or_create_conv1d_stream()
