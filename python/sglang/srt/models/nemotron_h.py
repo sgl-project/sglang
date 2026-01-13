@@ -727,10 +727,10 @@ class NemotronHForCausalLM(nn.Module):
 
     def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
         return self.mamba_cache.get_seqlen_agnostic_capture_inputs(batch_size)
-    
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
-    
+
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight
@@ -738,9 +738,10 @@ class NemotronHForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]],
-                     is_mtp: bool = False) -> None:
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
+    ) -> None:
         updated_weights = []
         for name, loaded_weight in weights:
             name = replace_prefix(name, self.remap_prefix)
@@ -764,7 +765,7 @@ class NemotronHForCausalLM(nn.Module):
             if is_mtp:
                 if "mtp" not in name:
                     continue
-            
+
                 name = name.replace("mtp.layers.", "model.layers.")
 
                 if "embeddings" in name:
@@ -774,7 +775,7 @@ class NemotronHForCausalLM(nn.Module):
 
             if not is_mtp and "mtp" in name:
                 continue
-            
+
             if "scale" in name:
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
