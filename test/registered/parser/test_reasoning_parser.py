@@ -10,7 +10,8 @@ from sglang.srt.parser.reasoning_parser import (
     StreamingParseResult,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase  # noqa
+
+# from sglang.test.test_utils import CustomTestCase  # noqa
 
 register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
