@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+from python.sglang.srt.layers.quantization.fp4_utils import KVFP4QuantizeUtil
 
 
 def calculate_accuracy_metrics(
