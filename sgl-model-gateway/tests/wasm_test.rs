@@ -18,10 +18,7 @@ use axum::{
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
-    core::{
-        steps::{create_wasm_module_registration_workflow, create_wasm_module_removal_workflow},
-        LoadMonitor, WorkerRegistry,
-    },
+    core::{LoadMonitor, WorkerRegistry},
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     },
@@ -71,10 +68,10 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         config.worker_startup_check_interval_secs,
     )));
 
-    // Create empty OnceLock for worker job queue, workflow engine, and mcp manager
+    // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
     use std::sync::OnceLock;
     let worker_job_queue = Arc::new(OnceLock::new());
-    let workflow_engine = Arc::new(OnceLock::new());
+    let workflow_engines = Arc::new(OnceLock::new());
     let mcp_manager_lock = Arc::new(OnceLock::new());
 
     let app_context = Arc::new(
@@ -92,7 +89,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
             .conversation_item_storage(conversation_item_storage)
             .load_monitor(load_monitor)
             .worker_job_queue(worker_job_queue)
-            .workflow_engine(workflow_engine)
+            .workflow_engines(workflow_engines)
             .mcp_manager(mcp_manager_lock)
             .wasm_manager(Some(wasm_manager))
             .build()
@@ -107,28 +104,13 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         .set(job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize WorkflowEngine and register workflows
-    use smg::{
-        core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
-        workflow::WorkflowEngine,
-    };
-    let engine = Arc::new(WorkflowEngine::new());
-    engine
-        .register_workflow(create_worker_registration_workflow(&config))
-        .expect("worker_registration workflow should be valid");
-    engine
-        .register_workflow(create_worker_removal_workflow())
-        .expect("worker_removal workflow should be valid");
-    engine
-        .register_workflow(create_wasm_module_registration_workflow())
-        .expect("wasm_module_registration workflow should be valid");
-    engine
-        .register_workflow(create_wasm_module_removal_workflow())
-        .expect("wasm_module_removal workflow should be valid");
+    // Initialize WorkflowEngines
+    use smg::core::steps::WorkflowEngines;
+    let engines = WorkflowEngines::new(&config);
     app_context
-        .workflow_engine
-        .set(engine)
-        .expect("WorkflowEngine should only be initialized once");
+        .workflow_engines
+        .set(engines)
+        .expect("WorkflowEngines should only be initialized once");
 
     // Initialize MCP manager with empty config
     use smg::mcp::{McpConfig, McpManager};
@@ -678,15 +660,15 @@ async fn test_wasm_module_execution() {
         .as_ref()
         .expect("WASM manager should be initialized");
 
-    let engine = app_context
-        .workflow_engine
+    let engines = app_context
+        .workflow_engines
         .get()
-        .expect("Workflow engine should be initialized");
+        .expect("Workflow engines should be initialized");
 
     // Create workflow context for registration
     use smg::{
-        core::steps::WasmModuleConfigRequest,
-        workflow::{WorkflowContext, WorkflowId, WorkflowInstanceId},
+        core::steps::{WasmModuleConfigRequest, WasmRegistrationWorkflowData},
+        workflow::WorkflowId,
     };
 
     let descriptor = WasmModuleDescriptor {
@@ -700,40 +682,45 @@ async fn test_wasm_module_execution() {
     };
 
     let config_request = WasmModuleConfigRequest { descriptor };
-    let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-    workflow_context.set_arc("wasm_module_config", Arc::new(config_request));
-    workflow_context.set_arc("app_context", app_context.clone());
+    let workflow_data = WasmRegistrationWorkflowData {
+        config: config_request,
+        wasm_bytes: None,
+        sha256_hash: None,
+        file_size_bytes: None,
+        module_uuid: None,
+        app_context: Some(app_context.clone()),
+    };
 
     // Start workflow
-    let instance_id = engine
-        .start_workflow(
-            WorkflowId::new("wasm_module_registration"),
-            workflow_context,
-        )
+    let instance_id = engines
+        .wasm_registration
+        .start_workflow(WorkflowId::new("wasm_module_registration"), workflow_data)
         .await
         .expect("Failed to start workflow");
 
     // Wait for workflow to complete
     let timeout = Duration::from_secs(30);
     let start = std::time::Instant::now();
-    let mut module_uuid: Option<Uuid> = None;
 
-    loop {
+    let module_uuid = loop {
         if start.elapsed() > timeout {
             panic!("Workflow timeout");
         }
 
-        let state = engine
+        let state = engines
+            .wasm_registration
             .get_status(instance_id)
+            .await
             .expect("Failed to get workflow status");
 
         match state.status {
             smg::workflow::WorkflowStatus::Completed => {
-                // Extract module UUID from context
-                if let Some(uuid_arc) = state.context.get::<Uuid>("module_uuid") {
-                    module_uuid = Some(*uuid_arc.as_ref());
-                }
-                break;
+                // Extract module UUID from typed workflow data
+                break state
+                    .context
+                    .data
+                    .module_uuid
+                    .expect("Module UUID should be in context");
             }
             smg::workflow::WorkflowStatus::Failed => {
                 panic!("Workflow failed: {:?}", state);
@@ -742,9 +729,7 @@ async fn test_wasm_module_execution() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-    }
-
-    let module_uuid = module_uuid.expect("Module UUID should be in context");
+    };
 
     // Verify module is registered
     let module = wasm_manager
