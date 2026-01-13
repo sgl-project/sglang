@@ -11,8 +11,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
@@ -468,7 +470,7 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
 
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         if seq_lens.is_npu:
@@ -563,11 +565,25 @@ class VisionAttention(nn.Module):
         self.dummy_dim = (num_dummy_heads + num_heads) * self.head_size
 
         if self.qk_normalization:
+            norm_kwargs = (
+                dict(
+                    weight_dtype=torch.float32,
+                    cast_x_before_out_mul=True,
+                )
+                if get_global_server_args().rl_on_policy_target is not None
+                else {}
+            )
             self.q_norm = RMSNorm(
-                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+                self.dummy_dim,
+                eps=layer_norm_eps,
+                var_hidden_size=embed_dim,
+                **norm_kwargs,
             )
             self.k_norm = RMSNorm(
-                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+                self.dummy_dim,
+                eps=layer_norm_eps,
+                var_hidden_size=embed_dim,
+                **norm_kwargs,
             )
 
         # Select attention backend via a unified method
@@ -718,6 +734,15 @@ class VisionAttention(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
+        if (
+            get_global_server_args().rl_on_policy_target is not None
+            and position_embeddings is not None
+        ):
+            assert isinstance(position_embeddings, tuple), (
+                "expected position_embeddings to be a tuple of two tensors,\n"
+                f"but got {type(position_embeddings)}, change if needed"
+            )
+            position_embeddings = tuple(p.to(x.dtype) for p in position_embeddings)
         x_shape = x.shape
         bsz, s, _ = x_shape
         head = self.num_attention_heads_per_partition
@@ -799,7 +824,23 @@ class VisionAttention(nn.Module):
 
         # internvl
         if self.qk_normalization:
-            q, k = self._apply_qk_norm(q, k)
+            # jit kernel
+            if can_use_jit_qk_norm(self.head_size, q.dtype):
+
+                # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
+                head_dim_for_norm = head * self.head_size
+
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    head_dim=head_dim_for_norm,
+                    alt_stream=self.aux_stream,
+                )
+
+            else:
+                q, k = self._apply_qk_norm(q, k)
 
         output = self.qkv_backend.forward(
             q=q,

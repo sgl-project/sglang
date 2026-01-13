@@ -250,11 +250,13 @@ class ServerManager:
         port: int,
         wait_deadline: float = 1200.0,
         extra_args: str = "",
+        env_vars: dict[str, str] | None = None,
     ):
         self.model = model
         self.port = port
         self.wait_deadline = wait_deadline
         self.extra_args = extra_args
+        self.env_vars = env_vars or {}
 
     def _wait_for_rocm_gpu_memory_clear(self, max_wait: float = 60.0) -> None:
         """ROCm-specific: Wait for GPU memory to be mostly free before starting.
@@ -346,6 +348,9 @@ class ServerManager:
         env = os.environ.copy()
         env["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
         env["SGLANG_PERF_LOG_DIR"] = log_dir.as_posix()
+
+        # Apply custom environment variables
+        env.update(self.env_vars)
 
         # TODO: unify with run_command
         logger.info(f"Running command: {shlex.join(command)}")
@@ -1073,7 +1078,11 @@ def get_generate_fn(
             prompt=sampling_params.prompt,
             size=sampling_params.output_size,
             seconds=video_seconds,
-            extra_body={"reference_url": sampling_params.image_path},
+            extra_body={
+                "reference_url": sampling_params.image_path,
+                "fps": sampling_params.fps,
+                "num_frames": sampling_params.num_frames,
+            },
         )
 
     def generate_text_image_to_video(case_id, client) -> str:
@@ -1097,6 +1106,10 @@ def get_generate_fn(
                 size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
+                extra_body={
+                    "fps": sampling_params.fps,
+                    "num_frames": sampling_params.num_frames,
+                },
             )
 
     if modality == "video":
