@@ -162,12 +162,14 @@ class GrammarManager:
             # we still treat those requests as ready instead of canceling them.
             for i in range(num_ready_reqs_min, num_ready_reqs_max):
                 req = self.grammar_queue[i]
+                if req.finished():
+                    continue
                 if isinstance(req.grammar, futures.Future):
                     req.grammar = req.grammar.result()
-                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-                if req.grammar is INVALID_GRAMMAR_OBJ:
-                    error_msg = f"Invalid grammar request: {req.grammar_key=}"
-                    req.set_finish_with_abort(error_msg)
+                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                    if req.grammar is INVALID_GRAMMAR_OBJ:
+                        error_msg = f"Invalid grammar request: {req.grammar_key=}"
+                        req.set_finish_with_abort(error_msg)
 
             num_ready_reqs_min = num_ready_reqs_max
 
