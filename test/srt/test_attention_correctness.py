@@ -105,7 +105,7 @@ class TestAttentionPositionCorrectness(unittest.TestCase):
             v_cache,
             seq_lens,
             top_k=top_k,
-            sm_scale=1.0 / (head_dim ** 0.5),
+            sm_scale=1.0 / (head_dim**0.5),
         )
 
         # Verify: all indices should be in [0, seq_len)
@@ -171,7 +171,7 @@ class TestAttentionPositionCorrectness(unittest.TestCase):
             v_cache,
             seq_lens,
             top_k=top_k,
-            sm_scale=1.0 / (head_dim ** 0.5),
+            sm_scale=1.0 / (head_dim**0.5),
         )
 
         # The needle position should appear in top-k for all heads
@@ -258,7 +258,7 @@ class TestGQABroadcastCorrectness(unittest.TestCase):
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device="cuda")
 
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         # Run chunked attention extraction
         (
@@ -395,7 +395,7 @@ class TestPagedAttentionMapping(unittest.TestCase):
         # kv_indptr: [0, seq_len] for single batch
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
 
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         # Run attention extraction
         (
@@ -493,7 +493,7 @@ class TestPagedAttentionMapping(unittest.TestCase):
         # Query matches needle
         q = needle_key.expand(batch_size, num_q_heads, head_dim)
 
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         (
             topk_scores,

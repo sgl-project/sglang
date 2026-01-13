@@ -77,17 +77,17 @@ from sklearn.preprocessing import StandardScaler
 
 # Import fingerprint schema from central module
 from .fingerprint_schema import (
-    SCHEMA_VERSION,
-    V1_DIM as FINGERPRINT_DIM,
-    FP_LOCAL_MASS,
-    FP_MID_MASS,
-    FP_LONG_MASS,
     FP_ENTROPY,
-    FP_HISTOGRAM_START,
     FP_HISTOGRAM_END,
+    FP_HISTOGRAM_START,
+    FP_LOCAL_MASS,
+    FP_LONG_MASS,
+    FP_MID_MASS,
     FP_ROTATIONAL_VARIANCE,
-    ZONE_THRESHOLDS,
+    SCHEMA_VERSION,
 )
+from .fingerprint_schema import V1_DIM as FINGERPRINT_DIM
+from .fingerprint_schema import ZONE_THRESHOLDS
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"

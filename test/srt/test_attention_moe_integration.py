@@ -13,10 +13,9 @@ Usage:
 """
 
 import argparse
-import json
-import requests
 import time
-from typing import Dict, List, Optional, Any
+
+import requests
 
 
 def test_basic_completion(base_url: str) -> bool:
@@ -30,7 +29,7 @@ def test_basic_completion(base_url: str) -> bool:
             "messages": [{"role": "user", "content": "Say hello in one word."}],
             "max_tokens": 10,
             "temperature": 0.0,
-        }
+        },
     )
 
     if response.status_code != 200:
@@ -59,7 +58,7 @@ def test_attention_capture(base_url: str) -> bool:
             "return_attention_tokens": True,
             "top_k_attention": 5,
             "attention_capture_layer_ids": [0, 11, 23],  # Sample layers
-        }
+        },
     )
 
     if response.status_code != 200:
@@ -97,7 +96,7 @@ def test_moe_routing_capture(base_url: str) -> bool:
             "temperature": 0.0,
             "return_moe_routing": True,
             "moe_routing_top_k": 2,
-        }
+        },
     )
 
     if response.status_code != 200:
@@ -120,7 +119,7 @@ def test_moe_routing_capture(base_url: str) -> bool:
     if moe_routing:
         first_record = moe_routing[0]
         print(f"First record: decode_step={first_record.get('decode_step')}")
-        layers = first_record.get('layers', {})
+        layers = first_record.get("layers", {})
         print(f"Captured {len(layers)} layers")
         if layers:
             layer_id = list(layers.keys())[0]
@@ -138,9 +137,9 @@ def test_attention_biases(base_url: str) -> bool:
     # Format: {layer_id_str: {token_pos_str: bias_value, ...}, ...}
     attention_biases = {
         "11": {  # Apply to layer 11
-            "0": 2.0,   # Boost first token
-            "1": 1.5,   # Boost second token
-            "2": 1.0,   # Boost third token
+            "0": 2.0,  # Boost first token
+            "1": 1.5,  # Boost second token
+            "2": 1.0,  # Boost third token
         }
     }
 
@@ -149,12 +148,14 @@ def test_attention_biases(base_url: str) -> bool:
         f"{base_url}/v1/chat/completions",
         json={
             "model": "default",
-            "messages": [{"role": "user", "content": "Complete this: The quick brown fox"}],
+            "messages": [
+                {"role": "user", "content": "Complete this: The quick brown fox"}
+            ],
             "max_tokens": 10,
             "temperature": 0.0,
             "return_attention_tokens": True,
             "attention_capture_layer_ids": [11],
-        }
+        },
     )
 
     # Then run with biases
@@ -162,13 +163,15 @@ def test_attention_biases(base_url: str) -> bool:
         f"{base_url}/v1/chat/completions",
         json={
             "model": "default",
-            "messages": [{"role": "user", "content": "Complete this: The quick brown fox"}],
+            "messages": [
+                {"role": "user", "content": "Complete this: The quick brown fox"}
+            ],
             "max_tokens": 10,
             "temperature": 0.0,
             "return_attention_tokens": True,
             "attention_capture_layer_ids": [11],
             "attention_biases": attention_biases,
-        }
+        },
     )
 
     if response_no_bias.status_code != 200 or response_with_bias.status_code != 200:
@@ -200,7 +203,9 @@ def test_combined_features(base_url: str) -> bool:
         f"{base_url}/v1/chat/completions",
         json={
             "model": "default",
-            "messages": [{"role": "user", "content": "Explain quantum computing briefly."}],
+            "messages": [
+                {"role": "user", "content": "Explain quantum computing briefly."}
+            ],
             "max_tokens": 50,
             "temperature": 0.0,
             "return_attention_tokens": True,
@@ -208,10 +213,8 @@ def test_combined_features(base_url: str) -> bool:
             "attention_capture_layer_ids": [0, 11, 23, 35],
             "return_moe_routing": True,
             "moe_routing_top_k": 3,
-            "attention_biases": {
-                "11": {"0": 1.0}  # Small bias on layer 11, token 0
-            },
-        }
+            "attention_biases": {"11": {"0": 1.0}},  # Small bias on layer 11, token 0
+        },
     )
 
     if response.status_code != 200:
@@ -243,13 +246,15 @@ def test_thinking_with_telemetry(base_url: str) -> bool:
         f"{base_url}/v1/chat/completions",
         json={
             "model": "default",
-            "messages": [{"role": "user", "content": "What is 15 * 23? Think step by step."}],
+            "messages": [
+                {"role": "user", "content": "What is 15 * 23? Think step by step."}
+            ],
             "max_tokens": 200,
             "temperature": 0.0,
             "return_attention_tokens": True,
             "top_k_attention": 5,
             "return_moe_routing": True,
-        }
+        },
     )
 
     if response.status_code != 200:
@@ -293,8 +298,12 @@ def test_thinking_with_telemetry(base_url: str) -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Integration test for attention/MoE features")
-    parser.add_argument("--base-url", default="http://localhost:30000", help="Server base URL")
+    parser = argparse.ArgumentParser(
+        description="Integration test for attention/MoE features"
+    )
+    parser.add_argument(
+        "--base-url", default="http://localhost:30000", help="Server base URL"
+    )
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")

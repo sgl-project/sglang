@@ -65,18 +65,19 @@ import shutil
 import sqlite3
 import struct
 import tempfile
-import time
 import threading
+import time
 from collections import deque
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
-import numpy as np
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 # Import manifest for git/hardware info in /version endpoint
 try:
-    from schemas.manifest import get_git_sha, get_git_branch
+    from schemas.manifest import get_git_branch, get_git_sha
 
     HAS_MANIFEST = True
 except ImportError:
@@ -103,11 +104,11 @@ except ImportError:
 # Try to import RoPE de-rotation for educational analysis
 try:
     from discovery import (
-        RoPEDerotator,
-        RoPEConfig,
-        get_term_explanation,
-        explain_attention_step,
         ATTENTION_GLOSSARY,
+        RoPEConfig,
+        RoPEDerotator,
+        explain_attention_step,
+        get_term_explanation,
     )
 
     HAS_DEROTATION = True
@@ -117,11 +118,11 @@ except ImportError:
 # Try to import Compass Router for angle-based routing
 try:
     from discovery import (
+        COMPASS_GLOSSARY,
         CompassRouter,
         CompassRouterConfig,
-        COMPASS_GLOSSARY,
-        create_compass_router,
         analyze_attention_compass,
+        create_compass_router,
     )
 
     HAS_COMPASS = True
@@ -130,11 +131,7 @@ except ImportError:
 
 # Try to import Manifold Firewall for hallucination detection
 try:
-    from discovery import (
-        ManifoldFirewall,
-        ManifoldBatchAnalyzer,
-        FIREWALL_GLOSSARY,
-    )
+    from discovery import FIREWALL_GLOSSARY, ManifoldBatchAnalyzer, ManifoldFirewall
 
     HAS_FIREWALL = True
     # Global firewall instance for session management
@@ -168,9 +165,10 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
-# Simple HTTP server
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
+
+# Simple HTTP server
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 class ClusteringBackend(Enum):
@@ -634,7 +632,7 @@ class OnlineMicroCluster:
         self.decay = decay
         self.centroid = point.copy()
         self.weight = 1.0
-        self.sq_sum = np.sum(point ** 2)
+        self.sq_sum = np.sum(point**2)
         self.n_points = 1
         self.last_update = time.time()
 
@@ -651,7 +649,7 @@ class OnlineMicroCluster:
         # Add new point
         self.centroid = (self.centroid * self.weight + point) / (self.weight + 1)
         self.weight += 1
-        self.sq_sum += np.sum(point ** 2)
+        self.sq_sum += np.sum(point**2)
         self.n_points += 1
         self.last_update = time.time()
 
@@ -660,7 +658,7 @@ class OnlineMicroCluster:
         """Approximate cluster radius (std dev from centroid)."""
         if self.weight < 2:
             return 0.0
-        variance = max(0, self.sq_sum / self.weight - np.sum(self.centroid ** 2))
+        variance = max(0, self.sq_sum / self.weight - np.sum(self.centroid**2))
         return float(np.sqrt(variance))
 
     def is_stale(self, max_age: float = 300) -> bool:
@@ -1199,9 +1197,9 @@ class RAPIDSSidecar:
 
         return {
             "manifold": {
-                "zone": centroid.traits[0]
-                if centroid and centroid.traits
-                else "unknown",
+                "zone": (
+                    centroid.traits[0] if centroid and centroid.traits else "unknown"
+                ),
                 "confidence": max(0, 1 - distance / 5.0),  # Heuristic confidence
                 "cluster_id": cluster_id,
                 "cluster_label": None,

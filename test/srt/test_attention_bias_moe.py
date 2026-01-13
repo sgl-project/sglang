@@ -14,8 +14,7 @@ Usage:
 
 import math
 import unittest
-from unittest.mock import MagicMock, patch
-from typing import Dict, List, Optional, Tuple
+from typing import Dict
 
 import torch
 
@@ -26,11 +25,14 @@ class TestMultiLayerAttentionBias(unittest.TestCase):
     def test_csr_indexing_single_layer(self):
         """Test CSR indexing with biases on a single layer."""
         # Simulate bias data: layer 5, batch 0, positions [10, 20, 30]
-        indices = torch.tensor([
-            [5, 0, 10],  # layer_id, batch_idx, token_pos
-            [5, 0, 20],
-            [5, 0, 30],
-        ], dtype=torch.int64)
+        indices = torch.tensor(
+            [
+                [5, 0, 10],  # layer_id, batch_idx, token_pos
+                [5, 0, 20],
+                [5, 0, 30],
+            ],
+            dtype=torch.int64,
+        )
         values = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
         layers = [5]
         # CSR indptr: [0, 3] meaning layer 5 has entries 0-3
@@ -52,17 +54,20 @@ class TestMultiLayerAttentionBias(unittest.TestCase):
     def test_csr_indexing_multi_layer(self):
         """Test CSR indexing with biases on multiple layers."""
         # Biases on layers 0, 5, 10
-        indices = torch.tensor([
-            # Layer 0 (2 entries)
-            [0, 0, 5],
-            [0, 0, 10],
-            # Layer 5 (3 entries)
-            [5, 0, 15],
-            [5, 0, 20],
-            [5, 0, 25],
-            # Layer 10 (1 entry)
-            [10, 0, 30],
-        ], dtype=torch.int64)
+        indices = torch.tensor(
+            [
+                # Layer 0 (2 entries)
+                [0, 0, 5],
+                [0, 0, 10],
+                # Layer 5 (3 entries)
+                [5, 0, 15],
+                [5, 0, 20],
+                [5, 0, 25],
+                # Layer 10 (1 entry)
+                [10, 0, 30],
+            ],
+            dtype=torch.int64,
+        )
         values = torch.tensor([0.5, 0.6, 1.0, 1.5, 2.0, 3.0], dtype=torch.float32)
         layers = [0, 5, 10]
         # CSR indptr: layer 0 has 0-2, layer 5 has 2-5, layer 10 has 5-6
@@ -141,7 +146,7 @@ class TestMoETelemetry(unittest.TestCase):
             layer_count += 1
 
         churn_rate = churn_count / layer_count if layer_count > 0 else 0
-        self.assertAlmostEqual(churn_rate, 2/3, places=2)
+        self.assertAlmostEqual(churn_rate, 2 / 3, places=2)
 
     def test_hubness_computation(self):
         """Test hubness (expert concentration) computation."""
@@ -176,14 +181,18 @@ class TestMoETelemetry(unittest.TestCase):
             expert_id = 5
             if layer_id not in hubness_tracker:
                 hubness_tracker[layer_id] = {}
-            hubness_tracker[layer_id][expert_id] = hubness_tracker[layer_id].get(expert_id, 0) + 1
+            hubness_tracker[layer_id][expert_id] = (
+                hubness_tracker[layer_id].get(expert_id, 0) + 1
+            )
 
             # Layer 1 alternates between expert 10 and 11
             layer_id = 1
             expert_id = 10 if step % 2 == 0 else 11
             if layer_id not in hubness_tracker:
                 hubness_tracker[layer_id] = {}
-            hubness_tracker[layer_id][expert_id] = hubness_tracker[layer_id].get(expert_id, 0) + 1
+            hubness_tracker[layer_id][expert_id] = (
+                hubness_tracker[layer_id].get(expert_id, 0) + 1
+            )
 
             total_steps += 1
 
@@ -223,8 +232,8 @@ class TestThinkPhaseTracking(unittest.TestCase):
         # Check phase assignments
         self.assertEqual(phase_history[0], "output")  # Before <think>
         self.assertEqual(phase_history[1], "output")
-        self.assertEqual(phase_history[2], "think")   # At <think>
-        self.assertEqual(phase_history[3], "think")   # Inside think
+        self.assertEqual(phase_history[2], "think")  # At <think>
+        self.assertEqual(phase_history[3], "think")  # Inside think
         self.assertEqual(phase_history[4], "think")
         self.assertEqual(phase_history[5], "think")
         self.assertEqual(phase_history[6], "output")  # At </think>
@@ -252,10 +261,7 @@ class TestLayerValidation(unittest.TestCase):
         num_layers = 32
         requested_layers = [-1, 0, 15, 31, 32, 100]
 
-        valid_layers = [
-            lid for lid in requested_layers
-            if 0 <= lid < num_layers
-        ]
+        valid_layers = [lid for lid in requested_layers if 0 <= lid < num_layers]
 
         self.assertEqual(valid_layers, [0, 15, 31])
 
@@ -264,10 +270,7 @@ class TestLayerValidation(unittest.TestCase):
         num_layers = 32
         requested_layers = [-5, 50, 100]
 
-        valid_layers = [
-            lid for lid in requested_layers
-            if 0 <= lid < num_layers
-        ]
+        valid_layers = [lid for lid in requested_layers if 0 <= lid < num_layers]
 
         result = valid_layers if valid_layers else None
         self.assertIsNone(result)
@@ -279,10 +282,7 @@ class TestLayerValidation(unittest.TestCase):
         capture_layer_ids = [0, 2, 4, 10]  # User requests these
 
         # Filter to only actual MoE layers
-        valid_moe_captures = [
-            lid for lid in capture_layer_ids
-            if lid in moe_layer_ids
-        ]
+        valid_moe_captures = [lid for lid in capture_layer_ids if lid in moe_layer_ids]
 
         self.assertEqual(valid_moe_captures, [2, 4])
 
@@ -431,7 +431,7 @@ class TestPerRequestOverridePriority(unittest.TestCase):
             "manifold": {
                 "zone": "semantic_bridge",
                 "cluster_id": 12,
-                "cluster_conf": 0.92
+                "cluster_conf": 0.92,
             },
             "control": {
                 "next_capture_layer_ids": [8, 16, 24],
@@ -439,8 +439,8 @@ class TestPerRequestOverridePriority(unittest.TestCase):
                 "max_attention_steps": 256,
                 "fingerprint_mode": True,
                 "fingerprint_max_steps": 128,
-                "hub_tokens": [42, 128, 256]
-            }
+                "hub_tokens": [42, 128, 256],
+            },
         }
 
         # Simulate parsing
@@ -485,6 +485,7 @@ class TestPerRequestOverridePriority(unittest.TestCase):
 
     def test_no_global_state_mutation(self):
         """Test that per-request overrides don't mutate shared state."""
+
         # Simulate batch-level defaults (immutable)
         class BatchDefaults:
             attention_tokens_stride = 8
@@ -505,12 +506,28 @@ class TestPerRequestOverridePriority(unittest.TestCase):
         req2 = Request2()
 
         # Resolve for request 1
-        stride1 = req1.attention_stride if req1.attention_stride is not None else defaults.attention_tokens_stride
-        fp_mode1 = req1.attention_fingerprint_mode if req1.attention_fingerprint_mode is not None else defaults.attention_fingerprint_mode
+        stride1 = (
+            req1.attention_stride
+            if req1.attention_stride is not None
+            else defaults.attention_tokens_stride
+        )
+        fp_mode1 = (
+            req1.attention_fingerprint_mode
+            if req1.attention_fingerprint_mode is not None
+            else defaults.attention_fingerprint_mode
+        )
 
         # Resolve for request 2
-        stride2 = req2.attention_stride if req2.attention_stride is not None else defaults.attention_tokens_stride
-        fp_mode2 = req2.attention_fingerprint_mode if req2.attention_fingerprint_mode is not None else defaults.attention_fingerprint_mode
+        stride2 = (
+            req2.attention_stride
+            if req2.attention_stride is not None
+            else defaults.attention_tokens_stride
+        )
+        fp_mode2 = (
+            req2.attention_fingerprint_mode
+            if req2.attention_fingerprint_mode is not None
+            else defaults.attention_fingerprint_mode
+        )
 
         # Verify different requests get different values
         self.assertEqual(stride1, 2)

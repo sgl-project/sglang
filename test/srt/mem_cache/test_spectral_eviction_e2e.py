@@ -12,8 +12,8 @@ For live server testing, use: scripts/test_spectral_eviction_live.py
 
 import time
 import unittest
-from unittest.mock import MagicMock
 from typing import Dict, List
+from unittest.mock import MagicMock
 
 import numpy as np
 
@@ -36,9 +36,9 @@ class TestSpectralEvictionE2E(unittest.TestCase):
         # Check if spectral eviction is available
         try:
             from sglang.srt.mem_cache.spectral_eviction import (
+                ZONE_IMPORTANCE,
                 SpectralEvictionStrategy,
                 SpectralSkeletonComputer,
-                ZONE_IMPORTANCE,
             )
 
             self.SpectralEvictionStrategy = SpectralEvictionStrategy
@@ -303,9 +303,9 @@ class TestFingerprintSchemaIntegration(unittest.TestCase):
         """Test that schema constants are importable from central module."""
         try:
             from examples.attention_explorer.discovery.fingerprint_schema import (
+                FP_ROTATIONAL_VARIANCE,
                 V1_DIM,
                 V2_DIM,
-                FP_ROTATIONAL_VARIANCE,
                 ZONE_THRESHOLDS,
             )
 

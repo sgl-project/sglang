@@ -15,15 +15,13 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 from scipy import stats
 
 # Import manifest module for comprehensive experiment tracking
 try:
-    from .manifest import (
-        get_git_info,
-        get_gpu_info,
-    )
+    from .manifest import get_git_info, get_gpu_info
 
     HAS_MANIFEST = True
 except ImportError:

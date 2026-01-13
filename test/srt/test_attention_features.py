@@ -10,10 +10,8 @@ Usage:
     python -m pytest test/srt/test_attention_features.py -v
 """
 
-import math
 import time
 import unittest
-from typing import Dict, List
 
 import numpy as np
 
@@ -26,9 +24,9 @@ class TestAttentionSketch(CustomTestCase):
     def test_compute_attention_sketch_basic(self):
         """Test basic sketch computation with valid inputs."""
         from sglang.srt.managers.scheduler_output_processor_mixin import (
-            compute_attention_sketch,
-            SKETCH_TOP_HUBS_K,
             SKETCH_DIST_BINS,
+            SKETCH_TOP_HUBS_K,
+            compute_attention_sketch,
         )
 
         # Sample attention data
@@ -69,8 +67,8 @@ class TestAttentionSketch(CustomTestCase):
     def test_compute_attention_sketch_empty(self):
         """Test sketch computation with empty inputs."""
         from sglang.srt.managers.scheduler_output_processor_mixin import (
-            compute_attention_sketch,
             SKETCH_DIST_BINS,
+            compute_attention_sketch,
         )
 
         sketch = compute_attention_sketch([], [], None, None, 100)
@@ -128,18 +126,14 @@ class TestAttentionSketch(CustomTestCase):
     def test_merge_sketches(self):
         """Test merging multiple sketches."""
         from sglang.srt.managers.scheduler_output_processor_mixin import (
+            SKETCH_DIST_BINS,
             compute_attention_sketch,
             merge_sketches,
-            SKETCH_DIST_BINS,
         )
 
         # Create two sketches
-        sketch1 = compute_attention_sketch(
-            [10, 20], [0.6, 0.4], [1.0, 0.5], 1.5, 100
-        )
-        sketch2 = compute_attention_sketch(
-            [10, 30], [0.7, 0.3], [1.2, 0.3], 1.6, 150
-        )
+        sketch1 = compute_attention_sketch([10, 20], [0.6, 0.4], [1.0, 0.5], 1.5, 100)
+        sketch2 = compute_attention_sketch([10, 30], [0.7, 0.3], [1.2, 0.3], 1.6, 150)
 
         merged = merge_sketches([sketch1, sketch2])
 
@@ -161,8 +155,8 @@ class TestAttentionSketch(CustomTestCase):
     def test_merge_sketches_empty(self):
         """Test merging empty list of sketches."""
         from sglang.srt.managers.scheduler_output_processor_mixin import (
-            merge_sketches,
             SKETCH_DIST_BINS,
+            merge_sketches,
         )
 
         merged = merge_sketches([])
@@ -348,6 +342,7 @@ class TestThinkSegmentation(CustomTestCase):
     def _make_sampling_params(self):
         """Create minimal sampling params for testing."""
         from sglang.srt.sampling.sampling_params import SamplingParams
+
         return SamplingParams(max_new_tokens=10)
 
     def test_think_phase_default(self):

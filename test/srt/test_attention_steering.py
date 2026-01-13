@@ -133,9 +133,9 @@ class TestAttentionBiasesWiring(unittest.TestCase):
         bias_tensor = torch.zeros((batch_size, max_seq_len))
         valid_mask = token_positions < max_seq_len
         if valid_mask.any():
-            bias_tensor[
-                batch_indices[valid_mask], token_positions[valid_mask]
-            ] = bias_values[valid_mask]
+            bias_tensor[batch_indices[valid_mask], token_positions[valid_mask]] = (
+                bias_values[valid_mask]
+            )
 
         # Verify (use assertAlmostEqual for float comparison)
         self.assertAlmostEqual(bias_tensor[0, 10].item(), 0.5, places=5)

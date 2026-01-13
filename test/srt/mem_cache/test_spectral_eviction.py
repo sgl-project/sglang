@@ -10,7 +10,7 @@ Tests:
 
 import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 
@@ -21,6 +21,7 @@ class TestSpectralSkeletonComputer(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures."""
         from sglang.srt.mem_cache.spectral_eviction import SpectralSkeletonComputer
+
         self.computer = SpectralSkeletonComputer(
             n_components=5,
             retention_ratio=0.3,
@@ -103,7 +104,9 @@ class TestSpectralSkeletonComputer(unittest.TestCase):
         result2 = self.computer.compute_skeleton(fingerprints2, 100, cache_key="test")
 
         # Should have different sizes due to growth
-        self.assertNotEqual(len(result1.skeleton_indices), len(result2.skeleton_indices))
+        self.assertNotEqual(
+            len(result1.skeleton_indices), len(result2.skeleton_indices)
+        )
 
 
 class TestSpectralEvictionStrategy(unittest.TestCase):
@@ -112,12 +115,15 @@ class TestSpectralEvictionStrategy(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures."""
         from sglang.srt.mem_cache.spectral_eviction import SpectralEvictionStrategy
+
         self.strategy = SpectralEvictionStrategy(
             retention_ratio=0.3,
             spectral_weight=0.7,
         )
 
-    def _create_mock_node(self, fingerprint=None, zone=None, coherence=None, access_time=None):
+    def _create_mock_node(
+        self, fingerprint=None, zone=None, coherence=None, access_time=None
+    ):
         """Create a mock TreeNode with spectral metadata."""
         node = MagicMock()
         node.spectral_fingerprint = fingerprint
@@ -181,7 +187,9 @@ class TestSpectralEvictionStrategy(unittest.TestCase):
         """Test that recent access time increases priority."""
         fp = np.zeros(20)
 
-        old_node = self._create_mock_node(fp, "semantic_bridge", 0.5, time.monotonic() - 1000)
+        old_node = self._create_mock_node(
+            fp, "semantic_bridge", 0.5, time.monotonic() - 1000
+        )
         new_node = self._create_mock_node(fp, "semantic_bridge", 0.5, time.monotonic())
 
         old_priority = self.strategy.get_priority(old_node)
@@ -201,7 +209,8 @@ class TestRadixCacheSpectralIntegration(unittest.TestCase):
         cls.TreeNode = None
         cls.RadixCache = None
         try:
-            from sglang.srt.mem_cache.radix_cache import TreeNode, RadixCache
+            from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+
             cls.TreeNode = TreeNode
             cls.RadixCache = RadixCache
             cls.radix_cache_available = True
@@ -222,9 +231,9 @@ class TestRadixCacheSpectralIntegration(unittest.TestCase):
         else:
             node = self.TreeNode()
 
-        self.assertTrue(hasattr(node, 'spectral_fingerprint'))
-        self.assertTrue(hasattr(node, 'manifold_zone'))
-        self.assertTrue(hasattr(node, 'spectral_coherence'))
+        self.assertTrue(hasattr(node, "spectral_fingerprint"))
+        self.assertTrue(hasattr(node, "manifold_zone"))
+        self.assertTrue(hasattr(node, "spectral_coherence"))
 
         # Should be None initially
         self.assertIsNone(node.spectral_fingerprint)
@@ -242,7 +251,9 @@ class TestRadixCacheSpectralIntegration(unittest.TestCase):
                     self.spectral_coherence = None
 
             class MockRadixCache:
-                def attach_spectral_metadata(self, node, fingerprint, manifold_zone, spectral_coherence):
+                def attach_spectral_metadata(
+                    self, node, fingerprint, manifold_zone, spectral_coherence
+                ):
                     node.spectral_fingerprint = fingerprint
                     node.manifold_zone = manifold_zone
                     node.spectral_coherence = spectral_coherence
@@ -275,21 +286,15 @@ class TestZoneImportanceScoring(unittest.TestCase):
         from sglang.srt.mem_cache.spectral_eviction import ZONE_IMPORTANCE
 
         self.assertGreater(
-            ZONE_IMPORTANCE["semantic_bridge"],
-            ZONE_IMPORTANCE["long_range"]
+            ZONE_IMPORTANCE["semantic_bridge"], ZONE_IMPORTANCE["long_range"]
         )
         self.assertGreater(
-            ZONE_IMPORTANCE["long_range"],
-            ZONE_IMPORTANCE["structure_ripple"]
+            ZONE_IMPORTANCE["long_range"], ZONE_IMPORTANCE["structure_ripple"]
         )
         self.assertGreater(
-            ZONE_IMPORTANCE["structure_ripple"],
-            ZONE_IMPORTANCE["syntax_floor"]
+            ZONE_IMPORTANCE["structure_ripple"], ZONE_IMPORTANCE["syntax_floor"]
         )
-        self.assertGreater(
-            ZONE_IMPORTANCE["syntax_floor"],
-            ZONE_IMPORTANCE["diffuse"]
-        )
+        self.assertGreater(ZONE_IMPORTANCE["syntax_floor"], ZONE_IMPORTANCE["diffuse"])
 
     def test_all_zones_have_scores(self):
         """Test that all expected zones have importance scores."""

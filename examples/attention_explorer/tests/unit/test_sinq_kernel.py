@@ -71,7 +71,7 @@ class TestSinqKernelOptimization:
         kv_indices = torch.arange(
             seq_len * batch_size, dtype=torch.int32, device=device
         )
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         return {
             "q": q,
@@ -254,7 +254,7 @@ class TestSinqEdgeCases:
         )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         scores, indices, logits, logsumexp = compute_topk_attention_chunked(
             q,
@@ -292,7 +292,7 @@ class TestSinqEdgeCases:
         )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         # Sink threshold larger than sequence
         scores, indices, logits, logsumexp = compute_topk_attention_chunked(
@@ -350,7 +350,7 @@ class TestSinqPerformanceCharacteristics:
             kv_indices = torch.arange(
                 seq_len * batch_size, dtype=torch.int32, device=device
             )
-            sm_scale = 1.0 / (head_dim ** 0.5)
+            sm_scale = 1.0 / (head_dim**0.5)
 
             capture = TopKAttentionCapture(top_k=20, sink_threshold=5)
             result = capture.extract(q, k_buffer, kv_indptr, kv_indices, sm_scale)
@@ -393,7 +393,7 @@ def demo_sinq_optimization():
         [0, seq_len, seq_len * 2], dtype=torch.int32, device=device
     )
     kv_indices = torch.arange(seq_len * batch_size, dtype=torch.int32, device=device)
-    sm_scale = 1.0 / (head_dim ** 0.5)
+    sm_scale = 1.0 / (head_dim**0.5)
 
     print("=" * 60)
     print("Sinq Kernel Optimization Demo")

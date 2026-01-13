@@ -13,7 +13,6 @@ import random
 import unittest
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase
@@ -134,7 +133,7 @@ class TestTopkAttention(CustomTestCase):
 
         kv_indices = torch.arange(total_tokens, dtype=torch.int32, device=device)
 
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         # Run the chunked kernel (returns 4-tuple: scores, indices, logits, logsumexp)
         (
@@ -266,7 +265,7 @@ class TestTopkAttention(CustomTestCase):
         k_buffer = torch.randn(0, num_heads, head_dim, device=device)
         kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
         kv_indices = torch.zeros(0, dtype=torch.int32, device=device)
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         (
             topk_scores,
@@ -315,7 +314,7 @@ class TestTopkAttention(CustomTestCase):
         )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         # This should not OOM due to chunked approach
         (
@@ -371,7 +370,7 @@ class TestTopkAttention(CustomTestCase):
         kv_indices = torch.arange(
             seq_len * batch_size, dtype=torch.int32, device=device
         )
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         # Test the capture class
         capture = TopKAttentionCapture(top_k=top_k, chunk_size=256)
@@ -449,7 +448,7 @@ class TestHeadSelectionFiltering(CustomTestCase):
         )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         # Run without head filtering
         scores_all, indices_all, _, _ = compute_topk_attention_chunked(
@@ -508,7 +507,7 @@ class TestHeadSelectionFiltering(CustomTestCase):
         )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         # Empty head_ids should behave like None (all heads)
         scores_empty, indices_empty, _, _ = compute_topk_attention_chunked(
@@ -556,7 +555,7 @@ class TestHeadSelectionFiltering(CustomTestCase):
         )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         # Include some invalid head IDs (negative and out of range)
         head_ids = [-1, 0, 2, 100]  # Only 0 and 2 are valid for num_heads=4
@@ -600,7 +599,7 @@ class TestHeadSelectionFiltering(CustomTestCase):
         )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         # Use only head 0
         scores, indices, logits, lse = compute_topk_attention_chunked(
@@ -646,7 +645,7 @@ class TestHeadSelectionFiltering(CustomTestCase):
         )
         kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
         kv_indices = torch.arange(seq_len, dtype=torch.int32, device=device)
-        sm_scale = 1.0 / (head_dim ** 0.5)
+        sm_scale = 1.0 / (head_dim**0.5)
 
         # Filter to subset of heads
         head_ids = [0, 4, 8, 12]

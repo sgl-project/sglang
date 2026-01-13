@@ -31,22 +31,22 @@ Author: SGLang Attention Explorer
 """
 
 import os
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 # Import schema constants
 try:
     from .fingerprint_schema import (
-        V1_DIM,
-        V2_DIM,
-        FP_LOCAL_MASS,
-        FP_MID_MASS,
-        FP_LONG_MASS,
         FP_ENTROPY,
+        FP_LOCAL_MASS,
+        FP_LONG_MASS,
+        FP_MID_MASS,
         FP_ROTATIONAL_VARIANCE,
         RV_THRESHOLD_LOCAL,
         RV_THRESHOLD_LONG_RANGE,
+        V1_DIM,
+        V2_DIM,
     )
 except ImportError:
     # Fallback for standalone use
@@ -64,8 +64,8 @@ def _get_plt():
     """Lazy import matplotlib."""
     global _plt, _colors
     if _plt is None:
-        import matplotlib.pyplot as plt
         import matplotlib.colors as mcolors
+        import matplotlib.pyplot as plt
 
         _plt = plt
         _colors = mcolors
@@ -686,8 +686,8 @@ def create_exploration_report(
 def main():
     """Generate visualizations from command line."""
     import argparse
-    import struct
     import sqlite3
+    import struct
 
     parser = argparse.ArgumentParser(description="Generate fingerprint visualizations")
     parser.add_argument(
