@@ -72,6 +72,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     log_info_on_rank0,
+    next_power_of_2,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -79,6 +80,7 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 
@@ -1318,7 +1320,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             trtllm_fp8_block_scale_moe,
             trtllm_fp8_per_tensor_scale_moe,
         )
-
         from sglang.srt.layers.moe.topk import TopKOutputChecker
         from sglang.srt.layers.moe.utils import RoutingMethodType
 
