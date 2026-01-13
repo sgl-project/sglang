@@ -232,7 +232,6 @@ class Req:
 
     def set_as_warmup(self):
         self.is_warmup = True
-        self.num_inference_steps = 1
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
         self.num_inference_steps = 1
 
