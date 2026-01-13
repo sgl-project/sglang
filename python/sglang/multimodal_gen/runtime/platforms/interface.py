@@ -33,6 +33,7 @@ class AttentionBackendEnum(enum.Enum):
     VIDEO_SPARSE_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
+    SPARSE_LINEAR_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
