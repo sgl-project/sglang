@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 )
 
 if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1"
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1,2,3"
 DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
     7000 + int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0]) * 100
 )
@@ -43,7 +43,7 @@ class TestAscendW4A4(CustomTestCase):
                 "--attention-backend",
                 "ascend",
                 "--tp-size",
-                "2",
+                "4",
                 "--mem-fraction-static",
                 "0.8",
                 "--cuda-graph-bs",
