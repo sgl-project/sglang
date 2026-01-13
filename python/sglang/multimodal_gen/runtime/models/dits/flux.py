@@ -531,7 +531,6 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             self.config.patch_size * self.config.patch_size * self.out_channels,
             bias=True,
             gather_output=True,
-            quant_config=quant_config,
         )
 
         self.layer_names = [

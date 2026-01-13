@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.models.parameter import ModelWeightParameter
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
@@ -278,7 +279,7 @@ def load_model_from_full_model_state_dict(
                 sharded_tensor = torch.empty_like(
                     meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
                 )
-                temp_param = nn.Parameter(sharded_tensor)
+                temp_param = ModelWeightParameter(sharded_tensor)
                 for attr in ["output_dim", "input_dim", "is_sharded_weight"]:
                     if hasattr(actual_param, attr):
                         setattr(temp_param, attr, getattr(actual_param, attr))
@@ -295,8 +296,6 @@ def load_model_from_full_model_state_dict(
             )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
-        if target_param_name == "proj_out.weight_scale_inv":
-            sharded_tensor = sharded_tensor.unsqueeze(0)
         sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
