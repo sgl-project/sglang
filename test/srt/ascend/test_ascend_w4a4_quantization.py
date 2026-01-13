@@ -72,7 +72,7 @@ class TestAscendW4A4(CustomTestCase):
         print(metrics)
 
         self.assertGreaterEqual(metrics["accuracy"], 0.80)
-        self.assertGreaterEqual(metrics["output_throughput"], 1000)
+        self.assertGreaterEqual(metrics["output_throughput"], 1050)
 
     def test_throughput(self):
         max_tokens = 256
