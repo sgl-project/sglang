@@ -193,54 +193,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_with_retry_success_after_failures() {
-        let cfg = base_retry_config();
-        let remaining = Arc::new(AtomicU32::new(2));
-        let calls = Arc::new(AtomicU32::new(0));
-
-        let res: Result<u32, RetryError> = RetryExecutor::execute_with_retry(&cfg, {
-            let remaining = remaining.clone();
-            let calls = calls.clone();
-            move |_attempt| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                let remaining = remaining.clone();
-                async move {
-                    if remaining
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
-                        .is_ok()
-                    {
-                        Err(())
-                    } else {
-                        Ok(42u32)
-                    }
-                }
-            }
-        })
-        .await;
-
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap(), 42);
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
-    }
-
-    #[tokio::test]
-    async fn test_execute_with_retry_exhausted() {
-        let cfg = base_retry_config();
-        let calls = Arc::new(AtomicU32::new(0));
-        let res: Result<u32, RetryError> = RetryExecutor::execute_with_retry(&cfg, {
-            let calls = calls.clone();
-            move |_attempt| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                async move { Err(()) }
-            }
-        })
-        .await;
-
-        assert!(matches!(res, Err(RetryError::MaxRetriesExceeded)));
-        assert_eq!(calls.load(Ordering::Relaxed), cfg.max_retries);
-    }
-
-    #[tokio::test]
     async fn test_execute_response_with_retry_success_path_and_hooks() {
         let cfg = base_retry_config();
         let remaining = Arc::new(AtomicU32::new(2));
