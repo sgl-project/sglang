@@ -76,10 +76,42 @@ class MoonshotKimiaForCausalLM(nn.Module):
     ) -> LogitsProcessorOutput:
         assert get_embedding is False, "embedding is not supported yet"
         aux_hidden_states = None
+        seq_lens = forward_batch.seq_lens
+        total_len = input_ids.shape[0]
+        dtype = self.model.dtype
+        attention_mask = torch.full(
+            (total_len, total_len),
+            torch.finfo(dtype).min,
+            device=input_ids.device,
+            dtype=dtype,
+        )
+        start = 0
+        for seq_len in seq_lens.tolist():
+            end = start + seq_len
+            block = torch.zeros(
+                (seq_len, seq_len),
+                device=input_ids.device,
+                dtype=dtype,
+            )
+            block = block.masked_fill_(
+                torch.triu(
+                    torch.ones(
+                        (seq_len, seq_len),
+                        device=input_ids.device,
+                        dtype=torch.bool,
+                    ),
+                    diagonal=1,
+                ),
+                torch.finfo(dtype).min,
+            )
+            attention_mask[start:end, start:end] = block
+            start = end
+        attention_mask = attention_mask[None, None, ...]
         hidden_states = self.model(
             input_ids[None, ...],
             use_cache=False,
             position_ids=positions[None, ...],
+            attention_mask=attention_mask,
             return_dict=False,
         )[0][0, ...]
 
