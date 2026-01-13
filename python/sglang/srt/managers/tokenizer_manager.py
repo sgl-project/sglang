@@ -1624,7 +1624,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         token_ids_logprob: List[int],
         return_text_in_logprobs: bool,
     ):
-        # print("hello")
         # 1. Handle regular logprobs
         if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
             state.input_token_logprobs.extend(
