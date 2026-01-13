@@ -624,6 +624,7 @@ async fn test_unsupported_endpoints() {
         bootstrap_room: None,
         bootstrap_pair_key: None,
         data_parallel_rank: None,
+        data_parallel_rank_decode: None,
         background: false,
         conversation_id: None,
         priority: None,

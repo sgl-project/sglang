@@ -62,6 +62,9 @@ impl GrpcPDRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
+            ctx.load_monitor
+                .as_ref()
+                .map(|load_monitor_arc| load_monitor_arc.worker_load_manager.clone()),
         );
 
         Ok(GrpcPDRouter {

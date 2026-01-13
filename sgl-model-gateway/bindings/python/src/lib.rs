@@ -342,6 +342,7 @@ struct Router {
     policy: PolicyType,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
+    worker_load_check_interval: u64,
     cache_threshold: f32,
     balance_abs_threshold: usize,
     balance_rel_threshold: f32,
@@ -351,6 +352,7 @@ struct Router {
     assignment_mode: String,
     max_payload_size: usize,
     dp_aware: bool,
+    dp_minimum_tokens_scheduler: bool,
     api_key: Option<String>,
     log_dir: Option<String>,
     log_level: Option<String>,
@@ -566,6 +568,7 @@ impl Router {
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .worker_load_check_interval_secs(self.worker_load_check_interval)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -627,6 +630,7 @@ impl Router {
                 self.server_cert_path.as_ref(),
                 self.server_key_path.as_ref(),
             )
+            .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .build()
     }
 }
@@ -641,6 +645,7 @@ impl Router {
         port = 3001,
         worker_startup_timeout_secs = 600,
         worker_startup_check_interval = 30,
+        worker_load_check_interval = 10,
         cache_threshold = 0.3,
         balance_abs_threshold = 64,
         balance_rel_threshold = 1.5,
@@ -650,6 +655,7 @@ impl Router {
         assignment_mode = String::from("random"),
         max_payload_size = 512 * 1024 * 1024,
         dp_aware = false,
+        dp_minimum_tokens_scheduler = false,
         api_key = None,
         log_dir = None,
         log_level = None,
@@ -726,6 +732,7 @@ impl Router {
         port: u16,
         worker_startup_timeout_secs: u64,
         worker_startup_check_interval: u64,
+        worker_load_check_interval: u64,
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
@@ -735,6 +742,7 @@ impl Router {
         assignment_mode: String,
         max_payload_size: usize,
         dp_aware: bool,
+        dp_minimum_tokens_scheduler: bool,
         api_key: Option<String>,
         log_dir: Option<String>,
         log_level: Option<String>,
@@ -824,6 +832,7 @@ impl Router {
             policy,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
+            worker_load_check_interval,
             cache_threshold,
             balance_abs_threshold,
             balance_rel_threshold,
@@ -833,6 +842,7 @@ impl Router {
             assignment_mode,
             max_payload_size,
             dp_aware,
+            dp_minimum_tokens_scheduler,
             api_key,
             log_dir,
             log_level,

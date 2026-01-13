@@ -29,7 +29,7 @@ use super::{
     utils::error_type_from_status,
 };
 use crate::{
-    core::{WorkerRegistry, UNKNOWN_MODEL_ID},
+    core::{WorkerLoadManager, WorkerRegistry, UNKNOWN_MODEL_ID},
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     policies::PolicyRegistry,
     protocols::{
@@ -85,6 +85,7 @@ impl RequestPipeline {
                 worker_registry,
                 policy_registry,
                 WorkerSelectionMode::Regular,
+                None,
             )),
             Box::new(ClientAcquisitionStage),
             Box::new(RequestBuildingStage::new(false)), // No PD metadata
@@ -114,6 +115,7 @@ impl RequestPipeline {
                 worker_registry,
                 policy_registry,
                 WorkerSelectionMode::Regular,
+                None,
             )),
             Box::new(ClientAcquisitionStage),
             Box::new(harmony::stages::HarmonyRequestBuildingStage::new(false)),
@@ -144,6 +146,7 @@ impl RequestPipeline {
                 worker_registry,
                 policy_registry,
                 WorkerSelectionMode::PrefillDecode,
+                None,
             )),
             Box::new(ClientAcquisitionStage),
             Box::new(harmony::stages::HarmonyRequestBuildingStage::new(true)),
@@ -166,6 +169,7 @@ impl RequestPipeline {
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
+        worker_load_manager: Option<Arc<WorkerLoadManager>>,
     ) -> Self {
         let processor = processor::ResponseProcessor::new(
             tool_parser_factory.clone(),
@@ -188,6 +192,7 @@ impl RequestPipeline {
                 worker_registry,
                 policy_registry,
                 WorkerSelectionMode::PrefillDecode,
+                worker_load_manager,
             )),
             Box::new(ClientAcquisitionStage),
             Box::new(RequestBuildingStage::new(true)), // Inject PD metadata
@@ -213,6 +218,7 @@ impl RequestPipeline {
                 worker_registry,
                 policy_registry,
                 WorkerSelectionMode::Regular, // Embeddings are always single
+                None,
             )),
             Box::new(ClientAcquisitionStage),
             Box::new(EmbeddingRequestBuildingStage::new()),
@@ -241,6 +247,7 @@ impl RequestPipeline {
                 worker_registry,
                 policy_registry,
                 WorkerSelectionMode::Regular, // Classify is always single worker
+                None,
             )),
             Box::new(ClientAcquisitionStage),
             Box::new(EmbeddingRequestBuildingStage::new()),

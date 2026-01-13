@@ -232,6 +232,7 @@ class Engine(EngineBase):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
+        data_parallel_rank_decode: Optional[int] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
@@ -269,6 +270,7 @@ class Engine(EngineBase):
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
             external_trace_header=external_trace_header,
+            data_parallel_rank_decode=data_parallel_rank_decode,
             rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -319,6 +321,7 @@ class Engine(EngineBase):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
+        data_parallel_rank_decode: Optional[int] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
@@ -357,6 +360,7 @@ class Engine(EngineBase):
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
             external_trace_header=external_trace_header,
+            data_parallel_rank_decode=data_parallel_rank_decode,
             rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
