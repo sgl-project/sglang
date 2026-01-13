@@ -414,6 +414,34 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("transfer_kv_all_layer_direct_lf_pf", torch::kCUDA, &transfer_kv_all_layer_direct_lf_pf);
 
   /*
+   * Sparse KV Cache Manager
+   */
+  m.def(
+      "sparse_cache_manager_fused(Tensor top_k_indices, Tensor! hot_buffer_token_indices, "
+      "Tensor hot_buffer_device_locations, Tensor cache_cpu_locations, Tensor! top_k_device_locations, "
+      "Tensor! copy_src_cpu_locations, Tensor! copy_dst_gpu_locations, Tensor! copy_count) -> ()");
+  m.impl("sparse_cache_manager_fused", torch::kCUDA, &sparse_cache_manager_fused);
+
+  m.def(
+      "sparse_cache_manager(Tensor top_k_indices, Tensor! hot_buffer_token_indices, "
+      "Tensor hot_buffer_device_locations, Tensor cache_cpu_locations, Tensor! top_k_device_locations, "
+      "Tensor! copy_src_cpu_locations, Tensor! copy_dst_gpu_locations, Tensor! copy_count) -> ()");
+  m.impl("sparse_cache_manager", torch::kCUDA, &sparse_cache_manager);
+
+  m.def(
+      "sparse_cache_copy(Tensor cpu_cache, Tensor! gpu_cache, Tensor copy_src_cpu_locations, "
+      "Tensor copy_dst_gpu_locations, int copy_count, int item_size_bytes) -> ()");
+  m.impl("sparse_cache_copy", torch::kCUDA, &sparse_cache_copy);
+
+  m.def(
+      "sparse_cache_manager_batch(Tensor top_k_indices, Tensor! hot_buffer_token_indices, "
+      "Tensor hot_buffer_device_locations, Tensor cache_cpu_locations, Tensor! top_k_device_locations, "
+      "Tensor! copy_src_cpu_locations, Tensor! copy_dst_gpu_locations, Tensor! copy_counts, "
+      "Tensor top_k_sizes, Tensor hot_buffer_sizes, Tensor token_pool_sizes, "
+      "int batch_size, int max_top_k, int max_hot_buffer, int max_copies) -> ()");
+  m.impl("sparse_cache_manager_batch", torch::kCUDA, &sparse_cache_manager_batch);
+
+  /*
    * From csrc/memory
    */
   m.def("store_kv_cache(Tensor k_cache, Tensor v_cache, Tensor out_loc, Tensor k, Tensor v) -> ()");

@@ -699,6 +699,55 @@ void transfer_kv_all_layer_direct_lf_pf(
     int64_t page_size);
 
 /*
+ * Sparse KV Cache Manager
+ * For managing hot buffer with eviction for sparse attention
+ */
+void sparse_cache_manager_fused(
+    at::Tensor top_k_indices,
+    at::Tensor hot_buffer_token_indices,
+    at::Tensor hot_buffer_device_locations,
+    at::Tensor cache_cpu_locations,
+    at::Tensor top_k_device_locations,
+    at::Tensor copy_src_cpu_locations,
+    at::Tensor copy_dst_gpu_locations,
+    at::Tensor copy_count);
+
+void sparse_cache_manager(
+    at::Tensor top_k_indices,
+    at::Tensor hot_buffer_token_indices,
+    at::Tensor hot_buffer_device_locations,
+    at::Tensor cache_cpu_locations,
+    at::Tensor top_k_device_locations,
+    at::Tensor copy_src_cpu_locations,
+    at::Tensor copy_dst_gpu_locations,
+    at::Tensor copy_count);
+
+void sparse_cache_copy(
+    at::Tensor cpu_cache,
+    at::Tensor gpu_cache,
+    at::Tensor copy_src_cpu_locations,
+    at::Tensor copy_dst_gpu_locations,
+    int32_t copy_count,
+    int64_t item_size_bytes);
+
+void sparse_cache_manager_batch(
+    at::Tensor top_k_indices,
+    at::Tensor hot_buffer_token_indices,
+    at::Tensor hot_buffer_device_locations,
+    at::Tensor cache_cpu_locations,
+    at::Tensor top_k_device_locations,
+    at::Tensor copy_src_cpu_locations,
+    at::Tensor copy_dst_gpu_locations,
+    at::Tensor copy_counts,
+    at::Tensor top_k_sizes,
+    at::Tensor hot_buffer_sizes,
+    at::Tensor token_pool_sizes,
+    int32_t batch_size,
+    int32_t max_top_k,
+    int32_t max_hot_buffer,
+    int32_t max_copies);
+
+/*
  * From csrc/memory
  */
 at::Tensor weak_ref_tensor(const at::Tensor& tensor);
