@@ -38,12 +38,11 @@ class RequestTrackers:
         self.device_buffer_cnt = device_buffer_cnt
         self.page_size = page_size
 
-
         # Request state tracker
         self.prompt_lens = torch.zeros(max_pool_size, dtype=torch.int64, device=device)
         self.repr_constructed = torch.zeros(
             max_pool_size, dtype=torch.bool, device=device
-        )     
+        )
         self.last_constructed_page = torch.zeros(
             max_pool_size, dtype=torch.int64, device=device
         )
@@ -229,7 +228,9 @@ class SparseCoordinator:
         """
         reqs = self.sparse_kv_cache_manager.poll_prompt_offload_completion()
         for req in reqs:
-            assert not req.hierarchical_sparse_enabled, "Request should not be offloaded and truncated again"
+            assert (
+                not req.hierarchical_sparse_enabled
+            ), "Request should not be offloaded and truncated again"
 
             # Truncate KV cache after prompt is offloaded
             self._maybe_truncate_kv_cache_after_prompt_offloaded(
@@ -423,11 +424,7 @@ class SparseCoordinator:
 
         Example: If allocated 40 pages and topk page cnt is 32, keep first 31 pages + last 1 page = 32 pages total.
         """
-        if (
-            req.is_chunked > 0
-            or req.finished()
-            or req.hierarchical_sparse_enabled
-        ):
+        if req.is_chunked > 0 or req.finished() or req.hierarchical_sparse_enabled:
             return
 
         # Check if truncation needed

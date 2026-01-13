@@ -496,8 +496,10 @@ def alloc_for_hierarchical_sparse_decode(
     Allocate KV cache for hierarchical sparse decode batch and write to req_to_token_pool.
     """
     if isinstance(batch.tree_cache, SWAChunkCache):
-        raise RuntimeError("SWAChunkCache is not supported for hierarchical sparse decode")
-    
+        raise RuntimeError(
+            "SWAChunkCache is not supported for hierarchical sparse decode"
+        )
+
     bs = batch.seq_lens.shape[0]
     seq_lens_next = batch.seq_lens + token_per_req
     page_size = batch.tree_cache.page_size

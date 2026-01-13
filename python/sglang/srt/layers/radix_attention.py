@@ -122,7 +122,7 @@ class RadixAttention(nn.Module):
             return output
         else:
             attention_begin_hook(q, k, v, self, forward_batch)
-            
+
             # Call backend attention
             output = forward_batch.attn_backend.forward(
                 q,
@@ -133,9 +133,10 @@ class RadixAttention(nn.Module):
                 save_kv_cache,
                 **kwargs,
             )
-            
+
             attention_end_hook(output, self, forward_batch)
             return output
+
 
 def attention_begin_hook(q, k, v, layer, forward_batch):
     sparse_coordinator = get_sparse_coordinator()
@@ -146,8 +147,9 @@ def attention_begin_hook(q, k, v, layer, forward_batch):
             value=v,
             layer=layer,
             forward_batch=forward_batch,
-            attn_metadata=getattr(forward_batch.attn_backend, 'forward_metadata', None),
+            attn_metadata=getattr(forward_batch.attn_backend, "forward_metadata", None),
         )
+
 
 def attention_end_hook(output, layer, forward_batch):
     sparse_coordinator = get_sparse_coordinator()

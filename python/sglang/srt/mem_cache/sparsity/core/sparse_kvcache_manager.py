@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+
 class SparseKVCacheManager:
     """
     Manages KV cache offloading between device (GPU) and host (CPU) memory
@@ -80,7 +82,7 @@ class SparseKVCacheManager:
         self.write_queue = []
         self.write_stream = device_module.Stream()
         self.device = self.mem_pool_device.device
-        self.io_backend = "kernel" 
+        self.io_backend = "kernel"
 
         # Initialize bitmap for tracking KV cache locations
         max_pool_size = self.req_to_token_pool.req_to_token.shape[0]
@@ -230,7 +232,9 @@ class SparseKVCacheManager:
         self.next_offload_id += 1
         offload_id = self.next_offload_id
         host_indices = self._write_to_host(
-            device_indices=token_indices, node_id=offload_id, sparse_ack_type="prompt_offload"
+            device_indices=token_indices,
+            node_id=offload_id,
+            sparse_ack_type="prompt_offload",
         )
         assert host_indices is not None, "Host out of memory"
         self.pending_sparse_prompt_offloads[offload_id] = (host_indices, req)
@@ -266,9 +270,7 @@ class SparseKVCacheManager:
 
         # Process all completed offload operations
         while completed_count > 0:
-            _, finish_event, offload_ids = (
-                self.ack_sparse_prompt_write_queue.pop(0)
-            )
+            _, finish_event, offload_ids = self.ack_sparse_prompt_write_queue.pop(0)
             finish_event.synchronize()
 
             host_indices, req = self.pending_sparse_prompt_offloads.pop(offload_ids[0])
@@ -285,7 +287,7 @@ class SparseKVCacheManager:
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
-        sparse_ack_type = "prompt_offload"
+        sparse_ack_type="prompt_offload",
     ) -> Optional[torch.Tensor]:
         """
         Back up KV caches from device memory to host memory.
@@ -329,7 +331,6 @@ class SparseKVCacheManager:
             self.ack_sparse_prompt_write_queue.append(ack)
         elif sparse_ack_type == "decode_offload":
             self.ack_sparse_decode_write_queue.append(ack)
-
 
     def move_indices(self, op: CacheOperation):
         """Move indices to device if needed."""
