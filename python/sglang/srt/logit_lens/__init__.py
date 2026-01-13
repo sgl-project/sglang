@@ -13,7 +13,10 @@
 # ==============================================================================
 """Logit Lens - Interpretability tool for visualizing token prediction evolution through layers."""
 
-from sglang.srt.logit_lens.extractor import LogitLensExtractor, create_logit_lens_extractor
-from sglang.srt.logit_lens.types import LogitLensOutput, LogitLensLayerResult
+from sglang.srt.logit_lens.extractor import (
+    LogitLensExtractor,
+    create_logit_lens_extractor,
+)
+from sglang.srt.logit_lens.types import LogitLensLayerResult, LogitLensOutput
 
 __all__ = ["LogitLensExtractor", "create_logit_lens_extractor", "LogitLensOutput", "LogitLensLayerResult"]

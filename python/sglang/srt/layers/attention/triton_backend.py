@@ -1347,10 +1347,10 @@ class TritonAttnBackend(AttentionBackend):
         For 1M context: ~125KB vs ~256MB
         """
         from sglang.srt.layers.attention.triton_ops.decode_attention_with_topk import (
-            compute_topk_attention_chunked,
-            compute_fingerprint_gpu,
-            compute_fingerprint_features,
             classify_manifold_gpu,
+            compute_fingerprint_features,
+            compute_fingerprint_gpu,
+            compute_topk_attention_chunked,
         )
         from sglang.srt.model_executor.forward_batch_info import AttentionTokenInfo
 

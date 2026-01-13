@@ -38,7 +38,7 @@ to keep the performance-critical attention kernel simple.
 """
 
 import logging
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
 
 import torch
 import triton

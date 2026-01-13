@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
-import math
 
 import torch
 
@@ -2351,6 +2351,7 @@ class SchedulerOutputProcessorMixin:
             return
 
         import json
+
         import zmq
 
         # Initialize sequence tracking if needed

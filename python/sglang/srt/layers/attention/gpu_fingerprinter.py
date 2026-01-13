@@ -26,10 +26,11 @@ Usage in model_runner:
     manifold = fingerprinter.classify_manifold(histogram)
 """
 
-import torch
-from typing import Optional, Tuple, Dict, List
 from dataclasses import dataclass
 from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
+import torch
 
 
 class ManifoldZone(Enum):

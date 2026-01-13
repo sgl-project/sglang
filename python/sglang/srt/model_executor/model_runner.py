@@ -90,7 +90,6 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.logit_lens import LogitLensExtractor, create_logit_lens_extractor
 from sglang.srt.layers.moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     get_global_experts_capturer,
@@ -101,6 +100,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+from sglang.srt.logit_lens import LogitLensExtractor, create_logit_lens_extractor
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
