@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-import time
+import random
 from concurrent import futures
 from typing import TYPE_CHECKING, List
 
@@ -124,7 +124,7 @@ class GrammarManager:
                     num_ready_reqs += 1
                     continue
 
-                if sim_timeout_prob > 0 and time.time() % 1 < sim_timeout_prob:
+                if sim_timeout_prob > 0 and random.random() < sim_timeout_prob:
                     # Simulate timeout for non-entry ranks in TP sync group for testing
                     logger.warning(
                         f"Simulating grammar timeout on {self.scheduler.tp_rank=}"
