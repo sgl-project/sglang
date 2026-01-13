@@ -110,12 +110,16 @@ jobs:
               - "python/*.toml"
               - ".github/workflows/pr-test.yml"
 
-      - name: Set max-parallel based on high-priority label
+      - name: Set max-parallel based on run type
         id: set-parallel
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
-            echo "max_parallel=15" >> $GITHUB_OUTPUT
-            echo "High priority PR detected, setting max_parallel to 15"
+          # Scheduled runs and high-priority PRs get full parallelism
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "max_parallel=14" >> $GITHUB_OUTPUT
+            echo "Scheduled run detected, setting max_parallel to 14"
+          elif [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
+            echo "max_parallel=14" >> $GITHUB_OUTPUT
+            echo "High priority PR detected, setting max_parallel to 14"
           else
             echo "max_parallel=3" >> $GITHUB_OUTPUT
             echo "Using default max_parallel of 3"
