@@ -328,7 +328,7 @@ class ServerArgs:
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
-    watchdog_timeout: float = 300000000
+    watchdog_timeout: float = 300
     soft_watchdog_timeout: Optional[float] = None
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
