@@ -943,7 +943,10 @@ class ServerArgs:
 
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             # TODO: need a better way to tell this
-            if "wan" in self.pipeline_config.__class__.__name__.lower():
+            if (
+                "wan" in self.pipeline_config.__class__.__name__.lower()
+                and self.dit_layerwise_offload is None
+            ):
                 logger.info(
                     "Automatically enable dit_layerwise_offload for Wan for best performance"
                 )
