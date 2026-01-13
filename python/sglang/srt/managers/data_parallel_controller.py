@@ -159,7 +159,7 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
-        self.status: List[int] = [1] * server_args.dp_size
+        self.status: List[bool] = [True] * server_args.dp_size
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -182,7 +182,7 @@ class DataParallelController:
 
     def send_to_all_workers(self, obj):
         for i, worker in enumerate(self.workers):
-            if self.status[i] == 1:
+            if self.status[i]:
                 worker.send_pyobj(obj)
 
     def send_control_message(self, obj):
@@ -487,7 +487,7 @@ class DataParallelController:
             return
 
         while True:
-            if self.status[self.round_robin_counter] == 1:
+            if self.status[self.round_robin_counter]:
                 logger.info(f"Choose worker {self.round_robin_counter}")
                 self.workers[self.round_robin_counter].send_pyobj(req)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(

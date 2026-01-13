@@ -1436,7 +1436,7 @@ class AbortReq(BaseReq):
 
 @dataclass
 class ActiveRanksOutput(BaseReq):
-    status: List[int]
+    status: List[bool]
 
 
 @dataclass
