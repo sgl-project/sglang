@@ -39,6 +39,7 @@ from huggingface_hub.errors import (
 )
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import RequestException
+from safetensors import safe_open
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
@@ -48,6 +49,87 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.utils import is_in_ci
 
 logger = init_logger(__name__)
+
+
+def _validate_safetensors_file(file_path: str) -> tuple[bool, str | None]:
+    """
+    Validate a single safetensors file by checking its header.
+
+    Args:
+        file_path: Path to the safetensors file
+
+    Returns:
+        Tuple of (is_valid, error_message)
+        - is_valid: True if the file is valid
+        - error_message: Error description if invalid, None otherwise
+    """
+    try:
+        # Check file exists and has non-zero size
+        if not os.path.exists(file_path):
+            return False, f"File does not exist: {file_path}"
+
+        file_size = os.path.getsize(file_path)
+        if file_size == 0:
+            return False, f"File is empty (0 bytes): {file_path}"
+
+        # Try to open and validate the safetensors header
+        with safe_open(file_path, framework="pt", device="cpu") as f:
+            # Just accessing keys() is enough to validate the header
+            _ = f.keys()
+
+        return True, None
+    except Exception as e:
+        return False, f"Invalid safetensors file {file_path}: {e}"
+
+
+def _check_single_safetensors_files(
+    model_path: str,
+) -> tuple[bool, list[str], list[str]]:
+    """
+    Check single (non-sharded) safetensors files in subdirectories.
+
+    This catches cases where a single safetensors file (like VAE) is corrupted
+    but wasn't detected by the index-based shard check.
+
+    Args:
+        model_path: Path to the model directory
+
+    Returns:
+        Tuple of (all_valid, invalid_files, checked_subdirs)
+    """
+    invalid_files = []
+    checked_subdirs = []
+
+    try:
+        subdirs = os.listdir(model_path)
+    except OSError as e:
+        logger.warning("Failed to list model directory %s: %s", model_path, e)
+        return True, [], []
+
+    for subdir in subdirs:
+        subdir_path = os.path.join(model_path, subdir)
+        if not os.path.isdir(subdir_path):
+            continue
+
+        # Skip directories that have index files (already checked by _check_index_files_for_missing_shards)
+        index_files = glob.glob(os.path.join(subdir_path, "*.safetensors.index.json"))
+        if index_files:
+            continue
+
+        # Check single safetensors files in this directory
+        safetensors_files = glob.glob(os.path.join(subdir_path, "*.safetensors"))
+        if not safetensors_files:
+            continue
+
+        checked_subdirs.append(subdir)
+
+        for st_file in safetensors_files:
+            is_valid, error_msg = _validate_safetensors_file(st_file)
+            if not is_valid:
+                relative_path = os.path.relpath(st_file, model_path)
+                invalid_files.append(f"{relative_path}: {error_msg}")
+
+    return len(invalid_files) == 0, invalid_files, checked_subdirs
 
 
 def _check_index_files_for_missing_shards(
@@ -162,8 +244,8 @@ def _ci_validate_diffusers_model(model_path: str) -> tuple[bool, bool]:
     CI-specific validation for diffusers models.
 
     Checks all subdirectories (transformer, transformer_2, vae, etc.) for
-    missing shards based on their index files. If issues are found in CI,
-    cleans up the cache to force re-download.
+    missing shards based on their index files, and validates single safetensors
+    files. If issues are found in CI, cleans up the cache to force re-download.
 
     Args:
         model_path: Path to the model directory
@@ -176,6 +258,7 @@ def _ci_validate_diffusers_model(model_path: str) -> tuple[bool, bool]:
     if not is_in_ci():
         return True, False
 
+    # Check 1: Validate sharded models (with index.json)
     is_valid, missing_files, checked_subdirs = _check_index_files_for_missing_shards(
         model_path
     )
@@ -195,11 +278,33 @@ def _ci_validate_diffusers_model(model_path: str) -> tuple[bool, bool]:
         )
         return False, cleanup_performed
 
-    if checked_subdirs:
+    # Check 2: Validate single safetensors files (non-sharded components like VAE)
+    single_valid, invalid_files, single_checked = _check_single_safetensors_files(
+        model_path
+    )
+
+    if not single_valid:
+        logger.error(
+            "CI validation failed for %s. Found %d invalid safetensors file(s): %s. "
+            "Checked subdirectories: %s",
+            model_path,
+            len(invalid_files),
+            invalid_files[:5] if len(invalid_files) > 5 else invalid_files,
+            single_checked,
+        )
+        cleanup_performed = _cleanup_model_cache(
+            model_path,
+            f"Invalid safetensors file(s): {invalid_files[:3]}",
+        )
+        return False, cleanup_performed
+
+    # Combine checked subdirs for logging
+    all_checked = list(set(checked_subdirs + single_checked))
+    if all_checked:
         logger.info(
             "CI validation passed for %s. Checked subdirectories: %s",
             model_path,
-            checked_subdirs,
+            all_checked,
         )
 
     return True, False

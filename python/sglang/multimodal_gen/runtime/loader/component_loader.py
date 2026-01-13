@@ -42,12 +42,14 @@ from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    _cleanup_model_cache,
     get_config,
     get_diffusers_component_config,
     get_hf_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.utils import is_in_ci
 
 logger = init_logger(__name__)
 
@@ -819,6 +821,36 @@ class PipelineComponentLoader:
                 transformers_or_diffusers,
             )
         except Exception as e:
+            error_str = str(e)
+            # Check if this is a safetensors corruption error
+            is_safetensors_error = (
+                "SafetensorError" in type(e).__name__
+                or "EOF while parsing" in error_str
+                or "invalid JSON in header" in error_str
+                or "Error while deserializing header" in error_str
+            )
+
+            if is_safetensors_error and is_in_ci():
+                logger.error(
+                    "Detected corrupted safetensors file for component %s at %s. "
+                    "Attempting to clean up cache for re-download.",
+                    module_name,
+                    component_model_path,
+                )
+                # Try to clean up the model cache
+                # Navigate from component path (e.g., .../vae) to model root
+                model_root = os.path.dirname(component_model_path)
+                cleanup_performed = _cleanup_model_cache(
+                    model_root,
+                    f"Corrupted safetensors file in {module_name}: {error_str[:100]}",
+                )
+                if cleanup_performed:
+                    raise RuntimeError(
+                        f"Corrupted model cache detected and cleaned up. "
+                        f"Component: {module_name}, Path: {component_model_path}. "
+                        f"Please retry to re-download the model. Original error: {e}"
+                    ) from e
+
             logger.error(
                 f"Error while loading component: {module_name}, {component_model_path=}"
             )
