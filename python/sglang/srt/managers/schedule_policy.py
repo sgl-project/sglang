@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp_in_seq_split
+from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -402,7 +402,7 @@ class PrefillAdder:
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp_in_seq_split()
+        self.nsa_enable_prefill_cp = is_nsa_prefill_cp_in_seq_split()
         self.prefill_max_requests = prefill_max_requests
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
