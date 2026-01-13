@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 
-from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -51,6 +50,9 @@ if is_flashinfer_available():
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
+
+    # Necessary for overlap plan stream correction.
+    from flashinfer.quantization import get_quantization_module
 
 
 class WrapperDispatch(Enum):
@@ -101,6 +103,13 @@ class PrefillMetadata:
     multi_item_params: Optional[MultiItemScoringParams] = None
 
 
+@dataclass
+class FlashInferPlanStreamCache:
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    seq_lens_sum: int
+
+
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
@@ -126,10 +135,6 @@ class FlashInferAttnBackend(AttentionBackend):
         self.multi_item_scoring_delimiter = (
             model_runner.server_args.multi_item_scoring_delimiter
         )
-
-        # FIXME: remove dllm workarounds from flashinfer
-        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
-        self.is_dllm_model = self.dllm_config is not None
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -164,10 +169,6 @@ class FlashInferAttnBackend(AttentionBackend):
             "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
             or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
             or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "Qwen3VLForConditionalGeneration"
-            in model_runner.model_config.hf_config.architectures
-            or "Qwen3VLMoeForConditionalGeneration"
-            in model_runner.model_config.hf_config.architectures
         ):
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
 
@@ -249,6 +250,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             else:
                 fmha_backend = "cutlass"
+
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
@@ -294,6 +296,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+
+        self.plan_stream_cache: Optional[FlashInferPlanStreamCache] = None
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -431,7 +435,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=False,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrappers)
-        elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
+        elif forward_batch.forward_mode.is_draft_extend():
+            # V1 draft_extend only - V2 (DRAFT_EXTEND_V2) falls through to else clause
+            # because V2 doesn't have accept_length (uses fixed num_draft_tokens)
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -642,35 +648,6 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
-        elif forward_mode.is_dllm_extend():
-            prefill_wrappers = []
-            for i in range(self.num_wrappers):
-                prefill_wrappers.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend="fa2",
-                        use_cuda_graph=True,
-                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                    )
-                )
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
-                seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_config.block_size,
-                prefill_wrappers=prefill_wrappers,
-                use_ragged=True,
-                encoder_lens=encoder_lens,
-                spec_info=None,
-            )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -721,20 +698,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
             )
-        elif forward_mode.is_dllm_extend():
-            self.indices_updater_prefill.update(
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
-                seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_config.block_size,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=True,
-                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
-                spec_info=None,
-            )
         else:
             raise ValueError("Invalid forward mode")
+
+        # Cache the req_pool_indices for use by the plan stream correction.
+        # NOTE: DRAFT_EXTEND does not need correction (no tree structure), so we skip caching
+        # to avoid clobbering the cache used by the concurrent verify phase.
+        # Race condition: draft_extend on Main Stream can run after verify's prep on Plan Stream,
+        # overwriting plan_stream_cache that update_verify_buffers_to_fill_after_draft needs.
+        if not forward_mode.is_draft_extend(include_v2=True):
+            self.plan_stream_cache = FlashInferPlanStreamCache(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_sum=seq_lens_sum,
+            )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -823,16 +800,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             else:
-                if not self.is_dllm_model:
-                    # TODO: design a better interface
-                    # For other models, use causal attention for the ragged part as previously
-                    causal = True
-
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=causal,
+                    causal=True,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
@@ -901,6 +873,95 @@ class FlashInferAttnBackend(AttentionBackend):
             return layer.is_cross_attention
 
         raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        # Nothing to fill here because the actual CUDA graph buffers will be filled in during
+        # flashinfer plan() and corrected in update_verify_buffers_to_fill_after_draft().
+        return [None, None]
+
+    def update_verify_buffers_to_fill_after_draft(
+        self,
+        spec_info: SpecInput,
+        cuda_graph_bs: Optional[int],
+    ):
+        assert cuda_graph_bs is not None and self.plan_stream_cache is not None
+
+        _, kv_indptr, qo_indptr, custom_mask = spec_info.generate_attn_arg_prefill(
+            self.plan_stream_cache.req_pool_indices,
+            self.plan_stream_cache.seq_lens,
+            self.plan_stream_cache.seq_lens_sum,
+            self.indices_updater_prefill.req_to_token,
+        )
+
+        # Tweaked version of _compute_page_mask_indptr from `flashinfer.prefill`.
+        def compute_page_mask_indptr_nosync(
+            qo_indptr: torch.Tensor,
+            paged_kv_indptr: torch.Tensor,
+            paged_kv_last_page_len: torch.Tensor,
+            page_size: int,
+        ) -> torch.Tensor:
+            if len(qo_indptr) != len(paged_kv_indptr):
+                raise ValueError(
+                    "The length of qo_indptr and paged_kv_indptr should be the same."
+                )
+            mask_indptr = torch.empty_like(qo_indptr)
+            # Using fill_ to avoid device-to-host copy.
+            mask_indptr[:1].fill_(0)
+            mask_indptr[1:] = torch.cumsum(
+                (qo_indptr[1:] - qo_indptr[:-1])
+                * (
+                    (paged_kv_indptr[1:] - paged_kv_indptr[:-1] - 1) * page_size
+                    + paged_kv_last_page_len
+                ),
+                0,
+            )
+            return mask_indptr
+
+        mask_indptr = compute_page_mask_indptr_nosync(
+            qo_indptr,
+            kv_indptr,
+            self.kv_last_page_len[:cuda_graph_bs],
+            1,
+        )
+
+        # Tweaked version of segment_packbits from `flashinfer.quantization`.
+        def segment_packbits_nosync(
+            x: torch.Tensor,
+            indptr: torch.Tensor,
+            output_nnzs: int,
+            bitorder: str,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            seglen = indptr[1:] - indptr[:-1]
+            packed_len = (seglen + 7) // 8
+            indptr_new = torch.zeros(len(indptr), dtype=indptr.dtype, device=indptr.device)
+            indptr_new[1:] = torch.cumsum(packed_len, 0)
+
+            device = x.device
+            indptr = indptr.to(torch.int32)
+            indptr_new = indptr_new.to(torch.int32)
+            y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
+            get_quantization_module().segment_packbits(x, indptr, indptr_new, bitorder, y)
+            return y, indptr_new
+
+        # Upper bound sum(packed_len), the size of the packed mask.
+        packed_custom_mask_size = min(
+            self.cuda_graph_custom_mask.shape[0],
+            (
+                spec_info.draft_token_num * self.plan_stream_cache.seq_lens_sum +
+                cuda_graph_bs * spec_info.draft_token_num * spec_info.draft_token_num
+            ) // 8 + cuda_graph_bs,
+        )
+
+        packed_custom_mask, mask_indptr = segment_packbits_nosync(
+            custom_mask.contiguous().view(-1),
+            mask_indptr,
+            packed_custom_mask_size,
+            bitorder="little",
+        )
+
+        self.cuda_graph_custom_mask[: packed_custom_mask_size].copy_(packed_custom_mask)
+        for i in range(len(self.prefill_wrappers_verify)):
+            self.cuda_graph_qk_indptr[i][: len(mask_indptr)].copy_(mask_indptr)
 
 
 class FlashInferIndicesUpdaterDecode:
@@ -1565,8 +1626,11 @@ class FlashInferMultiStepDraftBackend:
         self.common_template(forward_batch, kv_indices, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        # Buffer size includes * topk to accommodate all draft branches
+        buffer_size = max_bs * self.topk * self.max_context_len
+
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_num_tokens * self.max_context_len),
+            (self.speculative_num_steps, buffer_size),
             dtype=torch.int32,
             device="cuda",
         )
