@@ -1150,7 +1150,9 @@ class DeepseekV2MoE(nn.Module):
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
         else:
-            if not (self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter):
+            if not (
+                self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter
+            ):
                 final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
@@ -3108,7 +3110,19 @@ class DeepseekV2Model(nn.Module):
             allocate_size = 0
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
-                    tp_size = get_tensor_model_parallel_world_size()
+                    # tp_size = get_tensor_model_parallel_world_size()
+                    a2a_backend = get_moe_a2a_backend()
+                    is_a2a_moe = (
+                        a2a_backend.is_deepep()
+                        or a2a_backend.is_mooncake()
+                        or a2a_backend.is_mori()
+                    )
+                    tp_size = (
+                        1
+                        if is_a2a_moe
+                        or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                        else get_tensor_model_parallel_world_size()
+                    )
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts
                     )
@@ -3372,7 +3386,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
             disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
-        elif disable_reason is None and (get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori()):
+        elif disable_reason is None and (
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori()
+        ):
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."

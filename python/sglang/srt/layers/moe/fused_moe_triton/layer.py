@@ -119,6 +119,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         )
     elif a2a_backend.is_mori():
         from sglang.srt.layers.moe.token_dispatcher import MoriEPDispatcher
+
         return MoriEPDispatcher(
             group=get_tp_group(),
             router_topk=moe_runner_config.top_k,

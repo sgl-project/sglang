@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
-from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -16,25 +14,22 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.utils import get_int_env_var, get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.single_batch_overlap import CombineOverlapArgs
 
 from enum import Enum, auto
-
-import torch
-import torch.distributed as dist
-
 from functools import lru_cache
 
 import mori
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+import torch
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
 )
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -78,15 +73,25 @@ assert isinstance(MoriEPNormalCombineInput, CombineInput)
 
 
 @lru_cache(maxsize=2)
-def init_mori_op(group, router_topk, num_experts, num_local_experts, hidden_size, params_dtype, num_max_dispatch_tokens_per_rank):
+def init_mori_op(
+    group,
+    router_topk,
+    num_experts,
+    num_local_experts,
+    hidden_size,
+    params_dtype,
+    num_max_dispatch_tokens_per_rank,
+):
 
     world_size = get_moe_expert_parallel_world_size()
     rank = get_moe_expert_parallel_rank()
-    
+
     cpu_group = group.cpu_group
     torch._C._distributed_c10d._register_process_group("mori", cpu_group)
     mori.shmem.shmem_torch_process_group_init("mori")
-    logger.info(f'[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} {num_max_dispatch_tokens_per_rank=} {num_local_experts=} {router_topk=}')
+    logger.info(
+        f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} {num_max_dispatch_tokens_per_rank=} {num_local_experts=} {router_topk=}"
+    )
 
     if world_size <= 8:
         # single node
@@ -106,7 +111,7 @@ def init_mori_op(group, router_topk, num_experts, num_local_experts, hidden_size
         world_size=world_size,
         data_type=fp8_dtype,
         hidden_dim=hidden_size,
-        scale_dim=hidden_size // 128, #FIXME(billishyahao): remove magic number
+        scale_dim=hidden_size // 128,  # FIXME(billishyahao): remove magic number
         scale_type_size=torch.float32.itemsize,
         max_token_type_size=params_dtype.itemsize,
         max_num_inp_token_per_rank=num_max_dispatch_tokens_per_rank,
@@ -116,7 +121,7 @@ def init_mori_op(group, router_topk, num_experts, num_local_experts, hidden_size
         block_num=block_num,
         kernel_type=kernel_type,
         rdma_block_num=rdma_block_num,
-        num_qp_per_pe=2
+        num_qp_per_pe=2,
     )
     mori_op = mori.ops.EpDispatchCombineOp(mori_config)
     return mori_op
@@ -138,9 +143,7 @@ class _MoriEPDispatcherImplBase:
         try:
             import mori  # noqa: F401
         except ImportError:
-            raise ImportError(
-                "Mori EP is not installed. Please install."
-            )
+            raise ImportError("Mori EP is not installed. Please install.")
         self.group = group
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
@@ -152,17 +155,18 @@ class _MoriEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
 
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 
-            4096
+            "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
         )
 
-        self.mori_op = init_mori_op(self.group,
-                     self.router_topk,
-                     self.num_experts,
-                     self.num_local_experts,
-                     self.hidden_size,
-                     self.params_dtype,
-                     num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank)
+        self.mori_op = init_mori_op(
+            self.group,
+            self.router_topk,
+            self.num_experts,
+            self.num_local_experts,
+            self.hidden_size,
+            self.params_dtype,
+            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+        )
 
     def dispatch_a(
         self,
@@ -194,7 +198,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.quant_config = {}
-        #[kk TODO] need to support mxfp4 type
+        # [kk TODO] need to support mxfp4 type
         self.quant_func = get_hip_quant(QuantType.per_1x128)
 
     def dispatch_a(
@@ -224,17 +228,25 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             # FP8 quant
             if num_token > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some reason it failed at e2e case. Root cause TBD.
-                hidden_states, scale = self.quant_func(hidden_states, quant_dtype=fp8_dtype)
+                hidden_states, scale = self.quant_func(
+                    hidden_states, quant_dtype=fp8_dtype
+                )
             else:
-                hidden_states = torch.empty(hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device)
-                scale = torch.empty((0, self.hidden_size // 128), dtype=torch.float32, device=hidden_states.device)
+                hidden_states = torch.empty(
+                    hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
+                )
+                scale = torch.empty(
+                    (0, self.hidden_size // 128),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
 
         (
             packed_recv_hidden,
             recv_topk_weights,
             recv_scales,
             recv_topk_ids,
-            packed_recv_count
+            packed_recv_count,
         ) = self._dispatch_core(hidden_states, topk_weights, topk_ids, scale)
 
         return MoriEPNormalDispatchOutput(
@@ -242,7 +254,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             recv_scales,
             recv_topk_ids,
             recv_topk_weights,
-            packed_recv_count
+            packed_recv_count,
         )
 
     def _dispatch_core(
@@ -257,18 +269,18 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             recv_topk_weights,
             recv_scales,
             recv_topk_ids,
-            packed_recv_count
+            packed_recv_count,
         ) = self.mori_op.dispatch(hidden_states, topk_weights, scale, topk_ids)
 
-        #TODO(billishyahao): EPLB
+        # TODO(billishyahao): EPLB
         # get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
 
-        return  (
+        return (
             packed_recv_hidden,
             recv_topk_weights,
             recv_scales,
             recv_topk_ids,
-            packed_recv_count
+            packed_recv_count,
         )
 
     def combine_a(
@@ -295,11 +307,11 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor
+        topk_weights: torch.Tensor,
     ):
         combined_hidden_states = self.mori_op.combine(hidden_states, None, topk_ids)
         return combined_hidden_states[0]
-    
+
     def set_quant_config(self, quant_config: dict):
         self.quant_config = quant_config
 

@@ -442,7 +442,9 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep", "mori"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep", "mori"] = (
+        "none"
+    )
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False

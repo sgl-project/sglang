@@ -25,21 +25,19 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
 )
-
 from sglang.srt.layers.moe.token_dispatcher.moriep import MoriEPNormalCombineInput
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, fp8_dtype
-from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.quark_moe import QuarkW4A4MXFp4MoEMethod
-from sglang.srt.utils import get_bool_env_var, is_hip, is_npu, get_int_env_var
+from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLDispatchOutput,
         DeepEPNormalDispatchOutput,
-        MoriEPNormalDispatchOutput,
         DispatchOutput,
     )
 
@@ -556,6 +554,7 @@ class NpuFuseEPMoE(DeepEPMoE):
                 requires_grad=False,
             )
 
+
 class MoriEPMoE(FusedMoE):
     _has_printed = False
 
@@ -597,10 +596,10 @@ class MoriEPMoE(FusedMoE):
         )
         expert_start_idx = self.moe_ep_rank * self.num_local_experts
         expert_end_idx = expert_start_idx + self.num_local_experts
-        self.expert_mask[expert_start_idx : expert_end_idx] = 1
+        self.expert_mask[expert_start_idx:expert_end_idx] = 1
 
         self.quant_func = get_hip_quant(QuantType.per_1x128)
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -619,9 +618,17 @@ class MoriEPMoE(FusedMoE):
             self.dispatcher.enable_fp8_dispatch()
 
         # dispatch
-        dispatch_output = self.dispatcher.dispatch(hidden_states, topk_output)#, scale=scale)
+        dispatch_output = self.dispatcher.dispatch(
+            hidden_states, topk_output
+        )  # , scale=scale)
 
-        dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights, dispatch_recv_token_num = dispatch_output
+        (
+            dispatch_a1,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_weights,
+            dispatch_recv_token_num,
+        ) = dispatch_output
 
         w13_weight = self.w13_weight
         w2_weight = self.w2_weight
@@ -651,7 +658,7 @@ class MoriEPMoE(FusedMoE):
 
             quant_type = QuantType.per_128x128
 
-        # [KK TODO] shoulde to call the apply of quant method to handle fused moe
+        # [KK TODO] should to call the apply of quant method to handle fused moe
         hidden_states = fused_moe(
             hidden_states=dispatch_a1,
             w1=w13_weight,
@@ -680,17 +687,18 @@ class MoriEPMoE(FusedMoE):
         )
 
         # combine
-        result = self.dispatcher.combine(
-            combine_input
-        )
+        result = self.dispatcher.combine(combine_input)
 
         return result[:num_token]
+
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     # [TODO] kk, temporary solution
     if get_moe_a2a_backend().is_mori():
         return MoriEPMoE
-    if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake(): #or get_moe_a2a_backend().is_mori():
+    if (
+        get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+    ):  # or get_moe_a2a_backend().is_mori():
         return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE
