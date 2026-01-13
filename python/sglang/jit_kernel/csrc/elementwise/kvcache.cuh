@@ -130,6 +130,7 @@ struct StoreKVCacheKernel {
     auto I = SymbolicSize{"indices_stride"};
     auto dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
+    auto indice_dtype = SymbolicDType{};
     device.set_options<kDLCUDA>();
 
     TensorMatcher({B, D})  //
@@ -150,7 +151,7 @@ struct StoreKVCacheKernel {
         .verify(v_cache);
     TensorMatcher({B})  //
         .with_strides({I})
-        .with_dtype<int32_t, int64_t>()
+        .with_dtype<int32_t, int64_t>(indice_dtype)
         .with_device(device)
         .verify(indices);
 
@@ -171,7 +172,8 @@ struct StoreKVCacheKernel {
         .batch_size = static_cast<uint32_t>(B.unwrap()),
     };
     // select kernel and update num_split if needed
-    const auto kernel = dtype.is_type<int32_t>() ? get_kernel<int32_t>(num_split) : get_kernel<int64_t>(num_split);
+    const auto use_int32 = indice_dtype.is_type<int32_t>();
+    const auto kernel = use_int32 ? get_kernel<int32_t>(num_split) : get_kernel<int64_t>(num_split);
     const auto num_blocks = div_ceil(num_elements * num_split, kNumWarps);
     LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
