@@ -23,13 +23,11 @@ use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::{
-        steps::{
-            create_external_worker_registration_workflow, create_mcp_registration_workflow,
-            create_tokenizer_registration_workflow, create_wasm_module_registration_workflow,
-            create_wasm_module_removal_workflow, create_worker_registration_workflow,
-            create_worker_removal_workflow, create_worker_update_workflow,
-        },
-        Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
+        job_queue::{JobQueue, JobQueueConfig},
+        steps::WorkflowEngines,
+        worker::WorkerType,
+        worker_manager::WorkerManager,
+        Job,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -53,7 +51,7 @@ use crate::{
     routers::{conversations, parse, router_manager::RouterManager, tokenize, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
-    workflow::{LoggingSubscriber, WorkflowEngine},
+    workflow::LoggingSubscriber,
 };
 #[derive(Clone)]
 pub struct AppState {
@@ -654,7 +652,9 @@ pub fn build_app(
             max_payload_size,
         ))
         .layer(middleware::create_logging_layer())
-        .layer(middleware::HttpMetricsLayer::new())
+        .layer(middleware::HttpMetricsLayer::new(
+            app_state.context.inflight_tracker.clone(),
+        ))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
@@ -688,7 +688,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 json_format: false,
                 log_dir: config.log_dir.clone(),
                 colorize: true,
-                log_file_name: "sgl-model-gateway".to_string(),
+                log_file_name: "smg".to_string(),
                 log_targets: None,
             },
             config.router_config.trace_config.clone(),
@@ -714,6 +714,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         AppContext::from_config(config.router_config.clone(), config.request_timeout_secs).await?,
     );
 
+    if config.prometheus_config.is_some() {
+        app_context.inflight_tracker.start_sampler(20);
+    }
+
     let weak_context = Arc::downgrade(&app_context);
     let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
     app_context
@@ -721,44 +725,18 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .set(worker_job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize workflow engine and register workflows
-    let engine = Arc::new(WorkflowEngine::new());
+    // Initialize typed workflow engines
+    let engines = WorkflowEngines::new(&config.router_config);
 
-    engine
-        .event_bus()
-        .subscribe(Arc::new(LoggingSubscriber))
-        .await;
+    // Subscribe logging to all workflow engines
+    engines.subscribe_all(Arc::new(LoggingSubscriber)).await;
 
-    engine
-        .register_workflow(create_worker_registration_workflow(&config.router_config))
-        .expect("worker_registration workflow should be valid");
-    engine
-        .register_workflow(create_external_worker_registration_workflow())
-        .expect("external_worker_registration workflow should be valid");
-    engine
-        .register_workflow(create_worker_removal_workflow())
-        .expect("worker_removal workflow should be valid");
-    engine
-        .register_workflow(create_worker_update_workflow())
-        .expect("worker_update workflow should be valid");
-    engine
-        .register_workflow(create_mcp_registration_workflow())
-        .expect("mcp_registration workflow should be valid");
-    engine
-        .register_workflow(create_wasm_module_registration_workflow())
-        .expect("wasm_module_registration workflow should be valid");
-    engine
-        .register_workflow(create_wasm_module_removal_workflow())
-        .expect("wasm_module_removal workflow should be valid");
-    engine
-        .register_workflow(create_tokenizer_registration_workflow())
-        .expect("tokenizer_registration workflow should be valid");
     app_context
-        .workflow_engine
-        .set(engine)
-        .expect("WorkflowEngine should only be initialized once");
+        .workflow_engines
+        .set(engines)
+        .expect("WorkflowEngines should only be initialized once");
     debug!(
-        "Workflow engine initialized with worker and MCP registration workflows (health check timeout: {}s)",
+        "Workflow engines initialized (health check timeout: {}s)",
         config.router_config.health_check.timeout_secs
     );
 
