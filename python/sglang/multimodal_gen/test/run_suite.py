@@ -27,6 +27,8 @@ SUITES = {
         "test_lora_format_adapter.py",
         # cli test
         "../cli/test_generate_t2i_perf.py",
+        # unit tests (no server needed)
+        "../test_sampling_params_validate.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
@@ -153,8 +155,10 @@ def run_pytest(files, filter_expr=None):
         cmd = list(base_cmd)
         if i > 0:
             cmd.append("--last-failed")
-        else:
-            cmd.extend(files)
+        # Always include files to constrain test discovery scope
+        # This prevents pytest from scanning the entire rootdir and
+        # discovering unrelated tests that may have missing dependencies
+        cmd.extend(files)
 
         if i > 0:
             print(

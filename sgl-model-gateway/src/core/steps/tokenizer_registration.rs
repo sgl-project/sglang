@@ -9,7 +9,15 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
-use crate::{app_context::AppContext, tokenizer::factory, workflow::*};
+use super::workflow_data::TokenizerWorkflowData;
+use crate::{
+    app_context::AppContext,
+    tokenizer::factory,
+    workflow::{
+        BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId,
+        StepResult, WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
+    },
+};
 
 /// Configuration for adding a tokenizer
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,10 +47,17 @@ pub struct TokenizerRemovalRequest {
 pub struct ValidateTokenizerConfigStep;
 
 #[async_trait]
-impl StepExecutor for ValidateTokenizerConfigStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<TokenizerConfigRequest> = context.get_or_err("tokenizer_config")?;
-        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+impl StepExecutor<TokenizerWorkflowData> for ValidateTokenizerConfigStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<TokenizerWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let config = &context.data.config;
+        let app_context = context
+            .data
+            .app_context
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
         debug!(
             "Validating tokenizer config: name={}, source={}",
@@ -86,22 +101,36 @@ impl StepExecutor for ValidateTokenizerConfigStep {
 pub struct LoadTokenizerStep;
 
 #[async_trait]
-impl StepExecutor for LoadTokenizerStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<TokenizerConfigRequest> = context.get_or_err("tokenizer_config")?;
-        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
+impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<TokenizerWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let config = &context.data.config;
+        let app_context = context
+            .data
+            .app_context
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
+            .clone();
 
         info!(
             "Loading tokenizer '{}' (id: {}) from source: {}",
             config.name, config.id, config.source
         );
 
+        // Clone needed values before async move
+        let id = config.id.clone();
+        let name = config.name.clone();
+        let source = config.source.clone();
+        let chat_template = config.chat_template_path.clone();
+
         // Load the tokenizer using the registry's load method (handles deduplication)
         let result = app_context
             .tokenizer_registry
-            .load(&config.id, &config.name, &config.source, || {
-                let source = config.source.clone();
-                let chat_template = config.chat_template_path.clone();
+            .load(&id, &name, &source, || {
+                let source = source.clone();
+                let chat_template = chat_template.clone();
                 async move {
                     factory::create_tokenizer_async_with_chat_template(
                         &source,
@@ -123,18 +152,18 @@ impl StepExecutor for LoadTokenizerStep {
 
                 info!(
                     "Successfully loaded tokenizer '{}' (id: {}) with vocab_size: {:?}",
-                    config.name, loaded_id, vocab_size
+                    name, loaded_id, vocab_size
                 );
 
-                // Store vocab size in context for later use
+                // Store vocab size in typed data
                 if let Some(size) = vocab_size {
-                    context.set("vocab_size", size);
+                    context.data.vocab_size = Some(size);
                 }
 
                 Ok(StepResult::Success)
             }
             Err(e) => {
-                error!("Failed to load tokenizer '{}': {}", config.name, e);
+                error!("Failed to load tokenizer '{}': {}", name, e);
                 Err(WorkflowError::StepFailed {
                     step_id: StepId::new("load_tokenizer"),
                     message: e,
@@ -161,7 +190,7 @@ impl StepExecutor for LoadTokenizerStep {
 /// Workflow configuration:
 /// - ValidateConfig: No retry, 5s timeout (fast validation)
 /// - LoadTokenizer: 3 retries, 5min timeout (may need to download from HuggingFace)
-pub fn create_tokenizer_registration_workflow() -> WorkflowDefinition {
+pub fn create_tokenizer_registration_workflow() -> WorkflowDefinition<TokenizerWorkflowData> {
     WorkflowDefinition::new("tokenizer_registration", "Tokenizer Registration")
         .add_step(
             StepDefinition::new(
@@ -188,6 +217,18 @@ pub fn create_tokenizer_registration_workflow() -> WorkflowDefinition {
         )
 }
 
+/// Helper to create initial workflow data for tokenizer registration
+pub fn create_tokenizer_workflow_data(
+    config: TokenizerConfigRequest,
+    app_context: Arc<AppContext>,
+) -> TokenizerWorkflowData {
+    TokenizerWorkflowData {
+        config,
+        vocab_size: None,
+        app_context: Some(app_context),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,7 +253,11 @@ mod tests {
 
     #[test]
     fn test_workflow_creation() {
-        let workflow = create_tokenizer_registration_workflow();
+        let mut workflow = create_tokenizer_registration_workflow();
         assert_eq!(workflow.id.to_string(), "tokenizer_registration");
+        // Validate the workflow DAG
+        workflow
+            .validate()
+            .expect("Workflow validation should pass");
     }
 }

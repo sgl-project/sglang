@@ -165,9 +165,19 @@ def is_host_cpu_x86() -> bool:
     )
 
 
+def is_host_cpu_arm64() -> bool:
+    machine = platform.machine().lower()
+    return (
+        machine in ("aarch64", "arm64")
+        and hasattr(torch, "cpu")
+        and torch.cpu.is_available()
+    )
+
+
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
+    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
+    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -1501,8 +1511,28 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
+class RefCountedGauge:
+    def __init__(self, gauge):
+        self._gauge = gauge
+        self._refcount: Dict[str, int] = {}
+
+    def inc(self, key: str):
+        if key in self._refcount:
+            self._refcount[key] += 1
+        else:
+            self._refcount[key] = 1
+            self._gauge.inc()
+
+    def dec(self, key: str):
+        if key in self._refcount:
+            self._refcount[key] -= 1
+            if self._refcount[key] == 0:
+                del self._refcount[key]
+                self._gauge.dec()
+
+
 def add_prometheus_track_response_middleware(app):
-    from prometheus_client import Counter
+    from prometheus_client import Counter, Gauge
 
     http_request_counter = Counter(
         name="sglang:http_requests_total",
@@ -1516,24 +1546,48 @@ def add_prometheus_track_response_middleware(app):
         labelnames=["endpoint", "status_code", "method"],
     )
 
+    http_requests_active = Gauge(
+        name="sglang:http_requests_active",
+        documentation="Number of currently active HTTP requests",
+        labelnames=["endpoint", "method"],
+        multiprocess_mode="livesum",
+    )
+
+    routing_keys_active = RefCountedGauge(
+        Gauge(
+            name="sglang:routing_keys_active",
+            documentation="Number of unique routing keys with active requests",
+            multiprocess_mode="livesum",
+        )
+    )
+
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
         # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
         # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
         path, is_handled_path = _get_fastapi_request_path(request)
         method = request.method
+        routing_key = request.headers.get("x-smg-routing-key")
 
         http_request_counter.labels(endpoint=path, method=method).inc()
+        http_requests_active.labels(endpoint=path, method=method).inc()
+        if routing_key:
+            routing_keys_active.inc(routing_key)
 
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
 
-        http_response_counter.labels(
-            endpoint=path,
-            method=method,
-            status_code=str(response.status_code),
-        ).inc()
+            http_response_counter.labels(
+                endpoint=path,
+                method=method,
+                status_code=str(response.status_code),
+            ).inc()
 
-        return response
+            return response
+        finally:
+            http_requests_active.labels(endpoint=path, method=method).dec()
+            if routing_key:
+                routing_keys_active.dec(routing_key)
 
 
 # https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
@@ -2423,6 +2477,11 @@ def set_cuda_arch():
         )
 
 
+def cdiv(a: int, b: int) -> int:
+    """Ceiling division."""
+    return -(a // -b)
+
+
 def next_power_of_2(n: int):
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
@@ -3117,7 +3176,7 @@ def get_cpu_ids_by_node():
 
 def is_shm_available(dtype, world_size, local_size):
     return (
-        cpu_has_amx_support()
+        (cpu_has_amx_support() or is_host_cpu_arm64())
         and dtype in [torch.bfloat16, torch.float16, torch.float]
         and world_size >= 1
         and world_size == local_size

@@ -106,6 +106,8 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if x.numel() == 0:
+            return x
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, **kwargs)
         if is_batch_invariant_mode_enabled():
@@ -125,9 +127,8 @@ class RMSNorm(MultiPlatformOp):
             # (hidden_states+residual)+post_residual_addition != hidden_states+(residual+post_residual_addition),
             # we probably need to add another parameter to fused_add_rmsnorm
             post_residual_addition = kwargs.get("post_residual_addition")
-            residual = residual + (
-                post_residual_addition if post_residual_addition is not None else 0.0
-            )
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
@@ -503,12 +504,3 @@ class Gemma3RMSNorm(MultiPlatformOp):
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
-
-
-if not (
-    _is_cuda or _is_hip or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_xpu
-):
-    logger.info(
-        "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."
-    )
-    from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm  # noqa: F401
