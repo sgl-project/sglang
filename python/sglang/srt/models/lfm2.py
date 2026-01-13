@@ -122,7 +122,6 @@ class Lfm2Attention(nn.Module):
         self,
         config: Lfm2Config,
         layer_id: int,
-        attn_layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -233,7 +232,6 @@ class Lfm2ShortConv(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.conv_kernel = int(config.conv_L_cache)
-        self.L_cache = self.conv_kernel - 1
         self.use_bias = bool(config.conv_bias)
         self.hidden_size = config.hidden_size
 
@@ -325,7 +323,6 @@ class Lfm2DecoderLayer(nn.Module):
         self,
         config: Lfm2Config,
         layer_id: int,
-        attn_layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -340,7 +337,6 @@ class Lfm2DecoderLayer(nn.Module):
             self.self_attn = Lfm2Attention(
                 config=config,
                 layer_id=layer_id,
-                attn_layer_id=attn_layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("self_attn", prefix),
             )
@@ -401,23 +397,15 @@ class Lfm2Model(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        # Compute attention layer IDs for KV cache
-        attn_layer_ids = []
-        attn_count = 0
-        for layer_type in config.layer_types:
-            if layer_type == "full_attention":
-                attn_layer_ids.append(attn_count)
-                attn_count += 1
-            else:
-                attn_layer_ids.append(-1)
-
-        self.num_attention_layers = attn_count
+        # Count attention layers for KV cache sizing
+        self.num_attention_layers = sum(
+            1 for lt in config.layer_types if lt == "full_attention"
+        )
 
         def get_layer(idx: int, prefix: str, **kwargs):
             return Lfm2DecoderLayer(
                 config=config,
                 layer_id=idx,
-                attn_layer_id=attn_layer_ids[idx],
                 quant_config=quant_config,
                 prefix=prefix,
             )
