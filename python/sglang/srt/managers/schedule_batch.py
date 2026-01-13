@@ -2026,6 +2026,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
+        self.extend_lens = [self.extend_lens[i] for i in keep_indices]
+        self.prefix_lens = [self.prefix_lens[i] for i in keep_indices]
 
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
@@ -2076,6 +2078,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+        self.prefix_lens.extend(other.prefix_lens)
+        self.extend_lens.extend(other.extend_lens)
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
