@@ -26,10 +26,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install pre-commit hook
+      - name: Install pre-commit
         run: |
           python -m pip install pre-commit
-          pre-commit install
 
       - name: Run pre-commit to format code
         run: SKIP=no-commit-to-branch pre-commit run --all-files
