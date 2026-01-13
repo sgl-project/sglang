@@ -52,7 +52,7 @@ if _use_aiter:
 if _is_npu:
     import torch_npu
 
-    from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
+    from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
@@ -306,8 +306,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if _is_npu:
             for weight_name in ["w13_weight", "w2_weight"]:
                 weight = getattr(layer, weight_name)
-                weight.data = torch_npu.npu_format_cast(
-                    weight.data, NPUACLFormat.ACL_FORMAT_FRACTAL_NZ
+                weight.data = npu_format_cast(
+                    weight.data,
                 )
 
         return
