@@ -55,16 +55,32 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
 class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "ZImagePipeline"
 
+    # TODO: review how to add extra component?
+    _extra_config_module_map = {
+        "siglip": "image_encoder",
+        "siglip_processor": "processor",
+    }
     _required_config_modules = [
         "text_encoder",
         "tokenizer",
         "vae",
         "transformer",
         "scheduler",
+        "siglip",
+        "siglip_processor",
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         """Set up pipeline stages with proper dependency injection."""
+
+        # copy from diffusers
+        from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
+
+        vae_scale_factor = server_args.pipeline_config.vae_config.vae_scale_factor
+        # NOTE: replace vae with Flux in zimage-omni
+        self.image_processor = Flux2ImageProcessor(
+            vae_scale_factor=vae_scale_factor * 2
+        )
 
         self.add_stage(
             stage_name="input_validation_stage", stage=InputValidationStage()

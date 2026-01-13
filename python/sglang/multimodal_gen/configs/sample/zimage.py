@@ -31,3 +31,9 @@ class ZImageSamplingParams(SamplingParams):
             ],
         )
     )
+
+
+@dataclass
+class ZImageOmniSamplingParams(ZImageSamplingParams):
+    num_inference_steps: int = 50
+    pass

@@ -2,7 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Optional, Tuple
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 
@@ -25,6 +25,9 @@ class ZImageArchConfig(DiTArchConfig):
     t_scale: float = 1000.0
     axes_dims: Tuple[int, int, int] = (32, 48, 48)
     axes_lens: Tuple[int, int, int] = (1024, 512, 512)
+
+    # Optional: set to enable SigLIP support for Omni
+    siglip_feat_dim: Optional[int] = None
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [

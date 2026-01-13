@@ -412,6 +412,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         self.all_f_patch_size = arch_config.all_f_patch_size
         self.dim = arch_config.dim
         self.n_heads = arch_config.num_attention_heads
+        self.siglip_feat_dim = arch_config.siglip_feat_dim
 
         self.rope_theta = arch_config.rope_theta
         self.t_scale = arch_config.t_scale
@@ -468,6 +469,33 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 for layer_id in range(arch_config.n_refiner_layers)
             ]
         )
+
+        # Optional SigLIP components (for Omni variant)
+        if self.siglip_feat_dim is not None:
+            self.siglip_embedder = nn.Sequential(
+                RMSNorm(self.siglip_feat_dim, eps=arch_config.norm_eps),
+                nn.Linear(self.siglip_feat_dim, self.dim, bias=True),
+            )
+            self.siglip_refiner = nn.ModuleList(
+                [
+                    ZImageTransformerBlock(
+                        2000 + layer_id,
+                        self.dim,
+                        self.n_heads,
+                        arch_config.n_kv_heads,
+                        arch_config.norm_eps,
+                        arch_config.qk_norm,
+                        modulation=False,
+                    )
+                    for layer_id in range(arch_config.n_refiner_layers)
+                ]
+            )
+            self.siglip_pad_token = nn.Parameter(torch.empty((1, self.dim)))
+        else:
+            self.siglip_embedder = None
+            self.siglip_refiner = None
+            self.siglip_pad_token = None
+
         self.t_embedder = TimestepEmbedder(
             min(self.dim, ADALN_EMBED_DIM), mid_size=1024
         )

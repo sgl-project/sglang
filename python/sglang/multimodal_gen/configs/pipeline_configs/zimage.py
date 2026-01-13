@@ -157,3 +157,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
                 batch,
             ),
         }
+
+
+class ZImageOmniPipelineConfig(ZImagePipelineConfig):
+    pass
