@@ -29,7 +29,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.token_dispatcher.moriep import MoriEPNormalCombineInput
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, fp8_dtype
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.layers.quantization.quark.quark_moe import QuarkW4A4MXFp4MoEMethod
@@ -612,14 +612,16 @@ class MoriEPMoE(FusedMoE):
         num_token = hidden_states.shape[0]
         output_dtype = hidden_states.dtype
         scale = None
+        is_fp8_quant = isinstance(self.quant_method, Fp8MoEMethod)
+        is_quark_w4a4 = isinstance(self.quant_method, QuarkW4A4MXFp4MoEMethod)
+
+        if is_fp8_quant and get_bool_env_var("SGLANG_MORI_FP8_DISP", "False"):
+            self.dispatcher.enable_fp8_dispatch()
 
         # dispatch
         dispatch_output = self.dispatcher.dispatch(hidden_states, topk_output)#, scale=scale)
 
         dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights, dispatch_recv_token_num = dispatch_output
-        #assert dispatch_scale is not None
-
-        is_quark_w4a4 = isinstance(self.quant_method, QuarkW4A4MXFp4MoEMethod)
 
         w13_weight = self.w13_weight
         w2_weight = self.w2_weight
@@ -637,14 +639,17 @@ class MoriEPMoE(FusedMoE):
             w13_scale = self.w13_weight_scale
             w2_scale = self.w2_weight_scale
             quant_type = QuantType.per_1x32
-        else:
+
+            if hasattr(self.w13_weight, "is_shuffled"):
+                w13_weight.is_shuffled = True
+                w2_weight.is_shuffled = True
+        elif is_fp8_quant:
             if hasattr(self, "w13_weight_scale_inv"):
                 w13_scale = self.w13_weight_scale_inv
             if hasattr(self, "w13_weight_scale_inv"):
                 w2_scale = self.w2_weight_scale_inv
 
-            if w13_scale or w2_scale:
-                quant_type = QuantType.per_128x128
+            quant_type = QuantType.per_128x128
 
         # [KK TODO] shoulde to call the apply of quant method to handle fused moe
         hidden_states = fused_moe(

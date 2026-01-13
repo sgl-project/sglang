@@ -215,13 +215,12 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         hidden_states,
         topk_weights,
         topk_ids,
+        fp8_dispatch,
     ):
-        enable_fp8 = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
-
         num_token = hidden_states.shape[0]
         scale = None
 
-        if enable_fp8:
+        if fp8_dispatch:
             # FP8 quant
             if num_token > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some reason it failed at e2e case. Root cause TBD.
@@ -345,6 +344,7 @@ class MoriEPDispatcher(BaseDispatcher):
             raise NotImplementedError
 
         self._stage = _Stage.INITIAL
+        self.fp8_dispatch = False
 
     def dispatch(self, *args, **kwargs) -> DispatchOutput:
         self.dispatch_a(*args, **kwargs)
@@ -367,7 +367,7 @@ class MoriEPDispatcher(BaseDispatcher):
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
         inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        return self._get_impl().dispatch_b(*inner_state)
+        return self._get_impl().dispatch_b(*inner_state, self.fp8_dispatch)
 
     def combine(
         self,
@@ -418,3 +418,6 @@ class MoriEPDispatcher(BaseDispatcher):
             raise NotImplementedError
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher.set_quant_config(quant_config)
+
+    def enable_fp8_dispatch(self):
+        self.fp8_dispatch = True
