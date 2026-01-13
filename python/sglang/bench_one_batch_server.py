@@ -14,9 +14,9 @@ python3 -m sglang.bench_one_batch_server --model None --base-url http://localhos
 
 import argparse
 
+from sglang.srt.server_args import ServerArgs
 from sglang.test.bench_one_batch_server_internal import (
     BenchArgs,
-    ServerArgs,
     run_benchmark_internal,
 )
 from sglang.test.nightly_bench_utils import save_results_as_pydantic_models
