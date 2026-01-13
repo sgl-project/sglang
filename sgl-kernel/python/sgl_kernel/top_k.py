@@ -58,7 +58,7 @@ def fast_topk_transform_fused(
             between the query and the key whose layout is either ragged or paged.
             row_starts is only required when the key is ragged.
         lengths: The lengths tensor of shape (B)
-        page_table_size_1: The page table tensor of shape (Batch, topk)
+        page_table_size_1: The page table tensor of shape (Batch, L)
         cu_seqlens_q: The cumulative sequence lengths tensor of shape (Batch + 1)
         topk: The number of topk indices to get
         row_starts: The start index of each row in the score tensor of shape (B).
