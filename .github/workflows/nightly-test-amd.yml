@@ -24,7 +24,6 @@ on:
           # MI30x Unit Tests
           - 'nightly-test-1-gpu-unit'
           # MI30x Accuracy Tests (GSM8K / MMMU)
-          - 'nightly-accuracy-1-gpu'
           - 'nightly-accuracy-2-gpu'
           - 'nightly-accuracy-2-gpu-vlm'
           - 'nightly-accuracy-8-gpu'
@@ -89,36 +88,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ============================================== MI30x Accuracy Tests ==============================================
-  # 1-GPU Accuracy Tests - GSM8K eval TP=1 models (MI30x only)
-  nightly-accuracy-1-gpu:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-1-gpu')
-    runs-on: linux-mi325-gpu-1
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-
-      - name: Setup docker
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Nightly Accuracy Test (1-GPU GSM8K)
-        timeout-minutes: 120
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-1-gpu --nightly --timeout-per-file 600 || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
-  # 2-GPU Accuracy Tests - GSM8K eval TP=2 models (MI30x only)
+  # 2-GPU Accuracy Tests - GSM8K eval (MI30x only)
   nightly-accuracy-2-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-2-gpu')
     runs-on: linux-mi325-gpu-2
@@ -138,12 +108,11 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
-      - name: Nightly Accuracy Test (2-GPU GSM8K)
-        timeout-minutes: 120
+      - name: Nightly Test (2-GPU)
         run: |
           bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-2-gpu --nightly --timeout-per-file 600 || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -613,7 +582,6 @@ jobs:
       # MI30x Unit Tests
       - nightly-test-1-gpu-unit
       # MI30x Accuracy Tests
-      - nightly-accuracy-1-gpu
       - nightly-accuracy-2-gpu
       - nightly-accuracy-2-gpu-vlm
       - nightly-accuracy-8-gpu
