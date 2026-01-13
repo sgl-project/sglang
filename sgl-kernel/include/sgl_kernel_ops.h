@@ -703,6 +703,12 @@ void transfer_kv_all_layer_direct_lf_pf(
  */
 at::Tensor weak_ref_tensor(const at::Tensor& tensor);
 void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
+void manage_sparse_cache(
+    at::Tensor top_k_indices,
+    at::Tensor hot_buffer_token_indices,
+    at::Tensor hot_buffer_device_locations,
+    at::Tensor cache_cpu_locations,
+    at::Tensor top_k_device_locations);
 
 /*
  * From FlashInfer

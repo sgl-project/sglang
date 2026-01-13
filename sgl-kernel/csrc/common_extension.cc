@@ -419,6 +419,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("store_kv_cache(Tensor k_cache, Tensor v_cache, Tensor out_loc, Tensor k, Tensor v) -> ()");
   m.impl("store_kv_cache", &store_kv_cache);
 
+  m.def("manage_sparse_cache(Tensor top_k_indices, Tensor hot_buffer_token_indices, Tensor hot_buffer_device_locations, Tensor cache_cpu_locations, Tensor top_k_device_locations) -> ()");
+  m.impl("manage_sparse_cache", torch::kCUDA, &manage_sparse_cache);
+
   m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
   m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
 
