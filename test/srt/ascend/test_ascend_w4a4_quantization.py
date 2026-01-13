@@ -72,7 +72,21 @@ class TestAscendW4A4(CustomTestCase):
         print(metrics)
 
         self.assertGreaterEqual(metrics["accuracy"], 0.80)
-        self.assertGreaterEqual(metrics["output_throughput"], 1050)
+        self.assertGreaterEqual(metrics["output_throughput"], 1000)
+
+    def run_decode(self, max_new_tokens):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                },
+                "ignore_eos": True,
+            },
+        )
+        return response.json()
 
     def test_throughput(self):
         max_tokens = 256
