@@ -122,8 +122,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
-        if _is_npu:
-            layer.weight.data = npu_format_cast(layer.weight.data)
 
     def apply(
         self,
@@ -235,6 +233,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+        if is_npu():
+            layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
+            layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
