@@ -96,8 +96,6 @@ class GrammarManager:
                         error_msg = f"Invalid grammar request with cache hit: {key=}"
                         req.set_finish_with_abort(error_msg)
 
-        print(f"[Process Req With Grammar]{id(req)=}, {req.grammar=}")
-
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
 
@@ -105,13 +103,14 @@ class GrammarManager:
 
     def get_ready_grammar_requests(self) -> List[Req]:
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
-
         num_ready_reqs = 0
-        sim_timeout_prob = envs.SGLANG_GRAMMAR_SIMULATE_TIMEOUT.get()
+        num_timeout_pt = 0
+        sim_timeout_prob = (
+            -1
+            if self.is_grammar_sync_entry
+            else envs.SGLANG_GRAMMAR_SIMULATE_TIMEOUT.get()
+        )  # Entry rank never simulates timeout
         timeout_ct = GRAMMAR_TIMEOUT / GRAMMAR_POLL_INTERVAL
-        if self.is_grammar_sync_entry:
-            # Entry rank never simulates timeout
-            sim_timeout_prob = -1
 
         for req in self.grammar_queue:
             try:
@@ -119,12 +118,11 @@ class GrammarManager:
                     num_ready_reqs += 1
                     continue
 
-                print(f"[Get Ready]{id(req)=}, {req.grammar=}")
-
                 if sim_timeout_prob > 0 and time.time() % 1 < sim_timeout_prob:
                     # Simulate timeout for non-entry ranks in TP sync group for testing
-                    warn_msg = f"Simulating grammar timeout for non-entry rank={self.grammar_sync_entry}"
-                    logger.warning(warn_msg)
+                    logger.warning(
+                        f"Simulating grammar timeout on {self.scheduler.tp_rank=}"
+                    )
                     raise futures._base.TimeoutError()
 
                 req.grammar = req.grammar.result(timeout=GRAMMAR_POLL_INTERVAL)
@@ -145,17 +143,36 @@ class GrammarManager:
 
         if self.grammar_sync_size > 1:
             # Sync across TP ranks to make sure they have the same number of ready requests
-            tensor = torch.tensor([num_ready_reqs, -num_timeout_pt], dtype=torch.int32)
+            tensor = torch.tensor(
+                [num_ready_reqs, -num_ready_reqs, -num_timeout_pt], dtype=torch.int32
+            )
             torch.distributed.all_reduce(
                 tensor, op=torch.distributed.ReduceOp.MIN, group=self.grammar_sync_group
             )
             num_ready_reqs_min = tensor[0].item()
-            num_timeout_pt_max = -tensor[1].item()
+            num_ready_reqs_max = -tensor[1].item()
+            num_timeout_pt_max = -tensor[2].item()
         else:
             num_ready_reqs_min = num_ready_reqs
+            num_ready_reqs_max = num_ready_reqs
             num_timeout_pt_max = num_timeout_pt
 
-        # Cancel timed-out requests
+        if envs.SGLANG_GRAMMAR_SIMULATE_TIMEOUT.get() > 0:
+            # NOTE: in simulation timeout mode, if only some TP ranks report a timeout,
+            # we still treat those requests as ready instead of canceling them.
+            for i in range(num_ready_reqs_min, num_ready_reqs_max):
+                req = self.grammar_queue[i]
+                if isinstance(req.grammar, futures.Future):
+                    req.grammar = req.grammar.result()
+                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                if req.grammar is INVALID_GRAMMAR_OBJ:
+                    error_msg = f"Invalid grammar request: {req.grammar_key=}"
+                    req.set_finish_with_abort(error_msg)
+
+            num_ready_reqs_min = num_ready_reqs_max
+
+        # NOTE: in non-simulation mode, cancel any request that times out on a subset of
+        # TP ranks because timeouts can diverge across ranks.
         for i in range(num_ready_reqs_min, num_timeout_pt_max):
             req = self.grammar_queue[i]
             if isinstance(req.grammar, futures.Future):
