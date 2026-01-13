@@ -159,5 +159,17 @@ class ZImagePipelineConfig(ImagePipelineConfig):
         }
 
 
+def zimage_omni_preprocess_text(prompt: str):
+    # TODO: single image only
+    #
+    # elif num_condition_images > 0:
+    #  ....
+
+    return "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n"
+
+
+@dataclass
 class ZImageOmniPipelineConfig(ZImagePipelineConfig):
-    pass
+    preprocess_text_funcs: tuple[Callable, ...] = field(
+        default_factory=lambda: (zimage_omni_preprocess_text,)
+    )
