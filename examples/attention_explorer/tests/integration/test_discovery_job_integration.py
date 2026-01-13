@@ -9,36 +9,34 @@ Tests the full discovery pipeline including:
 - Artifact generation
 """
 
-import json
-import os
 import sqlite3
-import pytest
-import numpy as np
-import pandas as pd
-from pathlib import Path
-from datetime import datetime
 
 # Add parent to path for imports
 import sys
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from discovery.discovery_job import (
-    DiscoveryConfig,
-    DiscoveryResult,
-    extract_fingerprints,
-    extract_request_summaries,
-    assign_zone_labels,
-    compute_zone_for_cluster,
-    unpack_fingerprint,
-    pack_fingerprint,
     FINGERPRINT_DIM,
-    FP_LOCAL_MASS,
-    FP_MID_MASS,
-    FP_LONG_MASS,
     FP_ENTROPY,
-    ZONE_THRESHOLDS,
+    FP_LOCAL_MASS,
+    FP_LONG_MASS,
+    FP_MID_MASS,
     HAS_HDBSCAN,
     HAS_UMAP,
+    DiscoveryConfig,
+    assign_zone_labels,
+    compute_zone_for_cluster,
+    extract_fingerprints,
+    extract_request_summaries,
+    pack_fingerprint,
+    unpack_fingerprint,
 )
 
 
@@ -83,16 +81,16 @@ class TestExtractFingerprints:
         df = extract_fingerprints(populated_db, time_window_hours=24)
 
         assert len(df) == 1000  # 1000 fingerprints in fixture
-        assert 'fingerprint' in df.columns
-        assert 'request_id' in df.columns
-        assert 'step' in df.columns
+        assert "fingerprint" in df.columns
+        assert "request_id" in df.columns
+        assert "step" in df.columns
 
     def test_extracted_fingerprint_shape(self, populated_db):
         """Test extracted fingerprints have correct shape."""
         df = extract_fingerprints(populated_db, time_window_hours=24)
 
         # Check first fingerprint
-        fp = df.iloc[0]['fingerprint']
+        fp = df.iloc[0]["fingerprint"]
         assert isinstance(fp, np.ndarray)
         assert fp.shape == (FINGERPRINT_DIM,)
         assert fp.dtype == np.float32
@@ -151,7 +149,7 @@ class TestAssignZoneLabels:
 
         zones, confidences = assign_zone_labels(fp)
 
-        assert zones[0] == 'syntax_floor'
+        assert zones[0] == "syntax_floor"
         assert confidences[0] > 0
 
     def test_semantic_bridge_assignment(self):
@@ -165,7 +163,7 @@ class TestAssignZoneLabels:
 
         zones, confidences = assign_zone_labels(fp)
 
-        assert zones[0] == 'semantic_bridge'
+        assert zones[0] == "semantic_bridge"
         assert confidences[0] > 0
 
     def test_structure_ripple_assignment(self):
@@ -182,7 +180,7 @@ class TestAssignZoneLabels:
         zones, confidences = assign_zone_labels(fp)
 
         # Should be structure_ripple with high long_mass and periodic histogram
-        assert zones[0] in ['structure_ripple', 'semantic_bridge']  # Accept either
+        assert zones[0] in ["structure_ripple", "semantic_bridge"]  # Accept either
         assert confidences[0] > 0
 
     def test_batch_zone_assignment(self, sample_fingerprints):
@@ -193,7 +191,7 @@ class TestAssignZoneLabels:
         assert len(confidences) == len(sample_fingerprints)
 
         # Check all zones are valid
-        valid_zones = {'syntax_floor', 'semantic_bridge', 'structure_ripple'}
+        valid_zones = {"syntax_floor", "semantic_bridge", "structure_ripple"}
         assert all(z in valid_zones for z in zones)
 
         # Check confidences are in [0, 1]
@@ -204,9 +202,9 @@ class TestAssignZoneLabels:
         zones, _ = assign_zone_labels(sample_fingerprints)
 
         # Fixture has 100 of each type
-        syntax_count = np.sum(zones == 'syntax_floor')
-        bridge_count = np.sum(zones == 'semantic_bridge')
-        ripple_count = np.sum(zones == 'structure_ripple')
+        syntax_count = np.sum(zones == "syntax_floor")
+        bridge_count = np.sum(zones == "semantic_bridge")
+        ripple_count = np.sum(zones == "structure_ripple")
 
         # Should have representation from all zones
         assert syntax_count > 50  # At least half of syntax_floor inputs
@@ -225,7 +223,7 @@ class TestComputeZoneForCluster:
 
         zone, confidence = compute_zone_for_cluster(sample_fingerprints, labels, 0)
 
-        assert zone in ['syntax_floor', 'semantic_bridge', 'structure_ripple']
+        assert zone in ["syntax_floor", "semantic_bridge", "structure_ripple"]
         assert 0 <= confidence <= 1
 
     def test_nonexistent_cluster(self, sample_fingerprints):
@@ -234,7 +232,7 @@ class TestComputeZoneForCluster:
 
         zone, confidence = compute_zone_for_cluster(sample_fingerprints, labels, 999)
 
-        assert zone == 'unknown'
+        assert zone == "unknown"
         assert confidence == 0.0
 
 
@@ -243,10 +241,7 @@ class TestDiscoveryConfig:
 
     def test_default_config(self):
         """Test default configuration values."""
-        config = DiscoveryConfig(
-            db_path="/tmp/test.db",
-            output_dir="/tmp/output"
-        )
+        config = DiscoveryConfig(db_path="/tmp/test.db", output_dir="/tmp/output")
 
         assert config.time_window_hours == 24
         assert config.min_cluster_size == 50
@@ -261,7 +256,7 @@ class TestDiscoveryConfig:
             output_dir="/tmp/output",
             time_window_hours=48,
             min_cluster_size=100,
-            umap_neighbors=30
+            umap_neighbors=30,
         )
 
         assert config.time_window_hours == 48
@@ -316,15 +311,15 @@ class TestFullDiscoveryPipeline:
         embeddings_path = Path(result.output_dir) / "embeddings.parquet"
         df = pd.read_parquet(embeddings_path)
 
-        assert 'x' in df.columns
-        assert 'y' in df.columns
+        assert "x" in df.columns
+        assert "y" in df.columns
         assert len(df) == 1000
 
         # Check coordinates are finite
-        assert df['x'].notna().all()
-        assert df['y'].notna().all()
-        assert np.isfinite(df['x'].values).all()
-        assert np.isfinite(df['y'].values).all()
+        assert df["x"].notna().all()
+        assert df["y"].notna().all()
+        assert np.isfinite(df["x"].values).all()
+        assert np.isfinite(df["y"].values).all()
 
 
 class TestDatabaseOperations:
@@ -339,14 +334,13 @@ class TestDatabaseOperations:
         conn.execute(
             """INSERT INTO fingerprints (request_id, step, fingerprint, created_at)
                VALUES (?, ?, ?, ?)""",
-            ("test-req", 0, pack_fingerprint(fp), datetime.utcnow().isoformat())
+            ("test-req", 0, pack_fingerprint(fp), datetime.utcnow().isoformat()),
         )
         conn.commit()
 
         # Read
         cursor = conn.execute(
-            "SELECT fingerprint FROM fingerprints WHERE request_id = ?",
-            ("test-req",)
+            "SELECT fingerprint FROM fingerprints WHERE request_id = ?", ("test-req",)
         )
         row = cursor.fetchone()
         conn.close()
@@ -363,14 +357,14 @@ class TestDatabaseOperations:
         conn.execute(
             """UPDATE fingerprints SET manifold_zone = ?, manifold_confidence = ?
                WHERE request_id = ?""",
-            ("syntax_floor", 0.95, "req-0000")
+            ("syntax_floor", 0.95, "req-0000"),
         )
         conn.commit()
 
         # Verify
         cursor = conn.execute(
             "SELECT manifold_zone, manifold_confidence FROM fingerprints WHERE request_id = ?",
-            ("req-0000",)
+            ("req-0000",),
         )
         rows = cursor.fetchall()
         conn.close()

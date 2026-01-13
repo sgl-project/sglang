@@ -37,91 +37,87 @@ from .classifier import (
     OnlineClassifier,
     SidecarClassifier,
 )
-
-from .spectral_discovery import (
-    SpectralManifoldDiscovery,
-    SpectralDiscoveryConfig,
-    SpectralAnalysis,
-    SpectralCoherence,
-    SpectralMode,
-    FrequencyBandAnalyzer,
-)
-
-from .spectral_router import (
-    SpectralRouter,
-    AdaptiveSpectralRouter,
-    RouterConfig,
-    RoutingDecision,
-    ModelSize,
-    create_router_from_fingerprints,
-)
-
-from .rope_derotation import (
-    RoPEDerotator,
-    RoPEConfig,
-    DerotatedAttention,
-    AttentionMode,
-    GLOSSARY as ATTENTION_GLOSSARY,
-    INTERPRETATION_TEMPLATES,
-    get_glossary,
-    get_term_explanation,
-    explain_attention_step,
-    # Fingerprint integration (schema v2)
-    compute_rotational_variance_for_fingerprint,
-    compute_rotational_variance_batch,
-    extend_fingerprint_with_rotational_variance,
-    extend_fingerprints_batch,
-)
-
 from .compass_router import (
+    COMPASS_GLOSSARY,
+    CompassAnalyzer,
+    CompassHeading,
+    CompassReading,
     CompassRouter,
     CompassRouterConfig,
-    CompassAnalyzer,
-    CompassReading,
     CompassRoutingDecision,
-    CompassHeading,
     RoutingTier,
     SinqAnchor,
-    COMPASS_GLOSSARY,
-    create_compass_router,
     analyze_attention_compass,
+    create_compass_router,
 )
-
 from .manifold_firewall import (
-    ManifoldFirewall,
-    ManifoldBatchAnalyzer,
-    FirewallConfig,
-    FirewallState,
-    FirewallCheckResult,
-    ManifoldPoint,
-    DriftEvent,
-    DriftType,
-    AlertSeverity,
     FIREWALL_GLOSSARY,
     ZONE_TRANSITIONS,
+    AlertSeverity,
+    DriftEvent,
+    DriftType,
+    FirewallCheckResult,
+    FirewallConfig,
+    FirewallState,
+    ManifoldBatchAnalyzer,
+    ManifoldFirewall,
+    ManifoldPoint,
     create_firewall,
+)
+from .rope_derotation import (
+    GLOSSARY as ATTENTION_GLOSSARY,  # Fingerprint integration (schema v2)
+)
+from .rope_derotation import (
+    INTERPRETATION_TEMPLATES,
+    AttentionMode,
+    DerotatedAttention,
+    RoPEConfig,
+    RoPEDerotator,
+    compute_rotational_variance_batch,
+    compute_rotational_variance_for_fingerprint,
+    explain_attention_step,
+    extend_fingerprint_with_rotational_variance,
+    extend_fingerprints_batch,
+    get_glossary,
+    get_term_explanation,
+)
+from .spectral_discovery import (
+    FrequencyBandAnalyzer,
+    SpectralAnalysis,
+    SpectralCoherence,
+    SpectralDiscoveryConfig,
+    SpectralManifoldDiscovery,
+    SpectralMode,
+)
+from .spectral_router import (
+    AdaptiveSpectralRouter,
+    ModelSize,
+    RouterConfig,
+    RoutingDecision,
+    SpectralRouter,
+    create_router_from_fingerprints,
 )
 
 __all__ = [
     # Classifier
-    'ClassificationResult',
-    'ClusterInfo',
-    'OnlineClassifier',
-    'SidecarClassifier',
+    "ClassificationResult",
+    "ClusterInfo",
+    "OnlineClassifier",
+    "SidecarClassifier",
     # Spectral Discovery
-    'SpectralManifoldDiscovery',
-    'SpectralDiscoveryConfig',
-    'SpectralAnalysis',
-    'SpectralCoherence',
-    'SpectralMode',
-    'FrequencyBandAnalyzer',
+    "SpectralManifoldDiscovery",
+    "SpectralDiscoveryConfig",
+    "SpectralAnalysis",
+    "SpectralCoherence",
+    "SpectralMode",
+    "FrequencyBandAnalyzer",
     # Spectral Router
-    'SpectralRouter',
-    'AdaptiveSpectralRouter',
-    'RouterConfig',
-    'RoutingDecision',
-    'ModelSize',
-    'create_router_from_fingerprints',
+    "SpectralRouter",
+    "AdaptiveSpectralRouter",
+    "RouterConfig",
+    "RoutingDecision",
+    "ModelSize",
+    "create_router_from_fingerprints",
 ]
 
-__version__ = '1.1.0'
+__version__ = "1.1.0"

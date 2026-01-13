@@ -7,28 +7,25 @@ Tests the OnlineClassifier including:
 - Centroid-based classification
 """
 
-import json
-import os
-import pytest
-import numpy as np
-import pandas as pd
-from pathlib import Path
-from unittest.mock import Mock, patch
-
 # Add parent to path for imports
 import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from discovery.classifier import (
+    FINGERPRINT_DIM,
+    FP_ENTROPY,
+    FP_LOCAL_MASS,
+    FP_LONG_MASS,
+    FP_MID_MASS,
+    ZONE_THRESHOLDS,
     ClassificationResult,
     ClusterInfo,
     OnlineClassifier,
-    FINGERPRINT_DIM,
-    FP_LOCAL_MASS,
-    FP_MID_MASS,
-    FP_LONG_MASS,
-    FP_ENTROPY,
-    ZONE_THRESHOLDS,
 )
 
 
@@ -38,11 +35,11 @@ class TestOnlineClassifierInit:
     def test_init_with_valid_discovery_dir(self, discovery_artifacts):
         """Test initialization with valid discovery directory."""
         classifier = OnlineClassifier(
-            discovery_dir=discovery_artifacts['output_dir'],
+            discovery_dir=discovery_artifacts["output_dir"],
             precompute_embeddings=False,
         )
 
-        assert classifier.discovery_dir == Path(discovery_artifacts['output_dir'])
+        assert classifier.discovery_dir == Path(discovery_artifacts["output_dir"])
 
     def test_init_with_nonexistent_dir(self, temp_output_dir):
         """Test initialization with non-existent directory."""
@@ -56,12 +53,12 @@ class TestOnlineClassifierInit:
     def test_get_latest_dir(self, discovery_artifacts):
         """Test finding latest discovery run directory."""
         classifier = OnlineClassifier(
-            discovery_dir=discovery_artifacts['output_dir'],
+            discovery_dir=discovery_artifacts["output_dir"],
         )
 
         latest_dir = classifier._get_latest_dir()
 
-        assert latest_dir.name == discovery_artifacts['run_id']
+        assert latest_dir.name == discovery_artifacts["run_id"]
         assert (latest_dir / "manifest.json").exists()
 
 
@@ -71,7 +68,7 @@ class TestOnlineClassifierClassify:
     def test_classify_returns_result(self, discovery_artifacts):
         """Test that classify returns a ClassificationResult."""
         classifier = OnlineClassifier(
-            discovery_dir=discovery_artifacts['output_dir'],
+            discovery_dir=discovery_artifacts["output_dir"],
             precompute_embeddings=False,
         )
 
@@ -86,12 +83,17 @@ class TestOnlineClassifierClassify:
 
         assert result is not None
         assert isinstance(result, ClassificationResult)
-        assert result.zone in ['syntax_floor', 'semantic_bridge', 'structure_ripple', 'unknown']
+        assert result.zone in [
+            "syntax_floor",
+            "semantic_bridge",
+            "structure_ripple",
+            "unknown",
+        ]
 
     def test_classify_syntax_floor_fingerprint(self, discovery_artifacts):
         """Test classification of syntax_floor fingerprint."""
         classifier = OnlineClassifier(
-            discovery_dir=discovery_artifacts['output_dir'],
+            discovery_dir=discovery_artifacts["output_dir"],
             precompute_embeddings=False,
         )
 
@@ -106,12 +108,17 @@ class TestOnlineClassifierClassify:
 
         assert result is not None
         # Zone should be syntax_floor based on fingerprint
-        assert result.zone in ['syntax_floor', 'semantic_bridge', 'structure_ripple', 'unknown']
+        assert result.zone in [
+            "syntax_floor",
+            "semantic_bridge",
+            "structure_ripple",
+            "unknown",
+        ]
 
     def test_classify_batch(self, discovery_artifacts):
         """Test batch classification."""
         classifier = OnlineClassifier(
-            discovery_dir=discovery_artifacts['output_dir'],
+            discovery_dir=discovery_artifacts["output_dir"],
             precompute_embeddings=False,
         )
 
@@ -130,23 +137,23 @@ class TestClassificationResult:
     def test_result_fields(self, discovery_artifacts):
         """Test classification result has all required fields."""
         classifier = OnlineClassifier(
-            discovery_dir=discovery_artifacts['output_dir'],
+            discovery_dir=discovery_artifacts["output_dir"],
             precompute_embeddings=False,
         )
 
         fp = np.random.randn(FINGERPRINT_DIM).astype(np.float32)
         result = classifier.classify(fp)
 
-        assert hasattr(result, 'cluster_id')
-        assert hasattr(result, 'cluster_label')
-        assert hasattr(result, 'cluster_probability')
-        assert hasattr(result, 'zone')
-        assert hasattr(result, 'zone_confidence')
+        assert hasattr(result, "cluster_id")
+        assert hasattr(result, "cluster_label")
+        assert hasattr(result, "cluster_probability")
+        assert hasattr(result, "zone")
+        assert hasattr(result, "zone_confidence")
 
     def test_result_probability_range(self, discovery_artifacts):
         """Test classification probabilities are in valid range."""
         classifier = OnlineClassifier(
-            discovery_dir=discovery_artifacts['output_dir'],
+            discovery_dir=discovery_artifacts["output_dir"],
             precompute_embeddings=False,
         )
 
@@ -165,7 +172,7 @@ class TestClusterInfoRetrieval:
     def test_get_cluster_info(self, discovery_artifacts):
         """Test getting info for a specific cluster."""
         classifier = OnlineClassifier(
-            discovery_dir=discovery_artifacts['output_dir'],
+            discovery_dir=discovery_artifacts["output_dir"],
             precompute_embeddings=False,
         )
 
@@ -179,7 +186,7 @@ class TestClusterInfoRetrieval:
     def test_get_all_clusters(self, discovery_artifacts):
         """Test getting all cluster info."""
         classifier = OnlineClassifier(
-            discovery_dir=discovery_artifacts['output_dir'],
+            discovery_dir=discovery_artifacts["output_dir"],
             precompute_embeddings=False,
         )
 
@@ -197,7 +204,7 @@ class TestReload:
     def test_reload_artifacts(self, discovery_artifacts):
         """Test that reload reloads artifacts."""
         classifier = OnlineClassifier(
-            discovery_dir=discovery_artifacts['output_dir'],
+            discovery_dir=discovery_artifacts["output_dir"],
             precompute_embeddings=False,
         )
 
@@ -219,7 +226,7 @@ class TestRunIdProperty:
     def test_run_id(self, discovery_artifacts):
         """Test run_id property."""
         classifier = OnlineClassifier(
-            discovery_dir=discovery_artifacts['output_dir'],
+            discovery_dir=discovery_artifacts["output_dir"],
             precompute_embeddings=False,
         )
 
@@ -230,7 +237,7 @@ class TestRunIdProperty:
         run_id = classifier.run_id
 
         # Should match fixture
-        assert run_id is not None or run_id == discovery_artifacts['run_id']
+        assert run_id is not None or run_id == discovery_artifacts["run_id"]
 
 
 class TestClusterCount:
@@ -239,7 +246,7 @@ class TestClusterCount:
     def test_cluster_count(self, discovery_artifacts):
         """Test cluster_count property."""
         classifier = OnlineClassifier(
-            discovery_dir=discovery_artifacts['output_dir'],
+            discovery_dir=discovery_artifacts["output_dir"],
             precompute_embeddings=False,
         )
 
@@ -258,13 +265,13 @@ class TestZoneThresholds:
 
     def test_zone_thresholds_exist(self):
         """Test zone thresholds are defined."""
-        assert 'syntax_floor' in ZONE_THRESHOLDS
-        assert 'structure_ripple' in ZONE_THRESHOLDS
+        assert "syntax_floor" in ZONE_THRESHOLDS
+        assert "structure_ripple" in ZONE_THRESHOLDS
 
     def test_zone_thresholds_have_required_keys(self):
         """Test zone thresholds have required keys."""
-        assert 'local_mass_min' in ZONE_THRESHOLDS['syntax_floor']
-        assert 'entropy_max' in ZONE_THRESHOLDS['syntax_floor']
+        assert "local_mass_min" in ZONE_THRESHOLDS["syntax_floor"]
+        assert "entropy_max" in ZONE_THRESHOLDS["syntax_floor"]
 
 
 if __name__ == "__main__":

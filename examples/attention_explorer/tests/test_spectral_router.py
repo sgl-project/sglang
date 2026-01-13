@@ -4,25 +4,26 @@ Tests for Spectral Router
 Tests the spectral manifold discovery and routing logic.
 """
 
-import numpy as np
-import pytest
+import sys
 import tempfile
 from pathlib import Path
 
-import sys
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from discovery.spectral_discovery import (
-    SpectralManifoldDiscovery,
-    SpectralDiscoveryConfig,
-    SpectralMode,
     FrequencyBandAnalyzer,
+    SpectralDiscoveryConfig,
+    SpectralManifoldDiscovery,
+    SpectralMode,
 )
 from discovery.spectral_router import (
-    SpectralRouter,
     AdaptiveSpectralRouter,
-    RouterConfig,
     ModelSize,
+    RouterConfig,
+    SpectralRouter,
     create_router_from_fingerprints,
 )
 
@@ -117,7 +118,7 @@ class TestSpectralManifoldDiscovery:
         discovery = SpectralManifoldDiscovery(config)
         discovery.fit(sample_fingerprints)
 
-        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
             path = f.name
 
         try:
@@ -178,7 +179,7 @@ class TestSpectralRouter:
         assert decision.model_size in ModelSize
         assert isinstance(decision.use_chain_of_thought, bool)
         assert 0 <= decision.spectral_coherence <= 1
-        assert decision.estimated_complexity in ['trivial', 'moderate', 'complex']
+        assert decision.estimated_complexity in ["trivial", "moderate", "complex"]
 
     def test_route_consistency(self, fitted_router, sample_fingerprints):
         """Test that same fingerprint gives same routing."""
@@ -206,9 +207,9 @@ class TestSpectralRouter:
 
         stats = fitted_router.get_routing_stats()
 
-        assert stats['total_decisions'] == 50
-        assert sum(stats['model_distribution'].values()) == pytest.approx(1.0)
-        assert 0 <= stats['cot_rate'] <= 1
+        assert stats["total_decisions"] == 50
+        assert sum(stats["model_distribution"].values()) == pytest.approx(1.0)
+        assert 0 <= stats["cot_rate"] <= 1
 
     def test_high_coherence_routes_small(self, sample_fingerprints):
         """Test that high coherence fingerprints route to small model."""
@@ -297,7 +298,7 @@ class TestAdaptiveSpectralRouter:
             decision=decision,
             actual_quality=0.8,
             actual_latency=1.5,
-            was_correct_size=True
+            was_correct_size=True,
         )
 
         assert len(router._feedback_history) == 1
@@ -335,25 +336,37 @@ class TestFrequencyBandAnalyzer:
 
         result = analyzer.analyze_frequency_bands(fp)
 
-        assert 'high_band_activity' in result
-        assert 'low_band_activity' in result
-        assert 'band_ratio' in result
-        assert result['high_band_activity'] > result['low_band_activity']
+        assert "high_band_activity" in result
+        assert "low_band_activity" in result
+        assert "band_ratio" in result
+        assert result["high_band_activity"] > result["low_band_activity"]
 
     def test_recommend_model_size(self):
         """Test model size recommendation."""
         analyzer = FrequencyBandAnalyzer()
 
         # High band ratio -> large model
-        high_band = {'high_band_activity': 0.8, 'low_band_activity': 0.2, 'band_ratio': 4.0}
+        high_band = {
+            "high_band_activity": 0.8,
+            "low_band_activity": 0.2,
+            "band_ratio": 4.0,
+        }
         assert analyzer.recommend_model_size(high_band) == "large"
 
         # Low band ratio -> small model
-        low_band = {'high_band_activity': 0.2, 'low_band_activity': 0.8, 'band_ratio': 0.25}
+        low_band = {
+            "high_band_activity": 0.2,
+            "low_band_activity": 0.8,
+            "band_ratio": 0.25,
+        }
         assert analyzer.recommend_model_size(low_band) == "small"
 
         # Balanced -> medium
-        balanced = {'high_band_activity': 0.5, 'low_band_activity': 0.5, 'band_ratio': 1.0}
+        balanced = {
+            "high_band_activity": 0.5,
+            "low_band_activity": 0.5,
+            "band_ratio": 1.0,
+        }
         assert analyzer.recommend_model_size(balanced) == "medium"
 
 
@@ -396,7 +409,7 @@ class TestIntegration:
 
         # Check stats
         stats = router.get_routing_stats()
-        assert stats['total_decisions'] == 3
+        assert stats["total_decisions"] == 3
 
     def test_deterministic_routing(self):
         """Test that routing is deterministic for same input."""
@@ -415,5 +428,5 @@ class TestIntegration:
         assert d1.use_chain_of_thought == d2.use_chain_of_thought
 
 
-if __name__ == '__main__':
-    pytest.main([__file__, '-v'])
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

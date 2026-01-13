@@ -5,17 +5,16 @@ Collects attention patterns, fingerprints, MoE routing data, and
 performance metrics for analysis and insight generation.
 """
 
-import asyncio
 import json
+import logging
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-import logging
-import httpx
+from typing import Any, Dict, List, Optional
 
-from scenarios import Scenario, ExpectedManifold
+import httpx
+from scenarios import Scenario
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +22,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AttentionToken:
     """A single attention token with metadata."""
+
     token_id: int
     token_str: str
     offset: int
@@ -33,14 +33,15 @@ class AttentionToken:
 @dataclass
 class AttentionStep:
     """Attention data for a single generation step."""
+
     step_index: int
     output_token_id: int
     output_token_str: str
     top_k_tokens: List[AttentionToken]
     entropy: Optional[float] = None
     local_mass: Optional[float] = None  # offset < 8
-    mid_mass: Optional[float] = None    # 8 <= offset < 256
-    long_mass: Optional[float] = None   # offset >= 256
+    mid_mass: Optional[float] = None  # 8 <= offset < 256
+    long_mass: Optional[float] = None  # offset >= 256
 
     def compute_mass_distribution(self):
         """Compute local/mid/long mass from top-k tokens."""
@@ -62,6 +63,7 @@ class AttentionStep:
 @dataclass
 class Fingerprint:
     """20D attention fingerprint vector."""
+
     local_mass: float
     mid_mass: float
     long_mass: float
@@ -69,12 +71,18 @@ class Fingerprint:
     histogram: List[float]  # 16 bins
 
     def to_vector(self) -> List[float]:
-        return [self.local_mass, self.mid_mass, self.long_mass, self.entropy] + self.histogram
+        return [
+            self.local_mass,
+            self.mid_mass,
+            self.long_mass,
+            self.entropy,
+        ] + self.histogram
 
 
 @dataclass
 class MoERouting:
     """MoE routing data for a generation step."""
+
     step_index: int
     layer_idx: int
     expert_ids: List[int]
@@ -85,6 +93,7 @@ class MoERouting:
 @dataclass
 class TraceData:
     """Complete trace data for a scenario run."""
+
     scenario_name: str
     scenario_category: str
     expected_manifold: str
@@ -119,6 +128,7 @@ class TraceData:
 @dataclass
 class CollectionRun:
     """A complete collection run with multiple traces."""
+
     run_id: str
     start_time: str
     end_time: Optional[str] = None
@@ -131,11 +141,13 @@ class CollectionRun:
         self.traces.append(trace)
 
     def add_error(self, scenario_name: str, error: str):
-        self.errors.append({
-            "scenario": scenario_name,
-            "error": error,
-            "timestamp": datetime.now().isoformat()
-        })
+        self.errors.append(
+            {
+                "scenario": scenario_name,
+                "error": error,
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
 
     def summary(self) -> Dict[str, Any]:
         """Generate summary statistics."""
@@ -161,7 +173,8 @@ class CollectionRun:
             "by_manifold": {k: len(v) for k, v in by_manifold.items()},
             "avg_tokens_per_second": sum(
                 t.tokens_per_second for t in self.traces if t.tokens_per_second
-            ) / max(1, len([t for t in self.traces if t.tokens_per_second])),
+            )
+            / max(1, len([t for t in self.traces if t.tokens_per_second])),
         }
 
 
@@ -283,7 +296,9 @@ class AttentionCollector:
                     completion_text += content
 
                     # Extract attention tokens - in streaming mode they're in delta
-                    attention_data = delta.get("attention_tokens") or chunk.get("attention_tokens")
+                    attention_data = delta.get("attention_tokens") or chunk.get(
+                        "attention_tokens"
+                    )
                     if attention_data and isinstance(attention_data, list):
                         for step_data in attention_data:
                             step = self._parse_attention_step(step_data, step_index)
@@ -324,10 +339,14 @@ class AttentionCollector:
 
             # Compute tokens per second - use completion_tokens if available,
             # otherwise estimate from attention steps
-            token_count = trace.completion_tokens if trace.completion_tokens > 0 else len(trace.attention_steps)
+            token_count = (
+                trace.completion_tokens
+                if trace.completion_tokens > 0
+                else len(trace.attention_steps)
+            )
             if token_count > 0 and trace.total_generation_time_ms > 0:
-                trace.tokens_per_second = (
-                    token_count / (trace.total_generation_time_ms / 1000)
+                trace.tokens_per_second = token_count / (
+                    trace.total_generation_time_ms / 1000
                 )
 
             logger.info(
@@ -358,27 +377,33 @@ class AttentionCollector:
 
             if token_positions and attention_scores:
                 # New format from server - build AttentionToken list from parallel arrays
-                for i, (pos, score) in enumerate(zip(token_positions, attention_scores)):
+                for i, (pos, score) in enumerate(
+                    zip(token_positions, attention_scores)
+                ):
                     # In new format, position is the source position, offset is distance from current
                     # We use position directly and compute offset later if needed
-                    top_k.append(AttentionToken(
-                        token_id=0,  # Not available in new format
-                        token_str="",  # Not available in new format
-                        offset=pos,  # Position from start (can compute relative offset if needed)
-                        weight=score,
-                        position=pos,
-                    ))
+                    top_k.append(
+                        AttentionToken(
+                            token_id=0,  # Not available in new format
+                            token_str="",  # Not available in new format
+                            offset=pos,  # Position from start (can compute relative offset if needed)
+                            weight=score,
+                            position=pos,
+                        )
+                    )
             else:
                 # Old format: top_k list with full token data
                 tokens_data = data.get("top_k", [])
                 for t in tokens_data:
-                    top_k.append(AttentionToken(
-                        token_id=t.get("token_id", 0),
-                        token_str=t.get("token", ""),
-                        offset=t.get("offset", 0),
-                        weight=t.get("weight", 0.0),
-                        position=t.get("position", 0),
-                    ))
+                    top_k.append(
+                        AttentionToken(
+                            token_id=t.get("token_id", 0),
+                            token_str=t.get("token", ""),
+                            offset=t.get("offset", 0),
+                            weight=t.get("weight", 0.0),
+                            position=t.get("position", 0),
+                        )
+                    )
 
             # Get fingerprint data if available (new format)
             fingerprint = data.get("fingerprint", {})
@@ -436,6 +461,7 @@ class AttentionCollector:
             total = sum(weights)
             probs = [w / total for w in weights]
             import math
+
             entropy = -sum(p * math.log2(p) for p in probs if p > 0)
             # Normalize to [0, 1] range (assuming max entropy = log2(top_k))
             max_entropy = math.log2(len(weights)) if len(weights) > 1 else 1
@@ -456,6 +482,7 @@ class AttentionCollector:
                     bin_idx = 0
                 else:
                     import math
+
                     bin_idx = min(15, int(math.log2(offset + 1)))
                 histogram[bin_idx] += token.weight / total_weight
 

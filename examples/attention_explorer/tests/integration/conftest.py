@@ -8,15 +8,16 @@ import json
 import os
 import sqlite3
 import struct
-import tempfile
-import shutil
-import numpy as np
-import pytest
-from pathlib import Path
-from datetime import datetime, timedelta
 
 # Add parent to path for imports
 import sys
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 
@@ -32,9 +33,10 @@ SCHEMA_VERSION = 1
 # HELPER FUNCTIONS
 # =============================================================================
 
+
 def pack_fingerprint(arr: np.ndarray) -> bytes:
     """Pack numpy array to fingerprint blob."""
-    return struct.pack(f'<{FINGERPRINT_DIM}f', *arr.astype(np.float32))
+    return struct.pack(f"<{FINGERPRINT_DIM}f", *arr.astype(np.float32))
 
 
 def generate_syntax_floor_fingerprint() -> np.ndarray:
@@ -86,6 +88,7 @@ def generate_random_fingerprint() -> np.ndarray:
 # =============================================================================
 # FIXTURES
 # =============================================================================
+
 
 @pytest.fixture
 def sample_fingerprints():
@@ -143,7 +146,8 @@ def temp_db_with_schema():
         db_path = os.path.join(tmpdir, "test_fingerprints.db")
 
         conn = sqlite3.connect(db_path)
-        conn.executescript("""
+        conn.executescript(
+            """
             PRAGMA journal_mode = WAL;
 
             CREATE TABLE IF NOT EXISTS sessions (
@@ -255,7 +259,8 @@ def temp_db_with_schema():
 
             INSERT OR IGNORE INTO clusters (cluster_id, run_id, label, dominant_zone, size)
             VALUES (-1, 'initial', 'Unassigned', 'unknown', 0);
-        """)
+        """
+        )
         conn.commit()
         conn.close()
 
@@ -271,7 +276,7 @@ def populated_db(temp_db_with_schema, sample_fingerprints_large):
     # Insert session
     conn.execute(
         "INSERT INTO sessions (session_id, name, model_id) VALUES (?, ?, ?)",
-        ("test-session", "Integration Test", "test-model")
+        ("test-session", "Integration Test", "test-model"),
     )
 
     # Insert fingerprints
@@ -287,8 +292,14 @@ def populated_db(temp_db_with_schema, sample_fingerprints_large):
             """INSERT INTO fingerprints
                (request_id, session_id, step, fingerprint, model_id, created_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (request_id, "test-session", step, pack_fingerprint(fp),
-             "test-model", created_at.isoformat())
+            (
+                request_id,
+                "test-session",
+                step,
+                pack_fingerprint(fp),
+                "test-model",
+                created_at.isoformat(),
+            ),
         )
 
     # Insert request summaries
@@ -298,8 +309,14 @@ def populated_db(temp_db_with_schema, sample_fingerprints_large):
             """INSERT INTO request_summary
                (request_id, session_id, total_steps, prompt_preview, response_preview, model_id)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (request_id, "test-session", 10,
-             f"Test prompt {req_num}", f"Test response {req_num}", "test-model")
+            (
+                request_id,
+                "test-session",
+                10,
+                f"Test prompt {req_num}",
+                f"Test response {req_num}",
+                "test-model",
+            ),
         )
 
     conn.commit()
@@ -332,29 +349,28 @@ def discovery_artifacts(temp_output_dir, sample_fingerprints_large):
     embeddings = np.random.randn(n_samples, 2).astype(np.float32)
 
     # Create labels (3 clusters + noise)
-    labels = np.array(
-        [0] * 300 + [1] * 300 + [2] * 300 + [-1] * 100,
-        dtype=np.int32
-    )
+    labels = np.array([0] * 300 + [1] * 300 + [2] * 300 + [-1] * 100, dtype=np.int32)
 
     # Create zones
     zones = np.array(
-        ['syntax_floor'] * 300 +
-        ['semantic_bridge'] * 300 +
-        ['structure_ripple'] * 300 +
-        ['unknown'] * 100
+        ["syntax_floor"] * 300
+        + ["semantic_bridge"] * 300
+        + ["structure_ripple"] * 300
+        + ["unknown"] * 100
     )
 
     # Create embeddings parquet
-    embeddings_df = pd.DataFrame({
-        'id': range(n_samples),
-        'request_id': [f"req-{i // 10:04d}" for i in range(n_samples)],
-        'step': [i % 10 for i in range(n_samples)],
-        'x': embeddings[:, 0],
-        'y': embeddings[:, 1],
-        'cluster_id': labels,
-        'zone': zones,
-    })
+    embeddings_df = pd.DataFrame(
+        {
+            "id": range(n_samples),
+            "request_id": [f"req-{i // 10:04d}" for i in range(n_samples)],
+            "step": [i % 10 for i in range(n_samples)],
+            "x": embeddings[:, 0],
+            "y": embeddings[:, 1],
+            "cluster_id": labels,
+            "zone": zones,
+        }
+    )
     embeddings_df.to_parquet(run_dir / "embeddings.parquet")
 
     # Create cluster metadata
@@ -362,26 +378,30 @@ def discovery_artifacts(temp_output_dir, sample_fingerprints_large):
     for cluster_id in range(3):
         mask = labels == cluster_id
         centroid = sample_fingerprints_large[mask].mean(axis=0)
-        clusters.append({
-            'cluster_id': cluster_id,
-            'label': f"Cluster {cluster_id}",
-            'size': int(mask.sum()),
-            'dominant_zone': zones[mask][0],
-            'zone_confidence': 0.9,
-            'centroid_x': float(embeddings[mask, 0].mean()),
-            'centroid_y': float(embeddings[mask, 1].mean()),
-        })
+        clusters.append(
+            {
+                "cluster_id": cluster_id,
+                "label": f"Cluster {cluster_id}",
+                "size": int(mask.sum()),
+                "dominant_zone": zones[mask][0],
+                "zone_confidence": 0.9,
+                "centroid_x": float(embeddings[mask, 0].mean()),
+                "centroid_y": float(embeddings[mask, 1].mean()),
+            }
+        )
 
-    with open(run_dir / "clusters.json", 'w') as f:
+    with open(run_dir / "clusters.json", "w") as f:
         json.dump(clusters, f, indent=2)
 
     # Create fingerprints parquet
-    fingerprints_df = pd.DataFrame({
-        'id': range(n_samples),
-        'fingerprint': [fp.tobytes() for fp in sample_fingerprints_large],
-        'cluster_id': labels,
-        'zone': zones,
-    })
+    fingerprints_df = pd.DataFrame(
+        {
+            "id": range(n_samples),
+            "fingerprint": [fp.tobytes() for fp in sample_fingerprints_large],
+            "cluster_id": labels,
+            "zone": zones,
+        }
+    )
     fingerprints_df.to_parquet(run_dir / "fingerprints.parquet")
 
     # Create centroids
@@ -390,21 +410,21 @@ def discovery_artifacts(temp_output_dir, sample_fingerprints_large):
         mask = labels == cluster_id
         centroids[cluster_id] = sample_fingerprints_large[mask].mean(axis=0).tolist()
 
-    with open(run_dir / "centroids.json", 'w') as f:
+    with open(run_dir / "centroids.json", "w") as f:
         json.dump(centroids, f)
 
     # Create manifest
     manifest = {
-        'run_id': run_id,
-        'created_at': datetime.utcnow().isoformat(),
-        'fingerprint_count': n_samples,
-        'cluster_count': 3,
-        'noise_count': 100,
-        'embedding_method': 'pca_50_umap_2',
-        'clustering_method': 'hdbscan',
+        "run_id": run_id,
+        "created_at": datetime.utcnow().isoformat(),
+        "fingerprint_count": n_samples,
+        "cluster_count": 3,
+        "noise_count": 100,
+        "embedding_method": "pca_50_umap_2",
+        "clustering_method": "hdbscan",
     }
 
-    with open(run_dir / "manifest.json", 'w') as f:
+    with open(run_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
 
     # Create latest symlink
@@ -414,13 +434,13 @@ def discovery_artifacts(temp_output_dir, sample_fingerprints_large):
     latest_link.symlink_to(run_dir)
 
     return {
-        'output_dir': str(output_dir),
-        'run_dir': str(run_dir),
-        'run_id': run_id,
-        'n_samples': n_samples,
-        'embeddings': embeddings,
-        'labels': labels,
-        'zones': zones,
-        'fingerprints': sample_fingerprints_large,
-        'centroids': centroids,
+        "output_dir": str(output_dir),
+        "run_dir": str(run_dir),
+        "run_id": run_id,
+        "n_samples": n_samples,
+        "embeddings": embeddings,
+        "labels": labels,
+        "zones": zones,
+        "fingerprints": sample_fingerprints_large,
+        "centroids": centroids,
     }

@@ -8,13 +8,11 @@ refine boundaries between attention zones.
 
 import json
 import logging
-import math
 from collections import defaultdict
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -25,41 +23,43 @@ logger = logging.getLogger(__name__)
 
 # Default zone thresholds (from classifier.py)
 DEFAULT_ZONE_THRESHOLDS = {
-    'syntax_floor': {
-        'local_mass_min': 0.7,
-        'entropy_max': 2.0,
-        'long_range_mass_max': 0.1,
+    "syntax_floor": {
+        "local_mass_min": 0.7,
+        "entropy_max": 2.0,
+        "long_range_mass_max": 0.1,
     },
-    'semantic_bridge': {
-        'local_mass_range': (0.3, 0.7),
-        'mid_mass_min': 0.2,
-        'entropy_range': (2.0, 4.0),
+    "semantic_bridge": {
+        "local_mass_range": (0.3, 0.7),
+        "mid_mass_min": 0.2,
+        "entropy_range": (2.0, 4.0),
     },
-    'long_range': {
-        'long_mass_min': 0.3,
-        'local_mass_max': 0.3,
-        'entropy_min': 3.0,
+    "long_range": {
+        "long_mass_min": 0.3,
+        "local_mass_max": 0.3,
+        "entropy_min": 3.0,
     },
-    'structure_ripple': {
-        'entropy_range': (2.5, 4.5),
-        'pattern_score_min': 0.5,
+    "structure_ripple": {
+        "entropy_range": (2.5, 4.5),
+        "pattern_score_min": 0.5,
     },
-    'diffuse': {
-        'entropy_min': 4.5,
-        'max_mass_max': 0.3,
+    "diffuse": {
+        "entropy_min": 4.5,
+        "max_mass_max": 0.3,
     },
 }
 
-ZONES = ['syntax_floor', 'semantic_bridge', 'long_range', 'structure_ripple', 'diffuse']
+ZONES = ["syntax_floor", "semantic_bridge", "long_range", "structure_ripple", "diffuse"]
 
 
 # =============================================================================
 # DATA STRUCTURES
 # =============================================================================
 
+
 @dataclass
 class ZoneSample:
     """A single sample with features and ground truth."""
+
     fingerprint_id: int
     features: Dict[str, float]  # local_mass, mid_mass, long_mass, entropy, etc.
     predicted_zone: str
@@ -71,6 +71,7 @@ class ZoneSample:
 @dataclass
 class ThresholdCandidate:
     """A candidate threshold value with performance metrics."""
+
     parameter: str
     value: float
     accuracy: float
@@ -81,6 +82,7 @@ class ThresholdCandidate:
 @dataclass
 class TuningState:
     """Serializable state for threshold tuning."""
+
     zone_thresholds: Dict[str, Dict[str, Any]]
     samples: List[Dict[str, Any]]
     accuracy_history: List[Dict[str, float]]
@@ -92,7 +94,7 @@ class TuningState:
         return json.dumps(asdict(self), indent=2)
 
     @classmethod
-    def from_json(cls, json_str: str) -> 'TuningState':
+    def from_json(cls, json_str: str) -> "TuningState":
         """Deserialize from JSON."""
         data = json.loads(json_str)
         return cls(**data)
@@ -101,6 +103,7 @@ class TuningState:
 # =============================================================================
 # THRESHOLD TUNER
 # =============================================================================
+
 
 class ZoneThresholdTuner:
     """
@@ -198,11 +201,13 @@ class ZoneThresholdTuner:
             result: Dict with keys like 'fingerprint_id', 'features', 'predicted_zone', etc.
         """
         self.add_sample(
-            fingerprint_id=result.get('fingerprint_id', 0),
-            features=result.get('features', {}),
-            predicted_zone=result.get('predicted_zone', 'unknown'),
-            actual_zone=result.get('actual_zone', result.get('expected_zone', 'unknown')),
-            confidence=result.get('confidence', 0.0),
+            fingerprint_id=result.get("fingerprint_id", 0),
+            features=result.get("features", {}),
+            predicted_zone=result.get("predicted_zone", "unknown"),
+            actual_zone=result.get(
+                "actual_zone", result.get("expected_zone", "unknown")
+            ),
+            confidence=result.get("confidence", 0.0),
         )
 
     def compute_accuracy(self) -> Dict[str, float]:
@@ -213,14 +218,14 @@ class ZoneThresholdTuner:
             Dict with overall accuracy and per-zone accuracy
         """
         if not self._samples:
-            return {'overall': 0.0}
+            return {"overall": 0.0}
 
         # Overall accuracy
         correct = sum(1 for s in self._samples if s.predicted_zone == s.actual_zone)
         overall = correct / len(self._samples)
 
         # Per-zone accuracy
-        result = {'overall': overall}
+        result = {"overall": overall}
 
         for zone in ZONES:
             zone_samples = self._samples_by_zone.get(zone, [])
@@ -284,51 +289,59 @@ class ZoneThresholdTuner:
         Returns:
             Predicted zone name
         """
-        local_mass = features.get('local_mass', 0.0)
-        mid_mass = features.get('mid_mass', 0.0)
-        long_mass = features.get('long_mass', 0.0)
-        entropy = features.get('entropy', 0.0)
-        pattern_score = features.get('pattern_score', 0.0)
+        local_mass = features.get("local_mass", 0.0)
+        mid_mass = features.get("mid_mass", 0.0)
+        long_mass = features.get("long_mass", 0.0)
+        entropy = features.get("entropy", 0.0)
+        pattern_score = features.get("pattern_score", 0.0)
 
         # Check syntax_floor
-        sf = thresholds.get('syntax_floor', {})
-        if (local_mass >= sf.get('local_mass_min', 0.7) and
-            entropy <= sf.get('entropy_max', 2.0) and
-            long_mass <= sf.get('long_range_mass_max', 0.1)):
-            return 'syntax_floor'
+        sf = thresholds.get("syntax_floor", {})
+        if (
+            local_mass >= sf.get("local_mass_min", 0.7)
+            and entropy <= sf.get("entropy_max", 2.0)
+            and long_mass <= sf.get("long_range_mass_max", 0.1)
+        ):
+            return "syntax_floor"
 
         # Check long_range
-        lr = thresholds.get('long_range', {})
-        if (long_mass >= lr.get('long_mass_min', 0.3) and
-            local_mass <= lr.get('local_mass_max', 0.3) and
-            entropy >= lr.get('entropy_min', 3.0)):
-            return 'long_range'
+        lr = thresholds.get("long_range", {})
+        if (
+            long_mass >= lr.get("long_mass_min", 0.3)
+            and local_mass <= lr.get("local_mass_max", 0.3)
+            and entropy >= lr.get("entropy_min", 3.0)
+        ):
+            return "long_range"
 
         # Check diffuse
-        df = thresholds.get('diffuse', {})
+        df = thresholds.get("diffuse", {})
         max_mass = max(local_mass, mid_mass, long_mass)
-        if (entropy >= df.get('entropy_min', 4.5) and
-            max_mass <= df.get('max_mass_max', 0.3)):
-            return 'diffuse'
+        if entropy >= df.get("entropy_min", 4.5) and max_mass <= df.get(
+            "max_mass_max", 0.3
+        ):
+            return "diffuse"
 
         # Check structure_ripple
-        sr = thresholds.get('structure_ripple', {})
-        entropy_range = sr.get('entropy_range', (2.5, 4.5))
-        if (entropy_range[0] <= entropy <= entropy_range[1] and
-            pattern_score >= sr.get('pattern_score_min', 0.5)):
-            return 'structure_ripple'
+        sr = thresholds.get("structure_ripple", {})
+        entropy_range = sr.get("entropy_range", (2.5, 4.5))
+        if entropy_range[0] <= entropy <= entropy_range[1] and pattern_score >= sr.get(
+            "pattern_score_min", 0.5
+        ):
+            return "structure_ripple"
 
         # Check semantic_bridge
-        sb = thresholds.get('semantic_bridge', {})
-        local_range = sb.get('local_mass_range', (0.3, 0.7))
-        entropy_range = sb.get('entropy_range', (2.0, 4.0))
-        if (local_range[0] <= local_mass <= local_range[1] and
-            mid_mass >= sb.get('mid_mass_min', 0.2) and
-            entropy_range[0] <= entropy <= entropy_range[1]):
-            return 'semantic_bridge'
+        sb = thresholds.get("semantic_bridge", {})
+        local_range = sb.get("local_mass_range", (0.3, 0.7))
+        entropy_range = sb.get("entropy_range", (2.0, 4.0))
+        if (
+            local_range[0] <= local_mass <= local_range[1]
+            and mid_mass >= sb.get("mid_mass_min", 0.2)
+            and entropy_range[0] <= entropy <= entropy_range[1]
+        ):
+            return "semantic_bridge"
 
         # Default to semantic_bridge if no match
-        return 'semantic_bridge'
+        return "semantic_bridge"
 
     def _optimize_threshold(
         self,
@@ -423,11 +436,11 @@ class ZoneThresholdTuner:
             for param, current_value in self.thresholds.get(zone, {}).items():
                 if isinstance(current_value, (int, float)):
                     # Determine search range based on parameter type
-                    if 'mass' in param:
+                    if "mass" in param:
                         value_range = (0.0, 1.0)
-                    elif 'entropy' in param:
+                    elif "entropy" in param:
                         value_range = (0.0, 6.0)
-                    elif 'score' in param:
+                    elif "score" in param:
                         value_range = (0.0, 1.0)
                     else:
                         value_range = (current_value * 0.5, current_value * 1.5)
@@ -438,12 +451,14 @@ class ZoneThresholdTuner:
 
                     # Apply learning rate
                     new_value = (
-                        current_value * (1 - self.learning_rate) +
-                        optimal * self.learning_rate
+                        current_value * (1 - self.learning_rate)
+                        + optimal * self.learning_rate
                     )
                     new_thresholds[zone][param] = round(new_value, 3)
 
-                elif isinstance(current_value, (list, tuple)) and len(current_value) == 2:
+                elif (
+                    isinstance(current_value, (list, tuple)) and len(current_value) == 2
+                ):
                     # Range parameter - optimize both bounds
                     new_thresholds[zone][param] = current_value  # Keep as-is for now
                 else:
@@ -455,12 +470,14 @@ class ZoneThresholdTuner:
         # Record accuracy after update
         accuracy_after = self.compute_accuracy()
 
-        self._accuracy_history.append({
-            'iteration': self._iteration,
-            'before': accuracy_before,
-            'after': accuracy_after,
-            'timestamp': datetime.now().isoformat(),
-        })
+        self._accuracy_history.append(
+            {
+                "iteration": self._iteration,
+                "before": accuracy_before,
+                "after": accuracy_after,
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
 
         logger.info(
             f"Threshold update complete: "
@@ -483,17 +500,17 @@ class ZoneThresholdTuner:
             Threshold dict with metadata
         """
         export_data = {
-            'thresholds': self.thresholds,
-            'metadata': {
-                'iteration': self._iteration,
-                'samples_count': len(self._samples),
-                'accuracy': self.compute_accuracy(),
-                'exported_at': datetime.now().isoformat(),
+            "thresholds": self.thresholds,
+            "metadata": {
+                "iteration": self._iteration,
+                "samples_count": len(self._samples),
+                "accuracy": self.compute_accuracy(),
+                "exported_at": datetime.now().isoformat(),
             },
         }
 
         if path:
-            with open(path, 'w') as f:
+            with open(path, "w") as f:
                 json.dump(export_data, f, indent=2)
             logger.info(f"Exported thresholds to {path}")
 
@@ -509,8 +526,8 @@ class ZoneThresholdTuner:
         with open(path) as f:
             data = json.load(f)
 
-        if 'thresholds' in data:
-            self.thresholds = data['thresholds']
+        if "thresholds" in data:
+            self.thresholds = data["thresholds"]
         else:
             self.thresholds = data
 
@@ -531,7 +548,7 @@ class ZoneThresholdTuner:
             last_updated=datetime.now().isoformat(),
         )
 
-        with open(path, 'w') as f:
+        with open(path, "w") as f:
             f.write(state.to_json())
 
         logger.info(f"Saved tuner state to {path}")
@@ -547,9 +564,7 @@ class ZoneThresholdTuner:
             state = TuningState.from_json(f.read())
 
         self.thresholds = state.zone_thresholds
-        self._samples = [
-            ZoneSample(**s) for s in state.samples
-        ]
+        self._samples = [ZoneSample(**s) for s in state.samples]
         self._samples_by_zone = defaultdict(list)
         for sample in self._samples:
             if sample.actual_zone:
@@ -628,6 +643,7 @@ class ZoneThresholdTuner:
 # FACTORY FUNCTION
 # =============================================================================
 
+
 def create_threshold_tuner(
     thresholds_path: Optional[str] = None,
     state_path: Optional[str] = None,
@@ -669,41 +685,41 @@ if __name__ == "__main__":
         zone = random.choice(ZONES)
 
         # Generate features typical for zone
-        if zone == 'syntax_floor':
+        if zone == "syntax_floor":
             features = {
-                'local_mass': random.uniform(0.6, 0.9),
-                'mid_mass': random.uniform(0.1, 0.3),
-                'long_mass': random.uniform(0.0, 0.15),
-                'entropy': random.uniform(0.5, 2.5),
+                "local_mass": random.uniform(0.6, 0.9),
+                "mid_mass": random.uniform(0.1, 0.3),
+                "long_mass": random.uniform(0.0, 0.15),
+                "entropy": random.uniform(0.5, 2.5),
             }
-        elif zone == 'semantic_bridge':
+        elif zone == "semantic_bridge":
             features = {
-                'local_mass': random.uniform(0.25, 0.65),
-                'mid_mass': random.uniform(0.2, 0.5),
-                'long_mass': random.uniform(0.1, 0.3),
-                'entropy': random.uniform(1.5, 4.5),
+                "local_mass": random.uniform(0.25, 0.65),
+                "mid_mass": random.uniform(0.2, 0.5),
+                "long_mass": random.uniform(0.1, 0.3),
+                "entropy": random.uniform(1.5, 4.5),
             }
-        elif zone == 'long_range':
+        elif zone == "long_range":
             features = {
-                'local_mass': random.uniform(0.1, 0.35),
-                'mid_mass': random.uniform(0.1, 0.4),
-                'long_mass': random.uniform(0.25, 0.6),
-                'entropy': random.uniform(2.5, 5.0),
+                "local_mass": random.uniform(0.1, 0.35),
+                "mid_mass": random.uniform(0.1, 0.4),
+                "long_mass": random.uniform(0.25, 0.6),
+                "entropy": random.uniform(2.5, 5.0),
             }
-        elif zone == 'structure_ripple':
+        elif zone == "structure_ripple":
             features = {
-                'local_mass': random.uniform(0.2, 0.5),
-                'mid_mass': random.uniform(0.2, 0.4),
-                'long_mass': random.uniform(0.1, 0.3),
-                'entropy': random.uniform(2.0, 5.0),
-                'pattern_score': random.uniform(0.4, 0.9),
+                "local_mass": random.uniform(0.2, 0.5),
+                "mid_mass": random.uniform(0.2, 0.4),
+                "long_mass": random.uniform(0.1, 0.3),
+                "entropy": random.uniform(2.0, 5.0),
+                "pattern_score": random.uniform(0.4, 0.9),
             }
         else:  # diffuse
             features = {
-                'local_mass': random.uniform(0.1, 0.3),
-                'mid_mass': random.uniform(0.1, 0.3),
-                'long_mass': random.uniform(0.1, 0.3),
-                'entropy': random.uniform(4.0, 6.0),
+                "local_mass": random.uniform(0.1, 0.3),
+                "mid_mass": random.uniform(0.1, 0.3),
+                "long_mass": random.uniform(0.1, 0.3),
+                "entropy": random.uniform(4.0, 6.0),
             }
 
         # Classify with current thresholds

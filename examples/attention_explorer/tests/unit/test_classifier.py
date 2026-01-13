@@ -5,27 +5,27 @@ Tests zone classification, cluster info handling, and classifier utilities.
 """
 
 import json
-import os
-import tempfile
-import pytest
-import numpy as np
-from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
 
 # Add parent to path for imports
 import sys
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from discovery.classifier import (
+    FINGERPRINT_DIM,
+    FP_ENTROPY,
+    FP_LOCAL_MASS,
+    FP_LONG_MASS,
+    FP_MID_MASS,
+    ZONE_THRESHOLDS,
     ClassificationResult,
     ClusterInfo,
     OnlineClassifier,
-    FINGERPRINT_DIM,
-    FP_LOCAL_MASS,
-    FP_MID_MASS,
-    FP_LONG_MASS,
-    FP_ENTROPY,
-    ZONE_THRESHOLDS,
 )
 
 
@@ -85,7 +85,9 @@ class TestClusterInfo:
         assert info.label == "Local Attention"
         assert info.zone == "syntax_floor"
         # Use pytest.approx for float32 vs float comparison
-        assert float(info.centroid_fingerprint[FP_LOCAL_MASS]) == pytest.approx(0.7, rel=1e-5)
+        assert float(info.centroid_fingerprint[FP_LOCAL_MASS]) == pytest.approx(
+            0.7, rel=1e-5
+        )
         assert info.centroid_xy == (0.25, 0.75)
         assert info.size == 150
 
@@ -230,13 +232,16 @@ def classify_zone_from_fingerprint(fp: np.ndarray) -> str:
     long_mass = fp[FP_LONG_MASS]
 
     # Check syntax_floor
-    sf_thresh = ZONE_THRESHOLDS['syntax_floor']
-    if local_mass >= sf_thresh['local_mass_min'] and entropy <= sf_thresh['entropy_max']:
+    sf_thresh = ZONE_THRESHOLDS["syntax_floor"]
+    if (
+        local_mass >= sf_thresh["local_mass_min"]
+        and entropy <= sf_thresh["entropy_max"]
+    ):
         return "syntax_floor"
 
     # Check structure_ripple
-    sr_thresh = ZONE_THRESHOLDS['structure_ripple']
-    if long_mass >= sr_thresh['long_mass_min']:
+    sr_thresh = ZONE_THRESHOLDS["structure_ripple"]
+    if long_mass >= sr_thresh["long_mass_min"]:
         return "structure_ripple"
 
     # Default

@@ -15,18 +15,20 @@ import gc
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
 
 try:
     import psutil
+
     HAS_PSUTIL = True
 except ImportError:
     HAS_PSUTIL = False
 
 try:
     import umap
+
     HAS_UMAP = True
 except ImportError:
     HAS_UMAP = False
@@ -38,9 +40,11 @@ logger = logging.getLogger(__name__)
 # MEMORY MONITOR
 # =============================================================================
 
+
 @dataclass
 class MemoryStatus:
     """Current memory status."""
+
     used_bytes: int
     available_bytes: int
     total_bytes: int
@@ -90,6 +94,7 @@ class MemoryMonitor:
         else:
             # Fallback: estimate from process
             import resource
+
             rusage = resource.getrusage(resource.RUSAGE_SELF)
             used = rusage.ru_maxrss * 1024  # Convert to bytes
             available = self.max_memory_bytes - used
@@ -124,7 +129,7 @@ class MemoryMonitor:
             Memory usage in gigabytes
         """
         status = self.get_status()
-        return status.used_bytes / (1024 ** 3)
+        return status.used_bytes / (1024**3)
 
     def maybe_gc(self) -> bool:
         """
@@ -166,6 +171,7 @@ class MemoryMonitor:
 # MEMORY-BOUNDED UMAP
 # =============================================================================
 
+
 class MemoryBoundedUMAP:
     """
     Memory-safe UMAP wrapper that processes in chunks.
@@ -195,7 +201,7 @@ class MemoryBoundedUMAP:
         n_components: int = 2,
         n_neighbors: int = 15,
         min_dist: float = 0.1,
-        metric: str = 'euclidean',
+        metric: str = "euclidean",
         sample_size: int = 50000,
         transform_chunk_size: int = 10000,
         max_memory_gb: float = 8.0,
@@ -265,7 +271,7 @@ class MemoryBoundedUMAP:
 
         # Compute rough variance per feature and sort
         variances = np.var(X, axis=0)
-        top_features = np.argsort(variances)[-min(10, X.shape[1]):]
+        top_features = np.argsort(variances)[-min(10, X.shape[1]) :]
 
         # Use top-variance features for binning
         X_reduced = X[:, top_features]
@@ -274,7 +280,7 @@ class MemoryBoundedUMAP:
         n_bins = min(100, sample_size // 10)
         bin_indices = np.digitize(
             X_reduced[:, 0],  # Use first high-variance feature
-            bins=np.percentile(X_reduced[:, 0], np.linspace(0, 100, n_bins + 1)[1:-1])
+            bins=np.percentile(X_reduced[:, 0], np.linspace(0, 100, n_bins + 1)[1:-1]),
         )
 
         # Sample from each bin
@@ -304,7 +310,7 @@ class MemoryBoundedUMAP:
         indices = np.array(indices[:sample_size])
         return X[indices], indices
 
-    def fit(self, X: np.ndarray) -> 'MemoryBoundedUMAP':
+    def fit(self, X: np.ndarray) -> "MemoryBoundedUMAP":
         """
         Fit UMAP on a sample of the data.
 
@@ -427,7 +433,9 @@ class MemoryBoundedUMAP:
         # If small enough, standard fit_transform
         if n_samples <= self.sample_size:
             if self.verbose:
-                logger.info(f"Small dataset ({n_samples} points), using standard fit_transform")
+                logger.info(
+                    f"Small dataset ({n_samples} points), using standard fit_transform"
+                )
 
             use_low_memory = self.low_memory or n_samples > 500000
             self._reducer = umap.UMAP(
@@ -456,7 +464,9 @@ class MemoryBoundedUMAP:
 
         # Transform all points (including re-doing sample for consistency)
         if self.verbose:
-            logger.info(f"Transforming {n_samples} points in chunks of {self.transform_chunk_size}")
+            logger.info(
+                f"Transforming {n_samples} points in chunks of {self.transform_chunk_size}"
+            )
 
         embeddings = self.transform(X, progress_callback)
 
@@ -481,6 +491,7 @@ class MemoryBoundedUMAP:
 # =============================================================================
 # ADAPTIVE PROCESSOR
 # =============================================================================
+
 
 class AdaptiveProcessor:
     """
@@ -597,7 +608,9 @@ if __name__ == "__main__":
     print("\nTesting MemoryMonitor...")
     monitor = MemoryMonitor(max_memory_gb=8.0)
     status = monitor.get_status()
-    print(f"Current memory: {status.used_bytes / 1e9:.2f} GB ({status.percent_used:.1%})")
+    print(
+        f"Current memory: {status.used_bytes / 1e9:.2f} GB ({status.percent_used:.1%})"
+    )
 
     # Test adaptive processor
     print("\nTesting AdaptiveProcessor...")

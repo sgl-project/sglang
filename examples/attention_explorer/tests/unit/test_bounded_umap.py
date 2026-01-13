@@ -4,23 +4,23 @@ Unit tests for MemoryBoundedUMAP and related classes
 Tests memory monitoring, chunked UMAP processing, and adaptive batch sizing.
 """
 
-import gc
-import pytest
-import numpy as np
-from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
-
 # Add parent to path for imports
 import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from discovery.bounded_umap import (
-    MemoryStatus,
-    MemoryMonitor,
-    MemoryBoundedUMAP,
-    AdaptiveProcessor,
-    HAS_UMAP,
     HAS_PSUTIL,
+    HAS_UMAP,
+    AdaptiveProcessor,
+    MemoryBoundedUMAP,
+    MemoryMonitor,
+    MemoryStatus,
 )
 
 
@@ -176,7 +176,7 @@ class TestMemoryBoundedUMAP:
 
     def test_initialization_without_umap_raises(self):
         """Test that initialization without umap-learn raises ImportError."""
-        with patch('discovery.bounded_umap.HAS_UMAP', False):
+        with patch("discovery.bounded_umap.HAS_UMAP", False):
             # Need to reimport to trigger the check
             # This test verifies the check exists in __init__
             pass  # The actual check happens at runtime
@@ -331,7 +331,7 @@ class TestMemoryBoundedUMAP:
         umap.fit(small_data)
         reducer = umap.get_reducer()
         assert reducer is not None
-        assert hasattr(reducer, 'transform')
+        assert hasattr(reducer, "transform")
 
 
 class TestAdaptiveProcessor:

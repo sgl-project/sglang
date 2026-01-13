@@ -2,13 +2,15 @@
 Shared pytest fixtures and configuration for E2E tests.
 """
 
-import os
-import pytest
 import asyncio
+import os
 from pathlib import Path
 
+import pytest
+
 # Configure pytest-asyncio
-pytest_plugins = ('pytest_asyncio',)
+pytest_plugins = ("pytest_asyncio",)
+
 
 # Set asyncio mode to auto for all async tests
 def pytest_configure(config):
@@ -16,15 +18,15 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')"
     )
-    config.addinivalue_line(
-        "markers", "requires_gpu: marks tests that require GPU"
-    )
+    config.addinivalue_line("markers", "requires_gpu: marks tests that require GPU")
     config.addinivalue_line(
         "markers", "requires_sidecar: marks tests that require sidecar"
     )
 
+
 # Add parent to path for imports
 import sys
+
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 

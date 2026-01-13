@@ -4,24 +4,17 @@ Unit tests for ProxyClassifier
 Tests centroid-based classification for online attention routing.
 """
 
-import json
-import pytest
-import numpy as np
-import threading
-import time
-from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
-
 # Add parent to path for imports
 import sys
+import threading
+from pathlib import Path
+
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from proxy_classifier import (
-    CachedCentroid,
-    ProxyClassifier,
-    HAS_REQUESTS,
-    HAS_TORCH,
-)
+from proxy_classifier import HAS_REQUESTS, HAS_TORCH, CachedCentroid, ProxyClassifier
 
 
 class TestCachedCentroid:
@@ -108,7 +101,7 @@ class TestProxyClassifier:
         assert result is not None
         cluster_id, distance, traits, sampling_hint = result
         assert cluster_id is None  # No centroids -> no match
-        assert distance == float('inf')
+        assert distance == float("inf")
         assert traits == []
         assert sampling_hint == {}
 

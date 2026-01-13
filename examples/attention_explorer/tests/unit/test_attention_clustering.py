@@ -4,22 +4,17 @@ Unit tests for AttentionClusterer
 Tests HDBSCAN clustering of attention fingerprints.
 """
 
-import json
-import pytest
-import numpy as np
-from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
-
 # Add parent to path for imports
 import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from attention_clustering import (
-    AttentionClusterer,
-    HAS_HDBSCAN,
-    HAS_UMAP,
-    HAS_SKLEARN,
-)
+from attention_clustering import HAS_HDBSCAN, HAS_SKLEARN, HAS_UMAP, AttentionClusterer
 
 
 class TestAttentionClusterer:
@@ -52,7 +47,7 @@ class TestAttentionClusterer:
 
     def test_initialization_without_hdbscan(self):
         """Test that initialization fails without hdbscan."""
-        with patch('attention_clustering.HAS_HDBSCAN', False):
+        with patch("attention_clustering.HAS_HDBSCAN", False):
             # The actual check happens in __init__
             pass  # Would need to reload module to test
 

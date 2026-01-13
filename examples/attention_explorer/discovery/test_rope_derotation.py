@@ -5,27 +5,25 @@ Tests the educational RoPE de-rotation system that reveals semantic vs positiona
 attention patterns for model interpretability.
 """
 
-import pytest
 import numpy as np
-from typing import List
+import pytest
 
 from .rope_derotation import (
-    RoPEDerotator,
-    RoPEConfig,
-    DerotatedAttention,
-    AttentionMode,
-    GLOSSARY,
     INTERPRETATION_TEMPLATES,
-    get_glossary,
-    get_term_explanation,
-    get_interpretation_for_pattern,
+    AttentionMode,
+    DerotatedAttention,
+    RoPEConfig,
+    RoPEDerotator,
     explain_attention_step,
+    get_glossary,
+    get_interpretation_for_pattern,
+    get_term_explanation,
 )
-
 
 # =============================================================================
 # CONFIGURATION TESTS
 # =============================================================================
+
 
 class TestRoPEConfig:
     """Test RoPEConfig dataclass."""
@@ -41,10 +39,7 @@ class TestRoPEConfig:
     def test_custom_values(self):
         """Test custom configuration."""
         config = RoPEConfig(
-            head_dim=64,
-            base=5000.0,
-            is_neox_style=False,
-            max_position=8192
+            head_dim=64, base=5000.0, is_neox_style=False, max_position=8192
         )
         assert config.head_dim == 64
         assert config.base == 5000.0
@@ -55,6 +50,7 @@ class TestRoPEConfig:
 # =============================================================================
 # DEROTATOR INITIALIZATION TESTS
 # =============================================================================
+
 
 class TestRoPEDerotatorInit:
     """Test RoPEDerotator initialization."""
@@ -87,6 +83,7 @@ class TestRoPEDerotatorInit:
 # ROTATION COMPUTATION TESTS
 # =============================================================================
 
+
 class TestRelativeRotation:
     """Test rotation angle computations."""
 
@@ -112,8 +109,12 @@ class TestRelativeRotation:
     def test_symmetric_rotation(self):
         """Rotation should be symmetric with respect to distance."""
         derotator = RoPEDerotator()
-        cos_fwd, sin_fwd = derotator.compute_relative_rotation(query_pos=110, key_pos=100)
-        cos_bwd, sin_bwd = derotator.compute_relative_rotation(query_pos=100, key_pos=110)
+        cos_fwd, sin_fwd = derotator.compute_relative_rotation(
+            query_pos=110, key_pos=100
+        )
+        cos_bwd, sin_bwd = derotator.compute_relative_rotation(
+            query_pos=100, key_pos=110
+        )
 
         # Both should give same rotation magnitude
         np.testing.assert_allclose(cos_fwd, cos_bwd, atol=1e-5)
@@ -123,6 +124,7 @@ class TestRelativeRotation:
 # POSITIONAL BIAS TESTS
 # =============================================================================
 
+
 class TestPositionalBias:
     """Test positional bias estimation."""
 
@@ -131,8 +133,7 @@ class TestPositionalBias:
         derotator = RoPEDerotator()
 
         biases = derotator.estimate_positional_bias(
-            query_pos=100,
-            key_positions=[99, 50, 10]  # Nearby, medium, far
+            query_pos=100, key_positions=[99, 50, 10]  # Nearby, medium, far
         )
 
         assert biases[0] > biases[1]  # 99 closer than 50
@@ -143,8 +144,7 @@ class TestPositionalBias:
         derotator = RoPEDerotator()
 
         biases = derotator.estimate_positional_bias(
-            query_pos=100,
-            key_positions=[100, 99, 50]
+            query_pos=100, key_positions=[100, 99, 50]
         )
 
         assert biases[0] == pytest.approx(1.0, abs=0.01)  # Same position
@@ -155,8 +155,7 @@ class TestPositionalBias:
         derotator = RoPEDerotator()
 
         biases = derotator.estimate_positional_bias(
-            query_pos=1000,
-            key_positions=[0, 100, 500, 999, 1000]
+            query_pos=1000, key_positions=[0, 100, 500, 999, 1000]
         )
 
         assert all(0 <= b <= 1 for b in biases)
@@ -165,6 +164,7 @@ class TestPositionalBias:
 # =============================================================================
 # DEROTATION TESTS
 # =============================================================================
+
 
 class TestDerotateScores:
     """Test score de-rotation."""
@@ -176,7 +176,7 @@ class TestDerotateScores:
         semantic = derotator.derotate_scores(
             query_pos=100,
             key_positions=[50, 90, 95, 98],
-            attention_scores=[0.1, 0.15, 0.25, 0.5]
+            attention_scores=[0.1, 0.15, 0.25, 0.5],
         )
 
         assert semantic.sum() == pytest.approx(1.0, abs=1e-5)
@@ -189,9 +189,7 @@ class TestDerotateScores:
         scores = [0.2, 0.2, 0.2, 0.2, 0.2]
 
         semantic = derotator.derotate_scores(
-            query_pos=100,
-            key_positions=positions,
-            attention_scores=scores
+            query_pos=100, key_positions=positions, attention_scores=scores
         )
 
         assert len(semantic) == len(positions)
@@ -204,7 +202,7 @@ class TestDerotateScores:
         semantic = derotator.derotate_scores(
             query_pos=100,
             key_positions=[50, 99],
-            attention_scores=[0.5, 0.5]  # Same raw attention
+            attention_scores=[0.5, 0.5],  # Same raw attention
         )
 
         # Distant token should have higher semantic score after de-rotation
@@ -216,6 +214,7 @@ class TestDerotateScores:
 # FULL ANALYSIS TESTS
 # =============================================================================
 
+
 class TestAnalyze:
     """Test full analysis pipeline."""
 
@@ -226,7 +225,7 @@ class TestAnalyze:
         result = derotator.analyze(
             query_pos=100,
             key_positions=[50, 90, 95, 98],
-            attention_scores=[0.1, 0.15, 0.25, 0.5]
+            attention_scores=[0.1, 0.15, 0.25, 0.5],
         )
 
         assert isinstance(result, DerotatedAttention)
@@ -238,7 +237,7 @@ class TestAnalyze:
         result = derotator.analyze(
             query_pos=100,
             key_positions=[50, 90, 95, 98],
-            attention_scores=[0.1, 0.15, 0.25, 0.5]
+            attention_scores=[0.1, 0.15, 0.25, 0.5],
         )
 
         assert result.raw_scores is not None
@@ -248,7 +247,11 @@ class TestAnalyze:
         assert result.semantic_entropy >= 0
         assert result.positional_entropy >= 0
         assert result.dominant_mode in ["semantic", "positional", "balanced"]
-        assert result.manifold_zone in ["syntax_floor", "semantic_bridge", "structure_ripple"]
+        assert result.manifold_zone in [
+            "syntax_floor",
+            "semantic_bridge",
+            "structure_ripple",
+        ]
         assert len(result.explanations) > 0
 
     def test_sink_dominated_detection(self):
@@ -259,7 +262,7 @@ class TestAnalyze:
         result = derotator.analyze(
             query_pos=100,
             key_positions=[0, 1, 2, 50, 99],
-            attention_scores=[0.4, 0.2, 0.2, 0.1, 0.1]
+            attention_scores=[0.4, 0.2, 0.2, 0.1, 0.1],
         )
 
         # The pattern field contains human-readable description
@@ -274,7 +277,7 @@ class TestAnalyze:
         result = derotator.analyze(
             query_pos=100,
             key_positions=[97, 98, 99],  # All within 16 positions
-            attention_scores=[0.2, 0.3, 0.5]
+            attention_scores=[0.2, 0.3, 0.5],
         )
 
         assert result.manifold_zone == "syntax_floor"
@@ -287,7 +290,7 @@ class TestAnalyze:
         result = derotator.analyze(
             query_pos=1000,
             key_positions=[10, 100, 200, 999],  # Most > 256 positions away
-            attention_scores=[0.3, 0.3, 0.3, 0.1]
+            attention_scores=[0.3, 0.3, 0.3, 0.1],
         )
 
         assert result.manifold_zone == "structure_ripple"
@@ -299,7 +302,7 @@ class TestAnalyze:
         result = derotator.analyze(
             query_pos=100,
             key_positions=[50, 90, 95, 98],
-            attention_scores=[0.1, 0.15, 0.25, 0.5]
+            attention_scores=[0.1, 0.15, 0.25, 0.5],
         )
 
         d = result.to_dict()
@@ -313,6 +316,7 @@ class TestAnalyze:
 # =============================================================================
 # GLOSSARY API TESTS
 # =============================================================================
+
 
 class TestGlossaryAPI:
     """Test educational glossary API."""
@@ -370,6 +374,7 @@ class TestGlossaryAPI:
 # INTERPRETATION TESTS
 # =============================================================================
 
+
 class TestInterpretation:
     """Test interpretation templates."""
 
@@ -380,7 +385,7 @@ class TestInterpretation:
             "high_positional_low_semantic",
             "high_both",
             "low_both",
-            "sink_dominated"
+            "sink_dominated",
         ]
 
         for pattern in expected_patterns:
@@ -408,6 +413,7 @@ class TestInterpretation:
 # EXPLANATION GENERATION TESTS
 # =============================================================================
 
+
 class TestExplainAttentionStep:
     """Test natural language explanation generation."""
 
@@ -418,14 +424,14 @@ class TestExplainAttentionStep:
         analysis = derotator.analyze(
             query_pos=100,
             key_positions=[50, 90, 95, 98],
-            attention_scores=[0.1, 0.15, 0.25, 0.5]
+            attention_scores=[0.1, 0.15, 0.25, 0.5],
         )
 
         explanation = explain_attention_step(
             query_token="therefore",
             key_tokens=["hypothesis", "shows", "that", "the"],
             attention_scores=[0.1, 0.15, 0.25, 0.5],
-            analysis=analysis
+            analysis=analysis,
         )
 
         assert isinstance(explanation, str)
@@ -437,16 +443,14 @@ class TestExplainAttentionStep:
         derotator = RoPEDerotator()
 
         analysis = derotator.analyze(
-            query_pos=100,
-            key_positions=[97, 98, 99],
-            attention_scores=[0.2, 0.3, 0.5]
+            query_pos=100, key_positions=[97, 98, 99], attention_scores=[0.2, 0.3, 0.5]
         )
 
         explanation = explain_attention_step(
             query_token="running",
             key_tokens=["the", "dog", "is"],
             attention_scores=[0.2, 0.3, 0.5],
-            analysis=analysis
+            analysis=analysis,
         )
 
         assert analysis.manifold_zone in explanation
@@ -457,25 +461,28 @@ class TestExplainAttentionStep:
 
         # Long-range attention
         analysis = derotator.analyze(
-            query_pos=500,
-            key_positions=[10, 20, 30],
-            attention_scores=[0.5, 0.3, 0.2]
+            query_pos=500, key_positions=[10, 20, 30], attention_scores=[0.5, 0.3, 0.2]
         )
 
         explanation = explain_attention_step(
             query_token="conclusion",
             key_tokens=["first", "hypothesis", "evidence"],
             attention_scores=[0.5, 0.3, 0.2],
-            analysis=analysis
+            analysis=analysis,
         )
 
         # Should mention semantic or positional
-        assert "SEMANTIC" in explanation or "POSITIONAL" in explanation or "BALANCED" in explanation
+        assert (
+            "SEMANTIC" in explanation
+            or "POSITIONAL" in explanation
+            or "BALANCED" in explanation
+        )
 
 
 # =============================================================================
 # ATTENTION MODE ENUM TESTS
 # =============================================================================
+
 
 class TestAttentionMode:
     """Test AttentionMode enum."""
@@ -492,6 +499,7 @@ class TestAttentionMode:
 # EDGE CASE TESTS
 # =============================================================================
 
+
 class TestEdgeCases:
     """Test edge cases and boundary conditions."""
 
@@ -500,9 +508,7 @@ class TestEdgeCases:
         derotator = RoPEDerotator()
 
         result = derotator.analyze(
-            query_pos=100,
-            key_positions=[50],
-            attention_scores=[1.0]
+            query_pos=100, key_positions=[50], attention_scores=[1.0]
         )
 
         assert result.semantic_scores.sum() == pytest.approx(1.0, abs=1e-5)
@@ -513,9 +519,7 @@ class TestEdgeCases:
 
         # This might produce NaN without proper handling
         result = derotator.analyze(
-            query_pos=100,
-            key_positions=[50, 60, 70],
-            attention_scores=[0.0, 0.0, 0.0]
+            query_pos=100, key_positions=[50, 60, 70], attention_scores=[0.0, 0.0, 0.0]
         )
 
         # Should not crash, should have valid zone
@@ -529,7 +533,7 @@ class TestEdgeCases:
         result = derotator.analyze(
             query_pos=8000,
             key_positions=[10, 100, 7999],
-            attention_scores=[0.3, 0.3, 0.4]
+            attention_scores=[0.3, 0.3, 0.4],
         )
 
         assert result.manifold_zone is not None
@@ -541,7 +545,7 @@ class TestEdgeCases:
         result = derotator.analyze(
             query_pos=100,
             key_positions=[0, 1, 2, 3, 4],
-            attention_scores=[0.5, 0.2, 0.15, 0.1, 0.05]
+            attention_scores=[0.5, 0.2, 0.15, 0.1, 0.05],
         )
 
         # The pattern field contains human-readable description
@@ -551,6 +555,7 @@ class TestEdgeCases:
 # =============================================================================
 # INTEGRATION TESTS
 # =============================================================================
+
 
 class TestIntegration:
     """Integration tests for the full analysis pipeline."""
@@ -570,7 +575,7 @@ class TestIntegration:
         result = derotator.analyze(
             query_pos=10,  # "running"
             key_positions=[7, 8, 9],  # "The", "dog", "is"
-            attention_scores=[0.1, 0.3, 0.6]  # High to "is"
+            attention_scores=[0.1, 0.3, 0.6],  # High to "is"
         )
 
         # Verify local pattern detection
@@ -581,7 +586,7 @@ class TestIntegration:
             query_token="running",
             key_tokens=["The", "dog", "is"],
             attention_scores=[0.1, 0.3, 0.6],
-            analysis=result
+            analysis=result,
         )
 
         # Explanation should be coherent
@@ -596,7 +601,7 @@ class TestIntegration:
         result = derotator.analyze(
             query_pos=500,  # "therefore"
             key_positions=[10, 50, 200, 498],  # "The", "hypothesis", "evidence", "thus"
-            attention_scores=[0.1, 0.4, 0.35, 0.15]
+            attention_scores=[0.1, 0.4, 0.35, 0.15],
         )
 
         # Verify long-range detection

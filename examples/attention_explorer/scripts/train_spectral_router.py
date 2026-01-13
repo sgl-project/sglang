@@ -22,16 +22,10 @@ import numpy as np
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from discovery import (
-    SpectralRouter,
-    SpectralManifoldDiscovery,
-    RouterConfig,
-    create_router_from_fingerprints,
-)
+from discovery import RouterConfig, SpectralManifoldDiscovery, SpectralRouter
 
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -51,7 +45,7 @@ def load_fingerprints_from_db(db_path: str, limit: int = None) -> np.ndarray:
 
     fingerprints = []
     for (fp_blob,) in rows:
-        fp = np.array(struct.unpack('<20f', fp_blob))
+        fp = np.array(struct.unpack("<20f", fp_blob))
         fingerprints.append(fp)
 
     return np.array(fingerprints)
@@ -91,14 +85,14 @@ def train_router(args):
 
     # Save metadata
     metadata = {
-        'n_fingerprints': len(fingerprints),
-        'spectral_gap': float(analysis.spectral_gap),
-        'effective_dimension': int(analysis.effective_dimension),
-        'graph_connectivity': float(analysis.graph_connectivity),
-        'high_coherence_threshold': router.config.high_coherence_threshold,
-        'low_coherence_threshold': router.config.low_coherence_threshold,
+        "n_fingerprints": len(fingerprints),
+        "spectral_gap": float(analysis.spectral_gap),
+        "effective_dimension": int(analysis.effective_dimension),
+        "graph_connectivity": float(analysis.graph_connectivity),
+        "high_coherence_threshold": router.config.high_coherence_threshold,
+        "low_coherence_threshold": router.config.low_coherence_threshold,
     }
-    with open(output_path / "metadata.json", 'w') as f:
+    with open(output_path / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
     logger.info(f"Router saved to {router_path}")
@@ -108,11 +102,15 @@ def train_router(args):
         validate_router(router, fingerprints, args.validate_samples)
 
 
-def validate_router(router: SpectralRouter, fingerprints: np.ndarray, n_samples: int = 100):
+def validate_router(
+    router: SpectralRouter, fingerprints: np.ndarray, n_samples: int = 100
+):
     """Validate router on sample fingerprints."""
     logger.info(f"Validating on {n_samples} samples...")
 
-    indices = np.random.choice(len(fingerprints), min(n_samples, len(fingerprints)), replace=False)
+    indices = np.random.choice(
+        len(fingerprints), min(n_samples, len(fingerprints)), replace=False
+    )
 
     decisions = []
     for idx in indices:
@@ -124,7 +122,9 @@ def validate_router(router: SpectralRouter, fingerprints: np.ndarray, n_samples:
     logger.info("Routing Statistics:")
     logger.info(f"  Model distribution: {stats['model_distribution']}")
     logger.info(f"  CoT rate: {stats['cot_rate']:.2%}")
-    logger.info(f"  Avg coherence: {stats['avg_coherence']:.3f} (+/- {stats['coherence_std']:.3f})")
+    logger.info(
+        f"  Avg coherence: {stats['avg_coherence']:.3f} (+/- {stats['coherence_std']:.3f})"
+    )
     logger.info(f"  Complexity distribution: {stats['complexity_distribution']}")
 
 
@@ -135,7 +135,7 @@ def route_fingerprint(args):
 
     # Parse fingerprint
     if args.fingerprint:
-        fp = np.array([float(x) for x in args.fingerprint.split(',')])
+        fp = np.array([float(x) for x in args.fingerprint.split(",")])
     elif args.fingerprint_file:
         fp = np.load(args.fingerprint_file)
     else:
@@ -167,9 +167,9 @@ def analyze_db(args):
     discovery = SpectralManifoldDiscovery()
     analysis = discovery.analyze(fingerprints)
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("SPECTRAL ANALYSIS RESULTS")
-    print("="*60)
+    print("=" * 60)
     print(f"\nFingerprints analyzed: {len(fingerprints)}")
     print(f"Spectral gap: {analysis.spectral_gap:.6f}")
     print(f"Effective dimension: {analysis.effective_dimension}")
@@ -216,71 +216,88 @@ def analyze_db(args):
 
         # Save metadata
         metadata = {
-            'n_fingerprints': len(fingerprints),
-            'spectral_gap': float(analysis.spectral_gap),
-            'effective_dimension': int(analysis.effective_dimension),
-            'graph_connectivity': float(analysis.graph_connectivity),
-            'coherence_mean': float(np.mean(coherences)),
-            'coherence_std': float(np.std(coherences)),
+            "n_fingerprints": len(fingerprints),
+            "spectral_gap": float(analysis.spectral_gap),
+            "effective_dimension": int(analysis.effective_dimension),
+            "graph_connectivity": float(analysis.graph_connectivity),
+            "coherence_mean": float(np.mean(coherences)),
+            "coherence_std": float(np.std(coherences)),
         }
-        with open(output_path / "spectral_analysis.json", 'w') as f:
+        with open(output_path / "spectral_analysis.json", "w") as f:
             json.dump(metadata, f, indent=2)
 
         logger.info(f"Analysis saved to {args.output}")
 
-    print("="*60)
+    print("=" * 60)
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Train and use Spectral Router for query routing"
     )
-    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Train command
-    train_parser = subparsers.add_parser('train', help='Train spectral router')
-    train_parser.add_argument('--db', required=True, help='Fingerprint database path')
-    train_parser.add_argument('--output', required=True, help='Output directory for router')
-    train_parser.add_argument('--limit', type=int, help='Limit number of fingerprints')
-    train_parser.add_argument('--high-threshold', type=float, default=0.7,
-                             help='High coherence threshold')
-    train_parser.add_argument('--low-threshold', type=float, default=0.3,
-                             help='Low coherence threshold')
-    train_parser.add_argument('--small-model', default='Qwen/Qwen3-4B',
-                             help='Small model identifier')
-    train_parser.add_argument('--medium-model', default='Qwen/Qwen3-14B',
-                             help='Medium model identifier')
-    train_parser.add_argument('--large-model', default='Qwen/Qwen3-72B',
-                             help='Large model identifier')
-    train_parser.add_argument('--validate', action='store_true',
-                             help='Run validation after training')
-    train_parser.add_argument('--validate-samples', type=int, default=100,
-                             help='Number of validation samples')
+    train_parser = subparsers.add_parser("train", help="Train spectral router")
+    train_parser.add_argument("--db", required=True, help="Fingerprint database path")
+    train_parser.add_argument(
+        "--output", required=True, help="Output directory for router"
+    )
+    train_parser.add_argument("--limit", type=int, help="Limit number of fingerprints")
+    train_parser.add_argument(
+        "--high-threshold", type=float, default=0.7, help="High coherence threshold"
+    )
+    train_parser.add_argument(
+        "--low-threshold", type=float, default=0.3, help="Low coherence threshold"
+    )
+    train_parser.add_argument(
+        "--small-model", default="Qwen/Qwen3-4B", help="Small model identifier"
+    )
+    train_parser.add_argument(
+        "--medium-model", default="Qwen/Qwen3-14B", help="Medium model identifier"
+    )
+    train_parser.add_argument(
+        "--large-model", default="Qwen/Qwen3-72B", help="Large model identifier"
+    )
+    train_parser.add_argument(
+        "--validate", action="store_true", help="Run validation after training"
+    )
+    train_parser.add_argument(
+        "--validate-samples", type=int, default=100, help="Number of validation samples"
+    )
 
     # Route command
-    route_parser = subparsers.add_parser('route', help='Route a fingerprint')
-    route_parser.add_argument('--load', required=True, help='Path to trained router')
-    route_parser.add_argument('--fingerprint', help='Comma-separated fingerprint values')
-    route_parser.add_argument('--fingerprint-file', help='Path to .npy fingerprint file')
-    route_parser.add_argument('--json', action='store_true', help='Output as JSON')
+    route_parser = subparsers.add_parser("route", help="Route a fingerprint")
+    route_parser.add_argument("--load", required=True, help="Path to trained router")
+    route_parser.add_argument(
+        "--fingerprint", help="Comma-separated fingerprint values"
+    )
+    route_parser.add_argument(
+        "--fingerprint-file", help="Path to .npy fingerprint file"
+    )
+    route_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
     # Analyze command
-    analyze_parser = subparsers.add_parser('analyze', help='Analyze database with spectral methods')
-    analyze_parser.add_argument('--db', required=True, help='Fingerprint database path')
-    analyze_parser.add_argument('--output', help='Output directory for analysis')
-    analyze_parser.add_argument('--limit', type=int, help='Limit number of fingerprints')
+    analyze_parser = subparsers.add_parser(
+        "analyze", help="Analyze database with spectral methods"
+    )
+    analyze_parser.add_argument("--db", required=True, help="Fingerprint database path")
+    analyze_parser.add_argument("--output", help="Output directory for analysis")
+    analyze_parser.add_argument(
+        "--limit", type=int, help="Limit number of fingerprints"
+    )
 
     args = parser.parse_args()
 
-    if args.command == 'train':
+    if args.command == "train":
         train_router(args)
-    elif args.command == 'route':
+    elif args.command == "route":
         route_fingerprint(args)
-    elif args.command == 'analyze':
+    elif args.command == "analyze":
         analyze_db(args)
     else:
         parser.print_help()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

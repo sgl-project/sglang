@@ -10,16 +10,16 @@ import os
 import shutil
 import sqlite3
 import tempfile
-from dataclasses import dataclass, field, asdict
+import threading
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-import threading
-
 
 # =============================================================================
 # DATA STRUCTURES
 # =============================================================================
+
 
 @dataclass
 class CheckpointState:
@@ -28,6 +28,7 @@ class CheckpointState:
 
     Captures everything needed to resume a discovery run from any stage.
     """
+
     run_id: str
     stage: int  # 0-9 (9 stages in pipeline)
     stage_name: str
@@ -60,7 +61,7 @@ class CheckpointState:
         return json.dumps(asdict(self), indent=2)
 
     @classmethod
-    def from_json(cls, json_str: str) -> 'CheckpointState':
+    def from_json(cls, json_str: str) -> "CheckpointState":
         """Deserialize from JSON string."""
         data = json.loads(json_str)
         return cls(**data)
@@ -72,22 +73,23 @@ class CheckpointState:
 
 # Stage names for reference
 STAGE_NAMES = [
-    "extract",           # 0: Extract fingerprints from DB
-    "standardize",       # 1: Standardize features
-    "pca",               # 2: PCA dimensionality reduction
-    "umap",              # 3: UMAP embedding
-    "cluster",           # 4: HDBSCAN clustering
-    "zones",             # 5: Zone assignment
-    "metadata",          # 6: Cluster metadata
-    "prototypes",        # 7: Prototype selection
-    "export",            # 8: Export artifacts
-    "complete",          # 9: Finalization
+    "extract",  # 0: Extract fingerprints from DB
+    "standardize",  # 1: Standardize features
+    "pca",  # 2: PCA dimensionality reduction
+    "umap",  # 3: UMAP embedding
+    "cluster",  # 4: HDBSCAN clustering
+    "zones",  # 5: Zone assignment
+    "metadata",  # 6: Cluster metadata
+    "prototypes",  # 7: Prototype selection
+    "export",  # 8: Export artifacts
+    "complete",  # 9: Finalization
 ]
 
 
 # =============================================================================
 # CHECKPOINT MANAGER
 # =============================================================================
+
 
 class CheckpointManager:
     """
@@ -202,16 +204,19 @@ class CheckpointManager:
             # Save to database atomically
             try:
                 with self._get_connection() as conn:
-                    conn.execute("""
+                    conn.execute(
+                        """
                         INSERT OR REPLACE INTO discovery_checkpoints
                         (run_id, stage, stage_name, state_json, created_at)
                         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    """, (
-                        state.run_id,
-                        state.stage,
-                        state.stage_name,
-                        state.to_json(),
-                    ))
+                    """,
+                        (
+                            state.run_id,
+                            state.stage,
+                            state.stage_name,
+                            state.to_json(),
+                        ),
+                    )
                     conn.commit()
 
                 self._last_checkpoint_time[state.run_id] = now
@@ -232,15 +237,18 @@ class CheckpointManager:
             CheckpointState if found, None otherwise
         """
         with self._get_connection() as conn:
-            row = conn.execute("""
+            row = conn.execute(
+                """
                 SELECT state_json FROM discovery_checkpoints
                 WHERE run_id = ?
                 ORDER BY stage DESC, created_at DESC
                 LIMIT 1
-            """, (run_id,)).fetchone()
+            """,
+                (run_id,),
+            ).fetchone()
 
             if row:
-                return CheckpointState.from_json(row['state_json'])
+                return CheckpointState.from_json(row["state_json"])
             return None
 
     def load_checkpoint_at_stage(
@@ -259,15 +267,18 @@ class CheckpointManager:
             CheckpointState if found, None otherwise
         """
         with self._get_connection() as conn:
-            row = conn.execute("""
+            row = conn.execute(
+                """
                 SELECT state_json FROM discovery_checkpoints
                 WHERE run_id = ? AND stage = ?
                 ORDER BY created_at DESC
                 LIMIT 1
-            """, (run_id, stage)).fetchone()
+            """,
+                (run_id, stage),
+            ).fetchone()
 
             if row:
-                return CheckpointState.from_json(row['state_json'])
+                return CheckpointState.from_json(row["state_json"])
             return None
 
     def get_resumable_runs(self) -> List[Dict[str, Any]]:
@@ -278,7 +289,8 @@ class CheckpointManager:
             List of dicts with run_id, stage, stage_name, last_checkpoint_at
         """
         with self._get_connection() as conn:
-            rows = conn.execute("""
+            rows = conn.execute(
+                """
                 SELECT
                     run_id,
                     MAX(stage) as stage,
@@ -288,14 +300,15 @@ class CheckpointManager:
                 WHERE stage < 9  -- Not complete
                 GROUP BY run_id
                 ORDER BY last_checkpoint DESC
-            """).fetchall()
+            """
+            ).fetchall()
 
             return [
                 {
-                    'run_id': row['run_id'],
-                    'stage': row['stage'],
-                    'stage_name': row['stage_name'],
-                    'last_checkpoint': row['last_checkpoint'],
+                    "run_id": row["run_id"],
+                    "stage": row["stage"],
+                    "stage_name": row["stage_name"],
+                    "last_checkpoint": row["last_checkpoint"],
                 }
                 for row in rows
             ]
@@ -308,10 +321,13 @@ class CheckpointManager:
             run_id: The run ID to clear checkpoints for
         """
         with self._get_connection() as conn:
-            conn.execute("""
+            conn.execute(
+                """
                 DELETE FROM discovery_checkpoints
                 WHERE run_id = ?
-            """, (run_id,))
+            """,
+                (run_id,),
+            )
             conn.commit()
 
         # Also clean up partial artifact files
@@ -333,19 +349,22 @@ class CheckpointManager:
             List of checkpoint records ordered by stage
         """
         with self._get_connection() as conn:
-            rows = conn.execute("""
+            rows = conn.execute(
+                """
                 SELECT stage, stage_name, created_at, state_json
                 FROM discovery_checkpoints
                 WHERE run_id = ?
                 ORDER BY stage ASC, created_at ASC
-            """, (run_id,)).fetchall()
+            """,
+                (run_id,),
+            ).fetchall()
 
             return [
                 {
-                    'stage': row['stage'],
-                    'stage_name': row['stage_name'],
-                    'created_at': row['created_at'],
-                    'state': CheckpointState.from_json(row['state_json']),
+                    "stage": row["stage"],
+                    "stage_name": row["stage_name"],
+                    "created_at": row["created_at"],
+                    "state": CheckpointState.from_json(row["state_json"]),
                 }
                 for row in rows
             ]
@@ -355,7 +374,7 @@ class CheckpointManager:
         run_id: str,
         artifact_name: str,
         data: Any,
-        format: str = 'parquet',
+        format: str = "parquet",
     ) -> str:
         """
         Save a partial artifact for checkpoint recovery.
@@ -374,16 +393,15 @@ class CheckpointManager:
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        if format == 'parquet':
+        if format == "parquet":
             import pandas as pd
+
             filename = f"{artifact_name}_{timestamp}.parquet"
             filepath = run_dir / filename
 
             # Atomic write via temp file
             temp_fd, temp_path = tempfile.mkstemp(
-                dir=run_dir,
-                prefix=f".{artifact_name}_",
-                suffix=".parquet.tmp"
+                dir=run_dir, prefix=f".{artifact_name}_", suffix=".parquet.tmp"
             )
             try:
                 os.close(temp_fd)
@@ -397,17 +415,15 @@ class CheckpointManager:
                     os.unlink(temp_path)
                 raise
 
-        elif format == 'json':
+        elif format == "json":
             filename = f"{artifact_name}_{timestamp}.json"
             filepath = run_dir / filename
 
             temp_fd, temp_path = tempfile.mkstemp(
-                dir=run_dir,
-                prefix=f".{artifact_name}_",
-                suffix=".json.tmp"
+                dir=run_dir, prefix=f".{artifact_name}_", suffix=".json.tmp"
             )
             try:
-                with os.fdopen(temp_fd, 'w') as f:
+                with os.fdopen(temp_fd, "w") as f:
                     json.dump(data, f, indent=2)
                 shutil.move(temp_path, filepath)
             except Exception:
@@ -423,7 +439,7 @@ class CheckpointManager:
     def load_partial_artifact(
         self,
         relative_path: str,
-        format: str = 'parquet',
+        format: str = "parquet",
     ) -> Any:
         """
         Load a partial artifact from checkpoint.
@@ -440,10 +456,11 @@ class CheckpointManager:
         if not filepath.exists():
             raise FileNotFoundError(f"Artifact not found: {filepath}")
 
-        if format == 'parquet':
+        if format == "parquet":
             import pandas as pd
+
             return pd.read_parquet(filepath)
-        elif format == 'json':
+        elif format == "json":
             with open(filepath) as f:
                 return json.load(f)
         else:
@@ -453,6 +470,7 @@ class CheckpointManager:
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
+
 
 def create_checkpoint_state(
     run_id: str,
@@ -476,7 +494,7 @@ def create_checkpoint_state(
         run_id=run_id,
         stage=stage,
         stage_name=stage_name,
-        started_at=kwargs.pop('started_at', datetime.now().isoformat()),
+        started_at=kwargs.pop("started_at", datetime.now().isoformat()),
         **kwargs,
     )
 
@@ -533,7 +551,7 @@ if __name__ == "__main__":
             run_id="test-run-001",
             stage=3,
             total_fingerprints=100000,
-            metrics={'fingerprints_processed': 50000},
+            metrics={"fingerprints_processed": 50000},
         )
 
         saved = mgr.save_checkpoint(state, force=True)
@@ -549,7 +567,8 @@ if __name__ == "__main__":
 
         # Save partial artifact
         import pandas as pd
-        df = pd.DataFrame({'x': [1, 2, 3], 'y': [4, 5, 6]})
+
+        df = pd.DataFrame({"x": [1, 2, 3], "y": [4, 5, 6]})
         path = mgr.save_partial_artifact("test-run-001", "embeddings", df)
         print(f"Saved artifact: {path}")
 

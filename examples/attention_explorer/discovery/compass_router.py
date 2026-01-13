@@ -58,12 +58,12 @@ Oscillating Pattern:
 - Route to: Large model with full context
 """
 
-import math
-import numpy as np
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
-from enum import Enum
 import logging
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -72,20 +72,23 @@ logger = logging.getLogger(__name__)
 # ENUMS AND DATA STRUCTURES
 # =============================================================================
 
+
 class CompassHeading(Enum):
     """Cardinal directions for attention patterns."""
-    NORTH = "north"          # Toward beginning (retrieval)
-    EAST = "east"            # Toward recent local context
-    SOUTH = "south"          # Away from sink (creative)
-    WEST = "west"            # Toward middle context
+
+    NORTH = "north"  # Toward beginning (retrieval)
+    EAST = "east"  # Toward recent local context
+    SOUTH = "south"  # Away from sink (creative)
+    WEST = "west"  # Toward middle context
     SCATTERED = "scattered"  # No clear direction
 
 
 class RoutingTier(Enum):
     """Model tier for routing decision."""
-    SMALL = "small"      # 4B-8B, fast syntactic
-    MEDIUM = "medium"    # 13B-30B, balanced
-    LARGE = "large"      # 70B+, complex reasoning
+
+    SMALL = "small"  # 4B-8B, fast syntactic
+    MEDIUM = "medium"  # 13B-30B, balanced
+    LARGE = "large"  # 70B+, complex reasoning
     CONTEXT = "context"  # Needs full context window
 
 
@@ -97,11 +100,12 @@ class SinqAnchor:
     The sink tokens (typically positions 0-4) act as "true north"
     for measuring attention direction.
     """
-    sink_positions: List[int]           # Which positions are sink
-    sink_attention: np.ndarray          # Attention mass to sink
-    sink_total: float                   # Total sink attention
-    is_sink_dominated: bool             # >30% attention to sink
-    sink_entropy: float                 # Entropy within sink
+
+    sink_positions: List[int]  # Which positions are sink
+    sink_attention: np.ndarray  # Attention mass to sink
+    sink_total: float  # Total sink attention
+    is_sink_dominated: bool  # >30% attention to sink
+    sink_entropy: float  # Entropy within sink
 
     @classmethod
     def from_attention(
@@ -149,7 +153,11 @@ class SinqAnchor:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "sink_positions": self.sink_positions,
-            "sink_attention": self.sink_attention.tolist() if isinstance(self.sink_attention, np.ndarray) else self.sink_attention,
+            "sink_attention": (
+                self.sink_attention.tolist()
+                if isinstance(self.sink_attention, np.ndarray)
+                else self.sink_attention
+            ),
             "sink_total": self.sink_total,
             "is_sink_dominated": self.is_sink_dominated,
             "sink_entropy": self.sink_entropy,
@@ -161,21 +169,22 @@ class CompassReading:
     """
     Angular analysis of attention pattern relative to sink anchor.
     """
+
     # Angular metrics
-    heading: CompassHeading              # Dominant direction
-    heading_angle: float                 # Angle in radians [0, 2π]
-    angular_variance: float              # How spread out (0=focused, 1=scattered)
-    angular_concentration: float         # Inverse variance (0=scattered, 1=focused)
+    heading: CompassHeading  # Dominant direction
+    heading_angle: float  # Angle in radians [0, 2π]
+    angular_variance: float  # How spread out (0=focused, 1=scattered)
+    angular_concentration: float  # Inverse variance (0=scattered, 1=focused)
 
     # Directional breakdown
-    north_mass: float                    # Attention toward beginning
-    east_mass: float                     # Attention toward recent
-    south_mass: float                    # Attention away from sink
-    west_mass: float                     # Attention toward middle
+    north_mass: float  # Attention toward beginning
+    east_mass: float  # Attention toward recent
+    south_mass: float  # Attention away from sink
+    west_mass: float  # Attention toward middle
 
     # Pattern classification
-    pattern_type: str                    # "focused", "bimodal", "scattered", "oscillating"
-    rotational_variance: float           # From RoPE de-rotation
+    pattern_type: str  # "focused", "bimodal", "scattered", "oscillating"
+    rotational_variance: float  # From RoPE de-rotation
 
     # Sink analysis
     anchor: SinqAnchor
@@ -201,6 +210,7 @@ class CompassRoutingDecision:
     """
     Routing decision based on compass analysis.
     """
+
     tier: RoutingTier
     use_chain_of_thought: bool
     reason: str
@@ -230,11 +240,12 @@ class CompassRoutingDecision:
 @dataclass
 class CompassRouterConfig:
     """Configuration for the compass router."""
+
     # Sink configuration
-    sink_threshold: int = 5              # Positions 0-4 are sink
+    sink_threshold: int = 5  # Positions 0-4 are sink
 
     # Angular variance thresholds
-    low_variance_threshold: float = 0.3   # Below = syntactic
+    low_variance_threshold: float = 0.3  # Below = syntactic
     high_variance_threshold: float = 0.7  # Above = reasoning
 
     # Model mapping
@@ -243,9 +254,9 @@ class CompassRouterConfig:
     large_model: str = "Qwen/Qwen3-72B"
 
     # Temperature recommendations
-    syntactic_temperature: float = 0.3    # Low for precision
-    reasoning_temperature: float = 0.7    # Medium for exploration
-    creative_temperature: float = 0.9     # High for creativity
+    syntactic_temperature: float = 0.3  # Low for precision
+    reasoning_temperature: float = 0.7  # Medium for exploration
+    creative_temperature: float = 0.9  # High for creativity
 
     # Token limits
     syntactic_max_tokens: int = 256
@@ -253,13 +264,14 @@ class CompassRouterConfig:
     creative_max_tokens: int = 2048
 
     # CoT thresholds
-    cot_variance_threshold: float = 0.5   # Above = enable CoT
-    cot_sink_threshold: float = 0.4       # High sink = uncertain, enable CoT
+    cot_variance_threshold: float = 0.5  # Above = enable CoT
+    cot_sink_threshold: float = 0.4  # High sink = uncertain, enable CoT
 
 
 # =============================================================================
 # COMPASS ANALYZER
 # =============================================================================
+
 
 class CompassAnalyzer:
     """
@@ -300,9 +312,7 @@ class CompassAnalyzer:
 
         # Extract sink anchor
         anchor = SinqAnchor.from_attention(
-            positions.tolist(),
-            scores.tolist(),
-            self.config.sink_threshold
+            positions.tolist(), scores.tolist(), self.config.sink_threshold
         )
 
         # Get non-sink attention
@@ -339,7 +349,10 @@ class CompassAnalyzer:
         pattern_type = self._classify_pattern(
             angular_variance,
             anchor.is_sink_dominated,
-            north_mass, east_mass, south_mass, west_mass
+            north_mass,
+            east_mass,
+            south_mass,
+            west_mass,
         )
 
         return CompassReading(
@@ -432,11 +445,11 @@ class CompassAnalyzer:
         # South: 3π/4 to 5π/4 (away from sink)
         # West: 5π/4 to 7π/4 (toward middle)
 
-        if angle < np.pi/4 or angle >= 7*np.pi/4:
+        if angle < np.pi / 4 or angle >= 7 * np.pi / 4:
             return CompassHeading.NORTH
-        elif angle < 3*np.pi/4:
+        elif angle < 3 * np.pi / 4:
             return CompassHeading.EAST
-        elif angle < 5*np.pi/4:
+        elif angle < 5 * np.pi / 4:
             return CompassHeading.SOUTH
         else:
             return CompassHeading.WEST
@@ -448,10 +461,10 @@ class CompassAnalyzer:
     ) -> Tuple[float, float, float, float]:
         """Compute attention mass in each cardinal direction."""
         # Define direction masks
-        north_mask = (angles < np.pi/4) | (angles >= 7*np.pi/4)
-        east_mask = (angles >= np.pi/4) & (angles < 3*np.pi/4)
-        south_mask = (angles >= 3*np.pi/4) & (angles < 5*np.pi/4)
-        west_mask = (angles >= 5*np.pi/4) & (angles < 7*np.pi/4)
+        north_mask = (angles < np.pi / 4) | (angles >= 7 * np.pi / 4)
+        east_mask = (angles >= np.pi / 4) & (angles < 3 * np.pi / 4)
+        south_mask = (angles >= 3 * np.pi / 4) & (angles < 5 * np.pi / 4)
+        west_mask = (angles >= 5 * np.pi / 4) & (angles < 7 * np.pi / 4)
 
         north_mass = float(weights[north_mask].sum())
         east_mass = float(weights[east_mask].sum())
@@ -510,6 +523,7 @@ class CompassAnalyzer:
 # =============================================================================
 # COMPASS ROUTER
 # =============================================================================
+
 
 class CompassRouter:
     """
@@ -690,7 +704,10 @@ class CompassRouter:
         # High variance = reasoning, large model
         if variance > self.config.high_variance_threshold:
             if pattern == "scattered":
-                return RoutingTier.LARGE, "Scattered attention - complex reasoning needed"
+                return (
+                    RoutingTier.LARGE,
+                    "Scattered attention - complex reasoning needed",
+                )
             else:
                 return RoutingTier.LARGE, "High variance - multi-hop reasoning"
 
@@ -793,7 +810,7 @@ class CompassRouter:
                     "percentage": count / self._total_routes * 100,
                 }
                 for tier, count in self._route_counts.items()
-            }
+            },
         }
 
     def reset_statistics(self):
@@ -846,6 +863,7 @@ COMPASS_GLOSSARY = {
 # FACTORY FUNCTIONS
 # =============================================================================
 
+
 def create_compass_router(
     config: Optional[CompassRouterConfig] = None,
 ) -> CompassRouter:
@@ -872,6 +890,7 @@ def analyze_attention_compass(
 # DEMO
 # =============================================================================
 
+
 def demo():
     """Demonstrate the compass router."""
     print("=" * 60)
@@ -887,7 +906,7 @@ def demo():
     result1 = router.route(
         query_pos=100,
         key_positions=[95, 96, 97, 98, 99],
-        attention_scores=[0.1, 0.15, 0.2, 0.25, 0.3]
+        attention_scores=[0.1, 0.15, 0.2, 0.25, 0.3],
     )
 
     print(f"Tier: {result1.tier.value}")
@@ -904,7 +923,7 @@ def demo():
     result2 = router.route(
         query_pos=500,
         key_positions=[10, 50, 100, 200, 450, 499],
-        attention_scores=[0.2, 0.15, 0.15, 0.2, 0.15, 0.15]
+        attention_scores=[0.2, 0.15, 0.15, 0.2, 0.15, 0.15],
     )
 
     print(f"Tier: {result2.tier.value}")
@@ -921,7 +940,7 @@ def demo():
     result3 = router.route(
         query_pos=100,
         key_positions=[0, 1, 2, 3, 50, 99],
-        attention_scores=[0.3, 0.2, 0.15, 0.1, 0.15, 0.1]
+        attention_scores=[0.3, 0.2, 0.15, 0.1, 0.15, 0.1],
     )
 
     print(f"Tier: {result3.tier.value}")
@@ -934,7 +953,7 @@ def demo():
     print("\n--- Routing Statistics ---")
     stats = router.get_statistics()
     print(f"Total routes: {stats['total_routes']}")
-    for tier, data in stats['distribution'].items():
+    for tier, data in stats["distribution"].items():
         print(f"  {tier}: {data['count']} ({data['percentage']:.0f}%)")
 
 

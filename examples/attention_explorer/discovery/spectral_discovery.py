@@ -9,23 +9,23 @@ eigenvectors of the graph Laplacian, not as associative lookups.
 """
 
 import logging
-import numpy as np
-from dataclasses import dataclass, field
-from typing import Optional, Tuple, List, Dict, Any
+from dataclasses import dataclass
 from enum import Enum
+from typing import Dict, List, Optional
 
-from sklearn.manifold import SpectralEmbedding
+import numpy as np
+from scipy.linalg import eigh
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import laplacian
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
-from scipy.sparse.csgraph import laplacian
-from scipy.sparse import csr_matrix
-from scipy.linalg import eigh
 
 logger = logging.getLogger(__name__)
 
 
 class SpectralMode(Enum):
     """Spectral modes indicating computation type."""
+
     GEOMETRIC_LOOKUP = "geometric_lookup"  # High coherence - simple navigation
     SEMANTIC_REASONING = "semantic_reasoning"  # Medium coherence - mid-range
     VOID_COMPUTATION = "void_computation"  # Low coherence - needs deep reasoning
@@ -34,6 +34,7 @@ class SpectralMode(Enum):
 @dataclass
 class SpectralAnalysis:
     """Results of spectral analysis on fingerprints."""
+
     embeddings: np.ndarray  # n_samples x n_components
     eigenvalues: np.ndarray  # Laplacian eigenvalues
     eigenvectors: np.ndarray  # Laplacian eigenvectors
@@ -45,6 +46,7 @@ class SpectralAnalysis:
 @dataclass
 class SpectralCoherence:
     """Coherence metrics for a query fingerprint."""
+
     coherence_score: float  # 0-1, how well query fits spectral skeleton
     projection_energy: np.ndarray  # Energy in each eigenmode
     dominant_modes: List[int]  # Indices of dominant eigenmodes
@@ -55,6 +57,7 @@ class SpectralCoherence:
 @dataclass
 class SpectralDiscoveryConfig:
     """Configuration for spectral manifold discovery."""
+
     n_components: int = 50  # Number of spectral components
     n_neighbors: int = 15  # k for k-NN graph construction
     eigen_solver: str = "arpack"  # Eigenvalue solver
@@ -103,9 +106,7 @@ class SpectralManifoldDiscovery:
         # Build k-NN graph (the "subway map" structure)
         logger.info(f"Building {self.config.n_neighbors}-NN graph...")
         nn = NearestNeighbors(
-            n_neighbors=self.config.n_neighbors,
-            algorithm='auto',
-            metric='euclidean'
+            n_neighbors=self.config.n_neighbors, algorithm="auto", metric="euclidean"
         )
         nn.fit(fingerprints_scaled)
 
@@ -124,8 +125,7 @@ class SpectralManifoldDiscovery:
         weights = np.exp(-self.config.gamma * distances.flatten() ** 2)
 
         adjacency = csr_matrix(
-            (weights, (row_idx, col_idx)),
-            shape=(n_samples, n_samples)
+            (weights, (row_idx, col_idx)), shape=(n_samples, n_samples)
         )
         # Make symmetric
         adjacency = (adjacency + adjacency.T) / 2
@@ -141,19 +141,20 @@ class SpectralManifoldDiscovery:
 
         if self.config.eigen_solver == "arpack":
             from scipy.sparse.linalg import eigsh
+
             # Get smallest eigenvalues (Laplacian is positive semi-definite)
             eigenvalues, eigenvectors = eigsh(
                 L,
                 k=n_components + 1,  # +1 for the zero eigenvalue
-                which='SM',
-                maxiter=5000
+                which="SM",
+                maxiter=5000,
             )
         else:
             # Dense solver for small datasets
-            L_dense = L.toarray() if hasattr(L, 'toarray') else L
+            L_dense = L.toarray() if hasattr(L, "toarray") else L
             eigenvalues, eigenvectors = eigh(L_dense)
-            eigenvalues = eigenvalues[:n_components + 1]
-            eigenvectors = eigenvectors[:, :n_components + 1]
+            eigenvalues = eigenvalues[: n_components + 1]
+            eigenvectors = eigenvectors[:, : n_components + 1]
 
         # Sort by eigenvalue (should already be sorted, but ensure)
         idx = np.argsort(eigenvalues)
@@ -161,11 +162,13 @@ class SpectralManifoldDiscovery:
         eigenvectors = eigenvectors[:, idx]
 
         # Skip the first eigenvector (constant, eigenvalue ≈ 0)
-        self.eigenvalues_ = eigenvalues[1:n_components + 1]
-        self.eigenvectors_ = eigenvectors[:, 1:n_components + 1]
+        self.eigenvalues_ = eigenvalues[1 : n_components + 1]
+        self.eigenvectors_ = eigenvectors[:, 1 : n_components + 1]
 
         self._fitted = True
-        logger.info(f"Spectral discovery fitted. Spectral gap: {self._compute_spectral_gap():.4f}")
+        logger.info(
+            f"Spectral discovery fitted. Spectral gap: {self._compute_spectral_gap():.4f}"
+        )
 
         return self
 
@@ -252,7 +255,7 @@ class SpectralManifoldDiscovery:
             eigenvectors=self.eigenvectors_.copy(),
             spectral_gap=self._compute_spectral_gap(),
             effective_dimension=self.compute_effective_dimension(),
-            graph_connectivity=self._compute_connectivity()
+            graph_connectivity=self._compute_connectivity(),
         )
 
     def _compute_connectivity(self) -> float:
@@ -263,8 +266,7 @@ class SpectralManifoldDiscovery:
         return float(self.eigenvalues_[0]) if len(self.eigenvalues_) > 0 else 0.0
 
     def compute_spectral_coherence(
-        self,
-        query_fingerprint: np.ndarray
+        self, query_fingerprint: np.ndarray
     ) -> SpectralCoherence:
         """
         Measure how well a query projects onto the spectral skeleton.
@@ -355,14 +357,24 @@ class SpectralManifoldDiscovery:
         # Determine computation mode
         if coherence_score > self.config.coherence_threshold_high:
             mode = SpectralMode.GEOMETRIC_LOOKUP
-            confidence = (coherence_score - self.config.coherence_threshold_high) / (1.0 - self.config.coherence_threshold_high + 1e-10)
+            confidence = (coherence_score - self.config.coherence_threshold_high) / (
+                1.0 - self.config.coherence_threshold_high + 1e-10
+            )
         elif coherence_score < self.config.coherence_threshold_low:
             mode = SpectralMode.VOID_COMPUTATION
-            confidence = (self.config.coherence_threshold_low - coherence_score) / (self.config.coherence_threshold_low + 1e-10)
+            confidence = (self.config.coherence_threshold_low - coherence_score) / (
+                self.config.coherence_threshold_low + 1e-10
+            )
         else:
             mode = SpectralMode.SEMANTIC_REASONING
-            mid = (self.config.coherence_threshold_high + self.config.coherence_threshold_low) / 2
-            range_size = self.config.coherence_threshold_high - self.config.coherence_threshold_low
+            mid = (
+                self.config.coherence_threshold_high
+                + self.config.coherence_threshold_low
+            ) / 2
+            range_size = (
+                self.config.coherence_threshold_high
+                - self.config.coherence_threshold_low
+            )
             confidence = 1.0 - abs(coherence_score - mid) / (range_size + 1e-10)
 
         confidence = float(np.clip(confidence, 0, 1))
@@ -372,7 +384,7 @@ class SpectralManifoldDiscovery:
             projection_energy=projection_energy,
             dominant_modes=dominant_modes,
             mode=mode,
-            confidence=confidence
+            confidence=confidence,
         )
 
     def get_spectral_skeleton(self, n_landmarks: int = 100) -> np.ndarray:
@@ -397,17 +409,18 @@ class SpectralManifoldDiscovery:
     def save(self, path: str) -> None:
         """Save the fitted model to disk."""
         import pickle
+
         state = {
-            'config': self.config,
-            'eigenvalues': self.eigenvalues_,
-            'eigenvectors': self.eigenvectors_,
-            'mean_fingerprint': self.mean_fingerprint_,
-            'training_fingerprints_scaled': self._training_fingerprints_scaled,
-            'scaler_mean': self.scaler.mean_,
-            'scaler_scale': self.scaler.scale_,
-            'fitted': self._fitted
+            "config": self.config,
+            "eigenvalues": self.eigenvalues_,
+            "eigenvectors": self.eigenvectors_,
+            "mean_fingerprint": self.mean_fingerprint_,
+            "training_fingerprints_scaled": self._training_fingerprints_scaled,
+            "scaler_mean": self.scaler.mean_,
+            "scaler_scale": self.scaler.scale_,
+            "fitted": self._fitted,
         }
-        with open(path, 'wb') as f:
+        with open(path, "wb") as f:
             pickle.dump(state, f)
         logger.info(f"Saved spectral discovery to {path}")
 
@@ -415,17 +428,20 @@ class SpectralManifoldDiscovery:
     def load(cls, path: str) -> "SpectralManifoldDiscovery":
         """Load a fitted model from disk."""
         import pickle
-        with open(path, 'rb') as f:
+
+        with open(path, "rb") as f:
             state = pickle.load(f)
 
-        instance = cls(config=state['config'])
-        instance.eigenvalues_ = state['eigenvalues']
-        instance.eigenvectors_ = state['eigenvectors']
-        instance.mean_fingerprint_ = state['mean_fingerprint']
-        instance._training_fingerprints_scaled = state.get('training_fingerprints_scaled')
-        instance.scaler.mean_ = state['scaler_mean']
-        instance.scaler.scale_ = state['scaler_scale']
-        instance._fitted = state['fitted']
+        instance = cls(config=state["config"])
+        instance.eigenvalues_ = state["eigenvalues"]
+        instance.eigenvectors_ = state["eigenvectors"]
+        instance.mean_fingerprint_ = state["mean_fingerprint"]
+        instance._training_fingerprints_scaled = state.get(
+            "training_fingerprints_scaled"
+        )
+        instance.scaler.mean_ = state["scaler_mean"]
+        instance.scaler.scale_ = state["scaler_scale"]
+        instance._fitted = state["fitted"]
 
         logger.info(f"Loaded spectral discovery from {path}")
         return instance
@@ -445,9 +461,7 @@ class FrequencyBandAnalyzer:
         self.n_high_dims = n_high_dims
 
     def analyze_frequency_bands(
-        self,
-        fingerprint: np.ndarray,
-        pca_loadings: Optional[np.ndarray] = None
+        self, fingerprint: np.ndarray, pca_loadings: Optional[np.ndarray] = None
     ) -> Dict[str, float]:
         """
         Analyze activity in high vs low frequency bands.
@@ -457,8 +471,8 @@ class FrequencyBandAnalyzer:
         """
         if pca_loadings is not None:
             # Use PCA loadings to identify frequency-sensitive components
-            low_band = np.abs(pca_loadings[:self.n_low_dims]).sum()
-            high_band = np.abs(pca_loadings[self.n_high_dims:]).sum()
+            low_band = np.abs(pca_loadings[: self.n_low_dims]).sum()
+            high_band = np.abs(pca_loadings[self.n_high_dims :]).sum()
         else:
             # Direct fingerprint analysis
             # Fingerprint layout: [local_mass, mid_mass, long_mass, entropy, hist..., layer_entropy...]
@@ -471,15 +485,15 @@ class FrequencyBandAnalyzer:
         total = low_band + high_band
         if total == 0:
             return {
-                'high_band_activity': 0.0,
-                'low_band_activity': 0.0,
-                'band_ratio': 1.0
+                "high_band_activity": 0.0,
+                "low_band_activity": 0.0,
+                "band_ratio": 1.0,
             }
 
         return {
-            'high_band_activity': float(high_band / total),
-            'low_band_activity': float(low_band / total),
-            'band_ratio': float(high_band / low_band) if low_band > 0 else float('inf')
+            "high_band_activity": float(high_band / total),
+            "low_band_activity": float(low_band / total),
+            "band_ratio": float(high_band / low_band) if low_band > 0 else float("inf"),
         }
 
     def recommend_model_size(self, band_analysis: Dict[str, float]) -> str:
@@ -489,7 +503,7 @@ class FrequencyBandAnalyzer:
         High-band dominant -> Complex reasoning, use large model
         Low-band dominant -> Grammar/local, use small model
         """
-        ratio = band_analysis['band_ratio']
+        ratio = band_analysis["band_ratio"]
 
         if ratio > 2.0:
             return "large"  # 70B+ for complex reasoning

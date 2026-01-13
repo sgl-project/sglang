@@ -6,6 +6,7 @@ Tests the SQLite-backed checkpoint persistence and resume capability.
 
 import json
 import sqlite3
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -14,15 +15,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from discovery.checkpoint import (
+    STAGE_NAMES,
     CheckpointManager,
     CheckpointState,
     create_checkpoint_state,
     should_checkpoint,
-    STAGE_NAMES,
 )
 
 
@@ -50,42 +50,44 @@ class TestCheckpointState:
             stage=2,
             stage_name="pca",
             total_fingerprints=50000,
-            metrics={'variance_explained': 0.95},
+            metrics={"variance_explained": 0.95},
         )
 
         json_str = state.to_json()
         data = json.loads(json_str)
 
-        assert data['run_id'] == "test-run"
-        assert data['stage'] == 2
-        assert data['total_fingerprints'] == 50000
-        assert data['metrics']['variance_explained'] == 0.95
+        assert data["run_id"] == "test-run"
+        assert data["stage"] == 2
+        assert data["total_fingerprints"] == 50000
+        assert data["metrics"]["variance_explained"] == 0.95
 
     def test_state_from_json(self):
         """Test deserialization from JSON."""
-        json_str = json.dumps({
-            'run_id': 'test-run',
-            'stage': 4,
-            'stage_name': 'cluster',
-            'fingerprint_ids_processed': [1, 2, 3],
-            'total_fingerprints': 1000,
-            'embeddings_path': None,
-            'clusters_path': None,
-            'prototypes_path': None,
-            'zone_thresholds': {'syntax_floor': {'local_mass_min': 0.7}},
-            'started_at': '2026-01-10T10:00:00',
-            'last_checkpoint_at': '2026-01-10T10:30:00',
-            'elapsed_seconds': 1800.0,
-            'metrics': {'clusters_found': 42},
-            'errors': [],
-        })
+        json_str = json.dumps(
+            {
+                "run_id": "test-run",
+                "stage": 4,
+                "stage_name": "cluster",
+                "fingerprint_ids_processed": [1, 2, 3],
+                "total_fingerprints": 1000,
+                "embeddings_path": None,
+                "clusters_path": None,
+                "prototypes_path": None,
+                "zone_thresholds": {"syntax_floor": {"local_mass_min": 0.7}},
+                "started_at": "2026-01-10T10:00:00",
+                "last_checkpoint_at": "2026-01-10T10:30:00",
+                "elapsed_seconds": 1800.0,
+                "metrics": {"clusters_found": 42},
+                "errors": [],
+            }
+        )
 
         state = CheckpointState.from_json(json_str)
 
-        assert state.run_id == 'test-run'
+        assert state.run_id == "test-run"
         assert state.stage == 4
         assert state.total_fingerprints == 1000
-        assert state.zone_thresholds['syntax_floor']['local_mass_min'] == 0.7
+        assert state.zone_thresholds["syntax_floor"]["local_mass_min"] == 0.7
 
     def test_update_timestamp(self):
         """Test timestamp update."""
@@ -108,7 +110,7 @@ class TestCheckpointManager:
     @pytest.fixture
     def temp_db(self):
         """Create temporary database."""
-        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             path = f.name
         yield path
         Path(path).unlink(missing_ok=True)
@@ -130,13 +132,11 @@ class TestCheckpointManager:
 
         # Check tables exist
         conn = sqlite3.connect(temp_db)
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = [row[0] for row in cursor.fetchall()]
         conn.close()
 
-        assert 'discovery_checkpoints' in tables
+        assert "discovery_checkpoints" in tables
 
     def test_save_and_load_checkpoint(self, manager):
         """Test saving and loading a checkpoint."""
@@ -144,7 +144,7 @@ class TestCheckpointManager:
             run_id="test-run-001",
             stage=3,
             total_fingerprints=10000,
-            metrics={'embeddings_shape': [10000, 2]},
+            metrics={"embeddings_shape": [10000, 2]},
         )
 
         # Save
@@ -220,8 +220,8 @@ class TestCheckpointManager:
 
         # Should have 3 resumable runs (not the complete one)
         assert len(resumable) == 3
-        run_ids = [r['run_id'] for r in resumable]
-        assert 'complete-run' not in run_ids
+        run_ids = [r["run_id"] for r in resumable]
+        assert "complete-run" not in run_ids
 
     def test_clear_checkpoint(self, manager, temp_dir):
         """Test clearing checkpoint."""
@@ -270,54 +270,56 @@ class TestCheckpointManager:
         history = manager.get_checkpoint_history("test-run")
 
         assert len(history) == 4
-        assert history[0]['stage'] == 0
-        assert history[3]['stage'] == 3
+        assert history[0]["stage"] == 0
+        assert history[3]["stage"] == 3
 
     def test_save_partial_artifact_parquet(self, manager):
         """Test saving parquet artifact."""
-        df = pd.DataFrame({
-            'x': np.random.randn(100),
-            'y': np.random.randn(100),
-            'cluster': np.random.randint(0, 5, 100),
-        })
+        df = pd.DataFrame(
+            {
+                "x": np.random.randn(100),
+                "y": np.random.randn(100),
+                "cluster": np.random.randint(0, 5, 100),
+            }
+        )
 
         path = manager.save_partial_artifact(
             "test-run",
             "embeddings",
             df,
-            format='parquet',
+            format="parquet",
         )
 
         assert path is not None
-        assert path.endswith('.parquet')
+        assert path.endswith(".parquet")
 
         # Load and verify
-        loaded = manager.load_partial_artifact(path, format='parquet')
+        loaded = manager.load_partial_artifact(path, format="parquet")
         assert len(loaded) == 100
-        assert list(loaded.columns) == ['x', 'y', 'cluster']
+        assert list(loaded.columns) == ["x", "y", "cluster"]
 
     def test_save_partial_artifact_json(self, manager):
         """Test saving JSON artifact."""
         data = {
-            'clusters': [
-                {'id': 0, 'size': 100, 'zone': 'syntax_floor'},
-                {'id': 1, 'size': 200, 'zone': 'semantic_bridge'},
+            "clusters": [
+                {"id": 0, "size": 100, "zone": "syntax_floor"},
+                {"id": 1, "size": 200, "zone": "semantic_bridge"},
             ],
-            'metadata': {'version': 1},
+            "metadata": {"version": 1},
         }
 
         path = manager.save_partial_artifact(
             "test-run",
             "clusters",
             data,
-            format='json',
+            format="json",
         )
 
-        assert path.endswith('.json')
+        assert path.endswith(".json")
 
-        loaded = manager.load_partial_artifact(path, format='json')
-        assert len(loaded['clusters']) == 2
-        assert loaded['metadata']['version'] == 1
+        loaded = manager.load_partial_artifact(path, format="json")
+        assert len(loaded["clusters"]) == 2
+        assert loaded["metadata"]["version"] == 1
 
 
 class TestHelperFunctions:
@@ -329,41 +331,50 @@ class TestHelperFunctions:
             run_id="run-123",
             stage=5,
             total_fingerprints=75000,
-            metrics={'key': 'value'},
+            metrics={"key": "value"},
         )
 
         assert state.run_id == "run-123"
         assert state.stage == 5
         assert state.stage_name == STAGE_NAMES[5]
         assert state.total_fingerprints == 75000
-        assert state.metrics == {'key': 'value'}
+        assert state.metrics == {"key": "value"}
 
     def test_should_checkpoint_on_stage_change(self):
         """Test checkpointing on stage change."""
-        assert should_checkpoint(
-            current_stage=3,
-            last_checkpoint_stage=2,
-            elapsed_seconds=10,
-            checkpoint_interval=300,
-        ) is True
+        assert (
+            should_checkpoint(
+                current_stage=3,
+                last_checkpoint_stage=2,
+                elapsed_seconds=10,
+                checkpoint_interval=300,
+            )
+            is True
+        )
 
     def test_should_checkpoint_on_interval(self):
         """Test checkpointing on time interval."""
-        assert should_checkpoint(
-            current_stage=3,
-            last_checkpoint_stage=3,
-            elapsed_seconds=400,  # > 300s interval
-            checkpoint_interval=300,
-        ) is True
+        assert (
+            should_checkpoint(
+                current_stage=3,
+                last_checkpoint_stage=3,
+                elapsed_seconds=400,  # > 300s interval
+                checkpoint_interval=300,
+            )
+            is True
+        )
 
     def test_should_not_checkpoint_too_soon(self):
         """Test skipping checkpoint when too soon."""
-        assert should_checkpoint(
-            current_stage=3,
-            last_checkpoint_stage=3,
-            elapsed_seconds=100,  # < 300s interval
-            checkpoint_interval=300,
-        ) is False
+        assert (
+            should_checkpoint(
+                current_stage=3,
+                last_checkpoint_stage=3,
+                elapsed_seconds=100,  # < 300s interval
+                checkpoint_interval=300,
+            )
+            is False
+        )
 
 
 class TestResumeScenarios:
@@ -397,11 +408,13 @@ class TestResumeScenarios:
     def test_resume_from_umap_stage(self, manager):
         """Test resume from UMAP stage with partial embeddings."""
         # Save partial embeddings
-        partial_embeddings = pd.DataFrame({
-            'id': range(25000),
-            'x': np.random.randn(25000),
-            'y': np.random.randn(25000),
-        })
+        partial_embeddings = pd.DataFrame(
+            {
+                "id": range(25000),
+                "x": np.random.randn(25000),
+                "y": np.random.randn(25000),
+            }
+        )
         path = manager.save_partial_artifact(
             "run-umap",
             "embeddings_partial",
@@ -415,7 +428,7 @@ class TestResumeScenarios:
             total_fingerprints=100000,
         )
         state.embeddings_path = path
-        state.metrics = {'embeddings_computed': 25000}
+        state.metrics = {"embeddings_computed": 25000}
         manager.save_checkpoint(state, force=True)
 
         # Resume
@@ -430,8 +443,8 @@ class TestResumeScenarios:
     def test_resume_preserves_zone_thresholds(self, manager):
         """Test that resume preserves custom zone thresholds."""
         custom_thresholds = {
-            'syntax_floor': {'local_mass_min': 0.8, 'entropy_max': 1.5},
-            'long_range': {'long_mass_min': 0.4},
+            "syntax_floor": {"local_mass_min": 0.8, "entropy_max": 1.5},
+            "long_range": {"long_mass_min": 0.4},
         }
 
         state = create_checkpoint_state(
@@ -483,14 +496,12 @@ class TestErrorRecovery:
             run_id="failed-run",
             stage=4,
         )
-        state.errors = [
-            {'stage': 4, 'error': 'HDBSCAN failed: not enough memory'}
-        ]
+        state.errors = [{"stage": 4, "error": "HDBSCAN failed: not enough memory"}]
         manager.save_checkpoint(state, force=True)
 
         loaded = manager.load_checkpoint("failed-run")
         assert len(loaded.errors) == 1
-        assert 'memory' in loaded.errors[0]['error']
+        assert "memory" in loaded.errors[0]["error"]
 
     def test_atomic_write_integrity(self, manager):
         """Test that checkpoint writes are atomic."""
@@ -502,13 +513,13 @@ class TestErrorRecovery:
 
         # Save multiple times rapidly
         for i in range(10):
-            state.metrics = {'iteration': i}
+            state.metrics = {"iteration": i}
             manager.save_checkpoint(state, force=True)
 
         # Final state should be consistent
         loaded = manager.load_checkpoint("atomic-test")
-        assert loaded.metrics['iteration'] == 9
+        assert loaded.metrics["iteration"] == 9
 
 
-if __name__ == '__main__':
-    pytest.main([__file__, '-v'])
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

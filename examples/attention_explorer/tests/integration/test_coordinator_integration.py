@@ -7,29 +7,24 @@ Tests the DiscoveryJobCoordinator including:
 - Zone classification
 """
 
-import json
-import os
-import pytest
-import numpy as np
-import tempfile
-from pathlib import Path
-from datetime import datetime
-from dataclasses import field
-from typing import Dict, Any, List, Optional
-
 # Add parent to path for imports
 import sys
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from discovery.coordinator import (
-    CoordinatorConfig,
-    StageResult,
-    DiscoveryResult,
-    DiscoveryJobCoordinator,
-    STAGE_NAMES,
-)
-
 from discovery.bounded_umap import MemoryMonitor
+from discovery.coordinator import (
+    STAGE_NAMES,
+    CoordinatorConfig,
+    DiscoveryJobCoordinator,
+    DiscoveryResult,
+    StageResult,
+)
 
 
 class TestCoordinatorInit:
@@ -220,7 +215,11 @@ class TestDiscoveryResult:
             stages_completed=9,
             total_fingerprints=1000,
             total_clusters=5,
-            zone_distribution={"syntax_floor": 300, "semantic_bridge": 500, "long_range": 200},
+            zone_distribution={
+                "syntax_floor": 300,
+                "semantic_bridge": 500,
+                "long_range": 200,
+            },
             output_paths={"embeddings": "/path/to/embeddings.parquet"},
             stage_results=[],
         )

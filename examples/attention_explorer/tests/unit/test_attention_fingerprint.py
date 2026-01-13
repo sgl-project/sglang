@@ -4,20 +4,16 @@ Unit tests for AttentionFingerprint and related functions
 Tests fingerprint computation: hubness, consensus, spectral, offset histogram.
 """
 
-import json
-import pytest
-import numpy as np
-from pathlib import Path
-from typing import Dict, List
-
 # Add parent to path for imports
 import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from attention_fingerprint import (
-    AttentionFingerprint,
-    normalize_attention_data,
-)
+from attention_fingerprint import AttentionFingerprint, normalize_attention_data
 
 
 class TestNormalizeAttentionData:
@@ -26,8 +22,16 @@ class TestNormalizeAttentionData:
     def test_normalize_list_format(self):
         """Test normalization of list format attention data."""
         attention_tokens = [
-            {"token_positions": [0, 1, 2], "attention_scores": [0.5, 0.3, 0.2], "layer_id": 6},
-            {"token_positions": [1, 2, 3], "attention_scores": [0.4, 0.4, 0.2], "layer_id": 12},
+            {
+                "token_positions": [0, 1, 2],
+                "attention_scores": [0.5, 0.3, 0.2],
+                "layer_id": 6,
+            },
+            {
+                "token_positions": [1, 2, 3],
+                "attention_scores": [0.4, 0.4, 0.2],
+                "layer_id": 12,
+            },
         ]
 
         flat_list, per_layer = normalize_attention_data(attention_tokens)
@@ -105,9 +109,21 @@ class TestAttentionFingerprint:
     def sample_attention_tokens(self):
         """Create sample attention token data."""
         return [
-            {"token_positions": [0, 1, 2], "attention_scores": [0.5, 0.3, 0.2], "layer_id": 6},
-            {"token_positions": [0, 1, 3], "attention_scores": [0.6, 0.2, 0.2], "layer_id": 6},
-            {"token_positions": [0, 2, 4], "attention_scores": [0.7, 0.2, 0.1], "layer_id": 12},
+            {
+                "token_positions": [0, 1, 2],
+                "attention_scores": [0.5, 0.3, 0.2],
+                "layer_id": 6,
+            },
+            {
+                "token_positions": [0, 1, 3],
+                "attention_scores": [0.6, 0.2, 0.2],
+                "layer_id": 6,
+            },
+            {
+                "token_positions": [0, 2, 4],
+                "attention_scores": [0.7, 0.2, 0.1],
+                "layer_id": 12,
+            },
         ]
 
     def test_initialization(self):
@@ -147,8 +163,14 @@ class TestComputeHubness:
         """Test hubness with uniform attention."""
         # All positions get equal attention -> low hubness
         tokens = [
-            {"token_positions": [0, 1, 2, 3], "attention_scores": [0.25, 0.25, 0.25, 0.25]},
-            {"token_positions": [0, 1, 2, 3], "attention_scores": [0.25, 0.25, 0.25, 0.25]},
+            {
+                "token_positions": [0, 1, 2, 3],
+                "attention_scores": [0.25, 0.25, 0.25, 0.25],
+            },
+            {
+                "token_positions": [0, 1, 2, 3],
+                "attention_scores": [0.25, 0.25, 0.25, 0.25],
+            },
         ]
         result = fingerprinter.compute_hubness(tokens)
         assert 0.0 <= result <= 0.3  # Should be low
@@ -157,9 +179,18 @@ class TestComputeHubness:
         """Test hubness with concentrated attention."""
         # One position gets almost all attention -> high hubness
         tokens = [
-            {"token_positions": [0, 1, 2, 3], "attention_scores": [0.9, 0.03, 0.03, 0.04]},
-            {"token_positions": [0, 1, 2, 3], "attention_scores": [0.85, 0.05, 0.05, 0.05]},
-            {"token_positions": [0, 1, 2, 3], "attention_scores": [0.95, 0.02, 0.02, 0.01]},
+            {
+                "token_positions": [0, 1, 2, 3],
+                "attention_scores": [0.9, 0.03, 0.03, 0.04],
+            },
+            {
+                "token_positions": [0, 1, 2, 3],
+                "attention_scores": [0.85, 0.05, 0.05, 0.05],
+            },
+            {
+                "token_positions": [0, 1, 2, 3],
+                "attention_scores": [0.95, 0.02, 0.02, 0.01],
+            },
         ]
         result = fingerprinter.compute_hubness(tokens)
         assert result > 0.5  # Should be high
@@ -214,9 +245,21 @@ class TestComputeConsensus:
     def test_consensus_in_range(self, fingerprinter):
         """Test consensus is always in reasonable range."""
         tokens = [
-            {"token_positions": [0, 1, 2], "attention_scores": [0.5, 0.3, 0.2], "layer_id": 6},
-            {"token_positions": [1, 2, 3], "attention_scores": [0.4, 0.4, 0.2], "layer_id": 12},
-            {"token_positions": [0, 2, 4], "attention_scores": [0.6, 0.2, 0.2], "layer_id": 18},
+            {
+                "token_positions": [0, 1, 2],
+                "attention_scores": [0.5, 0.3, 0.2],
+                "layer_id": 6,
+            },
+            {
+                "token_positions": [1, 2, 3],
+                "attention_scores": [0.4, 0.4, 0.2],
+                "layer_id": 12,
+            },
+            {
+                "token_positions": [0, 2, 4],
+                "attention_scores": [0.6, 0.2, 0.2],
+                "layer_id": 18,
+            },
         ]
         _, per_layer = normalize_attention_data(tokens)
         result = fingerprinter.compute_consensus(tokens, per_layer)
@@ -240,10 +283,12 @@ class TestComputeSpectral:
         # Attention to recent tokens (small t - pos)
         tokens = []
         for t in range(20):
-            tokens.append({
-                "token_positions": [max(0, t-1), max(0, t-2)],
-                "attention_scores": [0.6, 0.4],
-            })
+            tokens.append(
+                {
+                    "token_positions": [max(0, t - 1), max(0, t - 2)],
+                    "attention_scores": [0.6, 0.4],
+                }
+            )
         result = fingerprinter.compute_spectral(tokens)
         assert 0.0 <= result <= 1.0
 
@@ -252,10 +297,12 @@ class TestComputeSpectral:
         # Attention to distant tokens (large t - pos)
         tokens = []
         for t in range(50):
-            tokens.append({
-                "token_positions": [0, 1],  # Always attend to beginning
-                "attention_scores": [0.5, 0.5],
-            })
+            tokens.append(
+                {
+                    "token_positions": [0, 1],  # Always attend to beginning
+                    "attention_scores": [0.5, 0.5],
+                }
+            )
         result = fingerprinter.compute_spectral(tokens)
         assert 0.0 <= result <= 1.0
 
@@ -296,7 +343,10 @@ class TestComputeEntropy:
     def test_entropy_uniform(self, fingerprinter):
         """Test entropy with uniform attention."""
         tokens = [
-            {"token_positions": [0, 1, 2, 3], "attention_scores": [0.25, 0.25, 0.25, 0.25]},
+            {
+                "token_positions": [0, 1, 2, 3],
+                "attention_scores": [0.25, 0.25, 0.25, 0.25],
+            },
         ]
         result = fingerprinter.compute_entropy(tokens)
         # Uniform distribution has maximum entropy
@@ -330,8 +380,16 @@ class TestFullFingerprint:
     def test_fingerprint_returns_dict(self, fingerprinter):
         """Test fingerprint returns dictionary with all features."""
         tokens = [
-            {"token_positions": [0, 1, 2], "attention_scores": [0.5, 0.3, 0.2], "layer_id": 6},
-            {"token_positions": [1, 2, 3], "attention_scores": [0.4, 0.4, 0.2], "layer_id": 12},
+            {
+                "token_positions": [0, 1, 2],
+                "attention_scores": [0.5, 0.3, 0.2],
+                "layer_id": 6,
+            },
+            {
+                "token_positions": [1, 2, 3],
+                "attention_scores": [0.4, 0.4, 0.2],
+                "layer_id": 12,
+            },
         ]
 
         result = fingerprinter.fingerprint(tokens)

@@ -19,33 +19,28 @@ Usage:
     pytest test_attention_capture.py -v --full-validation
 """
 
-import asyncio
-import json
 import os
-import pytest
-import time
-import numpy as np
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-import httpx
 
 # Add parent to path for imports
 import sys
+from pathlib import Path
+
+import httpx
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from collector import AttentionCollector
 from scenarios import (
-    Scenario, ExpectedManifold,
-    SYNTAX_SCENARIOS, SEMANTIC_SCENARIOS, STRUCTURE_SCENARIOS,
+    SEMANTIC_SCENARIOS,
+    STRUCTURE_SCENARIOS,
+    SYNTAX_SCENARIOS,
+    ExpectedManifold,
+    Scenario,
     get_balanced_scenarios,
 )
-from collector import (
-    AttentionCollector, AttentionStep, AttentionToken,
-    Fingerprint, TraceData,
-)
-
 
 # Test configuration
 DEFAULT_SERVER_URL = os.environ.get("SGLANG_SERVER_URL", "http://localhost:30000")
@@ -187,9 +182,7 @@ class TestAttentionCapture:
             name="basic_test",
             category="test",
             description="Basic attention capture test",
-            messages=[
-                {"role": "user", "content": "What is 2 + 2?"}
-            ],
+            messages=[{"role": "user", "content": "What is 2 + 2?"}],
             expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
             max_tokens=50,
         )
@@ -216,9 +209,7 @@ class TestAttentionCapture:
             name="structure_test",
             category="test",
             description="Test attention token structure",
-            messages=[
-                {"role": "user", "content": "Hello, how are you?"}
-            ],
+            messages=[{"role": "user", "content": "Hello, how are you?"}],
             expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
             max_tokens=50,
         )
@@ -246,7 +237,10 @@ class TestAttentionCapture:
             category="test",
             description="Test attention weight normalization",
             messages=[
-                {"role": "user", "content": "Explain the concept of attention in neural networks briefly."}
+                {
+                    "role": "user",
+                    "content": "Explain the concept of attention in neural networks briefly.",
+                }
             ],
             expected_manifold=ExpectedManifold.SEMANTIC_BRIDGE,
             max_tokens=100,
@@ -268,7 +262,10 @@ class TestAttentionCapture:
             category="test",
             description="Test mass distribution computation",
             messages=[
-                {"role": "user", "content": "Write a short paragraph about programming."}
+                {
+                    "role": "user",
+                    "content": "Write a short paragraph about programming.",
+                }
             ],
             expected_manifold=ExpectedManifold.SEMANTIC_BRIDGE,
             max_tokens=150,
@@ -302,9 +299,7 @@ class TestFingerprintGeneration:
             name="fingerprint_test",
             category="test",
             description="Test fingerprint generation",
-            messages=[
-                {"role": "user", "content": "List three primary colors."}
-            ],
+            messages=[{"role": "user", "content": "List three primary colors."}],
             expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
             max_tokens=50,
         )
@@ -322,9 +317,7 @@ class TestFingerprintGeneration:
             name="fingerprint_shape_test",
             category="test",
             description="Test fingerprint vector shape",
-            messages=[
-                {"role": "user", "content": "What is the capital of France?"}
-            ],
+            messages=[{"role": "user", "content": "What is the capital of France?"}],
             expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
             max_tokens=50,
         )
@@ -419,9 +412,7 @@ class TestPerformanceMetrics:
             name="timing_test",
             category="test",
             description="Test timing capture",
-            messages=[
-                {"role": "user", "content": "Count from 1 to 10."}
-            ],
+            messages=[{"role": "user", "content": "Count from 1 to 10."}],
             expected_manifold=ExpectedManifold.STRUCTURE_RIPPLE,
             max_tokens=50,
         )
@@ -449,9 +440,7 @@ class TestPerformanceMetrics:
             name="token_count_test",
             category="test",
             description="Test token counting",
-            messages=[
-                {"role": "user", "content": "Say hello."}
-            ],
+            messages=[{"role": "user", "content": "Say hello."}],
             expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
             max_tokens=20,
         )
@@ -483,23 +472,35 @@ class TestFullValidation:
         for scenario in scenarios:
             try:
                 trace = await collector.run_scenario(scenario)
-                results.append({
-                    "name": scenario.name,
-                    "category": scenario.category,
-                    "expected_manifold": scenario.expected_manifold.value,
-                    "completion_tokens": trace.completion_tokens,
-                    "attention_steps": len(trace.attention_steps),
-                    "avg_local_mass": np.mean([fp.local_mass for fp in trace.fingerprints]) if trace.fingerprints else 0,
-                    "avg_entropy": np.mean([fp.entropy for fp in trace.fingerprints]) if trace.fingerprints else 0,
-                    "tokens_per_second": trace.tokens_per_second,
-                    "success": True,
-                })
+                results.append(
+                    {
+                        "name": scenario.name,
+                        "category": scenario.category,
+                        "expected_manifold": scenario.expected_manifold.value,
+                        "completion_tokens": trace.completion_tokens,
+                        "attention_steps": len(trace.attention_steps),
+                        "avg_local_mass": (
+                            np.mean([fp.local_mass for fp in trace.fingerprints])
+                            if trace.fingerprints
+                            else 0
+                        ),
+                        "avg_entropy": (
+                            np.mean([fp.entropy for fp in trace.fingerprints])
+                            if trace.fingerprints
+                            else 0
+                        ),
+                        "tokens_per_second": trace.tokens_per_second,
+                        "success": True,
+                    }
+                )
             except Exception as e:
-                results.append({
-                    "name": scenario.name,
-                    "success": False,
-                    "error": str(e),
-                })
+                results.append(
+                    {
+                        "name": scenario.name,
+                        "success": False,
+                        "error": str(e),
+                    }
+                )
 
         # Print summary
         print("\n" + "=" * 60)
@@ -514,7 +515,9 @@ class TestFullValidation:
         print(f"Failures: {len(failures)}")
 
         for r in successes:
-            print(f"  [OK] {r['name']}: {r['completion_tokens']} tokens, {r['attention_steps']} steps")
+            print(
+                f"  [OK] {r['name']}: {r['completion_tokens']} tokens, {r['attention_steps']} steps"
+            )
 
         for r in failures:
             print(f"  [FAIL] {r['name']}: {r.get('error', 'Unknown error')}")
@@ -533,7 +536,9 @@ class TestModelSpecific:
         actual_model = collector.model_name
 
         if model_name:
-            assert model_name in actual_model, f"Expected {model_name}, got {actual_model}"
+            assert (
+                model_name in actual_model
+            ), f"Expected {model_name}, got {actual_model}"
 
         print(f"Testing with model: {actual_model}")
 
@@ -570,7 +575,10 @@ class TestModelSpecific:
             category="test",
             description="Test long context attention",
             messages=[
-                {"role": "user", "content": f"{long_context}\n\nBased on the text above, who designed the Analytical Engine?"}
+                {
+                    "role": "user",
+                    "content": f"{long_context}\n\nBased on the text above, who designed the Analytical Engine?",
+                }
             ],
             expected_manifold=ExpectedManifold.LONG_RANGE,
             max_tokens=100,
@@ -582,7 +590,11 @@ class TestModelSpecific:
         assert len(trace.attention_steps) > 0
 
         # With long context, should see some long-range attention
-        avg_long_mass = np.mean([fp.long_mass for fp in trace.fingerprints]) if trace.fingerprints else 0
+        avg_long_mass = (
+            np.mean([fp.long_mass for fp in trace.fingerprints])
+            if trace.fingerprints
+            else 0
+        )
         print(f"Average long-range mass: {avg_long_mass:.3f}")
 
         # Just verify we can handle long context
@@ -605,7 +617,10 @@ class TestHardwareValidation:
                 category="benchmark",
                 description="Throughput benchmark",
                 messages=[
-                    {"role": "user", "content": f"Write a short story about adventure number {i}."}
+                    {
+                        "role": "user",
+                        "content": f"Write a short story about adventure number {i}.",
+                    }
                 ],
                 expected_manifold=ExpectedManifold.DIFFUSE,
                 max_tokens=200,
@@ -620,7 +635,11 @@ class TestHardwareValidation:
         for scenario in scenarios:
             trace = await collector.run_scenario(scenario)
             # Use attention steps as proxy for tokens in streaming mode
-            tokens = trace.completion_tokens if trace.completion_tokens > 0 else len(trace.attention_steps)
+            tokens = (
+                trace.completion_tokens
+                if trace.completion_tokens > 0
+                else len(trace.attention_steps)
+            )
             total_tokens += tokens
             total_time += trace.total_generation_time_ms / 1000
 
@@ -635,7 +654,9 @@ class TestHardwareValidation:
         print(f"{'=' * 60}")
 
         # Verify reasonable throughput (>10 tokens/sec)
-        assert avg_throughput > 10, f"Throughput too low: {avg_throughput:.1f} tokens/sec"
+        assert (
+            avg_throughput > 10
+        ), f"Throughput too low: {avg_throughput:.1f} tokens/sec"
 
     @pytest.mark.asyncio
     async def test_memory_stability(self, collector, full_validation):
@@ -649,9 +670,7 @@ class TestHardwareValidation:
                 name=f"memory_test_{i}",
                 category="test",
                 description="Memory stability test",
-                messages=[
-                    {"role": "user", "content": f"What is {i} + {i}?"}
-                ],
+                messages=[{"role": "user", "content": f"What is {i} + {i}?"}],
                 expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
                 max_tokens=30,
             )

@@ -30,22 +30,24 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import random
 import sqlite3
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional
+
 import aiohttp
 
 # Import manifest module for reproducibility layer
 try:
     import sys
+
     # Add parent directory for schemas import
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from schemas.manifest import ExperimentManifest, RunType
+
     HAS_MANIFEST = True
 except ImportError:
     HAS_MANIFEST = False
@@ -53,11 +55,14 @@ except ImportError:
 # Import threshold tuner for adaptive zone tuning
 try:
     from .threshold_tuner import ZoneThresholdTuner, create_threshold_tuner
+
     HAS_THRESHOLD_TUNER = True
 except ImportError:
     HAS_THRESHOLD_TUNER = False
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
@@ -65,12 +70,14 @@ logger = logging.getLogger(__name__)
 # PROBE PACKS - Each designed to excite specific attention programs
 # ============================================================================
 
+
 @dataclass
 class Probe:
     """A single probe with expected behavior label."""
+
     prompt: str
     expected_zone: str  # syntax_floor, semantic_bridge, structure_ripple
-    pack: str           # Probe pack name for grouping
+    pack: str  # Probe pack name for grouping
     max_tokens: int = 256
 
 
@@ -81,11 +88,14 @@ def generate_json_repair_probes() -> List[Probe]:
         ('Complete this JSON array: [1, 2, 3, {"nested": [4, 5,', 50),
         ('Fix the brackets: def foo(): return {"a": 1, "b": [2, 3}', 100),
         ('Parse and fix: [{"id": 1, "values": [10, 20, 30}, {"id": 2}]', 100),
-        ('Complete: CREATE TABLE users (id INT, name VARCHAR(255', 50),
-        ('Fix this YAML:\nname: test\nitems:\n  - item1\n  - item2\n  nested:\n    key: value', 100),
+        ("Complete: CREATE TABLE users (id INT, name VARCHAR(255", 50),
+        (
+            "Fix this YAML:\nname: test\nitems:\n  - item1\n  - item2\n  nested:\n    key: value",
+            100,
+        ),
     ]
     return [
-        Probe(prompt=p, expected_zone='syntax_floor', pack='json_repair', max_tokens=t)
+        Probe(prompt=p, expected_zone="syntax_floor", pack="json_repair", max_tokens=t)
         for p, t in templates
     ]
 
@@ -93,21 +103,41 @@ def generate_json_repair_probes() -> List[Probe]:
 def generate_coref_probes() -> List[Probe]:
     """Coreference and retrieval - expected to produce semantic_bridge patterns."""
     templates = [
-        ("Alice met Bob at the park. She gave him a book. Later, he thanked her for it. "
-         "Who received the book?", 50),
-        ("The cat sat on the mat. The dog lay near the door. It wagged its tail. "
-         "Which animal wagged its tail?", 50),
-        ("Dr. Smith examined the patient. She noted the symptoms. He described his pain. "
-         "Who described the pain?", 50),
-        ("John's car broke down. Mary offered to help. She drove him to the mechanic. "
-         "Whose car needed repair?", 50),
-        ("The red ball and the blue ball were on the table. Sarah picked up the larger one. "
-         "The one she chose was the red ball. What color was the larger ball?", 100),
-        ("In the story, the hero found a sword. Later, he used it to defeat the dragon. "
-         "The weapon was magical. What did the hero use against the dragon?", 100),
+        (
+            "Alice met Bob at the park. She gave him a book. Later, he thanked her for it. "
+            "Who received the book?",
+            50,
+        ),
+        (
+            "The cat sat on the mat. The dog lay near the door. It wagged its tail. "
+            "Which animal wagged its tail?",
+            50,
+        ),
+        (
+            "Dr. Smith examined the patient. She noted the symptoms. He described his pain. "
+            "Who described the pain?",
+            50,
+        ),
+        (
+            "John's car broke down. Mary offered to help. She drove him to the mechanic. "
+            "Whose car needed repair?",
+            50,
+        ),
+        (
+            "The red ball and the blue ball were on the table. Sarah picked up the larger one. "
+            "The one she chose was the red ball. What color was the larger ball?",
+            100,
+        ),
+        (
+            "In the story, the hero found a sword. Later, he used it to defeat the dragon. "
+            "The weapon was magical. What did the hero use against the dragon?",
+            100,
+        ),
     ]
     return [
-        Probe(prompt=p, expected_zone='semantic_bridge', pack='coreference', max_tokens=t)
+        Probe(
+            prompt=p, expected_zone="semantic_bridge", pack="coreference", max_tokens=t
+        )
         for p, t in templates
     ]
 
@@ -120,10 +150,18 @@ def generate_counting_table_probes() -> List[Probe]:
         ("List the first 20 Fibonacci numbers with their indices.", 300),
         ("Generate a CSV with columns: ID, Name, Score for 15 students.", 400),
         ("Create a weekly schedule table with hours 9AM-5PM and days Mon-Fri.", 400),
-        ("Write a table of ASCII codes for letters A-Z (uppercase and lowercase).", 400),
+        (
+            "Write a table of ASCII codes for letters A-Z (uppercase and lowercase).",
+            400,
+        ),
     ]
     return [
-        Probe(prompt=p, expected_zone='structure_ripple', pack='counting_tables', max_tokens=t)
+        Probe(
+            prompt=p,
+            expected_zone="structure_ripple",
+            pack="counting_tables",
+            max_tokens=t,
+        )
         for p, t in templates
     ]
 
@@ -131,21 +169,32 @@ def generate_counting_table_probes() -> List[Probe]:
 def generate_code_editing_probes() -> List[Probe]:
     """Code editing tasks - mixed patterns depending on task type."""
     templates = [
-        ("Rename the variable 'x' to 'count' in this code:\n"
-         "def sum_list(items):\n    x = 0\n    for item in items:\n        x += item\n    return x",
-         150, 'syntax_floor'),
-        ("Add type hints to this function:\n"
-         "def calculate(a, b, operation):\n    if operation == 'add':\n        return a + b\n    return a - b",
-         150, 'syntax_floor'),
-        ("Refactor this code to use list comprehension:\n"
-         "result = []\nfor i in range(10):\n    if i % 2 == 0:\n        result.append(i * 2)",
-         100, 'semantic_bridge'),
-        ("Add error handling to this code:\n"
-         "def divide(a, b):\n    return a / b",
-         150, 'semantic_bridge'),
+        (
+            "Rename the variable 'x' to 'count' in this code:\n"
+            "def sum_list(items):\n    x = 0\n    for item in items:\n        x += item\n    return x",
+            150,
+            "syntax_floor",
+        ),
+        (
+            "Add type hints to this function:\n"
+            "def calculate(a, b, operation):\n    if operation == 'add':\n        return a + b\n    return a - b",
+            150,
+            "syntax_floor",
+        ),
+        (
+            "Refactor this code to use list comprehension:\n"
+            "result = []\nfor i in range(10):\n    if i % 2 == 0:\n        result.append(i * 2)",
+            100,
+            "semantic_bridge",
+        ),
+        (
+            "Add error handling to this code:\n" "def divide(a, b):\n    return a / b",
+            150,
+            "semantic_bridge",
+        ),
     ]
     return [
-        Probe(prompt=p, expected_zone=z, pack='code_editing', max_tokens=t)
+        Probe(prompt=p, expected_zone=z, pack="code_editing", max_tokens=t)
         for p, t, z in templates
     ]
 
@@ -153,20 +202,32 @@ def generate_code_editing_probes() -> List[Probe]:
 def generate_reasoning_probes() -> List[Probe]:
     """Multi-step reasoning - exercises deep attention patterns."""
     templates = [
-        ("If it takes 5 machines 5 minutes to make 5 widgets, how long would it take "
-         "100 machines to make 100 widgets? Think step by step.", 200),
-        ("A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. "
-         "How much does the ball cost? Show your reasoning.", 200),
-        ("There are 3 boxes. One contains only apples, one contains only oranges, and one "
-         "contains both. The boxes are labeled, but all labels are wrong. If you can only "
-         "pick one fruit from one box, which box should you pick from to determine all "
-         "contents? Explain your logic.", 300),
-        ("A farmer needs to cross a river with a fox, a chicken, and a bag of grain. "
-         "The boat can only carry the farmer and one item. If left alone, the fox will eat "
-         "the chicken, and the chicken will eat the grain. How should the farmer cross?", 400),
+        (
+            "If it takes 5 machines 5 minutes to make 5 widgets, how long would it take "
+            "100 machines to make 100 widgets? Think step by step.",
+            200,
+        ),
+        (
+            "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. "
+            "How much does the ball cost? Show your reasoning.",
+            200,
+        ),
+        (
+            "There are 3 boxes. One contains only apples, one contains only oranges, and one "
+            "contains both. The boxes are labeled, but all labels are wrong. If you can only "
+            "pick one fruit from one box, which box should you pick from to determine all "
+            "contents? Explain your logic.",
+            300,
+        ),
+        (
+            "A farmer needs to cross a river with a fox, a chicken, and a bag of grain. "
+            "The boat can only carry the farmer and one item. If left alone, the fox will eat "
+            "the chicken, and the chicken will eat the grain. How should the farmer cross?",
+            400,
+        ),
     ]
     return [
-        Probe(prompt=p, expected_zone='semantic_bridge', pack='reasoning', max_tokens=t)
+        Probe(prompt=p, expected_zone="semantic_bridge", pack="reasoning", max_tokens=t)
         for p, t in templates
     ]
 
@@ -174,14 +235,26 @@ def generate_reasoning_probes() -> List[Probe]:
 def generate_adversarial_probes() -> List[Probe]:
     """Edge cases and adversarial inputs - for detecting anomalies."""
     templates = [
-        ("a" * 500, 50, 'diffuse'),  # Repetitive noise
-        ("The the the the quick quick brown brown fox fox jumps jumps", 100, 'diffuse'),
-        ("Explain quantum entanglement using only words starting with 'q'.", 200, 'semantic_bridge'),
-        ("Write a story where every sentence contradicts the previous one.", 300, 'diffuse'),
-        ("Translate to French: Hello. Now to Spanish. Now to German. Now back to English.", 200, 'diffuse'),
+        ("a" * 500, 50, "diffuse"),  # Repetitive noise
+        ("The the the the quick quick brown brown fox fox jumps jumps", 100, "diffuse"),
+        (
+            "Explain quantum entanglement using only words starting with 'q'.",
+            200,
+            "semantic_bridge",
+        ),
+        (
+            "Write a story where every sentence contradicts the previous one.",
+            300,
+            "diffuse",
+        ),
+        (
+            "Translate to French: Hello. Now to Spanish. Now to German. Now back to English.",
+            200,
+            "diffuse",
+        ),
     ]
     return [
-        Probe(prompt=p, expected_zone=z, pack='adversarial', max_tokens=t)
+        Probe(prompt=p, expected_zone=z, pack="adversarial", max_tokens=t)
         for p, t, z in templates
     ]
 
@@ -199,7 +272,7 @@ def generate_natural_probes() -> List[Probe]:
         ("What happened during World War II?", 300),
     ]
     return [
-        Probe(prompt=p, expected_zone='semantic_bridge', pack='natural', max_tokens=t)
+        Probe(prompt=p, expected_zone="semantic_bridge", pack="natural", max_tokens=t)
         for p, t in templates
     ]
 
@@ -207,13 +280,13 @@ def generate_natural_probes() -> List[Probe]:
 def get_all_probe_packs() -> Dict[str, List[Probe]]:
     """Get all probe packs with their probes."""
     return {
-        'json_repair': generate_json_repair_probes(),
-        'coreference': generate_coref_probes(),
-        'counting_tables': generate_counting_table_probes(),
-        'code_editing': generate_code_editing_probes(),
-        'reasoning': generate_reasoning_probes(),
-        'adversarial': generate_adversarial_probes(),
-        'natural': generate_natural_probes(),
+        "json_repair": generate_json_repair_probes(),
+        "coreference": generate_coref_probes(),
+        "counting_tables": generate_counting_table_probes(),
+        "code_editing": generate_code_editing_probes(),
+        "reasoning": generate_reasoning_probes(),
+        "adversarial": generate_adversarial_probes(),
+        "natural": generate_natural_probes(),
     }
 
 
@@ -221,9 +294,11 @@ def get_all_probe_packs() -> Dict[str, List[Probe]]:
 # HARNESS - Runs probes and captures fingerprints
 # ============================================================================
 
+
 @dataclass
 class ProbeResult:
     """Result of running a single probe."""
+
     probe: Probe
     request_id: str
     response: str
@@ -248,18 +323,18 @@ class ManifoldHarness:
         thresholds_path: Optional[str] = None,
         tuner_state_path: Optional[str] = None,
     ):
-        self.server_url = server_url.rstrip('/')
+        self.server_url = server_url.rstrip("/")
         self.db_path = Path(db_path)
         self.concurrency = concurrency
         self.seed = seed
         self.tune_thresholds = tune_thresholds
         self.probe_packs = get_all_probe_packs()
         self.results: List[ProbeResult] = []
-        self._manifest: Optional['ExperimentManifest'] = None
+        self._manifest: Optional["ExperimentManifest"] = None
         self._init_db()
 
         # Initialize threshold tuner if enabled
-        self._threshold_tuner: Optional['ZoneThresholdTuner'] = None
+        self._threshold_tuner: Optional["ZoneThresholdTuner"] = None
         if tune_thresholds and HAS_THRESHOLD_TUNER:
             self._threshold_tuner = create_threshold_tuner(
                 thresholds_path=thresholds_path,
@@ -278,7 +353,8 @@ class ManifoldHarness:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS probe_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 request_id TEXT,
@@ -293,14 +369,19 @@ class ManifoldHarness:
                 timestamp TEXT,
                 error TEXT
             )
-        """)
+        """
+        )
 
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_probe_pack ON probe_results(pack)
-        """)
-        cursor.execute("""
+        """
+        )
+        cursor.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_probe_timestamp ON probe_results(timestamp)
-        """)
+        """
+        )
 
         conn.commit()
         conn.close()
@@ -311,24 +392,29 @@ class ManifoldHarness:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             INSERT INTO probe_results
             (request_id, pack, expected_zone, actual_zone, prompt, response,
              fingerprint, duration_ms, tokens_generated, timestamp, error)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            result.request_id,
-            result.probe.pack,
-            result.probe.expected_zone,
-            result.manifold_zone,
-            result.probe.prompt[:500],  # Truncate long prompts
-            result.response[:2000] if result.response else None,  # Truncate long responses
-            json.dumps(result.fingerprint) if result.fingerprint else None,
-            result.duration_ms,
-            result.tokens_generated,
-            result.timestamp,
-            result.error,
-        ))
+        """,
+            (
+                result.request_id,
+                result.probe.pack,
+                result.probe.expected_zone,
+                result.manifold_zone,
+                result.probe.prompt[:500],  # Truncate long prompts
+                (
+                    result.response[:2000] if result.response else None
+                ),  # Truncate long responses
+                json.dumps(result.fingerprint) if result.fingerprint else None,
+                result.duration_ms,
+                result.tokens_generated,
+                result.timestamp,
+                result.error,
+            ),
+        )
 
         conn.commit()
         conn.close()
@@ -365,7 +451,7 @@ class ManifoldHarness:
                     timeout=aiohttp.ClientTimeout(total=60),
                 ) as resp:
                     async for line in resp.content:
-                        line = line.decode('utf-8').strip()
+                        line = line.decode("utf-8").strip()
                         if not line or line == "data: [DONE]":
                             continue
                         if line.startswith("data: "):
@@ -377,9 +463,15 @@ class ManifoldHarness:
                                     response_text += content
                                     tokens += 1
                                 # Extract fingerprint from attention data
-                                attn = data.get("choices", [{}])[0].get("attention_tokens")
+                                attn = data.get("choices", [{}])[0].get(
+                                    "attention_tokens"
+                                )
                                 if attn and isinstance(attn, list) and len(attn) > 0:
-                                    latest = attn[-1] if isinstance(attn[-1], dict) else attn[0]
+                                    latest = (
+                                        attn[-1]
+                                        if isinstance(attn[-1], dict)
+                                        else attn[0]
+                                    )
                                     if "fingerprint" in latest:
                                         fingerprint = latest["fingerprint"]
                                     if "manifold_zone" in latest:
@@ -426,10 +518,10 @@ class ManifoldHarness:
         fp = result.fingerprint
         if isinstance(fp, list) and len(fp) >= 4:
             features = {
-                'local_mass': fp[0],
-                'mid_mass': fp[1],
-                'long_mass': fp[2],
-                'entropy': fp[3],
+                "local_mass": fp[0],
+                "mid_mass": fp[1],
+                "long_mass": fp[2],
+                "entropy": fp[3],
             }
         elif isinstance(fp, dict):
             features = fp
@@ -439,7 +531,7 @@ class ManifoldHarness:
         self._threshold_tuner.add_sample(
             fingerprint_id=hash(result.request_id),
             features=features,
-            predicted_zone=result.manifold_zone or 'unknown',
+            predicted_zone=result.manifold_zone or "unknown",
             actual_zone=result.probe.expected_zone,
             confidence=0.0,
         )
@@ -462,17 +554,17 @@ class ManifoldHarness:
         if probe_mix is None:
             # Default: 70% structured probes, 30% natural
             probe_mix = {
-                'json_repair': 0.12,
-                'coreference': 0.12,
-                'counting_tables': 0.12,
-                'code_editing': 0.12,
-                'reasoning': 0.12,
-                'adversarial': 0.10,
-                'natural': 0.30,
+                "json_repair": 0.12,
+                "coreference": 0.12,
+                "counting_tables": 0.12,
+                "code_editing": 0.12,
+                "reasoning": 0.12,
+                "adversarial": 0.10,
+                "natural": 0.30,
             }
 
         # Create experiment manifest for reproducibility
-        run_id = datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
+        run_id = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
         if HAS_MANIFEST:
             self._manifest = ExperimentManifest.create(
                 run_type=RunType.PROBE_HARNESS,
@@ -535,7 +627,9 @@ class ManifoldHarness:
                 if result.error:
                     errors += 1
                 if result.manifold_zone:
-                    zone_counts[result.manifold_zone] = zone_counts.get(result.manifold_zone, 0) + 1
+                    zone_counts[result.manifold_zone] = (
+                        zone_counts.get(result.manifold_zone, 0) + 1
+                    )
 
                 # Progress update every 10 probes
                 if probes_run % 10 == 0:
@@ -587,7 +681,9 @@ class ManifoldHarness:
             Path where manifest was saved, or None if manifest not available
         """
         if not HAS_MANIFEST or not self._manifest:
-            logger.warning("Manifest not available (run discovery first or install manifest module)")
+            logger.warning(
+                "Manifest not available (run discovery first or install manifest module)"
+            )
             return None
 
         manifest_path = Path(output_path)
@@ -659,6 +755,7 @@ class ManifoldHarness:
 # REPORT GENERATION
 # ============================================================================
 
+
 def generate_report(db_path: str) -> str:
     """Generate analysis report from captured data."""
     conn = sqlite3.connect(db_path)
@@ -681,27 +778,33 @@ def generate_report(db_path: str) -> str:
     report_lines.append("-" * 40)
     report_lines.append("PROBES BY PACK")
     report_lines.append("-" * 40)
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT pack, COUNT(*), AVG(duration_ms), AVG(tokens_generated)
         FROM probe_results
         GROUP BY pack
         ORDER BY COUNT(*) DESC
-    """)
+    """
+    )
     for pack, count, avg_duration, avg_tokens in cursor.fetchall():
-        report_lines.append(f"  {pack:20s}: {count:5d} probes | {avg_duration:.0f}ms avg | {avg_tokens:.0f} tokens avg")
+        report_lines.append(
+            f"  {pack:20s}: {count:5d} probes | {avg_duration:.0f}ms avg | {avg_tokens:.0f} tokens avg"
+        )
     report_lines.append("")
 
     # Zone distribution
     report_lines.append("-" * 40)
     report_lines.append("ZONE DISTRIBUTION")
     report_lines.append("-" * 40)
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT actual_zone, COUNT(*) as cnt
         FROM probe_results
         WHERE actual_zone IS NOT NULL
         GROUP BY actual_zone
         ORDER BY cnt DESC
-    """)
+    """
+    )
     for zone, count in cursor.fetchall():
         pct = (count / total) * 100
         bar = "#" * int(pct / 2)
@@ -713,13 +816,15 @@ def generate_report(db_path: str) -> str:
     report_lines.append("ZONE CONFUSION MATRIX (Expected vs Actual)")
     report_lines.append("-" * 40)
 
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT expected_zone, actual_zone, COUNT(*) as cnt
         FROM probe_results
         WHERE actual_zone IS NOT NULL
         GROUP BY expected_zone, actual_zone
         ORDER BY expected_zone, actual_zone
-    """)
+    """
+    )
     confusion = {}
     zones = set()
     for exp, act, cnt in cursor.fetchall():
@@ -748,7 +853,8 @@ def generate_report(db_path: str) -> str:
     report_lines.append("CLUSTER PURITY BY PACK")
     report_lines.append("-" * 40)
 
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT pack,
                COUNT(*) as total,
                SUM(CASE WHEN expected_zone = actual_zone THEN 1 ELSE 0 END) as correct
@@ -756,17 +862,22 @@ def generate_report(db_path: str) -> str:
         WHERE actual_zone IS NOT NULL
         GROUP BY pack
         ORDER BY pack
-    """)
+    """
+    )
     for pack, total, correct in cursor.fetchall():
         purity = (correct / total * 100) if total > 0 else 0
         bar = "#" * int(purity / 5)
-        report_lines.append(f"  {pack:20s}: {purity:5.1f}% purity ({correct}/{total}) {bar}")
+        report_lines.append(
+            f"  {pack:20s}: {purity:5.1f}% purity ({correct}/{total}) {bar}"
+        )
     report_lines.append("")
 
     # Error rate
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT COUNT(*) FROM probe_results WHERE error IS NOT NULL
-    """)
+    """
+    )
     errors = cursor.fetchone()[0]
     error_rate = (errors / total * 100) if total > 0 else 0
     report_lines.append(f"Error Rate: {error_rate:.1f}% ({errors}/{total} probes)")
@@ -780,6 +891,7 @@ def generate_report(db_path: str) -> str:
 # ============================================================================
 # CLI
 # ============================================================================
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -795,71 +907,76 @@ Examples:
 
   # Generate report from captured data
   python prompt_harness.py --report --db fingerprints.db
-        """
+        """,
     )
 
     parser.add_argument(
-        "--server", "-s",
+        "--server",
+        "-s",
         default="http://localhost:8000",
-        help="SGLang server URL (default: http://localhost:8000)"
+        help="SGLang server URL (default: http://localhost:8000)",
     )
     parser.add_argument(
-        "--duration", "-d",
+        "--duration",
+        "-d",
         type=int,
         default=5,
-        help="Discovery duration in minutes (default: 5)"
+        help="Discovery duration in minutes (default: 5)",
     )
     parser.add_argument(
         "--db",
         default="fingerprints.db",
-        help="SQLite database path (default: fingerprints.db)"
+        help="SQLite database path (default: fingerprints.db)",
     )
     parser.add_argument(
-        "--concurrency", "-c",
+        "--concurrency",
+        "-c",
         type=int,
         default=1,
-        help="Concurrent requests (default: 1)"
+        help="Concurrent requests (default: 1)",
     )
     parser.add_argument(
-        "--report", "-r",
+        "--report",
+        "-r",
         action="store_true",
-        help="Generate report from existing data instead of running probes"
+        help="Generate report from existing data instead of running probes",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="Random seed for reproducibility (default: None)"
+        help="Random seed for reproducibility (default: None)",
     )
     parser.add_argument(
-        "--output-dir", "-o",
+        "--output-dir",
+        "-o",
         default=None,
-        help="Output directory for manifest and report (default: same as db)"
+        help="Output directory for manifest and report (default: same as db)",
     )
 
     # Threshold tuning arguments
     parser.add_argument(
         "--tune-thresholds",
         action="store_true",
-        help="Enable adaptive zone threshold tuning"
+        help="Enable adaptive zone threshold tuning",
     )
     parser.add_argument(
         "--thresholds",
         type=str,
         default=None,
-        help="Path to initial zone thresholds JSON (for tuning)"
+        help="Path to initial zone thresholds JSON (for tuning)",
     )
     parser.add_argument(
         "--tuner-state",
         type=str,
         default=None,
-        help="Path to tuner state file (for resuming tuning)"
+        help="Path to tuner state file (for resuming tuning)",
     )
     parser.add_argument(
         "--export-thresholds",
         type=str,
         default=None,
-        help="Path to export optimized thresholds after tuning"
+        help="Path to export optimized thresholds after tuning",
     )
 
     args = parser.parse_args()
@@ -874,7 +991,7 @@ Examples:
         print(report)
 
         # Also save to file
-        report_path = Path(args.db).with_suffix('.report.txt')
+        report_path = Path(args.db).with_suffix(".report.txt")
         report_path.write_text(report)
         print(f"\nReport saved to: {report_path}")
         return 0
@@ -901,12 +1018,12 @@ Examples:
     print("\n" + report)
 
     # Save report to file
-    report_path = output_dir / Path(args.db).with_suffix('.report.txt').name
+    report_path = output_dir / Path(args.db).with_suffix(".report.txt").name
     report_path.write_text(report)
     print(f"\nReport saved to: {report_path}")
 
     # Save manifest for reproducibility
-    manifest_path = output_dir / Path(args.db).with_suffix('.manifest.json').name
+    manifest_path = output_dir / Path(args.db).with_suffix(".manifest.json").name
     saved_path = harness.save_manifest(str(manifest_path))
     if saved_path:
         print(f"Manifest saved to: {saved_path}")
@@ -921,7 +1038,7 @@ Examples:
             print("=" * 40)
             print(f"Overall accuracy: {accuracy.get('overall', 0):.1%}")
             for zone, acc in accuracy.items():
-                if zone != 'overall':
+                if zone != "overall":
                     print(f"  {zone}: {acc:.1%}")
 
             # Print suggestions

@@ -9,35 +9,32 @@ Tests the RapidsSidecar server including:
 """
 
 import json
-import os
 import sqlite3
 import struct
-import threading
-import time
-import pytest
-import numpy as np
-from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
-from http.client import HTTPConnection
-from urllib.request import urlopen, Request
-from urllib.error import URLError
 
 # Add parent to path for imports
 import sys
+import threading
+from pathlib import Path
+
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from rapids_sidecar import (
-    ClusteringBackend,
-    FingerprintStorage,
-    SIDECAR_VERSION,
     HAS_RAPIDS,
     HAS_SKLEARN,
     HAS_ZMQ,
+    SIDECAR_VERSION,
+    ClusteringBackend,
+    FingerprintStorage,
 )
 
 # Import sidecar class if available
 try:
-    from rapids_sidecar import RapidsSidecar, ClusterCentroid
+    from rapids_sidecar import ClusterCentroid, RapidsSidecar
+
     HAS_SIDECAR = True
 except ImportError:
     HAS_SIDECAR = False
@@ -48,7 +45,7 @@ FINGERPRINT_DIM = 20
 
 def pack_fingerprint(arr: np.ndarray) -> bytes:
     """Pack numpy array to fingerprint blob."""
-    return struct.pack(f'<{FINGERPRINT_DIM}f', *arr.astype(np.float32))
+    return struct.pack(f"<{FINGERPRINT_DIM}f", *arr.astype(np.float32))
 
 
 class TestFingerprintStorageIntegration:
@@ -56,7 +53,9 @@ class TestFingerprintStorageIntegration:
 
     def test_full_write_read_cycle(self, temp_db_with_schema):
         """Test complete write and read cycle."""
-        storage = FingerprintStorage(db_path=temp_db_with_schema, session_id="test-session")
+        storage = FingerprintStorage(
+            db_path=temp_db_with_schema, session_id="test-session"
+        )
         storage._ensure_initialized()
 
         # Write multiple fingerprints
@@ -92,7 +91,9 @@ class TestFingerprintStorageIntegration:
 
     def test_concurrent_writes(self, temp_db_with_schema):
         """Test concurrent writes from multiple threads."""
-        storage = FingerprintStorage(db_path=temp_db_with_schema, session_id="test-session")
+        storage = FingerprintStorage(
+            db_path=temp_db_with_schema, session_id="test-session"
+        )
         storage._ensure_initialized()
 
         errors = []
@@ -131,7 +132,9 @@ class TestFingerprintStorageIntegration:
 
     def test_storage_stats(self, temp_db_with_schema):
         """Test storage statistics."""
-        storage = FingerprintStorage(db_path=temp_db_with_schema, session_id="test-session")
+        storage = FingerprintStorage(
+            db_path=temp_db_with_schema, session_id="test-session"
+        )
         storage._ensure_initialized()
 
         # Write some fingerprints
@@ -149,7 +152,9 @@ class TestFingerprintStorageIntegration:
 
     def test_storage_close(self, temp_db_with_schema):
         """Test storage cleanup on close."""
-        storage = FingerprintStorage(db_path=temp_db_with_schema, session_id="test-session")
+        storage = FingerprintStorage(
+            db_path=temp_db_with_schema, session_id="test-session"
+        )
         storage._ensure_initialized()
 
         # Write and flush
@@ -202,10 +207,10 @@ class TestRapidsSidecarInit:
         sidecar = RapidsSidecar(
             port=0,
             db_path=temp_db_with_schema,
-            discovery_dir=discovery_artifacts['output_dir'],
+            discovery_dir=discovery_artifacts["output_dir"],
         )
 
-        assert sidecar.discovery_dir == discovery_artifacts['output_dir']
+        assert sidecar.discovery_dir == discovery_artifacts["output_dir"]
 
 
 @pytest.mark.skipif(not HAS_SIDECAR, reason="RapidsSidecar not available")
@@ -258,7 +263,9 @@ class TestRapidsSidecarFingerprints:
 class TestOnlineClustering:
     """Tests for online clustering functionality."""
 
-    def test_clustering_updates_centroids(self, temp_db_with_schema, sample_fingerprints_large):
+    def test_clustering_updates_centroids(
+        self, temp_db_with_schema, sample_fingerprints_large
+    ):
         """Test that clustering produces centroids."""
         sidecar = RapidsSidecar(
             port=0,
@@ -401,8 +408,8 @@ class TestZMQIntegration:
         }
 
         # Should be valid JSON
-        encoded = json.dumps(message).encode('utf-8')
-        decoded = json.loads(encoded.decode('utf-8'))
+        encoded = json.dumps(message).encode("utf-8")
+        decoded = json.loads(encoded.decode("utf-8"))
 
         assert decoded["request_id"] == "test-req"
         assert len(decoded["vector"]) == FINGERPRINT_DIM
@@ -413,7 +420,7 @@ class TestDiscoveryIntegration:
 
     def test_load_discovery_artifacts(self, discovery_artifacts):
         """Test loading discovery artifacts."""
-        output_dir = Path(discovery_artifacts['output_dir'])
+        output_dir = Path(discovery_artifacts["output_dir"])
         latest_dir = output_dir / "latest"
 
         # Verify artifacts exist
@@ -424,7 +431,7 @@ class TestDiscoveryIntegration:
 
     def test_centroids_from_discovery(self, discovery_artifacts):
         """Test loading centroids from discovery artifacts."""
-        centroids_path = Path(discovery_artifacts['run_dir']) / "centroids.json"
+        centroids_path = Path(discovery_artifacts["run_dir"]) / "centroids.json"
 
         with open(centroids_path) as f:
             centroids = json.load(f)

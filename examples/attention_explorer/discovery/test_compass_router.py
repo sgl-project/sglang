@@ -5,28 +5,26 @@ Tests the angular analysis and routing logic for the compass-based
 query router that uses Sinq anchoring.
 """
 
-import pytest
 import numpy as np
-from typing import List
+import pytest
 
 from .compass_router import (
-    SinqAnchor,
-    CompassReading,
-    CompassRoutingDecision,
-    CompassHeading,
-    RoutingTier,
+    COMPASS_GLOSSARY,
     CompassAnalyzer,
+    CompassHeading,
+    CompassReading,
     CompassRouter,
     CompassRouterConfig,
-    COMPASS_GLOSSARY,
-    create_compass_router,
+    RoutingTier,
+    SinqAnchor,
     analyze_attention_compass,
+    create_compass_router,
 )
-
 
 # =============================================================================
 # SINQ ANCHOR TESTS
 # =============================================================================
+
 
 class TestSinqAnchor:
     """Test SinqAnchor extraction."""
@@ -101,6 +99,7 @@ class TestSinqAnchor:
 # COMPASS ANALYZER TESTS
 # =============================================================================
 
+
 class TestCompassAnalyzer:
     """Test CompassAnalyzer."""
 
@@ -111,7 +110,7 @@ class TestCompassAnalyzer:
         reading = analyzer.analyze(
             query_pos=100,
             key_positions=[95, 96, 97, 98, 99],
-            attention_scores=[0.1, 0.15, 0.2, 0.25, 0.3]
+            attention_scores=[0.1, 0.15, 0.2, 0.25, 0.3],
         )
 
         assert reading.angular_variance < 0.3
@@ -125,7 +124,7 @@ class TestCompassAnalyzer:
         reading = analyzer.analyze(
             query_pos=500,
             key_positions=[10, 100, 200, 400, 499],
-            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2]
+            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2],
         )
 
         assert 0.2 < reading.angular_variance < 0.8
@@ -139,7 +138,7 @@ class TestCompassAnalyzer:
         reading = analyzer.analyze(
             query_pos=1000,
             key_positions=[10, 100, 300, 500, 700, 999],
-            attention_scores=[0.16, 0.17, 0.17, 0.17, 0.17, 0.16]
+            attention_scores=[0.16, 0.17, 0.17, 0.17, 0.17, 0.16],
         )
 
         # Should have relatively high variance
@@ -152,7 +151,7 @@ class TestCompassAnalyzer:
         reading = analyzer.analyze(
             query_pos=100,
             key_positions=[0, 1, 2, 3, 50],
-            attention_scores=[0.4, 0.2, 0.15, 0.15, 0.1]
+            attention_scores=[0.4, 0.2, 0.15, 0.15, 0.1],
         )
 
         assert reading.anchor.is_sink_dominated
@@ -163,9 +162,7 @@ class TestCompassAnalyzer:
         analyzer = CompassAnalyzer()
 
         reading = analyzer.analyze(
-            query_pos=100,
-            key_positions=[90, 95, 99],
-            attention_scores=[0.2, 0.3, 0.5]
+            query_pos=100, key_positions=[90, 95, 99], attention_scores=[0.2, 0.3, 0.5]
         )
 
         # Local tokens should have low variance and clear heading
@@ -177,9 +174,7 @@ class TestCompassAnalyzer:
         analyzer = CompassAnalyzer()
 
         reading = analyzer.analyze(
-            query_pos=1000,
-            key_positions=[10, 20, 30],
-            attention_scores=[0.4, 0.3, 0.3]
+            query_pos=1000, key_positions=[10, 20, 30], attention_scores=[0.4, 0.3, 0.3]
         )
 
         # Distant tokens should map to NORTH or WEST
@@ -192,7 +187,7 @@ class TestCompassAnalyzer:
         reading = analyzer.analyze(
             query_pos=100,
             key_positions=[95, 96, 97, 98, 99],
-            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2]
+            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2],
         )
 
         assert reading.angular_concentration == pytest.approx(
@@ -204,6 +199,7 @@ class TestCompassAnalyzer:
 # COMPASS ROUTER TESTS
 # =============================================================================
 
+
 class TestCompassRouter:
     """Test CompassRouter routing logic."""
 
@@ -214,12 +210,15 @@ class TestCompassRouter:
         decision = router.route(
             query_pos=100,
             key_positions=[95, 96, 97, 98, 99],
-            attention_scores=[0.1, 0.15, 0.2, 0.25, 0.3]
+            attention_scores=[0.1, 0.15, 0.2, 0.25, 0.3],
         )
 
         assert decision.tier == RoutingTier.SMALL
         assert not decision.use_chain_of_thought
-        assert "syntactic" in decision.reason.lower() or "focused" in decision.reason.lower()
+        assert (
+            "syntactic" in decision.reason.lower()
+            or "focused" in decision.reason.lower()
+        )
 
     def test_route_sink_dominated_to_large(self):
         """Sink-dominated attention should route to LARGE."""
@@ -228,21 +227,22 @@ class TestCompassRouter:
         decision = router.route(
             query_pos=100,
             key_positions=[0, 1, 2, 3, 50],
-            attention_scores=[0.4, 0.2, 0.15, 0.15, 0.1]
+            attention_scores=[0.4, 0.2, 0.15, 0.15, 0.1],
         )
 
         assert decision.tier == RoutingTier.LARGE
         assert decision.use_chain_of_thought
-        assert "sink" in decision.reason.lower() or "uncertainty" in decision.reason.lower()
+        assert (
+            "sink" in decision.reason.lower()
+            or "uncertainty" in decision.reason.lower()
+        )
 
     def test_route_returns_recommendations(self):
         """Route should return model recommendations."""
         router = CompassRouter()
 
         decision = router.route(
-            query_pos=100,
-            key_positions=[90, 95, 99],
-            attention_scores=[0.3, 0.3, 0.4]
+            query_pos=100, key_positions=[90, 95, 99], attention_scores=[0.3, 0.3, 0.4]
         )
 
         assert decision.recommended_model is not None
@@ -260,7 +260,7 @@ class TestCompassRouter:
         decision = router.route(
             query_pos=500,
             key_positions=[10, 100, 200, 400, 499],
-            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2]
+            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2],
         )
 
         # Should use CoT if variance > 0.3
@@ -273,16 +273,14 @@ class TestCompassRouter:
 
         # Very focused pattern
         decision_focused = router.route(
-            query_pos=100,
-            key_positions=[98, 99],
-            attention_scores=[0.3, 0.7]
+            query_pos=100, key_positions=[98, 99], attention_scores=[0.3, 0.7]
         )
 
         # Distributed pattern
         decision_distributed = router.route(
             query_pos=500,
             key_positions=[10, 100, 200, 300, 400, 499],
-            attention_scores=[0.16, 0.17, 0.17, 0.17, 0.17, 0.16]
+            attention_scores=[0.16, 0.17, 0.17, 0.17, 0.17, 0.16],
         )
 
         assert decision_focused.confidence >= decision_distributed.confidence
@@ -296,7 +294,7 @@ class TestCompassRouter:
             router.route(
                 query_pos=100,
                 key_positions=[95, 96, 97, 98, 99],
-                attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2]
+                attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2],
             )
 
         stats = router.get_statistics()
@@ -310,7 +308,7 @@ class TestCompassRouter:
         router.route(
             query_pos=100,
             key_positions=[95, 96, 97, 98, 99],
-            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2]
+            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2],
         )
 
         router.reset_statistics()
@@ -322,6 +320,7 @@ class TestCompassRouter:
 # FINGERPRINT ROUTING TESTS
 # =============================================================================
 
+
 class TestFingerprintRouting:
     """Test routing from fingerprint vectors."""
 
@@ -332,9 +331,9 @@ class TestFingerprintRouting:
         # Create fingerprint with high local ratio
         # Structure: [entropy, entropy_std, local_ratio, mid_ratio, long_ratio, ...]
         fingerprint = np.zeros(20)
-        fingerprint[0] = 1.5   # Low entropy
-        fingerprint[2] = 0.7   # High local ratio
-        fingerprint[4] = 0.1   # Low long ratio
+        fingerprint[0] = 1.5  # Low entropy
+        fingerprint[2] = 0.7  # High local ratio
+        fingerprint[4] = 0.1  # Low long ratio
 
         decision = router.route_fingerprint(fingerprint)
 
@@ -346,9 +345,9 @@ class TestFingerprintRouting:
         router = CompassRouter()
 
         fingerprint = np.zeros(20)
-        fingerprint[0] = 3.5   # High entropy
-        fingerprint[2] = 0.2   # Low local ratio
-        fingerprint[4] = 0.5   # High long ratio
+        fingerprint[0] = 3.5  # High entropy
+        fingerprint[2] = 0.2  # Low local ratio
+        fingerprint[4] = 0.5  # High long ratio
 
         decision = router.route_fingerprint(fingerprint)
 
@@ -360,6 +359,7 @@ class TestFingerprintRouting:
 # =============================================================================
 # CONFIGURATION TESTS
 # =============================================================================
+
 
 class TestCompassRouterConfig:
     """Test configuration options."""
@@ -376,7 +376,7 @@ class TestCompassRouterConfig:
         decision = router.route(
             query_pos=100,
             key_positions=[95, 96, 97, 98, 99],
-            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2]
+            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2],
         )
 
         # Should route to LARGE due to low thresholds
@@ -396,11 +396,13 @@ class TestCompassRouterConfig:
         decision = router.route(
             query_pos=100,
             key_positions=[95, 96, 97, 98, 99],
-            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2]
+            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2],
         )
 
         assert decision.recommended_model in [
-            "my-small-model", "my-medium-model", "my-large-model"
+            "my-small-model",
+            "my-medium-model",
+            "my-large-model",
         ]
 
 
@@ -408,12 +410,18 @@ class TestCompassRouterConfig:
 # GLOSSARY TESTS
 # =============================================================================
 
+
 class TestCompassGlossary:
     """Test educational glossary."""
 
     def test_glossary_has_required_terms(self):
         """Glossary should have key terms."""
-        required_terms = ["sinq_anchor", "compass_heading", "angular_variance", "routing_tier"]
+        required_terms = [
+            "sinq_anchor",
+            "compass_heading",
+            "angular_variance",
+            "routing_tier",
+        ]
 
         for term in required_terms:
             assert term in COMPASS_GLOSSARY
@@ -432,6 +440,7 @@ class TestCompassGlossary:
 # FACTORY FUNCTION TESTS
 # =============================================================================
 
+
 class TestFactoryFunctions:
     """Test factory/convenience functions."""
 
@@ -447,9 +456,7 @@ class TestFactoryFunctions:
     def test_analyze_attention_compass(self):
         """analyze_attention_compass should return reading."""
         reading = analyze_attention_compass(
-            query_pos=100,
-            key_positions=[90, 95, 99],
-            attention_scores=[0.3, 0.3, 0.4]
+            query_pos=100, key_positions=[90, 95, 99], attention_scores=[0.3, 0.3, 0.4]
         )
 
         assert isinstance(reading, CompassReading)
@@ -460,6 +467,7 @@ class TestFactoryFunctions:
 # SERIALIZATION TESTS
 # =============================================================================
 
+
 class TestSerialization:
     """Test to_dict serialization."""
 
@@ -467,9 +475,7 @@ class TestSerialization:
         """CompassReading should serialize to dict."""
         analyzer = CompassAnalyzer()
         reading = analyzer.analyze(
-            query_pos=100,
-            key_positions=[90, 95, 99],
-            attention_scores=[0.3, 0.3, 0.4]
+            query_pos=100, key_positions=[90, 95, 99], attention_scores=[0.3, 0.3, 0.4]
         )
 
         d = reading.to_dict()
@@ -483,9 +489,7 @@ class TestSerialization:
         """CompassRoutingDecision should serialize to dict."""
         router = CompassRouter()
         decision = router.route(
-            query_pos=100,
-            key_positions=[90, 95, 99],
-            attention_scores=[0.3, 0.3, 0.4]
+            query_pos=100, key_positions=[90, 95, 99], attention_scores=[0.3, 0.3, 0.4]
         )
 
         d = decision.to_dict()
@@ -500,6 +504,7 @@ class TestSerialization:
 # EDGE CASE TESTS
 # =============================================================================
 
+
 class TestEdgeCases:
     """Test edge cases and boundary conditions."""
 
@@ -508,9 +513,7 @@ class TestEdgeCases:
         analyzer = CompassAnalyzer()
 
         reading = analyzer.analyze(
-            query_pos=100,
-            key_positions=[50],
-            attention_scores=[1.0]
+            query_pos=100, key_positions=[50], attention_scores=[1.0]
         )
 
         # Single token should have approximately zero variance (floating point)
@@ -524,7 +527,7 @@ class TestEdgeCases:
         reading = analyzer.analyze(
             query_pos=100,
             key_positions=[0, 1, 2, 3, 4],
-            attention_scores=[0.3, 0.25, 0.2, 0.15, 0.1]
+            attention_scores=[0.3, 0.25, 0.2, 0.15, 0.1],
         )
 
         assert reading.pattern_type == "sink_dominated"
@@ -536,9 +539,7 @@ class TestEdgeCases:
 
         # At position 0, can only attend to sink (which is position 0)
         reading = analyzer.analyze(
-            query_pos=0,
-            key_positions=[0],
-            attention_scores=[1.0]
+            query_pos=0, key_positions=[0], attention_scores=[1.0]
         )
 
         assert reading is not None
@@ -550,7 +551,7 @@ class TestEdgeCases:
         reading = analyzer.analyze(
             query_pos=100000,
             key_positions=[100, 1000, 10000, 50000, 99999],
-            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2]
+            attention_scores=[0.2, 0.2, 0.2, 0.2, 0.2],
         )
 
         assert reading.angular_variance >= 0
@@ -561,12 +562,14 @@ class TestEdgeCases:
 # INTEGRATION TESTS
 # =============================================================================
 
+
 class TestIntegration:
     """Integration tests."""
 
     def test_demo_runs_without_error(self):
         """Demo should complete without error."""
         from .compass_router import demo
+
         demo()  # Should not raise
 
     def test_full_routing_pipeline(self):
@@ -606,7 +609,11 @@ class TestIntegration:
             decision = router.route(**pattern)
             decisions.append(decision)
             assert decision.tier is not None
-            assert decision.recommended_model in ["test-small", "test-medium", "test-large"]
+            assert decision.recommended_model in [
+                "test-small",
+                "test-medium",
+                "test-large",
+            ]
 
         # Verify statistics
         stats = router.get_statistics()

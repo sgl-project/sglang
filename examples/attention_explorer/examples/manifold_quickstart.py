@@ -25,7 +25,6 @@ Usage:
 
 import argparse
 import json
-import os
 import random
 import sqlite3
 import struct
@@ -46,7 +45,7 @@ FINGERPRINT_DIM = 20
 
 def pack_fingerprint(arr: np.ndarray) -> bytes:
     """Pack numpy array to fingerprint blob."""
-    return struct.pack(f'<{FINGERPRINT_DIM}f', *arr.astype(np.float32))
+    return struct.pack(f"<{FINGERPRINT_DIM}f", *arr.astype(np.float32))
 
 
 def init_database():
@@ -125,8 +124,7 @@ def generate_fingerprint(zone: str) -> np.ndarray:
     layer_entropy = [layer_base + random.uniform(-0.5, 0.5) for _ in range(8)]
 
     return np.array(
-        [local, mid, long, entropy] + list(hist) + layer_entropy,
-        dtype=np.float32
+        [local, mid, long, entropy] + list(hist) + layer_entropy, dtype=np.float32
     )
 
 
@@ -143,7 +141,13 @@ def generate_fingerprints(count: int = 500):
 
     # Use zones that match the schema CHECK constraint
     # Note: long_range and diffuse patterns are generated but stored as 'unknown'
-    zones = ["syntax_floor", "semantic_bridge", "structure_ripple", "long_range", "diffuse"]
+    zones = [
+        "syntax_floor",
+        "semantic_bridge",
+        "structure_ripple",
+        "long_range",
+        "diffuse",
+    ]
     zone_to_db = {
         "syntax_floor": "syntax_floor",
         "semantic_bridge": "semantic_bridge",
@@ -164,13 +168,18 @@ def generate_fingerprints(count: int = 500):
 
             for step in range(n_steps):
                 # Add small variation per step
-                fp = base_fp + np.random.uniform(-0.05, 0.05, FINGERPRINT_DIM).astype(np.float32)
+                fp = base_fp + np.random.uniform(-0.05, 0.05, FINGERPRINT_DIM).astype(
+                    np.float32
+                )
                 fp = np.clip(fp, 0, 10)  # Keep values reasonable
 
-                cursor.execute("""
+                cursor.execute(
+                    """
                     INSERT INTO fingerprints (request_id, step, fingerprint, manifold_zone)
                     VALUES (?, ?, ?, ?)
-                """, (request_id, step, pack_fingerprint(fp), zone_to_db[zone]))
+                """,
+                    (request_id, step, pack_fingerprint(fp), zone_to_db[zone]),
+                )
                 total_inserted += 1
 
         print(f"  Generated {per_zone} requests for zone: {zone}")
@@ -197,10 +206,14 @@ def run_discovery():
     cmd = [
         sys.executable,
         str(discovery_script),
-        "--db", DB_PATH,
-        "--output", OUTPUT_DIR,
-        "--hours", "24",
-        "--min-cluster-size", "10",
+        "--db",
+        DB_PATH,
+        "--output",
+        OUTPUT_DIR,
+        "--hours",
+        "24",
+        "--min-cluster-size",
+        "10",
     ]
 
     print(f"Command: {' '.join(cmd)}")
@@ -236,9 +249,12 @@ def start_sidecar():
     cmd = [
         sys.executable,
         str(sidecar_script),
-        "--port", str(SIDECAR_PORT),
-        "--db", DB_PATH,
-        "--discovery-dir", OUTPUT_DIR,
+        "--port",
+        str(SIDECAR_PORT),
+        "--db",
+        DB_PATH,
+        "--discovery-dir",
+        OUTPUT_DIR,
         "--online",
     ]
 
@@ -263,7 +279,9 @@ def classify_fingerprints():
             return False
     except requests.exceptions.ConnectionError:
         print(f"Cannot connect to sidecar at {base_url}")
-        print("Start the sidecar first: python examples/manifold_quickstart.py --step sidecar")
+        print(
+            "Start the sidecar first: python examples/manifold_quickstart.py --step sidecar"
+        )
         return False
 
     print("Sidecar is healthy!\n")
@@ -344,14 +362,21 @@ Examples:
         # Start sidecar in background for classify step
         print("Starting sidecar in background...")
         sidecar_script = Path(__file__).parent.parent / "rapids_sidecar.py"
-        sidecar_proc = subprocess.Popen([
-            sys.executable,
-            str(sidecar_script),
-            "--port", str(SIDECAR_PORT),
-            "--db", DB_PATH,
-            "--discovery-dir", OUTPUT_DIR,
-            "--online",
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        sidecar_proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(sidecar_script),
+                "--port",
+                str(SIDECAR_PORT),
+                "--db",
+                DB_PATH,
+                "--discovery-dir",
+                OUTPUT_DIR,
+                "--online",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
         try:
             for step in steps:

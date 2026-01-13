@@ -23,7 +23,7 @@ import sqlite3
 import struct
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
 
@@ -31,17 +31,14 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from discovery.fingerprint_schema import (
-    V1_DIM,
-    V2_DIM,
-    FP_LOCAL_MASS,
-    FP_MID_MASS,
-    FP_LONG_MASS,
     FP_ENTROPY,
+    FP_LOCAL_MASS,
+    FP_LONG_MASS,
+    FP_MID_MASS,
     FP_ROTATIONAL_VARIANCE,
     RV_THRESHOLD_LOCAL,
     RV_THRESHOLD_LONG_RANGE,
-    ZONE_THRESHOLDS,
-    is_v2,
+    V2_DIM,
 )
 
 
@@ -104,38 +101,46 @@ def classify_zone_v2(fingerprint: np.ndarray) -> Tuple[str, float]:
     mid_mass = fingerprint[FP_MID_MASS]
     long_mass = fingerprint[FP_LONG_MASS]
     entropy = fingerprint[FP_ENTROPY]
-    rv = fingerprint[FP_ROTATIONAL_VARIANCE] if len(fingerprint) > FP_ROTATIONAL_VARIANCE else 0.5
+    rv = (
+        fingerprint[FP_ROTATIONAL_VARIANCE]
+        if len(fingerprint) > FP_ROTATIONAL_VARIANCE
+        else 0.5
+    )
 
     total_mass = max(local_mass + mid_mass + long_mass, 1e-6)
 
     # Syntax floor: high local, low entropy, low RV
     if local_mass > 0.5 and entropy < 2.5 and rv <= RV_THRESHOLD_LOCAL:
         confidence = min(1.0, local_mass * (1.0 - entropy / 4.0) * (1.0 - rv))
-        return 'syntax_floor', confidence
+        return "syntax_floor", confidence
 
     # Structure ripple: high long-range, high RV
     if long_mass > 0.25 and rv >= RV_THRESHOLD_LONG_RANGE:
         confidence = min(1.0, (long_mass + rv) / 2)
-        return 'structure_ripple', confidence
+        return "structure_ripple", confidence
 
     # Semantic bridge: default
     confidence = mid_mass / total_mass
-    return 'semantic_bridge', confidence
+    return "semantic_bridge", confidence
 
 
-def load_fingerprints(db_path: str, limit: int = 100000) -> Tuple[np.ndarray, List[str], List[str]]:
+def load_fingerprints(
+    db_path: str, limit: int = 100000
+) -> Tuple[np.ndarray, List[str], List[str]]:
     """Load fingerprints from database."""
     print(f"Loading fingerprints from {db_path}...")
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    cursor.execute(f"""
+    cursor.execute(
+        f"""
         SELECT fingerprint, manifold_zone, request_id
         FROM fingerprints
         ORDER BY id
         LIMIT {limit}
-    """)
+    """
+    )
 
     rows = cursor.fetchall()
     conn.close()
@@ -146,13 +151,15 @@ def load_fingerprints(db_path: str, limit: int = 100000) -> Tuple[np.ndarray, Li
 
     for fp_blob, zone, req_id in rows:
         n_floats = len(fp_blob) // 4
-        fp = np.array(struct.unpack(f'<{n_floats}f', fp_blob))
+        fp = np.array(struct.unpack(f"<{n_floats}f", fp_blob))
         fingerprints.append(fp)
-        zones.append(zone or 'unknown')
+        zones.append(zone or "unknown")
         request_ids.append(req_id)
 
     fingerprints = np.array(fingerprints)
-    print(f"Loaded {len(fingerprints)} fingerprints (original dim={fingerprints.shape[1]})")
+    print(
+        f"Loaded {len(fingerprints)} fingerprints (original dim={fingerprints.shape[1]})"
+    )
 
     return fingerprints, zones, request_ids
 
@@ -196,7 +203,9 @@ def run_v2_exploration(
     v2_counts = count_zones(zones_v2)
 
     print("\nZone distribution comparison:")
-    print(f"{'Zone':<20} {'V1 Count':<12} {'V1 %':<10} {'V2 Count':<12} {'V2 %':<10} {'Delta'}")
+    print(
+        f"{'Zone':<20} {'V1 Count':<12} {'V1 %':<10} {'V2 Count':<12} {'V2 %':<10} {'Delta'}"
+    )
     print("-" * 75)
     all_zones = set(v1_counts.keys()) | set(v2_counts.keys())
     for zone in sorted(all_zones):
@@ -205,7 +214,9 @@ def run_v2_exploration(
         v1_pct = v1_c / len(zones_v1) * 100
         v2_pct = v2_c / len(zones_v2) * 100
         delta = v2_pct - v1_pct
-        print(f"{zone:<20} {v1_c:<12} {v1_pct:<10.1f} {v2_c:<12} {v2_pct:<10.1f} {delta:+.1f}%")
+        print(
+            f"{zone:<20} {v1_c:<12} {v1_pct:<10.1f} {v2_c:<12} {v2_pct:<10.1f} {delta:+.1f}%"
+        )
 
     # RV statistics
     rv_values = fingerprints_v2[:, FP_ROTATIONAL_VARIANCE]
@@ -227,10 +238,13 @@ def run_v2_exploration(
     skeleton_indices = None
     try:
         from discovery.spectral_eviction import SpectralSkeletonComputer
+
         computer = SpectralSkeletonComputer(retention_ratio=skeleton_ratio)
         result = computer.compute_skeleton(fingerprints_v2, len(fingerprints_v2))
         skeleton_indices = result.skeleton_indices
-        print(f"Skeleton computed: {len(skeleton_indices)} tokens retained ({len(skeleton_indices)/len(fingerprints_v2)*100:.1f}%)")
+        print(
+            f"Skeleton computed: {len(skeleton_indices)} tokens retained ({len(skeleton_indices)/len(fingerprints_v2)*100:.1f}%)"
+        )
 
         # Skeleton zone distribution
         skeleton_zones = [zones_v2[i] for i in skeleton_indices]
@@ -261,7 +275,7 @@ def run_v2_exploration(
 
     # Write summary report
     summary_path = os.path.join(output_dir, "v2_exploration_summary.md")
-    with open(summary_path, 'w') as f:
+    with open(summary_path, "w") as f:
         f.write("# V2 Exploration Summary\n\n")
         f.write(f"**Source Database:** {db_path}\n")
         f.write(f"**Fingerprints:** {len(fingerprints_v2)}\n")
@@ -276,7 +290,9 @@ def run_v2_exploration(
             v1_pct = v1_c / len(zones_v1) * 100
             v2_pct = v2_c / len(zones_v2) * 100
             delta = v2_pct - v1_pct
-            f.write(f"| {zone} | {v1_c} | {v1_pct:.1f}% | {v2_c} | {v2_pct:.1f}% | {delta:+.1f}% |\n")
+            f.write(
+                f"| {zone} | {v1_c} | {v1_pct:.1f}% | {v2_c} | {v2_pct:.1f}% | {delta:+.1f}% |\n"
+            )
 
         f.write("\n## Rotational Variance Statistics\n\n")
         f.write(f"- **Min:** {rv_values.min():.3f}\n")
@@ -296,7 +312,9 @@ def run_v2_exploration(
             f.write(f"\n## Spectral Skeleton\n\n")
             f.write(f"- **Retention ratio:** {skeleton_ratio:.0%}\n")
             f.write(f"- **Tokens retained:** {len(skeleton_indices)}\n")
-            f.write(f"- **Tokens evicted:** {len(fingerprints_v2) - len(skeleton_indices)}\n\n")
+            f.write(
+                f"- **Tokens evicted:** {len(fingerprints_v2) - len(skeleton_indices)}\n\n"
+            )
 
             f.write("### Skeleton Zone Distribution\n\n")
             f.write("| Zone | Count | % |\n")
@@ -318,11 +336,11 @@ def run_v2_exploration(
     print(f"\nV2 exploration completed in {elapsed:.1f}s")
 
     return {
-        'fingerprints_v2': fingerprints_v2,
-        'zones_v2': zones_v2,
-        'skeleton_indices': skeleton_indices,
-        'rv_values': rv_values,
-        'saved_files': saved_files,
+        "fingerprints_v2": fingerprints_v2,
+        "zones_v2": zones_v2,
+        "skeleton_indices": skeleton_indices,
+        "rv_values": rv_values,
+        "saved_files": saved_files,
     }
 
 
@@ -331,10 +349,18 @@ def main():
         description="Run V2 exploration with rotational variance",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--db", "-d", required=True, help="Path to fingerprints database")
-    parser.add_argument("--output", "-o", default="./v2_outputs", help="Output directory")
-    parser.add_argument("--limit", "-n", type=int, default=100000, help="Max fingerprints to load")
-    parser.add_argument("--skeleton-ratio", type=float, default=0.3, help="Skeleton retention ratio")
+    parser.add_argument(
+        "--db", "-d", required=True, help="Path to fingerprints database"
+    )
+    parser.add_argument(
+        "--output", "-o", default="./v2_outputs", help="Output directory"
+    )
+    parser.add_argument(
+        "--limit", "-n", type=int, default=100000, help="Max fingerprints to load"
+    )
+    parser.add_argument(
+        "--skeleton-ratio", type=float, default=0.3, help="Skeleton retention ratio"
+    )
 
     args = parser.parse_args()
 

@@ -17,8 +17,7 @@ import argparse
 import sys
 import threading
 import time
-from collections import deque
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -38,10 +37,10 @@ except ImportError:
 
 # Zone colors
 ZONE_COLORS = {
-    'syntax_floor': '#3498db',      # Blue
-    'semantic_bridge': '#9b59b6',   # Purple
-    'structure_ripple': '#e74c3c',  # Red
-    'unknown': '#95a5a6',           # Gray
+    "syntax_floor": "#3498db",  # Blue
+    "semantic_bridge": "#9b59b6",  # Purple
+    "structure_ripple": "#e74c3c",  # Red
+    "unknown": "#95a5a6",  # Gray
 }
 
 # Sample prompts for variety
@@ -182,35 +181,38 @@ def run_visualization(base_url: str):
     manifold.start_requests()
 
     # Setup plot
-    fig, (ax_main, ax_stats) = plt.subplots(1, 2, figsize=(14, 6),
-                                             gridspec_kw={'width_ratios': [2, 1]})
-    fig.suptitle('Real-time Attention Manifold', fontsize=14, fontweight='bold')
+    fig, (ax_main, ax_stats) = plt.subplots(
+        1, 2, figsize=(14, 6), gridspec_kw={"width_ratios": [2, 1]}
+    )
+    fig.suptitle("Real-time Attention Manifold", fontsize=14, fontweight="bold")
 
     # Initialize scatter
     scatter = ax_main.scatter([], [], c=[], s=20, alpha=0.6)
-    ax_main.set_xlabel('PCA Dimension 1')
-    ax_main.set_ylabel('PCA Dimension 2')
-    ax_main.set_title('Fingerprint Manifold (colored by zone)')
+    ax_main.set_xlabel("PCA Dimension 1")
+    ax_main.set_ylabel("PCA Dimension 2")
+    ax_main.set_title("Fingerprint Manifold (colored by zone)")
     ax_main.grid(True, alpha=0.3)
 
     # Stats bars
     zone_names = list(ZONE_COLORS.keys())
-    bars = ax_stats.barh(zone_names, [0]*len(zone_names),
-                         color=[ZONE_COLORS[z] for z in zone_names])
-    ax_stats.set_xlabel('Count')
-    ax_stats.set_title('Zone Distribution')
+    bars = ax_stats.barh(
+        zone_names, [0] * len(zone_names), color=[ZONE_COLORS[z] for z in zone_names]
+    )
+    ax_stats.set_xlabel("Count")
+    ax_stats.set_title("Zone Distribution")
     ax_stats.set_xlim(0, 100)
 
     # Text for total
-    total_text = ax_stats.text(0.95, 0.95, '', transform=ax_stats.transAxes,
-                               ha='right', va='top', fontsize=12)
+    total_text = ax_stats.text(
+        0.95, 0.95, "", transform=ax_stats.transAxes, ha="right", va="top", fontsize=12
+    )
 
     def update(frame):
         coords, zones, counts = manifold.get_plot_data()
 
         if coords is not None and len(coords) > 0:
             # Update scatter
-            colors = [ZONE_COLORS.get(z, '#95a5a6') for z in zones]
+            colors = [ZONE_COLORS.get(z, "#95a5a6") for z in zones]
             scatter.set_offsets(coords)
             scatter.set_facecolors(colors)
 
@@ -228,14 +230,14 @@ def run_visualization(base_url: str):
 
             # Update total
             total = sum(counts.values())
-            total_text.set_text(f'Total: {total}')
+            total_text.set_text(f"Total: {total}")
 
         return scatter, *bars, total_text
 
     def on_close(event):
         manifold.stop()
 
-    fig.canvas.mpl_connect('close_event', on_close)
+    fig.canvas.mpl_connect("close_event", on_close)
 
     ani = FuncAnimation(fig, update, interval=200, blit=False, cache_frame_data=False)
     plt.tight_layout()

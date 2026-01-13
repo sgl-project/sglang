@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Compare attention patterns between Qwen3-80B and Qwen3-4B models."""
 
-import sqlite3
 import matplotlib.pyplot as plt
 import numpy as np
-from collections import defaultdict
 
 # Model data from explorations
 DATA = {
@@ -67,8 +65,15 @@ def create_comparison_charts():
 
     for i, zone in enumerate(["structure_ripple", "semantic_bridge", "syntax_floor"]):
         percentages = [calculate_percentages(DATA[m]["zones"])[zone] for m in models]
-        ax1.bar(x + i * width, percentages, width, label=zone.replace("_", " ").title(),
-                color=colors[zone], edgecolor="black", linewidth=0.5)
+        ax1.bar(
+            x + i * width,
+            percentages,
+            width,
+            label=zone.replace("_", " ").title(),
+            color=colors[zone],
+            edgecolor="black",
+            linewidth=0.5,
+        )
 
     ax1.set_ylabel("Percentage (%)", fontsize=12)
     ax1.set_title("Zone Distribution Comparison", fontsize=14, fontweight="bold")
@@ -83,8 +88,13 @@ def create_comparison_charts():
         percentages = [calculate_percentages(DATA[m]["zones"])[zone] for m in models]
         for j, pct in enumerate(percentages):
             if pct > 3:  # Only show label if bar is tall enough
-                ax1.annotate(f"{pct:.1f}%", xy=(j + i * width, pct + 1),
-                           ha="center", va="bottom", fontsize=9)
+                ax1.annotate(
+                    f"{pct:.1f}%",
+                    xy=(j + i * width, pct + 1),
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                )
 
     # 2. Pie Charts Side by Side
     ax2 = fig.add_subplot(2, 2, 2)
@@ -97,13 +107,24 @@ def create_comparison_charts():
 
     for ax, model in [(ax2a, models[0]), (ax2b, models[1])]:
         pcts = calculate_percentages(DATA[model]["zones"])
-        sizes = [pcts["structure_ripple"], pcts["semantic_bridge"], pcts["syntax_floor"]]
+        sizes = [
+            pcts["structure_ripple"],
+            pcts["semantic_bridge"],
+            pcts["syntax_floor"],
+        ]
         labels = ["Struct. Ripple", "Semantic Bridge", "Syntax Floor"]
-        cols = [colors["structure_ripple"], colors["semantic_bridge"], colors["syntax_floor"]]
+        cols = [
+            colors["structure_ripple"],
+            colors["semantic_bridge"],
+            colors["syntax_floor"],
+        ]
 
         wedges, texts, autotexts = ax.pie(
-            sizes, labels=None, autopct=lambda p: f'{p:.1f}%' if p > 2 else '',
-            colors=cols, startangle=90
+            sizes,
+            labels=None,
+            autopct=lambda p: f"{p:.1f}%" if p > 2 else "",
+            colors=cols,
+            startangle=90,
         )
         ax.set_title(model.split()[0], fontsize=11, fontweight="bold")
 
@@ -114,18 +135,36 @@ def create_comparison_charts():
     ax3 = fig.add_subplot(2, 2, 3)
 
     metrics = ["Tokens Generated", "Prompts Processed", "Discovery Runs"]
-    values_80b = [DATA[models[0]]["total_tokens"],
-                  DATA[models[0]]["total_prompts"],
-                  DATA[models[0]]["discovery_runs"] * 10000]  # Scale for visibility
-    values_4b = [DATA[models[1]]["total_tokens"],
-                 DATA[models[1]]["total_prompts"],
-                 DATA[models[1]]["discovery_runs"] * 10000]
+    values_80b = [
+        DATA[models[0]]["total_tokens"],
+        DATA[models[0]]["total_prompts"],
+        DATA[models[0]]["discovery_runs"] * 10000,
+    ]  # Scale for visibility
+    values_4b = [
+        DATA[models[1]]["total_tokens"],
+        DATA[models[1]]["total_prompts"],
+        DATA[models[1]]["discovery_runs"] * 10000,
+    ]
 
     x = np.arange(3)
     width = 0.35
 
-    bars1 = ax3.bar(x - width/2, values_80b, width, label=models[0], color="#3498db", edgecolor="black")
-    bars2 = ax3.bar(x + width/2, values_4b, width, label=models[1], color="#e74c3c", edgecolor="black")
+    bars1 = ax3.bar(
+        x - width / 2,
+        values_80b,
+        width,
+        label=models[0],
+        color="#3498db",
+        edgecolor="black",
+    )
+    bars2 = ax3.bar(
+        x + width / 2,
+        values_4b,
+        width,
+        label=models[1],
+        color="#e74c3c",
+        edgecolor="black",
+    )
 
     ax3.set_ylabel("Count", fontsize=12)
     ax3.set_title("Data Collection Comparison", fontsize=14, fontweight="bold")
@@ -139,9 +178,15 @@ def create_comparison_charts():
         for bar, val in zip(bars, vals):
             height = bar.get_height()
             label = f"{val:,}" if val < 1000 else f"{val/1000:.0f}K"
-            ax3.annotate(label, xy=(bar.get_x() + bar.get_width()/2, height),
-                        xytext=(0, 3), textcoords="offset points",
-                        ha="center", va="bottom", fontsize=9)
+            ax3.annotate(
+                label,
+                xy=(bar.get_x() + bar.get_width() / 2, height),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
 
     # 4. Key Findings Summary Table
     ax4 = fig.add_subplot(2, 2, 4)
@@ -181,12 +226,21 @@ def create_comparison_charts():
     - 80B: Better for tasks needing semantic reasoning
     """
 
-    ax4.text(0.05, 0.95, summary_text, transform=ax4.transAxes, fontsize=10,
-             verticalalignment="top", fontfamily="monospace",
-             bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+    ax4.text(
+        0.05,
+        0.95,
+        summary_text,
+        transform=ax4.transAxes,
+        fontsize=10,
+        verticalalignment="top",
+        fontfamily="monospace",
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+    )
 
     plt.tight_layout()
-    plt.savefig("./exploration_outputs/80b_vs_4b_comparison.png", dpi=150, bbox_inches="tight")
+    plt.savefig(
+        "./exploration_outputs/80b_vs_4b_comparison.png", dpi=150, bbox_inches="tight"
+    )
     plt.close()
 
     print("Comparison chart saved to: ./exploration_outputs/80b_vs_4b_comparison.png")
@@ -326,7 +380,9 @@ Based on zone distributions:
     with open("./exploration_outputs/80B_VS_4B_COMPARISON_REPORT.md", "w") as f:
         f.write(report)
 
-    print("Comparison report saved to: ./exploration_outputs/80B_VS_4B_COMPARISON_REPORT.md")
+    print(
+        "Comparison report saved to: ./exploration_outputs/80B_VS_4B_COMPARISON_REPORT.md"
+    )
 
 
 if __name__ == "__main__":
@@ -334,9 +390,9 @@ if __name__ == "__main__":
     create_comparison_report()
 
     # Print summary
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("COMPARISON SUMMARY: Qwen3-80B (MoE) vs Qwen3-4B (Dense)")
-    print("="*60)
+    print("=" * 60)
     print("\nZone Distribution:")
     print("-" * 50)
     print(f"{'Zone':<20} {'80B (MoE)':<15} {'4B (Dense)':<15}")
@@ -351,4 +407,4 @@ if __name__ == "__main__":
     print("-" * 50)
     print("\nKey Insight: 4B model relies ~20% more on structure_ripple")
     print("             80B model has ~20% more semantic_bridge usage")
-    print("="*60)
+    print("=" * 60)

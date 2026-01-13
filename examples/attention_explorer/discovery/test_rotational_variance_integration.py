@@ -12,44 +12,37 @@ RV Semantics (IMPORTANT - see TestRotationalVarianceGoldenInvariant):
 RV is NOT "semantic vs positional". It measures attention DISTANCE.
 """
 
-import pytest
 import unittest
+
 import numpy as np
-from typing import List, Tuple
+import pytest
+
+from .discovery_job import assign_zone_labels
 
 # Import the canonical schema module (single source of truth)
 from .fingerprint_schema import (
-    V1_DIM as FINGERPRINT_DIM,
-    V2_DIM as FINGERPRINT_DIM_V2,
-    FP_LOCAL_MASS,
-    FP_MID_MASS,
-    FP_LONG_MASS,
     FP_ENTROPY,
+    FP_LOCAL_MASS,
+    FP_LONG_MASS,
+    FP_MID_MASS,
     FP_ROTATIONAL_VARIANCE,
-    ZONE_THRESHOLDS,
-    RV_THRESHOLD_LOCAL,
-    RV_THRESHOLD_LONG_RANGE,
-    RV_SEMANTICS_DOC,
-    is_v2,
-    get_rotational_variance,
 )
+from .fingerprint_schema import V1_DIM as FINGERPRINT_DIM
+from .fingerprint_schema import V2_DIM as FINGERPRINT_DIM_V2
+from .fingerprint_schema import ZONE_THRESHOLDS
 
 # Import the modules under test
 from .rope_derotation import (
-    RoPEDerotator,
-    DerotatedAttention,
-    compute_rotational_variance_for_fingerprint,
     compute_rotational_variance_batch,
+    compute_rotational_variance_for_fingerprint,
     extend_fingerprint_with_rotational_variance,
     extend_fingerprints_batch,
 )
-from .classifier import OnlineClassifier
-from .discovery_job import assign_zone_labels
-
 
 # =============================================================================
 # FINGERPRINT COMPUTATION TESTS
 # =============================================================================
+
 
 class TestRotationalVarianceComputation:
     """Tests for rotational variance computation from attention patterns."""
@@ -124,6 +117,7 @@ class TestRotationalVarianceComputation:
 # FINGERPRINT EXTENSION TESTS
 # =============================================================================
 
+
 class TestFingerprintExtension:
     """Tests for extending fingerprints from v1 (20-dim) to v2 (21-dim)."""
 
@@ -149,7 +143,9 @@ class TestFingerprintExtension:
         result = extend_fingerprint_with_rotational_variance(fp_v2, 0.5)
 
         assert len(result) == 21
-        assert result[FP_ROTATIONAL_VARIANCE] == pytest.approx(0.35, rel=1e-5)  # Original value preserved
+        assert result[FP_ROTATIONAL_VARIANCE] == pytest.approx(
+            0.35, rel=1e-5
+        )  # Original value preserved
 
     def test_extend_batch(self):
         """Extend a batch of fingerprints."""
@@ -176,6 +172,7 @@ class TestFingerprintExtension:
 # =============================================================================
 # ZONE CLASSIFICATION WITH ROTATIONAL VARIANCE TESTS
 # =============================================================================
+
 
 class TestZoneClassificationWithRotationalVariance:
     """Tests for zone classification using rotational variance (v2 fingerprints)."""
@@ -229,7 +226,7 @@ class TestZoneClassificationWithRotationalVariance:
 
         zones, confidences = assign_zone_labels(fp.reshape(1, -1))
 
-        assert zones[0] == 'syntax_floor'
+        assert zones[0] == "syntax_floor"
         assert confidences[0] > 0.3  # Should have decent confidence
 
     def test_syntax_floor_blocked_by_high_rotational_variance(self):
@@ -248,7 +245,7 @@ class TestZoneClassificationWithRotationalVariance:
 
         # Should NOT be syntax_floor due to high rotational variance
         # (high RV indicates long-range attention, inconsistent with syntax)
-        assert zones[0] in ['semantic_bridge', 'structure_ripple']
+        assert zones[0] in ["semantic_bridge", "structure_ripple"]
 
     def test_structure_ripple_with_high_rotational_variance(self):
         """Structure ripple: long-range + HIGH rotational variance = strong signal."""
@@ -267,7 +264,7 @@ class TestZoneClassificationWithRotationalVariance:
 
         zones, confidences = assign_zone_labels(fp.reshape(1, -1))
 
-        assert zones[0] == 'structure_ripple'
+        assert zones[0] == "structure_ripple"
 
     def test_semantic_bridge_medium_rotational_variance(self):
         """Semantic bridge with medium rotational variance."""
@@ -282,7 +279,7 @@ class TestZoneClassificationWithRotationalVariance:
 
         zones, confidences = assign_zone_labels(fp.reshape(1, -1))
 
-        assert zones[0] == 'semantic_bridge'
+        assert zones[0] == "semantic_bridge"
 
     def test_backwards_compatibility_v1_fingerprints(self):
         """V1 fingerprints (20-dim) should still classify correctly."""
@@ -296,7 +293,7 @@ class TestZoneClassificationWithRotationalVariance:
         zones, confidences = assign_zone_labels(fp_v1.reshape(1, -1))
 
         # Should use original heuristics without rotational variance
-        assert zones[0] == 'syntax_floor'
+        assert zones[0] == "syntax_floor"
         assert confidences[0] > 0
 
     def test_mixed_batch_v1_and_v2(self):
@@ -317,14 +314,15 @@ class TestZoneClassificationWithRotationalVariance:
 
         zones, confidences = assign_zone_labels(fps)
 
-        assert zones[0] == 'syntax_floor'
-        assert zones[1] == 'semantic_bridge'
-        assert zones[2] == 'structure_ripple'
+        assert zones[0] == "syntax_floor"
+        assert zones[1] == "semantic_bridge"
+        assert zones[2] == "structure_ripple"
 
 
 # =============================================================================
 # CLASSIFIER INTEGRATION TESTS
 # =============================================================================
+
 
 class TestClassifierWithRotationalVariance:
     """Tests for OnlineClassifier using rotational variance."""
@@ -368,14 +366,15 @@ class TestClassifierWithRotationalVariance:
 
     def test_zone_thresholds_have_rotational_variance(self):
         """Verify zone thresholds include rotational variance parameters."""
-        assert 'rotational_variance_max' in ZONE_THRESHOLDS['syntax_floor']
-        assert 'rotational_variance_min' in ZONE_THRESHOLDS['structure_ripple']
-        assert 'rotational_variance_range' in ZONE_THRESHOLDS['semantic_bridge']
+        assert "rotational_variance_max" in ZONE_THRESHOLDS["syntax_floor"]
+        assert "rotational_variance_min" in ZONE_THRESHOLDS["structure_ripple"]
+        assert "rotational_variance_range" in ZONE_THRESHOLDS["semantic_bridge"]
 
 
 # =============================================================================
 # EDGE CASE TESTS
 # =============================================================================
+
 
 class TestEdgeCases:
     """Edge case tests for rotational variance integration."""
@@ -398,7 +397,7 @@ class TestEdgeCases:
         zones, _ = assign_zone_labels(fps)
 
         # At boundary should be syntax_floor
-        assert zones[0] == 'syntax_floor'
+        assert zones[0] == "syntax_floor"
         # Over boundary should NOT be syntax_floor
         # (will be semantic_bridge since no other zone matches)
 
@@ -411,7 +410,7 @@ class TestEdgeCases:
 
         zones, confidences = assign_zone_labels(fp.reshape(1, -1))
 
-        assert zones[0] == 'syntax_floor'
+        assert zones[0] == "syntax_floor"
         # Zero RV should boost confidence significantly
         assert confidences[0] > 0.4
 
@@ -427,7 +426,7 @@ class TestEdgeCases:
         zones, _ = assign_zone_labels(fp.reshape(1, -1))
 
         # Despite local mass, high RV should prevent syntax_floor
-        assert zones[0] != 'syntax_floor'
+        assert zones[0] != "syntax_floor"
 
     def test_very_small_fingerprint_batch(self):
         """Test with single-element batch."""
@@ -445,6 +444,7 @@ class TestEdgeCases:
 # CONSISTENCY TESTS
 # =============================================================================
 
+
 class TestConsistency:
     """Tests for consistency of schema constants from fingerprint_schema.py."""
 
@@ -461,7 +461,7 @@ class TestConsistency:
 
     def test_zone_names_are_consistent(self):
         """Ensure zone names are consistent across modules."""
-        expected_zones = {'syntax_floor', 'semantic_bridge', 'structure_ripple'}
+        expected_zones = {"syntax_floor", "semantic_bridge", "structure_ripple"}
 
         # Check classifier thresholds
         classifier_zones = set(ZONE_THRESHOLDS.keys())
@@ -495,6 +495,7 @@ class TestConsistency:
 # INTEGRATION SCENARIO TESTS
 # =============================================================================
 
+
 class TestIntegrationScenarios:
     """Real-world integration scenarios."""
 
@@ -526,11 +527,11 @@ class TestIntegrationScenarios:
         zones, _ = assign_zone_labels(fps)
 
         # Pattern 1 should be syntax (local attention to nearby tokens)
-        assert zones[0] == 'syntax_floor'
+        assert zones[0] == "syntax_floor"
 
         # Pattern 2 should NOT be syntax despite similar local mass
         # (high RV indicates long-range attention, inconsistent with local mass)
-        assert zones[1] != 'syntax_floor'
+        assert zones[1] != "syntax_floor"
 
     def test_hallucination_warning_scenario(self):
         """
@@ -557,8 +558,8 @@ class TestIntegrationScenarios:
         zones, confidences = assign_zone_labels(fps)
 
         # Both are structure_ripple, but confidence differs
-        assert zones[0] == 'structure_ripple'
-        assert zones[1] == 'structure_ripple'
+        assert zones[0] == "structure_ripple"
+        assert zones[1] == "structure_ripple"
 
         # Pattern 2 (consistent RV) should have higher confidence
         # (high RV confirms long-range attention)
@@ -568,6 +569,7 @@ class TestIntegrationScenarios:
 # =============================================================================
 # GOLDEN TEST: RV Direction Invariant
 # =============================================================================
+
 
 class TestRotationalVarianceGoldenInvariant(unittest.TestCase):
     """
@@ -631,10 +633,14 @@ class TestRotationalVarianceGoldenInvariant(unittest.TestCase):
         )
 
         # INVARIANT: Local → low RV (syntax_floor threshold ≤ 0.25)
-        assert rv_local <= 0.25, f"Local RV should be ≤ 0.25 for syntax_floor, got {rv_local:.3f}"
+        assert (
+            rv_local <= 0.25
+        ), f"Local RV should be ≤ 0.25 for syntax_floor, got {rv_local:.3f}"
 
         # INVARIANT: Long-range → high RV (structure_ripple threshold ≥ 0.35)
-        assert rv_long >= 0.35, f"Long-range RV should be ≥ 0.35 for structure_ripple, got {rv_long:.3f}"
+        assert (
+            rv_long >= 0.35
+        ), f"Long-range RV should be ≥ 0.35 for structure_ripple, got {rv_long:.3f}"
 
         # INVARIANT: Monotonic ordering
         assert rv_local < rv_mid < rv_long, (
@@ -654,8 +660,8 @@ class TestRotationalVarianceGoldenInvariant(unittest.TestCase):
         """
         from discovery.discovery_job import ZONE_THRESHOLDS
 
-        sf_max = ZONE_THRESHOLDS['syntax_floor'].get('rotational_variance_max', 1.0)
-        sr_min = ZONE_THRESHOLDS['structure_ripple'].get('rotational_variance_min', 0.0)
+        sf_max = ZONE_THRESHOLDS["syntax_floor"].get("rotational_variance_max", 1.0)
+        sr_min = ZONE_THRESHOLDS["structure_ripple"].get("rotational_variance_min", 0.0)
 
         # INVARIANT: syntax_floor RV threshold < structure_ripple RV threshold
         assert sf_max < sr_min, (
@@ -688,13 +694,18 @@ class TestRotationalVarianceGoldenInvariant(unittest.TestCase):
         zones, _ = assign_zone_labels(fps)
 
         # INVARIANT: Low RV → local zone, High RV → long-range zone
-        assert zones[0] == 'syntax_floor', f"Low RV pattern should be syntax_floor, got {zones[0]}"
-        assert zones[1] == 'structure_ripple', f"High RV pattern should be structure_ripple, got {zones[1]}"
+        assert (
+            zones[0] == "syntax_floor"
+        ), f"Low RV pattern should be syntax_floor, got {zones[0]}"
+        assert (
+            zones[1] == "structure_ripple"
+        ), f"High RV pattern should be structure_ripple, got {zones[1]}"
 
 
 # =============================================================================
 # RUN DEMO
 # =============================================================================
+
 
 def demo():
     """Demonstrate rotational variance integration."""

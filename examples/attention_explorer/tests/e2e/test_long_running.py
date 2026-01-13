@@ -31,13 +31,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from scenarios import (
-    ALL_SCENARIOS, SCENARIOS_BY_CATEGORY,
-    get_random_scenarios, get_balanced_scenarios, Scenario
-)
-from collector import AttentionCollector, CollectionRunner, CollectionRun
 from analyzer import AttentionAnalyzer, RunAnalysis
+from collector import AttentionCollector, CollectionRun, CollectionRunner
 from report_generator import ReportGenerator
+from scenarios import (
+    ALL_SCENARIOS,
+    SCENARIOS_BY_CATEGORY,
+    Scenario,
+    get_balanced_scenarios,
+    get_random_scenarios,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -45,7 +48,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-    ]
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -69,7 +72,9 @@ class TestRunner:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Add file logging
-        log_file = self.output_dir / f"test_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        log_file = (
+            self.output_dir / f"test_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(
             logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -138,7 +143,9 @@ class TestRunner:
 
         logger.info(f"Running {len(scenarios)} scenarios from categories: {categories}")
 
-        run = await self._run_collection(scenarios, max_duration=self.timeout_minutes * 60)
+        run = await self._run_collection(
+            scenarios, max_duration=self.timeout_minutes * 60
+        )
         analysis = self._analyze_results(run)
         self._generate_report(run, analysis)
 

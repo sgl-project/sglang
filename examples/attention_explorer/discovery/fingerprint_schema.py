@@ -35,12 +35,12 @@ FINGERPRINT_DIM = V1_DIM  # Default to v1 for backward compatibility
 # =============================================================================
 
 # Attention mass distribution (positions 0-2)
-FP_LOCAL_MASS = 0      # Attention mass in local window (0-32 tokens)
-FP_MID_MASS = 1        # Attention mass in mid range (32-256 tokens)
-FP_LONG_MASS = 2       # Attention mass in long range (256+ tokens)
+FP_LOCAL_MASS = 0  # Attention mass in local window (0-32 tokens)
+FP_MID_MASS = 1  # Attention mass in mid range (32-256 tokens)
+FP_LONG_MASS = 2  # Attention mass in long range (256+ tokens)
 
 # Attention entropy (position 3)
-FP_ENTROPY = 3         # Attention entropy (higher = more distributed)
+FP_ENTROPY = 3  # Attention entropy (higher = more distributed)
 
 # Distance histogram (positions 4-11)
 FP_HISTOGRAM_START = 4
@@ -79,8 +79,8 @@ FP_ROTATIONAL_VARIANCE = 20
 # =============================================================================
 
 # RV thresholds for zone classification
-RV_THRESHOLD_LOCAL = 0.25      # syntax_floor: RV must be ≤ this
-RV_THRESHOLD_LONG_RANGE = 0.35 # structure_ripple: RV must be ≥ this
+RV_THRESHOLD_LOCAL = 0.25  # syntax_floor: RV must be ≤ this
+RV_THRESHOLD_LONG_RANGE = 0.35  # structure_ripple: RV must be ≥ this
 RV_RANGE_BRIDGE = (0.15, 0.5)  # semantic_bridge: typical RV range
 
 
@@ -89,21 +89,21 @@ RV_RANGE_BRIDGE = (0.15, 0.5)  # semantic_bridge: typical RV range
 # =============================================================================
 
 ZONE_THRESHOLDS = {
-    'syntax_floor': {
-        'local_mass_min': 0.5,
-        'entropy_max': 2.5,
+    "syntax_floor": {
+        "local_mass_min": 0.5,
+        "entropy_max": 2.5,
         # Low RV = local attention to nearby tokens
-        'rotational_variance_max': RV_THRESHOLD_LOCAL,
+        "rotational_variance_max": RV_THRESHOLD_LOCAL,
     },
-    'structure_ripple': {
-        'long_mass_min': 0.25,
-        'histogram_variance_min': 0.1,
+    "structure_ripple": {
+        "long_mass_min": 0.25,
+        "histogram_variance_min": 0.1,
         # High RV = long-range attention to distant tokens
-        'rotational_variance_min': RV_THRESHOLD_LONG_RANGE,
+        "rotational_variance_min": RV_THRESHOLD_LONG_RANGE,
     },
-    'semantic_bridge': {
+    "semantic_bridge": {
         # Medium RV = balanced local/long-range attention
-        'rotational_variance_range': RV_RANGE_BRIDGE,
+        "rotational_variance_range": RV_RANGE_BRIDGE,
     },
 }
 
@@ -111,6 +111,7 @@ ZONE_THRESHOLDS = {
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
+
 
 def get_version(fingerprint: np.ndarray) -> int:
     """

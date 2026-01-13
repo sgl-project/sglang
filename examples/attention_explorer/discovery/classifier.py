@@ -25,7 +25,6 @@ Author: SGLang Attention Explorer
 """
 
 import logging
-import os
 import struct
 import threading
 from dataclasses import dataclass
@@ -38,6 +37,7 @@ import numpy as np
 # Optional: HDBSCAN for approximate_predict
 try:
     import hdbscan
+
     HAS_HDBSCAN = True
 except ImportError:
     HAS_HDBSCAN = False
@@ -49,29 +49,24 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 from .fingerprint_schema import (
-    V1_DIM as FINGERPRINT_DIM,
-    V2_DIM as FINGERPRINT_DIM_V2,
-    FP_LOCAL_MASS,
-    FP_MID_MASS,
-    FP_LONG_MASS,
     FP_ENTROPY,
-    FP_HISTOGRAM_START,
-    FP_HISTOGRAM_END,
-    FP_LAYER_STATS_START,
-    FP_LAYER_STATS_END,
+    FP_LOCAL_MASS,
+    FP_LONG_MASS,
+    FP_MID_MASS,
     FP_ROTATIONAL_VARIANCE,
-    ZONE_THRESHOLDS,
-    is_v2,
 )
-
+from .fingerprint_schema import V1_DIM as FINGERPRINT_DIM
+from .fingerprint_schema import ZONE_THRESHOLDS
 
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
 
+
 @dataclass
 class ClassificationResult:
     """Result of fingerprint classification."""
+
     cluster_id: int
     cluster_label: str
     cluster_probability: float
@@ -83,6 +78,7 @@ class ClassificationResult:
 @dataclass
 class ClusterInfo:
     """Cached cluster information."""
+
     cluster_id: int
     label: str
     zone: str
@@ -94,6 +90,7 @@ class ClusterInfo:
 # =============================================================================
 # ONLINE CLASSIFIER
 # =============================================================================
+
 
 class OnlineClassifier:
     """
@@ -150,15 +147,19 @@ class OnlineClassifier:
 
     def _get_latest_dir(self) -> Path:
         """Get path to latest discovery run."""
-        latest = self.discovery_dir / 'latest'
+        latest = self.discovery_dir / "latest"
         if latest.is_symlink() or latest.exists():
             return latest.resolve() if latest.is_symlink() else latest
 
         # Fallback: find most recent directory
-        runs = sorted([
-            d for d in self.discovery_dir.iterdir()
-            if d.is_dir() and d.name != 'latest'
-        ], reverse=True)
+        runs = sorted(
+            [
+                d
+                for d in self.discovery_dir.iterdir()
+                if d.is_dir() and d.name != "latest"
+            ],
+            reverse=True,
+        )
 
         if not runs:
             raise FileNotFoundError(f"No discovery runs found in {self.discovery_dir}")
@@ -178,21 +179,25 @@ class OnlineClassifier:
             logger.info(f"Loading classifier models from {latest_dir}")
 
             # Load clusterer
-            clusterer_path = latest_dir / 'clusterer.joblib'
+            clusterer_path = latest_dir / "clusterer.joblib"
             if clusterer_path.exists():
                 self._clusterer = joblib.load(clusterer_path)
                 logger.info("  Loaded HDBSCAN clusterer")
 
                 # Check if prediction_data is available
-                if hasattr(self._clusterer, '_prediction_data'):
-                    logger.info("  Clusterer has prediction_data (approximate_predict available)")
+                if hasattr(self._clusterer, "_prediction_data"):
+                    logger.info(
+                        "  Clusterer has prediction_data (approximate_predict available)"
+                    )
                 else:
-                    logger.info("  Clusterer lacks prediction_data, using centroid fallback")
+                    logger.info(
+                        "  Clusterer lacks prediction_data, using centroid fallback"
+                    )
                     self.use_approximate_predict = False
 
             # Load embedding models (for precompute_embeddings mode)
             if self.precompute_embeddings:
-                models_path = latest_dir / 'embedding_models.joblib'
+                models_path = latest_dir / "embedding_models.joblib"
                 if models_path.exists():
                     self._embedding_models = joblib.load(models_path)
                     logger.info("  Loaded embedding models (scaler, PCA, UMAP)")
@@ -201,12 +206,13 @@ class OnlineClassifier:
             self._load_clusters(latest_dir)
 
             # Read run_id from manifest
-            manifest_path = latest_dir / 'manifest.json'
+            manifest_path = latest_dir / "manifest.json"
             if manifest_path.exists():
                 import json
+
                 with open(manifest_path) as f:
                     manifest = json.load(f)
-                    self._run_id = manifest.get('run_id')
+                    self._run_id = manifest.get("run_id")
 
             self._loaded = True
             logger.info(f"  Classifier ready (run_id={self._run_id})")
@@ -215,7 +221,7 @@ class OnlineClassifier:
         """Load cluster info from Parquet file."""
         import pyarrow.parquet as pq
 
-        clusters_path = latest_dir / 'clusters.parquet'
+        clusters_path = latest_dir / "clusters.parquet"
         if not clusters_path.exists():
             logger.warning(f"Clusters file not found: {clusters_path}")
             self._clusters = {}
@@ -229,28 +235,27 @@ class OnlineClassifier:
         centroid_ids = []
 
         for _, row in df.iterrows():
-            cluster_id = int(row['cluster_id'])
+            cluster_id = int(row["cluster_id"])
 
             # Unpack centroid fingerprint
-            centroid_fp = row.get('centroid_fingerprint')
+            centroid_fp = row.get("centroid_fingerprint")
             if isinstance(centroid_fp, bytes):
                 centroid_fp = np.array(
-                    struct.unpack(f'<{FINGERPRINT_DIM}f', centroid_fp),
-                    dtype=np.float32
+                    struct.unpack(f"<{FINGERPRINT_DIM}f", centroid_fp), dtype=np.float32
                 )
             elif centroid_fp is None:
                 centroid_fp = np.zeros(FINGERPRINT_DIM, dtype=np.float32)
 
             self._clusters[cluster_id] = ClusterInfo(
                 cluster_id=cluster_id,
-                label=row.get('label', f'Cluster {cluster_id}'),
-                zone=row.get('dominant_zone', 'unknown'),
+                label=row.get("label", f"Cluster {cluster_id}"),
+                zone=row.get("dominant_zone", "unknown"),
                 centroid_fingerprint=centroid_fp,
                 centroid_xy=(
-                    float(row.get('centroid_x', 0)),
-                    float(row.get('centroid_y', 0))
+                    float(row.get("centroid_x", 0)),
+                    float(row.get("centroid_y", 0)),
                 ),
-                size=int(row.get('size', 0)),
+                size=int(row.get("size", 0)),
             )
 
             if cluster_id >= 0:  # Exclude noise cluster
@@ -290,7 +295,9 @@ class OnlineClassifier:
 
         fingerprint = np.asarray(fingerprint, dtype=np.float32)
         if fingerprint.shape != (FINGERPRINT_DIM,):
-            raise ValueError(f"Expected fingerprint of shape ({FINGERPRINT_DIM},), got {fingerprint.shape}")
+            raise ValueError(
+                f"Expected fingerprint of shape ({FINGERPRINT_DIM},), got {fingerprint.shape}"
+            )
 
         # Assign zone based on fingerprint features
         zone, zone_confidence = self._assign_zone(fingerprint)
@@ -303,7 +310,7 @@ class OnlineClassifier:
 
         # Get cluster label
         cluster_info = self._clusters.get(cluster_id)
-        cluster_label = cluster_info.label if cluster_info else f'Cluster {cluster_id}'
+        cluster_label = cluster_info.label if cluster_info else f"Cluster {cluster_id}"
 
         # Optionally compute embedding
         embedding = None
@@ -367,49 +374,60 @@ class OnlineClassifier:
 
         # Check for rotational_variance (v2 fingerprint)
         has_rotational_variance = len(fingerprint) > FP_ROTATIONAL_VARIANCE
-        rotational_variance = fingerprint[FP_ROTATIONAL_VARIANCE] if has_rotational_variance else None
+        rotational_variance = (
+            fingerprint[FP_ROTATIONAL_VARIANCE] if has_rotational_variance else None
+        )
 
         total_mass = max(local_mass + mid_mass + long_mass, 1e-6)
 
         # Check syntax_floor (high local, low entropy, optionally low rotational variance)
-        sf_thresh = ZONE_THRESHOLDS['syntax_floor']
-        if local_mass > sf_thresh['local_mass_min']:
-            if entropy < sf_thresh['entropy_max']:
+        sf_thresh = ZONE_THRESHOLDS["syntax_floor"]
+        if local_mass > sf_thresh["local_mass_min"]:
+            if entropy < sf_thresh["entropy_max"]:
                 # If we have rotational variance, verify it's low (local attention to nearby tokens)
                 if rotational_variance is not None:
-                    if rotational_variance <= sf_thresh.get('rotational_variance_max', 1.0):
+                    if rotational_variance <= sf_thresh.get(
+                        "rotational_variance_max", 1.0
+                    ):
                         # Strong confidence when RV confirms local/short-range attention
-                        confidence = min(1.0, local_mass * (1.0 - entropy / 4.0) * (1.0 - rotational_variance))
-                        return 'syntax_floor', confidence
+                        confidence = min(
+                            1.0,
+                            local_mass
+                            * (1.0 - entropy / 4.0)
+                            * (1.0 - rotational_variance),
+                        )
+                        return "syntax_floor", confidence
                     # High RV with local mass suggests mixed pattern - fall through
                     # Fall through to check other zones
                 else:
                     # No rotational variance, use original heuristic
                     confidence = min(1.0, local_mass * (1.0 - entropy / 4.0))
-                    return 'syntax_floor', confidence
+                    return "syntax_floor", confidence
 
         # Check structure_ripple (high long-range, optionally high rotational variance)
-        sr_thresh = ZONE_THRESHOLDS['structure_ripple']
-        if long_mass > sr_thresh['long_mass_min']:
+        sr_thresh = ZONE_THRESHOLDS["structure_ripple"]
+        if long_mass > sr_thresh["long_mass_min"]:
             # If we have rotational variance, verify it's high (long-range attention)
             if rotational_variance is not None:
-                rv_min = sr_thresh.get('rotational_variance_min', 0.0)
+                rv_min = sr_thresh.get("rotational_variance_min", 0.0)
                 if rotational_variance >= rv_min:
                     # High confidence when RV confirms long-range attention pattern
                     confidence = min(1.0, (long_mass + rotational_variance) / 2)
-                    return 'structure_ripple', confidence
+                    return "structure_ripple", confidence
                 # Low RV with long mass = unusual pattern, still classify but lower confidence
                 # Still return structure_ripple but with lower confidence
                 confidence = min(1.0, long_mass * 0.8)
-                return 'structure_ripple', confidence
+                return "structure_ripple", confidence
             else:
                 confidence = min(1.0, long_mass * 1.5)
-                return 'structure_ripple', confidence
+                return "structure_ripple", confidence
 
         # Default: semantic_bridge
         # When rotational variance is available, use it to boost confidence
         if rotational_variance is not None:
-            sb_range = ZONE_THRESHOLDS['semantic_bridge'].get('rotational_variance_range', (0.0, 1.0))
+            sb_range = ZONE_THRESHOLDS["semantic_bridge"].get(
+                "rotational_variance_range", (0.0, 1.0)
+            )
             if sb_range[0] <= rotational_variance <= sb_range[1]:
                 # Rotational variance in expected range for semantic bridging
                 confidence = min(1.0, mid_mass / total_mass + 0.1)
@@ -418,16 +436,16 @@ class OnlineClassifier:
         else:
             confidence = mid_mass / total_mass
 
-        return 'semantic_bridge', confidence
+        return "semantic_bridge", confidence
 
     def _classify_hdbscan(self, fingerprint: np.ndarray) -> Tuple[int, float]:
         """Classify using HDBSCAN approximate_predict."""
         try:
             # Need to transform fingerprint through embedding pipeline first
             if self._embedding_models:
-                scaler = self._embedding_models.get('scaler')
-                pca = self._embedding_models.get('pca')
-                umap_model = self._embedding_models.get('umap')
+                scaler = self._embedding_models.get("scaler")
+                pca = self._embedding_models.get("pca")
+                umap_model = self._embedding_models.get("umap")
 
                 fp_scaled = scaler.transform(fingerprint.reshape(1, -1))
                 fp_pca = pca.transform(fp_scaled)
@@ -442,7 +460,9 @@ class OnlineClassifier:
                 return self._classify_centroid(fingerprint)
 
         except Exception as e:
-            logger.warning(f"HDBSCAN approximate_predict failed: {e}, using centroid fallback")
+            logger.warning(
+                f"HDBSCAN approximate_predict failed: {e}, using centroid fallback"
+            )
             return self._classify_centroid(fingerprint)
 
     def _classify_centroid(self, fingerprint: np.ndarray) -> Tuple[int, float]:
@@ -470,15 +490,17 @@ class OnlineClassifier:
 
         return cluster_id, float(confidence)
 
-    def _compute_embedding(self, fingerprint: np.ndarray) -> Optional[Tuple[float, float]]:
+    def _compute_embedding(
+        self, fingerprint: np.ndarray
+    ) -> Optional[Tuple[float, float]]:
         """Compute 2D embedding for a fingerprint."""
         if not self._embedding_models:
             return None
 
         try:
-            scaler = self._embedding_models.get('scaler')
-            pca = self._embedding_models.get('pca')
-            umap_model = self._embedding_models.get('umap')
+            scaler = self._embedding_models.get("scaler")
+            pca = self._embedding_models.get("pca")
+            umap_model = self._embedding_models.get("umap")
 
             fp_scaled = scaler.transform(fingerprint.reshape(1, -1))
             fp_pca = pca.transform(fp_scaled)
@@ -516,6 +538,7 @@ class OnlineClassifier:
 # =============================================================================
 # SIDECAR INTEGRATION
 # =============================================================================
+
 
 class SidecarClassifier:
     """
@@ -579,28 +602,32 @@ class SidecarClassifier:
 
             # Convert numpy types to Python native types for JSON serialization
             return {
-                'manifold': {
-                    'zone': result.zone,
-                    'confidence': float(result.zone_confidence),
-                    'cluster_id': int(result.cluster_id),
-                    'cluster_label': result.cluster_label,
-                    'cluster_probability': float(result.cluster_probability) if result.cluster_probability is not None else None,
+                "manifold": {
+                    "zone": result.zone,
+                    "confidence": float(result.zone_confidence),
+                    "cluster_id": int(result.cluster_id),
+                    "cluster_label": result.cluster_label,
+                    "cluster_probability": (
+                        float(result.cluster_probability)
+                        if result.cluster_probability is not None
+                        else None
+                    ),
                 },
-                'schema_version': 1,
-                'run_id': self.classifier.run_id,
+                "schema_version": 1,
+                "run_id": self.classifier.run_id,
             }
 
         except Exception as e:
             logger.error(f"Classification failed: {e}")
             return {
-                'manifold': {
-                    'zone': 'unknown',
-                    'confidence': 0.0,
-                    'cluster_id': -1,
-                    'cluster_label': 'Error',
+                "manifold": {
+                    "zone": "unknown",
+                    "confidence": 0.0,
+                    "cluster_id": -1,
+                    "cluster_label": "Error",
                 },
-                'error': str(e),
-                'schema_version': 1,
+                "error": str(e),
+                "schema_version": 1,
             }
 
     def _check_for_new_run(self):
@@ -610,12 +637,13 @@ class SidecarClassifier:
             latest_dir = self.classifier._get_latest_dir()
 
             # Read manifest to check run_id
-            manifest_path = latest_dir / 'manifest.json'
+            manifest_path = latest_dir / "manifest.json"
             if manifest_path.exists():
                 import json
+
                 with open(manifest_path) as f:
                     manifest = json.load(f)
-                    new_run_id = manifest.get('run_id')
+                    new_run_id = manifest.get("run_id")
 
                     if new_run_id != old_run_id:
                         logger.info(f"New discovery run detected: {new_run_id}")
@@ -628,9 +656,9 @@ class SidecarClassifier:
     def stats(self) -> Dict[str, Any]:
         """Get classifier statistics."""
         return {
-            'classification_count': self._classification_count,
-            'run_id': self.classifier.run_id,
-            'cluster_count': self.classifier.cluster_count,
+            "classification_count": self._classification_count,
+            "run_id": self.classifier.run_id,
+            "cluster_count": self.classifier.cluster_count,
         }
 
 
@@ -638,20 +666,32 @@ class SidecarClassifier:
 # CLI FOR TESTING
 # =============================================================================
 
+
 def main():
     """Test classifier from command line."""
     import argparse
     import json
 
-    parser = argparse.ArgumentParser(description='Test online classifier')
-    parser.add_argument('--discovery-dir', '-d', required=True,
-                       help='Path to discovery outputs directory')
-    parser.add_argument('--fingerprint', '-f',
-                       help='JSON array of 20 floats to classify')
-    parser.add_argument('--random', '-r', action='store_true',
-                       help='Classify random fingerprints')
-    parser.add_argument('--count', '-n', type=int, default=10,
-                       help='Number of random fingerprints to classify')
+    parser = argparse.ArgumentParser(description="Test online classifier")
+    parser.add_argument(
+        "--discovery-dir",
+        "-d",
+        required=True,
+        help="Path to discovery outputs directory",
+    )
+    parser.add_argument(
+        "--fingerprint", "-f", help="JSON array of 20 floats to classify"
+    )
+    parser.add_argument(
+        "--random", "-r", action="store_true", help="Classify random fingerprints"
+    )
+    parser.add_argument(
+        "--count",
+        "-n",
+        type=int,
+        default=10,
+        help="Number of random fingerprints to classify",
+    )
 
     args = parser.parse_args()
 
@@ -672,8 +712,10 @@ def main():
         for i in range(args.count):
             fp = np.random.rand(FINGERPRINT_DIM).astype(np.float32)
             result = classifier.classify(fp)
-            print(f"  [{i}] cluster={result.cluster_id}, zone={result.zone}, "
-                  f"conf={result.zone_confidence:.2f}")
+            print(
+                f"  [{i}] cluster={result.cluster_id}, zone={result.zone}, "
+                f"conf={result.zone_confidence:.2f}"
+            )
 
     else:
         print("Classifier loaded successfully!")
@@ -682,8 +724,10 @@ def main():
         print("\nCluster info:")
         for cluster_id, info in sorted(classifier.get_all_clusters().items()):
             if cluster_id >= 0:
-                print(f"  [{cluster_id}] {info.label} - {info.zone} (size: {info.size})")
+                print(
+                    f"  [{cluster_id}] {info.label} - {info.zone} (size: {info.size})"
+                )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

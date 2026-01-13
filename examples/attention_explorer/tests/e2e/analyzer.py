@@ -5,15 +5,13 @@ Provides pattern detection, manifold classification, and
 insight extraction for understanding attention behavior.
 """
 
-import math
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Tuple
-from collections import defaultdict
 import logging
+import math
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Dict, List
 
-from collector import (
-    TraceData, AttentionStep, Fingerprint, MoERouting, CollectionRun
-)
+from collector import CollectionRun, Fingerprint, MoERouting, TraceData
 from scenarios import ExpectedManifold
 
 logger = logging.getLogger(__name__)
@@ -24,22 +22,106 @@ PCA_LOADINGS = [
     {
         "name": "PC1: Local vs Long-Range",
         "variance_explained": 0.35,
-        "loadings": [0.6, 0.1, -0.6, -0.2, 0.4, 0.3, 0.1, 0.0, -0.1, -0.2, -0.3, -0.3, -0.2, -0.15, -0.1, -0.05, 0.0, 0.0, 0.0, 0.0],
+        "loadings": [
+            0.6,
+            0.1,
+            -0.6,
+            -0.2,
+            0.4,
+            0.3,
+            0.1,
+            0.0,
+            -0.1,
+            -0.2,
+            -0.3,
+            -0.3,
+            -0.2,
+            -0.15,
+            -0.1,
+            -0.05,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
     },
     {
         "name": "PC2: Focused vs Diffuse",
         "variance_explained": 0.22,
-        "loadings": [0.2, 0.2, 0.2, -0.7, 0.3, 0.2, 0.1, 0.0, -0.1, -0.15, -0.2, -0.2, -0.15, -0.1, -0.05, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "loadings": [
+            0.2,
+            0.2,
+            0.2,
+            -0.7,
+            0.3,
+            0.2,
+            0.1,
+            0.0,
+            -0.1,
+            -0.15,
+            -0.2,
+            -0.2,
+            -0.15,
+            -0.1,
+            -0.05,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
     },
     {
         "name": "PC3: Semantic Bridge",
         "variance_explained": 0.15,
-        "loadings": [-0.1, 0.6, -0.1, 0.1, -0.2, 0.1, 0.3, 0.3, 0.3, 0.2, 0.1, 0.0, -0.1, -0.2, -0.25, -0.2, -0.1, 0.0, 0.0, 0.0],
+        "loadings": [
+            -0.1,
+            0.6,
+            -0.1,
+            0.1,
+            -0.2,
+            0.1,
+            0.3,
+            0.3,
+            0.3,
+            0.2,
+            0.1,
+            0.0,
+            -0.1,
+            -0.2,
+            -0.25,
+            -0.2,
+            -0.1,
+            0.0,
+            0.0,
+            0.0,
+        ],
     },
     {
         "name": "PC4: Structure Ripple",
         "variance_explained": 0.10,
-        "loadings": [0.0, 0.0, 0.0, 0.3, 0.4, -0.3, 0.3, -0.3, 0.3, -0.25, 0.2, -0.2, 0.15, -0.15, 0.1, -0.1, 0.05, -0.05, 0.0, 0.0],
+        "loadings": [
+            0.0,
+            0.0,
+            0.0,
+            0.3,
+            0.4,
+            -0.3,
+            0.3,
+            -0.3,
+            0.3,
+            -0.25,
+            0.2,
+            -0.2,
+            0.15,
+            -0.15,
+            0.1,
+            -0.1,
+            0.05,
+            -0.05,
+            0.0,
+            0.0,
+        ],
     },
 ]
 
@@ -47,6 +129,7 @@ PCA_LOADINGS = [
 @dataclass
 class ManifoldClassification:
     """Classification of a trace into manifold zones."""
+
     primary_zone: str
     confidence: float
     zone_scores: Dict[str, float]
@@ -57,6 +140,7 @@ class ManifoldClassification:
 @dataclass
 class PatternDetection:
     """Detected pattern in attention data."""
+
     pattern_type: str
     strength: float
     evidence: List[str]
@@ -66,6 +150,7 @@ class PatternDetection:
 @dataclass
 class MoEInsight:
     """Insight from MoE routing analysis."""
+
     insight_type: str
     description: str
     expert_stats: Dict[int, float]
@@ -75,6 +160,7 @@ class MoEInsight:
 @dataclass
 class TraceAnalysis:
     """Complete analysis of a single trace."""
+
     scenario_name: str
     expected_manifold: str
     actual_classification: ManifoldClassification
@@ -88,6 +174,7 @@ class TraceAnalysis:
 @dataclass
 class RunAnalysis:
     """Complete analysis of a collection run."""
+
     run_id: str
     trace_analyses: List[TraceAnalysis]
     manifold_accuracy: Dict[str, float]  # Expected -> accuracy rate
@@ -196,10 +283,18 @@ class AttentionAnalyzer:
 
         # Score each zone
         zone_scores = {
-            ExpectedManifold.SYNTAX_FLOOR.value: self._score_syntax_floor(avg_fp, pca_scores),
-            ExpectedManifold.SEMANTIC_BRIDGE.value: self._score_semantic_bridge(avg_fp, pca_scores),
-            ExpectedManifold.LONG_RANGE.value: self._score_long_range(avg_fp, pca_scores),
-            ExpectedManifold.STRUCTURE_RIPPLE.value: self._score_structure_ripple(avg_fp, pca_scores),
+            ExpectedManifold.SYNTAX_FLOOR.value: self._score_syntax_floor(
+                avg_fp, pca_scores
+            ),
+            ExpectedManifold.SEMANTIC_BRIDGE.value: self._score_semantic_bridge(
+                avg_fp, pca_scores
+            ),
+            ExpectedManifold.LONG_RANGE.value: self._score_long_range(
+                avg_fp, pca_scores
+            ),
+            ExpectedManifold.STRUCTURE_RIPPLE.value: self._score_structure_ripple(
+                avg_fp, pca_scores
+            ),
             ExpectedManifold.DIFFUSE.value: self._score_diffuse(avg_fp, pca_scores),
         }
 
@@ -231,10 +326,7 @@ class AttentionAnalyzer:
             mid_mass=sum(fp.mid_mass for fp in fps) / n,
             long_mass=sum(fp.long_mass for fp in fps) / n,
             entropy=sum(fp.entropy for fp in fps) / n,
-            histogram=[
-                sum(fp.histogram[i] for fp in fps) / n
-                for i in range(16)
-            ],
+            histogram=[sum(fp.histogram[i] for fp in fps) / n for i in range(16)],
         )
 
     def _project_to_pca(self, fp: Fingerprint) -> List[float]:
@@ -298,20 +390,15 @@ class AttentionAnalyzer:
             return 0.0
 
         # Check for alternating high/low pattern
-        diffs = [histogram[i+1] - histogram[i] for i in range(len(histogram)-1)]
+        diffs = [histogram[i + 1] - histogram[i] for i in range(len(histogram) - 1)]
         sign_changes = sum(
-            1 for i in range(len(diffs)-1)
-            if diffs[i] * diffs[i+1] < 0
+            1 for i in range(len(diffs) - 1) if diffs[i] * diffs[i + 1] < 0
         )
 
         return sign_changes / (len(diffs) - 1) if len(diffs) > 1 else 0
 
     def _interpret_classification(
-        self,
-        zone: str,
-        fp: Fingerprint,
-        pca: List[float],
-        scores: Dict[str, float]
+        self, zone: str, fp: Fingerprint, pca: List[float], scores: Dict[str, float]
     ) -> str:
         """Generate human-readable interpretation."""
         interpretations = {
@@ -358,20 +445,19 @@ class AttentionAnalyzer:
         # 1. Sink token pattern (high attention to token 0)
         sink_steps = []
         for i, step in enumerate(trace.attention_steps):
-            first_token = next(
-                (t for t in step.top_k_tokens if t.position == 0),
-                None
-            )
+            first_token = next((t for t in step.top_k_tokens if t.position == 0), None)
             if first_token and first_token.weight > 0.3:
                 sink_steps.append(i)
 
         if len(sink_steps) > len(trace.attention_steps) * 0.3:
-            patterns.append(PatternDetection(
-                pattern_type="sink_token",
-                strength=len(sink_steps) / len(trace.attention_steps),
-                evidence=[f"High attention to token 0 in {len(sink_steps)} steps"],
-                step_indices=sink_steps,
-            ))
+            patterns.append(
+                PatternDetection(
+                    pattern_type="sink_token",
+                    strength=len(sink_steps) / len(trace.attention_steps),
+                    evidence=[f"High attention to token 0 in {len(sink_steps)} steps"],
+                    step_indices=sink_steps,
+                )
+            )
 
         # 2. Local copy pattern (attending to recent similar tokens)
         # 3. Induction heads (looking for pattern repetition)
@@ -384,12 +470,16 @@ class AttentionAnalyzer:
                 prev_token_steps.append(i)
 
         if len(prev_token_steps) > len(trace.attention_steps) * 0.5:
-            patterns.append(PatternDetection(
-                pattern_type="previous_token",
-                strength=len(prev_token_steps) / len(trace.attention_steps),
-                evidence=[f"Strong previous-token attention in {len(prev_token_steps)} steps"],
-                step_indices=prev_token_steps,
-            ))
+            patterns.append(
+                PatternDetection(
+                    pattern_type="previous_token",
+                    strength=len(prev_token_steps) / len(trace.attention_steps),
+                    evidence=[
+                        f"Strong previous-token attention in {len(prev_token_steps)} steps"
+                    ],
+                    step_indices=prev_token_steps,
+                )
+            )
 
         # 5. Entropy transitions (sudden changes)
         if len(trace.fingerprints) > 5:
@@ -397,16 +487,20 @@ class AttentionAnalyzer:
             transition_steps = []
 
             for i in range(1, len(entropies)):
-                if abs(entropies[i] - entropies[i-1]) > 0.3:
+                if abs(entropies[i] - entropies[i - 1]) > 0.3:
                     transition_steps.append(i)
 
             if transition_steps:
-                patterns.append(PatternDetection(
-                    pattern_type="entropy_transition",
-                    strength=len(transition_steps) / len(entropies),
-                    evidence=[f"Entropy transitions at steps: {transition_steps[:5]}"],
-                    step_indices=transition_steps,
-                ))
+                patterns.append(
+                    PatternDetection(
+                        pattern_type="entropy_transition",
+                        strength=len(transition_steps) / len(entropies),
+                        evidence=[
+                            f"Entropy transitions at steps: {transition_steps[:5]}"
+                        ],
+                        step_indices=transition_steps,
+                    )
+                )
 
         return patterns
 
@@ -428,37 +522,34 @@ class AttentionAnalyzer:
 
         # Find dominant experts
         total = sum(expert_counts.values())
-        expert_usage = {
-            eid: count / total for eid, count in expert_counts.items()
-        }
+        expert_usage = {eid: count / total for eid, count in expert_counts.items()}
 
-        dominant = [
-            (eid, usage) for eid, usage in expert_usage.items()
-            if usage > 0.15
-        ]
+        dominant = [(eid, usage) for eid, usage in expert_usage.items() if usage > 0.15]
 
         if dominant:
-            insights.append(MoEInsight(
-                insight_type="dominant_experts",
-                description=f"Experts {[e[0] for e in dominant]} dominate routing",
-                expert_stats=expert_usage,
-                layer_stats={},
-            ))
+            insights.append(
+                MoEInsight(
+                    insight_type="dominant_experts",
+                    description=f"Experts {[e[0] for e in dominant]} dominate routing",
+                    expert_stats=expert_usage,
+                    layer_stats={},
+                )
+            )
 
         # Expert diversity
         n_experts = len(expert_counts)
-        entropy = -sum(
-            p * math.log2(p) for p in expert_usage.values() if p > 0
-        )
+        entropy = -sum(p * math.log2(p) for p in expert_usage.values() if p > 0)
         max_entropy = math.log2(n_experts) if n_experts > 1 else 1
         diversity = entropy / max_entropy if max_entropy > 0 else 0
 
-        insights.append(MoEInsight(
-            insight_type="expert_diversity",
-            description=f"Expert diversity: {diversity:.2f} (0=concentrated, 1=uniform)",
-            expert_stats={"diversity": diversity, "n_experts_used": n_experts},
-            layer_stats={},
-        ))
+        insights.append(
+            MoEInsight(
+                insight_type="expert_diversity",
+                description=f"Expert diversity: {diversity:.2f} (0=concentrated, 1=uniform)",
+                expert_stats={"diversity": diversity, "n_experts_used": n_experts},
+                layer_stats={},
+            )
+        )
 
         return insights
 
@@ -481,19 +572,19 @@ class AttentionAnalyzer:
             total = sum(expert_counts.values())
             layer_stats[layer] = {
                 "n_routings": len(routings),
-                "top_experts": sorted(
-                    expert_counts.items(), key=lambda x: -x[1]
-                )[:3],
+                "top_experts": sorted(expert_counts.items(), key=lambda x: -x[1])[:3],
                 "expert_diversity": len(expert_counts) / total if total > 0 else 0,
             }
 
         if layer_stats:
-            insights.append(MoEInsight(
-                insight_type="layer_analysis",
-                description="Per-layer expert usage patterns",
-                expert_stats={},
-                layer_stats=layer_stats,
-            ))
+            insights.append(
+                MoEInsight(
+                    insight_type="layer_analysis",
+                    description="Per-layer expert usage patterns",
+                    expert_stats={},
+                    layer_stats=layer_stats,
+                )
+            )
 
         return insights
 
@@ -545,8 +636,7 @@ class AttentionAnalyzer:
 
         # Sink token pattern
         sink_pattern = next(
-            (p for p in patterns if p.pattern_type == "sink_token"),
-            None
+            (p for p in patterns if p.pattern_type == "sink_token"), None
         )
         if sink_pattern and sink_pattern.strength > 0.5:
             recs.append(

@@ -4,21 +4,22 @@ Unit tests for CheckpointManager
 Tests checkpoint save/load/resume functionality for long-running discovery jobs.
 """
 
-import json
 import os
-import tempfile
-import pytest
-from pathlib import Path
 
 # Add parent to path for imports
 import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from discovery.checkpoint import (
+    STAGE_NAMES,
     CheckpointManager,
     CheckpointState,
     create_checkpoint_state,
-    STAGE_NAMES,
 )
 
 
@@ -221,15 +222,17 @@ class TestCheckpointManager:
         db_path, output_dir = temp_dirs
         mgr = CheckpointManager(db_path, output_dir)
 
-        import pandas as pd
         import numpy as np
+        import pandas as pd
 
         # Save parquet artifact
-        df = pd.DataFrame({
-            "x": np.random.randn(100),
-            "y": np.random.randn(100),
-            "cluster": np.random.randint(0, 5, 100),
-        })
+        df = pd.DataFrame(
+            {
+                "x": np.random.randn(100),
+                "y": np.random.randn(100),
+                "cluster": np.random.randint(0, 5, 100),
+            }
+        )
 
         path = mgr.save_partial_artifact("run-artifact", "embeddings", df, "parquet")
         assert path is not None
@@ -288,8 +291,16 @@ class TestStageNames:
     def test_stage_names_order(self):
         """Test stage name order matches pipeline."""
         expected = [
-            "extract", "standardize", "pca", "umap", "cluster",
-            "zones", "metadata", "prototypes", "export", "complete",
+            "extract",
+            "standardize",
+            "pca",
+            "umap",
+            "cluster",
+            "zones",
+            "metadata",
+            "prototypes",
+            "export",
+            "complete",
         ]
         assert STAGE_NAMES == expected
 

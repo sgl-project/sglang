@@ -7,26 +7,27 @@ Tests configuration, stage results, zone classification, and helper methods.
 import asyncio
 import json
 import os
-import tempfile
-import time
-import pytest
-import numpy as np
-from dataclasses import asdict
-from pathlib import Path
-from unittest.mock import Mock, MagicMock, AsyncMock, patch
 
 # Add parent to path for imports
 import sys
+import tempfile
+import time
+from dataclasses import asdict
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from discovery.checkpoint import STAGE_NAMES
 from discovery.coordinator import (
     CoordinatorConfig,
-    StageResult,
-    DiscoveryResult,
     DiscoveryJobCoordinator,
+    DiscoveryResult,
+    StageResult,
     run_discovery,
 )
-from discovery.checkpoint import STAGE_NAMES
 
 
 class TestCoordinatorConfig:
@@ -140,7 +141,9 @@ class TestDiscoveryResult:
     def test_successful_discovery_result(self):
         """Test creating a successful discovery result."""
         stage_results = [
-            StageResult(stage=i, stage_name=STAGE_NAMES[i], success=True, duration_seconds=10.0)
+            StageResult(
+                stage=i, stage_name=STAGE_NAMES[i], success=True, duration_seconds=10.0
+            )
             for i in range(10)
         ]
 
@@ -334,8 +337,11 @@ class TestDiscoveryJobCoordinator:
         """Test zone distribution with labels."""
         coordinator = DiscoveryJobCoordinator(config)
         coordinator._zone_labels = [
-            "syntax_floor", "syntax_floor", "syntax_floor",
-            "semantic_bridge", "semantic_bridge",
+            "syntax_floor",
+            "syntax_floor",
+            "syntax_floor",
+            "semantic_bridge",
+            "semantic_bridge",
             "long_range",
         ]
 
@@ -360,8 +366,12 @@ class TestDiscoveryJobCoordinator:
         coordinator._run_id = "test-run"
         coordinator._start_time = time.time() - 100
         coordinator._stage_results = [
-            StageResult(stage=0, stage_name="extract", success=True, duration_seconds=10.0),
-            StageResult(stage=1, stage_name="standardize", success=True, duration_seconds=10.0),
+            StageResult(
+                stage=0, stage_name="extract", success=True, duration_seconds=10.0
+            ),
+            StageResult(
+                stage=1, stage_name="standardize", success=True, duration_seconds=10.0
+            ),
         ]
         coordinator._fingerprints = None
         coordinator._cluster_metadata = None
@@ -379,8 +389,16 @@ class TestDiscoveryJobCoordinator:
         coordinator._run_id = "test-run"
         coordinator._start_time = time.time() - 100
         coordinator._stage_results = [
-            StageResult(stage=0, stage_name="extract", success=True, duration_seconds=10.0),
-            StageResult(stage=1, stage_name="standardize", success=False, duration_seconds=5.0, error="Memory error"),
+            StageResult(
+                stage=0, stage_name="extract", success=True, duration_seconds=10.0
+            ),
+            StageResult(
+                stage=1,
+                stage_name="standardize",
+                success=False,
+                duration_seconds=5.0,
+                error="Memory error",
+            ),
         ]
         coordinator._fingerprints = None
         coordinator._cluster_metadata = None
@@ -403,8 +421,16 @@ class TestStageNames:
     def test_stage_names_order(self):
         """Test stage names are in correct order."""
         expected = [
-            "extract", "standardize", "pca", "umap", "cluster",
-            "zones", "metadata", "prototypes", "export", "complete",
+            "extract",
+            "standardize",
+            "pca",
+            "umap",
+            "cluster",
+            "zones",
+            "metadata",
+            "prototypes",
+            "export",
+            "complete",
         ]
         assert STAGE_NAMES == expected
 
@@ -429,27 +455,31 @@ class TestRunDiscoveryFunction:
         # but we can verify the function signature works
         # by checking the coordinator is created properly
 
-        with patch('discovery.coordinator.DiscoveryJobCoordinator') as MockCoordinator:
+        with patch("discovery.coordinator.DiscoveryJobCoordinator") as MockCoordinator:
             mock_instance = MagicMock()
-            mock_instance.run = AsyncMock(return_value=DiscoveryResult(
-                run_id="test",
-                success=True,
-                total_duration_seconds=0,
-                stages_completed=0,
-                total_fingerprints=0,
-                total_clusters=0,
-                zone_distribution={},
-                output_paths={},
-                stage_results=[],
-            ))
+            mock_instance.run = AsyncMock(
+                return_value=DiscoveryResult(
+                    run_id="test",
+                    success=True,
+                    total_duration_seconds=0,
+                    stages_completed=0,
+                    total_fingerprints=0,
+                    total_clusters=0,
+                    zone_distribution={},
+                    output_paths={},
+                    stage_results=[],
+                )
+            )
             MockCoordinator.return_value = mock_instance
 
             # Run the async function
-            result = asyncio.run(run_discovery(
-                db_path=db_path,
-                output_dir=output_dir,
-                websocket_port=0,  # Disabled
-            ))
+            result = asyncio.run(
+                run_discovery(
+                    db_path=db_path,
+                    output_dir=output_dir,
+                    websocket_port=0,  # Disabled
+                )
+            )
 
             # Verify coordinator was created
             MockCoordinator.assert_called_once()

@@ -9,6 +9,7 @@ Orchestrates the 9-stage manifold discovery pipeline with:
 """
 
 import asyncio
+import json
 import logging
 import signal
 import struct
@@ -16,8 +17,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
-import json
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -30,15 +30,16 @@ def unpack_fingerprint(blob: bytes) -> np.ndarray:
     """Unpack fingerprint from blob to numpy array."""
     if blob is None:
         return np.zeros(FINGERPRINT_DIM, dtype=np.float32)
-    return np.array(struct.unpack(f'<{FINGERPRINT_DIM}f', blob), dtype=np.float32)
+    return np.array(struct.unpack(f"<{FINGERPRINT_DIM}f", blob), dtype=np.float32)
 
+
+from .bounded_umap import MemoryBoundedUMAP, MemoryMonitor
 from .checkpoint import (
+    STAGE_NAMES,
     CheckpointManager,
     CheckpointState,
     create_checkpoint_state,
-    STAGE_NAMES,
 )
-from .bounded_umap import MemoryBoundedUMAP, MemoryMonitor
 from .websocket_server import ManifoldWebSocketServer, create_websocket_server
 
 logger = logging.getLogger(__name__)
@@ -48,9 +49,11 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # =============================================================================
 
+
 @dataclass
 class CoordinatorConfig:
     """Configuration for discovery coordinator."""
+
     # Database
     db_path: str
     output_dir: str
@@ -81,6 +84,7 @@ class CoordinatorConfig:
 @dataclass
 class StageResult:
     """Result from a pipeline stage."""
+
     stage: int
     stage_name: str
     success: bool
@@ -92,6 +96,7 @@ class StageResult:
 @dataclass
 class DiscoveryResult:
     """Final result of discovery run."""
+
     run_id: str
     success: bool
     total_duration_seconds: float
@@ -107,6 +112,7 @@ class DiscoveryResult:
 # =============================================================================
 # COORDINATOR
 # =============================================================================
+
 
 class DiscoveryJobCoordinator:
     """
@@ -210,7 +216,9 @@ class DiscoveryJobCoordinator:
                 start_stage = 0
             else:
                 start_stage = self._current_state.stage
-                logger.info(f"Resuming from stage {start_stage}: {STAGE_NAMES[start_stage]}")
+                logger.info(
+                    f"Resuming from stage {start_stage}: {STAGE_NAMES[start_stage]}"
+                )
         else:
             self._run_id = self._generate_run_id()
             start_stage = 0
@@ -223,11 +231,14 @@ class DiscoveryJobCoordinator:
             self._ws_server = create_websocket_server(port=self.config.websocket_port)
             if self._ws_server:
                 await self._ws_server.start()
-                await self._ws_server.broadcast_run_start(self._run_id, {
-                    'db_path': self.config.db_path,
-                    'output_dir': str(self.output_dir),
-                    'start_stage': start_stage,
-                })
+                await self._ws_server.broadcast_run_start(
+                    self._run_id,
+                    {
+                        "db_path": self.config.db_path,
+                        "output_dir": str(self.output_dir),
+                        "start_stage": start_stage,
+                    },
+                )
 
         try:
             # Run pipeline stages
@@ -340,7 +351,9 @@ class DiscoveryJobCoordinator:
             path = self.output_dir / self._current_state.embeddings_path
             if path.exists():
                 self._fingerprints = pd.read_parquet(path)
-                logger.info(f"Loaded {len(self._fingerprints)} fingerprints from checkpoint")
+                logger.info(
+                    f"Loaded {len(self._fingerprints)} fingerprints from checkpoint"
+                )
                 return
 
         # Load from database in chunks
@@ -360,7 +373,7 @@ class DiscoveryJobCoordinator:
 
             await self._broadcast_progress(
                 stage=0,
-                stage_name='extract',
+                stage_name="extract",
                 items_processed=total_loaded,
                 total_items=0,  # Unknown until complete
                 percent_complete=0,
@@ -388,7 +401,7 @@ class DiscoveryJobCoordinator:
         # Parse fingerprint BLOB to feature array
         features_list = []
         for idx, row in self._fingerprints.iterrows():
-            fp = row['fingerprint']
+            fp = row["fingerprint"]
             if isinstance(fp, bytes):
                 # Unpack from BLOB format (packed float32)
                 fp = unpack_fingerprint(fp)
@@ -400,7 +413,7 @@ class DiscoveryJobCoordinator:
             if idx % 10000 == 0:
                 await self._broadcast_progress(
                     stage=1,
-                    stage_name='standardize',
+                    stage_name="standardize",
                     items_processed=idx,
                     total_items=len(self._fingerprints),
                     percent_complete=(idx / len(self._fingerprints)) * 100,
@@ -439,7 +452,7 @@ class DiscoveryJobCoordinator:
 
         await self._broadcast_progress(
             stage=2,
-            stage_name='pca',
+            stage_name="pca",
             items_processed=n_samples,
             total_items=n_samples,
             percent_complete=100,
@@ -465,7 +478,7 @@ class DiscoveryJobCoordinator:
         async def progress_callback(processed: int, total: int) -> None:
             await self._broadcast_progress(
                 stage=3,
-                stage_name='umap',
+                stage_name="umap",
                 items_processed=processed,
                 total_items=total,
                 percent_complete=(processed / total) * 100 if total > 0 else 0,
@@ -494,19 +507,23 @@ class DiscoveryJobCoordinator:
         clusterer = HDBSCAN(
             min_cluster_size=50,
             min_samples=10,
-            cluster_selection_method='eom',
+            cluster_selection_method="eom",
         )
 
         self._cluster_labels = clusterer.fit_predict(self._embeddings)
 
-        n_clusters = len(set(self._cluster_labels)) - (1 if -1 in self._cluster_labels else 0)
+        n_clusters = len(set(self._cluster_labels)) - (
+            1 if -1 in self._cluster_labels else 0
+        )
         n_noise = np.sum(self._cluster_labels == -1)
 
-        logger.info(f"Clustering complete: {n_clusters} clusters, {n_noise} noise points")
+        logger.info(
+            f"Clustering complete: {n_clusters} clusters, {n_noise} noise points"
+        )
 
         await self._broadcast_progress(
             stage=4,
-            stage_name='cluster',
+            stage_name="cluster",
             items_processed=len(self._embeddings),
             total_items=len(self._embeddings),
             percent_complete=100,
@@ -524,14 +541,14 @@ class DiscoveryJobCoordinator:
         if self.config.zone_thresholds_path:
             with open(self.config.zone_thresholds_path) as f:
                 data = json.load(f)
-                zone_thresholds = data.get('thresholds', data)
+                zone_thresholds = data.get("thresholds", data)
 
         # Classify each fingerprint
         self._zone_labels = []
 
         for idx in range(len(self._fingerprints)):
             row = self._fingerprints.iloc[idx]
-            fp = row['fingerprint']
+            fp = row["fingerprint"]
             if isinstance(fp, str):
                 fp = json.loads(fp)
 
@@ -541,7 +558,7 @@ class DiscoveryJobCoordinator:
             if idx % 10000 == 0:
                 await self._broadcast_progress(
                     stage=5,
-                    stage_name='zones',
+                    stage_name="zones",
                     items_processed=idx,
                     total_items=len(self._fingerprints),
                     percent_complete=(idx / len(self._fingerprints)) * 100,
@@ -566,7 +583,7 @@ class DiscoveryJobCoordinator:
         # Extract features from fingerprint
         # Assuming fingerprint format: [local_mass, mid_mass, long_mass, entropy, ...]
         if len(fingerprint) < 4:
-            return 'semantic_bridge'
+            return "semantic_bridge"
 
         local_mass = fingerprint[0]
         mid_mass = fingerprint[1]
@@ -576,24 +593,28 @@ class DiscoveryJobCoordinator:
         # Use thresholds or defaults
         if thresholds is None:
             thresholds = {
-                'syntax_floor': {'local_mass_min': 0.7, 'entropy_max': 2.0},
-                'long_range': {'long_mass_min': 0.3, 'entropy_min': 3.0},
-                'diffuse': {'entropy_min': 4.5},
+                "syntax_floor": {"local_mass_min": 0.7, "entropy_max": 2.0},
+                "long_range": {"long_mass_min": 0.3, "entropy_min": 3.0},
+                "diffuse": {"entropy_min": 4.5},
             }
 
-        sf = thresholds.get('syntax_floor', {})
-        if local_mass >= sf.get('local_mass_min', 0.7) and entropy <= sf.get('entropy_max', 2.0):
-            return 'syntax_floor'
+        sf = thresholds.get("syntax_floor", {})
+        if local_mass >= sf.get("local_mass_min", 0.7) and entropy <= sf.get(
+            "entropy_max", 2.0
+        ):
+            return "syntax_floor"
 
-        lr = thresholds.get('long_range', {})
-        if long_mass >= lr.get('long_mass_min', 0.3) and entropy >= lr.get('entropy_min', 3.0):
-            return 'long_range'
+        lr = thresholds.get("long_range", {})
+        if long_mass >= lr.get("long_mass_min", 0.3) and entropy >= lr.get(
+            "entropy_min", 3.0
+        ):
+            return "long_range"
 
-        df = thresholds.get('diffuse', {})
-        if entropy >= df.get('entropy_min', 4.5):
-            return 'diffuse'
+        df = thresholds.get("diffuse", {})
+        if entropy >= df.get("entropy_min", 4.5):
+            return "diffuse"
 
-        return 'semantic_bridge'
+        return "semantic_bridge"
 
     async def _stage_metadata(self) -> None:
         """Stage 6: Compute cluster metadata."""
@@ -614,30 +635,32 @@ class DiscoveryJobCoordinator:
 
             # Zone distribution within cluster
             if self._zone_labels:
-                cluster_zones = [self._zone_labels[i] for i in range(len(mask)) if mask[i]]
+                cluster_zones = [
+                    self._zone_labels[i] for i in range(len(mask)) if mask[i]
+                ]
                 zone_counts = {}
                 for z in cluster_zones:
                     zone_counts[z] = zone_counts.get(z, 0) + 1
                 dominant_zone = max(zone_counts, key=zone_counts.get)
             else:
-                dominant_zone = 'unknown'
+                dominant_zone = "unknown"
 
             self._cluster_metadata[int(cluster_id)] = {
-                'centroid_x': float(centroid[0]),
-                'centroid_y': float(centroid[1]),
-                'size': size,
-                'dominant_zone': dominant_zone,
+                "centroid_x": float(centroid[0]),
+                "centroid_y": float(centroid[1]),
+                "size": size,
+                "dominant_zone": dominant_zone,
             }
 
         # Broadcast cluster updates
         if self._ws_server:
             clusters = [
                 {
-                    'id': cid,
-                    'centroid_x': meta['centroid_x'],
-                    'centroid_y': meta['centroid_y'],
-                    'size': meta['size'],
-                    'zone': meta['dominant_zone'],
+                    "id": cid,
+                    "centroid_x": meta["centroid_x"],
+                    "centroid_y": meta["centroid_y"],
+                    "size": meta["size"],
+                    "zone": meta["dominant_zone"],
                 }
                 for cid, meta in self._cluster_metadata.items()
             ]
@@ -662,18 +685,20 @@ class DiscoveryJobCoordinator:
             if len(cluster_indices) == 0:
                 continue
 
-            centroid = np.array([meta['centroid_x'], meta['centroid_y']])
+            centroid = np.array([meta["centroid_x"], meta["centroid_y"]])
             cluster_embeddings = self._embeddings[mask]
 
             # Find closest to centroid
             distances = np.linalg.norm(cluster_embeddings - centroid, axis=1)
             prototype_idx = cluster_indices[np.argmin(distances)]
 
-            prototypes.append({
-                'cluster_id': int(cluster_id),
-                'fingerprint_idx': int(prototype_idx),
-                'fingerprint_id': int(self._fingerprints.iloc[prototype_idx]['id']),
-            })
+            prototypes.append(
+                {
+                    "cluster_id": int(cluster_id),
+                    "fingerprint_idx": int(prototype_idx),
+                    "fingerprint_id": int(self._fingerprints.iloc[prototype_idx]["id"]),
+                }
+            )
 
         # Store prototypes
         self._prototypes = prototypes
@@ -689,50 +714,56 @@ class DiscoveryJobCoordinator:
 
         # Export embeddings
         if self._embeddings is not None and self._fingerprints is not None:
-            df_embeddings = pd.DataFrame({
-                'fingerprint_id': self._fingerprints['id'].values,
-                'x': self._embeddings[:, 0],
-                'y': self._embeddings[:, 1],
-                'cluster_id': self._cluster_labels,
-                'zone': self._zone_labels,
-            })
-            embeddings_path = export_dir / 'embeddings.parquet'
+            df_embeddings = pd.DataFrame(
+                {
+                    "fingerprint_id": self._fingerprints["id"].values,
+                    "x": self._embeddings[:, 0],
+                    "y": self._embeddings[:, 1],
+                    "cluster_id": self._cluster_labels,
+                    "zone": self._zone_labels,
+                }
+            )
+            embeddings_path = export_dir / "embeddings.parquet"
             df_embeddings.to_parquet(embeddings_path, index=False)
 
         # Export cluster metadata
         if self._cluster_metadata:
-            metadata_path = export_dir / 'clusters.json'
-            with open(metadata_path, 'w') as f:
+            metadata_path = export_dir / "clusters.json"
+            with open(metadata_path, "w") as f:
                 json.dump(self._cluster_metadata, f, indent=2)
 
         # Export prototypes
-        if hasattr(self, '_prototypes'):
-            prototypes_path = export_dir / 'prototypes.json'
-            with open(prototypes_path, 'w') as f:
+        if hasattr(self, "_prototypes"):
+            prototypes_path = export_dir / "prototypes.json"
+            with open(prototypes_path, "w") as f:
                 json.dump(self._prototypes, f, indent=2)
 
         # Export manifest
         manifest = {
-            'run_id': self._run_id,
-            'timestamp': timestamp,
-            'config': {
-                'db_path': self.config.db_path,
-                'chunk_size': self.config.chunk_size,
-                'umap_sample_size': self.config.umap_sample_size,
+            "run_id": self._run_id,
+            "timestamp": timestamp,
+            "config": {
+                "db_path": self.config.db_path,
+                "chunk_size": self.config.chunk_size,
+                "umap_sample_size": self.config.umap_sample_size,
             },
-            'metrics': {
-                'total_fingerprints': len(self._fingerprints) if self._fingerprints is not None else 0,
-                'total_clusters': len(self._cluster_metadata) if self._cluster_metadata else 0,
-                'zone_distribution': self._get_zone_distribution(),
+            "metrics": {
+                "total_fingerprints": (
+                    len(self._fingerprints) if self._fingerprints is not None else 0
+                ),
+                "total_clusters": (
+                    len(self._cluster_metadata) if self._cluster_metadata else 0
+                ),
+                "zone_distribution": self._get_zone_distribution(),
             },
-            'files': {
-                'embeddings': 'embeddings.parquet',
-                'clusters': 'clusters.json',
-                'prototypes': 'prototypes.json',
+            "files": {
+                "embeddings": "embeddings.parquet",
+                "clusters": "clusters.json",
+                "prototypes": "prototypes.json",
             },
         }
-        manifest_path = export_dir / 'manifest.json'
-        with open(manifest_path, 'w') as f:
+        manifest_path = export_dir / "manifest.json"
+        with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
 
         self._export_dir = export_dir
@@ -747,11 +778,18 @@ class DiscoveryJobCoordinator:
 
         # Broadcast completion
         if self._ws_server:
-            await self._ws_server.broadcast_run_complete(self._run_id, {
-                'total_fingerprints': len(self._fingerprints) if self._fingerprints is not None else 0,
-                'total_clusters': len(self._cluster_metadata) if self._cluster_metadata else 0,
-                'duration_seconds': time.time() - self._start_time,
-            })
+            await self._ws_server.broadcast_run_complete(
+                self._run_id,
+                {
+                    "total_fingerprints": (
+                        len(self._fingerprints) if self._fingerprints is not None else 0
+                    ),
+                    "total_clusters": (
+                        len(self._cluster_metadata) if self._cluster_metadata else 0
+                    ),
+                    "duration_seconds": time.time() - self._start_time,
+                },
+            )
 
         logger.info(f"Discovery run {self._run_id} complete")
 
@@ -765,6 +803,7 @@ class DiscoveryJobCoordinator:
 
     def _setup_signal_handlers(self) -> None:
         """Setup graceful shutdown signal handlers."""
+
         def handler(signum, frame):
             logger.info(f"Received signal {signum}, requesting shutdown")
             self._shutdown_requested = True
@@ -785,15 +824,19 @@ class DiscoveryJobCoordinator:
         state = create_checkpoint_state(
             run_id=self._run_id,
             stage=stage,
-            total_fingerprints=len(self._fingerprints) if self._fingerprints is not None else 0,
+            total_fingerprints=(
+                len(self._fingerprints) if self._fingerprints is not None else 0
+            ),
             elapsed_seconds=time.time() - self._start_time,
         )
 
         # Save partial artifacts for resume
         if self._scaled_features is not None and stage > 1:
             path = self._checkpoint_mgr.save_partial_artifact(
-                self._run_id, 'scaled_features',
-                pd.DataFrame(self._scaled_features), 'parquet'
+                self._run_id,
+                "scaled_features",
+                pd.DataFrame(self._scaled_features),
+                "parquet",
             )
             state.embeddings_path = path
 
@@ -803,16 +846,18 @@ class DiscoveryJobCoordinator:
     def _get_stage_metrics(self, stage: int) -> Dict[str, Any]:
         """Get metrics for a completed stage."""
         metrics = {
-            'memory_gb': self._memory_monitor.get_usage_gb(),
+            "memory_gb": self._memory_monitor.get_usage_gb(),
         }
 
         if stage == 0 and self._fingerprints is not None:
-            metrics['fingerprints_loaded'] = len(self._fingerprints)
+            metrics["fingerprints_loaded"] = len(self._fingerprints)
         elif stage == 3 and self._embeddings is not None:
-            metrics['embeddings_computed'] = len(self._embeddings)
+            metrics["embeddings_computed"] = len(self._embeddings)
         elif stage == 4 and self._cluster_labels is not None:
-            n_clusters = len(set(self._cluster_labels)) - (1 if -1 in self._cluster_labels else 0)
-            metrics['clusters_found'] = n_clusters
+            n_clusters = len(set(self._cluster_labels)) - (
+                1 if -1 in self._cluster_labels else 0
+            )
+            metrics["clusters_found"] = n_clusters
 
         return metrics
 
@@ -833,11 +878,13 @@ class DiscoveryJobCoordinator:
             success=all(r.success for r in self._stage_results),
             total_duration_seconds=time.time() - self._start_time,
             stages_completed=len([r for r in self._stage_results if r.success]),
-            total_fingerprints=len(self._fingerprints) if self._fingerprints is not None else 0,
+            total_fingerprints=(
+                len(self._fingerprints) if self._fingerprints is not None else 0
+            ),
             total_clusters=len(self._cluster_metadata) if self._cluster_metadata else 0,
             zone_distribution=self._get_zone_distribution(),
             output_paths={
-                'export_dir': str(getattr(self, '_export_dir', '')),
+                "export_dir": str(getattr(self, "_export_dir", "")),
             },
             stage_results=self._stage_results,
             error=next((r.error for r in self._stage_results if r.error), None),
@@ -885,7 +932,9 @@ class DiscoveryJobCoordinator:
     async def _broadcast_stage_complete(self, stage: int, stage_name: str) -> None:
         """Broadcast stage completion."""
         if self._ws_server:
-            await self._ws_server.broadcast_stage_complete(self._run_id, stage, stage_name)
+            await self._ws_server.broadcast_stage_complete(
+                self._run_id, stage, stage_name
+            )
 
     async def _broadcast_error(self, error: str) -> None:
         """Broadcast error."""
@@ -896,6 +945,7 @@ class DiscoveryJobCoordinator:
 # =============================================================================
 # CLI ENTRY POINT
 # =============================================================================
+
 
 async def run_discovery(
     db_path: str,
@@ -947,26 +997,36 @@ if __name__ == "__main__":
     parser.add_argument("--db", required=True, help="Path to fingerprints database")
     parser.add_argument("--output", required=True, help="Output directory")
     parser.add_argument("--resume", help="Run ID to resume from")
-    parser.add_argument("--websocket-port", type=int, default=9010, help="WebSocket port (0 to disable)")
-    parser.add_argument("--max-memory-gb", type=float, default=8.0, help="Memory limit in GB")
-    parser.add_argument("--chunk-size", type=int, default=10000, help="Processing chunk size")
-    parser.add_argument("--umap-sample-size", type=int, default=50000, help="UMAP fit sample size")
+    parser.add_argument(
+        "--websocket-port", type=int, default=9010, help="WebSocket port (0 to disable)"
+    )
+    parser.add_argument(
+        "--max-memory-gb", type=float, default=8.0, help="Memory limit in GB"
+    )
+    parser.add_argument(
+        "--chunk-size", type=int, default=10000, help="Processing chunk size"
+    )
+    parser.add_argument(
+        "--umap-sample-size", type=int, default=50000, help="UMAP fit sample size"
+    )
     parser.add_argument("--zone-thresholds", help="Path to zone thresholds JSON")
     parser.add_argument("--max-hours", type=float, help="Maximum runtime in hours")
 
     args = parser.parse_args()
 
-    result = asyncio.run(run_discovery(
-        db_path=args.db,
-        output_dir=args.output,
-        resume_from=args.resume,
-        websocket_port=args.websocket_port,
-        max_memory_gb=args.max_memory_gb,
-        chunk_size=args.chunk_size,
-        umap_sample_size=args.umap_sample_size,
-        zone_thresholds_path=args.zone_thresholds,
-        max_runtime_hours=args.max_hours,
-    ))
+    result = asyncio.run(
+        run_discovery(
+            db_path=args.db,
+            output_dir=args.output,
+            resume_from=args.resume,
+            websocket_port=args.websocket_port,
+            max_memory_gb=args.max_memory_gb,
+            chunk_size=args.chunk_size,
+            umap_sample_size=args.umap_sample_size,
+            zone_thresholds_path=args.zone_thresholds,
+            max_runtime_hours=args.max_hours,
+        )
+    )
 
     print(f"\nDiscovery {'COMPLETE' if result.success else 'FAILED'}")
     print(f"  Run ID: {result.run_id}")

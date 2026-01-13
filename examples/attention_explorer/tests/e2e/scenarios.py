@@ -12,10 +12,10 @@ These scenarios help build a comprehensive manifold map and
 inform future sinq (semantic intelligence query) implementation.
 """
 
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
-from enum import Enum
 import random
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
 
 class ExpectedManifold(Enum):
@@ -30,6 +30,7 @@ class ExpectedManifold(Enum):
 @dataclass
 class Scenario:
     """A test scenario with expected attention patterns."""
+
     name: str
     category: str
     description: str
@@ -51,7 +52,10 @@ SYNTAX_SCENARIOS = [
         category="syntax",
         description="Simple sentence completion requiring local context",
         messages=[
-            {"role": "user", "content": "Complete this sentence naturally: The quick brown fox"}
+            {
+                "role": "user",
+                "content": "Complete this sentence naturally: The quick brown fox",
+            }
         ],
         expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
         expected_characteristics={"local_mass": ">0.5", "entropy": "<0.4"},
@@ -63,7 +67,10 @@ SYNTAX_SCENARIOS = [
         category="syntax",
         description="Grammar correction focusing on local structure",
         messages=[
-            {"role": "user", "content": "Fix the grammar: Him went to the store yesterday and buyed milk."}
+            {
+                "role": "user",
+                "content": "Fix the grammar: Him went to the store yesterday and buyed milk.",
+            }
         ],
         expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
         expected_characteristics={"local_mass": ">0.4"},
@@ -75,7 +82,10 @@ SYNTAX_SCENARIOS = [
         category="syntax",
         description="Simple translation requiring local token attention",
         messages=[
-            {"role": "user", "content": "Translate word by word to Spanish: The cat sleeps on the mat."}
+            {
+                "role": "user",
+                "content": "Translate word by word to Spanish: The cat sleeps on the mat.",
+            }
         ],
         expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
         max_tokens=100,
@@ -85,9 +95,7 @@ SYNTAX_SCENARIOS = [
         name="rhyme_generation",
         category="syntax",
         description="Generate rhyming words (phonetic local attention)",
-        messages=[
-            {"role": "user", "content": "List 10 words that rhyme with 'cat':"}
-        ],
+        messages=[{"role": "user", "content": "List 10 words that rhyme with 'cat':"}],
         expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
         expected_characteristics={"entropy": "<0.5"},
         max_tokens=100,
@@ -98,7 +106,10 @@ SYNTAX_SCENARIOS = [
         category="syntax",
         description="Complete a single line of code",
         messages=[
-            {"role": "user", "content": "Complete this Python line: result = sum([x for x in range("}
+            {
+                "role": "user",
+                "content": "Complete this Python line: result = sum([x for x in range(",
+            }
         ],
         expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
         max_tokens=30,
@@ -117,13 +128,16 @@ SEMANTIC_SCENARIOS = [
         category="semantic",
         description="Summarize a paragraph (requires sentence-level context)",
         messages=[
-            {"role": "user", "content": """Summarize this paragraph in one sentence:
+            {
+                "role": "user",
+                "content": """Summarize this paragraph in one sentence:
 
 The development of artificial intelligence has progressed rapidly over the past decade.
 Machine learning algorithms have become increasingly sophisticated, enabling applications
 from image recognition to natural language processing. However, concerns about AI safety
 and ethical implications have grown alongside these technological advances. Researchers
-are now working to ensure AI systems are aligned with human values and remain beneficial."""}
+are now working to ensure AI systems are aligned with human values and remain beneficial.""",
+            }
         ],
         expected_manifold=ExpectedManifold.SEMANTIC_BRIDGE,
         expected_characteristics={"mid_mass": ">0.4"},
@@ -135,13 +149,16 @@ are now working to ensure AI systems are aligned with human values and remain be
         category="semantic",
         description="Identify cause and effect relationships",
         messages=[
-            {"role": "user", "content": """Read the following and identify the cause and effect:
+            {
+                "role": "user",
+                "content": """Read the following and identify the cause and effect:
 
 The city experienced unprecedented rainfall for three consecutive weeks. Streets flooded,
 basements filled with water, and the subway system was forced to shut down. Many residents
 had to evacuate their homes, and local businesses reported significant losses.
 
-What was the cause and what were the effects?"""}
+What was the cause and what were the effects?""",
+            }
         ],
         expected_manifold=ExpectedManifold.SEMANTIC_BRIDGE,
         expected_characteristics={"mid_mass": ">0.35"},
@@ -153,12 +170,15 @@ What was the cause and what were the effects?"""}
         category="semantic",
         description="Compare two short texts",
         messages=[
-            {"role": "user", "content": """Compare these two descriptions:
+            {
+                "role": "user",
+                "content": """Compare these two descriptions:
 
 Description A: "The algorithm processes data in linear time, making it efficient for large datasets."
 Description B: "The method requires quadratic time complexity, limiting its use to smaller inputs."
 
-What are the key differences?"""}
+What are the key differences?""",
+            }
         ],
         expected_manifold=ExpectedManifold.SEMANTIC_BRIDGE,
         max_tokens=150,
@@ -169,13 +189,16 @@ What are the key differences?"""}
         category="semantic",
         description="Answer question based on provided context",
         messages=[
-            {"role": "user", "content": """Based on the following information, answer the question:
+            {
+                "role": "user",
+                "content": """Based on the following information, answer the question:
 
 Context: The Python programming language was created by Guido van Rossum and first released
 in 1991. It emphasizes code readability and uses significant whitespace. Python supports
 multiple programming paradigms, including procedural, object-oriented, and functional programming.
 
-Question: What programming paradigms does Python support?"""}
+Question: What programming paradigms does Python support?""",
+            }
         ],
         expected_manifold=ExpectedManifold.SEMANTIC_BRIDGE,
         expected_characteristics={"mid_mass": ">0.3", "entropy": "<0.6"},
@@ -187,14 +210,17 @@ Question: What programming paradigms does Python support?"""}
         category="semantic",
         description="Analyze sentiment of a review",
         messages=[
-            {"role": "user", "content": """Analyze the sentiment of this review:
+            {
+                "role": "user",
+                "content": """Analyze the sentiment of this review:
 
 "I was really excited about this product, but after using it for a week, I'm disappointed.
 The build quality is decent, and it looks nice on my desk. However, the performance is
 sluggish, the battery life is terrible, and customer support was unhelpful when I reached
 out. I expected better for the price."
 
-Is this positive, negative, or mixed? Explain your analysis."""}
+Is this positive, negative, or mixed? Explain your analysis.""",
+            }
         ],
         expected_manifold=ExpectedManifold.SEMANTIC_BRIDGE,
         max_tokens=200,
@@ -262,9 +288,12 @@ LONG_RANGE_SCENARIOS = [
         category="long_range",
         description="Answer question requiring information from document start",
         messages=[
-            {"role": "user", "content": f"""{LONG_DOCUMENT}
+            {
+                "role": "user",
+                "content": f"""{LONG_DOCUMENT}
 
-Based on the document above, what are the three types of layers in a typical neural network architecture?"""}
+Based on the document above, what are the three types of layers in a typical neural network architecture?""",
+            }
         ],
         expected_manifold=ExpectedManifold.LONG_RANGE,
         expected_characteristics={"long_mass": ">0.3"},
@@ -276,10 +305,13 @@ Based on the document above, what are the three types of layers in a typical neu
         category="long_range",
         description="Connect information from different parts of document",
         messages=[
-            {"role": "user", "content": f"""{LONG_DOCUMENT}
+            {
+                "role": "user",
+                "content": f"""{LONG_DOCUMENT}
 
 How do the challenges mentioned relate to the applications described earlier?
-Give specific examples connecting them."""}
+Give specific examples connecting them.""",
+            }
         ],
         expected_manifold=ExpectedManifold.LONG_RANGE,
         expected_characteristics={"long_mass": ">0.25", "mid_mass": ">0.2"},
@@ -291,11 +323,26 @@ Give specific examples connecting them."""}
         category="long_range",
         description="Multi-turn conversation requiring recall of earlier context",
         messages=[
-            {"role": "user", "content": "I'm building a machine learning system. It needs to recognize faces in photos."},
-            {"role": "assistant", "content": "That's a computer vision task! You'll want to use a convolutional neural network (CNN) architecture. Popular choices include ResNet, VGGNet, or more modern architectures like EfficientNet. For face recognition specifically, you might want to look at FaceNet or ArcFace which are optimized for generating face embeddings."},
-            {"role": "user", "content": "Great! Now I also need it to understand voice commands."},
-            {"role": "assistant", "content": "For voice command recognition, you'll need a speech recognition system. Recurrent neural networks (RNNs), particularly LSTMs or GRUs, have been traditionally used. However, transformer-based models like Wav2Vec 2.0 and Whisper have shown excellent performance. You'll need to handle audio preprocessing, feature extraction (like mel spectrograms), and possibly speaker verification if you need to identify who is speaking."},
-            {"role": "user", "content": "What challenges might I face combining both the systems I asked about initially?"}
+            {
+                "role": "user",
+                "content": "I'm building a machine learning system. It needs to recognize faces in photos.",
+            },
+            {
+                "role": "assistant",
+                "content": "That's a computer vision task! You'll want to use a convolutional neural network (CNN) architecture. Popular choices include ResNet, VGGNet, or more modern architectures like EfficientNet. For face recognition specifically, you might want to look at FaceNet or ArcFace which are optimized for generating face embeddings.",
+            },
+            {
+                "role": "user",
+                "content": "Great! Now I also need it to understand voice commands.",
+            },
+            {
+                "role": "assistant",
+                "content": "For voice command recognition, you'll need a speech recognition system. Recurrent neural networks (RNNs), particularly LSTMs or GRUs, have been traditionally used. However, transformer-based models like Wav2Vec 2.0 and Whisper have shown excellent performance. You'll need to handle audio preprocessing, feature extraction (like mel spectrograms), and possibly speaker verification if you need to identify who is speaking.",
+            },
+            {
+                "role": "user",
+                "content": "What challenges might I face combining both the systems I asked about initially?",
+            },
         ],
         expected_manifold=ExpectedManifold.LONG_RANGE,
         expected_characteristics={"long_mass": ">0.2"},
@@ -307,7 +354,9 @@ Give specific examples connecting them."""}
         category="long_range",
         description="Continue a story maintaining consistency with earlier details",
         messages=[
-            {"role": "user", "content": """Continue this story, making sure to reference the earlier details:
+            {
+                "role": "user",
+                "content": """Continue this story, making sure to reference the earlier details:
 
 Chapter 1: The Discovery
 Dr. Sarah Chen had spent fifteen years searching for evidence of extraterrestrial intelligence.
@@ -324,7 +373,8 @@ to respond. Some argued for immediate transmission of a return message, others c
 caution. Dr. Chen was invited to address the assembly.
 
 Chapter 3: The Decision
-Write what happens next, referencing details from both previous chapters."""}
+Write what happens next, referencing details from both previous chapters.""",
+            }
         ],
         expected_manifold=ExpectedManifold.LONG_RANGE,
         max_tokens=400,
@@ -343,13 +393,16 @@ STRUCTURE_SCENARIOS = [
         category="structure",
         description="Generate a complete function with structured code",
         messages=[
-            {"role": "user", "content": """Write a Python function that:
+            {
+                "role": "user",
+                "content": """Write a Python function that:
 1. Takes a list of numbers
 2. Filters out negative numbers
 3. Squares the remaining numbers
 4. Returns the sum
 
-Include docstring and type hints."""}
+Include docstring and type hints.""",
+            }
         ],
         expected_manifold=ExpectedManifold.STRUCTURE_RIPPLE,
         expected_characteristics={"entropy": "<0.5"},
@@ -361,14 +414,17 @@ Include docstring and type hints."""}
         category="structure",
         description="Generate a class with methods",
         messages=[
-            {"role": "user", "content": """Create a Python class called 'BankAccount' with:
+            {
+                "role": "user",
+                "content": """Create a Python class called 'BankAccount' with:
 - Constructor taking owner name and initial balance
 - deposit() method
 - withdraw() method with overdraft protection
 - get_balance() method
 - transfer_to() method for transferring to another account
 
-Include proper error handling."""}
+Include proper error handling.""",
+            }
         ],
         expected_manifold=ExpectedManifold.STRUCTURE_RIPPLE,
         max_tokens=500,
@@ -379,7 +435,10 @@ Include proper error handling."""}
         category="structure",
         description="Generate a numbered list with consistent structure",
         messages=[
-            {"role": "user", "content": "List 10 tips for effective public speaking, numbered 1-10, with a brief explanation for each."}
+            {
+                "role": "user",
+                "content": "List 10 tips for effective public speaking, numbered 1-10, with a brief explanation for each.",
+            }
         ],
         expected_manifold=ExpectedManifold.STRUCTURE_RIPPLE,
         max_tokens=500,
@@ -390,9 +449,12 @@ Include proper error handling."""}
         category="structure",
         description="Generate a markdown table",
         messages=[
-            {"role": "user", "content": """Create a markdown table comparing 5 programming languages:
+            {
+                "role": "user",
+                "content": """Create a markdown table comparing 5 programming languages:
 - Include columns: Language, Year Created, Primary Use, Key Feature, Popularity Rank
-- Languages: Python, JavaScript, Rust, Go, TypeScript"""}
+- Languages: Python, JavaScript, Rust, Go, TypeScript""",
+            }
         ],
         expected_manifold=ExpectedManifold.STRUCTURE_RIPPLE,
         max_tokens=300,
@@ -403,13 +465,16 @@ Include proper error handling."""}
         category="structure",
         description="Generate structured JSON data",
         messages=[
-            {"role": "user", "content": """Generate a JSON object representing a user profile with:
+            {
+                "role": "user",
+                "content": """Generate a JSON object representing a user profile with:
 - Basic info (name, email, age)
 - Address (street, city, country, postal code)
 - Preferences (theme, language, notifications as nested object)
 - Array of 3 recent orders (id, date, total, items array)
 
-Use realistic sample data."""}
+Use realistic sample data.""",
+            }
         ],
         expected_manifold=ExpectedManifold.STRUCTURE_RIPPLE,
         expected_characteristics={"entropy": "<0.4"},
@@ -421,11 +486,14 @@ Use realistic sample data."""}
         category="structure",
         description="Implement a sorting algorithm with clear structure",
         messages=[
-            {"role": "user", "content": """Implement quicksort in Python with:
+            {
+                "role": "user",
+                "content": """Implement quicksort in Python with:
 - Clear partition function
 - Recursive sort function
 - Example usage with test array
-- Comments explaining each step"""}
+- Comments explaining each step""",
+            }
         ],
         expected_manifold=ExpectedManifold.STRUCTURE_RIPPLE,
         max_tokens=400,
@@ -444,7 +512,10 @@ DIFFUSE_SCENARIOS = [
         category="diffuse",
         description="Open-ended brainstorming with many possibilities",
         messages=[
-            {"role": "user", "content": "Brainstorm innovative uses for blockchain technology beyond cryptocurrency."}
+            {
+                "role": "user",
+                "content": "Brainstorm innovative uses for blockchain technology beyond cryptocurrency.",
+            }
         ],
         expected_manifold=ExpectedManifold.DIFFUSE,
         expected_characteristics={"entropy": ">0.6"},
@@ -456,7 +527,10 @@ DIFFUSE_SCENARIOS = [
         category="diffuse",
         description="Abstract philosophical reasoning",
         messages=[
-            {"role": "user", "content": "What does it mean for an AI to 'understand' something? Is there a meaningful difference between processing and understanding?"}
+            {
+                "role": "user",
+                "content": "What does it mean for an AI to 'understand' something? Is there a meaningful difference between processing and understanding?",
+            }
         ],
         expected_manifold=ExpectedManifold.DIFFUSE,
         expected_characteristics={"entropy": ">0.5"},
@@ -468,7 +542,10 @@ DIFFUSE_SCENARIOS = [
         category="diffuse",
         description="Creative writing with freedom of interpretation",
         messages=[
-            {"role": "user", "content": "Write a short poem about the relationship between humans and technology."}
+            {
+                "role": "user",
+                "content": "Write a short poem about the relationship between humans and technology.",
+            }
         ],
         expected_manifold=ExpectedManifold.DIFFUSE,
         max_tokens=200,
@@ -479,7 +556,10 @@ DIFFUSE_SCENARIOS = [
         category="diffuse",
         description="Explore a hypothetical with many branches",
         messages=[
-            {"role": "user", "content": "If humans could photosynthesize like plants, how might society be different?"}
+            {
+                "role": "user",
+                "content": "If humans could photosynthesize like plants, how might society be different?",
+            }
         ],
         expected_manifold=ExpectedManifold.DIFFUSE,
         expected_characteristics={"entropy": ">0.5"},
@@ -499,8 +579,11 @@ MIXED_SCENARIOS = [
         category="mixed",
         description="Explanation followed by code (semantic -> structure)",
         messages=[
-            {"role": "user", "content": """First explain what a binary search tree is and why it's useful.
-Then implement one in Python with insert, search, and in-order traversal methods."""}
+            {
+                "role": "user",
+                "content": """First explain what a binary search tree is and why it's useful.
+Then implement one in Python with insert, search, and in-order traversal methods.""",
+            }
         ],
         expected_manifold=ExpectedManifold.MIXED,
         expected_characteristics={"transition": "semantic_to_structure"},
@@ -512,10 +595,13 @@ Then implement one in Python with insert, search, and in-order traversal methods
         category="mixed",
         description="Detailed analysis followed by summary (long -> local)",
         messages=[
-            {"role": "user", "content": f"""{LONG_DOCUMENT}
+            {
+                "role": "user",
+                "content": f"""{LONG_DOCUMENT}
 
 First, analyze the key themes and arguments in this document in detail.
-Then provide a one-sentence TL;DR summary."""}
+Then provide a one-sentence TL;DR summary.""",
+            }
         ],
         expected_manifold=ExpectedManifold.MIXED,
         expected_characteristics={"transition": "long_to_local"},
@@ -527,7 +613,9 @@ Then provide a one-sentence TL;DR summary."""}
         category="mixed",
         description="Review code then fix it (structure -> structure with semantic bridge)",
         messages=[
-            {"role": "user", "content": """Review this code for bugs and then provide the corrected version:
+            {
+                "role": "user",
+                "content": """Review this code for bugs and then provide the corrected version:
 
 ```python
 def calculate_average(numbers):
@@ -549,7 +637,8 @@ def process_data(data):
     return [x * 2 for x in data if x > 0]
 ```
 
-First identify all bugs, then provide the corrected code."""}
+First identify all bugs, then provide the corrected code.""",
+            }
         ],
         expected_manifold=ExpectedManifold.MIXED,
         max_tokens=500,
@@ -568,13 +657,16 @@ MATH_SCENARIOS = [
         category="math",
         description="Multi-step mathematical problem",
         messages=[
-            {"role": "user", "content": """Solve this problem step by step:
+            {
+                "role": "user",
+                "content": """Solve this problem step by step:
 
 A train leaves Station A at 9:00 AM traveling at 60 mph toward Station B.
 Another train leaves Station B at 10:00 AM traveling at 80 mph toward Station A.
 If the stations are 280 miles apart, at what time will the trains meet?
 
-Show all your work."""}
+Show all your work.""",
+            }
         ],
         expected_manifold=ExpectedManifold.SEMANTIC_BRIDGE,
         max_tokens=400,
@@ -585,7 +677,10 @@ Show all your work."""}
         category="math",
         description="Mathematical proof requiring logical chain",
         messages=[
-            {"role": "user", "content": "Prove that the sum of the first n positive integers is n(n+1)/2 using mathematical induction."}
+            {
+                "role": "user",
+                "content": "Prove that the sum of the first n positive integers is n(n+1)/2 using mathematical induction.",
+            }
         ],
         expected_manifold=ExpectedManifold.SEMANTIC_BRIDGE,
         expected_characteristics={"mid_mass": ">0.35"},
@@ -597,7 +692,9 @@ Show all your work."""}
         category="math",
         description="Logic puzzle requiring deduction",
         messages=[
-            {"role": "user", "content": """Solve this logic puzzle:
+            {
+                "role": "user",
+                "content": """Solve this logic puzzle:
 
 There are five houses in a row, each painted a different color.
 In each house lives a person of a different nationality.
@@ -615,7 +712,8 @@ Clues:
 9. The Norwegian lives in the first house.
 10. The Blend smoker lives next to the one who keeps cats.
 
-Who owns the fish?"""}
+Who owns the fish?""",
+            }
         ],
         expected_manifold=ExpectedManifold.LONG_RANGE,  # Needs to track many constraints
         max_tokens=800,
@@ -629,13 +727,13 @@ Who owns the fish?"""}
 # =============================================================================
 
 ALL_SCENARIOS: List[Scenario] = (
-    SYNTAX_SCENARIOS +
-    SEMANTIC_SCENARIOS +
-    LONG_RANGE_SCENARIOS +
-    STRUCTURE_SCENARIOS +
-    DIFFUSE_SCENARIOS +
-    MIXED_SCENARIOS +
-    MATH_SCENARIOS
+    SYNTAX_SCENARIOS
+    + SEMANTIC_SCENARIOS
+    + LONG_RANGE_SCENARIOS
+    + STRUCTURE_SCENARIOS
+    + DIFFUSE_SCENARIOS
+    + MIXED_SCENARIOS
+    + MATH_SCENARIOS
 )
 
 SCENARIOS_BY_CATEGORY: Dict[str, List[Scenario]] = {
@@ -655,7 +753,9 @@ for scenario in ALL_SCENARIOS:
     SCENARIOS_BY_MANIFOLD[scenario.expected_manifold].append(scenario)
 
 
-def get_random_scenarios(n: int, categories: Optional[List[str]] = None) -> List[Scenario]:
+def get_random_scenarios(
+    n: int, categories: Optional[List[str]] = None
+) -> List[Scenario]:
     """Get n random scenarios, optionally filtered by category."""
     pool = ALL_SCENARIOS
     if categories:

@@ -6,19 +6,21 @@ Tests adaptive zone threshold learning from probe harness feedback.
 
 import json
 import os
-import tempfile
-import pytest
-from pathlib import Path
 
 # Add parent to path for imports
 import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from discovery.threshold_tuner import (
-    ZoneThresholdTuner,
-    ZoneSample,
     DEFAULT_ZONE_THRESHOLDS,
     ZONES,
+    ZoneSample,
+    ZoneThresholdTuner,
     create_threshold_tuner,
 )
 
@@ -172,7 +174,9 @@ class TestZoneThresholdTuner:
         cm = tuner.get_confusion_matrix()
 
         assert cm["syntax_floor"]["syntax_floor"] == 2
-        assert cm["semantic_bridge"]["syntax_floor"] == 1  # actual=sem_bridge, pred=syn_floor
+        assert (
+            cm["semantic_bridge"]["syntax_floor"] == 1
+        )  # actual=sem_bridge, pred=syn_floor
         assert cm["semantic_bridge"]["semantic_bridge"] == 1
 
     def test_export_import_thresholds(self):
@@ -280,11 +284,7 @@ class TestFactoryFunction:
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create thresholds file
             thresholds_path = os.path.join(tmpdir, "thresholds.json")
-            thresholds = {
-                "thresholds": {
-                    "syntax_floor": {"local_mass_min": 0.75}
-                }
-            }
+            thresholds = {"thresholds": {"syntax_floor": {"local_mass_min": 0.75}}}
             with open(thresholds_path, "w") as f:
                 json.dump(thresholds, f)
 

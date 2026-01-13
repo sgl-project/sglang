@@ -4,27 +4,27 @@ Unit tests for RAPIDS Sidecar utility classes and functions
 Tests FingerprintStorage, ClusteringBackend, and helper utilities.
 """
 
-import json
 import os
 import sqlite3
-import tempfile
-import pytest
-import numpy as np
-import threading
-from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
 
 # Add parent to path for imports
 import sys
+import tempfile
+import threading
+from pathlib import Path
+
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from rapids_sidecar import (
-    ClusteringBackend,
-    FingerprintStorage,
-    SIDECAR_VERSION,
     HAS_RAPIDS,
     HAS_SKLEARN,
     HAS_ZMQ,
+    SIDECAR_VERSION,
+    ClusteringBackend,
+    FingerprintStorage,
 )
 
 
@@ -66,7 +66,8 @@ class TestFingerprintStorage:
 
             # Create schema matching discovery/schema.sql
             conn = sqlite3.connect(db_path)
-            conn.executescript("""
+            conn.executescript(
+                """
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
                     name TEXT,
@@ -108,7 +109,8 @@ class TestFingerprintStorage:
                     ON fingerprints(session_id);
                 CREATE INDEX IF NOT EXISTS idx_fingerprints_request
                     ON fingerprints(request_id);
-            """)
+            """
+            )
             conn.commit()
             conn.close()
 
@@ -138,8 +140,7 @@ class TestFingerprintStorage:
 
         # Verify session was created
         cursor = storage._conn.execute(
-            "SELECT session_id FROM sessions WHERE session_id = ?",
-            ("test-session",)
+            "SELECT session_id FROM sessions WHERE session_id = ?", ("test-session",)
         )
         row = cursor.fetchone()
         assert row is not None
@@ -164,7 +165,7 @@ class TestFingerprintStorage:
         # Verify stored
         cursor = storage._conn.execute(
             "SELECT request_id, step FROM fingerprints WHERE request_id = ?",
-            ("req-001",)
+            ("req-001",),
         )
         row = cursor.fetchone()
         assert row is not None

@@ -6,27 +6,29 @@ Tests WebSocket connection management, message broadcasting, and message types.
 
 import asyncio
 import json
-import pytest
-from dataclasses import asdict
-from pathlib import Path
-from unittest.mock import Mock, MagicMock, AsyncMock, patch
 
 # Add parent to path for imports
 import sys
+from dataclasses import asdict
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from discovery.websocket_server import (
-    MessageType,
-    ProgressMessage,
+    HAS_WEBSOCKETS,
     BatchCompleteMessage,
     ClusterUpdateMessage,
-    ZoneStatsMessage,
-    StageMessage,
-    RunMessage,
     ConnectionManager,
     ManifoldWebSocketServer,
+    MessageType,
+    ProgressMessage,
+    RunMessage,
+    StageMessage,
+    ZoneStatsMessage,
     create_websocket_server,
-    HAS_WEBSOCKETS,
 )
 
 
@@ -152,8 +154,20 @@ class TestClusterUpdateMessage:
     def test_create_cluster_message(self):
         """Test creating a cluster update message."""
         clusters = [
-            {"id": 0, "centroid_x": 0.5, "centroid_y": 0.3, "size": 100, "zone": "syntax_floor"},
-            {"id": 1, "centroid_x": -0.2, "centroid_y": 0.8, "size": 50, "zone": "long_range"},
+            {
+                "id": 0,
+                "centroid_x": 0.5,
+                "centroid_y": 0.3,
+                "size": 100,
+                "zone": "syntax_floor",
+            },
+            {
+                "id": 1,
+                "centroid_x": -0.2,
+                "centroid_y": 0.8,
+                "size": 50,
+                "zone": "long_range",
+            },
         ]
 
         msg = ClusterUpdateMessage(
@@ -174,8 +188,16 @@ class TestZoneStatsMessage:
         """Test creating a zone stats message."""
         msg = ZoneStatsMessage(
             run_id="run-001",
-            distribution={"syntax_floor": 500, "semantic_bridge": 300, "long_range": 200},
-            percentages={"syntax_floor": 50.0, "semantic_bridge": 30.0, "long_range": 20.0},
+            distribution={
+                "syntax_floor": 500,
+                "semantic_bridge": 300,
+                "long_range": 200,
+            },
+            percentages={
+                "syntax_floor": 50.0,
+                "semantic_bridge": 30.0,
+                "long_range": 20.0,
+            },
         )
 
         assert msg.run_id == "run-001"
@@ -236,6 +258,7 @@ class TestConnectionManager:
 
     def test_connect(self):
         """Test connecting a websocket."""
+
         async def run_test():
             manager = ConnectionManager()
             ws = AsyncMock()
@@ -249,6 +272,7 @@ class TestConnectionManager:
 
     def test_disconnect(self):
         """Test disconnecting a websocket."""
+
         async def run_test():
             manager = ConnectionManager()
             ws = AsyncMock()
@@ -263,6 +287,7 @@ class TestConnectionManager:
 
     def test_subscribe(self):
         """Test subscribing to a run."""
+
         async def run_test():
             manager = ConnectionManager()
             ws = AsyncMock()
@@ -277,6 +302,7 @@ class TestConnectionManager:
 
     def test_unsubscribe(self):
         """Test unsubscribing from a run."""
+
         async def run_test():
             manager = ConnectionManager()
             ws = AsyncMock()
@@ -293,6 +319,7 @@ class TestConnectionManager:
 
     def test_broadcast_to_all(self):
         """Test broadcasting to all connections."""
+
         async def run_test():
             manager = ConnectionManager()
             ws1 = AsyncMock()
@@ -314,6 +341,7 @@ class TestConnectionManager:
 
     def test_broadcast_to_run(self):
         """Test broadcasting to subscribers of a specific run."""
+
         async def run_test():
             manager = ConnectionManager()
             ws1 = AsyncMock()
@@ -343,6 +371,7 @@ class TestConnectionManager:
 
     def test_broadcast_to_empty_run(self):
         """Test broadcasting to a run with no subscribers."""
+
         async def run_test():
             manager = ConnectionManager()
             sent = await manager.broadcast_to_run("nonexistent-run", {"type": "test"})
@@ -352,6 +381,7 @@ class TestConnectionManager:
 
     def test_broadcast_handles_dead_connection(self):
         """Test broadcast handles and cleans up dead connections."""
+
         async def run_test():
             manager = ConnectionManager()
             ws1 = AsyncMock()
@@ -377,6 +407,7 @@ class TestConnectionManager:
 
     def test_get_subscription_counts(self):
         """Test getting subscription counts."""
+
         async def run_test():
             manager = ConnectionManager()
             ws1 = AsyncMock()

@@ -44,14 +44,14 @@ The firewall can run:
 3. As a sidecar service receiving fingerprints via API
 """
 
-import math
-import numpy as np
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any, Deque
-from enum import Enum
 import logging
 import time
+from collections import deque
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -60,25 +60,28 @@ logger = logging.getLogger(__name__)
 # ENUMS AND CONSTANTS
 # =============================================================================
 
+
 class AlertSeverity(Enum):
     """Severity levels for firewall alerts."""
-    SAFE = "safe"           # Normal, no concerns
-    WATCH = "watch"         # Minor drift, monitoring
-    WARNING = "warning"     # Suspicious, may need verification
-    ALERT = "alert"         # Likely hallucination
-    CRITICAL = "critical"   # Strong signal, stop generation
+
+    SAFE = "safe"  # Normal, no concerns
+    WATCH = "watch"  # Minor drift, monitoring
+    WARNING = "warning"  # Suspicious, may need verification
+    ALERT = "alert"  # Likely hallucination
+    CRITICAL = "critical"  # Strong signal, stop generation
 
 
 class DriftType(Enum):
     """Types of manifold drift."""
+
     NONE = "none"
-    GRADUAL = "gradual"           # Normal progression
-    SUDDEN_JUMP = "sudden_jump"   # Teleport to distant region
+    GRADUAL = "gradual"  # Normal progression
+    SUDDEN_JUMP = "sudden_jump"  # Teleport to distant region
     ZONE_VIOLATION = "zone_violation"  # Unexpected zone change
-    ENTROPY_SPIKE = "entropy_spike"    # Scattered attention
-    SINK_COLLAPSE = "sink_collapse"    # High sink after confidence
-    TRAJECTORY_REVERSAL = "reversal"   # Unexpected backtrack
-    OSCILLATION = "oscillation"        # Rapid zone switching
+    ENTROPY_SPIKE = "entropy_spike"  # Scattered attention
+    SINK_COLLAPSE = "sink_collapse"  # High sink after confidence
+    TRAJECTORY_REVERSAL = "reversal"  # Unexpected backtrack
+    OSCILLATION = "oscillation"  # Rapid zone switching
 
 
 # Zone transition matrix: expected vs suspicious
@@ -100,17 +103,19 @@ ZONE_TRANSITIONS = {
 # DATA STRUCTURES
 # =============================================================================
 
+
 @dataclass
 class ManifoldPoint:
     """A point on the attention manifold."""
-    fingerprint: np.ndarray         # 20-dim fingerprint
-    zone: str                       # syntax_floor, semantic_bridge, etc.
-    cluster_id: Optional[int]       # Cluster assignment
+
+    fingerprint: np.ndarray  # 20-dim fingerprint
+    zone: str  # syntax_floor, semantic_bridge, etc.
+    cluster_id: Optional[int]  # Cluster assignment
     embedding: Optional[Tuple[float, float]]  # (x, y) if computed
-    entropy: float                  # Attention entropy
-    sink_ratio: float               # Attention to sink tokens
-    timestamp: float                # When captured
-    token_position: int             # Position in generation
+    entropy: float  # Attention entropy
+    sink_ratio: float  # Attention to sink tokens
+    timestamp: float  # When captured
+    token_position: int  # Position in generation
 
     def distance_to(self, other: "ManifoldPoint") -> float:
         """Euclidean distance in fingerprint space."""
@@ -120,9 +125,10 @@ class ManifoldPoint:
 @dataclass
 class DriftEvent:
     """A detected drift event."""
+
     drift_type: DriftType
     severity: AlertSeverity
-    magnitude: float                # How severe (0-1)
+    magnitude: float  # How severe (0-1)
     from_point: ManifoldPoint
     to_point: ManifoldPoint
     reason: str
@@ -147,6 +153,7 @@ class DriftEvent:
 @dataclass
 class FirewallState:
     """Current state of the firewall for a generation session."""
+
     session_id: str
     trajectory: Deque[ManifoldPoint]
     events: List[DriftEvent]
@@ -172,15 +179,16 @@ class FirewallState:
 @dataclass
 class FirewallConfig:
     """Configuration for the manifold firewall."""
+
     # Trajectory settings
-    window_size: int = 20           # Number of points to track
+    window_size: int = 20  # Number of points to track
     min_points_for_detection: int = 3  # Min points before alerting
 
     # Drift thresholds
-    gradual_drift_threshold: float = 0.3   # Normal drift
-    sudden_jump_threshold: float = 0.8     # Teleport detection
-    entropy_spike_threshold: float = 1.5   # Entropy increase ratio
-    sink_collapse_threshold: float = 0.4   # Sink ratio jump
+    gradual_drift_threshold: float = 0.3  # Normal drift
+    sudden_jump_threshold: float = 0.8  # Teleport detection
+    entropy_spike_threshold: float = 1.5  # Entropy increase ratio
+    sink_collapse_threshold: float = 0.4  # Sink ratio jump
 
     # Severity thresholds (cumulative drift)
     watch_threshold: float = 0.5
@@ -190,17 +198,18 @@ class FirewallConfig:
 
     # Zone transition settings
     zone_violation_weight: float = 0.5  # Weight for zone violations
-    oscillation_window: int = 5         # Window for oscillation detection
-    oscillation_threshold: int = 3      # Zone changes for oscillation
+    oscillation_window: int = 5  # Window for oscillation detection
+    oscillation_threshold: int = 3  # Zone changes for oscillation
 
     # Decay settings
-    drift_decay: float = 0.9           # Decay factor per step
-    event_retention: int = 100          # Max events to keep
+    drift_decay: float = 0.9  # Decay factor per step
+    event_retention: int = 100  # Max events to keep
 
 
 # =============================================================================
 # DRIFT DETECTORS
 # =============================================================================
+
 
 class DriftDetector:
     """Base class for drift detection strategies."""
@@ -233,7 +242,7 @@ class SuddenJumpDetector(DriftDetector):
         # Compute average step size for comparison
         if len(trajectory) >= 3:
             recent_distances = [
-                trajectory[i].distance_to(trajectory[i-1])
+                trajectory[i].distance_to(trajectory[i - 1])
                 for i in range(1, min(5, len(trajectory)))
             ]
             avg_step = np.mean(recent_distances) if recent_distances else 0.3
@@ -263,7 +272,9 @@ class SuddenJumpDetector(DriftDetector):
 
         return None
 
-    def _compute_severity(self, magnitude: float, config: FirewallConfig) -> AlertSeverity:
+    def _compute_severity(
+        self, magnitude: float, config: FirewallConfig
+    ) -> AlertSeverity:
         if magnitude < 0.3:
             return AlertSeverity.WATCH
         elif magnitude < 0.5:
@@ -335,7 +346,11 @@ class EntropySpikeDetector(DriftDetector):
 
                 return DriftEvent(
                     drift_type=DriftType.ENTROPY_SPIKE,
-                    severity=AlertSeverity.WARNING if magnitude < 0.5 else AlertSeverity.ALERT,
+                    severity=(
+                        AlertSeverity.WARNING
+                        if magnitude < 0.5
+                        else AlertSeverity.ALERT
+                    ),
                     magnitude=magnitude,
                     from_point=trajectory[-1],
                     to_point=current,
@@ -403,12 +418,13 @@ class OscillationDetector(DriftDetector):
             return None
 
         # Count zone changes in recent window
-        recent_zones = [p.zone for p in list(trajectory)[-config.oscillation_window:]]
+        recent_zones = [p.zone for p in list(trajectory)[-config.oscillation_window :]]
         recent_zones.append(current.zone)
 
         zone_changes = sum(
-            1 for i in range(1, len(recent_zones))
-            if recent_zones[i] != recent_zones[i-1]
+            1
+            for i in range(1, len(recent_zones))
+            if recent_zones[i] != recent_zones[i - 1]
         )
 
         if zone_changes >= config.oscillation_threshold:
@@ -434,6 +450,7 @@ class OscillationDetector(DriftDetector):
 # =============================================================================
 # MANIFOLD FIREWALL
 # =============================================================================
+
 
 class ManifoldFirewall:
     """
@@ -543,7 +560,7 @@ class ManifoldFirewall:
 
                     # Limit stored events
                     if len(state.events) > self.config.event_retention:
-                        state.events = state.events[-self.config.event_retention:]
+                        state.events = state.events[-self.config.event_retention :]
 
         # Update cumulative drift
         if new_events:
@@ -617,6 +634,7 @@ class ManifoldFirewall:
 @dataclass
 class FirewallCheckResult:
     """Result of a firewall check."""
+
     severity: AlertSeverity
     cumulative_drift: float
     new_events: List[DriftEvent]
@@ -629,7 +647,11 @@ class FirewallCheckResult:
 
     @property
     def needs_attention(self) -> bool:
-        return self.severity in [AlertSeverity.WARNING, AlertSeverity.ALERT, AlertSeverity.CRITICAL]
+        return self.severity in [
+            AlertSeverity.WARNING,
+            AlertSeverity.ALERT,
+            AlertSeverity.CRITICAL,
+        ]
 
     @property
     def should_stop(self) -> bool:
@@ -651,6 +673,7 @@ class FirewallCheckResult:
 # =============================================================================
 # BATCH ANALYZER
 # =============================================================================
+
 
 class ManifoldBatchAnalyzer:
     """
@@ -680,9 +703,9 @@ class ManifoldBatchAnalyzer:
         self.firewall.start_session(session_id)
 
         results = []
-        for i, (fp, zone, entropy, sink) in enumerate(zip(
-            fingerprints, zones, entropies, sink_ratios
-        )):
+        for i, (fp, zone, entropy, sink) in enumerate(
+            zip(fingerprints, zones, entropies, sink_ratios)
+        ):
             result = self.firewall.check(
                 session_id=session_id,
                 fingerprint=fp,
@@ -711,18 +734,22 @@ class ManifoldBatchAnalyzer:
                 region_start = i
             elif not result.needs_attention and in_region:
                 in_region = False
-                suspicious_regions.append({
-                    "start": region_start,
-                    "end": i - 1,
-                    "length": i - region_start,
-                })
+                suspicious_regions.append(
+                    {
+                        "start": region_start,
+                        "end": i - 1,
+                        "length": i - region_start,
+                    }
+                )
 
         if in_region:
-            suspicious_regions.append({
-                "start": region_start,
-                "end": len(results) - 1,
-                "length": len(results) - region_start,
-            })
+            suspicious_regions.append(
+                {
+                    "start": region_start,
+                    "end": len(results) - 1,
+                    "length": len(results) - region_start,
+                }
+            )
 
         # Generate recommendations
         recommendations = self._generate_recommendations(results, suspicious_regions)
@@ -747,7 +774,9 @@ class ManifoldBatchAnalyzer:
         recommendations = []
 
         if not suspicious_regions:
-            recommendations.append("Generation appears stable with no major drift events.")
+            recommendations.append(
+                "Generation appears stable with no major drift events."
+            )
             return recommendations
 
         # Count event types
@@ -838,6 +867,7 @@ FIREWALL_GLOSSARY = {
 # FACTORY AND DEMO
 # =============================================================================
 
+
 def create_firewall(config: Optional[FirewallConfig] = None) -> ManifoldFirewall:
     """Create a manifold firewall with default or custom config."""
     return ManifoldFirewall(config)
@@ -871,7 +901,9 @@ def demo():
             sink_ratio=sink,
             token_position=i,
         )
-        print(f"Token {i}: {result.severity.value} (drift={result.cumulative_drift:.2f})")
+        print(
+            f"Token {i}: {result.severity.value} (drift={result.cumulative_drift:.2f})"
+        )
 
     # Simulate sudden jump (hallucination indicator)
     print("\n--- Phase 2: Sudden Jump (Potential Hallucination) ---")

@@ -53,12 +53,11 @@ De-rotation removes R(pos_k - pos_q):
 
 """
 
-import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Any
-import numpy as np
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 
 # =============================================================================
 # EDUCATIONAL GLOSSARY
@@ -71,7 +70,7 @@ GLOSSARY = {
         "detailed": "A technique that encodes position by rotating vectors. Each position gets a unique rotation angle, and the model learns to use these rotations to understand relative distances between tokens.",
         "analogy": "Like a clock where each token's position is shown by the angle of the hands. When comparing two tokens, the model looks at how different their angles are.",
         "example": "Token at position 10 is rotated 10 degrees, position 20 is rotated 20 degrees. Their attention score includes information that they're 10 positions apart.",
-        "why_it_matters": "RoPE lets the model understand 'this token is 5 positions before that one' without needing absolute position numbers."
+        "why_it_matters": "RoPE lets the model understand 'this token is 5 positions before that one' without needing absolute position numbers.",
     },
     "de_rotation": {
         "term": "De-Rotation",
@@ -79,7 +78,7 @@ GLOSSARY = {
         "detailed": "The inverse operation of RoPE. By 'unrotating' the attention scores, we reveal the pure semantic similarity between tokens - what they would attend to if position didn't matter.",
         "analogy": "Like removing tinted glasses to see true colors. Raw attention is 'tinted' by position; de-rotation removes that tint.",
         "example": "If token A strongly attends to token B in raw attention, de-rotation tells us if that's because they're semantically related or just positionally close.",
-        "why_it_matters": "Helps distinguish 'these concepts are related' from 'these words happen to be near each other'."
+        "why_it_matters": "Helps distinguish 'these concepts are related' from 'these words happen to be near each other'.",
     },
     "semantic_attention": {
         "term": "Semantic Attention (De-Rotated)",
@@ -87,7 +86,7 @@ GLOSSARY = {
         "detailed": "After removing positional encoding (de-rotation), what remains is the 'pure meaning' similarity between tokens. High semantic attention means the tokens are conceptually related regardless of where they appear.",
         "analogy": "Like finding friends at a party based on shared interests, not just who's standing nearby.",
         "example": "In 'The cat sat on the mat', semantic attention might connect 'cat' to 'sat' (subject-verb) strongly even if raw attention is dominated by nearby words.",
-        "why_it_matters": "Reveals the model's understanding of concepts and relationships, not just surface patterns."
+        "why_it_matters": "Reveals the model's understanding of concepts and relationships, not just surface patterns.",
     },
     "positional_attention": {
         "term": "Positional Attention",
@@ -95,7 +94,7 @@ GLOSSARY = {
         "detailed": "The component of attention that comes from RoPE encoding. Nearby tokens naturally have higher positional attention. This is the 'local bias' that helps with grammar and syntax.",
         "analogy": "Like only talking to people sitting next to you at dinner - closeness matters.",
         "example": "Words like 'the', 'a', 'is' often have high positional attention to neighbors because syntax is local.",
-        "why_it_matters": "Helps understand when the model is using local patterns (good for grammar) vs. long-range reasoning."
+        "why_it_matters": "Helps understand when the model is using local patterns (good for grammar) vs. long-range reasoning.",
     },
     "attention_sink": {
         "term": "Attention Sink (Index 0-4)",
@@ -103,7 +102,7 @@ GLOSSARY = {
         "detailed": "The first few tokens (especially <BOS> or system prompt tokens) often receive high attention regardless of content. They act as 'garbage collectors' for attention probability mass that doesn't have a better target.",
         "analogy": "Like a 'miscellaneous' folder on your computer - stuff goes there when it doesn't fit elsewhere.",
         "example": "The <BOS> token might have 40% attention even when it has no semantic meaning - it's just absorbing excess attention.",
-        "why_it_matters": "We filter these out to see the 'real' attention patterns. Without filtering, the sink dominates everything."
+        "why_it_matters": "We filter these out to see the 'real' attention patterns. Without filtering, the sink dominates everything.",
     },
     "attention_entropy": {
         "term": "Attention Entropy",
@@ -111,7 +110,7 @@ GLOSSARY = {
         "detailed": "A measure of attention distribution. Low entropy = focused on few tokens. High entropy = spread across many tokens. Calculated as -sum(p * log(p)) where p is attention probability.",
         "analogy": "Like a spotlight vs. a floodlight. Spotlight (low entropy) illuminates one spot brightly. Floodlight (high entropy) covers everything dimly.",
         "example": "Entropy=0.5: Very focused, attending to 1-2 tokens. Entropy=4.0: Spread across many tokens, less certain.",
-        "why_it_matters": "Low entropy often indicates confident retrieval or syntax. High entropy suggests the model is 'considering many options' - often during reasoning."
+        "why_it_matters": "Low entropy often indicates confident retrieval or syntax. High entropy suggests the model is 'considering many options' - often during reasoning.",
     },
     "manifold_zone": {
         "term": "Manifold Zone",
@@ -123,24 +122,24 @@ GLOSSARY = {
                 "simple": "Processing grammar and local structure",
                 "characteristics": "High local attention, low entropy. Model is handling nearby tokens.",
                 "color": "#4CAF50",
-                "example": "Attention from 'running' to 'is' in 'The dog is running'"
+                "example": "Attention from 'running' to 'is' in 'The dog is running'",
             },
             "semantic_bridge": {
                 "name": "Semantic Bridge",
                 "simple": "Connecting meaning across medium distances",
                 "characteristics": "Balanced attention, moderate entropy. Model is linking concepts.",
                 "color": "#2196F3",
-                "example": "Attention from 'conclusion' to 'hypothesis' across a paragraph"
+                "example": "Attention from 'conclusion' to 'hypothesis' across a paragraph",
             },
             "structure_ripple": {
                 "name": "Structure Ripple",
                 "simple": "Processing document structure and long-range patterns",
                 "characteristics": "High long-range attention, high entropy. Model is reasoning across the full context.",
                 "color": "#FF9800",
-                "example": "Attention from the answer to question keywords far earlier"
-            }
+                "example": "Attention from the answer to question keywords far earlier",
+            },
         },
-        "why_it_matters": "Different zones indicate different cognitive operations. This helps understand what the model is 'doing' at each step."
+        "why_it_matters": "Different zones indicate different cognitive operations. This helps understand what the model is 'doing' at each step.",
     },
     "rotational_variance": {
         "term": "Rotational Variance",
@@ -148,7 +147,7 @@ GLOSSARY = {
         "detailed": "Measures the difference between raw attention and de-rotated attention. High variance = position matters a lot. Low variance = attention is primarily semantic.",
         "analogy": "Like measuring how much your opinion of someone changes based on where you meet them. High variance = very location-dependent. Low variance = you'd feel the same anywhere.",
         "example": "Rotational variance of 0.8: This attention pattern is 80% driven by position. Variance of 0.1: Mostly semantic.",
-        "why_it_matters": "Helps identify whether the model is using position as a shortcut or genuine semantic understanding."
+        "why_it_matters": "Helps identify whether the model is using position as a shortcut or genuine semantic understanding.",
     },
     "sinq_anchor": {
         "term": "Sinq Anchor (Coordinate Origin)",
@@ -156,8 +155,8 @@ GLOSSARY = {
         "detailed": "Instead of just filtering out the sink, we use it as a 'compass origin'. All other attention is measured relative to the sink's direction. This reveals the 'heading' of each thought.",
         "analogy": "Like using true north on a compass. The sink is 'north', and we measure which direction the attention is pointing.",
         "example": "If attention to sink is (0.8, 0.2) and to token X is (0.6, 0.7), the relative angle tells us X's semantic direction.",
-        "why_it_matters": "Provides a stable reference for comparing attention across different positions and requests."
-    }
+        "why_it_matters": "Provides a stable reference for comparing attention across different positions and requests.",
+    },
 }
 
 
@@ -173,10 +172,10 @@ INTERPRETATION_TEMPLATES = {
         "examples": [
             "Connecting 'photosynthesis' to 'plants' across a long explanation",
             "Linking a conclusion to evidence presented earlier",
-            "Finding the subject of a sentence through complex clauses"
+            "Finding the subject of a sentence through complex clauses",
         ],
         "confidence": "high",
-        "icon": "brain"
+        "icon": "brain",
     },
     "high_positional_low_semantic": {
         "pattern": "High positional attention, low semantic similarity",
@@ -185,10 +184,10 @@ INTERPRETATION_TEMPLATES = {
         "examples": [
             "Article 'the' attending to the next noun",
             "Punctuation attending to adjacent words",
-            "Copy-paste patterns where position matters more than content"
+            "Copy-paste patterns where position matters more than content",
         ],
         "confidence": "medium",
-        "icon": "ruler"
+        "icon": "ruler",
     },
     "high_both": {
         "pattern": "High semantic AND positional attention",
@@ -197,10 +196,10 @@ INTERPRETATION_TEMPLATES = {
         "examples": [
             "Subject-verb agreement in simple sentences",
             "Modifier-noun pairs like 'red apple'",
-            "Question word to immediate answer"
+            "Question word to immediate answer",
         ],
         "confidence": "very_high",
-        "icon": "check-circle"
+        "icon": "check-circle",
     },
     "low_both": {
         "pattern": "Low semantic AND positional attention",
@@ -209,10 +208,10 @@ INTERPRETATION_TEMPLATES = {
         "examples": [
             "Unrelated sentences in a document",
             "Different topics in a conversation",
-            "Filler words to distant content"
+            "Filler words to distant content",
         ],
         "confidence": "low",
-        "icon": "minus-circle"
+        "icon": "minus-circle",
     },
     "sink_dominated": {
         "pattern": "Attention dominated by sink tokens (position 0-4)",
@@ -221,11 +220,11 @@ INTERPRETATION_TEMPLATES = {
         "examples": [
             "Ambiguous pronoun resolution",
             "Missing context in a question",
-            "Early in generation before context is established"
+            "Early in generation before context is established",
         ],
         "confidence": "uncertain",
-        "icon": "question-circle"
-    }
+        "icon": "question-circle",
+    },
 }
 
 
@@ -233,11 +232,13 @@ INTERPRETATION_TEMPLATES = {
 # DATA STRUCTURES
 # =============================================================================
 
+
 class AttentionMode(Enum):
     """Mode of attention pattern."""
-    RAW = "raw"                    # Original attention with RoPE
-    DEROTATED = "derotated"        # Semantic attention (RoPE removed)
-    POSITIONAL = "positional"      # Positional component only
+
+    RAW = "raw"  # Original attention with RoPE
+    DEROTATED = "derotated"  # Semantic attention (RoPE removed)
+    POSITIONAL = "positional"  # Positional component only
     SINQ_ANCHORED = "sinq_anchored"  # Relative to sink anchor
 
 
@@ -248,20 +249,21 @@ class DerotatedAttention:
 
     Educational fields explain what each metric means.
     """
+
     # Core metrics
-    raw_scores: np.ndarray              # Original attention scores
-    semantic_scores: np.ndarray         # De-rotated (pure meaning)
-    positional_bias: np.ndarray         # Positional component
+    raw_scores: np.ndarray  # Original attention scores
+    semantic_scores: np.ndarray  # De-rotated (pure meaning)
+    positional_bias: np.ndarray  # Positional component
 
     # Derived metrics
-    rotational_variance: float          # How much position affects attention
-    semantic_entropy: float             # Spread of semantic attention
-    positional_entropy: float           # Spread of positional attention
+    rotational_variance: float  # How much position affects attention
+    semantic_entropy: float  # Spread of semantic attention
+    positional_entropy: float  # Spread of positional attention
 
     # Interpretation
-    dominant_mode: str                  # "semantic", "positional", or "balanced"
-    interpretation: Dict[str, Any]      # Human-readable interpretation
-    manifold_zone: str                  # syntax_floor, semantic_bridge, etc.
+    dominant_mode: str  # "semantic", "positional", or "balanced"
+    interpretation: Dict[str, Any]  # Human-readable interpretation
+    manifold_zone: str  # syntax_floor, semantic_bridge, etc.
 
     # Educational annotations
     explanations: Dict[str, str] = field(default_factory=dict)
@@ -269,9 +271,21 @@ class DerotatedAttention:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
-            "raw_scores": self.raw_scores.tolist() if isinstance(self.raw_scores, np.ndarray) else self.raw_scores,
-            "semantic_scores": self.semantic_scores.tolist() if isinstance(self.semantic_scores, np.ndarray) else self.semantic_scores,
-            "positional_bias": self.positional_bias.tolist() if isinstance(self.positional_bias, np.ndarray) else self.positional_bias,
+            "raw_scores": (
+                self.raw_scores.tolist()
+                if isinstance(self.raw_scores, np.ndarray)
+                else self.raw_scores
+            ),
+            "semantic_scores": (
+                self.semantic_scores.tolist()
+                if isinstance(self.semantic_scores, np.ndarray)
+                else self.semantic_scores
+            ),
+            "positional_bias": (
+                self.positional_bias.tolist()
+                if isinstance(self.positional_bias, np.ndarray)
+                else self.positional_bias
+            ),
             "rotational_variance": self.rotational_variance,
             "semantic_entropy": self.semantic_entropy,
             "positional_entropy": self.positional_entropy,
@@ -285,15 +299,17 @@ class DerotatedAttention:
 @dataclass
 class RoPEConfig:
     """Configuration for RoPE de-rotation."""
-    head_dim: int = 128           # Dimension of each attention head
-    base: float = 10000.0         # RoPE base frequency
-    is_neox_style: bool = True    # Whether to use NeoX-style rotation
-    max_position: int = 131072    # Maximum position for cache
+
+    head_dim: int = 128  # Dimension of each attention head
+    base: float = 10000.0  # RoPE base frequency
+    is_neox_style: bool = True  # Whether to use NeoX-style rotation
+    max_position: int = 131072  # Maximum position for cache
 
 
 # =============================================================================
 # CORE DE-ROTATION IMPLEMENTATION
 # =============================================================================
+
 
 class RoPEDerotator:
     """
@@ -331,7 +347,8 @@ class RoPEDerotator:
     def _build_cache(self):
         """Pre-compute cos/sin cache for efficient de-rotation."""
         inv_freq = 1.0 / (
-            self.config.base ** (
+            self.config.base
+            ** (
                 np.arange(0, self.config.head_dim, 2, dtype=np.float32)
                 / self.config.head_dim
             )
@@ -358,9 +375,7 @@ class RoPEDerotator:
         return self._cos_cache[position], self._sin_cache[position]
 
     def compute_relative_rotation(
-        self,
-        query_pos: int,
-        key_pos: int
+        self, query_pos: int, key_pos: int
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute the relative rotation between query and key positions.
@@ -528,7 +543,9 @@ class RoPEDerotator:
         positional_bias = self.estimate_positional_bias(query_pos, key_positions)
 
         # Compute semantic scores
-        semantic_scores = self.derotate_scores(query_pos, key_positions, attention_scores)
+        semantic_scores = self.derotate_scores(
+            query_pos, key_positions, attention_scores
+        )
 
         # Compute rotational variance
         # Measures how much RoPE de-rotation changes attention scores.
@@ -561,7 +578,11 @@ class RoPEDerotator:
             return -np.sum(p * np.log2(p + 1e-10))
 
         semantic_entropy = entropy(semantic_scores)
-        positional_entropy = entropy(positional_bias / positional_bias.sum() if positional_bias.sum() > 0 else positional_bias)
+        positional_entropy = entropy(
+            positional_bias / positional_bias.sum()
+            if positional_bias.sum() > 0
+            else positional_bias
+        )
 
         # Classify the pattern
         # Check for sink dominance
@@ -607,8 +628,13 @@ class RoPEDerotator:
 
         # Build educational explanations
         explanations = self._build_explanations(
-            scores, semantic_scores, positional_bias,
-            variance, pattern, manifold_zone, sink_attention
+            scores,
+            semantic_scores,
+            positional_bias,
+            variance,
+            pattern,
+            manifold_zone,
+            sink_attention,
         )
 
         return DerotatedAttention(
@@ -669,18 +695,25 @@ class RoPEDerotator:
         explanations["zone"] = zone_info.get("simple", "Unknown zone")
 
         # Metrics explanation
-        explanations["variance"] = (
-            f"Rotational variance ({variance:.2f}): "
-            + ("Position strongly affects attention" if variance > 0.3 else "Position has minimal effect")
+        explanations["variance"] = f"Rotational variance ({variance:.2f}): " + (
+            "Position strongly affects attention"
+            if variance > 0.3
+            else "Position has minimal effect"
         )
 
         # Actionable insight
         if pattern == "sink_dominated":
-            explanations["insight"] = "Consider: Is the query ambiguous? Is context missing?"
+            explanations["insight"] = (
+                "Consider: Is the query ambiguous? Is context missing?"
+            )
         elif pattern == "high_positional_low_semantic":
-            explanations["insight"] = "Normal for syntax processing. Suspicious if expecting reasoning."
+            explanations["insight"] = (
+                "Normal for syntax processing. Suspicious if expecting reasoning."
+            )
         elif pattern == "high_semantic_low_positional":
-            explanations["insight"] = "Good sign for reasoning - the model is connecting concepts."
+            explanations["insight"] = (
+                "Good sign for reasoning - the model is connecting concepts."
+            )
         else:
             explanations["insight"] = "Watch for how this evolves in subsequent tokens."
 
@@ -690,6 +723,7 @@ class RoPEDerotator:
 # =============================================================================
 # EDUCATIONAL API
 # =============================================================================
+
 
 def get_glossary() -> Dict[str, Any]:
     """Get the full educational glossary."""
@@ -795,6 +829,7 @@ def explain_attention_step(
 # FINGERPRINT INTEGRATION
 # =============================================================================
 
+
 def compute_rotational_variance_for_fingerprint(
     query_pos: int,
     key_positions: List[int],
@@ -874,9 +909,7 @@ def compute_rotational_variance_batch(
     for i in range(n):
         if key_positions_batch[i] and attention_scores_batch[i]:
             result = derotator.analyze(
-                query_positions[i],
-                key_positions_batch[i],
-                attention_scores_batch[i]
+                query_positions[i], key_positions_batch[i], attention_scores_batch[i]
             )
             variances[i] = result.rotational_variance
         else:
@@ -938,9 +971,7 @@ def demo():
     print("Keys: 'The', 'dog', 'is' at positions 7, 8, 9")
 
     result1 = derotator.analyze(
-        query_pos=10,
-        key_positions=[7, 8, 9],
-        attention_scores=[0.1, 0.3, 0.6]
+        query_pos=10, key_positions=[7, 8, 9], attention_scores=[0.1, 0.3, 0.6]
     )
 
     print(f"\nResult:")
@@ -955,9 +986,7 @@ def demo():
     print("Keys: 'hypothesis' at 50, 'evidence' at 200, 'the' at 498")
 
     result2 = derotator.analyze(
-        query_pos=500,
-        key_positions=[50, 200, 498],
-        attention_scores=[0.4, 0.35, 0.25]
+        query_pos=500, key_positions=[50, 200, 498], attention_scores=[0.4, 0.35, 0.25]
     )
 
     print(f"\nResult:")
@@ -974,7 +1003,7 @@ def demo():
     result3 = derotator.analyze(
         query_pos=100,
         key_positions=[0, 1, 2, 3, 4, 50],
-        attention_scores=[0.4, 0.15, 0.1, 0.1, 0.05, 0.2]
+        attention_scores=[0.4, 0.15, 0.1, 0.1, 0.05, 0.2],
     )
 
     print(f"\nResult:")

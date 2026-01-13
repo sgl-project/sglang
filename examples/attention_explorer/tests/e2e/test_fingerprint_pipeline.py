@@ -15,31 +15,25 @@ Usage:
     pytest test_fingerprint_pipeline.py::TestFullPipeline -v
 """
 
-import asyncio
 import json
 import os
-import pytest
-import time
-import numpy as np
-import tempfile
 import sqlite3
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-import httpx
 
 # Add parent to path for imports
 import sys
+import tempfile
+import time
+from pathlib import Path
+
+import httpx
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from scenarios import (
-    Scenario, ExpectedManifold,
-    ALL_SCENARIOS, SCENARIOS_BY_CATEGORY,
-)
-from collector import AttentionCollector, TraceData
-
+from collector import AttentionCollector
+from scenarios import ExpectedManifold, Scenario
 
 # Test configuration
 DEFAULT_SERVER_URL = os.environ.get("SGLANG_SERVER_URL", "http://localhost:30000")
@@ -98,7 +92,10 @@ class TestFingerprintComputation:
             category="test",
             description="Test fingerprint components",
             messages=[
-                {"role": "user", "content": "Explain what machine learning is in one sentence."}
+                {
+                    "role": "user",
+                    "content": "Explain what machine learning is in one sentence.",
+                }
             ],
             expected_manifold=ExpectedManifold.SEMANTIC_BRIDGE,
             max_tokens=100,
@@ -109,12 +106,16 @@ class TestFingerprintComputation:
         for fp in trace.fingerprints:
             # Test mass components
             total_mass = fp.local_mass + fp.mid_mass + fp.long_mass
-            assert abs(total_mass - 1.0) < 0.02, f"Mass should sum to 1.0, got {total_mass}"
+            assert (
+                abs(total_mass - 1.0) < 0.02
+            ), f"Mass should sum to 1.0, got {total_mass}"
 
             # Test histogram
             assert len(fp.histogram) == 16
             hist_sum = sum(fp.histogram)
-            assert abs(hist_sum - 1.0) < 0.02, f"Histogram should sum to 1.0, got {hist_sum}"
+            assert (
+                abs(hist_sum - 1.0) < 0.02
+            ), f"Histogram should sum to 1.0, got {hist_sum}"
 
             # Test entropy is bounded
             assert 0 <= fp.entropy <= 1.0
@@ -126,9 +127,7 @@ class TestFingerprintComputation:
             name="stability_test",
             category="test",
             description="Test fingerprint stability",
-            messages=[
-                {"role": "user", "content": "What color is the sky?"}
-            ],
+            messages=[{"role": "user", "content": "What color is the sky?"}],
             expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
             max_tokens=20,
             temperature=0.0,  # Deterministic
@@ -187,9 +186,7 @@ class TestPipelineIntegration:
             name="sidecar_post_test",
             category="test",
             description="Test sidecar fingerprint posting",
-            messages=[
-                {"role": "user", "content": "Hello!"}
-            ],
+            messages=[{"role": "user", "content": "Hello!"}],
             expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
             max_tokens=20,
         )
@@ -209,7 +206,7 @@ class TestPipelineIntegration:
                     "vector": fp.to_vector(),
                     "metadata": {
                         "scenario": scenario.name,
-                    }
+                    },
                 }
 
                 response = await client.post(
@@ -227,8 +224,12 @@ class TestPipelineIntegration:
                 # Check classification result
                 if "zone" in result:
                     assert result["zone"] in [
-                        "syntax_floor", "semantic_bridge",
-                        "structure_ripple", "long_range", "diffuse", "unknown"
+                        "syntax_floor",
+                        "semantic_bridge",
+                        "structure_ripple",
+                        "long_range",
+                        "diffuse",
+                        "unknown",
                     ]
 
             except httpx.ConnectError:
@@ -241,9 +242,7 @@ class TestPipelineIntegration:
             name="classify_test",
             category="test",
             description="Test classification",
-            messages=[
-                {"role": "user", "content": "What is 5 times 7?"}
-            ],
+            messages=[{"role": "user", "content": "What is 5 times 7?"}],
             expected_manifold=ExpectedManifold.SYNTAX_FLOOR,
             max_tokens=30,
         )
@@ -303,10 +302,12 @@ class TestFullPipeline:
                 name="semantic_e2e",
                 category="semantic",
                 description="Semantic bridge test",
-                messages=[{
-                    "role": "user",
-                    "content": "Summarize: AI is transforming industries by automating tasks and providing insights from data."
-                }],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "Summarize: AI is transforming industries by automating tasks and providing insights from data.",
+                    }
+                ],
                 expected_manifold=ExpectedManifold.SEMANTIC_BRIDGE,
                 max_tokens=50,
             ),
@@ -321,11 +322,13 @@ class TestFullPipeline:
                     trace = await collector.run_scenario(scenario)
 
                     if not trace.fingerprints:
-                        results.append({
-                            "scenario": scenario.name,
-                            "success": False,
-                            "error": "No fingerprints"
-                        })
+                        results.append(
+                            {
+                                "scenario": scenario.name,
+                                "success": False,
+                                "error": "No fingerprints",
+                            }
+                        )
                         continue
 
                     # Step 2: Classify
@@ -334,14 +337,18 @@ class TestFullPipeline:
                     try:
                         response = await client.post(
                             f"{sidecar_url}/classify",
-                            json={"vector": fp.to_vector()},  # Sidecar expects "vector" key
+                            json={
+                                "vector": fp.to_vector()
+                            },  # Sidecar expects "vector" key
                         )
 
                         if response.status_code == 200:
                             classification = response.json()
                             # Handle nested manifold response structure
                             if "manifold" in classification:
-                                predicted_zone = classification["manifold"].get("zone", "unknown")
+                                predicted_zone = classification["manifold"].get(
+                                    "zone", "unknown"
+                                )
                             else:
                                 predicted_zone = classification.get("zone", "unknown")
                         else:
@@ -355,23 +362,27 @@ class TestFullPipeline:
                     expected_zone = scenario.expected_manifold.value
                     match = predicted_zone == expected_zone
 
-                    results.append({
-                        "scenario": scenario.name,
-                        "expected": expected_zone,
-                        "predicted": predicted_zone,
-                        "match": match,
-                        "local_mass": fp.local_mass,
-                        "mid_mass": fp.mid_mass,
-                        "entropy": fp.entropy,
-                        "success": True,
-                    })
+                    results.append(
+                        {
+                            "scenario": scenario.name,
+                            "expected": expected_zone,
+                            "predicted": predicted_zone,
+                            "match": match,
+                            "local_mass": fp.local_mass,
+                            "mid_mass": fp.mid_mass,
+                            "entropy": fp.entropy,
+                            "success": True,
+                        }
+                    )
 
                 except Exception as e:
-                    results.append({
-                        "scenario": scenario.name,
-                        "success": False,
-                        "error": str(e),
-                    })
+                    results.append(
+                        {
+                            "scenario": scenario.name,
+                            "success": False,
+                            "error": str(e),
+                        }
+                    )
 
         # Print results
         print("\n" + "=" * 60)
@@ -381,8 +392,12 @@ class TestFullPipeline:
         for r in results:
             if r.get("success"):
                 status = "MATCH" if r.get("match") else "MISMATCH"
-                print(f"[{status}] {r['scenario']}: expected={r['expected']}, predicted={r['predicted']}")
-                print(f"         local={r['local_mass']:.3f}, mid={r['mid_mass']:.3f}, entropy={r['entropy']:.3f}")
+                print(
+                    f"[{status}] {r['scenario']}: expected={r['expected']}, predicted={r['predicted']}"
+                )
+                print(
+                    f"         local={r['local_mass']:.3f}, mid={r['mid_mass']:.3f}, entropy={r['entropy']:.3f}"
+                )
             else:
                 print(f"[FAIL] {r['scenario']}: {r.get('error')}")
 
@@ -421,8 +436,12 @@ class TestFullPipeline:
 
         # All should complete - use completion text length since streaming may not return usage
         assert len(traces) == 5
-        assert all(len(t.completion) > 0 for t in traces), "All traces should have completion text"
-        assert all(len(t.fingerprints) > 0 for t in traces), "All traces should have fingerprints"
+        assert all(
+            len(t.completion) > 0 for t in traces
+        ), "All traces should have completion text"
+        assert all(
+            len(t.fingerprints) > 0 for t in traces
+        ), "All traces should have fingerprints"
 
         # Compute aggregate stats
         all_fingerprints = [fp for t in traces for fp in t.fingerprints]
@@ -461,7 +480,8 @@ class TestDatabaseStorage:
 
         try:
             conn = sqlite3.connect(db_path)
-            conn.execute("""
+            conn.execute(
+                """
                 CREATE TABLE fingerprints (
                     id INTEGER PRIMARY KEY,
                     request_id TEXT,
@@ -472,23 +492,27 @@ class TestDatabaseStorage:
                     entropy REAL,
                     histogram TEXT
                 )
-            """)
+            """
+            )
 
             # Store fingerprints
             for i, fp in enumerate(trace.fingerprints):
-                conn.execute("""
+                conn.execute(
+                    """
                     INSERT INTO fingerprints
                     (request_id, step, local_mass, mid_mass, long_mass, entropy, histogram)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    f"test_{int(time.time())}",
-                    i,
-                    fp.local_mass,
-                    fp.mid_mass,
-                    fp.long_mass,
-                    fp.entropy,
-                    json.dumps(fp.histogram),
-                ))
+                """,
+                    (
+                        f"test_{int(time.time())}",
+                        i,
+                        fp.local_mass,
+                        fp.mid_mass,
+                        fp.long_mass,
+                        fp.entropy,
+                        json.dumps(fp.histogram),
+                    ),
+                )
 
             conn.commit()
 
@@ -497,7 +521,9 @@ class TestDatabaseStorage:
             count = cursor.fetchone()[0]
             assert count == len(trace.fingerprints)
 
-            cursor = conn.execute("SELECT local_mass, entropy FROM fingerprints LIMIT 1")
+            cursor = conn.execute(
+                "SELECT local_mass, entropy FROM fingerprints LIMIT 1"
+            )
             row = cursor.fetchone()
             assert 0 <= row[0] <= 1  # local_mass
             assert 0 <= row[1] <= 1  # entropy
@@ -543,8 +569,12 @@ class TestModelComparison:
 
         # Variation should be small (within 20%)
         if avg_locals:
-            local_variation = (max(avg_locals) - min(avg_locals)) / max(0.001, np.mean(avg_locals))
-            assert local_variation < 0.5, f"Too much local mass variation: {local_variation}"
+            local_variation = (max(avg_locals) - min(avg_locals)) / max(
+                0.001, np.mean(avg_locals)
+            )
+            assert (
+                local_variation < 0.5
+            ), f"Too much local mass variation: {local_variation}"
 
 
 if __name__ == "__main__":

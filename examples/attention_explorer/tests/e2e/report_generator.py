@@ -9,14 +9,13 @@ Generates comprehensive reports including:
 """
 
 import json
-from dataclasses import asdict
+import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List
-import logging
+from typing import Dict, List
 
-from collector import CollectionRun, TraceData
-from analyzer import RunAnalysis, TraceAnalysis, ManifoldClassification
+from analyzer import RunAnalysis, TraceAnalysis
+from collector import CollectionRun
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +169,9 @@ class ReportGenerator:
         for category, analyses in sorted(by_category.items()):
             matches = sum(1 for a in analyses if a.match_expected)
             lines.append(f"### {category}")
-            lines.append(f"Accuracy: {matches}/{len(analyses)} ({100*matches/len(analyses):.0f}%)")
+            lines.append(
+                f"Accuracy: {matches}/{len(analyses)} ({100*matches/len(analyses):.0f}%)"
+            )
             lines.append("")
 
             # Show mismatches
@@ -208,8 +209,7 @@ class ReportGenerator:
         # Show one good and one problematic trace per zone
         for zone in set(analysis.manifold_accuracy.keys()):
             zone_traces = [
-                ta for ta in analysis.trace_analyses
-                if ta.expected_manifold == zone
+                ta for ta in analysis.trace_analyses if ta.expected_manifold == zone
             ]
             if not zone_traces:
                 continue
@@ -220,9 +220,15 @@ class ReportGenerator:
             good = next((t for t in zone_traces if t.match_expected), None)
             if good:
                 lines.append(f"**Good Example:** {good.scenario_name}")
-                lines.append(f"- Classification: {good.actual_classification.primary_zone}")
-                lines.append(f"- Confidence: {good.actual_classification.confidence:.2f}")
-                lines.append(f"- Interpretation: {good.actual_classification.interpretation}")
+                lines.append(
+                    f"- Classification: {good.actual_classification.primary_zone}"
+                )
+                lines.append(
+                    f"- Confidence: {good.actual_classification.confidence:.2f}"
+                )
+                lines.append(
+                    f"- Interpretation: {good.actual_classification.interpretation}"
+                )
                 lines.append("")
 
             # Problem example
@@ -231,7 +237,9 @@ class ReportGenerator:
                 lines.append(f"**Misclassified Example:** {bad.scenario_name}")
                 lines.append(f"- Expected: {bad.expected_manifold}")
                 lines.append(f"- Got: {bad.actual_classification.primary_zone}")
-                lines.append(f"- Confidence: {bad.actual_classification.confidence:.2f}")
+                lines.append(
+                    f"- Confidence: {bad.actual_classification.confidence:.2f}"
+                )
                 if bad.recommendations:
                     lines.append(f"- Recommendation: {bad.recommendations[0]}")
                 lines.append("")
@@ -350,7 +358,7 @@ class ReportGenerator:
                     "Strong BOS attention often indicates uncertainty",
                     "Can signal need for exploration or clarification",
                     "Useful for detecting when model is 'searching'",
-                ]
+                ],
             ),
             "previous_token": (
                 "Previous Token Pattern",
@@ -358,7 +366,7 @@ class ReportGenerator:
                     "Indicates local/sequential processing",
                     "Common in syntax-heavy generation",
                     "May suggest completion rather than reasoning",
-                ]
+                ],
             ),
             "entropy_transition": (
                 "Entropy Transition Pattern",
@@ -366,7 +374,7 @@ class ReportGenerator:
                     "Signals phase change in generation",
                     "Can indicate topic/task shift",
                     "Useful for detecting when to switch strategies",
-                ]
+                ],
             ),
         }
 
@@ -411,17 +419,25 @@ class ReportGenerator:
 
         for i, rec in enumerate(analysis.sinq_recommendations, 1):
             lines.append(f"### {i}. {rec.split('.')[0]}")
-            if '.' in rec:
-                lines.append(rec.split('.', 1)[1].strip())
+            if "." in rec:
+                lines.append(rec.split(".", 1)[1].strip())
             lines.append("")
 
         # Additional suggestions
         lines.append("### Additional Implementation Notes")
         lines.append("")
-        lines.append("1. **Real-time Tracking**: Compute fingerprint per step during generation")
-        lines.append("2. **Zone History**: Track manifold trajectory for routing decisions")
-        lines.append("3. **Expert Routing**: Use zone + pattern signals for MoE expert selection")
-        lines.append("4. **Confidence Thresholds**: Implement fallback for low-confidence zones")
+        lines.append(
+            "1. **Real-time Tracking**: Compute fingerprint per step during generation"
+        )
+        lines.append(
+            "2. **Zone History**: Track manifold trajectory for routing decisions"
+        )
+        lines.append(
+            "3. **Expert Routing**: Use zone + pattern signals for MoE expert selection"
+        )
+        lines.append(
+            "4. **Confidence Thresholds**: Implement fallback for low-confidence zones"
+        )
         lines.append("5. **Caching**: Cache fingerprints for similar prompts")
         lines.append("")
 
@@ -438,7 +454,9 @@ class ReportGenerator:
             lines.append("  - Add more diverse scenarios for these zones")
             lines.append("  - Investigate classification boundary cases")
 
-        lines.append("- **Transition scenarios**: Traces that change zones mid-generation")
+        lines.append(
+            "- **Transition scenarios**: Traces that change zones mid-generation"
+        )
         lines.append("- **Edge cases**: Ambiguous prompts that could be multiple zones")
         lines.append("- **MoE correlation**: Which experts activate for which zones")
         lines.append("")

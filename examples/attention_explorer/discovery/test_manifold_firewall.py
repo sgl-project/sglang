@@ -5,35 +5,34 @@ Tests the hallucination detection system that monitors attention pattern
 trajectories for suspicious drift.
 """
 
-import pytest
-import numpy as np
 import time
 from collections import deque
 
+import numpy as np
+import pytest
+
 from .manifold_firewall import (
-    ManifoldFirewall,
-    ManifoldBatchAnalyzer,
-    FirewallConfig,
-    FirewallState,
-    FirewallCheckResult,
-    ManifoldPoint,
-    DriftEvent,
-    DriftType,
-    AlertSeverity,
-    SuddenJumpDetector,
-    ZoneViolationDetector,
-    EntropySpikeDetector,
-    SinkCollapseDetector,
-    OscillationDetector,
     FIREWALL_GLOSSARY,
     ZONE_TRANSITIONS,
+    AlertSeverity,
+    DriftType,
+    EntropySpikeDetector,
+    FirewallCheckResult,
+    FirewallConfig,
+    ManifoldBatchAnalyzer,
+    ManifoldFirewall,
+    ManifoldPoint,
+    OscillationDetector,
+    SinkCollapseDetector,
+    SuddenJumpDetector,
+    ZoneViolationDetector,
     create_firewall,
 )
-
 
 # =============================================================================
 # FIXTURES
 # =============================================================================
+
 
 @pytest.fixture
 def firewall():
@@ -79,6 +78,7 @@ def make_point(
 # MANIFOLD POINT TESTS
 # =============================================================================
 
+
 class TestManifoldPoint:
     """Test ManifoldPoint class."""
 
@@ -104,6 +104,7 @@ class TestManifoldPoint:
 # ALERT SEVERITY TESTS
 # =============================================================================
 
+
 class TestAlertSeverity:
     """Test AlertSeverity enum."""
 
@@ -118,20 +119,31 @@ class TestAlertSeverity:
     def test_severity_ordering(self):
         """Severities should have defined ordering."""
         severities = list(AlertSeverity)
-        assert severities.index(AlertSeverity.SAFE) < severities.index(AlertSeverity.CRITICAL)
+        assert severities.index(AlertSeverity.SAFE) < severities.index(
+            AlertSeverity.CRITICAL
+        )
 
 
 # =============================================================================
 # DRIFT TYPE TESTS
 # =============================================================================
 
+
 class TestDriftType:
     """Test DriftType enum."""
 
     def test_all_drift_types_defined(self):
         """All expected drift types should be defined."""
-        expected = ["none", "gradual", "sudden_jump", "zone_violation",
-                    "entropy_spike", "sink_collapse", "reversal", "oscillation"]
+        expected = [
+            "none",
+            "gradual",
+            "sudden_jump",
+            "zone_violation",
+            "entropy_spike",
+            "sink_collapse",
+            "reversal",
+            "oscillation",
+        ]
         for value in expected:
             assert any(dt.value == value for dt in DriftType)
 
@@ -139,6 +151,7 @@ class TestDriftType:
 # =============================================================================
 # DETECTOR TESTS
 # =============================================================================
+
 
 class TestSuddenJumpDetector:
     """Test SuddenJumpDetector."""
@@ -294,7 +307,13 @@ class TestOscillationDetector:
         config = FirewallConfig(oscillation_window=5, oscillation_threshold=3)
 
         # Build oscillating trajectory (need at least oscillation_window points)
-        zones = ["syntax_floor", "semantic_bridge", "syntax_floor", "semantic_bridge", "syntax_floor"]
+        zones = [
+            "syntax_floor",
+            "semantic_bridge",
+            "syntax_floor",
+            "semantic_bridge",
+            "syntax_floor",
+        ]
         trajectory = deque()
         for zone in zones:
             trajectory.append(make_point(zone=zone))
@@ -325,6 +344,7 @@ class TestOscillationDetector:
 # =============================================================================
 # FIREWALL TESTS
 # =============================================================================
+
 
 class TestManifoldFirewall:
     """Test ManifoldFirewall class."""
@@ -456,6 +476,7 @@ class TestManifoldFirewall:
 # FIREWALL CHECK RESULT TESTS
 # =============================================================================
 
+
 class TestFirewallCheckResult:
     """Test FirewallCheckResult class."""
 
@@ -472,7 +493,11 @@ class TestFirewallCheckResult:
 
     def test_needs_attention_property(self):
         """needs_attention should return True for WARNING+."""
-        for severity in [AlertSeverity.WARNING, AlertSeverity.ALERT, AlertSeverity.CRITICAL]:
+        for severity in [
+            AlertSeverity.WARNING,
+            AlertSeverity.ALERT,
+            AlertSeverity.CRITICAL,
+        ]:
             result = FirewallCheckResult(
                 severity=severity,
                 cumulative_drift=1.0,
@@ -522,6 +547,7 @@ class TestFirewallCheckResult:
 # BATCH ANALYZER TESTS
 # =============================================================================
 
+
 class TestManifoldBatchAnalyzer:
     """Test ManifoldBatchAnalyzer class."""
 
@@ -563,6 +589,7 @@ class TestManifoldBatchAnalyzer:
 # CONFIGURATION TESTS
 # =============================================================================
 
+
 class TestFirewallConfig:
     """Test FirewallConfig class."""
 
@@ -591,6 +618,7 @@ class TestFirewallConfig:
 # GLOSSARY TESTS
 # =============================================================================
 
+
 class TestFirewallGlossary:
     """Test educational glossary."""
 
@@ -607,6 +635,7 @@ class TestFirewallGlossary:
 # =============================================================================
 # ZONE TRANSITIONS TESTS
 # =============================================================================
+
 
 class TestZoneTransitions:
     """Test zone transition matrix."""
@@ -632,6 +661,7 @@ class TestZoneTransitions:
 # FACTORY FUNCTION TESTS
 # =============================================================================
 
+
 class TestFactoryFunctions:
     """Test factory functions."""
 
@@ -651,12 +681,14 @@ class TestFactoryFunctions:
 # INTEGRATION TESTS
 # =============================================================================
 
+
 class TestIntegration:
     """Integration tests."""
 
     def test_demo_runs_without_error(self):
         """Demo should complete without error."""
         from .manifold_firewall import demo
+
         demo()  # Should not raise
 
     def test_full_session_lifecycle(self):

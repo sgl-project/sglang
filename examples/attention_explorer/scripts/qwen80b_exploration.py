@@ -19,17 +19,15 @@ Requirements:
 import argparse
 import json
 import logging
-import os
 import random
 import sqlite3
 import struct
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-import threading
+from typing import Dict, List, Optional
 
 import numpy as np
 import requests
@@ -37,11 +35,13 @@ import requests
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(f'exploration_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
-    ]
+        logging.FileHandler(
+            f'exploration_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+        ),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -136,19 +136,43 @@ PROMPT_CATEGORIES = {
     "multi_turn_context": [
         # These will be sent as multi-turn conversations
         [
-            {"role": "user", "content": "I'm planning a trip to Japan. What's the best time to visit?"},
-            {"role": "assistant", "content": "The best times to visit Japan are spring (March-May) for cherry blossoms and fall (September-November) for autumn foliage. Both seasons offer mild weather and beautiful scenery."},
-            {"role": "user", "content": "What about visiting temples? Which ones should I prioritize?"},
+            {
+                "role": "user",
+                "content": "I'm planning a trip to Japan. What's the best time to visit?",
+            },
+            {
+                "role": "assistant",
+                "content": "The best times to visit Japan are spring (March-May) for cherry blossoms and fall (September-November) for autumn foliage. Both seasons offer mild weather and beautiful scenery.",
+            },
+            {
+                "role": "user",
+                "content": "What about visiting temples? Which ones should I prioritize?",
+            },
         ],
         [
-            {"role": "user", "content": "I'm learning to cook. Can you suggest a simple pasta recipe?"},
-            {"role": "assistant", "content": "Here's a simple aglio e olio: Cook spaghetti, sauté sliced garlic in olive oil until golden, add red pepper flakes, toss with pasta, and finish with parsley and parmesan."},
-            {"role": "user", "content": "That sounds good! How can I make it more protein-rich?"},
+            {
+                "role": "user",
+                "content": "I'm learning to cook. Can you suggest a simple pasta recipe?",
+            },
+            {
+                "role": "assistant",
+                "content": "Here's a simple aglio e olio: Cook spaghetti, sauté sliced garlic in olive oil until golden, add red pepper flakes, toss with pasta, and finish with parsley and parmesan.",
+            },
+            {
+                "role": "user",
+                "content": "That sounds good! How can I make it more protein-rich?",
+            },
         ],
         [
             {"role": "user", "content": "Explain what a neural network is."},
-            {"role": "assistant", "content": "A neural network is a computing system inspired by biological neurons. It consists of layers of interconnected nodes that process information by passing signals through weighted connections, learning patterns from data."},
-            {"role": "user", "content": "How does backpropagation work in training these networks?"},
+            {
+                "role": "assistant",
+                "content": "A neural network is a computing system inspired by biological neurons. It consists of layers of interconnected nodes that process information by passing signals through weighted connections, learning patterns from data.",
+            },
+            {
+                "role": "user",
+                "content": "How does backpropagation work in training these networks?",
+            },
         ],
     ],
     "long_context": [
@@ -207,9 +231,11 @@ Explain the algorithm, its time complexity, and what the output would be.""",
 # DATA STRUCTURES
 # =============================================================================
 
+
 @dataclass
 class ExplorationResult:
     """Result from a single exploration prompt."""
+
     prompt_id: str
     category: str
     prompt: str
@@ -229,6 +255,7 @@ class ExplorationResult:
 @dataclass
 class ExplorationSession:
     """Tracking for an exploration session."""
+
     session_id: str
     start_time: datetime
     end_time: Optional[datetime] = None
@@ -244,14 +271,15 @@ class ExplorationSession:
 # HELPERS
 # =============================================================================
 
+
 def pack_fingerprint(arr: np.ndarray) -> bytes:
     """Pack numpy array to fingerprint blob."""
-    return struct.pack(f'<{FINGERPRINT_DIM}f', *arr.astype(np.float32))
+    return struct.pack(f"<{FINGERPRINT_DIM}f", *arr.astype(np.float32))
 
 
 def unpack_fingerprint(blob: bytes) -> np.ndarray:
     """Unpack fingerprint from blob to numpy array."""
-    return np.array(struct.unpack(f'<{FINGERPRINT_DIM}f', blob), dtype=np.float32)
+    return np.array(struct.unpack(f"<{FINGERPRINT_DIM}f", blob), dtype=np.float32)
 
 
 def check_services():
@@ -295,6 +323,7 @@ def init_database(db_path: str):
 # EXPLORATION ENGINE
 # =============================================================================
 
+
 class ExplorationEngine:
     """Engine for running model exploration."""
 
@@ -320,7 +349,9 @@ class ExplorationEngine:
         init_database(db_path)
 
         # Findings log
-        self.findings_path = self.output_dir / f"findings_{self.session.session_id}.jsonl"
+        self.findings_path = (
+            self.output_dir / f"findings_{self.session.session_id}.jsonl"
+        )
 
     def send_prompt(
         self,
@@ -361,11 +392,11 @@ class ExplorationEngine:
             for line in resp.iter_lines():
                 if not line:
                     continue
-                line = line.decode('utf-8')
-                if not line.startswith('data: '):
+                line = line.decode("utf-8")
+                if not line.startswith("data: "):
                     continue
                 data = line[6:]
-                if data == '[DONE]':
+                if data == "[DONE]":
                     break
 
                 try:
@@ -377,7 +408,9 @@ class ExplorationEngine:
                     completion_text += content
 
                     # Extract attention tokens
-                    attn_data = delta.get("attention_tokens") or chunk.get("attention_tokens")
+                    attn_data = delta.get("attention_tokens") or chunk.get(
+                        "attention_tokens"
+                    )
                     if attn_data:
                         for step_data in attn_data:
                             attention_steps.append(step_data)
@@ -390,7 +423,9 @@ class ExplorationEngine:
                     # Extract usage
                     usage = chunk.get("usage", {})
                     if usage:
-                        completion_tokens = usage.get("completion_tokens", completion_tokens)
+                        completion_tokens = usage.get(
+                            "completion_tokens", completion_tokens
+                        )
 
                 except json.JSONDecodeError:
                     continue
@@ -401,10 +436,17 @@ class ExplorationEngine:
             # Compute metrics
             if completion_tokens == 0:
                 completion_tokens = len(attention_steps)
-            tokens_per_second = completion_tokens / (total_time_ms / 1000) if total_time_ms > 0 else 0
+            tokens_per_second = (
+                completion_tokens / (total_time_ms / 1000) if total_time_ms > 0 else 0
+            )
 
             # Compute zone distribution from fingerprints
-            zone_distribution = {"syntax_floor": 0, "semantic_bridge": 0, "structure_ripple": 0, "unknown": 0}
+            zone_distribution = {
+                "syntax_floor": 0,
+                "semantic_bridge": 0,
+                "structure_ripple": 0,
+                "unknown": 0,
+            }
             fingerprints = []
 
             for step in attention_steps:
@@ -417,7 +459,9 @@ class ExplorationEngine:
 
             # Count think vs output tokens
             think_tokens = sum(1 for s in attention_steps if s.get("phase") == "think")
-            output_tokens = sum(1 for s in attention_steps if s.get("phase") == "output")
+            output_tokens = sum(
+                1 for s in attention_steps if s.get("phase") == "output"
+            )
 
             # Store fingerprints in sidecar
             self._store_fingerprints(prompt_id, fingerprints)
@@ -464,12 +508,16 @@ class ExplorationEngine:
         for i, fp in enumerate(fingerprints):
             try:
                 # Build vector from fingerprint data
-                vector = [
-                    fp.get("local_mass", 0),
-                    fp.get("mid_mass", 0),
-                    fp.get("long_mass", 0),
-                    fp.get("entropy", 0),
-                ] + fp.get("histogram", [0]*8) + fp.get("layer_entropy", [0]*8)
+                vector = (
+                    [
+                        fp.get("local_mass", 0),
+                        fp.get("mid_mass", 0),
+                        fp.get("long_mass", 0),
+                        fp.get("entropy", 0),
+                    ]
+                    + fp.get("histogram", [0] * 8)
+                    + fp.get("layer_entropy", [0] * 8)
+                )
 
                 if len(vector) < FINGERPRINT_DIM:
                     vector.extend([0] * (FINGERPRINT_DIM - len(vector)))
@@ -489,25 +537,32 @@ class ExplorationEngine:
 
     def log_finding(self, finding: Dict):
         """Log a finding to the findings file."""
-        with open(self.findings_path, 'a') as f:
-            f.write(json.dumps(finding) + '\n')
+        with open(self.findings_path, "a") as f:
+            f.write(json.dumps(finding) + "\n")
 
     def run_discovery(self) -> Optional[str]:
         """Run discovery job and return run_id."""
         logger.info("Running discovery job...")
 
         try:
-            discovery_script = Path(__file__).parent.parent / "discovery" / "discovery_job.py"
+            discovery_script = (
+                Path(__file__).parent.parent / "discovery" / "discovery_job.py"
+            )
 
             import subprocess
+
             result = subprocess.run(
                 [
                     sys.executable,
                     str(discovery_script),
-                    "--db", self.db_path,
-                    "--output", str(self.output_dir / "discovery"),
-                    "--hours", "24",
-                    "--min-cluster-size", "10",
+                    "--db",
+                    self.db_path,
+                    "--output",
+                    str(self.output_dir / "discovery"),
+                    "--hours",
+                    "24",
+                    "--min-cluster-size",
+                    "10",
                 ],
                 capture_output=True,
                 text=True,
@@ -516,9 +571,9 @@ class ExplorationEngine:
 
             if result.returncode == 0:
                 # Parse run_id from output
-                for line in result.stdout.split('\n'):
-                    if 'Run ID:' in line:
-                        run_id = line.split('Run ID:')[1].strip()
+                for line in result.stdout.split("\n"):
+                    if "Run ID:" in line:
+                        run_id = line.split("Run ID:")[1].strip()
                         logger.info(f"Discovery completed: {run_id}")
                         return run_id
             else:
@@ -542,14 +597,16 @@ class ExplorationEngine:
 
         # Find most/least used experts
         if expert_counts:
-            sorted_experts = sorted(expert_counts.items(), key=lambda x: x[1], reverse=True)
+            sorted_experts = sorted(
+                expert_counts.items(), key=lambda x: x[1], reverse=True
+            )
             return {
                 "total_routings": len(moe_data),
                 "unique_experts": len(expert_counts),
                 "top_5_experts": sorted_experts[:5],
                 "bottom_5_experts": sorted_experts[-5:],
                 "expert_entropy": -sum(
-                    (c/len(moe_data)) * np.log(c/len(moe_data) + 1e-10)
+                    (c / len(moe_data)) * np.log(c / len(moe_data) + 1e-10)
                     for c in expert_counts.values()
                 ),
             }
@@ -599,54 +656,75 @@ class ExplorationEngine:
                     self.session.results.append(result)
                     self.session.total_prompts += 1
                     self.session.total_tokens += result.completion_tokens
-                    self.session.category_counts[category] = self.session.category_counts.get(category, 0) + 1
+                    self.session.category_counts[category] = (
+                        self.session.category_counts.get(category, 0) + 1
+                    )
 
                     # Update zone distribution
                     for zone, count in result.zone_distribution.items():
-                        self.session.zone_distribution[zone] = self.session.zone_distribution.get(zone, 0) + count
+                        self.session.zone_distribution[zone] = (
+                            self.session.zone_distribution.get(zone, 0) + count
+                        )
 
                     # Log key metrics
-                    logger.info(f"    Response: {result.completion_tokens} tokens, {result.tokens_per_second:.1f} tok/s")
+                    logger.info(
+                        f"    Response: {result.completion_tokens} tokens, {result.tokens_per_second:.1f} tok/s"
+                    )
                     logger.info(f"    Zones: {result.zone_distribution}")
-                    logger.info(f"    Think/Output: {result.think_tokens}/{result.output_tokens}")
+                    logger.info(
+                        f"    Think/Output: {result.think_tokens}/{result.output_tokens}"
+                    )
 
                     # Log interesting findings
                     if result.think_tokens > result.output_tokens * 2:
-                        self.log_finding({
-                            "type": "heavy_thinking",
-                            "prompt_id": prompt_id,
-                            "category": category,
-                            "think_tokens": result.think_tokens,
-                            "output_tokens": result.output_tokens,
-                            "prompt": messages[-1]["content"][:200],
-                        })
+                        self.log_finding(
+                            {
+                                "type": "heavy_thinking",
+                                "prompt_id": prompt_id,
+                                "category": category,
+                                "think_tokens": result.think_tokens,
+                                "output_tokens": result.output_tokens,
+                                "prompt": messages[-1]["content"][:200],
+                            }
+                        )
 
-                    if result.zone_distribution.get("syntax_floor", 0) > result.completion_tokens * 0.5:
-                        self.log_finding({
-                            "type": "high_syntax_floor",
-                            "prompt_id": prompt_id,
-                            "category": category,
-                            "zone_distribution": result.zone_distribution,
-                            "prompt": messages[-1]["content"][:200],
-                        })
+                    if (
+                        result.zone_distribution.get("syntax_floor", 0)
+                        > result.completion_tokens * 0.5
+                    ):
+                        self.log_finding(
+                            {
+                                "type": "high_syntax_floor",
+                                "prompt_id": prompt_id,
+                                "category": category,
+                                "zone_distribution": result.zone_distribution,
+                                "prompt": messages[-1]["content"][:200],
+                            }
+                        )
 
                     # Analyze MoE routing
                     if result.moe_routing:
                         moe_analysis = self.analyze_moe_routing(result.moe_routing)
                         if moe_analysis:
-                            logger.info(f"    MoE: {moe_analysis.get('unique_experts', 0)} unique experts")
+                            logger.info(
+                                f"    MoE: {moe_analysis.get('unique_experts', 0)} unique experts"
+                            )
                             if moe_analysis.get("unique_experts", 0) < 10:
-                                self.log_finding({
-                                    "type": "low_expert_diversity",
-                                    "prompt_id": prompt_id,
-                                    "category": category,
-                                    "moe_analysis": moe_analysis,
-                                })
+                                self.log_finding(
+                                    {
+                                        "type": "low_expert_diversity",
+                                        "prompt_id": prompt_id,
+                                        "category": category,
+                                        "moe_analysis": moe_analysis,
+                                    }
+                                )
 
                 prompt_count += 1
 
                 # Check if time for discovery
-                if datetime.now() - last_discovery > timedelta(minutes=discovery_interval_minutes):
+                if datetime.now() - last_discovery > timedelta(
+                    minutes=discovery_interval_minutes
+                ):
                     # Flush sidecar
                     try:
                         requests.post(f"{self.sidecar_url}/storage/flush", timeout=10)
@@ -664,8 +742,12 @@ class ExplorationEngine:
                     logger.info(f"Session Stats (elapsed: {elapsed})")
                     logger.info(f"  Total prompts: {self.session.total_prompts}")
                     logger.info(f"  Total tokens: {self.session.total_tokens}")
-                    logger.info(f"  Category distribution: {self.session.category_counts}")
-                    logger.info(f"  Zone distribution: {self.session.zone_distribution}")
+                    logger.info(
+                        f"  Category distribution: {self.session.category_counts}"
+                    )
+                    logger.info(
+                        f"  Zone distribution: {self.session.zone_distribution}"
+                    )
                     logger.info(f"  Discovery runs: {len(self.session.discovery_runs)}")
                     logger.info("=" * 60)
 
@@ -693,15 +775,20 @@ class ExplorationEngine:
 
     def save_session_summary(self):
         """Save the session summary to a file."""
-        summary_path = self.output_dir / f"session_{self.session.session_id}_summary.json"
+        summary_path = (
+            self.output_dir / f"session_{self.session.session_id}_summary.json"
+        )
 
         summary = {
             "session_id": self.session.session_id,
             "start_time": self.session.start_time.isoformat(),
-            "end_time": self.session.end_time.isoformat() if self.session.end_time else None,
+            "end_time": (
+                self.session.end_time.isoformat() if self.session.end_time else None
+            ),
             "duration_hours": (
                 (self.session.end_time - self.session.start_time).total_seconds() / 3600
-                if self.session.end_time else None
+                if self.session.end_time
+                else None
             ),
             "total_prompts": self.session.total_prompts,
             "total_tokens": self.session.total_tokens,
@@ -711,7 +798,7 @@ class ExplorationEngine:
             "findings_file": str(self.findings_path),
         }
 
-        with open(summary_path, 'w') as f:
+        with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
 
         logger.info(f"Session summary saved to: {summary_path}")
@@ -724,10 +811,14 @@ class ExplorationEngine:
         print(f"Total prompts: {summary['total_prompts']}")
         print(f"Total tokens: {summary['total_tokens']}")
         print(f"\nCategory distribution:")
-        for cat, count in sorted(summary['category_counts'].items(), key=lambda x: -x[1]):
+        for cat, count in sorted(
+            summary["category_counts"].items(), key=lambda x: -x[1]
+        ):
             print(f"  {cat}: {count}")
         print(f"\nZone distribution:")
-        for zone, count in sorted(summary['zone_distribution'].items(), key=lambda x: -x[1]):
+        for zone, count in sorted(
+            summary["zone_distribution"].items(), key=lambda x: -x[1]
+        ):
             print(f"  {zone}: {count}")
         print(f"\nDiscovery runs: {len(summary['discovery_runs'])}")
         print(f"\nFindings logged to: {summary['findings_file']}")
@@ -737,6 +828,7 @@ class ExplorationEngine:
 # =============================================================================
 # MAIN
 # =============================================================================
+
 
 def main():
     parser = argparse.ArgumentParser(

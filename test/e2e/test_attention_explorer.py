@@ -16,10 +16,10 @@ Or headless:
     pytest test/e2e/test_attention_explorer.py -v
 """
 
-import pytest
 import re
-from playwright.sync_api import Page, expect
 
+import pytest
+from playwright.sync_api import Page, expect
 
 # Test configuration
 BASE_URL = "http://localhost:8081/explorer.html"
@@ -57,7 +57,9 @@ class TestPageLoad:
         """Verify the header and logo are displayed."""
         page.goto(BASE_URL)
         expect(page.locator(".logo h1")).to_have_text("SGLang Attention Explorer")
-        expect(page.locator(".logo span")).to_have_text("Real Attention Token Visualization")
+        expect(page.locator(".logo span")).to_have_text(
+            "Real Attention Token Visualization"
+        )
 
     def test_connection_status_displays(self, page: Page):
         """Verify connection status shows model name when connected."""
@@ -589,7 +591,9 @@ class TestEndToEndWorkflow:
 
         # Step 9: Switch tabs
         page.locator(".detail-tab[data-tab='attendedBy']").click()
-        expect(page.locator(".detail-tab[data-tab='attendedBy']")).to_have_class(re.compile(r"active"))
+        expect(page.locator(".detail-tab[data-tab='attendedBy']")).to_have_class(
+            re.compile(r"active")
+        )
 
         # Step 10: Clear and verify reset
         page.locator(".btn-ghost").click()
@@ -661,7 +665,8 @@ class TestAPIIntegration:
         # Make direct API call via page context
         page.goto(BASE_URL)
 
-        result = page.evaluate("""
+        result = page.evaluate(
+            """
             async () => {
                 try {
                     const res = await fetch('http://localhost:8000/v1/models');
@@ -671,7 +676,8 @@ class TestAPIIntegration:
                     return { success: false, error: e.message };
                 }
             }
-        """)
+        """
+        )
 
         if not result["success"]:
             pytest.skip(f"API not accessible: {result.get('error')}")
@@ -689,7 +695,8 @@ class TestAPIIntegration:
             pytest.skip("Server not connected")
 
         # Make request and check for attention tokens
-        result = page.evaluate("""
+        result = page.evaluate(
+            """
             async () => {
                 try {
                     const res = await fetch('http://localhost:8000/v1/chat/completions', {
@@ -711,7 +718,8 @@ class TestAPIIntegration:
                     return { success: false, error: e.message };
                 }
             }
-        """)
+        """
+        )
 
         if not result["success"]:
             pytest.skip(f"API call failed: {result.get('error')}")

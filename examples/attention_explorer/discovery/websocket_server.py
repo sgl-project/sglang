@@ -12,14 +12,14 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
-import weakref
 
 try:
     import websockets
     from websockets.server import WebSocketServerProtocol
+
     HAS_WEBSOCKETS = True
 except ImportError:
     HAS_WEBSOCKETS = False
@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # MESSAGE TYPES
 # =============================================================================
+
 
 class MessageType(str, Enum):
     """WebSocket message types for manifold discovery updates."""
@@ -61,6 +62,7 @@ class MessageType(str, Enum):
 @dataclass
 class ProgressMessage:
     """Progress update message."""
+
     run_id: str
     stage: int
     stage_name: str
@@ -74,6 +76,7 @@ class ProgressMessage:
 @dataclass
 class BatchCompleteMessage:
     """Batch of embeddings completed."""
+
     run_id: str
     batch_idx: int
     new_points: List[Dict[str, Any]]  # [{x, y, cluster_id, zone, fingerprint_id}]
@@ -83,6 +86,7 @@ class BatchCompleteMessage:
 @dataclass
 class ClusterUpdateMessage:
     """Cluster state update."""
+
     run_id: str
     clusters: List[Dict[str, Any]]  # [{id, centroid_x, centroid_y, size, zone}]
     total_clusters: int
@@ -91,6 +95,7 @@ class ClusterUpdateMessage:
 @dataclass
 class ZoneStatsMessage:
     """Zone distribution statistics."""
+
     run_id: str
     distribution: Dict[str, int]  # {zone_name: count}
     percentages: Dict[str, float]  # {zone_name: percentage}
@@ -99,6 +104,7 @@ class ZoneStatsMessage:
 @dataclass
 class StageMessage:
     """Stage lifecycle message."""
+
     run_id: str
     stage: int
     stage_name: str
@@ -108,6 +114,7 @@ class StageMessage:
 @dataclass
 class RunMessage:
     """Run lifecycle message."""
+
     run_id: str
     status: str
     timestamp: float
@@ -118,6 +125,7 @@ class RunMessage:
 # =============================================================================
 # CONNECTION MANAGER
 # =============================================================================
+
 
 class ConnectionManager:
     """
@@ -141,8 +149,8 @@ class ConnectionManager:
         async with self._lock:
             self._connections.add(websocket)
             self._connection_info[websocket] = {
-                'connected_at': time.time(),
-                'subscriptions': set(),
+                "connected_at": time.time(),
+                "subscriptions": set(),
             }
 
         logger.info(f"WebSocket connected: {len(self._connections)} total connections")
@@ -154,7 +162,7 @@ class ConnectionManager:
 
             # Remove from all subscriptions
             info = self._connection_info.pop(websocket, {})
-            for run_id in info.get('subscriptions', set()):
+            for run_id in info.get("subscriptions", set()):
                 if run_id in self._subscriptions:
                     self._subscriptions[run_id].discard(websocket)
                     if not self._subscriptions[run_id]:
@@ -170,18 +178,20 @@ class ConnectionManager:
             self._subscriptions[run_id].add(websocket)
 
             if websocket in self._connection_info:
-                self._connection_info[websocket]['subscriptions'].add(run_id)
+                self._connection_info[websocket]["subscriptions"].add(run_id)
 
         logger.debug(f"Connection subscribed to run: {run_id}")
 
-    async def unsubscribe(self, websocket: WebSocketServerProtocol, run_id: str) -> None:
+    async def unsubscribe(
+        self, websocket: WebSocketServerProtocol, run_id: str
+    ) -> None:
         """Unsubscribe connection from a run's updates."""
         async with self._lock:
             if run_id in self._subscriptions:
                 self._subscriptions[run_id].discard(websocket)
 
             if websocket in self._connection_info:
-                self._connection_info[websocket]['subscriptions'].discard(run_id)
+                self._connection_info[websocket]["subscriptions"].discard(run_id)
 
     async def broadcast(self, message: Dict[str, Any]) -> int:
         """Broadcast message to all connected clients."""
@@ -241,6 +251,7 @@ class ConnectionManager:
 # =============================================================================
 # WEBSOCKET SERVER
 # =============================================================================
+
 
 class ManifoldWebSocketServer:
     """
@@ -317,7 +328,9 @@ class ManifoldWebSocketServer:
         # Start heartbeat task
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
-        logger.info(f"Manifold WebSocket server started on ws://{self.host}:{self.port}")
+        logger.info(
+            f"Manifold WebSocket server started on ws://{self.host}:{self.port}"
+        )
 
     async def stop(self) -> None:
         """Stop the WebSocket server."""
@@ -341,13 +354,17 @@ class ManifoldWebSocketServer:
         await self._manager.connect(websocket)
 
         # Send connected message
-        await websocket.send(json.dumps({
-            'type': MessageType.CONNECTED,
-            'timestamp': time.time(),
-            'server_info': {
-                'heartbeat_interval': self.heartbeat_interval,
-            }
-        }))
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": MessageType.CONNECTED,
+                    "timestamp": time.time(),
+                    "server_info": {
+                        "heartbeat_interval": self.heartbeat_interval,
+                    },
+                }
+            )
+        )
 
         try:
             async for message in websocket:
@@ -365,41 +382,53 @@ class ManifoldWebSocketServer:
         """Handle incoming message from client."""
         try:
             data = json.loads(message)
-            msg_type = data.get('type', '')
+            msg_type = data.get("type", "")
 
-            if msg_type == 'subscribe':
-                run_id = data.get('run_id')
+            if msg_type == "subscribe":
+                run_id = data.get("run_id")
                 if run_id:
                     await self._manager.subscribe(websocket, run_id)
-                    await websocket.send(json.dumps({
-                        'type': 'subscribed',
-                        'run_id': run_id,
-                        'timestamp': time.time(),
-                    }))
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "type": "subscribed",
+                                "run_id": run_id,
+                                "timestamp": time.time(),
+                            }
+                        )
+                    )
                     if self._on_subscribe:
-                        self._on_subscribe(run_id, 'subscribe')
+                        self._on_subscribe(run_id, "subscribe")
 
-            elif msg_type == 'unsubscribe':
-                run_id = data.get('run_id')
+            elif msg_type == "unsubscribe":
+                run_id = data.get("run_id")
                 if run_id:
                     await self._manager.unsubscribe(websocket, run_id)
-                    await websocket.send(json.dumps({
-                        'type': 'unsubscribed',
-                        'run_id': run_id,
-                        'timestamp': time.time(),
-                    }))
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "type": "unsubscribed",
+                                "run_id": run_id,
+                                "timestamp": time.time(),
+                            }
+                        )
+                    )
                     if self._on_subscribe:
-                        self._on_subscribe(run_id, 'unsubscribe')
+                        self._on_subscribe(run_id, "unsubscribe")
 
-            elif msg_type == 'command':
+            elif msg_type == "command":
                 if self._on_command:
-                    self._on_command(data.get('command', ''), data.get('params', {}))
+                    self._on_command(data.get("command", ""), data.get("params", {}))
 
-            elif msg_type == 'ping':
-                await websocket.send(json.dumps({
-                    'type': 'pong',
-                    'timestamp': time.time(),
-                }))
+            elif msg_type == "ping":
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "pong",
+                            "timestamp": time.time(),
+                        }
+                    )
+                )
 
         except json.JSONDecodeError:
             logger.warning(f"Invalid JSON received: {message[:100]}")
@@ -413,9 +442,9 @@ class ManifoldWebSocketServer:
                 await asyncio.sleep(self.heartbeat_interval)
 
                 message = {
-                    'type': MessageType.HEARTBEAT,
-                    'timestamp': time.time(),
-                    'connections': self._manager.connection_count,
+                    "type": MessageType.HEARTBEAT,
+                    "timestamp": time.time(),
+                    "connections": self._manager.connection_count,
                 }
 
                 await self._manager.broadcast(message)
@@ -457,18 +486,20 @@ class ManifoldWebSocketServer:
             Number of clients notified
         """
         message = {
-            'type': MessageType.PROGRESS,
-            'timestamp': time.time(),
-            'data': asdict(ProgressMessage(
-                run_id=run_id,
-                stage=stage,
-                stage_name=stage_name,
-                percent_complete=percent_complete,
-                items_processed=items_processed,
-                total_items=total_items,
-                eta_seconds=eta_seconds,
-                memory_used_gb=memory_used_gb,
-            ))
+            "type": MessageType.PROGRESS,
+            "timestamp": time.time(),
+            "data": asdict(
+                ProgressMessage(
+                    run_id=run_id,
+                    stage=stage,
+                    stage_name=stage_name,
+                    percent_complete=percent_complete,
+                    items_processed=items_processed,
+                    total_items=total_items,
+                    eta_seconds=eta_seconds,
+                    memory_used_gb=memory_used_gb,
+                )
+            ),
         }
 
         return await self._manager.broadcast_to_run(run_id, message)
@@ -481,14 +512,16 @@ class ManifoldWebSocketServer:
     ) -> int:
         """Broadcast stage start notification."""
         message = {
-            'type': MessageType.STAGE_START,
-            'timestamp': time.time(),
-            'data': asdict(StageMessage(
-                run_id=run_id,
-                stage=stage,
-                stage_name=stage_name,
-                timestamp=time.time(),
-            ))
+            "type": MessageType.STAGE_START,
+            "timestamp": time.time(),
+            "data": asdict(
+                StageMessage(
+                    run_id=run_id,
+                    stage=stage,
+                    stage_name=stage_name,
+                    timestamp=time.time(),
+                )
+            ),
         }
 
         return await self._manager.broadcast_to_run(run_id, message)
@@ -501,14 +534,16 @@ class ManifoldWebSocketServer:
     ) -> int:
         """Broadcast stage completion notification."""
         message = {
-            'type': MessageType.STAGE_COMPLETE,
-            'timestamp': time.time(),
-            'data': asdict(StageMessage(
-                run_id=run_id,
-                stage=stage,
-                stage_name=stage_name,
-                timestamp=time.time(),
-            ))
+            "type": MessageType.STAGE_COMPLETE,
+            "timestamp": time.time(),
+            "data": asdict(
+                StageMessage(
+                    run_id=run_id,
+                    stage=stage,
+                    stage_name=stage_name,
+                    timestamp=time.time(),
+                )
+            ),
         }
 
         return await self._manager.broadcast_to_run(run_id, message)
@@ -533,14 +568,16 @@ class ManifoldWebSocketServer:
             Number of clients notified
         """
         message = {
-            'type': MessageType.BATCH_COMPLETE,
-            'timestamp': time.time(),
-            'data': asdict(BatchCompleteMessage(
-                run_id=run_id,
-                batch_idx=batch_idx,
-                new_points=new_points,
-                total_points=total_points,
-            ))
+            "type": MessageType.BATCH_COMPLETE,
+            "timestamp": time.time(),
+            "data": asdict(
+                BatchCompleteMessage(
+                    run_id=run_id,
+                    batch_idx=batch_idx,
+                    new_points=new_points,
+                    total_points=total_points,
+                )
+            ),
         }
 
         return await self._manager.broadcast_to_run(run_id, message)
@@ -561,13 +598,15 @@ class ManifoldWebSocketServer:
             Number of clients notified
         """
         message = {
-            'type': MessageType.CLUSTER_UPDATE,
-            'timestamp': time.time(),
-            'data': asdict(ClusterUpdateMessage(
-                run_id=run_id,
-                clusters=clusters,
-                total_clusters=len(clusters),
-            ))
+            "type": MessageType.CLUSTER_UPDATE,
+            "timestamp": time.time(),
+            "data": asdict(
+                ClusterUpdateMessage(
+                    run_id=run_id,
+                    clusters=clusters,
+                    total_clusters=len(clusters),
+                )
+            ),
         }
 
         return await self._manager.broadcast_to_run(run_id, message)
@@ -589,18 +628,19 @@ class ManifoldWebSocketServer:
         """
         total = sum(distribution.values()) or 1
         percentages = {
-            zone: (count / total) * 100
-            for zone, count in distribution.items()
+            zone: (count / total) * 100 for zone, count in distribution.items()
         }
 
         message = {
-            'type': MessageType.ZONE_STATS,
-            'timestamp': time.time(),
-            'data': asdict(ZoneStatsMessage(
-                run_id=run_id,
-                distribution=distribution,
-                percentages=percentages,
-            ))
+            "type": MessageType.ZONE_STATS,
+            "timestamp": time.time(),
+            "data": asdict(
+                ZoneStatsMessage(
+                    run_id=run_id,
+                    distribution=distribution,
+                    percentages=percentages,
+                )
+            ),
         }
 
         return await self._manager.broadcast_to_run(run_id, message)
@@ -623,14 +663,14 @@ class ManifoldWebSocketServer:
             Number of clients notified
         """
         message = {
-            'type': MessageType.EMBEDDING_SAMPLE,
-            'timestamp': time.time(),
-            'data': {
-                'run_id': run_id,
-                'points': points,
-                'sample_type': sample_type,
-                'count': len(points),
-            }
+            "type": MessageType.EMBEDDING_SAMPLE,
+            "timestamp": time.time(),
+            "data": {
+                "run_id": run_id,
+                "points": points,
+                "sample_type": sample_type,
+                "count": len(points),
+            },
         }
 
         return await self._manager.broadcast_to_run(run_id, message)
@@ -642,14 +682,16 @@ class ManifoldWebSocketServer:
     ) -> int:
         """Broadcast run start notification."""
         message = {
-            'type': MessageType.RUN_START,
-            'timestamp': time.time(),
-            'data': asdict(RunMessage(
-                run_id=run_id,
-                status='started',
-                timestamp=time.time(),
-                metrics=config,
-            ))
+            "type": MessageType.RUN_START,
+            "timestamp": time.time(),
+            "data": asdict(
+                RunMessage(
+                    run_id=run_id,
+                    status="started",
+                    timestamp=time.time(),
+                    metrics=config,
+                )
+            ),
         }
 
         # Broadcast to all connections (run hasn't started subscribing yet)
@@ -662,14 +704,16 @@ class ManifoldWebSocketServer:
     ) -> int:
         """Broadcast run completion notification."""
         message = {
-            'type': MessageType.RUN_COMPLETE,
-            'timestamp': time.time(),
-            'data': asdict(RunMessage(
-                run_id=run_id,
-                status='complete',
-                timestamp=time.time(),
-                metrics=metrics,
-            ))
+            "type": MessageType.RUN_COMPLETE,
+            "timestamp": time.time(),
+            "data": asdict(
+                RunMessage(
+                    run_id=run_id,
+                    status="complete",
+                    timestamp=time.time(),
+                    metrics=metrics,
+                )
+            ),
         }
 
         return await self._manager.broadcast_to_run(run_id, message)
@@ -681,14 +725,16 @@ class ManifoldWebSocketServer:
     ) -> int:
         """Broadcast run error notification."""
         message = {
-            'type': MessageType.RUN_ERROR,
-            'timestamp': time.time(),
-            'data': asdict(RunMessage(
-                run_id=run_id,
-                status='error',
-                timestamp=time.time(),
-                message=error_message,
-            ))
+            "type": MessageType.RUN_ERROR,
+            "timestamp": time.time(),
+            "data": asdict(
+                RunMessage(
+                    run_id=run_id,
+                    status="error",
+                    timestamp=time.time(),
+                    message=error_message,
+                )
+            ),
         }
 
         return await self._manager.broadcast_to_run(run_id, message)
@@ -726,6 +772,7 @@ class ManifoldWebSocketServer:
 # FACTORY FUNCTION
 # =============================================================================
 
+
 def create_websocket_server(
     port: int = 9010,
     enabled: bool = True,
@@ -746,8 +793,7 @@ def create_websocket_server(
 
     if not HAS_WEBSOCKETS:
         logger.warning(
-            "websockets library not available. "
-            "Install with: pip install websockets"
+            "websockets library not available. " "Install with: pip install websockets"
         )
         return None
 
@@ -762,6 +808,7 @@ def create_websocket_server(
 # TESTING
 # =============================================================================
 
+
 async def _test_server():
     """Test the WebSocket server."""
     import random
@@ -771,7 +818,7 @@ async def _test_server():
 
     print(f"WebSocket server running on ws://localhost:9010")
     print("Connect with: websocat ws://localhost:9010")
-    print("Send: {\"type\": \"subscribe\", \"run_id\": \"test-001\"}")
+    print('Send: {"type": "subscribe", "run_id": "test-001"}')
 
     # Simulate discovery updates
     run_id = "test-001"
@@ -799,19 +846,23 @@ async def _test_server():
                 if i % 3 == 0:
                     points = [
                         {
-                            'x': random.uniform(-10, 10),
-                            'y': random.uniform(-10, 10),
-                            'cluster_id': random.randint(0, 5),
-                            'zone': random.choice(['syntax_floor', 'semantic_bridge', 'long_range']),
-                            'fingerprint_id': i * 10 + j,
+                            "x": random.uniform(-10, 10),
+                            "y": random.uniform(-10, 10),
+                            "cluster_id": random.randint(0, 5),
+                            "zone": random.choice(
+                                ["syntax_floor", "semantic_bridge", "long_range"]
+                            ),
+                            "fingerprint_id": i * 10 + j,
                         }
                         for j in range(10)
                     ]
-                    await server.broadcast_batch_complete(run_id, i, points, (i + 1) * 100)
+                    await server.broadcast_batch_complete(
+                        run_id, i, points, (i + 1) * 100
+                    )
 
             await server.broadcast_stage_complete(run_id, stage, stage_name)
 
-        await server.broadcast_run_complete(run_id, {'total_points': 1000})
+        await server.broadcast_run_complete(run_id, {"total_points": 1000})
 
         # Keep server running
         while True:
