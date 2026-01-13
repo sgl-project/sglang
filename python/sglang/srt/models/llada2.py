@@ -362,11 +362,13 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             shared_output = self._forward_shared_experts(hidden_states)
             final_hidden_states = self._forward_router_experts(hidden_states)
 
-        # manually scales the hidden states as not all moe runner support fuse scaling factor
-        final_hidden_states.mul_(self.routed_scaling_factor)
-
         if self.num_shared_experts > 0:
-            final_hidden_states = final_hidden_states + shared_output
+            x = shared_output
+            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+            # final_hidden_states = final_hidden_states + shared_output
+        else:
+            final_hidden_states.mul_(self.routed_scaling_factor)
 
         if self.tp_size > 1 and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -398,11 +400,13 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             topk_output=topk_output,
         )
 
-        # manually scales the hidden states as not all moe runner support fuse scaling factor
-        final_hidden_states.mul_(self.routed_scaling_factor)
-
         if shared_output is not None:
-            final_hidden_states += shared_output
+            x = shared_output
+            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+            # final_hidden_states = final_hidden_states + shared_output
+        else:
+            final_hidden_states.mul_(self.routed_scaling_factor)
 
         return final_hidden_states
 

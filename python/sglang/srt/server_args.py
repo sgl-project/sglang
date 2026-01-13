@@ -2725,7 +2725,13 @@ class ServerArgs:
                 )
                 self.attention_backend = "triton"
         elif not self.disable_cuda_graph:
-            if self.attention_backend != "flashinfer":
+            if self.device == "npu":
+                if self.attention_backend != "ascend":
+                    logger.warning(
+                        "Attention backend is set to ascend with npu because of enabling cuda graph in diffusion LLM inference"
+                    )
+                    self.attention_backend = "ascend"
+            elif self.attention_backend != "flashinfer":
                 logger.warning(
                     "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
                 )

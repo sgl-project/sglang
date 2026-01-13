@@ -83,10 +83,17 @@ class NPUGraphRunner(CudaGraphRunner):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
 
     def _init_arch_map(self):
-        self.attr_name: Dict[str, str] = {
-            AttentionArch.MLA: "actual_seq_lengths_kv",
-            AttentionArch.MHA: "context_lens",
-        }
+        if self.is_dllm:
+            self.attr_name: Dict[str, str] = {
+                AttentionArch.MLA: "actual_seq_lengths_kv",
+                AttentionArch.MHA: "actual_seq_lengths_kv",
+                # AttentionArch.MHA: "context_lens",
+            }
+        else:
+            self.attr_name: Dict[str, str] = {
+                AttentionArch.MLA: "actual_seq_lengths_kv",
+                AttentionArch.MHA: "context_lens",
+            }
         self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
             AttentionArch.MLA: [],
             AttentionArch.MHA: torch.Tensor(),
@@ -188,8 +195,15 @@ class NPUGraphRunner(CudaGraphRunner):
 
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
+            if self.is_dllm:
+                next_token_logits = None
+                full_logits = output.full_logits[: self.raw_num_token]
+            else:
+                full_logits = None
+                next_token_logits = output.next_token_logits[: self.raw_num_token]
             return LogitsProcessorOutput(
-                next_token_logits=output.next_token_logits[: self.raw_num_token],
+                next_token_logits=next_token_logits,
+                full_logits=full_logits,
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
