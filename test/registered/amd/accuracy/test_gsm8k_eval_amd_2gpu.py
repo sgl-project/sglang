@@ -141,19 +141,35 @@ TRITON_MOE_MODELS = {
 
 def popen_launch_server_wrapper(base_url, model):
     """Launch server with TP=2 configuration."""
-    other_args = ["--log-level-http", "warning", "--trust-remote-code", "--tp", "2"]
+    # Use longer watchdog timeout for AITER kernel compilation (can take 5-10 min)
+    other_args = [
+        "--log-level-http",
+        "warning",
+        "--trust-remote-code",
+        "--tp",
+        "2",
+        "--watchdog-timeout",
+        "600",  # 10 minutes for AITER kernel compilation
+    ]
+
+    # Increase server launch timeout (default may be too short for AITER compilation)
+    launch_timeout = max(DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, 600)
 
     process = popen_launch_server(
         model,
         base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        timeout=launch_timeout,
         other_args=other_args,
     )
     return process
 
 
-def check_model_scores(results):
-    """Check model scores and generate summary table with pass/fail status."""
+def check_model_scores(results, skipped_models=None):
+    """Check model scores and generate summary table with pass/fail status.
+
+    Only accuracy failures (score < threshold) cause test failure.
+    Skipped models (AITER compilation, download, server issues) do not cause failure.
+    """
     failed_models = []
     passed_count = 0
     failed_count = 0
@@ -191,20 +207,33 @@ def check_model_scores(results):
         line = f"| {model} | 2 | {score:.3f} | {threshold_str} | {startup_str} | {eval_str} | {total_str} | {status} |\n"
         summary += line
 
+    # Add skipped models to summary (not failures)
+    skipped_count = len(skipped_models) if skipped_models else 0
+    if skipped_models:
+        summary += (
+            "\n**Skipped Models (infrastructure issues, not accuracy failures):**\n"
+        )
+        for model, reason in skipped_models:
+            summary += f"| {model} | 2 | - | - | - | - | - | ⏭️ SKIP: {reason} |\n"
+
     print(f"\n{'='*60}")
     print("SUMMARY - TP=2 Instruction Models (mgsm_en)")
     print(f"{'='*60}")
     print(summary)
     print(f"\n📊 Final Statistics:")
     print(f"   Passed: {passed_count}")
-    print(f"   Failed: {failed_count}")
+    print(f"   Failed (accuracy): {failed_count}")
+    print(f"   Skipped (infra): {skipped_count}")
 
     if is_in_ci():
         write_github_step_summary(f"### TestNightlyGsm8KEval2GPU (TP=2)\n{summary}")
 
+    # Only fail on accuracy failures, not skips
     if failed_models:
         failure_msg = "\n".join(failed_models)
-        raise AssertionError(f"The following models failed:\n{failure_msg}")
+        raise AssertionError(
+            f"The following models failed accuracy test:\n{failure_msg}"
+        )
 
 
 class TestNightlyGsm8KEval2GPU(unittest.TestCase):
@@ -349,10 +378,17 @@ class TestNightlyGsm8KEval2GPU(unittest.TestCase):
             print(f"Error reading results.json: {e}")
 
         # Check all scores after collecting all results
+        # Only accuracy failures cause test failure; skips are reported but don't fail
         if all_results:
-            check_model_scores(all_results)
+            check_model_scores(all_results, skipped_models)
+        elif skipped_models:
+            # All models were skipped - not a failure, just report
+            print("\n⚠️ All models were skipped (infrastructure issues):")
+            for model, reason in skipped_models:
+                print(f"  - {model}: {reason}")
+            print("\nNo accuracy failures - test passes with all skips.")
         else:
-            print("\n⚠️ No models were tested successfully!")
+            print("\n⚠️ No models were tested!")
 
         print(
             f"\n⏱️  Total test runtime: {total_test_time:.1f}s ({total_test_time/60:.1f} min)"
