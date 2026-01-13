@@ -371,6 +371,12 @@ class DeepEPMoE(FusedMoE):
                 hidden_states = npu_fused_moe_without_routing_weights_bf16(
                     self, hidden_states, group_list_type, group_list, output_dtype
                 )
+            elif self.w13_weight.dtype == torch.uint8:
+                hidden_states = self.quant_method.apply_without_routing_weights(
+                    self,
+                    hidden_states,
+                    group_list,
+                )
             else:
                 input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
                 if not input_quant and not isinstance(
@@ -404,6 +410,12 @@ class DeepEPMoE(FusedMoE):
             if self.w13_weight.dtype == torch.bfloat16:
                 hidden_states = npu_fused_moe_without_routing_weights_bf16(
                     self, hidden_states, group_list_type, group_list, output_dtype
+                )
+            elif self.w13_weight.dtype == torch.uint8:
+                hidden_states = self.quant_method.apply_without_routing_weights(
+                    self,
+                    hidden_states,
+                    group_list,
                 )
             else:
                 hidden_states = self.quant_method.apply_without_routing_weights(
