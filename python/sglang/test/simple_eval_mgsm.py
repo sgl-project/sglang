@@ -20,9 +20,22 @@ from sglang.test.simple_eval_common import (
     SingleEvalResult,
 )
 
-LATIN_SCRIPT_LANGUAGES = ["de", "en", "es", "fr", "sw"]
+LATIN_SCRIPT_LANGUAGES = [
+    "de",
+    "en",
+    "es",
+    "fr",
+    "sw",
+]
 
-NON_LATIN_SCRIPT_LANGUAGES = ["bn", "ja", "ru", "te", "th", "zh"]
+NON_LATIN_SCRIPT_LANGUAGES = [
+    "bn",
+    "ja",
+    "ru",
+    "te",
+    "th",
+    "zh",
+]
 
 ALL_LANGUAGES = LATIN_SCRIPT_LANGUAGES + NON_LATIN_SCRIPT_LANGUAGES
 
