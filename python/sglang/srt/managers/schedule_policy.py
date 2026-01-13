@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import logging
+
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+from sglang.srt.utils import get_bool_env_var
+
+_ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
+logger = logging.getLogger(__name__)
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +25,7 @@ from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 
 import os
 import random
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
@@ -78,6 +84,7 @@ class CacheAgnosticPolicy(Enum):
     FCFS = "fcfs"  # first come first serve
     LOF = "lof"  # longest output first
     RANDOM = "random"
+    ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
 
 
 class SchedulePolicy:
@@ -101,7 +108,9 @@ class SchedulePolicy:
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
-    def calc_priority(self, waiting_queue: List[Req]) -> bool:
+    def calc_priority(
+        self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
+    ) -> bool:
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
@@ -136,6 +145,9 @@ class SchedulePolicy:
                 )
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
+            elif policy == CacheAgnosticPolicy.ROUTING_KEY:
+                if running_batch is not None:
+                    SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
         return prefix_computed
@@ -287,6 +299,39 @@ class SchedulePolicy:
                 x.time_stats.wait_queue_entry_time,
             )
         )
+
+    @staticmethod
+    def _sort_by_routing_key(
+        waiting_queue: List[Req], running_batch: ScheduleBatch
+    ) -> None:
+        """Sorts waiting queue by routing key frequency in running batch."""
+        routing_key_counts = Counter(
+            r.routing_key for r in running_batch.reqs if r.routing_key
+        )
+
+        if _ROUTING_KEY_POLICY_DEBUG_LOG:
+            waiting_keys_before = [r.routing_key for r in waiting_queue]
+            logger.info(
+                f"routing_key_counts={dict(routing_key_counts)}, "
+                f"waiting_keys_before={waiting_keys_before}"
+            )
+
+        if not routing_key_counts:
+            return
+
+        def sort_key(req: Req):
+            key = req.routing_key
+            if key and key in routing_key_counts:
+                count = routing_key_counts[key]
+                return (0, -count, key)
+            else:
+                return (1, 0, key or "")
+
+        waiting_queue.sort(key=sort_key)
+
+        if _ROUTING_KEY_POLICY_DEBUG_LOG:
+            waiting_keys_after = [r.routing_key for r in waiting_queue]
+            logger.info(f"waiting_keys_after={waiting_keys_after}")
 
     @staticmethod
     def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:

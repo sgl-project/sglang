@@ -39,6 +39,7 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -125,6 +126,7 @@ def _register_group(group: "GroupCoordinator") -> None:
 
 
 @register_custom_op(mutates_args=["tensor"])
+@register_split_op()
 def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
@@ -222,7 +224,6 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         pynccl_use_current_stream: bool = False,
-        torch_compile: Optional[bool] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
     ):
         # Set group info
@@ -1331,7 +1332,6 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     pynccl_use_current_stream: bool = True,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
-    torch_compile: Optional[bool] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1353,7 +1353,6 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         pynccl_use_current_stream=pynccl_use_current_stream,
-        torch_compile=torch_compile,
     )
 
 
@@ -1524,7 +1523,6 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
-    torch_compile: Optional[bool] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1581,7 +1579,6 @@ def initialize_model_parallel(
         ),
         group_name="tp",
         pynccl_use_current_stream=duplicate_tp_group,
-        torch_compile=torch_compile,
     )
 
     if duplicate_tp_group:
@@ -1598,7 +1595,6 @@ def initialize_model_parallel(
             ),
             group_name="pdmux_prefill_tp",
             pynccl_use_current_stream=True,
-            torch_compile=torch_compile,
         )
         if _TP.pynccl_comm:
             _TP.pynccl_comm.disabled = False
