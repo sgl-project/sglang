@@ -514,7 +514,7 @@ class NpuFuseEPMoE(DeepEPMoE):
         return weight.view(*original_shape[:dim], -1, *original_shape[dim + 1 :])
 
     def _process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        cpu_w13 = layer.w13_weight.cpu()
+        cpu_w13 = layer.w13_weight.data.transpose(1, 2).contiguous().cpu()
         w13 = self.reshape_w13_weight(cpu_w13, -1).npu()
         w13 = npu_format_cast(w13)
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
