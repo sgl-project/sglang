@@ -21,10 +21,10 @@ from sglang.test.simple_eval_common import (
 )
 
 LATIN_SCRIPT_LANGUAGES = [
-    "de",
     "en",
     "es",
     "fr",
+    "de",
     "sw",
 ]
 
@@ -40,10 +40,10 @@ NON_LATIN_SCRIPT_LANGUAGES = [
 ALL_LANGUAGES = LATIN_SCRIPT_LANGUAGES + NON_LATIN_SCRIPT_LANGUAGES
 
 LANG_TO_FPATH = {
-    "de": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_de.tsv",
     "en": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_en.tsv",
     "es": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_es.tsv",
     "fr": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_fr.tsv",
+    "de": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_de.tsv",
     "sw": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_sw.tsv",
     "ru": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_ru.tsv",
     "bn": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_bn.tsv",
@@ -54,9 +54,9 @@ LANG_TO_FPATH = {
 }
 LANG_TO_INSTRUCTIONS = {
     "en": """Solve this math problem. Give the reasoning steps before giving the final answer on the last line by itself in the format of "Answer:". Do not add anything other than the integer answer after "Answer:".\n\n{input}""",
-    "de": """Löse dieses Mathematikproblem. Gib die Schritte zur Begründung an, bevor du die endgültige Antwort in der letzten Zeile alleine im Format "Antwort:" gibst. Füge nichts anderes als die ganzzahlige Antwort nach "Antwort:" hinzu.\n\n{input}""",
     "es": """Resuelve este problema matemático. Proporciona los pasos de razonamiento antes de dar la respuesta final en la última línea por sí misma en el formato de "Respuesta:". No añadas nada más que la respuesta entera después de "Respuesta:".\n\n{input}""",
     "fr": """Résolvez ce problème de mathématiques. Donnez les étapes de raisonnement avant de fournir la réponse finale sur la dernière ligne elle-même dans le format de "Réponse:". N'ajoutez rien d'autre que la réponse entière après "Réponse:".\n\n{input}""",
+    "de": """Löse dieses Mathematikproblem. Gib die Schritte zur Begründung an, bevor du die endgültige Antwort in der letzten Zeile alleine im Format "Antwort:" gibst. Füge nichts anderes als die ganzzahlige Antwort nach "Antwort:" hinzu.\n\n{input}""",
     "sw": """Suluhisha tatizo hili la hesabu. Toa hatua za mantiki kabla ya kutoa jibu la mwisho kwenye mstari wa mwisho peke yake katika muundo wa "Jibu:". Usiongeze chochote kingine isipokuwa jibu la integer baada ya "Jibu:".\n\n{input}""",
     "ru": """Решите эту математическую задачу. Объясните шаги рассуждения перед тем, как дать окончательный ответ в последней строке сам по себе в формате "Ответ:". Не добавляйте ничего, кроме целочисленного ответа после "Ответ:".\n\n{input}""",
     "bn": """এই গণিতের সমস্যাটি সমাধান করুন। চূড়ান্ত উত্তর দেওয়ার আগে যুক্তিসম্পন্ন পদক্ষেপ প্রদান করুন। চূড়ান্ত উত্তরটি একক সংখ্যা হিসাবে "উত্তর:" এর পরে শেষ লাইনে দিন। "উত্তর:" এর পরে অন্য কিছু যুক্ত করবেন না।.\n\n{input}""",
@@ -68,9 +68,9 @@ LANG_TO_INSTRUCTIONS = {
 
 LANG_TO_ANSWER_PREFIX = {
     "en": "Answer",
-    "de": "Antwort",
     "es": "Respuesta",
     "fr": "Réponse",
+    "de": "Antwort",
     "sw": "Jibu",
     "ru": "Ответ",
     "bn": "উত্তর",
