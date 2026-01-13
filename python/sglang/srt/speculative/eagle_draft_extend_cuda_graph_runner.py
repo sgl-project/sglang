@@ -70,9 +70,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        print(
-            f"[EAGLE DraftExtend] capture_bs={self.capture_bs} compile_bs={self.compile_bs}"
-        )
         self.padded_static_len = -1
 
         # Attention backend
@@ -82,9 +79,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.num_tokens_per_bs = self.speculative_num_steps + 1
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        print(
-            f"[EAGLE DraftExtend] max_bs={self.max_bs} num_tokens_per_bs={self.num_tokens_per_bs} max_num_token={self.max_num_token}"
-        )
 
         self.eagle_worker.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token

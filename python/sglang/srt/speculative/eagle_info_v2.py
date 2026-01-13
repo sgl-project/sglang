@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -51,51 +49,6 @@ if is_cuda():
         tree_speculative_sampling_target_only,
     )
 
-# Profiling for V1 vs V2 comparison (set SGLANG_PROFILE_SPEC_SYNC=1 to enable)
-_PROFILE_SYNC = os.environ.get("SGLANG_PROFILE_SPEC_SYNC", "0") == "1"
-_sync_stats = {"wait_verify_ns": 0, "seq_lens_cpu_ns": 0, "count": 0}
-
-# Comprehensive step timing (enabled by same flag)
-_step_stats = {
-    "draft_ns": 0,
-    "verify_ns": 0,
-    "draft_extend_ns": 0,
-    "total_ns": 0,
-    "count": 0,
-}
-
-
-def record_step_time(phase: str, elapsed_ns: int):
-    """Record timing for a phase of the decode step."""
-    if phase in _step_stats:
-        _step_stats[phase] += elapsed_ns
-
-
-def print_step_stats():
-    """Print accumulated step timing stats."""
-    if _PROFILE_SYNC and _step_stats["count"] > 0:
-        n = _step_stats["count"]
-        draft = _step_stats["draft_ns"] / n / 1e6
-        verify = _step_stats["verify_ns"] / n / 1e6
-        draft_ext = _step_stats["draft_extend_ns"] / n / 1e6
-        total = _step_stats["total_ns"] / n / 1e6
-        print(
-            f"[V2 STEP STATS] n={n} draft={draft:.2f}ms verify={verify:.2f}ms "
-            f"draft_ext={draft_ext:.2f}ms total={total:.2f}ms",
-            flush=True,
-        )
-
-
-def get_v2_sync_stats():
-    """Return V2 sync stats as dict. Call from outside to get final summary."""
-    if _sync_stats["count"] == 0:
-        return None
-    return {
-        "count": _sync_stats["count"],
-        "wait_verify_ms": _sync_stats["wait_verify_ns"] / _sync_stats["count"] / 1e6,
-        "seq_lens_cpu_ms": _sync_stats["seq_lens_cpu_ns"] / _sync_stats["count"] / 1e6,
-    }
-
 
 @triton.jit
 def assign_draft_cache_locs_page_size_1(
@@ -124,18 +77,6 @@ def assign_draft_cache_locs_page_size_1(
         tl.store(out_cache_ptr + copy_offset, data, mask=mask)
 
 
-def print_sync_stats():
-    """Print accumulated sync stats. Call at end of generation."""
-    if _PROFILE_SYNC and _sync_stats["count"] > 0:
-        avg_wait = _sync_stats["wait_verify_ns"] / _sync_stats["count"] / 1e6
-        avg_cpu = _sync_stats["seq_lens_cpu_ns"] / _sync_stats["count"] / 1e6
-        print(
-            f"[V2 SYNC STATS] n={_sync_stats['count']} "
-            f"wait_verify={avg_wait:.3f}ms seq_lens_cpu={avg_cpu:.3f}ms "
-            f"total={avg_wait + avg_cpu:.3f}ms/step"
-        )
-
-
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
@@ -148,11 +89,7 @@ class EagleDraftInputV2Mixin:
         bs = batch.batch_size()
 
         # Now seq_lens is correct
-        if _PROFILE_SYNC:
-            _t0 = time.perf_counter_ns()
         batch.maybe_wait_verify_done()
-        if _PROFILE_SYNC:
-            _sync_stats["wait_verify_ns"] += time.perf_counter_ns() - _t0
 
         page_size = batch.token_to_kv_pool_allocator.page_size
         cur_kv_lens_cpu = []
@@ -199,21 +136,7 @@ class EagleDraftInputV2Mixin:
         )
 
         # FIXME(lsyin): make this sync optional
-        if _PROFILE_SYNC:
-            _t1 = time.perf_counter_ns()
         batch.seq_lens_cpu = batch.seq_lens.cpu()
-        if _PROFILE_SYNC:
-            _sync_stats["seq_lens_cpu_ns"] += time.perf_counter_ns() - _t1
-            _sync_stats["count"] += 1
-            if _sync_stats["count"] % 20 == 0:
-                avg_wait = _sync_stats["wait_verify_ns"] / _sync_stats["count"] / 1e6
-                avg_cpu = _sync_stats["seq_lens_cpu_ns"] / _sync_stats["count"] / 1e6
-                print(
-                    f"[V2 SYNC STATS] n={_sync_stats['count']} "
-                    f"wait_verify={avg_wait:.3f}ms seq_lens_cpu={avg_cpu:.3f}ms "
-                    f"total={avg_wait + avg_cpu:.3f}ms/step",
-                    flush=True,
-                )
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
     def prepare_for_v2_draft(

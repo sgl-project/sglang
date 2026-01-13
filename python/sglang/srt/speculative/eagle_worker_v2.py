@@ -32,14 +32,11 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
-    _PROFILE_SYNC,
-    _step_stats,
     assign_extend_cache_locs,
     build_compact_kv_src_tgt_cache_loc,
     compact_data_tensors_func,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
-    record_step_time,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -677,9 +674,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
-            if _PROFILE_SYNC:
-                _t_step_start = time.perf_counter_ns()
-
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
@@ -689,8 +683,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
 
-            if _PROFILE_SYNC:
-                _t_draft_start = time.perf_counter_ns()
             with (
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
@@ -698,20 +690,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
-            if _PROFILE_SYNC:
-                record_step_time("draft_ns", time.perf_counter_ns() - _t_draft_start)
 
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
 
-            if _PROFILE_SYNC:
-                _t_verify_start = time.perf_counter_ns()
             batch_output = self.verify(model_worker_batch)
-            if _PROFILE_SYNC:
-                record_step_time("verify_ns", time.perf_counter_ns() - _t_verify_start)
 
-            if _PROFILE_SYNC:
-                _t_draft_ext_start = time.perf_counter_ns()
             with (
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
@@ -719,23 +703,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )
-            if _PROFILE_SYNC:
-                record_step_time(
-                    "draft_extend_ns", time.perf_counter_ns() - _t_draft_ext_start
-                )
-                record_step_time("total_ns", time.perf_counter_ns() - _t_step_start)
-                _step_stats["count"] += 1
-                if _step_stats["count"] % 20 == 0:
-                    n = _step_stats["count"]
-                    draft = _step_stats["draft_ns"] / n / 1e6
-                    verify = _step_stats["verify_ns"] / n / 1e6
-                    draft_ext = _step_stats["draft_extend_ns"] / n / 1e6
-                    total = _step_stats["total_ns"] / n / 1e6
-                    print(
-                        f"[V2 STEP] n={n} draft={draft:.2f}ms verify={verify:.2f}ms "
-                        f"draft_ext={draft_ext:.2f}ms total={total:.2f}ms",
-                        flush=True,
-                    )
 
             return batch_output
 
