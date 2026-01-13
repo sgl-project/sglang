@@ -146,6 +146,7 @@ class NPUGraphRunner(CudaGraphRunner):
             self.enable_torch_compile
             and (not self.enable_npu_torchair_compile)
             and (not self.compile_bs or bs in self.compile_bs)
+            and (bs >= get_attention_tp_size())
         ):
             compiler = NpuGraphCompiler(
                 model_runner=self.model_runner,
