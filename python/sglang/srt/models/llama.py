@@ -217,7 +217,11 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if not _is_npu or not hasattr(self.rotary_emb, 'get_cos_sin_with_position') or self.force_native_attention_path:
+        if (
+            not _is_npu
+            or not hasattr(self.rotary_emb, "get_cos_sin_with_position")
+            or self.force_native_attention_path
+        ):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
