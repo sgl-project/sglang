@@ -321,7 +321,7 @@ class SamplingParams:
         if server_args.output_path is not None:
             self.output_path = server_args.output_path
             logger.debug(
-                f"Server mode: Using server-configured output_path: {self.output_path}"
+                f"Overriding output_path with server configuration: {self.output_path}"
             )
 
         # Process negative prompt
