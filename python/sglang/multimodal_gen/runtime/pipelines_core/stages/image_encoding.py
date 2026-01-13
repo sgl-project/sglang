@@ -225,25 +225,34 @@ class ImageVAEEncodingStage(PipelineStage):
                 image,
             ).to(get_local_torch_device(), dtype=torch.float32)
 
-            # (B, C, H, W) -> (B, C, 1, H, W)
-            image = image.unsqueeze(2)
+            # Determine VAE input format based on VAE architecture:
+            # - ParallelTiledVAE (QwenImage, Wan, Hunyuan) expects 5D input (B, C, T, H, W)
+            # - AutoencoderKL (Flux) expects 4D input (B, C, H, W)
+            is_3d_vae = isinstance(self.vae, ParallelTiledVAE)
 
-            if num_frames == 1:
-                video_condition = image
+            if is_3d_vae:
+                # (B, C, H, W) -> (B, C, 1, H, W) for 3D VAE
+                image = image.unsqueeze(2)
+
+                if num_frames == 1:
+                    video_condition = image
+                else:
+                    video_condition = torch.cat(
+                        [
+                            image,
+                            image.new_zeros(
+                                image.shape[0],
+                                image.shape[1],
+                                num_frames - 1,
+                                image.shape[3],
+                                image.shape[4],
+                            ),
+                        ],
+                        dim=2,
+                    )
             else:
-                video_condition = torch.cat(
-                    [
-                        image,
-                        image.new_zeros(
-                            image.shape[0],
-                            image.shape[1],
-                            num_frames - 1,
-                            image.shape[3],
-                            image.shape[4],
-                        ),
-                    ],
-                    dim=2,
-                )
+                # Keep as 4D for 2D VAE (e.g., Flux AutoencoderKL)
+                video_condition = image
             video_condition = video_condition.to(
                 device=get_local_torch_device(), dtype=torch.float32
             )
@@ -295,13 +304,14 @@ class ImageVAEEncodingStage(PipelineStage):
             )
 
             # apply shift & scale if needed
-            if isinstance(shift_factor, torch.Tensor):
-                shift_factor = shift_factor.to(latent_condition.device)
+            if shift_factor is not None:
+                if isinstance(shift_factor, torch.Tensor):
+                    shift_factor = shift_factor.to(latent_condition.device)
+                latent_condition = latent_condition - shift_factor
 
             if isinstance(scaling_factor, torch.Tensor):
                 scaling_factor = scaling_factor.to(latent_condition.device)
 
-            latent_condition -= shift_factor
             latent_condition = latent_condition * scaling_factor
 
             image_latent = server_args.pipeline_config.postprocess_image_latent(

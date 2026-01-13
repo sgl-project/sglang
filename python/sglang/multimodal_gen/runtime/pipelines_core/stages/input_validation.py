@@ -92,8 +92,31 @@ class InputValidationStage(PipelineStage):
             config = server_args.pipeline_config
             config.preprocess_vae_image(batch, self.vae_image_processor)
 
+            # For I2I tasks (like Kontext), use batch's target output dimensions
+            # instead of the input image's original dimensions
+            is_i2i_task = config.task_type == ModelTaskType.I2I
+
+            # For I2I, first calculate the target output size based on batch or image aspect ratio
+            if is_i2i_task and (batch.width is None or batch.height is None):
+                # If output size not specified, calculate from input image
+                calculated_size = config.prepare_calculated_size(final_image)
+                if calculated_size is not None:
+                    if batch.width is None:
+                        batch.width = calculated_size[0]
+                    if batch.height is None:
+                        batch.height = calculated_size[1]
+
             for img in batch.condition_image:
-                size = config.calculate_condition_image_size(img, img.width, img.height)
+                # For I2I tasks, use batch's target dimensions for condition image
+                if is_i2i_task and batch.width is not None and batch.height is not None:
+                    target_width, target_height = batch.width, batch.height
+                else:
+                    # For other tasks, use image's original dimensions
+                    target_width, target_height = img.width, img.height
+
+                size = config.calculate_condition_image_size(
+                    img, target_width, target_height
+                )
                 if size is not None:
                     width, height = size
                     img, _ = config.preprocess_condition_image(

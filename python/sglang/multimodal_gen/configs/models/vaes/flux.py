@@ -8,6 +8,11 @@ from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAECon
 class FluxVAEArchConfig(VAEArchConfig):
     spatial_compression_ratio: int = 1
 
+    # FLUX VAE scaling and shift factors (from official Black Forest Labs implementation)
+    # These are critical for correct latent space encoding/decoding
+    scaling_factor: float = 0.3611
+    shift_factor: float = 0.1159
+
     base_dim: int = 96
     decoder_base_dim: int | None = None
     z_dim: int = 16

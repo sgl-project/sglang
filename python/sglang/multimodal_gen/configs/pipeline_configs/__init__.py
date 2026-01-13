@@ -7,7 +7,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
     DiffusersGenericPipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.flux import FluxPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    FluxKontextPipelineConfig,
+    FluxPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
     Flux2FinetunedPipelineConfig,
 )
@@ -28,6 +31,7 @@ __all__ = [
     "DiffusersGenericPipelineConfig",
     "HunyuanConfig",
     "FastHunyuanConfig",
+    "FluxKontextPipelineConfig",
     "FluxPipelineConfig",
     "Flux2FinetunedPipelineConfig",
     "PipelineConfig",
