@@ -55,34 +55,6 @@ pub enum RetryError {
 pub struct RetryExecutor;
 
 impl RetryExecutor {
-    /// Execute an async operation with retries and backoff.
-    /// The `operation` closure is invoked each attempt with the attempt index.
-    pub async fn execute_with_retry<F, Fut, T>(
-        config: &RetryConfig,
-        mut operation: F,
-    ) -> Result<T, RetryError>
-    where
-        F: FnMut(u32) -> Fut,
-        Fut: std::future::Future<Output = Result<T, ()>>,
-    {
-        let max = config.max_retries.max(1);
-        let mut attempt: u32 = 0;
-        loop {
-            match operation(attempt).await {
-                Ok(val) => return Ok(val),
-                Err(_) => {
-                    let is_last = attempt + 1 >= max;
-                    if is_last {
-                        return Err(RetryError::MaxRetriesExceeded);
-                    }
-                    let delay = BackoffCalculator::calculate_delay(config, attempt);
-                    attempt += 1;
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
-    }
-
     /// Execute an operation that returns an HTTP Response with retries and backoff.
     ///
     /// Usage pattern:
