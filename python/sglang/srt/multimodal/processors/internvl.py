@@ -82,7 +82,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             or getattr(hf_config, "text_config", None)
             or hf_config
         )
-        llm_arch = getattr(text_cfg, "architectures", [None])[0]
+        llm_arch = (getattr(text_cfg, "architectures", []) or [None])[0]
         self.llm_arch = llm_arch
         video_token_map = {
             "Qwen2ForCausalLM": "<|video_pad|>",
