@@ -23,13 +23,11 @@ use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::{
-        steps::{
-            create_external_worker_registration_workflow, create_mcp_registration_workflow,
-            create_tokenizer_registration_workflow, create_wasm_module_registration_workflow,
-            create_wasm_module_removal_workflow, create_worker_registration_workflow,
-            create_worker_removal_workflow, create_worker_update_workflow,
-        },
-        Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
+        job_queue::{JobQueue, JobQueueConfig},
+        steps::WorkflowEngines,
+        worker::WorkerType,
+        worker_manager::WorkerManager,
+        Job,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -53,7 +51,7 @@ use crate::{
     routers::{conversations, parse, router_manager::RouterManager, tokenize, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
-    workflow::{LoggingSubscriber, WorkflowEngine},
+    workflow::LoggingSubscriber,
 };
 #[derive(Clone)]
 pub struct AppState {
@@ -524,11 +522,14 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
+    /// Control plane authentication configuration
+    pub control_plane_auth: Option<crate::auth::ControlPlaneAuthConfig>,
 }
 
 pub fn build_app(
     app_state: Arc<AppState>,
     auth_config: AuthConfig,
+    control_plane_auth_state: Option<crate::auth::ControlPlaneAuthState>,
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
@@ -593,6 +594,7 @@ pub fn build_app(
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));
 
+    // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
@@ -613,22 +615,32 @@ pub fn build_app(
         .route(
             "/v1/tokenizers/{tokenizer_id}/status",
             get(v1_tokenizers_status),
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            auth_config.clone(),
-            middleware::auth_middleware,
-        ));
+        );
 
+    // Build worker routes
     let worker_routes = Router::new()
         .route("/workers", post(create_worker).get(list_workers_rest))
         .route(
             "/workers/{worker_id}",
             get(get_worker).put(update_worker).delete(delete_worker),
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            auth_config.clone(),
-            middleware::auth_middleware,
-        ));
+        );
+
+    // Apply authentication middleware to control plane routes
+    let apply_control_plane_auth = |routes: Router<Arc<AppState>>| {
+        if let Some(ref cp_state) = control_plane_auth_state {
+            routes.route_layer(axum::middleware::from_fn_with_state(
+                cp_state.clone(),
+                crate::auth::control_plane_auth_middleware,
+            ))
+        } else {
+            routes.route_layer(axum::middleware::from_fn_with_state(
+                auth_config.clone(),
+                middleware::auth_middleware,
+            ))
+        }
+    };
+    let admin_routes = apply_control_plane_auth(admin_routes);
+    let worker_routes = apply_control_plane_auth(worker_routes);
 
     Router::new()
         .merge(protected_routes)
@@ -640,7 +652,9 @@ pub fn build_app(
             max_payload_size,
         ))
         .layer(middleware::create_logging_layer())
-        .layer(middleware::HttpMetricsLayer::new())
+        .layer(middleware::HttpMetricsLayer::new(
+            app_state.context.inflight_tracker.clone(),
+        ))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
@@ -674,7 +688,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 json_format: false,
                 log_dir: config.log_dir.clone(),
                 colorize: true,
-                log_file_name: "sgl-model-gateway".to_string(),
+                log_file_name: "smg".to_string(),
                 log_targets: None,
             },
             config.router_config.trace_config.clone(),
@@ -700,6 +714,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         AppContext::from_config(config.router_config.clone(), config.request_timeout_secs).await?,
     );
 
+    if config.prometheus_config.is_some() {
+        app_context.inflight_tracker.start_sampler(20);
+    }
+
     let weak_context = Arc::downgrade(&app_context);
     let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
     app_context
@@ -707,44 +725,18 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .set(worker_job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize workflow engine and register workflows
-    let engine = Arc::new(WorkflowEngine::new());
+    // Initialize typed workflow engines
+    let engines = WorkflowEngines::new(&config.router_config);
 
-    engine
-        .event_bus()
-        .subscribe(Arc::new(LoggingSubscriber))
-        .await;
+    // Subscribe logging to all workflow engines
+    engines.subscribe_all(Arc::new(LoggingSubscriber)).await;
 
-    engine
-        .register_workflow(create_worker_registration_workflow(&config.router_config))
-        .expect("worker_registration workflow should be valid");
-    engine
-        .register_workflow(create_external_worker_registration_workflow())
-        .expect("external_worker_registration workflow should be valid");
-    engine
-        .register_workflow(create_worker_removal_workflow())
-        .expect("worker_removal workflow should be valid");
-    engine
-        .register_workflow(create_worker_update_workflow())
-        .expect("worker_update workflow should be valid");
-    engine
-        .register_workflow(create_mcp_registration_workflow())
-        .expect("mcp_registration workflow should be valid");
-    engine
-        .register_workflow(create_wasm_module_registration_workflow())
-        .expect("wasm_module_registration workflow should be valid");
-    engine
-        .register_workflow(create_wasm_module_removal_workflow())
-        .expect("wasm_module_removal workflow should be valid");
-    engine
-        .register_workflow(create_tokenizer_registration_workflow())
-        .expect("tokenizer_registration workflow should be valid");
     app_context
-        .workflow_engine
-        .set(engine)
-        .expect("WorkflowEngine should only be initialized once");
+        .workflow_engines
+        .set(engines)
+        .expect("WorkflowEngines should only be initialized once");
     debug!(
-        "Workflow engine initialized with worker and MCP registration workflows (health check timeout: {}s)",
+        "Workflow engines initialized (health check timeout: {}s)",
         config.router_config.health_check.timeout_secs
     );
 
@@ -881,9 +873,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         api_key: config.router_config.api_key.clone(),
     };
 
+    // Initialize control plane authentication if configured
+    let control_plane_auth_state =
+        crate::auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
+
     let app = build_app(
         app_state,
         auth_config,
+        control_plane_auth_state,
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),

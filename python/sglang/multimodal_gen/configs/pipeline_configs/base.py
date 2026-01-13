@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import json
+import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
@@ -194,11 +195,6 @@ class PipelineConfig:
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.tensor], ...] = (
         field(default_factory=lambda: (postprocess_text,))
     )
-
-    # StepVideo specific parameters
-    pos_magic: str | None = None
-    neg_magic: str | None = None
-    timesteps_scale: bool | None = None
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -468,27 +464,6 @@ class PipelineConfig:
             choices=["fp32", "fp16", "bf16"],
             help="Precision for image encoder",
         )
-        parser.add_argument(
-            f"--{prefix_with_dot}pos_magic",
-            type=str,
-            dest=f"{prefix_with_dot.replace('-', '_')}pos_magic",
-            default=PipelineConfig.pos_magic,
-            help="Positive magic prompt for sampling, used in stepvideo",
-        )
-        parser.add_argument(
-            f"--{prefix_with_dot}neg_magic",
-            type=str,
-            dest=f"{prefix_with_dot.replace('-', '_')}neg_magic",
-            default=PipelineConfig.neg_magic,
-            help="Negative magic prompt for sampling, used in stepvideo",
-        )
-        parser.add_argument(
-            f"--{prefix_with_dot}timesteps_scale",
-            type=bool,
-            dest=f"{prefix_with_dot.replace('-', '_')}timesteps_scale",
-            default=PipelineConfig.timesteps_scale,
-            help="Bool for applying scheduler scale in set_timesteps, used in stepvideo",
-        )
 
         # DMD parameters
         parser.add_argument(
@@ -544,15 +519,55 @@ class PipelineConfig:
         if model_path is None:
             raise ValueError("model_path is required in kwargs")
 
+        # Check if model_path is a safetensors file and pipeline_class_name is specified
+        pipeline_class_name = kwargs.get(
+            prefix_with_dot + "pipeline_class_name"
+        ) or kwargs.get("pipeline_class_name")
+        is_safetensors_file = os.path.isfile(model_path) and model_path.endswith(
+            ".safetensors"
+        )
+
         # 1. Get the pipeline config class from the registry
         from sglang.multimodal_gen.configs.pipeline_configs.flux import (
             Flux2PipelineConfig,
         )
+        from sglang.multimodal_gen.registry import get_pipeline_config_classes
 
-        model_info = get_model_info(model_path)
+        # If model_path is a safetensors file and pipeline_class_name is specified,
+        # try to get PipelineConfig from the registry first
+        if is_safetensors_file and pipeline_class_name:
+            config_classes = get_pipeline_config_classes(pipeline_class_name)
+            if config_classes is not None:
+                pipeline_config_cls, _ = config_classes
+                logger.info(
+                    f"Detected safetensors file with {pipeline_class_name}, "
+                    f"using {pipeline_config_cls.__name__} directly without model_index.json"
+                )
+            else:
+                model_info = get_model_info(model_path)
+                if model_info is None:
+                    from sglang.multimodal_gen.registry import (
+                        _PIPELINE_CONFIG_REGISTRY,
+                        _discover_and_register_pipelines,
+                    )
 
-        # 1.5. Adjust pipeline config for fine-tuned VAE if needed
-        pipeline_config_cls = model_info.pipeline_config_cls
+                    _discover_and_register_pipelines()
+                    available_pipelines = list(_PIPELINE_CONFIG_REGISTRY.keys())
+                    raise ValueError(
+                        f"Could not get model info for '{model_path}'. "
+                        f"If using a safetensors file, please specify a valid pipeline_class_name. "
+                        f"Available pipelines with config classes: {available_pipelines}"
+                    )
+                pipeline_config_cls = model_info.pipeline_config_cls
+        else:
+            model_info = get_model_info(model_path)
+            if model_info is None:
+                raise ValueError(
+                    f"Could not get model info for '{model_path}'. "
+                    f"If using a safetensors file, please specify pipeline_class_name"
+                )
+            # 1.5. Adjust pipeline config for fine-tuned VAE if needed
+            pipeline_config_cls = model_info.pipeline_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
 
         # Check if this is a Flux2 model with fal/FLUX.2-Tiny-AutoEncoder

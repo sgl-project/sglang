@@ -103,6 +103,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
@@ -1062,6 +1063,21 @@ async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
         )
 
 
+@app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
+async def load_lora_adapter_from_tensors(
+    obj: LoadLoRAAdapterFromTensorsReqInput, request: Request
+):
+    """Load a new LoRA adapter from tensors without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
+        obj, request
+    )
+
+    if result.success:
+        return ORJSONResponse(result, status_code=HTTPStatus.OK)
+    else:
+        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.api_route("/unload_lora_adapter", methods=["POST"])
 async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
@@ -1514,8 +1530,13 @@ def _execute_server_warmup(server_args: ServerArgs):
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
-    elif is_vlm and server_args.disaggregation_mode == "null":
+    elif (
+        is_vlm
+        and server_args.disaggregation_mode == "null"
+        and model_info["is_generation"]
+    ):
         # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
+        # Only use chat completions format for generation models, not embedding models
         json_data = {
             "model": _global_state.tokenizer_manager.served_model_name,
             "messages": [
