@@ -356,6 +356,19 @@ impl RoutingMode {
     }
 }
 
+/// Assignment mode for manual policy when encountering a new routing key
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualAssignmentMode {
+    /// Random selection (default)
+    #[default]
+    Random,
+    /// Select worker with minimum running requests
+    MinLoad,
+    /// Select worker with minimum active routing keys
+    MinGroup,
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -401,6 +414,9 @@ pub enum PolicyConfig {
         /// Maximum idle time before eviction (seconds, default: 14400 = 4 hours)
         #[serde(default = "default_manual_max_idle_secs")]
         max_idle_secs: u64,
+        /// Assignment mode for new routing keys (default: random)
+        #[serde(default)]
+        assignment_mode: ManualAssignmentMode,
     },
 
     /// Consistent hashing policy using hash ring for session affinity:
