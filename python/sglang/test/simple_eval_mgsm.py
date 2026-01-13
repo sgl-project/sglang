@@ -22,7 +22,7 @@ from sglang.test.simple_eval_common import (
 
 LATIN_LANGUAGES = ["de", "en", "es", "fr", "sw"]
 NON_LATIN_LANGUAGES = ["bn", "ja", "ru", "te", "th", "zh"]
-ALL_LANGUAGES = ["de", "en", "es", "fr", "sw"] + ["bn", "ja", "ru", "te", "th", "zh"]
+ALL_LANGUAGES = LATIN_LANGUAGES + ["bn", "ja", "ru", "te", "th", "zh"]
 
 LANG_TO_FPATH = {
     "bn": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_bn.tsv",
