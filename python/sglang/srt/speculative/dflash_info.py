@@ -12,7 +12,10 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import alloc_token_slots
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool,
+    assign_req_to_token_pool_func,
+)
 from sglang.srt.utils import next_power_of_2
 
 
@@ -155,9 +158,18 @@ class DFlashVerifyInput(SpecInput):
         batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict])
         batch.out_cache_loc = batch.out_cache_loc[accepted]
 
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + self.accept_length + 1,
+            batch.out_cache_loc,
+            bs,
+        )
+
         # Update lengths
         for i, req in enumerate(batch.reqs):
-            req.kv_committed_len += accept_cpu[i] + 1
+            req.kv_committed_len += final_accept_lens[i] + 1
             req.kv_allocated_len = req.kv_committed_len
 
         batch.seq_lens.add_(self.accept_length + 1)
