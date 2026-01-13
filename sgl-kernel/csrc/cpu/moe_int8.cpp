@@ -129,7 +129,7 @@ inline void silu_and_mul(
   __m512 vc1[COLS];
   __m512i vcomp0[COLS];
   __m512i vcomp1[COLS];
-  __m512 vas;
+  __m512 vas_row;
   __m512 vbs0[COLS];
   __m512 vbs1[COLS];
 
@@ -143,14 +143,14 @@ inline void silu_and_mul(
 
   auto scalec = [&](auto col, int64_t row) {
     // update As
-    vas = _mm512_set1_ps(As[row]);
+    vas_row = _mm512_set1_ps(As[row]);
     // C = As * (C - Bcomp) * Bs
     __m512i vc32_0 = _mm512_loadu_si512(C0 + row * BLOCK_N + col * 16);
     __m512i vc32_1 = _mm512_loadu_si512(C1 + row * BLOCK_N + col * 16);
     vc0[col] = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc32_0, vcomp0[col]));
     vc1[col] = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc32_1, vcomp1[col]));
-    vc0[col] = _mm512_mul_ps(_mm512_mul_ps(vc0[col], vas), vbs0[col]);
-    vc1[col] = _mm512_mul_ps(_mm512_mul_ps(vc1[col], vas), vbs1[col]);
+    vc0[col] = _mm512_mul_ps(_mm512_mul_ps(vc0[col], vas_row), vbs0[col]);
+    vc1[col] = _mm512_mul_ps(_mm512_mul_ps(vc1[col], vas_row), vbs1[col]);
   };
 
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -196,7 +196,7 @@ inline void scale_C(
 
   __m512 vc[COLS];
   __m512i vcomp[COLS];
-  __m512 vas;
+  __m512 vas_row;
   __m512 vbs[COLS];
 
   auto load_scale_and_comp = [&](auto col) {
@@ -207,11 +207,11 @@ inline void scale_C(
 
   auto scalec = [&](auto col, int64_t row) {
     // update As
-    vas = _mm512_set1_ps(As[row]);
+    vas_row = _mm512_set1_ps(As[row]);
     // C = As * (C - Bcomp) * Bs
     __m512i vc32 = _mm512_loadu_si512(Ctmp + row * BLOCK_N + col * 16);
     vc[col] = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc32, vcomp[col]));
-    vc[col] = _mm512_mul_ps(_mm512_mul_ps(vc[col], vas), vbs[col]);
+    vc[col] = _mm512_mul_ps(_mm512_mul_ps(vc[col], vas_row), vbs[col]);
     _mm512_storeu_ps(C + row * BLOCK_N + col * 16, vc[col]);
   };
 
@@ -272,7 +272,7 @@ struct tinygemm_kernel_vnni<at::BFloat16, BLOCK_M, BLOCK_N> {
     __m512i vc1[ROWS * COLS];
     __m512i vcomp0[COLS];
     __m512i vcomp1[COLS];
-    __m512 vas;
+    __m512 vas_row;
     __m512 vbs0[COLS];
     __m512 vbs1[COLS];
 
@@ -313,7 +313,7 @@ struct tinygemm_kernel_vnni<at::BFloat16, BLOCK_M, BLOCK_N> {
 
       // load a scale
       if constexpr (col == 0) {
-        vas = _mm512_set1_ps(As[row]);
+        vas_row = _mm512_set1_ps(As[row]);
       }
       // load b scale and vcomp
       if constexpr (row == 0) {
@@ -324,8 +324,8 @@ struct tinygemm_kernel_vnni<at::BFloat16, BLOCK_M, BLOCK_N> {
       }
       __m512 c0 = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc0[i], vcomp0[col]));
       __m512 c1 = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc1[i], vcomp1[col]));
-      vc0[i] = _mm512_castps_si512(_mm512_mul_ps(_mm512_mul_ps(c0, vas), vbs0[col]));
-      vc1[i] = _mm512_castps_si512(_mm512_mul_ps(_mm512_mul_ps(c1, vas), vbs1[col]));
+      vc0[i] = _mm512_castps_si512(_mm512_mul_ps(_mm512_mul_ps(c0, vas_row), vbs0[col]));
+      vc1[i] = _mm512_castps_si512(_mm512_mul_ps(_mm512_mul_ps(c1, vas_row), vbs1[col]));
     };
     Unroll<ROWS * COLS>{}(scalec);
 
@@ -463,7 +463,7 @@ struct tinygemm_kernel_vnni2<at::BFloat16, BLOCK_M, BLOCK_N> {
     __m512i vb[COLS];
     __m512i vc[ROWS * COLS];
     __m512i vcomp[COLS];
-    __m512 vas;
+    __m512 vas_row;
     __m512 vbs[COLS];
 
     auto loadc = [&](auto i) { vc[i] = _mm512_set1_epi32(0); };
@@ -497,7 +497,7 @@ struct tinygemm_kernel_vnni2<at::BFloat16, BLOCK_M, BLOCK_N> {
 
       // load a scale
       if constexpr (col == 0) {
-        vas = _mm512_set1_ps(As[row]);
+        vas_row = _mm512_set1_ps(As[row]);
       }
       // load b scale and vcomp per 2 vectors
       // also load bias if any
@@ -510,7 +510,7 @@ struct tinygemm_kernel_vnni2<at::BFloat16, BLOCK_M, BLOCK_N> {
         }
       }
       __m512 x = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc[i], vcomp[col]));
-      x = _mm512_mul_ps(_mm512_mul_ps(x, vas), vbs[col]);
+      x = _mm512_mul_ps(_mm512_mul_ps(x, vas_row), vbs[col]);
       _mm512_storeu_ps(reinterpret_cast<__m512*>(C + row * ldc + col * 16), x);
     };
     Unroll<ROWS * COLS>{}(storec);
