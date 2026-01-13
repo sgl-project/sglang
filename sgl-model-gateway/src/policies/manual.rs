@@ -207,7 +207,7 @@ impl ManualPolicy {
         }
 
         (
-            Some(self.select_new_worker(workers, &healthy_indices)),
+            Some(random_select(&healthy_indices)),
             ExecutionBranch::NoRoutingId,
         )
     }
