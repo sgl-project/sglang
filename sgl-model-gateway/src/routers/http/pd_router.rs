@@ -294,7 +294,7 @@ impl PDRouter {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
         let prefill_workers: Vec<Arc<dyn Worker>> = if let Some(model) = effective_model_id {
             self.worker_registry
-                .get_by_model_fast(model)
+                .get_by_model(model)
                 .iter()
                 .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
                 .cloned()
@@ -341,7 +341,7 @@ impl PDRouter {
             Err(e) => return Self::handle_serialization_error(e),
         };
 
-        let _prefill_guard = WorkerLoadGuard::new(prefill.clone());
+        let _prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
         let request = self.build_post_with_headers(
             &self.client,
             prefill.url(),
