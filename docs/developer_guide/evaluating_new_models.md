@@ -67,7 +67,7 @@ python -m sglang.test.few_shot_gsm8k \
 [HellaSwag](https://arxiv.org/abs/1905.07830) Common sense reasoning.
 
 ```bash
-python3 benchmark/hellaswag/bench_sglang.py \
+python benchmark/hellaswag/bench_sglang.py \
   --host http://127.0.0.1 \
   --port 30000 \
   --num-questions 200 \
@@ -78,7 +78,7 @@ python3 benchmark/hellaswag/bench_sglang.py \
 [Graduate-Level Google-Proof Q&A Benchmark](https://arxiv.org/abs/2311.12022).
 
 ```bash
-python3 -m sglang.test.run_eval \
+python -m sglang.test.run_eval \
   --eval-name gpqa \
   --port 30000 \
   --num-examples 198 \
@@ -95,7 +95,7 @@ HumanEval problem solving dataset described in the paper "[Evaluating Large Lang
 # Install human-eval if it is not installed yet
 pip install human_eval
 
-python3 -m sglang.test.run_eval \
+python -m sglang.test.run_eval \
   --eval-name humaneval \
   --num-examples 10 \
   --port 30000
@@ -107,7 +107,7 @@ python3 -m sglang.test.run_eval \
 [Massive Multi-discipline Multimodal Understanding and Reasoning Benchmark](https://arxiv.org/abs/2311.16502).
 
 ```bash
-python3 benchmark/mmmu/bench_sglang.py \
+python benchmark/mmmu/bench_sglang.py \
   --port 30000 \
   --concurrency 64
 ```
@@ -135,7 +135,7 @@ The following sections are examples for LLMs. For VLMs, add the following argume
 This simulates a scenario with low concurrency (e.g., single user) to measure latency.
 
 ```bash
-python3 -m sglang.bench_serving \
+python -m sglang.bench_serving \
   --backend sglang \
   --host 0.0.0.0 \
   --port 30000 \
@@ -149,7 +149,7 @@ python3 -m sglang.bench_serving \
 This simulates a high-traffic scenario to measure maximum system throughput.
 
 ```bash
-python3 -m sglang.bench_serving \
+python -m sglang.bench_serving \
   --backend sglang \
   --host 0.0.0.0 \
   --port 30000 \
