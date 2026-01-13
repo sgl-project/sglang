@@ -418,7 +418,7 @@ def initialize_model_parallel(
 
         PROCESS_GROUP = _DummyProcessGroup()
     else:
-        # Build yunchang SP sub-groups based on the true SP groups. This is
+        # Build SGLang Diffusion SP sub-groups based on the true SP groups. This is
         # critical when TP>1, because SP groups may be strided in global ranks
         # (e.g., tp-sp order).
         sp_groups = rank_generator.get_ranks("sp")
