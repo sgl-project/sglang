@@ -1328,6 +1328,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             trtllm_fp8_block_scale_moe,
             trtllm_fp8_per_tensor_scale_moe,
         )
+
         from sglang.srt.layers.moe.topk import TopKOutputChecker
         from sglang.srt.layers.moe.utils import RoutingMethodType
 
