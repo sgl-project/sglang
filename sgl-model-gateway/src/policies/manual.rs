@@ -154,6 +154,7 @@ impl ManualPolicy {
         match self.assignment_mode {
             ManualAssignmentMode::Random => random_select(healthy_indices),
             ManualAssignmentMode::MinLoad => min_load_select(workers, healthy_indices),
+            ManualAssignmentMode::MinGroup => min_group_select(workers, healthy_indices),
         }
     }
 
@@ -288,6 +289,12 @@ where
 
 fn min_load_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
     select_min_by(healthy_indices, |idx| workers[idx].load())
+}
+
+fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
+    select_min_by(healthy_indices, |idx| {
+        workers[idx].worker_routing_key_load().value()
+    })
 }
 
 #[cfg(test)]
@@ -755,6 +762,76 @@ mod tests {
     }
 
     #[test]
+    fn test_min_group_select_distributes_evenly() {
+        let config = ManualConfig {
+            assignment_mode: ManualAssignmentMode::MinGroup,
+            ..Default::default()
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        for i in 0..9 {
+            let routing_key = format!("key-{}", i);
+            let headers = headers_with_routing_key(&routing_key);
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert!(result.is_some());
+            assert_eq!(branch, ExecutionBranch::Vacant);
+
+            let selected_idx = result.unwrap();
+            workers[selected_idx]
+                .worker_routing_key_load()
+                .increment(&routing_key);
+        }
+
+        let distribution: HashMap<_, usize> = policy
+            .routing_map
+            .iter()
+            .map(|e| e.candi_worker_urls.first().unwrap().clone())
+            .fold(HashMap::new(), |mut acc, url| {
+                *acc.entry(url).or_default() += 1;
+                acc
+            });
+
+        assert_eq!(distribution.len(), 3, "Should use all 3 workers");
+        for count in distribution.values() {
+            assert_eq!(*count, 3, "Each worker should have exactly 3 routing keys");
+        }
+    }
+
+    #[test]
+    fn test_min_group_select_prefers_worker_with_fewer_routing_keys() {
+        let config = ManualConfig {
+            assignment_mode: ManualAssignmentMode::MinGroup,
+            ..Default::default()
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        workers[0].worker_routing_key_load().increment("existing-1");
+        workers[0].worker_routing_key_load().increment("existing-2");
+        workers[1].worker_routing_key_load().increment("existing-3");
+
+        assert_eq!(workers[0].worker_routing_key_load().value(), 2);
+        assert_eq!(workers[1].worker_routing_key_load().value(), 1);
+        assert_eq!(workers[2].worker_routing_key_load().value(), 0);
+
+        let headers = headers_with_routing_key("new-key");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let (result, _) = policy.select_worker_impl(&workers, &info);
+        let selected_idx = result.unwrap();
+
+        assert_eq!(selected_idx, 2, "Should select worker with 0 routing keys");
+    }
+
+    #[test]
     fn test_min_load_select_prefers_worker_with_fewer_requests() {
         let config = ManualConfig {
             assignment_mode: ManualAssignmentMode::MinLoad,
@@ -780,6 +857,44 @@ mod tests {
         let selected_idx = result.unwrap();
 
         assert_eq!(selected_idx, 2, "Should select worker with 0 load");
+    }
+
+    #[test]
+    fn test_min_group_sticky_after_assignment() {
+        let config = ManualConfig {
+            assignment_mode: ManualAssignmentMode::MinGroup,
+            ..Default::default()
+        };
+        let policy = ManualPolicy::with_config(config);
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        workers[0].worker_routing_key_load().increment("key-0");
+        workers[1].worker_routing_key_load().increment("key-1");
+        workers[1].worker_routing_key_load().increment("key-2");
+
+        let headers = headers_with_routing_key("new-key");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+        let first_idx = first_result.unwrap();
+        assert_eq!(branch, ExecutionBranch::Vacant);
+        assert_eq!(
+            first_idx, 0,
+            "Should select worker 0 (has 1 routing key vs 2)"
+        );
+
+        for _ in 0..10 {
+            let (result, branch) = policy.select_worker_impl(&workers, &info);
+            assert_eq!(
+                result,
+                Some(first_idx),
+                "Same routing key should route to same worker"
+            );
+            assert_eq!(branch, ExecutionBranch::OccupiedHit);
+        }
     }
 
     #[test]

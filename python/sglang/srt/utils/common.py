@@ -1925,9 +1925,10 @@ def crash_on_warnings():
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
+@functools.lru_cache(None)
 def print_warning_once(msg: str) -> None:
     # Set the stacklevel to 2 to print the caller's line info
-    logger.warning(msg, stacklevel=2)
+    logger.warning(msg)
 
 
 @functools.lru_cache(None)
@@ -3828,6 +3829,20 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+
+@contextmanager
+def temp_attr_context(obj, attr, value):
+    if obj is None:
+        yield
+        return
+
+    original_value = getattr(obj, attr)
+    setattr(obj, attr, value)
+    try:
+        yield
+    finally:
+        setattr(obj, attr, original_value)
 
 
 cached_device_index = -1

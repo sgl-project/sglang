@@ -461,6 +461,7 @@ impl Router {
                     assignment_mode: match self.assignment_mode.as_str() {
                         "random" => config::ManualAssignmentMode::Random,
                         "min_load" => config::ManualAssignmentMode::MinLoad,
+                        "min_group" => config::ManualAssignmentMode::MinGroup,
                         other => panic!("Unknown assignment mode: {}", other),
                     },
                 },
