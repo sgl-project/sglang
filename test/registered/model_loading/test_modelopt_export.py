@@ -20,6 +20,7 @@ from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu-5090")
 
 # Note: PYTHONPATH=python should be set when running tests
 

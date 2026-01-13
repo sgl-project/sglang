@@ -23,6 +23,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=561, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=561, suite="stage-b-test-small-1-gpu-5090")
 
 torch_dtype = torch.float16
 prefill_tolerance = 5e-2

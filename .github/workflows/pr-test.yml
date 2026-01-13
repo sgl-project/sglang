@@ -721,7 +721,7 @@ jobs:
         run: |
           source /etc/profile.d/sglang-ci.sh
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 5 --continue-on-error
+          python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu-5090 --auto-partition-id ${{ matrix.partition }} --auto-partition-size 5 --continue-on-error
 
   stage-b-test-large-2-gpu:
     needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels]
