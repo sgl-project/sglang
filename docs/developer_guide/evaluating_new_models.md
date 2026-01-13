@@ -92,8 +92,8 @@ python3 -m sglang.test.run_eval \
 HumanEval problem solving dataset described in the paper "[Evaluating Large Language Models Trained on Code](https://arxiv.org/abs/2107.03374)".
 
 ```bash
-# Install human-eval if it is not installed yet 
-pip install human_eval 
+# Install human-eval if it is not installed yet
+pip install human_eval
 
 python3 -m sglang.test.run_eval \
   --eval-name humaneval \
