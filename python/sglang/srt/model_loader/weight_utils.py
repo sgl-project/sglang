@@ -41,15 +41,17 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
 )
 from sglang.srt.model_loader.ci_weight_validation import (
-    ci_download_with_validation_and_retry,
-    ci_validate_and_cleanup_local_snapshot,
+    ci_download_with_retry,
+    ci_find_local_snapshot,
+    remove_hf_weights,
+    validate_hf_weights,
 )
-from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
+from sglang.srt.utils import log_info_on_rank0, print_warning_once
 from sglang.utils import is_in_ci
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
-except ImportError as e:
+except ImportError:
     SafeTensorsFileLoader = SingleGroup = None
 
 logger = logging.getLogger(__name__)
@@ -269,172 +271,6 @@ def get_quant_config(
         return quant_cls.from_config(config)
 
 
-def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
-    """
-    Check if all files listed in safetensors index files actually exist on disk.
-
-    This catches cases where the snapshot directory exists but files are missing
-    (e.g., due to incomplete downloads or corrupted cache).
-
-    Args:
-        snapshot_dir: Path to the model snapshot directory
-
-    Returns:
-        Tuple of (all_exist, error_message)
-    """
-    index_files = [
-        f for f in os.listdir(snapshot_dir) if f.endswith(".safetensors.index.json")
-    ]
-
-    if not index_files:
-        return True, None  # Not a sharded model
-
-    for index_file in index_files:
-        index_path = os.path.join(snapshot_dir, index_file)
-        if not os.path.exists(index_path):
-            continue
-        try:
-            with open(index_path) as f:
-                weight_map = json.load(f).get("weight_map", {})
-            if not weight_map:
-                continue
-            required_files = set(weight_map.values())
-            missing_files = [
-                fn
-                for fn in required_files
-                if not os.path.exists(os.path.join(snapshot_dir, fn))
-            ]
-            if missing_files:
-                return (
-                    False,
-                    f"Missing {len(missing_files)} file(s) from index {index_file}: "
-                    f"{missing_files[:3]}{'...' if len(missing_files) > 3 else ''}",
-                )
-        except Exception as e:
-            logger.warning("Failed to read index file %s: %s", index_file, e)
-            continue
-
-    return True, None
-
-
-def _find_local_hf_snapshot_dir_unlocked(
-    model_name_or_path: str,
-    cache_dir: Optional[str],
-    allow_patterns: List[str],
-    revision: Optional[str] = None,
-) -> Optional[str]:
-    """Find local HF snapshot directory without locking.
-
-    IMPORTANT: Caller MUST hold the model lock before calling this function
-    to prevent race conditions during validation and cleanup.
-
-    If the weights are already local, skip downloading and returns the path.
-    """
-    if os.path.isdir(model_name_or_path):
-        return None
-
-    found_local_snapshot_dir = None
-
-    # Check custom cache_dir (if provided)
-    if cache_dir:
-        try:
-            repo_folder = os.path.join(
-                cache_dir,
-                huggingface_hub.constants.REPO_ID_SEPARATOR.join(
-                    ["models", *model_name_or_path.split("/")]
-                ),
-            )
-            rev_to_use = revision
-            if not rev_to_use:
-                ref_main = os.path.join(repo_folder, "refs", "main")
-                if os.path.isfile(ref_main):
-                    with open(ref_main) as f:
-                        rev_to_use = f.read().strip()
-            if rev_to_use:
-                rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
-                if os.path.isdir(rev_dir):
-                    found_local_snapshot_dir = rev_dir
-        except Exception as e:
-            logger.warning(
-                "Failed to find local snapshot in custom cache_dir %s: %s",
-                cache_dir,
-                e,
-            )
-
-    # Check default HF cache as well
-    if not found_local_snapshot_dir:
-        try:
-            rev_dir = find_local_repo_dir(model_name_or_path, revision)
-            if rev_dir and os.path.isdir(rev_dir):
-                found_local_snapshot_dir = rev_dir
-        except Exception as e:
-            logger.warning("Failed to find local snapshot in default HF cache: %s", e)
-
-    # if local snapshot exists, validate it contains at least one weight file
-    # matching allow_patterns before skipping download.
-    if found_local_snapshot_dir is None:
-        return None
-
-    # Check if snapshot dir exists (might have been cleaned by another process
-    # before we acquired the lock)
-    if not os.path.isdir(found_local_snapshot_dir):
-        return None
-
-    local_weight_files: List[str] = []
-    try:
-        for pattern in allow_patterns:
-            matched_files = glob.glob(os.path.join(found_local_snapshot_dir, pattern))
-            for f in matched_files:
-                # os.path.exists returns False for broken symlinks.
-                if not os.path.exists(f):
-                    continue
-                local_weight_files.append(f)
-    except Exception as e:
-        logger.warning(
-            "Failed to scan local snapshot %s with patterns %s: %s",
-            found_local_snapshot_dir,
-            allow_patterns,
-            e,
-        )
-        local_weight_files = []
-
-    # Check for missing files from index (lightweight, for all users)
-    # This catches incomplete downloads before they cause cryptic load errors
-    if local_weight_files:
-        is_complete, error_msg = _check_index_files_exist(found_local_snapshot_dir)
-        if not is_complete:
-            log_info_on_rank0(
-                logger,
-                f"Local snapshot incomplete for {model_name_or_path}: {error_msg}. "
-                f"Will download missing files.",
-            )
-            return None  # Triggers snapshot_download() which handles partial downloads
-
-    # Only perform cache validation and cleanup in CI to avoid
-    # unnecessary overhead for regular users
-    if is_in_ci() and local_weight_files:
-        is_valid = ci_validate_and_cleanup_local_snapshot(
-            model_name_or_path, found_local_snapshot_dir, local_weight_files
-        )
-        if not is_valid:
-            return None
-
-    if len(local_weight_files) > 0:
-        log_info_on_rank0(
-            logger,
-            f"Found local HF snapshot for {model_name_or_path} at "
-            f"{found_local_snapshot_dir}; skipping download.",
-        )
-        return found_local_snapshot_dir
-    else:
-        log_info_on_rank0(
-            logger,
-            f"Local HF snapshot at {found_local_snapshot_dir} has no files matching "
-            f"{allow_patterns}; will attempt download.",
-        )
-        return None
-
-
 def download_weights_from_hf(
     model_name_or_path: str,
     cache_dir: Optional[str],
@@ -466,29 +302,39 @@ def download_weights_from_hf(
     if os.path.isdir(model_name_or_path):
         return model_name_or_path
 
-    # Use a SINGLE lock for the entire operation (validation + cleanup + download)
-    # to prevent race conditions where:
-    # 1. Process A validates, finds corruption, deletes corrupted file
-    # 2. Process B validates, sees missing file, deletes ENTIRE cache
-    # 3. Process A tries to download but cache is gone
-    # By using one lock, validation/cleanup and download are atomic.
     with get_lock(model_name_or_path, cache_dir):
-        # Check for valid local cache first (validates and cleans up if needed)
-        path = _find_local_hf_snapshot_dir_unlocked(
-            model_name_or_path, cache_dir, allow_patterns, revision
-        )
-        if path is not None:
-            # Valid local cache found, skip download
-            return path
+        # CI-only: check for valid local cache, validate, cleanup if invalid
+        if is_in_ci():
+            path = ci_find_local_snapshot(model_name_or_path, cache_dir, revision)
+            if path is not None:
+                is_valid, error_msg, corrupted_files = validate_hf_weights(
+                    path, allow_patterns
+                )
+                if is_valid:
+                    log_info_on_rank0(
+                        logger,
+                        f"Found valid local HF snapshot for {model_name_or_path} at "
+                        f"{path}; skipping download.",
+                    )
+                    return path
+                else:
+                    log_info_on_rank0(
+                        logger,
+                        f"Local cache invalid for {model_name_or_path}: {error_msg}. "
+                        "Will clean up and re-download.",
+                    )
+                    # Clean up invalid cache
+                    if corrupted_files:
+                        remove_hf_weights(path, corrupted_files)
+                    else:
+                        remove_hf_weights(path)
 
-        # In CI, skip HF API calls if we're in offline mode or want to avoid rate limits
-        # But we already checked for local cache above, so if we're here we need to download
+        # Determine which weight format to download
         if not huggingface_hub.constants.HF_HUB_OFFLINE:
-            # Before we download we look at what is available:
             fs = HfFileSystem()
             file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
 
-            # depending on what is available we download different things
+            # Select the first matching pattern
             for pattern in allow_patterns:
                 matching = fnmatch.filter(file_list, pattern)
                 if len(matching) > 0:
@@ -497,8 +343,18 @@ def download_weights_from_hf(
 
         log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
 
-        if not is_in_ci():
-            # Simple download without validation for non-CI environments
+        # Download weights
+        if is_in_ci():
+            return ci_download_with_retry(
+                model_name_or_path=model_name_or_path,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                revision=revision,
+                max_retries=max_retries,
+            )
+        else:
+            # Non-CI: simple download without validation overhead
             hf_folder = snapshot_download(
                 model_name_or_path,
                 allow_patterns=allow_patterns,
@@ -509,16 +365,6 @@ def download_weights_from_hf(
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
             return hf_folder
-        else:
-            # Only perform validation and retry in CI to avoid overhead for regular users
-            return ci_download_with_validation_and_retry(
-                model_name_or_path=model_name_or_path,
-                allow_patterns=allow_patterns,
-                ignore_patterns=ignore_patterns,
-                cache_dir=cache_dir,
-                revision=revision,
-                max_retries=max_retries,
-            )
 
 
 def download_safetensors_index_file_from_hf(
