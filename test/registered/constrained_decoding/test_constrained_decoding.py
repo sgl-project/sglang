@@ -71,5 +71,36 @@ class TestLLGuidanceBackend(
     backend = "llguidance"
 
 
+class TestLLGuidanceSpeculatorWithFastForwardTokens(
+    ServerWithGrammar,
+    TestJSONConstrainedMixin,
+    TestEBNFConstrainedMinxin,
+    TestRegexConstrainedMixin,
+):
+    backend = "llguidance"
+    disable_overlap = True
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        launch_args = [
+            "--grammar-backend",
+            cls.backend,
+            "--speculative-algorithm",
+            "LLGUIDANCE",
+        ]
+
+        if cls.disable_overlap:
+            launch_args += ["--disable-overlap-schedule"]
+
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=launch_args,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
