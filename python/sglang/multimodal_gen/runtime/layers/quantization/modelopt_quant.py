@@ -16,8 +16,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.multimodal_gen.runtime.models.parameter import (
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.utils import is_layer_skipped, swizzle_blockscale
 from sglang.srt.utils.custom_op import register_custom_op
 
