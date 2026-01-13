@@ -9,7 +9,7 @@ import unittest
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, run_mmlu_test
 
-register_cuda_ci(est_time=245, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=245, suite="stage-b-test-large-1-gpu")
 
 
 class TestOverlapSchedule(CustomTestCase):

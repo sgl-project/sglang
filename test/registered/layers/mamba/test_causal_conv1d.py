@@ -1,7 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=25, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=3, suite="stage-b-test-small-1-gpu-5090")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/main/tests/kernels/mamba/test_causal_conv1d.py
 
