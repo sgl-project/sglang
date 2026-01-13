@@ -100,19 +100,12 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.layer_idx = layer_idx
-        self.top_k = config.num_experts_per_tok
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.norm_topk_prob = config.norm_topk_prob
-        self.use_expert_bias = config.use_expert_bias
-        self.num_experts = config.num_experts
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.moe_intermediate_size
 
-        if self.tp_size > self.num_experts:
+        if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {self.num_experts}."
+                f"the number of experts {config.num_experts}."
             )
 
         # Gate (router) - outputs logits for each expert
@@ -125,7 +118,7 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         )
 
         # Expert bias (fp32) - affects selection but not weighting
-        if self.use_expert_bias:
+        if config.use_expert_bias:
             self.expert_bias = nn.Parameter(
                 torch.zeros(config.num_experts, dtype=torch.float32)
             )
@@ -138,10 +131,14 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
             layer_id=layer_idx,
             renormalize=config.norm_topk_prob,
             scoring_func="sigmoid",
-            correction_bias=self.expert_bias if self.use_expert_bias else None,
+            correction_bias=self.expert_bias if config.use_expert_bias else None,
         )
 
         # FusedMoE for efficient batched expert computation
+        # Note: We intentionally do NOT pass routed_scaling_factor to FusedMoE.
+        # While FusedMoE supports it, passing it there increases numerical
+        # differences vs HuggingFace (likely due to different code paths in the
+        # Triton runner when scaling_factor != None). We apply it manually below.
         self.experts = FusedMoE(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
@@ -164,7 +161,7 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         # Run fused expert computation
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        # Apply routed scaling factor
+        # Apply routed scaling factor (see __init__ comment for why not in FusedMoE)
         return final_hidden_states * self.routed_scaling_factor
 
 
@@ -327,21 +324,19 @@ class Lfm2MoeShortConv(nn.Module):
             T = hidden_states.shape[0]
             Bx_t = Bx.transpose(0, 1).contiguous()
 
+            # Build query_start_loc for variable-length sequences
+            # causal_conv1d_fn expects [start0, start1, ..., startN, T]
             extend_start_loc = forward_batch.extend_start_loc
             if extend_start_loc is not None and len(extend_start_loc) > 1:
-                query_start_loc = torch.cat(
-                    [
-                        extend_start_loc,
-                        torch.tensor(
-                            [T], dtype=torch.int32, device=hidden_states.device
-                        ),
-                    ]
-                )
+                # Multiple sequences: append T to extend_start_loc
+                # Allocate and fill to avoid torch.cat overhead
+                query_start_loc = extend_start_loc.new_empty(len(extend_start_loc) + 1)
+                query_start_loc[:-1] = extend_start_loc
+                query_start_loc[-1] = T
                 cache_indices = req_pool_indices.to(torch.int32)
             else:
-                query_start_loc = torch.tensor(
-                    [0, T], dtype=torch.int32, device=hidden_states.device
-                )
+                # Single sequence: [0, T]
+                query_start_loc = hidden_states.new_tensor([0, T], dtype=torch.int32)
                 cache_indices = req_pool_indices[:1].to(torch.int32)
 
             conv_out = causal_conv1d_fn(
