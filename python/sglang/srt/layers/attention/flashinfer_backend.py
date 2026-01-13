@@ -1626,11 +1626,9 @@ class FlashInferMultiStepDraftBackend:
         self.common_template(forward_batch, kv_indices, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        # Buffer size includes * topk to accommodate all draft branches
-        buffer_size = max_bs * self.topk * self.max_context_len
-
+        # max_num_tokens = max_bs * topk, so this accounts for all draft branches
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, buffer_size),
+            (self.speculative_num_steps, max_num_tokens * self.max_context_len),
             dtype=torch.int32,
             device="cuda",
         )
