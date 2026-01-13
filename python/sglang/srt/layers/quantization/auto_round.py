@@ -16,9 +16,6 @@ ScalarType, scalar_types = get_scalar_types()
 
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import is_npu
-
-_is_npu = is_npu()
 
 
 class AutoRoundConfig(QuantizationConfig):
@@ -302,13 +299,7 @@ class AutoRoundConfig(QuantizationConfig):
         return None
 
     def apply_gptq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
-        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.layers.quantization.gptq import (
-            GPTQConfig,
-            GPTQLinearAscendMethod,
-            GPTQMoEAscendMethod,
-        )
         from sglang.srt.layers.quantization.marlin_utils import (
             check_marlin_supported,
             check_moe_marlin_supports_layer,
@@ -330,23 +321,6 @@ class AutoRoundConfig(QuantizationConfig):
             group_size,
             sym,
         )
-        if _is_npu:
-            quant_args = GPTQConfig(
-                weight_bits=weight_bits,
-                group_size=group_size,
-                lm_head_quantized=False,
-                desc_act=False,
-                dynamic={},
-            )
-
-            if isinstance(layer, FusedMoE):
-                return GPTQMoEAscendMethod(quant_args)
-
-            if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return GPTQLinearAscendMethod(quant_args)
-
-            return None
-
         if backend == "auto" or "marlin" in backend:
             GPTQ_TYPE_MAP = {
                 (4, True): scalar_types.uint4b8,
