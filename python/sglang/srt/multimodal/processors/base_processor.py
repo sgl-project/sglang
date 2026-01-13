@@ -310,7 +310,22 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["audio_kwargs"].setdefault("truncation", False)
             else:
                 kwargs["audios"] = audios
-
+        
+        # For Qwen3_Omni: construct correct FPS and use_audio_in_video kwargs
+        if self._processor.__class__.__name__ == "Qwen3OmniMoeProcessor" and videos:
+            videos_kwargs = kwargs.get("videos_kwargs", {})
+            video_metadata = kwargs.get("video_metadata")
+            if video_metadata and "fps" not in videos_kwargs:
+                if isinstance(video_metadata, list):
+                    # TODO: Support list fps input in future Omni processor
+                    videos_kwargs["fps"] = [m.get("fps", 1.0) for m in video_metadata][0]
+                elif isinstance(video_metadata, dict):
+                    videos_kwargs["fps"] = video_metadata.get("fps", 1.0)
+            if "use_audio_in_video" in kwargs:
+                videos_kwargs["use_audio_in_video"] = kwargs.pop("use_audio_in_video")
+            
+            kwargs["videos_kwargs"] = videos_kwargs
+        
         processor = self._processor
         if (
             hasattr(processor, "image_processor")
@@ -388,6 +403,7 @@ class BaseMultimodalProcessor(ABC):
         frame_count_limit=None,
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
+        use_audio_in_video: Optional[bool] = False,     # Support Qwen3_Omni
     ):
         """
         Load a single multimodal data.
@@ -411,7 +427,14 @@ class BaseMultimodalProcessor(ABC):
                     img = img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
+                # Support use_audio_in_video
+                vr, audio_waveform = load_video(
+                    video_file=data, 
+                    frame_count_limit=frame_count_limit,
+                    use_audio_in_video=use_audio_in_video,
+                    audio_sample_rate=16000,
+                )
+                return vr, audio_waveform
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
@@ -428,6 +451,7 @@ class BaseMultimodalProcessor(ABC):
         image_scaling_factor: float = 1.0,
         max_image_frames: int = 30,
         audio_sample_rate: Optional[int] = None,
+        use_audio_in_video: Optional[bool] = False,
     ) -> Tuple[List, List]:
         """
         load multimodal data parallelly using iterators.
@@ -473,6 +497,7 @@ class BaseMultimodalProcessor(ABC):
                         frame_count_limit,
                         audio_sample_rate,
                         discard_alpha_channel,
+                        use_audio_in_video,     # Support Qwen3_Omni use_audio_in_video
                     )
                 )
                 task_info.append((modality, data, frame_count_limit))
@@ -555,7 +580,11 @@ class BaseMultimodalProcessor(ABC):
                 else:
                     images.append(result)
         elif modality == Modality.VIDEO:
-            videos.append(result)
+            # Consider audio in video
+            vr_part, audio_part = result
+            videos.append(vr_part)
+            if audio_part is not None:
+                audios.append(audio_part)
         elif modality == Modality.AUDIO:
             audios.append(result)
 
@@ -571,6 +600,7 @@ class BaseMultimodalProcessor(ABC):
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
+        use_audio_in_video: Optional[bool] = False,
     ) -> BaseMultiModalProcessorOutput:
         """
         Each frame of video/image will be replaced by a single image token
@@ -611,6 +641,7 @@ class BaseMultimodalProcessor(ABC):
             data_iterators=data_iterators,
             discard_alpha_channel=discard_alpha_channel,
             audio_sample_rate=audio_sample_rate,
+            use_audio_in_video=use_audio_in_video,
         )
         task_info_iter = iter(task_info)
         futures_iter = iter(futures)

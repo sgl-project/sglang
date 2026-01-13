@@ -537,6 +537,9 @@ class ChatCompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
+    # For Qwen3_Omni
+    use_audio_in_video: Optional[bool] = False
+
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None

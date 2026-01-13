@@ -72,6 +72,7 @@ from typing import (
 from unittest import SkipTest
 from urllib.parse import urlparse
 
+import av
 import numpy as np
 import orjson
 import psutil
@@ -844,6 +845,43 @@ def load_audio(
     return audio
 
 
+# Support Qwen3_Omni use_audio_in_video
+def extract_audio_via_av(path_or_file, sr=16000) -> np.ndarray:
+    try:
+        container = av.open(path_or_file)
+        if not container.streams.audio:
+            return None
+        
+        audio_stream = container.streams.audio[0]
+        resampler = av.AudioResampler(format='flt', layout='mono', rate=sr)
+        
+        audio_frames = []
+        
+        for frame in container.decode(audio_stream):
+            frame.pts = None
+            
+            # List[AudioFrame]
+            resampled_frames = resampler.resample(frame)
+            
+            for r_frame in resampled_frames:
+                audio_frames.append(r_frame.to_ndarray().flatten())
+
+        resampled_frames = resampler.resample(None)
+        for r_frame in resampled_frames:
+             audio_frames.append(r_frame.to_ndarray().flatten())
+        
+        container.close()
+        
+        if not audio_frames:
+            return None
+            
+        return np.concatenate(audio_frames)
+
+    except Exception as e:
+        print(f"Error extraction audio with PyAV: {e}")
+        return None
+
+
 @dataclass
 class ImageData:
     url: str
@@ -904,7 +942,14 @@ def get_image_bytes(image_file: Union[str, bytes]):
         raise NotImplementedError(f"Invalid image: {image_file}")
 
 
-def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+# re-write this for supporting use_audio_in_video for Qwen3_Omni, use the same video file to load both modalities
+def load_video(
+        video_file: Union[str, bytes], 
+        frame_count_limit: Optional[int] = None, 
+        use_gpu: bool = True,
+        use_audio_in_video: Optional[bool] = False,
+        audio_sample_rate: Optional[int] = 16000,
+    ):
     # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
     from decord import VideoReader, cpu, gpu
 
@@ -918,12 +963,14 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
 
     tmp_file = None
     vr = None
+    audio_waveform = None
+    target_path = None
     try:
         if isinstance(video_file, bytes):
             tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
             tmp_file.write(video_file)
             tmp_file.close()
-            vr = VideoReader(tmp_file.name, ctx=ctx)
+            target_path = tmp_file.name
         elif isinstance(video_file, str):
             if video_file.startswith(("http://", "https://")):
                 timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
@@ -933,27 +980,36 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 for chunk in response.iter_content(chunk_size=8192):
                     tmp_file.write(chunk)
                 tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
+                target_path = tmp_file.name
             elif video_file.startswith("data:"):
                 _, encoded = video_file.split(",", 1)
                 video_bytes = pybase64.b64decode(encoded, validate=True)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
+                target_path = tmp_file.name
             # `urlparse` supports file:// paths, and so does VideoReader
             elif os.path.isfile(urlparse(video_file).path):
-                vr = VideoReader(video_file, ctx=ctx)
+                target_path = video_file
             else:
                 video_bytes = pybase64.b64decode(video_file, validate=True)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
+                target_path = tmp_file.name
         else:
             raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
-        return vr
+        vr = VideoReader(target_path, ctx=ctx)
+
+        # Re-use the video, save 1 io/network load for the same source
+        if use_audio_in_video:
+            audio_waveform = extract_audio_via_av(target_path, sr=audio_sample_rate)
+            # if no audio, return at most 1 sec silence
+            if audio_waveform is None:
+                raise ValueError("When use_audio_in_video=True, the video must contain audio.")
+                
+        return vr, audio_waveform
 
     finally:
         if tmp_file and os.path.exists(tmp_file.name):

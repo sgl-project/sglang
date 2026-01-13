@@ -151,6 +151,7 @@ async def preprocess_video(
     entry_time = time.perf_counter()
 
     total_frames, video_fps = len(vr), vr.get_avg_fps()
+    duration = total_frames / video_fps if video_fps > 0 else 0
     nframes = smart_nframes(
         video_config, total_frames=total_frames, video_fps=video_fps
     )
@@ -201,8 +202,16 @@ async def preprocess_video(
         interpolation=InterpolationMode.BILINEAR,
     )
     video = video.pin_memory()
+
+    # Fix: correct fps from sampled video
+    if duration > 0:
+        effective_fps = round(nframes / duration, 1)
+    else:
+        effective_fps = video_fps
+
     video_metadata = {
-        "fps": video_fps,
+        "fps": effective_fps,
+        "original_fps": video_fps,
         "duration": total_frames / video_fps,
         "total_num_frames": total_frames,
         "frames_indices": idx,
@@ -248,6 +257,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         self.image_config = server_args.mm_process_config.get("image", {})
         self.video_config = server_args.mm_process_config.get("video", {})
+
+        # Support use_audio_in_video for Qwen3-Omni model
+        self.use_audio_in_video = False
 
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
@@ -305,12 +317,15 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         entry_time = time.perf_counter()
+        # For Qwen3_Omni
+        self.use_audio_in_video = request_obj.use_audio_in_video
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
+            use_audio_in_video=self.use_audio_in_video,
         )
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
@@ -332,6 +347,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 self.mm_tokens,
                 video_metadata=video_metadata,
                 do_sample_frames=False,
+            )
+        elif self.model_type in ("qwen3_omni_moe"):
+            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                base_output,
+                self.mm_tokens,
+                video_metadata=video_metadata,
+                do_sample_frames=False,
+                use_audio_in_video=self.use_audio_in_video,
             )
         else:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
@@ -385,7 +408,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             image_grid_thw=getattr(ret, "image_grid_thw", None),
             video_grid_thw=getattr(ret, "video_grid_thw", None),
             second_per_grid_ts=second_per_grid_ts,
-            use_audio_in_video=False,
+            use_audio_in_video=self.use_audio_in_video,         # Support use_audio_in_video
             audio_seqlens=audio_feature_lengths,
             audio_token_id=getattr(self.hf_config, "audio_token_id", None),
             audio_start_token_id=self.audio_start_token_id,

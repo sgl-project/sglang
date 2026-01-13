@@ -271,6 +271,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     image_max_dynamic_patch: Optional[int] = None
     video_max_dynamic_patch: Optional[int] = None
 
+    # Support Qwen3_Omni usage: Whether to use audio in video.
+    use_audio_in_video: Optional[bool] = False
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
