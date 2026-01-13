@@ -173,3 +173,27 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
     preprocess_text_funcs: tuple[Callable, ...] = field(
         default_factory=lambda: (zimage_omni_preprocess_text,)
     )
+
+    def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
+        # # flatten to 1-d list
+        # inputs = tokenizer(
+        #     prompts,
+        #     tokenize=True,
+        #     add_generation_prompt=True,
+        #     enable_thinking=True,
+        #     padding="max_length",
+        #     max_length=512,  # TODO (yhyang201): set max length according to config
+        #     truncation=True,
+        #     return_tensors="pt",
+        #     return_dict=True,
+        # )
+
+        inputs = tokenizer(
+            prompts,
+            padding="max_length",
+            max_length=512,  # TODO (yhyang201): set max length according to config
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        return inputs
