@@ -10,12 +10,12 @@ from sglang.srt.parser.reasoning_parser import (
     StreamingParseResult,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase  # noqa
 
 register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 
-class TestStreamingParseResult(CustomTestCase):
+class TestStreamingParseResult(unittest.TestCase):
     def test_init_default(self):
         """Test default initialization of StreamingParseResult."""
         result = StreamingParseResult()
@@ -29,7 +29,7 @@ class TestStreamingParseResult(CustomTestCase):
         self.assertEqual(result.reasoning_text, "reasoning")
 
 
-class TestBaseReasoningFormatDetector(CustomTestCase):
+class TestBaseReasoningFormatDetector(unittest.TestCase):
     def setUp(self):
         self.detector = BaseReasoningFormatDetector(
             think_start_token="<think>",
@@ -151,7 +151,7 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "normal")
 
 
-class TestDeepSeekR1Detector(CustomTestCase):
+class TestDeepSeekR1Detector(unittest.TestCase):
     def setUp(self):
         self.detector = DeepSeekR1Detector()
 
@@ -193,7 +193,7 @@ class TestDeepSeekR1Detector(CustomTestCase):
         self.assertEqual(result.normal_text, "The answer is 42.")
 
 
-class TestQwen3Detector(CustomTestCase):
+class TestQwen3Detector(unittest.TestCase):
     def setUp(self):
         self.detector = Qwen3Detector()
 
@@ -219,7 +219,7 @@ class TestQwen3Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
 
 
-class TestQwen3ForcedReasoningDetector(CustomTestCase):
+class TestQwen3ForcedReasoningDetector(unittest.TestCase):
     def setUp(self):
         self.detector = Qwen3Detector(force_reasoning=True)
 
@@ -265,7 +265,7 @@ class TestQwen3ForcedReasoningDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "The answer is 42.")
 
 
-class TestKimiDetector(CustomTestCase):
+class TestKimiDetector(unittest.TestCase):
     def setUp(self):
         self.detector = KimiDetector()
 
@@ -314,7 +314,7 @@ class TestKimiDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "answer")
 
 
-class TestReasoningParser(CustomTestCase):
+class TestReasoningParser(unittest.TestCase):
     def test_init_valid_model(self):
         """Test initialization with valid model types."""
         parser = ReasoningParser("deepseek-r1")
@@ -385,7 +385,7 @@ class TestReasoningParser(CustomTestCase):
         self.assertTrue(parser.detector.stream_reasoning)
 
 
-class TestIntegrationScenarios(CustomTestCase):
+class TestIntegrationScenarios(unittest.TestCase):
     """Integration tests for realistic usage scenarios."""
 
     def test_deepseek_r1_complete_response(self):
@@ -491,7 +491,7 @@ class TestIntegrationScenarios(CustomTestCase):
         self.assertIn("final answer", all_normal)
 
 
-class TestBufferLossBugFix(CustomTestCase):
+class TestBufferLossBugFix(unittest.TestCase):
     """Test cases for the buffer loss bug fix in parse_streaming_increment."""
 
     def test_partial_end_tag_buffer_loss_bug(self):
@@ -603,7 +603,7 @@ class TestBufferLossBugFix(CustomTestCase):
         self.assertTrue(detector.stripped_think_start)
 
 
-class TestGptOssDetector(CustomTestCase):
+class TestGptOssDetector(unittest.TestCase):
     """Test cases for GptOssDetector, including fix for tool_choice='required' bug."""
 
     def setUp(self):
