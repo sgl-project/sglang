@@ -21,7 +21,9 @@ from sglang.test.simple_eval_common import (
 )
 
 LATIN_SCRIPT_LANGUAGES = ["de", "en", "es", "fr", "sw"]
+
 NON_LATIN_SCRIPT_LANGUAGES = ["bn", "ja", "ru", "te", "th", "zh"]
+
 ALL_LANGUAGES = LATIN_SCRIPT_LANGUAGES + NON_LATIN_SCRIPT_LANGUAGES
 
 LANG_TO_FPATH = {
