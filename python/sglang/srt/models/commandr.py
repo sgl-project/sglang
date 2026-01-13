@@ -246,6 +246,7 @@ class CohereAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
             q, k = self._apply_qk_norm(q, k)
+        # Model v1 uses RoPE throughout, Model v2 uses RoPE only for SWA layers
         if self.v1 or self.sliding_window_size > 0:
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
