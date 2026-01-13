@@ -197,6 +197,7 @@ class TimeStats:
 class SchedulerStats:
     # Basics
     num_running_reqs: int = 0
+    num_running_reqs_by_priority: Dict[int, int] = field(default_factory=dict)
     num_used_tokens: int = 0
     token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
@@ -205,6 +206,7 @@ class SchedulerStats:
     decode_sum_seq_lens: int = 0
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
+    num_queue_reqs_by_priority: Dict[int, int] = field(default_factory=dict)
     num_grammar_queue_reqs: int = 0
     num_running_reqs_offline_batch: int = 0
     cache_hit_rate: float = 0.0
@@ -221,9 +223,13 @@ class SchedulerStats:
 
     # PD disaggregation
     num_prefill_prealloc_queue_reqs: int = 0
+    num_prefill_prealloc_queue_reqs_by_priority: Dict[int, int] = field(default_factory=dict)
     num_prefill_inflight_queue_reqs: int = 0
+    num_prefill_inflight_queue_reqs_by_priority: Dict[int, int] = field(default_factory=dict)
     num_decode_prealloc_queue_reqs: int = 0
+    num_decode_prealloc_queue_reqs_by_priority: Dict[int, int] = field(default_factory=dict)
     num_decode_transfer_queue_reqs: int = 0
+    num_decode_transfer_queue_reqs_by_priority: Dict[int, int] = field(default_factory=dict)
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     kv_transfer_bootstrap_ms: float = 0.0
@@ -841,9 +847,12 @@ class SchedulerMetricsCollector:
             ],
         )
 
-    def _log_gauge(self, gauge, data: Union[int, float]) -> None:
+    def _log_gauge(self, gauge, data: Union[int, float], priority: Optional[int] = None) -> None:
         # Convenience function for logging to gauge.
-        gauge.labels(**self.labels).set(data)
+        labels = dict(self.labels)
+        if priority is not None:
+            labels["priority"] = str(priority)
+        gauge.labels(**labels).set(data)
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
@@ -946,7 +955,11 @@ class SchedulerMetricsCollector:
             ).inc(t)
 
     def log_stats(self, stats: SchedulerStats) -> None:
-        self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
+        if stats.num_running_reqs_by_priority:
+            for key, value in stats.num_running_reqs_by_priority.items():
+                self._log_gauge(self.num_running_reqs, value, priority=key)
+        else:
+            self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
         self._log_gauge(
@@ -956,7 +969,11 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
-        self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
+        if stats.num_queue_reqs_by_priority:
+            for key, value in stats.num_queue_reqs_by_priority.items():
+                self._log_gauge(self.num_queue_reqs, value, priority=key)
+        else:
+            self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(
             self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
@@ -970,18 +987,34 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
 
         # PD disaggregation
-        self._log_gauge(
-            self.num_prefill_prealloc_queue_reqs, stats.num_prefill_prealloc_queue_reqs
-        )
-        self._log_gauge(
-            self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
-        )
-        self._log_gauge(
-            self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs
-        )
-        self._log_gauge(
-            self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
-        )
+        if stats.num_prefill_prealloc_queue_reqs_by_priority:
+            for key, value in stats.num_prefill_prealloc_queue_reqs_by_priority.items():
+                self._log_gauge(self.num_prefill_prealloc_queue_reqs, value, priority=key)
+        else:
+            self._log_gauge(
+                self.num_prefill_prealloc_queue_reqs, stats.num_prefill_prealloc_queue_reqs
+            )
+        if stats.num_prefill_inflight_queue_reqs_by_priority:
+            for key, value in stats.num_prefill_inflight_queue_reqs_by_priority.items():
+                self._log_gauge(self.num_prefill_inflight_queue_reqs, value, priority=key)
+        else:
+            self._log_gauge(
+                self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
+            )
+        if stats.num_decode_prealloc_queue_reqs_by_priority:
+            for key, value in stats.num_decode_prealloc_queue_reqs_by_priority.items():
+                self._log_gauge(self.num_decode_prealloc_queue_reqs, value, priority=key)
+        else:
+            self._log_gauge(
+                self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs
+            )
+        if stats.num_decode_transfer_queue_reqs_by_priority:
+            for key, value in stats.num_decode_transfer_queue_reqs_by_priority.items():
+                self._log_gauge(self.num_decode_transfer_queue_reqs, value, priority=key)
+        else:
+            self._log_gauge(
+                self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
+            )
         self._log_gauge(self.kv_transfer_speed_gb_s, stats.kv_transfer_speed_gb_s)
         self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
         self._log_gauge(self.kv_transfer_bootstrap_ms, stats.kv_transfer_bootstrap_ms)

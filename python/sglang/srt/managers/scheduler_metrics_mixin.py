@@ -97,6 +97,8 @@ class SchedulerMetricsMixin:
                 "pp_rank": pp_rank,
                 "moe_ep_rank": self.moe_ep_rank,
             }
+            if self.enable_priority_scheduling:
+                labels["priority"] = ""
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
             self.metrics_collector = SchedulerMetricsCollector(
@@ -140,6 +142,7 @@ class SchedulerMetricsMixin:
         can_run_list: List[Req],
         running_bs: int,
         running_bs_offline_batch: int,
+        num_running_reqs_by_priority: dict[int, int] = None,
     ):
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
@@ -219,6 +222,7 @@ class SchedulerMetricsMixin:
             )
 
             self.stats.num_running_reqs = running_bs
+            self.stats.num_running_reqs_by_priority = num_running_reqs_by_priority
             self.stats.num_running_reqs_offline_batch = running_bs_offline_batch
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
@@ -227,6 +231,11 @@ class SchedulerMetricsMixin:
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
             self.stats.num_queue_reqs = len(self.waiting_queue)
+            if self.enable_priority_scheduling:
+                num_queue_reqs_by_priority: dict[int, int] = defaultdict(int)
+                for req in self.waiting_queue:
+                    num_queue_reqs_by_priority[req.priority] += 1
+                self.stats.num_queue_reqs_by_priority = num_queue_reqs_by_priority
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
@@ -245,6 +254,15 @@ class SchedulerMetricsMixin:
                 self.stats.num_prefill_inflight_queue_reqs = len(
                     self.disagg_prefill_inflight_queue
                 )
+                if self.enable_priority_scheduling:
+                    num_prefill_prealloc_queue_reqs_by_priority: dict[int, int] = defaultdict(int)
+                    for req in self.disagg_prefill_bootstrap_queue.queue:
+                        num_prefill_prealloc_queue_reqs_by_priority[req.priority] += 1
+                    self.stats.num_prefill_prealloc_queue_reqs_by_priority = num_prefill_prealloc_queue_reqs_by_priority
+                    num_prefill_inflight_queue_reqs_by_priority: dict[int, int] = defaultdict(int)
+                    for req in self.disagg_prefill_inflight_queue:
+                        num_prefill_inflight_queue_reqs_by_priority[req.priority] += 1
+                    self.stats.num_prefill_inflight_queue_reqs_by_priority = num_prefill_inflight_queue_reqs_by_priority
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
                 self.stats.kv_transfer_bootstrap_ms = self.kv_transfer_bootstrap_ms
@@ -257,6 +275,15 @@ class SchedulerMetricsMixin:
                 self.stats.num_decode_transfer_queue_reqs = len(
                     self.disagg_decode_transfer_queue.queue
                 )
+                if self.enable_priority_scheduling:
+                    num_decode_prealloc_queue_reqs_by_priority: dict[int, int] = defaultdict(int)
+                    for req in self.disagg_decode_prealloc_queue.queue:
+                        num_decode_prealloc_queue_reqs_by_priority[req.priority] += 1
+                    self.stats.num_decode_prealloc_queue_reqs_by_priority = num_decode_prealloc_queue_reqs_by_priority
+                    num_decode_transfer_queue_reqs_by_priority: dict[int, int] = defaultdict(int)
+                    for req in self.disagg_decode_transfer_queue.queue:
+                        num_decode_transfer_queue_reqs_by_priority[req.priority] += 1
+                    self.stats.num_decode_transfer_queue_reqs_by_priority = num_decode_transfer_queue_reqs_by_priority
 
             # Others
             self.calculate_utilization()
@@ -289,6 +316,9 @@ class SchedulerMetricsMixin:
 
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
+        num_running_reqs_by_priority: dict[int, int] = defaultdict(int)
+        for req in batch.reqs:
+            num_running_reqs_by_priority[req.priority] += 1
         num_running_reqs_offline_batch = 0
 
         # TODO: generalize this for various memory pools
@@ -383,6 +413,7 @@ class SchedulerMetricsMixin:
         if self.enable_metrics:
             # Basics
             self.stats.num_running_reqs = num_running_reqs
+            self.stats.num_running_reqs_by_priority = num_running_reqs_by_priority
             self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
@@ -393,6 +424,11 @@ class SchedulerMetricsMixin:
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
+            if self.enable_priority_scheduling:
+                num_queue_reqs_by_priority: dict[int, int] = defaultdict(int)
+                for req in self.waiting_queue:
+                    num_queue_reqs_by_priority[req.priority] += 1
+                self.stats.num_queue_reqs_by_priority = num_queue_reqs_by_priority
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
@@ -415,6 +451,15 @@ class SchedulerMetricsMixin:
                 self.stats.num_prefill_inflight_queue_reqs = len(
                     self.disagg_prefill_inflight_queue
                 )
+                if self.enable_priority_scheduling:
+                    num_prefill_prealloc_queue_reqs_by_priority: dict[int, int] = defaultdict(int)
+                    for req in self.disagg_prefill_bootstrap_queue.queue:
+                        num_prefill_prealloc_queue_reqs_by_priority[req.priority] += 1
+                    self.stats.num_prefill_prealloc_queue_reqs_by_priority = num_prefill_prealloc_queue_reqs_by_priority
+                    num_prefill_inflight_queue_reqs_by_priority: dict[int, int] = defaultdict(int)
+                    for req in self.disagg_prefill_inflight_queue:
+                        num_prefill_inflight_queue_reqs_by_priority[req.priority] += 1
+                    self.stats.num_prefill_inflight_queue_reqs_by_priority = num_prefill_inflight_queue_reqs_by_priority
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = len(
                     self.disagg_decode_prealloc_queue.queue
@@ -422,7 +467,15 @@ class SchedulerMetricsMixin:
                 self.stats.num_decode_transfer_queue_reqs = len(
                     self.disagg_decode_transfer_queue.queue
                 )
-
+                if self.enable_priority_scheduling:
+                    num_decode_prealloc_queue_reqs_by_priority: dict[int, int] = defaultdict(int)
+                    for req in self.disagg_decode_prealloc_queue.queue:
+                        num_decode_prealloc_queue_reqs_by_priority[req.priority] += 1
+                    self.stats.num_decode_prealloc_queue_reqs_by_priority = num_decode_prealloc_queue_reqs_by_priority
+                    num_decode_transfer_queue_reqs_by_priority: dict[int, int] = defaultdict(int)
+                    for req in self.disagg_decode_transfer_queue.queue:
+                        num_decode_transfer_queue_reqs_by_priority[req.priority] += 1
+                    self.stats.num_decode_transfer_queue_reqs_by_priority = num_decode_transfer_queue_reqs_by_priority
             running_routing_keys = [r.routing_key for r in batch.reqs]
             waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
             (

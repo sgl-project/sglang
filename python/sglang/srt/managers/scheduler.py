@@ -20,6 +20,7 @@ import signal
 import sys
 import time
 from collections import deque
+from collections import defaultdict
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -774,7 +775,9 @@ class Scheduler(
                 token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
             )
         # Enable preemption for priority scheduling.
-        self.try_preemption = self.enable_priority_scheduling
+        self.try_preemption = (
+            self.enable_priority_scheduling and self.server_args.enable_try_preemption_by_priority
+        )
         self.init_new_token_ratio = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
             * self.server_args.schedule_conservativeness,
@@ -1852,6 +1855,10 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
+        num_running_reqs_by_priority = defaultdict(int)
+        if self.enable_priority_scheduling:
+            for req in self.running_batch.reqs:
+                num_running_reqs_by_priority[req.priority] += 1
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
         # as the space for the chunked request has just been released.
@@ -1924,6 +1931,10 @@ class Scheduler(
                     continue
 
             running_bs = len(self.running_batch.reqs)
+            if self.enable_priority_scheduling:
+                num_running_reqs_by_priority.clear()
+                for req in self.running_batch.reqs:
+                    num_running_reqs_by_priority[req.priority] += 1
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1994,6 +2005,7 @@ class Scheduler(
                 can_run_list,
                 running_bs=len(self.running_batch.reqs),
                 running_bs_offline_batch=0,
+                num_running_reqs_by_priority=num_running_reqs_by_priority,
             )
 
         # Record metrics
