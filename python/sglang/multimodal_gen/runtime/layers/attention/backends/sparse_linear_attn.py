@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from turbo_layer.py for Attention Backend integration
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
@@ -25,11 +27,11 @@ class SparseLinearAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        return [32, 64, 96, 128, 160, 192, 224, 256]
+        return [64, 128]
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
-        return AttentionBackendEnum.SPARSE_LINEAR_ATTN
+        return AttentionBackendEnum.SLA_ATTN
 
     @staticmethod
     def get_impl_cls() -> type["SparseLinearAttentionImpl"]:
@@ -52,87 +54,27 @@ class SparseLinearAttentionMetadata(AttentionMetadata):
     current_timestep: int
 
     # Sparse attention configuration
-    topk: float
-    feature_map: str = "softmax"
-    BLKQ: int = 64
-    BLKK: int = 64
-    use_bf16: bool = True
-    tie_feature_map_qk: bool = True
-
-    # Runtime computed values
-    head_dim: int = 64
-    real_topk_ratio: float = 0.1
-
-    def asdict_zerocopy(self, skip_fields: set[str] | None = None) -> Dict[str, Any]:
-        """Convert metadata to dict for zero-copy operations."""
-        if skip_fields is None:
-            skip_fields = set()
-        return {
-            field.name: getattr(self, field.name)
-            for field in self.__dataclass_fields__.values()
-            if field.name not in skip_fields
-        }
+    topk_ratio: float = 0.1
 
 
 class SparseLinearAttentionMetadataBuilder(AttentionMetadataBuilder):
     """Builder for SparseLinearAttentionMetadata."""
 
-    def __init__(
-        self,
-        topk: float = 0.1,
-        feature_map: str = "softmax",
-        BLKQ: int = 64,
-        BLKK: int = 64,
-        use_bf16: bool = True,
-        tie_feature_map_qk: bool = True,
-    ) -> None:
-        """Initialize the builder with configuration parameters.
-
-        Args:
-            topk: ratio of keys selected for sparse attention
-            feature_map: feature map type ['hedgehog', 'elu', 'relu', 'softmax']
-            BLKQ: block size for query
-            BLKK: block size for key
-            use_bf16: whether to use bfloat16
-            tie_feature_map_qk: whether to use same feature map for q and k
-        """
-        self.topk = topk
-        self.feature_map = feature_map
-        self.BLKQ = BLKQ
-        self.BLKK = BLKK
-        self.use_bf16 = use_bf16
-        self.tie_feature_map_qk = tie_feature_map_qk
+    def __init__(self) -> None:
+        pass
 
     def prepare(self) -> None:
-        """Prepare for one batch - no special preparation needed."""
         pass
 
     def build(
         self,
         current_timestep: int,
-        head_dim: int,
-        **kwargs: Dict[str, Any],
+        topk_ratio: float = 0.1,
+        **kwargs: dict[str, Any],
     ) -> SparseLinearAttentionMetadata:
-        """Build sparse linear attention metadata.
-
-        Args:
-            current_timestep: current diffusion timestep
-            head_dim: dimension of each attention head
-            **kwargs: additional parameters
-
-        Returns:
-            SparseLinearAttentionMetadata instance
-        """
         return SparseLinearAttentionMetadata(
             current_timestep=current_timestep,
-            topk=self.topk,
-            feature_map=self.feature_map,
-            BLKQ=self.BLKQ,
-            BLKK=self.BLKK,
-            use_bf16=self.use_bf16,
-            tie_feature_map_qk=self.tie_feature_map_qk,
-            head_dim=head_dim,
-            real_topk_ratio=self.topk,
+            topk_ratio=topk_ratio,
         )
 
 
@@ -143,46 +85,58 @@ class SparseLinearAttentionImpl(AttentionImpl):
         self,
         num_heads: int,
         head_size: int,
-        softmax_scale: float,
         causal: bool = False,
+        softmax_scale: float | None = None,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        # SLA-specific parameters - matched to TurboDiffusion defaults
+        topk_ratio: float = 0.1,  # TurboDiffusion uses topk=0.1
+        feature_map: str = "softmax",
+        BLKQ: int = 128,  # TurboDiffusion uses BLKQ=128
+        BLKK: int = 64,  # TurboDiffusion uses BLKK=64
+        use_bf16: bool = True,
         **extra_impl_args,
     ) -> None:
-        """Initialize sparse linear attention implementation.
-
-        Args:
-            num_heads: number of attention heads
-            head_size: dimension of each attention head
-            softmax_scale: scaling factor for attention scores
-            causal: whether to use causal attention
-            num_kv_heads: number of key/value heads (for GQA)
-            prefix: prefix for parameter names
-            **extra_impl_args: additional implementation arguments
-        """
-        super().__init__(
-            num_heads=num_heads,
-            head_size=head_size,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            num_kv_heads=num_kv_heads,
-            prefix=prefix,
-            **extra_impl_args,
-        )
+        nn.Module.__init__(self)
 
         self.num_heads = num_heads
         self.head_size = head_size
+        self.softmax_scale = softmax_scale if softmax_scale else head_size**-0.5
+        self.causal = causal
         self.prefix = prefix
 
-        # Initialize projection layer for linear attention
-        self.proj_l = torch.nn.Linear(head_size, head_size, dtype=torch.float32)
+        # SLA-specific config
+        self.topk_ratio = topk_ratio
+        self.BLKQ = BLKQ
+        self.BLKK = BLKK
+        self.dtype = torch.bfloat16 if use_bf16 else torch.float16
+
+        # Learnable linear projection for combining sparse + linear attention
+        self.proj_l = nn.Linear(head_size, head_size, dtype=torch.float32)
+
+        # Feature map for linear attention
+        # Type annotation for callables
+        self.feature_map_q: Callable[[torch.Tensor], torch.Tensor]
+        self.feature_map_k: Callable[[torch.Tensor], torch.Tensor]
+        if feature_map == "elu":
+            self.feature_map_q = lambda x: F.elu(x) + 1
+            self.feature_map_k = lambda x: F.elu(x) + 1
+        elif feature_map == "relu":
+            self.feature_map_q = F.relu
+            self.feature_map_k = F.relu
+        elif feature_map == "softmax":
+            self.feature_map_q = lambda x: F.softmax(x, dim=-1)
+            self.feature_map_k = lambda x: F.softmax(x, dim=-1)
+        else:
+            raise ValueError(f"Unknown feature map: {feature_map}")
+
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Initialize weights for the projection layer."""
+        """Initialize projection weights to zero for residual-like behavior."""
         with torch.no_grad():
-            torch.nn.init.zeros_(self.proj_l.weight)
-            torch.nn.init.zeros_(self.proj_l.bias)
+            nn.init.zeros_(self.proj_l.weight)
+            nn.init.zeros_(self.proj_l.bias)  # type: ignore[arg-type]
 
     def _get_feature_map(self, feature_map_type: str):
         """Get feature map function based on type."""
@@ -195,12 +149,16 @@ class SparseLinearAttentionImpl(AttentionImpl):
         else:
             raise NotImplementedError(f"Not supported feature map {feature_map_type}.")
 
+    def _calc_linear_attention_with_torch(self, q, k, v):
+        kv = torch.matmul(k.transpose(-1, -2), v)
+        k_sum = torch.sum(k, dim=-2, keepdim=True)
+        return torch.matmul(q, kv) / (1e-5 + torch.matmul(q, k_sum.transpose(-1, -2)))
+
     def forward(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        attn_metadata: SparseLinearAttentionMetadata,
     ) -> torch.Tensor:
         """Forward pass for sparse linear attention.
 
@@ -208,23 +166,14 @@ class SparseLinearAttentionImpl(AttentionImpl):
             q: query tensor of shape (B, H, L, D)
             k: key tensor of shape (B, H, L, D)
             v: value tensor of shape (B, H, L, D)
-            attn_metadata: attention metadata containing configuration
 
         Returns:
             output tensor of shape (B, H, L, D)
         """
         dtype = q.dtype
 
-        # Get configuration from metadata
-        topk_ratio = attn_metadata.topk
-        BLKQ = attn_metadata.BLKQ
-        BLKK = attn_metadata.BLKK
-        feature_map_type = attn_metadata.feature_map
-        use_bf16 = attn_metadata.use_bf16
-        tie_feature_map_qk = attn_metadata.tie_feature_map_qk
-
         # Determine computation dtype
-        compute_dtype = torch.bfloat16 if use_bf16 else torch.float16
+        compute_dtype = torch.bfloat16 if self.use_bf16 else torch.float16
 
         # Transpose for computation
         q = q.contiguous()
@@ -233,7 +182,7 @@ class SparseLinearAttentionImpl(AttentionImpl):
 
         # Get sparse attention map
         sparse_map, lut, real_topk = get_block_map(
-            q, k, topk_ratio=topk_ratio, BLKQ=BLKQ, BLKK=BLKK
+            q, k, topk_ratio=self.topk_ratio, BLKQ=self.BLKQ, BLKK=self.BLKK
         )
 
         # Convert to computation dtype
@@ -242,19 +191,13 @@ class SparseLinearAttentionImpl(AttentionImpl):
         v = v.to(compute_dtype)
 
         # Sparse attention computation
-        o_s = _attention.apply(q, k, v, sparse_map, lut, real_topk, BLKQ, BLKK)
-
-        # Get feature maps
-        feature_map_q = self._get_feature_map(feature_map_type)
-        feature_map_k = (
-            feature_map_q
-            if tie_feature_map_qk
-            else self._get_feature_map(feature_map_type)
+        o_s = _attention.apply(
+            q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK
         )
 
         # Apply feature maps
-        q = feature_map_q(q).contiguous().to(compute_dtype)  # c_q
-        k = feature_map_k(k).contiguous().to(compute_dtype)  # c_k
+        q = self.feature_map_q(q).contiguous().to(compute_dtype)  # c_q
+        k = self.feature_map_k(k).contiguous().to(compute_dtype)  # c_k
         # Linear attention computation
         o_l = self._torch_calc_linear(q, k, v)
 
@@ -266,17 +209,6 @@ class SparseLinearAttentionImpl(AttentionImpl):
         output = (o_s + o_l).to(dtype).transpose(1, 2)
 
         return output
-
-    def _torch_calc_linear(self, q, k, v):
-        kv = torch.matmul(k.transpose(-1, -2), v)
-        k_sum = torch.sum(k, dim=-2, keepdim=True)
-        return torch.matmul(q, kv) / (1e-5 + torch.matmul(q, k_sum.transpose(-1, -2)))
-
-    def _softmax_feature_map(self, x):
-        return F.softmax(x, dim=-1)
-
-    def _elu_feature_map(self, x):
-        return F.elu(x) + 1
 
 
 class _attention(torch.autograd.Function):
