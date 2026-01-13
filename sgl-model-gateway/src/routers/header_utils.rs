@@ -64,7 +64,7 @@ fn should_forward_header_no_alloc(name: &str) -> bool {
         || name.eq_ignore_ascii_case("proxy-authenticate")
         || name.eq_ignore_ascii_case("proxy-authorization")
         || name.eq_ignore_ascii_case("te")
-        || name.eq_ignore_ascii_case("trailers")
+        || name.eq_ignore_ascii_case("trailer")
         || name.eq_ignore_ascii_case("transfer-encoding")
         || name.eq_ignore_ascii_case("upgrade")
         || name.eq_ignore_ascii_case("content-encoding")
@@ -102,7 +102,7 @@ pub fn apply_request_headers(
             || key_str.eq_ignore_ascii_case("transfer-encoding")
             || key_str.eq_ignore_ascii_case("keep-alive")
             || key_str.eq_ignore_ascii_case("te")
-            || key_str.eq_ignore_ascii_case("trailers")
+            || key_str.eq_ignore_ascii_case("trailer")
             || key_str.eq_ignore_ascii_case("accept-encoding")
             || key_str.eq_ignore_ascii_case("upgrade")
             || (skip_content_headers
