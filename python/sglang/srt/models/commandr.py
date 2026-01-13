@@ -199,9 +199,13 @@ class CohereAttention(nn.Module):
             is_neox_style=False,
         )
 
-        # Model v2 has interleaved sliding windows, v1 does not
         self.v1 = isinstance(config, CohereConfig)
-        self.sliding_window_size = config.sliding_window if isinstance(config, Cohere2Config) and config.layer_types[layer_id] == "sliding_attention" else -1
+
+        # Model v2 has interleaved sliding windows, v1 does not
+        if isinstance(config, Cohere2Config) and config.layer_types[layer_id] == "sliding_attention":
+            self.sliding_window_size = config.sliding_window
+        else:
+            self.sliding_window_size = -1
 
         self.attn = RadixAttention(
             self.num_heads,
