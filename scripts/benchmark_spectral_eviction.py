@@ -161,7 +161,9 @@ def run_generation(
             output_tokens=tokens_received,
             time_to_first_token_ms=ttft or total_time,
             total_time_ms=total_time,
-            tokens_per_second=tokens_received / (total_time / 1000) if total_time > 0 else 0,
+            tokens_per_second=(
+                tokens_received / (total_time / 1000) if total_time > 0 else 0
+            ),
             output_text=output_text,
         )
 
@@ -197,14 +199,12 @@ def compute_text_similarity(text1: str, text2: str) -> float:
 BENCHMARK_PROMPTS = [
     # Short prompt
     "What is the capital of France?",
-
     # Medium prompt with context
     """The following is a conversation about machine learning:
     User: What are transformers in deep learning?
     Assistant: Transformers are a type of neural network architecture...
     User: How do attention mechanisms work?
     Please explain attention mechanisms in detail.""",
-
     # Long prompt for cache testing
     """Please read and summarize the following text:
 
@@ -226,7 +226,6 @@ BENCHMARK_PROMPTS = [
     and competing at the highest level in strategic game systems.
 
     What are the main points in this text?""",
-
     # Reasoning prompt
     """Let's solve this step by step:
     A train leaves Station A at 9:00 AM traveling at 60 mph.
@@ -250,7 +249,11 @@ def run_benchmark_suite(
 
         for i in range(num_iterations):
             if verbose:
-                print(f"  Running iteration {i+1}/{num_iterations}...", end=" ", flush=True)
+                print(
+                    f"  Running iteration {i+1}/{num_iterations}...",
+                    end=" ",
+                    flush=True,
+                )
 
             result = run_generation(base_url, prompt, max_tokens=150)
             prompt_results.append(result)
@@ -264,7 +267,9 @@ def run_benchmark_suite(
             eviction_policy=prompt_results[0].eviction_policy,
             prompt_tokens=prompt_results[0].prompt_tokens,
             output_tokens=int(np.mean([r.output_tokens for r in prompt_results])),
-            time_to_first_token_ms=np.mean([r.time_to_first_token_ms for r in prompt_results]),
+            time_to_first_token_ms=np.mean(
+                [r.time_to_first_token_ms for r in prompt_results]
+            ),
             total_time_ms=np.mean([r.total_time_ms for r in prompt_results]),
             tokens_per_second=np.mean([r.tokens_per_second for r in prompt_results]),
             output_text=prompt_results[-1].output_text,  # Use last iteration's output
@@ -279,11 +284,15 @@ def print_results(results: List[BenchmarkResult], title: str):
     print(f"\n{'='*80}")
     print(f" {title}")
     print(f"{'='*80}")
-    print(f"{'Prompt':<50} {'Tokens':<10} {'TTFT(ms)':<12} {'Total(ms)':<12} {'Tok/s':<10}")
+    print(
+        f"{'Prompt':<50} {'Tokens':<10} {'TTFT(ms)':<12} {'Total(ms)':<12} {'Tok/s':<10}"
+    )
     print("-" * 80)
 
     for r in results:
-        print(f"{r.name:<50} {r.output_tokens:<10} {r.time_to_first_token_ms:<12.1f} {r.total_time_ms:<12.1f} {r.tokens_per_second:<10.1f}")
+        print(
+            f"{r.name:<50} {r.output_tokens:<10} {r.time_to_first_token_ms:<12.1f} {r.total_time_ms:<12.1f} {r.tokens_per_second:<10.1f}"
+        )
 
     # Summary
     avg_ttft = np.mean([r.time_to_first_token_ms for r in results])
@@ -296,9 +305,15 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark Spectral KV Cache Eviction")
     parser.add_argument("--port", type=int, default=30000, help="Server port")
     parser.add_argument("--host", type=str, default="localhost", help="Server host")
-    parser.add_argument("--iterations", type=int, default=3, help="Iterations per prompt")
-    parser.add_argument("--baseline", action="store_true", help="Mark this as baseline (LRU) run")
-    parser.add_argument("--compare", type=str, help="Path to baseline results JSON for comparison")
+    parser.add_argument(
+        "--iterations", type=int, default=3, help="Iterations per prompt"
+    )
+    parser.add_argument(
+        "--baseline", action="store_true", help="Mark this as baseline (LRU) run"
+    )
+    parser.add_argument(
+        "--compare", type=str, help="Path to baseline results JSON for comparison"
+    )
     parser.add_argument("--output", type=str, help="Save results to JSON file")
     parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")
     args = parser.parse_args()
@@ -374,9 +389,13 @@ def main():
             baseline_results = baseline_data.get("results", [])
 
             for i, (spectral, baseline) in enumerate(zip(results, baseline_results)):
-                similarity = compute_text_similarity(spectral.output_text, baseline.get("output_text", ""))
-                latency_diff = ((spectral.total_time_ms - baseline.get("total_ms", 0)) /
-                               baseline.get("total_ms", 1)) * 100
+                similarity = compute_text_similarity(
+                    spectral.output_text, baseline.get("output_text", "")
+                )
+                latency_diff = (
+                    (spectral.total_time_ms - baseline.get("total_ms", 0))
+                    / baseline.get("total_ms", 1)
+                ) * 100
 
                 print(f"\nPrompt {i+1}: {spectral.name}")
                 print(f"  Quality (text similarity): {similarity:.1%}")
@@ -385,12 +404,16 @@ def main():
                 print(f"  Baseline tok/s: {baseline.get('tokens_per_second', 0):.1f}")
 
             # Overall summary
-            avg_similarity = np.mean([
-                compute_text_similarity(r.output_text, b.get("output_text", ""))
-                for r, b in zip(results, baseline_results)
-            ])
+            avg_similarity = np.mean(
+                [
+                    compute_text_similarity(r.output_text, b.get("output_text", ""))
+                    for r, b in zip(results, baseline_results)
+                ]
+            )
             avg_spectral_tps = np.mean([r.tokens_per_second for r in results])
-            avg_baseline_tps = np.mean([b.get("tokens_per_second", 0) for b in baseline_results])
+            avg_baseline_tps = np.mean(
+                [b.get("tokens_per_second", 0) for b in baseline_results]
+            )
 
             print(f"\n{'='*80}")
             print(" SUMMARY")
@@ -398,7 +421,9 @@ def main():
             print(f"  Average quality preservation: {avg_similarity:.1%}")
             print(f"  Spectral throughput: {avg_spectral_tps:.1f} tok/s")
             print(f"  Baseline throughput: {avg_baseline_tps:.1f} tok/s")
-            print(f"  Throughput change: {((avg_spectral_tps - avg_baseline_tps) / avg_baseline_tps * 100):+.1f}%")
+            print(
+                f"  Throughput change: {((avg_spectral_tps - avg_baseline_tps) / avg_baseline_tps * 100):+.1f}%"
+            )
 
         except FileNotFoundError:
             print(f"Warning: Baseline file not found: {args.compare}")
