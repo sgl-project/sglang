@@ -10,6 +10,15 @@ from unittest.mock import MagicMock, patch
 
 import torch.nn as nn
 
+from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.model_loader.loader import ModelOptModelLoader
+from sglang.srt.utils import get_device
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
 # Note: PYTHONPATH=python should be set when running tests
 
 # Constants for calibration parameters to avoid hard-coded values
@@ -17,18 +26,7 @@ CALIBRATION_BATCH_SIZE = 36
 CALIBRATION_NUM_SAMPLES = 512
 DEFAULT_DEVICE = "cuda:0"
 
-# Constants for calibration parameters to avoid hard-coded values
-CALIBRATION_BATCH_SIZE = 36
-CALIBRATION_NUM_SAMPLES = 512
-DEFAULT_DEVICE = "cuda:0"
-
-from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
-from sglang.srt.model_loader.loader import ModelOptModelLoader
-from sglang.srt.utils import get_device
-from sglang.test.test_utils import CustomTestCase
+register_cuda_ci(est_time=11, suite="stage-b-test-small-1-gpu")
 
 
 class TestModelOptModelLoader(CustomTestCase):
