@@ -1086,7 +1086,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Only cuda env uses fuse ssm_states update
             recurrent_state = ssm_states
             recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-            if is_npu():
+            if is_npu() or is_cpu():
                 recurrent_state = ssm_states[cache_indices]
                 recurrent_state_indices_args = {}
             core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
@@ -1101,7 +1101,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 use_qk_l2norm_in_kernel=True,
                 **recurrent_state_indices_args,
             )
-            if is_npu():
+            if is_npu() or is_cpu():
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )
