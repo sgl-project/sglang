@@ -34,18 +34,18 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
     ):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         super().__init__(
-            size,
-            page_size,
-            dtype,
-            head_num,
-            head_dim,
-            layer_num,
-            device,
-            enable_memory_saver,
-            start_layer,
-            end_layer,
-            enable_alt_stream,
-            enable_kv_cache_copy,
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_alt_stream=enable_alt_stream,
+            enable_kv_cache_copy=enable_kv_cache_copy,
         )
 
     def _create_buffers(self):
@@ -181,14 +181,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         end_layer: Optional[int] = None,
     ):
         super(MLATokenToKVPool, self).__init__(
-            size,
-            page_size,
-            dtype,
-            layer_num,
-            device,
-            enable_memory_saver,
-            start_layer,
-            end_layer,
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
         )
 
         self.kv_lora_rank = kv_lora_rank

@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import os
 import os.path
 import re
 import time
@@ -15,9 +16,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
 
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import StoreBoolean, align_to
+from sglang.multimodal_gen.utils import StoreBoolean
 
 logger = init_logger(__name__)
 
@@ -69,7 +69,7 @@ class DataType(Enum):
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
-            return "jpg"
+            return "png"
         else:
             return "mp4"
 
@@ -87,7 +87,7 @@ class SamplingParams:
     # All fields below are copied from ForwardBatch
 
     # Image inputs
-    image_path: str | None = None
+    image_path: str | list[str] | None = None
 
     # Text inputs
     prompt: str | list[str] | None = None
@@ -100,11 +100,11 @@ class SamplingParams:
 
     # Batch info
     num_outputs_per_prompt: int = 1
-    seed: int = 1024
+    seed: int = 42
     generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
 
     # Original dimensions (before VAE scaling)
-    num_frames: int = 125
+    num_frames: int = 1  # Default for image models
     num_frames_round_down: bool = (
         False  # Whether to round down num_frames if it's not divisible by num_gpus
     )
@@ -122,8 +122,9 @@ class SamplingParams:
 
     # Denoising parameters
     num_inference_steps: int = None
-    guidance_scale: float = None
+    guidance_scale: float = 1.0
     guidance_scale_2: float = None
+    true_cfg_scale: float = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
     boundary_ratio: float | None = None
 
@@ -194,27 +195,128 @@ class SamplingParams:
 
     def __post_init__(self) -> None:
         assert self.num_frames >= 1
-        self.data_type = DataType.VIDEO if self.num_frames > 1 else DataType.IMAGE
 
         if self.width is None:
             self.width_not_provided = True
         if self.height is None:
             self.height_not_provided = True
 
-    def check_sampling_param(self):
+        self._validate()
+
+        # Allow env var to override num_inference_steps (for faster CI testing on AMD)
+        env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
+        if env_steps is not None and self.num_inference_steps is not None:
+            self.num_inference_steps = int(env_steps)
+
+    def _validate(self):
+        """
+        check if the sampling params is correct by itself
+        """
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
-            raise ValueError("prompt_path must be a txt file")
+            raise ValueError(
+                f"prompt_path must be a txt file, got {self.prompt_path!r}"
+            )
+
+        # These are always required to be sane regardless of pipeline.
+        if (
+            not isinstance(self.num_outputs_per_prompt, int)
+            or self.num_outputs_per_prompt <= 0
+        ):
+            raise ValueError(
+                f"num_outputs_per_prompt must be a positive int, got {self.num_outputs_per_prompt!r}"
+            )
+
+        # Used by seconds() and video writer; fps <= 0 is always invalid.
+        if not isinstance(self.fps, int) or self.fps <= 0:
+            raise ValueError(f"fps must be a positive int, got {self.fps!r}")
+
+        # num_frames is already asserted in __post_init__, but keep a friendly error here too
+        # (e.g., when validation is triggered from other code paths).
+        if not isinstance(self.num_frames, int) or self.num_frames <= 0:
+            raise ValueError(
+                f"num_frames must be a positive int, got {self.num_frames!r}"
+            )
+
+        if self.num_inference_steps is not None:
+            if (
+                not isinstance(self.num_inference_steps, int)
+                or self.num_inference_steps <= 0
+            ):
+                raise ValueError(
+                    f"num_inference_steps must be a positive int, got {self.num_inference_steps!r}"
+                )
+
+        # Numeric hyperparams should not be NaN/Inf and should be within basic ranges.
+        # Note: bool is a subclass of int; reject it explicitly to avoid silent surprises.
+        def _finite_non_negative_float(
+            name: str, value: Any, allow_none: bool = True
+        ) -> None:
+            if value is None and allow_none:
+                return
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a number, got {value!r}")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite, got {value!r}")
+            if float(value) < 0.0:
+                raise ValueError(f"{name} must be non-negative, got {value!r}")
+
+        _finite_non_negative_float(
+            "guidance_scale", self.guidance_scale, allow_none=True
+        )
+        _finite_non_negative_float(
+            "guidance_scale_2", self.guidance_scale_2, allow_none=True
+        )
+        _finite_non_negative_float(
+            "true_cfg_scale", self.true_cfg_scale, allow_none=True
+        )
+        _finite_non_negative_float(
+            "guidance_rescale", self.guidance_rescale, allow_none=False
+        )
+
+        if self.boundary_ratio is not None:
+            if isinstance(self.boundary_ratio, bool) or not isinstance(
+                self.boundary_ratio, (int, float)
+            ):
+                raise ValueError(
+                    f"boundary_ratio must be a number, got {self.boundary_ratio!r}"
+                )
+            if not math.isfinite(float(self.boundary_ratio)):
+                raise ValueError(
+                    f"boundary_ratio must be finite, got {self.boundary_ratio!r}"
+                )
+            if not (0.0 <= float(self.boundary_ratio) <= 1.0):
+                raise ValueError(
+                    f"boundary_ratio must be within [0, 1], got {self.boundary_ratio!r}"
+                )
+
+    def check_sampling_param(self):
+        # Keep backward-compatibility for old call sites.
+        self._validate()
+
+    def _validate_with_pipeline_config(self, pipeline_config):
+        """
+        check if the sampling params is compatible and valid with server_args
+        """
+        if pipeline_config.task_type.requires_image_input():
+            # requires image input
+            if self.image_path is None:
+                raise ValueError(
+                    f"Served model with task type '{pipeline_config.task_type.name}' requires an 'image_path' input, but none was provided"
+                )
 
     def _adjust(
         self,
-        server_args: ServerArgs,
+        server_args,
     ):
         """
         final adjustment, called after merged with user params
         """
+        # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
         if not isinstance(self.prompt, str):
             raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
+
+        self.data_type = server_args.pipeline_config.task_type.data_type()
 
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
@@ -252,9 +354,10 @@ class SamplingParams:
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
-            logger.debug(f"Setting num_frames to 1 because this is an image-gen model")
-            self.num_frames = 1
-            self.data_type = DataType.IMAGE
+            if not server_args.pipeline_config.allow_set_num_frames():
+                logger.debug(f"Setting `num_frames` to 1 for image generation model")
+                self.num_frames = 1
+
         elif self.adjust_frames:
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
@@ -275,8 +378,6 @@ class SamplingParams:
 
             if use_temporal_scaling_frames:
                 orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
-            else:  # stepvideo only
-                orig_latent_num_frames = self.num_frames // 17 * 3
 
             if orig_latent_num_frames % server_args.num_gpus != 0:
                 # Adjust latent frames to be divisible by number of GPUs
@@ -295,15 +396,6 @@ class SamplingParams:
                     new_num_frames = (
                         new_latent_num_frames - 1
                     ) * temporal_scale_factor + 1
-                else:  # stepvideo only
-                    # Find the least common multiple of 3 and num_gpus
-                    divisor = math.lcm(3, num_gpus)
-                    # Round up to the nearest multiple of this LCM
-                    new_latent_num_frames = (
-                        (new_latent_num_frames + divisor - 1) // divisor
-                    ) * divisor
-                    # Convert back to actual frames using the StepVideo formula
-                    new_num_frames = new_latent_num_frames // 3 * 17
 
                 logger.info(
                     "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
@@ -313,8 +405,8 @@ class SamplingParams:
                 )
                 self.num_frames = new_num_frames
 
-        self._set_output_file_name()
-        self.log(server_args=server_args)
+        if not server_args.comfyui_mode:
+            self._set_output_file_name()
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
@@ -326,12 +418,52 @@ class SamplingParams:
 
     @staticmethod
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
-        sampling_params = SamplingParams.from_pretrained(model_path)
+        try:
+            sampling_params = SamplingParams.from_pretrained(model_path)
+        except (AttributeError, ValueError) as e:
+            # Handle safetensors files or other cases where model_index.json is not available
+            # Use appropriate SamplingParams based on pipeline_class_name from registry
+            if os.path.isfile(model_path) and model_path.endswith(".safetensors"):
+                # Determine which sampling params to use based on pipeline_class_name
+                pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
+
+                # Try to get SamplingParams from registry
+                from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+                config_classes = (
+                    get_pipeline_config_classes(pipeline_class_name)
+                    if pipeline_class_name
+                    else None
+                )
+
+                if config_classes is not None:
+                    _, sampling_params_cls = config_classes
+                    try:
+                        sampling_params = sampling_params_cls()
+                        logger.info(
+                            f"Using {sampling_params_cls.__name__} for {pipeline_class_name} safetensors file (no model_index.json): %s",
+                            model_path,
+                        )
+                    except Exception as import_error:
+                        logger.warning(
+                            f"Failed to instantiate {sampling_params_cls.__name__}: {import_error}. "
+                            "Using default SamplingParams"
+                        )
+                        sampling_params = SamplingParams()
+                else:
+                    raise ValueError(
+                        f"Could not get pipeline config classes for {pipeline_class_name}"
+                    )
+            else:
+                # Re-raise if it's not a safetensors file issue
+                raise
 
         user_sampling_params = SamplingParams(*args, **kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
         sampling_params._adjust(server_args)
+
+        sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
 
         return sampling_params
 
@@ -430,8 +562,8 @@ class SamplingParams:
             "--generator-device",
             type=str,
             default=SamplingParams.generator_device,
-            choices=["cuda", "cpu"],
-            help="Device for random generator (cuda or cpu). Default: cuda",
+            choices=["cuda", "musa", "cpu"],
+            help="Device for random generator (cuda, musa or cpu). Default: cuda",
         )
         parser.add_argument(
             "--num-frames",
@@ -535,8 +667,14 @@ class SamplingParams:
         parser.add_argument(
             "--image-path",
             type=str,
+            nargs="+",
             default=SamplingParams.image_path,
-            help="Path to input image for image-to-video generation",
+            help=(
+                "Path(s) to input image(s) for image-to-image / image-to-video "
+                "generation. For multiple images, pass them as space-separated "
+                "values, e.g.: "
+                '--image-path "img1.png" "img2.png"'
+            ),
         )
         parser.add_argument(
             "--moba-config-path",
@@ -555,6 +693,13 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.return_trajectory_decoded,
             help="Whether to return the decoded trajectory",
+        )
+        parser.add_argument(
+            "--diffusers-kwargs",
+            type=str,
+            default=None,
+            help="JSON string of extra kwargs to pass to diffusers pipeline. "
+            'Example: \'{"output_type": "latent", "clip_skip": 2}\'',
         )
         parser.add_argument(
             "--no-override-protected-fields",
@@ -645,37 +790,6 @@ class SamplingParams:
 
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)
-
-    def log(self, server_args: ServerArgs):
-        # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
-        if self.height:
-            target_height = align_to(self.height, 16)
-        else:
-            target_height = -1
-        if self.width:
-            target_width = align_to(self.width, 16)
-        else:
-            target_width = -1
-
-        # Log sampling parameters
-        debug_str = f"""Sampling params:
-                       width: {target_width}
-                      height: {target_height}
-                  num_frames: {self.num_frames}
-                      prompt: {self.prompt}
-                  neg_prompt: {self.negative_prompt}
-                        seed: {self.seed}
-                 infer_steps: {self.num_inference_steps}
-      num_outputs_per_prompt: {self.num_outputs_per_prompt}
-              guidance_scale: {self.guidance_scale}
-     embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
-                    n_tokens: {self.n_tokens}
-                  flow_shift: {server_args.pipeline_config.flow_shift}
-                  image_path: {self.image_path}
-                 save_output: {self.save_output}
-            output_file_path: {self.output_file_path()}
-        """  # type: ignore[attr-defined]
-        logger.info(debug_str)
 
 
 @dataclass
