@@ -10,6 +10,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
+from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_kernel,
@@ -421,3 +427,64 @@ class LayerNormScaleShift(nn.Module):
             output = output.to(x.dtype)
 
         return output
+
+
+def apply_qk_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: "RMSNorm",
+    k_norm: "RMSNorm",
+    head_dim: int,
+    allow_inplace: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply QK normalization for query and key tensors.
+
+    Uses JIT fused inplace kernel when available, falls back to standard RMSNorm.
+    """
+
+    batch_size = q.size(0)
+    q_eps = q_norm.variance_epsilon
+    k_eps = k_norm.variance_epsilon
+    # Only try fused path on CUDA and when it won't introduce implicit copies.
+    if (
+        q.is_cuda
+        and allow_inplace
+        and (q_eps == k_eps)
+        and can_use_fused_inplace_qknorm(head_dim, q.dtype)
+    ):
+        fused_inplace_qknorm(
+            q=q.view(batch_size, -1, head_dim),
+            k=k.view(batch_size, -1, head_dim),
+            q_weight=q_norm.weight,
+            k_weight=k_norm.weight,
+            head_dim=head_dim,
+            eps=q_eps,
+        )
+        return q, k
+
+    # Fallback for AMD/ROCm: apply RMSNorm separately to q and k
+    import warnings
+
+    warnings.warn(
+        "Fused QK-norm not available, using RMSNorm fallback",
+        stacklevel=2,
+    )
+    q_shape = q.shape
+    k_shape = k.shape
+    q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
+    k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
+    return q_out, k_out
+
+
+def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_size = get_tensor_model_parallel_world_size()
+    src_dtype = x.dtype
+    weight = norm.weight.tensor_split(tp_size)[tp_rank].float()
+    x_fp32 = x.float()
+    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+    variance = get_tp_group().all_reduce(
+        variance, op=torch._C._distributed_c10d.ReduceOp.AVG
+    )
+    output = x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * weight
+    return output.to(dtype=src_dtype)

@@ -3,11 +3,14 @@
 import argparse
 import asyncio
 import copy
+import doctest
+import inspect
 import json
 import logging
 import os
 import random
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -18,7 +21,7 @@ from datetime import datetime
 from functools import partial, wraps
 from io import BytesIO
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
@@ -58,6 +61,8 @@ DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instru
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
+# Hybrid Mamba models
+DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 # VL test models
 DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
@@ -91,18 +96,24 @@ DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = (
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
 )
 
-# EAGLE
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
-DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_EAGLE_DP_ATTENTION_TARGET_MODEL_FOR_TEST = "Qwen/Qwen3-30B-A3B"
-DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST = "Tengyunw/qwen3_30b_moe_eagle3"
-DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
-DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST = (
-    "meta-llama/Llama-3.1-8B-Instruct"
-)
-DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
-DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST = "Qwen/Qwen2.5-Coder-7B-Instruct"
+# EAGLE2 algorithm models
+DEFAULT_TARGET_MODEL_EAGLE = "meta-llama/Llama-2-7b-chat-hf"
+DEFAULT_DRAFT_MODEL_EAGLE = "lmsys/sglang-EAGLE-llama2-chat-7B"
+
+# EAGLE3 model
+DEFAULT_TARGET_MODEL_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+
+# EAGLE2 with DP-Attention models
+DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN = "Qwen/Qwen3-30B-A3B"
+DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN = "Tengyunw/qwen3_30b_moe_eagle3"
+
+# Standalone speculative decoding models
+DEFAULT_TARGET_MODEL_STANDALONE = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_STANDALONE = "meta-llama/Llama-3.2-1B-Instruct"
+
+# N-gram speculative decoding models
+DEFAULT_TARGET_MODEL_NGRAM = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 # Other use cases
 DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST = (
@@ -168,6 +179,11 @@ def is_blackwell_system():
     return envs.IS_BLACKWELL.get()
 
 
+def is_h200_system():
+    """Return whether it is running on an H200 system."""
+    return envs.IS_H200.get()
+
+
 def _use_cached_default_models(model_repo: str):
     cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
     if cache_dir and model_repo:
@@ -192,6 +208,9 @@ if is_in_amd_ci():
 
 if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+
+if is_h200_system():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -618,7 +637,7 @@ def popen_launch_server(
     if api_key:
         command += ["--api-key", api_key]
 
-    print(f"command={' '.join(command)}")
+    print(f"command={shlex.join(command)}")
 
     if return_stdout_stderr:
         process = subprocess.Popen(
@@ -669,6 +688,7 @@ def popen_launch_server(
                 response = session.get(
                     f"{base_url}/health_generate",
                     headers=headers,
+                    timeout=5,
                 )
                 if response.status_code == 200:
                     return process
@@ -734,6 +754,7 @@ def get_similarities(vec1, vec2):
 
 def get_benchmark_args(
     base_url="",
+    backend="sglang",
     dataset_name="",
     dataset_path="",
     tokenizer="",
@@ -751,9 +772,16 @@ def get_benchmark_args(
     lora_name=None,
     lora_request_distribution="uniform",
     lora_zipf_alpha=1.5,
+    gsp_num_groups=4,
+    gsp_prompts_per_group=4,
+    gsp_system_prompt_len=128,
+    gsp_question_len=32,
+    gsp_output_len=32,
+    gsp_num_turns=1,
+    header=None,
 ):
     return SimpleNamespace(
-        backend="sglang",
+        backend=backend,
         base_url=base_url,
         host=None,
         port=None,
@@ -785,6 +813,13 @@ def get_benchmark_args(
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
+        gsp_num_groups=gsp_num_groups,
+        gsp_prompts_per_group=gsp_prompts_per_group,
+        gsp_system_prompt_len=gsp_system_prompt_len,
+        gsp_question_len=gsp_question_len,
+        gsp_output_len=gsp_output_len,
+        gsp_num_turns=gsp_num_turns,
+        header=header,
     )
 
 
@@ -1697,16 +1732,19 @@ async def send_concurrent_generate_requests_with_custom_params(
 
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
-        max_retry = int(
-            os.environ.get("SGLANG_TEST_MAX_RETRY", "1" if is_in_ci() else "0")
-        )
+        max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
+        if max_retry is None:
+            max_retry = 1 if is_in_ci() else 0
         retry(
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
 
     def setUp(self):
-        print(f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}")
+        print(
+            f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}",
+            flush=True,
+        )
 
 
 def dump_bench_raw_result(
@@ -1748,11 +1786,13 @@ class ModelLaunchSettings:
         tp_size: int = 1,
         extra_args: Optional[List[str]] = None,
         env: Optional[dict] = None,
+        variant: Optional[str] = None,
     ):
         self.model_path = model_path
         self.tp_size = tp_size
         self.extra_args = list(extra_args) if extra_args else []
         self.env = env
+        self.variant = variant
 
         if self.tp_size > 1 and "--tp" not in self.extra_args:
             self.extra_args.extend(["--tp", str(self.tp_size)])
@@ -1931,3 +1971,177 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
         return wrapper
 
     return decorator
+
+
+def run_doctests(obj: Callable[..., Any] | ModuleType):
+    mod = inspect.getmodule(obj)
+    globals = dict(mod.__dict__)
+    finder = doctest.DocTestFinder()
+    runner = doctest.DocTestRunner(verbose=True)
+    tests = finder.find(obj, obj.__name__, globs=globals)
+    assert len(tests) >= 1, f"No tests found for {obj.__name__}"
+    for test in tests:
+        result = runner.run(test)
+        assert result.failed == 0, f"Test {test.name} failed"
+
+
+def dump_metric(metric_name: str, value: Any, labels: Optional[dict] = None):
+    """
+    Output test metric to JSONL and stdout for CI performance tracking.
+
+    Schema (v1):
+      - Required: filename, test_case, metric_name, value
+      - Optional fields supported: ts, labels
+        - ts is emitted by default for convenience
+        - labels preferred as dict; if not JSON-serializable, stored as string
+
+    Value types (v1 contract):
+      - Supported: int, float, str
+      - Input may be bool (will be coerced to int: True=1, False=0)
+      - Others: best-effort conversion to float, fallback to str
+
+    Output channels:
+      - JSONL: ${SGLANG_TEST_METRICS_OUTPUT}.${pid}.jsonl (if env var set)
+      - stdout: [METRIC] metric_name=value [labels=...]
+
+    This function never fails tests - all errors are silently caught.
+
+    Args:
+        metric_name: Metric name (e.g., "gsm8k_accuracy", "cache_hit_rate")
+        value: Metric value
+        labels: Optional label dict (e.g., {"backend": "fa3"})
+    """
+    try:
+        # 1. Capture test context
+        filename, test_case = _get_test_context()
+
+        # 2. Convert value to int/float/str
+        # First unwrap numpy/torch scalars
+        if hasattr(value, "item"):
+            value = value.item()
+
+        # Now convert, ensuring no bool in final result
+        if isinstance(value, bool):
+            converted_value = int(value)  # True->1, False->0
+        elif isinstance(value, (int, float, str)):
+            converted_value = value
+        else:
+            try:
+                converted_value = float(value)
+            except (ValueError, TypeError):
+                converted_value = str(value)
+
+        # 3. Build record
+        record = {
+            "filename": filename,
+            "test_case": test_case,
+            "metric_name": metric_name,
+            "value": converted_value,
+            "ts": time.time(),
+        }
+
+        # 4. Handle labels (best-effort JSON serialization)
+        labels_for_output = None
+        if labels:
+            try:
+                json.dumps(labels, ensure_ascii=False)  # Test serializability
+                record["labels"] = labels
+                labels_for_output = labels
+            except (TypeError, ValueError):
+                # If not serializable, stringify
+                stringified = str(labels)
+                record["labels"] = stringified
+                labels_for_output = stringified
+
+        # 5. Write JSONL
+        base_path = os.getenv("SGLANG_TEST_METRICS_OUTPUT")
+        if base_path:
+            try:
+                jsonl_path = f"{base_path}.{os.getpid()}.jsonl"
+                with open(jsonl_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception as e:
+                logging.warning(
+                    f"sglang.test.dump_metric: failed to write to {jsonl_path}: {e}"
+                )
+
+        # 6. Output to stdout (use same labels as record)
+        if labels_for_output:
+            if isinstance(labels_for_output, str):
+                labels_str = f" labels='{labels_for_output}'"
+            else:
+                labels_str = (
+                    f" labels={json.dumps(labels_for_output, ensure_ascii=False)}"
+                )
+        else:
+            labels_str = ""
+        print(f"[METRIC] {metric_name}={converted_value}{labels_str}")
+
+    except Exception as e:
+        # Silent failure - never break tests
+        logging.warning(
+            f"sglang.test.dump_metric: failed to dump metric '{metric_name}': {e}",
+            exc_info=True,
+        )
+
+
+def _get_test_context() -> tuple[str, str]:
+    """
+    Get current test's filename and test_case.
+
+    Tries PYTEST_CURRENT_TEST first, falls back to inspect.stack().
+    """
+    # 1. Try parsing PYTEST_CURRENT_TEST
+    pytest_current = os.getenv("PYTEST_CURRENT_TEST")
+    if pytest_current:
+        # Format: "path/to/test.py::TestClass::test_method (call)"
+        parts = pytest_current.split(" ")[0].split("::", 1)
+        if len(parts) == 2:
+            filename = _repo_relative_path(parts[0])
+            test_case = parts[1].replace("::", ".")
+            return filename, test_case
+
+    # 2. Fallback to inspect
+    import inspect
+
+    frame = inspect.currentframe()
+    # Assumes direct callsite: frame -> _get_test_context -> dump_metric -> caller
+    # If dump_metric gets wrapped, may need to scan upward
+    if frame and frame.f_back and frame.f_back.f_back:
+        caller = frame.f_back.f_back
+        filename = _repo_relative_path(caller.f_code.co_filename)
+
+        # Try to get class name from self
+        test_self = caller.f_locals.get("self")
+        if test_self and hasattr(test_self, "__class__"):
+            test_case = f"{test_self.__class__.__name__}.{caller.f_code.co_name}"
+        else:
+            test_case = caller.f_code.co_name
+
+        return filename, test_case
+
+    return "unknown.py", "unknown_test"
+
+
+def _repo_relative_path(filepath: str) -> str:
+    """Convert absolute path to repo-relative, preferring GITHUB_WORKSPACE"""
+    # Path is imported at module top (line 20)
+    try:
+        abs_path = Path(filepath).resolve()
+
+        # Try GITHUB_WORKSPACE first
+        workspace = os.getenv("GITHUB_WORKSPACE")
+        if workspace:
+            try:
+                return str(abs_path.relative_to(Path(workspace).resolve()))
+            except ValueError:
+                pass
+
+        # Fallback to cwd
+        try:
+            return str(abs_path.relative_to(Path.cwd()))
+        except ValueError:
+            return abs_path.name
+
+    except Exception:
+        return Path(filepath).name

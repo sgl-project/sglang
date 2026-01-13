@@ -17,14 +17,21 @@ HW_MAPPING = {
 
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["default"],
-    HWBackend.AMD: ["stage-a-test-1"],
+    HWBackend.CPU: ["default", "stage-a-cpu-only"],
+    HWBackend.AMD: [
+        "stage-a-test-1",
+        "stage-b-test-small-1-gpu-amd",
+        "stage-b-test-small-1-gpu-amd-mi35x",
+        "stage-b-test-large-2-gpu-amd",
+    ],
     HWBackend.CUDA: [
         "stage-a-test-1",
         "stage-b-test-small-1-gpu",
         "stage-b-test-large-1-gpu",
         "stage-b-test-large-2-gpu",
+        "stage-c-test-large-4-gpu",
         "stage-b-test-4-gpu-b200",
+        "stage-c-test-large-4-gpu-b200",
     ],
     HWBackend.NPU: [],
 }
@@ -43,8 +50,19 @@ NIGHTLY_SUITES = {
         "nightly-8-gpu-h200-basic",  # Basic tests for large models on H200
         "nightly-8-gpu-b200-basic",  # Basic tests for large models on B200
         "nightly-8-gpu-common",  # Common tests that run on both H200 and B200
+        # Eval and perf suites (2-gpu)
+        "nightly-eval-text-2-gpu",
+        "nightly-eval-vlm-2-gpu",
+        "nightly-perf-text-2-gpu",
+        "nightly-perf-vlm-2-gpu",
     ],
-    HWBackend.AMD: ["nightly-amd", "nightly-amd-8-gpu"],
+    HWBackend.AMD: [
+        "nightly-amd",
+        "nightly-amd-8-gpu",
+        "nightly-amd-vlm",
+        # MI35x 8-GPU suite (different model configs)
+        "nightly-amd-8-gpu-mi35x",
+    ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
         "nightly-1-npu-a3",
@@ -120,26 +138,27 @@ def pretty_print_tests(
 
     headers = ["Hardware", "Suite", "Nightly", "Partition"]
     rows = [[hw.name, suite, str(nightly), partition_info]]
-    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql")
-    print(msg + "\n")
+    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
 
     if skipped_tests:
-        print(f"⚠️  Skipped {len(skipped_tests)} test(s):")
+        msg += f"⚠️  Skipped {len(skipped_tests)} test(s):\n"
         for t in skipped_tests:
             reason = t.disabled or "disabled"
-            print(f"  - {t.filename} (reason: {reason})")
-
-        print()
+            msg += f"  - {t.filename} (reason: {reason})\n"
+        msg += "\n"
 
     if len(ci_tests) == 0:
-        print(f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}")
-        print("This is expected during incremental migration. Skipping.")
-        return
+        msg += f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}\n"
+        msg += "This is expected during incremental migration. Skipping.\n"
+    else:
+        total_est_time = sum(t.est_time for t in ci_tests)
+        msg += (
+            f"✅ Enabled {len(ci_tests)} test(s) (est total {total_est_time:.1f}s):\n"
+        )
+        for t in ci_tests:
+            msg += f"  - {t.filename} (est_time={t.est_time})\n"
 
-    total_est_time = sum(t.est_time for t in ci_tests)
-    print(f"✅ Enabled {len(ci_tests)} test(s) (est total {total_est_time:.1f}s):")
-    for t in ci_tests:
-        print(f"  - {t.filename} (est_time={t.est_time})")
+    print(msg, flush=True)
 
 
 def run_a_suite(args):
@@ -149,14 +168,10 @@ def run_a_suite(args):
     auto_partition_id = args.auto_partition_id
     auto_partition_size = args.auto_partition_size
 
-    # Temporary: search broadly for nightly tests during migration to registered/
-    if nightly:
-        files = glob.glob("**/*.py", recursive=True)
-        sanity_check = False  # Allow files without registration during migration
-    else:
-        files = glob.glob("registered/**/*.py", recursive=True)
-        # Strict: all registered files must have proper registration
-        sanity_check = True
+    # All tests (per-commit and nightly) are now in registered/
+    files = glob.glob("registered/**/*.py", recursive=True)
+    # Strict: all registered files must have proper registration
+    sanity_check = True
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
@@ -166,10 +181,18 @@ def run_a_suite(args):
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 
+    # Add extra timeout when retry is enabled
+    timeout = args.timeout_per_file
+    if args.enable_retry:
+        timeout += args.retry_timeout_increase
+
     return run_unittest_files(
         ci_tests,
-        timeout_per_file=args.timeout_per_file,
+        timeout_per_file=timeout,
         continue_on_error=args.continue_on_error,
+        enable_retry=args.enable_retry,
+        max_attempts=args.max_attempts,
+        retry_wait_seconds=args.retry_wait_seconds,
     )
 
 
@@ -211,6 +234,30 @@ def main():
         "--auto-partition-size",
         type=int,
         help="Use auto load balancing. The number of parts.",
+    )
+    parser.add_argument(
+        "--enable-retry",
+        action="store_true",
+        default=False,
+        help="Enable smart retry for accuracy/performance assertion failures (not code errors)",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=2,
+        help="Maximum number of attempts per file including initial run (default: 2)",
+    )
+    parser.add_argument(
+        "--retry-wait-seconds",
+        type=int,
+        default=60,
+        help="Seconds to wait between retries (default: 60)",
+    )
+    parser.add_argument(
+        "--retry-timeout-increase",
+        type=int,
+        default=600,
+        help="Additional timeout in seconds when retry is enabled (default: 600)",
     )
     args = parser.parse_args()
 

@@ -45,6 +45,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    LoadLoRAAdapterFromTensorsReqInput,
+    LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
@@ -617,6 +619,76 @@ class TokenizerCommunicatorMixin:
                 error_message=str(e),
             )
 
+    async def load_lora_adapter_from_tensors(
+        self: TokenizerManager,
+        obj: LoadLoRAAdapterFromTensorsReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoadLoRAAdapterFromTensorsReqOutput:
+        self.auto_create_handle_loop()
+
+        try:
+            if not self.server_args.enable_lora:
+                raise ValueError(
+                    "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                )
+
+            assert (
+                self.server_args.dp_size == 1
+            ), "dp_size must be 1 for dynamic lora loading"
+            logger.info(
+                "Start load Lora adapter from tensors. Lora name=%s",
+                obj.lora_name,
+            )
+
+            async with self.lora_update_lock:
+                new_adapter = LoRARef(
+                    lora_name=obj.lora_name,
+                    lora_path="__tensor__",
+                    pinned=obj.pinned,
+                )
+                obj.lora_id = new_adapter.lora_id
+                result = (await self.update_lora_adapter_communicator(obj))[0]
+
+                if result.success:
+                    await self.lora_registry.register(new_adapter)
+                    self.lora_ref_cache[obj.lora_name] = new_adapter
+                if self.server_args.max_loaded_loras is not None:
+                    while (
+                        self.lora_registry.num_registered_loras
+                        > self.server_args.max_loaded_loras
+                    ):
+                        lru_lora_name = await self.lora_registry.lru_lora_name(
+                            exclude_pinned=True
+                        )
+                        if lru_lora_name is None:
+                            raise ValueError(
+                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
+                                f"LoRA registry is: {self.lora_registry._registry}"
+                            )
+
+                        logger.info(
+                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
+                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
+                            f"max allowed: {self.server_args.max_loaded_loras})"
+                        )
+
+                        unload_result = await self._unload_lora_adapter_locked(
+                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
+                        )
+                        if not unload_result.success:
+                            raise ValueError(
+                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
+                                f"{unload_result.error_message}"
+                            )
+                        del result.loaded_adapters[lru_lora_name]
+
+                return result
+        except ValueError as e:
+            return LoadLoRAAdapterFromTensorsReqOutput(
+                success=False,
+                error_message=str(e),
+            )
+
     async def unload_lora_adapter(
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
@@ -736,44 +808,6 @@ class TokenizerCommunicatorMixin:
         self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
     ):
         await self.send_to_scheduler.send_pyobj(obj)
-
-    def get_log_request_metadata(self):
-        max_length = None
-        skip_names = None
-        out_skip_names = None
-        if self.log_requests:
-            if self.log_requests_level == 0:
-                max_length = 1 << 30
-                skip_names = {
-                    "text",
-                    "input_ids",
-                    "input_embeds",
-                    "image_data",
-                    "audio_data",
-                    "lora_path",
-                    "sampling_params",
-                }
-                out_skip_names = {"text", "output_ids", "embedding"}
-            elif self.log_requests_level == 1:
-                max_length = 1 << 30
-                skip_names = {
-                    "text",
-                    "input_ids",
-                    "input_embeds",
-                    "image_data",
-                    "audio_data",
-                    "lora_path",
-                }
-                out_skip_names = {"text", "output_ids", "embedding"}
-            elif self.log_requests_level == 2:
-                max_length = 2048
-            elif self.log_requests_level == 3:
-                max_length = 1 << 30
-            else:
-                raise ValueError(
-                    f"Invalid --log-requests-level: {self.log_requests_level=}"
-                )
-        return max_length, skip_names, out_skip_names
 
     def _update_weight_version_if_provided(self, weight_version: Optional[str]) -> None:
         """Update weight version if provided."""

@@ -6,10 +6,10 @@ use super::{
     model_type::ModelType,
     worker::{
         BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
-        WorkerType,
+        WorkerRoutingKeyLoad, WorkerType,
     },
 };
-use crate::routers::grpc::client::GrpcClient;
+use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {
@@ -187,11 +187,15 @@ impl BasicWorkerBuilder {
             None => OnceCell::new(),
         });
 
+        let healthy = true;
+        Metrics::set_worker_health(&self.url, healthy);
+
         BasicWorker {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
+            worker_routing_key_load: Arc::new(WorkerRoutingKeyLoad::new(&self.url)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
-            healthy: Arc::new(AtomicBool::new(true)),
+            healthy: Arc::new(AtomicBool::new(healthy)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::with_config_and_label(

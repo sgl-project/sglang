@@ -3,26 +3,13 @@ Benchmark online serving for diffusion models (Image/Video Generation).
 
 
 Usage:
-    # Video
-    t2v:
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-video --dataset vbench --task t2v --num-prompts 20
+    # launch a server and benchmark on it
 
-    i2v:
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-video --dataset vbench --task i2v --num-prompts 20
+    # T2V or T2I or any other multimodal generation model
+    sglang serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
 
-
-    # Image
-    t2i:
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task t2v --num-prompts 20
-
-    i2v:
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task i2v --num-prompts 20
-
-
+    # benchmark it and make sure the port is the same as the server's port
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231
 """
 
 import argparse
@@ -30,6 +17,7 @@ import asyncio
 import glob
 import json
 import os
+import re
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -40,6 +28,17 @@ import aiohttp
 import numpy as np
 import requests
 from tqdm.asyncio import tqdm
+
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    configure_logger,
+    init_logger,
+)
+
+logger = init_logger(__name__)
+
+
+def is_dir_not_empty(path):
+    return os.path.isdir(path) and bool(os.listdir(path))
 
 
 @dataclass
@@ -63,6 +62,7 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     response_body: Dict[str, Any] = field(default_factory=dict)
+    peak_memory_mb: float = 0.0
 
 
 class BaseDataset(ABC):
@@ -99,12 +99,14 @@ class VBenchDataset(BaseDataset):
         self.items = self._load_data()
 
     def _load_data(self) -> List[Dict[str, Any]]:
-        if self.args.task == "t2v":
+        if self.args.task_name in ("text-to-video", "text-to-image", "video-to-video"):
             return self._load_t2v_prompts()
-        elif self.args.task in ["i2v", "ti2v", "ti2i"]:
+        elif self.args.task_name in ("image-to-video", "image-to-image"):
             return self._load_i2v_data()
         else:
-            return self._load_t2v_prompts()
+            raise ValueError(
+                f"Illegal task name is found in VBenchDataset {args.task_name}"
+            )
 
     def _download_file(self, url: str, dest_path: str) -> None:
         """Download a file from URL to destination path."""
@@ -120,11 +122,11 @@ class VBenchDataset(BaseDataset):
         if not path:
             path = os.path.join(self.cache_dir, "vbench_subject_consistency.txt")
             if not os.path.exists(path):
-                print(f"Downloading VBench T2V prompts to {path}...")
+                logger.info(f"Downloading VBench T2V prompts to {path}...")
                 try:
                     self._download_file(self.T2V_PROMPT_URL, path)
                 except Exception as e:
-                    print(f"Failed to download VBench prompts: {e}")
+                    logger.info(f"Failed to download VBench prompts: {e}")
                     return [{"prompt": "A cat sitting on a bench"}] * 50
 
         prompts = []
@@ -140,11 +142,17 @@ class VBenchDataset(BaseDataset):
         """Auto-download VBench I2V dataset and return the dataset directory."""
         vbench_i2v_dir = os.path.join(self.cache_dir, "vbench_i2v", "vbench2_beta_i2v")
         info_json_path = os.path.join(vbench_i2v_dir, "data", "i2v-bench-info.json")
+        crop_dir = os.path.join(vbench_i2v_dir, "data", "crop")
+        origin_dir = os.path.join(vbench_i2v_dir, "data", "origin")
 
-        if os.path.exists(info_json_path):
+        if (
+            os.path.exists(info_json_path)
+            and is_dir_not_empty(crop_dir)
+            and is_dir_not_empty(origin_dir)
+        ):
             return vbench_i2v_dir
 
-        print(f"Downloading VBench I2V dataset to {vbench_i2v_dir}...")
+        logger.info(f"Downloading VBench I2V dataset to {vbench_i2v_dir}...")
         try:
             cache_root = os.path.join(self.cache_dir, "vbench_i2v")
             script_path = os.path.join(cache_root, "download_data.sh")
@@ -152,7 +160,7 @@ class VBenchDataset(BaseDataset):
             self._download_file(self.I2V_DOWNLOAD_SCRIPT_URL, script_path)
             os.chmod(script_path, 0o755)
 
-            print("Executing download_data.sh (this may take a while)...")
+            logger.info("Executing download_data.sh (this may take a while)...")
             import subprocess
 
             result = subprocess.run(
@@ -161,15 +169,23 @@ class VBenchDataset(BaseDataset):
                 capture_output=True,
                 text=True,
             )
-
             if result.returncode != 0:
                 raise RuntimeError(f"Download script failed: {result.stderr}")
-
-            print(f"Successfully downloaded VBench I2V dataset to {vbench_i2v_dir}")
+            missing_packages = re.findall(r"(\S+): command not found", result.stderr)
+            if missing_packages:
+                missing_packages = list(set(missing_packages))
+                package_list = ", ".join(f"'{cmd}'" for cmd in missing_packages)
+                raise RuntimeError(
+                    f"Download script failed because the following commands are not installed: {package_list}.\n"
+                    "Please install them (e.g., on Ubuntu: `sudo apt install ...`) and try again."
+                )
+            logger.info(
+                f"Successfully downloaded VBench I2V dataset to {vbench_i2v_dir}"
+            )
         except Exception as e:
-            print(f"Failed to download VBench I2V dataset: {e}")
-            print("Please manually download following instructions at:")
-            print(
+            logger.info(f"Failed to download VBench I2V dataset: {e}")
+            logger.info("Please manually download following instructions at:")
+            logger.info(
                 "https://github.com/Vchitect/VBench/tree/master/vbench2_beta_i2v#22-download"
             )
             return None
@@ -192,9 +208,9 @@ class VBenchDataset(BaseDataset):
             if os.path.exists(img_path):
                 data.append({"prompt": item.get("caption", ""), "image_path": img_path})
             else:
-                print(f"Warning: Image not found: {img_path}")
+                logger.warning(f"Image not found: {img_path}")
 
-        print(f"Loaded {len(data)} I2V samples from VBench I2V dataset")
+        logger.info(f"Loaded {len(data)} I2V samples from VBench I2V dataset")
         return data
 
     def _scan_directory_for_images(self, path: str) -> List[Dict[str, Any]]:
@@ -219,7 +235,7 @@ class VBenchDataset(BaseDataset):
 
     def _create_dummy_data(self) -> List[Dict[str, Any]]:
         """Create dummy data with a placeholder image in cache directory."""
-        print("No I2V data found. Using dummy placeholders.")
+        logger.info("No I2V data found. Using dummy placeholders.")
 
         dummy_image = os.path.join(self.cache_dir, "dummy_image.jpg")
         if not os.path.exists(dummy_image):
@@ -229,9 +245,9 @@ class VBenchDataset(BaseDataset):
                 os.makedirs(self.cache_dir, exist_ok=True)
                 img = Image.new("RGB", (100, 100), color="red")
                 img.save(dummy_image)
-                print(f"Created dummy image at {dummy_image}")
+                logger.info(f"Created dummy image at {dummy_image}")
             except ImportError:
-                print("PIL not installed, cannot create dummy image.")
+                logger.info("PIL not installed, cannot create dummy image.")
                 return []
 
         return [{"prompt": "A moving cat", "image_path": dummy_image}] * 10
@@ -239,7 +255,6 @@ class VBenchDataset(BaseDataset):
     def _load_i2v_data(self) -> List[Dict[str, Any]]:
         """Load I2V data from VBench I2V dataset or user-provided path."""
         path = self.args.dataset_path
-
         # Auto-download if no path provided
         if not path:
             path = self._auto_download_i2v_dataset()
@@ -257,7 +272,7 @@ class VBenchDataset(BaseDataset):
                 try:
                     return self._resize_data(self._load_from_i2v_json(json_path))
                 except Exception as e:
-                    print(f"Failed to load {json_path}: {e}")
+                    logger.info(f"Failed to load {json_path}: {e}")
 
         # Fallback: scan directory for images
         if os.path.isdir(path):
@@ -371,6 +386,8 @@ async def async_request_image_sglang(
                     resp_json = await response.json()
                     output.response_body = resp_json
                     output.success = True
+                    if "peak_memory_mb" in resp_json:
+                        output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
                     output.error = f"HTTP {response.status}: {await response.text()}"
                     output.success = False
@@ -398,6 +415,8 @@ async def async_request_image_sglang(
                     resp_json = await response.json()
                     output.response_body = resp_json
                     output.success = True
+                    if "peak_memory_mb" in resp_json:
+                        output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
                     output.error = f"HTTP {response.status}: {await response.text()}"
                     output.success = False
@@ -406,6 +425,7 @@ async def async_request_image_sglang(
             output.success = False
 
     output.latency = time.perf_counter() - output.start_time
+
     if pbar:
         pbar.update(1)
     return output
@@ -421,7 +441,6 @@ async def async_request_video_sglang(
 
     # 1. Submit Job
     job_id = None
-
     # Check if we need to upload images (Multipart) or just send JSON
     if input.image_paths and len(input.image_paths) > 0:
         # Use multipart/form-data
@@ -537,6 +556,8 @@ async def async_request_video_sglang(
                     if status == "completed":
                         output.success = True
                         output.response_body = status_data
+                        if "peak_memory_mb" in status_data:
+                            output.peak_memory_mb = status_data["peak_memory_mb"]
                         break
                     elif status == "failed":
                         output.success = False
@@ -557,6 +578,7 @@ async def async_request_video_sglang(
             break
 
     output.latency = time.perf_counter() - output.start_time
+
     if pbar:
         pbar.update(1)
     return output
@@ -568,6 +590,7 @@ def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
 
     num_success = len(success_outputs)
     latencies = [o.latency for o in success_outputs]
+    peak_memories = [o.peak_memory_mb for o in success_outputs if o.peak_memory_mb > 0]
 
     metrics = {
         "duration": total_duration,
@@ -578,20 +601,23 @@ def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
         "latency_median": np.median(latencies) if latencies else 0,
         "latency_p99": np.percentile(latencies, 99) if latencies else 0,
         "latency_p50": np.percentile(latencies, 50) if latencies else 0,
+        "peak_memory_mb_max": max(peak_memories) if peak_memories else 0,
+        "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
+        "peak_memory_mb_median": np.median(peak_memories) if peak_memories else 0,
     }
 
     return metrics
 
 
-def wait_for_service(base_url: str, timeout: int = 120) -> None:
-    print(f"Waiting for service at {base_url}...")
+def wait_for_service(base_url: str, timeout: int = 1200) -> None:
+    logger.info(f"Waiting for service at {base_url}...")
     start_time = time.time()
     while True:
         try:
             # Try /health endpoint first
             resp = requests.get(f"{base_url}/health", timeout=1)
             if resp.status_code == 200:
-                print("Service is ready.")
+                logger.info("Service is ready.")
                 break
         except requests.exceptions.RequestException:
             pass
@@ -605,6 +631,8 @@ def wait_for_service(base_url: str, timeout: int = 120) -> None:
 
 
 async def benchmark(args):
+    from huggingface_hub import model_info
+
     # Construct base_url if not provided
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
@@ -619,22 +647,32 @@ async def benchmark(args):
             info = resp.json()
             if "model_path" in info and info["model_path"]:
                 args.model = info["model_path"]
-                print(f"Updated model name from server: {args.model}")
+                logger.info(f"Updated model name from server: {args.model}")
     except Exception as e:
-        print(f"Failed to fetch model info: {e}. Using default: {args.model}")
+        logger.info(f"Failed to fetch model info: {e}. Using default: {args.model}")
 
-    # Setup dataset
-    if args.backend == "sglang-image":
-        if args.task == "i2v":
+    task_name = model_info(args.model).pipeline_tag
+
+    if args.task != task_name:
+        logger.warning(
+            f"Task from args {args.task} is different from huggingface pipeline_tag {task_name}, args.task will be ignored!"
+        )
+
+    if task_name in ("text-to-video", "image-to-video", "video-to-video"):
+        api_url = f"{args.base_url}/v1/videos"
+        request_func = async_request_video_sglang
+    elif task_name in ("text-to-image", "image-to-image"):
+        if task_name == "image-to-image":
             api_url = f"{args.base_url}/v1/images/edits"
         else:
             api_url = f"{args.base_url}/v1/images/generations"
         request_func = async_request_image_sglang
-    elif args.backend == "sglang-video":
-        api_url = f"{args.base_url}/v1/videos"
-        request_func = async_request_video_sglang
     else:
-        raise ValueError(f"Unknown backend: {args.backend}")
+        raise ValueError(
+            f"The task name {task_name} of model {args.model} is not a valid task name for multimodal generation. Please check the model path."
+        )
+
+    setattr(args, "task_name", task_name)
 
     if args.dataset == "vbench":
         dataset = VBenchDataset(args, api_url, args.model)
@@ -643,9 +681,9 @@ async def benchmark(args):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
-    print(f"Loading requests...")
+    logger.info(f"Loading requests...")
     requests_list = dataset.get_requests()
-    print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
+    logger.info(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
 
     # Limit concurrency
     if args.max_concurrency is not None:
@@ -686,10 +724,9 @@ async def benchmark(args):
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
 
     # Section 1: Configuration
-    print("{:<40} {:<15}".format("Backend:", args.backend))
+    print("{:<40} {:<15}".format("Task:", task_name))
     print("{:<40} {:<15}".format("Model:", args.model))
     print("{:<40} {:<15}".format("Dataset:", args.dataset))
-    print("{:<40} {:<15}".format("Task:", args.task))
 
     # Section 2: Execution & Traffic
     print(f"{'-' * 50}")
@@ -719,7 +756,25 @@ async def benchmark(args):
     print("{:<40} {:<15.4f}".format("Latency Median (s):", metrics["latency_median"]))
     print("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
 
-    print("\n" + "=" * 60)
+    if metrics["peak_memory_mb_max"] > 0:
+        print(f"{'-' * 50}")
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Max (MB):", metrics["peak_memory_mb_max"]
+            )
+        )
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]
+            )
+        )
+        print(
+            "{:<40} {:<15.2f}".format(
+                "Peak Memory Median (MB):", metrics["peak_memory_mb_median"]
+            )
+        )
+
+    print("=" * 60)
 
     if args.output_file:
         with open(args.output_file, "w") as f:
@@ -734,9 +789,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         type=str,
-        required=True,
-        choices=["sglang-image", "sglang-video"],
-        help="Backend type.",
+        default=None,
+        help="DEPRECATED: --task is deprecated and will be ignored. The task will be inferred from --model.",
     )
     parser.add_argument(
         "--base-url",
@@ -757,9 +811,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task",
         type=str,
-        default="t2v",
-        choices=["t2v", "i2v", "ti2v", "ti2i"],
-        help="Task type.",
+        choices=[
+            "text-to-video",
+            "image-to-video",
+            "text-to-image",
+            "image-to-image",
+            "video-to-video",
+        ],
+        default=None,
+        help="The task will be inferred from huggingface pipeline_tag. When huggingface pipeline_tag is not provided, --task will be used.",
     )
     parser.add_argument(
         "--dataset-path",
@@ -802,7 +862,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--disable-tqdm", action="store_true", help="Disable progress bar."
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Log level.",
+    )
 
     args = parser.parse_args()
+
+    configure_logger(args)
 
     asyncio.run(benchmark(args))
