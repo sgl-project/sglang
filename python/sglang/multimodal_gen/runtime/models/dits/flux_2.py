@@ -24,6 +24,7 @@ from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
+from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     apply_flashinfer_rope_qk_inplace,
@@ -76,6 +77,7 @@ class Flux2FeedForward(nn.Module):
         mult: float = 3.0,
         inner_dim: Optional[int] = None,
         bias: bool = False,
+        quant_config: QuantizationConfig = None,
     ):
         super().__init__()
         if inner_dim is None:
@@ -84,11 +86,19 @@ class Flux2FeedForward(nn.Module):
 
         # Flux2SwiGLU will reduce the dimension by half
         self.linear_in = ColumnParallelLinear(
-            dim, inner_dim * 2, bias=bias, gather_output=True
+            dim,
+            inner_dim * 2,
+            bias=bias,
+            gather_output=True,
+            quant_config=quant_config,
         )
         self.act_fn = Flux2SwiGLU()
         self.linear_out = ColumnParallelLinear(
-            inner_dim, dim_out, bias=bias, gather_output=True
+            inner_dim,
+            dim_out,
+            bias=bias,
+            gather_output=True,
+            quant_config=quant_config,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -112,6 +122,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         eps: float = 1e-5,
         out_dim: int = None,
         elementwise_affine: bool = True,
+        quant_config: QuantizationConfig = None,
     ):
         super().__init__()
 
@@ -128,13 +139,25 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.added_proj_bias = added_proj_bias
 
         self.to_q = ColumnParallelLinear(
-            query_dim, self.inner_dim, bias=bias, gather_output=True
+            query_dim,
+            self.inner_dim,
+            bias=bias,
+            gather_output=True,
+            quant_config=quant_config,
         )
         self.to_k = ColumnParallelLinear(
-            query_dim, self.inner_dim, bias=bias, gather_output=True
+            query_dim,
+            self.inner_dim,
+            bias=bias,
+            gather_output=True,
+            quant_config=quant_config,
         )
         self.to_v = ColumnParallelLinear(
-            query_dim, self.inner_dim, bias=bias, gather_output=True
+            query_dim,
+            self.inner_dim,
+            bias=bias,
+            gather_output=True,
+            quant_config=quant_config,
         )
 
         # QK Norm
@@ -144,7 +167,11 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.to_out = torch.nn.ModuleList([])
         self.to_out.append(
             ColumnParallelLinear(
-                self.inner_dim, self.out_dim, bias=out_bias, gather_output=True
+                self.inner_dim,
+                self.out_dim,
+                bias=out_bias,
+                gather_output=True,
+                quant_config=quant_config,
             )
         )
         self.to_out.append(torch.nn.Dropout(dropout))
@@ -157,21 +184,28 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 self.inner_dim,
                 bias=added_proj_bias,
                 gather_output=True,
+                quant_config=quant_config,
             )
             self.add_k_proj = ColumnParallelLinear(
                 added_kv_proj_dim,
                 self.inner_dim,
                 bias=added_proj_bias,
                 gather_output=True,
+                quant_config=quant_config,
             )
             self.add_v_proj = ColumnParallelLinear(
                 added_kv_proj_dim,
                 self.inner_dim,
                 bias=added_proj_bias,
                 gather_output=True,
+                quant_config=quant_config,
             )
             self.to_add_out = ColumnParallelLinear(
-                self.inner_dim, query_dim, bias=out_bias, gather_output=True
+                self.inner_dim,
+                query_dim,
+                bias=out_bias,
+                gather_output=True,
+                quant_config=quant_config,
             )
 
         self.attn = USPAttention(
@@ -273,6 +307,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         elementwise_affine: bool = True,
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
+        quant_config: QuantizationConfig = None,
     ):
         super().__init__()
 
@@ -295,6 +330,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             self.inner_dim * 3 + self.mlp_hidden_dim * self.mlp_mult_factor,
             bias=bias,
             gather_output=True,
+            quant_config=quant_config,
         )
         self.mlp_act_fn = Flux2SwiGLU()
 
@@ -308,6 +344,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             self.out_dim,
             bias=out_bias,
             gather_output=True,
+            quant_config=quant_config,
         )
 
         self.attn = USPAttention(
@@ -378,6 +415,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        quant_config: QuantizationConfig = None,
     ):
         super().__init__()
 
@@ -396,6 +434,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             eps=eps,
             mlp_ratio=mlp_ratio,
             mlp_mult_factor=2,
+            quant_config=quant_config,
         )
 
     def forward(
@@ -449,6 +488,7 @@ class Flux2TransformerBlock(nn.Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        quant_config: QuantizationConfig = None,
     ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
@@ -466,6 +506,7 @@ class Flux2TransformerBlock(nn.Module):
             added_proj_bias=bias,
             out_bias=bias,
             eps=eps,
+            quant_config=quant_config,
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -635,7 +676,12 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     param_names_mapping = FluxConfig().arch_config.param_names_mapping
 
-    def __init__(self, config: FluxConfig, hf_config: dict[str, Any]):
+    def __init__(
+        self,
+        config: FluxConfig,
+        hf_config: dict[str, Any],
+        quant_config: QuantizationConfig = None,
+    ):
         super().__init__(config=config, hf_config=hf_config)
         patch_size: int = config.patch_size
         in_channels: int = config.in_channels
@@ -694,6 +740,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    quant_config=quant_config,
                 )
                 for _ in range(num_layers)
             ]
@@ -709,6 +756,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    quant_config=quant_config,
                 )
                 for _ in range(num_single_layers)
             ]
@@ -727,6 +775,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
             patch_size * patch_size * self.out_channels,
             bias=False,
             gather_output=True,
+            quant_config=quant_config,
         )
 
         self.layer_names = ["transformer_blocks", "single_transformer_blocks"]
