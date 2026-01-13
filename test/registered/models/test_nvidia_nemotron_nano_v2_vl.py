@@ -3,7 +3,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 # NVIDIA Nemotron Nano V2 VL model tests (CUDA only)
 # GSM8k + MMMU evaluation
 register_cuda_ci(est_time=214, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=214, suite="stage-b-test-small-1-gpu-5090")
 
 import unittest
 

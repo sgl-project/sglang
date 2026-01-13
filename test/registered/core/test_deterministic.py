@@ -16,7 +16,6 @@ from sglang.test.test_deterministic_utils import (
 )
 
 register_cuda_ci(est_time=278, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=278, suite="stage-b-test-small-1-gpu-5090")
 
 
 class TestFlashinferDeterministic(TestDeterministicBase):

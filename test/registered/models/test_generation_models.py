@@ -2,7 +2,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 # Generation model tests (CUDA only)
 register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu-5090")
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");

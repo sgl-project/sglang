@@ -13,7 +13,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 register_cuda_ci(est_time=29, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=29, suite="stage-b-test-small-1-gpu-5090")
 
 
 class AsyncEngine(Engine):

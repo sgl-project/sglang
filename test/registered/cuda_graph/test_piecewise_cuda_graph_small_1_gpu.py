@@ -22,7 +22,6 @@ from sglang.test.test_utils import (
 
 # CI Registration - Small 1-GPU tests (24GB GPU sufficient)
 register_cuda_ci(est_time=539, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=539, suite="stage-b-test-small-1-gpu-5090")
 
 
 class TestPiecewiseCudaGraphCorrectness(CustomTestCase):
