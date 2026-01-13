@@ -5,8 +5,9 @@ use smg::{
     auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role},
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
-        RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
+        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
+        TraceConfig,
     },
     core::ConnectionMode,
     observability::{
@@ -169,6 +170,10 @@ struct CliArgs {
     /// Maximum idle time in seconds before eviction (for manual policy)
     #[arg(long, default_value_t = 14400, help_heading = "Routing Policy")]
     max_idle_secs: u64,
+
+    /// Assignment mode for manual policy when encountering a new routing key
+    #[arg(long, default_value = "random", value_parser = ["random", "min_load", "min_group"], help_heading = "Routing Policy")]
+    assignment_mode: String,
 
     /// Number of prefix tokens to use for prefix_hash policy
     #[arg(long, default_value_t = 256, help_heading = "Routing Policy")]
@@ -708,6 +713,12 @@ impl CliArgs {
             "manual" => PolicyConfig::Manual {
                 eviction_interval_secs: self.eviction_interval,
                 max_idle_secs: self.max_idle_secs,
+                assignment_mode: match self.assignment_mode.as_str() {
+                    "random" => ManualAssignmentMode::Random,
+                    "min_load" => ManualAssignmentMode::MinLoad,
+                    "min_group" => ManualAssignmentMode::MinGroup,
+                    other => panic!("Unknown assignment mode: {}", other),
+                },
             },
             _ => PolicyConfig::RoundRobin,
         }

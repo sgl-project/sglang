@@ -85,9 +85,9 @@ def _build_sampling_params_from_request(
         output_file_name=f"{request_id}.{ext}",
         seed=seed,
         generator_device=generator_device,
-        guidance_scale=guidance_scale,
         num_inference_steps=num_inference_steps,
         enable_teacache=enable_teacache,
+        **({"guidance_scale": guidance_scale} if guidance_scale is not None else {}),
         **({"negative_prompt": negative_prompt} if negative_prompt is not None else {}),
         **({"true_cfg_scale": true_cfg_scale} if true_cfg_scale is not None else {}),
     )
@@ -180,6 +180,7 @@ async def generations(
                 ImageResponseData(
                     url=cloud_url,
                     revised_prompt=request.prompt,
+                    file_path=os.path.abspath(save_file_path),
                 )
             ],
         }
@@ -308,7 +309,11 @@ async def edits(
                 with open(path, "rb") as f:
                     b64 = base64.b64encode(f.read()).decode("utf-8")
             response_kwargs["data"].append(
-                ImageResponseData(b64_json=b64, revised_prompt=prompt)
+                ImageResponseData(
+                    b64_json=b64,
+                    revised_prompt=prompt,
+                    file_path=os.path.abspath(path),
+                )
             )
         if result.peak_memory_mb and result.peak_memory_mb > 0:
             response_kwargs["peak_memory_mb"] = result.peak_memory_mb
@@ -318,8 +323,9 @@ async def edits(
                 ImageResponseData(
                     url=cloud_url if cloud_url else f"/v1/images/{request_id}/content",
                     revised_prompt=prompt,
+                    file_path=os.path.abspath(save_file_path),
                 )
-            ]
+            ],
         }
 
     response_kwargs = add_common_data_to_response(
