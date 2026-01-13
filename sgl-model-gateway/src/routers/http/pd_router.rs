@@ -31,8 +31,7 @@ use crate::{
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         classify::ClassifyRequest,
-        common::GenerationRequest,
-        common::{InputIds, StringOrArray},
+        common::{GenerationRequest, InputIds, StringOrArray},
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
