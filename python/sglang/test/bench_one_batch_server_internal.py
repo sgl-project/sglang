@@ -778,6 +778,3 @@ def run_benchmark_internal(
         write_github_step_summary(summary)
 
     return results, server_info
-
-
-g
